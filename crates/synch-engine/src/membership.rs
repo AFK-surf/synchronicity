@@ -999,13 +999,8 @@ impl Node {
     /// (`synch doctor --rebuild`, §10).
     ///
     /// Per origin, and one origin's failure does not stop the others. Each
-    /// `rematerialize` is its own transaction, so a failure rolls back only
-    /// that origin — but propagating it left every origin sorted after it in
-    /// `all_heads` order un-rebuilt, with no indication that the command had
-    /// stopped short. Which origin fails is not random: a trie past
-    /// `WALK_POSITION_CEILING` fails a *cold* materialization every time,
-    /// deterministically, on every node — so one such origin used to make
-    /// `doctor --rebuild` unusable for the whole cluster.
+    /// `rematerialize` is its own transaction, so a failure rolls back and is
+    /// reported for only that origin while the remaining origins continue.
     pub fn rebuild_views(&self) -> Result<usize> {
         let mut total = 0;
         let mut failed = Vec::new();

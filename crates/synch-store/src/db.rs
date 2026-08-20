@@ -344,11 +344,8 @@ impl Store {
         // wait on the one global connection mutex, and a long holder — a publish
         // batch, a GC pass, a slice commit — parks whoever is waiting for as
         // long as it runs. On a runtime worker that is the endpoint, the control
-        // socket and every timer in the process, which is why the rule is
-        // "blocking work goes to the blocking pool" and why it needs a checker
-        // rather than a convention: four audit passes moved call sites off the
-        // runtime and each left some behind, because a violation compiles,
-        // passes its tests, and only shows up as a daemon that goes quiet.
+        // socket and every timer in the process, so blocking work goes to the
+        // blocking pool and the invariant is checked here.
         synch_core::assert_off_runtime("a Store connection acquisition");
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1384,7 +1381,7 @@ mod tests {
         spaced.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// The `sql` block of `DESIGN.md` §10, read from the file rather than copied: a copy is exactly the drift this test exists to catch.
+    /// The `sql` block of `DESIGN.md` §10, read directly to avoid a duplicate.
     fn design_schema() -> String {
         let text = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

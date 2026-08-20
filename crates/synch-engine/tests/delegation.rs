@@ -462,10 +462,7 @@ async fn revocation_is_deletion_and_cuts_the_delegate_off() {
 /// must draw the same boundary. `GetNodes` applies the position check *and*
 /// `Scope::admits_node`, because a node at an admitted position can still
 /// describe a key that runs out of scope — a leaf spells the rest of its key,
-/// and that key's value is the record. `GetValues` used to apply only the
-/// position check, so the node one handler redacted was the node the other
-/// served the contents of, for the price of a hash the delegate holds
-/// honestly.
+/// and that key's value is the record.
 #[tokio::test]
 async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
     let issuer = WireNode::spawn(Some("nas")).await;

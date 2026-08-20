@@ -366,13 +366,9 @@ impl MptProtocol {
             }
             MptMessage::GetValues { root, wants } => {
                 check_wants(&wants)?;
-                // Bounded in bytes as well as in count, and *here*. The count
-                // cap alone was never a cost cap: a value is arbitrary bytes,
-                // so `MAX_BATCH` of them is whatever the origin that published
-                // them chose. This handler used to reason that a `b:` record is
-                // ~20 KB and a `FileEntry` small — true of honest records, and
-                // a claim about record shapes rather than an enforced bound.
-                // `MAX_TRIE_VALUE_LEN` is the enforced one now, and the budget
+                // Bounded in bytes as well as in count, and *here*. A value is
+                // arbitrary bytes, so the count cap alone is not a cost cap.
+                // `MAX_TRIE_VALUE_LEN` is the enforced bound, and the budget
                 // below is what keeps even a full batch of them inside a frame.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
@@ -553,17 +549,9 @@ fn admit(
             "requested positions against a root this node holds no head for".to_string(),
         ));
     }
-    // An out-of-scope position is refused as a position, not as a batch.
-    // Failing the whole request was too blunt for what is usually an honest
-    // disagreement: a delegation widens, the delegate learns its new scope
-    // from the peer serving it, and peers that have not yet replicated the
-    // new record still hold the old one. Erroring turned that lag into an
-    // aborted exchange for *every* origin in the round — and it self-heals a
-    // moment later, so the cost was paid for nothing. Resolving to `None`
-    // refuses exactly the position asked about, which the caller already
-    // reports as holding nothing, and leaves the rest of the batch answered.
-    // Nothing is conceded: a refused position is served no more than before,
-    // and the log line still names the peer.
+    // Refuse an out-of-scope position without failing the whole batch. Scope
+    // may differ briefly while a widened delegation replicates; the caller
+    // already represents the refused position as missing.
     let mut refused = 0usize;
     let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
     let admitted: Vec<bool> = paths

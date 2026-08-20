@@ -717,8 +717,8 @@ enum GateApex<'a> {
 /// A DNSSEC-validated answer that has **also** passed the §4.2 transparency
 /// gate — or that is under a policy which asks for no gate at all.
 ///
-/// Distinct from [`DnssecTxt`] because the two are different statements and
-/// were previously one type. `DnssecTxt` says *this zone signed this*, which
+/// Distinct from [`DnssecTxt`] because the two are different statements.
+/// `DnssecTxt` says *this zone signed this*, which
 /// under `RekorPolicy::Require` is not enough: the threat model's attacker is
 /// a compromised parent who substitutes a DS, adds a key to the apex DNSKEY
 /// RRset, and signs anything they like with a key that validates. What the
@@ -728,9 +728,7 @@ enum GateApex<'a> {
 /// The private field is the mechanism, as with
 /// [`chain::Authorized`](crate::chain::Authorized): only
 /// `DnssecResolver::gated_txt` can build one, so a value of this type is
-/// evidence the gate ran — exactly what a previous audit found missing when
-/// the attach record was read from a gate-less `DnssecTxt` in code that read
-/// identically to the gated path.
+/// evidence the gate ran.
 #[derive(Debug, Clone)]
 pub struct GatedTxt {
     /// The apex the gate held this answer against, or `None` under a policy
@@ -1060,11 +1058,7 @@ impl DnssecResolver {
     ///
     /// **This is the only way to obtain a [`GatedTxt`], and every trust
     /// decision in this module is made from one** — the whole point of the
-    /// separate type. The two steps were previously spelled three different
-    /// ways at three call sites, and the fourth — the attach record — spelled
-    /// them zero times while reading exactly like the others, because a
-    /// DNSSEC-validated answer and a gated one were the same type with the
-    /// same fields: a caller holding a `DnssecTxt` could not see which it had.
+    /// separate type.
     ///
     /// The TUF refresh happens here rather than at each site; its young-walk
     /// check makes the second call in a pass a no-op, so routing a
@@ -1226,8 +1220,7 @@ impl DnssecResolver {
         // shape (an `https://` or `http://` origin, see
         // `parse_control_plane_record`) and is otherwise an opaque redirect
         // target: acceptable *because* the zone key that published it is
-        // gated directly above — a claim this comment made before the gate
-        // was real, which is the reason the gate has to be. On `https://`,
+        // gated directly above. On `https://`,
         // WebPKI TLS on the WSS connection sits on top; on `http://` the
         // zone key is the whole of it.
         let mut refusal = None;

@@ -1,11 +1,8 @@
 //// The publish gate: whether this service will emit a zone whose key is
 //// not on the public record.
 ////
-//// `CP_REKOR_REQUIRE=true` turns it on. It is off by default because the
-//// rollout is phased (§7): phase 0 publishes records while enforcement
-//// stays off, so a control plane that has not run `rekor-publish` yet
-//// keeps serving. With it on, publish refuses rather than emitting a zone
-//// clients would reject — the same stance as the §3.2 build-time checks.
+//// `CP_REKOR_REQUIRE=true` turns it on. With it on, publish refuses rather
+//// than emitting a zone clients would reject.
 ////
 //// The environment is read here, at the check, rather than threaded from
 //// boot configuration through every publish path (API mutation, resign

@@ -42,13 +42,6 @@ pub const ttl_data = 300
 ///
 ///     watch cadence + publish + ttl_proof  <  ttl_data + client trust grace
 ///     300          + 60      + 300         <  300      + 900
-///
-/// The grace is `DEFAULT_TRUST_GRACE` in `crates/synch-net/src/dns.rs`, which
-/// is 15 minutes. This comment said 600 for a while, which *understated* the
-/// margin: the relation was being maintained against a budget of 900 when the
-/// real one is 1200, so it held by more than it claimed rather than less. Both
-/// numbers still satisfy it; the arithmetic is written down to be checked, so
-/// it should be the arithmetic that is actually true.
 pub const ttl_proof = 300
 
 /// The declaration's TTL. Its content is fixed forever — the same twenty

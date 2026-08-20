@@ -58,8 +58,8 @@ fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
     assert_eq!(proven, vec![zone.dnskey_rdata()]);
 }
 
-/// RFC 4035 §5.3.1: the signer is the closest enclosing zone — a foreign-named
-/// signature is still well-formed, and deleting this comparison left the suite green.
+/// RFC 4035 §5.3.1: the signer is the closest enclosing zone; a foreign-named
+/// signature may still be well-formed.
 #[test]
 fn a_declaration_signed_under_another_zones_name_is_refused() {
     let mut zone = SimZone::new("cluster.example", Vec::new());
@@ -210,8 +210,7 @@ fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
 
 // ------------------------------------------- the delegation half of the walk
 // A link's DNSKEY RRset is believed because a DS its parent signed covers a
-// key in it. Until the harness could build a child key set the parent's DS
-// does *not* cover, they could not disagree — deleting any left the suite green.
+// key in it.
 
 /// A key set the parent's DS does not cover authorizes nothing, even when every
 /// other byte of the ladder is genuine — the forgery that costs an attacker

@@ -630,8 +630,7 @@ async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
 }
 
 /// The whole sync-and-fetch path completes without a runtime worker touching
-/// the store (§10) — an audit regression that panics inside the offending
-/// task, so "the work completed at all" is the assertion.
+/// the store (§10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
     // Deliberately without the `BlockingScope` the other tests take: this body holds to the rule too (§10).

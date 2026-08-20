@@ -455,9 +455,6 @@ fn check_watch_list(known: &KnownKeys, state_path: &Path) -> Result<(), MonitorE
 /// `--from-index` is refused for, arriving through the state file instead of
 /// the command line, so it gets the same treatment and the same escape.
 ///
-/// Split out of `run` so it can be tested: as an inline block it could be
-/// deleted whole and the workspace stayed green, which for a guard added by an
-/// audit is the same position the defect was in.
 fn coverage_gap(state: &MonitorState, args: &RunArgs) -> Result<(), MonitorError> {
     if let Some(covered) = state.watched.clone() {
         let widened = state.known.widening_over(&covered);
@@ -1286,8 +1283,7 @@ mod tests {
         assert_eq!(watching("cp.example.com").widening_over(&[]).len(), 1);
     }
 
-    /// The watch-coverage guard refuses a run and `--allow-gap` lets one through:
-    /// deleting `if let Some(covered)` — a filed-and-fixed audit defect — left the workspace green.
+    /// The watch-coverage guard refuses a run and `--allow-gap` lets one through.
     #[test]
     fn a_widened_watch_list_refuses_the_run_until_the_operator_says_so() {
         let dir = tempfile::tempdir().unwrap();

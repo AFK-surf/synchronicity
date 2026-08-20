@@ -265,12 +265,8 @@ impl PinState {
     pub fn log_keys(&self) -> Option<LogKeys> {
         match self.trusted_root.is_empty() {
             true => None,
-            // A `None` here is not the same `None` as the line above: it sends
-            // the caller back to the *embedded* bootstrap set, so an accepted
-            // trusted root this build cannot parse silently un-does every pin
-            // update ever applied. That is a downgrade, and it used to happen
-            // without a word. It still resolves the same way — falling back is
-            // better than having no pins — but it says so now.
+            // A `None` here sends the caller back to the embedded bootstrap set,
+            // so warn when an accepted trusted root cannot be parsed.
             false => match tlog_keys(&self.trusted_root) {
                 Ok(keys) => Some(keys),
                 Err(e) => {
@@ -1358,8 +1354,7 @@ pub fn key_id(key: &serde_json::Value) -> Result<String, TufError> {
 ///
 /// The rules are few and every one is load-bearing: object members sorted by
 /// key, no whitespace anywhere, strings escaping only `"` and `\` (control
-/// characters travel raw), integers only. This is where TUF implementations
-/// historically break, which is why the conformance fixture verifies it
+/// characters travel raw), integers only. The conformance fixture verifies it
 /// against the real repository's bytes rather than a hand-written example.
 pub(crate) fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, String> {
     let mut out = String::new();

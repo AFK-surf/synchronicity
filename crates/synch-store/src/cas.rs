@@ -852,9 +852,8 @@ impl Store {
         // transaction, so no *row* writer can slip between the delete and the
         // files going.
         //
-        // That is not enough on its own, and the version of this comment that
-        // said it was had the ordering backwards. Every writer of a blob row
-        // goes through this mutex; no writer of a blob's *bytes* does.
+        // Every writer of a blob row goes through this mutex; no writer of a
+        // blob's *bytes* does.
         // `write_slice` creates, grows, decodes and fsyncs the payload and the
         // outboard with nothing held, and only then takes the connection to
         // commit. Holding the guard across the unlinks therefore forces that
@@ -1158,20 +1157,10 @@ impl Store {
         // fail verification, and leave both behind — `trim_to_size` only runs
         // on a commit that completed the object, so nothing reclaims them.
         //
-        // This used to grow to the end of the *window*, on the reasoning that a
-        // window bounds the file by what is about to be verified. It does not:
-        // `window_end_bytes` reads the last range's end and nothing about where
-        // the window starts, so a fetch whose ask sits at the tail of the object
-        // — an S3 `Range: bytes=-1`, `synch cat --range` near the end, or simply
-        // provider *i*'s share under a fanout, which begins at ~i/fanout of the
-        // object — had a window whose end *was* the claimed size. The bound
-        // held only for fetches that began at group 0.
-        //
-        // Letting the decode do the extending is the honest version of the same
-        // rule: `write_at` grows the file as each verified group lands, so the
+        // Let the decode extend the file: `write_at` grows it as each verified
+        // group lands, so the
         // payload never gets longer than the bytes that have been proven
-        // against the root, whatever the window's position. The comment above
-        // already relied on that behaviour for later windows.
+        // against the root, whatever the window's position.
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)

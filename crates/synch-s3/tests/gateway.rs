@@ -1484,10 +1484,7 @@ impl<'a> Signer<'a> {
     }
 }
 
-/// One client's upload id is not another's to use: the listing used to hand
-/// every open upload's id to every caller, making the id — the only thing
-/// authorizing a part upload or a completion — public, so any key holder
-/// could overwrite another client's parts under this node's signature.
+/// One client's upload id is not another's to use.
 #[tokio::test]
 async fn uploads_are_scoped_to_the_key_that_opened_them() {
     let keys = vec![

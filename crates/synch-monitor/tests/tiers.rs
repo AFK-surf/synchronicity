@@ -270,9 +270,8 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
 
 /// The chain may not prove a signing zone the membership answer was not signed
 /// by: two ancestors of one domain need not be equal, so a parent zone's entry
-/// can be offered for a child's answer. It had no test — every `ZoneKey` set
-/// `signing_zone` equal to the apex, so deleting the check left the suite
-/// green — and `check_binds` matches on rdata digest, so shared key material
+/// can be offered for a child's answer. `check_binds` matches on rdata digest,
+/// so shared key material
 /// would let the parent's entry authorize the child's answer.
 #[test]
 fn an_entry_whose_chain_proves_another_signing_zone_is_refused() {

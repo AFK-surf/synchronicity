@@ -370,11 +370,6 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
-///
-/// And one *function*, for the same reason. [`Store::retained_roots`] used to
-/// carry a second copy of this query; the sweep ran this one and the sweep's
-/// test asserted on that one, so a change to either would have been invisible
-/// to the other until an audit found them.
 pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
@@ -660,8 +655,7 @@ mod tests {
         assert_eq!(store.gc(0).unwrap().orphans, 0);
     }
 
-    /// A leaked staging file is reclaimed, and never kills the sweep: a regular
-    /// file in the CAS root used to make every orphan pass fail NotADirectory.
+    /// A leaked staging file is reclaimed without stopping the sweep.
     #[test]
     fn a_staging_file_in_the_cas_root_is_reclaimed_rather_than_breaking_the_sweep() {
         let (_d, store) = store();

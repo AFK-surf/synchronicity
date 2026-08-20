@@ -36,12 +36,7 @@
 //// collects a chain from a seeded, really-signed zone and writes it to
 //// `test/fixtures/rekor/crossval/chain-collected.der`, and the Rust test
 //// `a_chain_the_control_plane_collected_walks_under_this_validator`, which
-//// runs `chain::validate` over exactly those bytes. **Not the e2e**: it runs
-//// with `RekorPolicy::Off` and builds no chain at all, and this comment said
-//// otherwise for two audit passes while `rekor/chain`'s 800 lines had no
-//// cross-language coverage of any kind. The asymmetry is why it matters —
-//// a divergence found after publication is a permanent entry in an
-//// append-only log that no client accepts.
+//// runs `chain::validate` over exactly those bytes.
 
 import dns/name.{type Name}
 import dnssec/keys

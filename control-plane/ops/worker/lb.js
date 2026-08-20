@@ -166,8 +166,7 @@ async function stickyKey(address) {
 
 /// The pin namespace, or null where there is no Cache API at all.
 ///
-/// Never fatal, like every other step of this: a balancer that cannot open a
-/// cache balances, which is what it did before any of this existed.
+/// Never fatal: a balancer that cannot open a cache still balances.
 async function stickyCache() {
   try {
     return (await globalThis.caches?.open(STICKY_CACHE)) ?? null;

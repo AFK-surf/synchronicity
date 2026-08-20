@@ -158,10 +158,9 @@ fi
 ok "csqlite workers sandbox themselves under the default runtime profile"
 
 # The trusted root is a tracked source file riding the shipment (priv/tuf/,
-# COPYed in by the shipment stage); when the build drops it — a broadened
-# .dockerignore once did — the service still boots and serves and every
-# check above still passes, but `rekor-publish` and the external-mode key
-# watcher can never discover a log.
+# COPYed in by the shipment stage). If the build drops it, the service still
+# boots and every check above still passes, but `rekor-publish` and the
+# external-mode key watcher can never discover a log.
 #
 # Asserted against the filesystem rather than the logs. The string a
 # missing file produces (`trusted_root.shipped`) is only ever reached from

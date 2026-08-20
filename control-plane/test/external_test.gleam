@@ -94,21 +94,9 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
 /// is already holding — else a routine rotation costs bindings rather than a
 /// few refreshes. The client's half of the relation (a 60 s re-resolution
 /// floor and a 900 s trust grace) is asserted in `crates/synch-net`.
-///
-/// The grace is `DEFAULT_TRUST_GRACE` in `crates/synch-net/src/dns.rs` and it
-/// is 15 minutes, not the 600 this test and the constant's own comment used
-/// to carry. The direction is worth noting: the wrong number *understated*
-/// the margin, so the relation was being maintained against a tighter budget
-/// than the real one. It holds either way — but a relation written down to be
-/// checked should be the one that is true.
 pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
-  // Against the shared fixture, not against literals. Three of the six terms
-  // are this side's constants and three are the client's, and every one of
-  // them used to be a number typed into a comment or a test on the far side
-  // of the language boundary — a previous audit found one of them stale, in
-  // the direction that *understated* the margin. `meta.txt` is written by the
-  // Rust regenerator from the client's own constants, so a change to either
-  // half now fails one of the two suites instead of drifting.
+  // `meta.txt` is generated from the client's constants so both suites check
+  // the same values.
   let client_trust_grace = rekor_test.meta_int("client_trust_grace")
   let republish_window = rekor_test.meta_int("control_plane_republish_window")
 
@@ -1126,12 +1114,6 @@ pub fn a_poke_at_no_reconciler_is_a_no_op_test() {
 /// steady-state sweep rate becomes one pass per interval per poke ever
 /// received. Any authenticated member can drive that by editing a device in
 /// a loop, and a revocation's own poke then queues behind the backlog.
-///
-/// Measured rather than reasoned: the sweep interval is named here so the
-/// chain is observable in a test. Ten pokes at the head of the window; with
-/// the bug the passes over the window are ~11 per interval instead of one.
-/// The bound is deliberately loose (pokes and boot tick included, plus one
-/// interval of slack) so it fails on the defect and not on scheduling jitter.
 pub fn a_poke_does_not_fork_a_second_sweep_timer_test() {
   let path = tmp_db()
   let conn = external_conn_at(path)
@@ -1255,8 +1237,7 @@ pub fn a_marker_changed_after_convergence_is_repaired_test() {
   assert after.last_error == None
   sqlite.close(conn)
 
-  // And a deployment that has never applied anything still refuses, which is
-  // the case the rule was written for.
+  // A deployment that has never applied anything still refuses.
   let fresh = external_conn()
   provider_sync.run_once_with(
     fresh,
@@ -1274,12 +1255,6 @@ pub fn a_marker_changed_after_convergence_is_repaired_test() {
 }
 
 /// A device edited while the gate is armed keeps its published record.
-///
-/// Byte equality alone shields only what did not change, so the gate turned a
-/// replace into a delete: the old record removed, the new one withheld, and
-/// the device out of the zone entirely until the gate disarmed. The trigger is
-/// an ordinary dashboard edit, with the gate armed by somebody else's routine
-/// key rotation.
 pub fn a_device_edited_while_the_gate_is_armed_keeps_its_record_test() {
   let nk = fixtures.nk()
   let owner = "_synchronicity.prod.acme.sync.test"

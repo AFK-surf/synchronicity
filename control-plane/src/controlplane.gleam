@@ -160,10 +160,9 @@ fn signing_zone_of(
 /// The apex and signing zone a ceremony command operates on.
 ///
 /// Both come from configuration, and the apex cannot be given on the command
-/// line: it is the zone this deployment publishes and signs, so a
-/// command-line apex was only ever a typo or a way to put an entry naming
-/// somebody else's apex into a public log. Public so the suite can hold that
-/// down without a database or a log.
+/// line: allowing an override could put an entry naming somebody else's apex
+/// into the public log. Public so the suite can assert this without a database
+/// or log.
 pub fn ceremony_zones(
   cfg: config.Config,
 ) -> Result(#(name.Name, name.Name), String) {
@@ -559,9 +558,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
 ///
 /// And no TUF refresh job — in either mode. Which shard to submit to is
 /// answered from `priv/tuf/sigstore_trusted_root.json`, which ships in the
-/// image and moves on a deploy (see `tuf/trusted_root`); nothing here walks
-/// a repository. This comment used to say the opposite, which sent a reader
-/// looking for a job that migration v8 removed.
+/// image and moves on a deploy (see `tuf/trusted_root`).
 fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,

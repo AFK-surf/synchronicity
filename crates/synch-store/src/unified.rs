@@ -305,11 +305,8 @@ impl Selection {
 /// deletion is a deletion. A symlink is identified by its target and can never
 /// coincide with a file, because the kind is part of the key.
 ///
-/// The kind is carried whole, not as "is this a tombstone". It used to be the
-/// latter, and then the sentence above was not true of the code under it: a
-/// `Dir` (content-less by §4.2) and a `File` whose content is absent both
-/// keyed as `(false, None, None)`, so a directory and a file collapsed into
-/// one version with two attestors that read as agreeing.
+/// The kind is carried whole so content-less directories and files remain
+/// distinct.
 type Identity = (EntryKind, Option<[u8; 32]>, Option<String>);
 
 fn content_of(entry: &EntryRow) -> Option<Hash> {

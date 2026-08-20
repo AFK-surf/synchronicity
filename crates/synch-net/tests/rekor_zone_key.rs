@@ -265,7 +265,7 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(proof.log_index.to_string(), field("log_index"));
     // The part ceiling is a *coupling*: raising it on the publishing side alone silently truncates every proof past the old limit.
     assert_eq!(rekor::MAX_PROOF_PARTS.to_string(), field("max_proof_parts"));
-    // The timing terms pin constants the control plane must match — an audit once found one of the six stale.
+    // The timing terms pin constants the control plane must match.
     assert_eq!(
         dns::DEFAULT_TRUST_GRACE.as_secs().to_string(),
         field("client_trust_grace")

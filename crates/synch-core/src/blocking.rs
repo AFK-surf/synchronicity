@@ -6,19 +6,13 @@
 //! a 10 GB file is not polling anything: the endpoint stops answering peers, the
 //! control socket stops answering `synch status`, and the timers driving
 //! anti-entropy fire late. So every blocking operation reachable from an async
-//! context goes through [`offload`] — every one, with no "short enough to stay
-//! inline" exception. There used to be one, for a single indexed `SELECT`, and
-//! it measured the wrong thing: what a store call costs on a worker is the wait
-//! for the one connection mutex, which a publish batch or a GC pass holds for as
-//! long as it runs.
+//! context goes through [`offload`]. What a store call costs on a worker includes
+//! waiting for the one connection mutex, which a publish batch or a GC pass may
+//! hold for its entire run.
 //!
 //! # Making the rule checkable
 //!
-//! "Everything blocking is offloaded" was a convention with nothing to enforce
-//! it, and four audit passes still left violations behind — invisible ones: the
-//! code compiles, the tests pass, and the only symptom is a daemon that goes
-//! silent while some *other* thread holds the store's one connection.
-//! [`offload`] therefore marks its thread with a [`BlockingScope`], and
+//! [`offload`] marks its thread with a [`BlockingScope`], and
 //! [`assert_off_runtime`] turns "am I allowed to block here?" into a question
 //! code can ask — the same shape as the `reentry::Scope` guard that made "no
 //! `Store::conn()` inside a transaction" checkable. The check fires only on a
@@ -75,19 +69,10 @@ pub fn blocking_is_allowed() -> bool {
 /// `what` names the operation, so the report says which rule was broken rather
 /// than only where. Release builds pay nothing: the whole check compiles away.
 ///
-/// **Why this aborts rather than panics.** A panic here fires inside whatever
-/// task happened to make the call, and tokio catches a task panic: in a
-/// detached `tokio::spawn` it kills that one task and nothing else. The
-/// consequences were measured, not guessed. `cargo test --workspace` on the
-/// commit that introduced this check printed four of these panics and reported
-/// every suite green, because libtest never sees a detached task's panic. In a
-/// debug daemon the same panic silently removed a standing loop — cloud attach,
-/// in the case that was found — and nothing restarts one. So the failure mode of
-/// a checker that unwinds is *exactly* the failure mode it was written to stop:
-/// a violation that nobody is told about.
+/// A panic inside a detached Tokio task only kills that task, so it may not reach
+/// libtest or restart a standing loop. A violated invariant in a debug build is
+/// not recoverable; aborting makes the failure visible at the offending stack.
 ///
-/// A violated invariant in a debug build is not a recoverable condition, so the
-/// process ends where it happened, with the stack that got there.
 #[track_caller]
 pub fn assert_off_runtime(what: &str) {
     if cfg!(debug_assertions) && !blocking_is_allowed() {

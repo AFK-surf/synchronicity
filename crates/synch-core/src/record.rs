@@ -294,14 +294,7 @@ impl BlobAd {
 /// over-reporting sends a fetcher to a provider that cannot serve it, while
 /// under-reporting costs at most a re-fetch.
 ///
-/// This used to round the start down and the end *up*, over-claiming up to a
-/// 16 MiB granule at each end of every run — not an edge case, since a slice
-/// window is 8 MiB and a fetch in progress almost never lands on a boundary.
-/// Worse, the clamp to `size` made it *claim the whole object*: a holder of
-/// the first 8 MiB of a 10 MiB object published `[(0, 10 485 760)]`, exactly
-/// the shape [`BlobAd::is_complete`] reads as "I hold all of this" — peers
-/// ranked it first and handed it a full `1/fanout` share. So a run now
-/// contributes the largest granule-aligned span inside it; the object's own
+/// Each run contributes the largest granule-aligned span inside it. The object's
 /// boundaries stay exact (0 is a granule boundary anyway, and the final partial
 /// granule is real bytes), so a whole-object holder still advertises the whole
 /// object.
@@ -867,9 +860,6 @@ mod tests {
     }
 
     /// A holder of part of an object never advertises the whole of it.
-    ///
-    /// Clamping an outward-rounded end to `size` once made a node holding one
-    /// window look complete: peers ranked it first and handed it a full share.
     #[test]
     fn a_partial_holder_never_reports_complete() {
         let g = AD_SPAN_GRANULARITY;

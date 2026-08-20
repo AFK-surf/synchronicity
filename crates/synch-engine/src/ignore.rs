@@ -52,13 +52,8 @@ impl IgnoreSet {
 
     /// The built-in defaults plus the space's `.syncignore`, if present.
     ///
-    /// Absent is fine and is the common case. Present-but-unreadable is not:
-    /// this used to swallow every error, so an `.syncignore` the daemon could
-    /// not read — a permission change, an `EIO`, a half-written file — silently
-    /// degraded the set to the builtins, and the very next scan *published*
-    /// every path the operator had asked it to exclude. Exclusion is not a
-    /// preference that may be dropped when convenient: the whole point of the
-    /// file is that its contents leave this machine only when it says so.
+    /// Absence is fine; any other read error is returned so exclusions are not
+    /// silently dropped.
     pub fn for_space(root: &std::path::Path) -> Result<Self> {
         let mut set = IgnoreSet::builtin();
         match std::fs::read_to_string(root.join(IGNORE_FILE)) {

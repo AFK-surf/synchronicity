@@ -476,10 +476,6 @@ fn with_principal(
 pub const zone_health_headroom = 86_400
 
 /// Whether a zone with signatures expiring at `expires` is servable at `now`.
-///
-/// Separated from the handler so the rule can be asserted without standing up
-/// the router: the bug it closes was that the *status code* did not depend on
-/// this at all, and a field nobody reads is not a signal.
 pub fn zone_is_servable(expires: Int, now: Int) -> Bool {
   expires > now + zone_health_headroom
 }

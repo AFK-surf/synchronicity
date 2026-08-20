@@ -88,10 +88,7 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
 
 /// First adoption of an origin diffs from `Hash::EMPTY`, and that must survive
 /// a corpus the size §7.1 names — including the shape that most stresses the
-/// guard. The guard used to be charged per *nibble slot* of every frame
-/// entered, billing sixteen times the real cost; at §14's one-`f:`-and-one-
-/// `b:`-per-file shape that refused first adoption at ~57 k files, inside the
-/// 100 k initial index §7.1 names, and `doctor --rebuild` was dead likewise.
+/// guard.
 #[test]
 fn a_first_adoption_diff_survives_the_documented_corpus_size() {
     let store = MemStore::new();

@@ -27,7 +27,7 @@ const dir = "test/fixtures/rekor/crossval/"
 /// (lowercased owner name in wire form, then the rdata, then the hash), not
 /// anything about the key. Both digest types are written, because `covers`
 /// on the Rust side dispatches on the type and the publisher has to agree
-/// with it on both arms — the SHA-384 one was dead code until it was pinned.
+/// with it on both arms.
 pub fn ds_digest_key() -> BitArray {
   <<257:int-size(16), 3:int-size(8), 13:int-size(8), 7:size(512)>>
 }

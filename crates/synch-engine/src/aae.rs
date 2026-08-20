@@ -54,10 +54,8 @@ impl Node {
     ///
     /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
-        // The address lookup and the latency record are both store work, and
-        // both used to run here, on the runtime worker that is also driving the
-        // endpoint (§10). `peers_seen` is read whole for the first and written
-        // for the second, each taking the one global connection mutex.
+        // The address lookup and latency record are store work and must stay
+        // off the runtime worker driving the endpoint (§10).
         let addr = {
             let node = self.clone();
             let key = *node_id;
@@ -419,12 +417,8 @@ impl Node {
                 // either still needs its trie, or is already gone.
                 Ok(crate::reconcile::Promotion::Waiting)
                 | Ok(crate::reconcile::Promotion::Idle) => false,
-                // Only a fault in what the *origin* published condemns its head.
-                // A `SQLITE_BUSY` from another process, a full disk, an I/O
-                // error — this used to read all of them as "poisoned" and
-                // abandon a head whose trie may be wholly present, so a busy
-                // gateway holding a write for six seconds cost an origin its
-                // floor and another round to get it back.
+                // Only a fault in what the *origin* published condemns its head;
+                // local database and I/O failures remain operational errors.
                 // `try_promote` has already retired the head it judged and
                 // recorded the verdict if it was a permanent one — and it is the
                 // only party that knows *which* head that was, since the slot
@@ -700,10 +694,8 @@ mod tests {
     }
 
     /// §12: one origin's undecodable `f:` record fails its own origin and
-    /// nothing else — the pass used to abort after it, which silently disabled
-    /// GC and every later sweep on every peer that adopted the head. The head
-    /// also has to stop holding `head_floor`: its trie is complete, so the TTL
-    /// rule steps over it as "one promotion away", which it is not.
+    /// nothing else. The head also stops holding `head_floor`: its trie is
+    /// complete, so the TTL rule would otherwise treat it as promotable.
     #[tokio::test]
     async fn a_head_that_cannot_be_materialized_does_not_stop_the_pass() {
         use synch_core::{file_key, Hash, SignedHead};

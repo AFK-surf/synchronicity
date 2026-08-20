@@ -215,7 +215,7 @@ async fn reactive_head_push_propagates_and_unservable_heads_are_abandoned() {
 /// A value small enough to be inline must *be* inline: the alternative gives
 /// one key/value map two roots, which is what structural sharing rests on not
 /// happening. Such a head is retired by the §5.2 abandonment rule, not the TTL
-/// sweep — a prior audit found it holding `head_floor` instead.
+/// sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_in_the_wrong_representation_retires_its_head() {
     let _blocking = synch_core::BlockingScope::enter();

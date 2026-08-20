@@ -690,15 +690,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// Descends to the one position an insert changes, then rebuilds the path
     /// above it — with the path on the heap.
-    ///
-    /// This used to recurse, one frame per trie level. `insert` accepts keys up
-    /// to `MAX_KEY_LEN` (§12) — 8 192 nibbles — and the store runs on
-    /// `spawn_blocking`'s 2 MiB stacks: a tree ~500 directories deep (a
-    /// 4 013-byte key, comfortably inside the bound) overflowed and *aborted
-    /// the process* rather than returning an error, mid-publish. Every
-    /// peer-facing walk in this crate was already on a heap stack
-    /// (`diff_walk`, `collect`); the write path was not, and it is reachable
-    /// from any local directory tree and an authenticated S3 `PUT` key.
     fn insert_at(
         &self,
         node: Option<Hash>,

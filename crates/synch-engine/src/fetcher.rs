@@ -385,17 +385,8 @@ impl Node {
             // in rank order so the fastest picks first, and nothing is handed to
             // two of them.
             //
-            // Cutting `remaining` positionally and zipping the pieces onto the
-            // ranked providers assumed every provider claims the whole object.
-            // When they do not the assignment is simply wrong: with two peers
-            // holding complementary halves, share 0 goes to the holder of the
-            // second half and share 1 to the holder of the first, both asks
-            // intersect to nothing, both are filtered out — and an empty batch
-            // ended the whole fetch, with nothing retired from the pool and no
-            // second attempt, so `prepare_range` reported "no provider could
-            // serve" while both halves were online. Deterministically, because
-            // the ranking is. The comment above promised a next batch that the
-            // `break` made sure never came.
+            // Assign from each provider's claimed ranges, so complementary
+            // providers can cover the request without either claiming it all.
             let mut unassigned = remaining.clone();
             let mut batch: Vec<(Provider, ChunkRanges)> = Vec::new();
             let mut left = chosen.len() as u64;
@@ -1755,8 +1746,7 @@ mod tests {
         assert_eq!(node.store().read_all(&root).unwrap(), payload);
     }
 
-    /// Complementary halves between two providers can serve an object: shares
-    /// used to be zipped in *rank* order, only an assignment if all claim all.
+    /// Complementary halves between two providers can serve an object.
     #[tokio::test]
     async fn complementary_holders_are_asked_for_what_they_hold() {
         let (_d, node) = node().await;

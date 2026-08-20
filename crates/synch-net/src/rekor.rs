@@ -643,9 +643,8 @@ pub struct VerifiedRecord {
 /// refuses a certificate for carrying an extension this build has no name
 /// for — the conformance fixture carries some — and it still verifies.
 ///
-/// A `retire` entry is refused, in an order worth stating because it is the
-/// reverse of what this comment used to say: the action is the last thing
-/// `check_binds` tests, so a retire carrying a chain is chain-checked first
+/// A `retire` entry is refused. The action is the last thing `check_binds`
+/// tests, so a retire carrying a chain is chain-checked first
 /// and refused on its action, while the chainless retire the publish side may
 /// emit (a retired zone may have no DS left) is refused as `Chain` several
 /// steps earlier. Either way retirement is a monitor breadcrumb (§2), never
@@ -1282,8 +1281,8 @@ impl Checkpoint {
     /// that says which log an entry is in would pass while looking intact.
     ///
     /// **The binding that closes that is the pin's own origin, and nothing
-    /// read out of the note.** This used to rest on the signature line's name
-    /// and its four-byte hint, and both of those sit *after* the blank line —
+    /// read out of the note.** The signature line's name and four-byte hint sit
+    /// *after* the blank line —
     /// the region no signature covers — while the hint's derivation
     /// (`SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, the C2SP note key id) is
     /// public arithmetic over public inputs. An attacker holding a genuine
@@ -1542,10 +1541,6 @@ impl LogKeys {
 /// the `id-ecPublicKey` / `prime256v1` algorithm identifier, the bit-string
 /// header, and the `0x04` uncompressed-point tag.
 ///
-/// One definition. It was written out three times in this file and again in
-/// `sim.rs`, and "the sites are what get forgotten" is the whole argument for
-/// naming it: a reader checking whether two of them agree has to compare 27
-/// hex bytes by eye.
 pub(crate) const P256_SPKI_PREFIX: &[u8] = &[
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
     0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
@@ -2225,8 +2220,7 @@ mod tests {
 
     /// A pinned key does not vouch for a tree that is not its own log's,
     /// however the note's *unsigned* tail is spelled. The line name and the
-    /// four-byte hint — the two things a reader used to read to decide which
-    /// log signed — both sit after the blank line where no signature
+    /// four-byte hint both sit after the blank line where no signature
     /// reaches; the binding has to come from the pin, where the trusted root
     /// put it. Built rather than captured: no real Sigstore checkpoint has a
     /// key signing a note whose origin is not its own log.

@@ -59,18 +59,11 @@ pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
 /// What a promotion attempt concluded.
 ///
-/// Four states rather than a `bool`, because the callers cannot tell them apart
-/// and kept getting it wrong: a promotion that did nothing because the trie is
-/// still arriving, one that retired the head on a verdict already in the memo,
-/// and one that dropped it because the complete slot had overtaken it are all
-/// "did not flip" — and reporting any of the latter two as the first counted a
-/// discarded head as accepted and rang the fetch bell for a head that no longer
-/// existed.
+/// Four states rather than a `bool`: a trie still arriving, a memoized refusal,
+/// and a head overtaken by the complete slot all mean "did not flip" but require
+/// different follow-up work.
 ///
-/// Returned rather than inferred. Re-reading the slot afterwards *could* see the
-/// difference — an earlier pass said it could not, and that was wrong — but it
-/// cost a lock acquisition on every ordinary adoption to answer a question the
-/// promotion already knew.
+/// Returned rather than inferred to avoid re-reading the slot after promotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Promotion {
     /// The pending head's trie was wholly present and the complete slot flipped.
@@ -82,13 +75,10 @@ pub enum Promotion {
     /// Nothing is pending now: there was no pending head, or the complete slot
     /// had overtaken the one there and it was dropped.
     ///
-    /// Distinct from `Waiting`, which the two used to share. The caller has to
-    /// tell them apart: `Waiting` means a head is sitting there needing its trie,
-    /// so it is reported accepted and rings the fetch bell, and doing that for a
-    /// head that was just dropped counted a discarded head as accepted and woke
-    /// the anti-entropy loop for something that no longer existed. The overtake
-    /// is reachable whenever a local `publish` or an `activate` moves the
-    /// complete slot between the offer's transaction and this one — both derive
+    /// Distinct from `Waiting`: only a pending head that still needs its trie
+    /// should be reported accepted and wake the anti-entropy loop. An overtake
+    /// is possible whenever local `publish` or `activate` moves the complete
+    /// slot between the offer's transaction and this one — both derive
     /// their seq from the complete slot alone (§3.4).
     Idle,
 }
@@ -609,15 +599,10 @@ impl Syncer {
                 txn.clear_head(origin, Slot::Pending)?;
                 return Ok(Promotion::Idle);
             }
-            // Only now the walk. `supersedes` above reads `(seq, root)` and
-            // nothing else, and it used to sit *after* this — so a pending head
-            // the complete slot had already overtaken kept the slot until
-            // `pending_head_ttl` expired, and cost three things on the way: this
-            // node went on advertising a `complete = false` summary for a head it
-            // had superseded, the maintenance sweep paid two full completeness
-            // walks for it every five minutes, and `sync_with`'s pending pass
-            // fetched the trie of a root the next promotion would discard. On a
-            // restore-from-backup, where that root shares nothing with the
+            // Only walk after the cheap `(seq, root)` supersession check. This
+            // avoids advertising, checking, and fetching a pending root that the
+            // complete slot has already overtaken. On a restore-from-backup,
+            // where that root shares nothing with the
             // current one, the last of those is a whole cold trie transfer thrown
             // away.
             let trie = Trie::new(txn);
@@ -1060,10 +1045,9 @@ impl Syncer {
 
     /// What this node advertises, and the heads it can actually hand over.
     ///
-    /// Read together because the push decision needs both and because the
-    /// second used to be read from inside the exchange closure, on a runtime
-    /// worker. One walk per unproven root and one query per origin, once — and
-    /// the scope declaration travels with them for the same reason.
+    /// Read together because the push decision needs both. This performs one
+    /// walk per unproven root and one query per origin off the runtime worker;
+    /// the scope declaration travels with them.
     async fn advertisement_off_runtime(&self, peer: synch_core::NodeId) -> Result<Advertisement> {
         let syncer = self.clone();
         crate::blocking::offload(move || {
@@ -1155,14 +1139,8 @@ impl Syncer {
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport> {
-        // The summaries and the servable heads behind them come over together,
-        // in one hop to the blocking pool. The decision below used to read the
-        // complete slot once per advertised origin *inside* the closure, which
-        // `head_exchange` calls on the runtime worker driving the connection —
-        // a two-table join per origin behind the store's one global mutex, on
-        // the thread the endpoint and every timer in the process share (§10).
-        // Nothing about the decision needs the store: it needs the heads, and
-        // the heads are already being read.
+        // Bring summaries and their servable heads over together in one hop to
+        // the blocking pool. The decision below needs only those heads (§10).
         let Advertisement {
             summaries: ours,
             declared,
@@ -1391,15 +1369,9 @@ impl HeadSink for Syncer {
     /// §12's rule is that a record this node cannot apply fails *its own
     /// origin* and no other, and `to_net` flattens every engine failure into
     /// one `NetError::Unexpected(String)` — so a caller on the far side of this
-    /// seam cannot tell an undecodable `f:` record from `SQLITE_BUSY`. Both
-    /// `synch-net` arms used to guess, and they guessed differently: the
-    /// `Hello` loop logged everything as "origin left behind" including a full
-    /// disk, and `HeadPush` eleven lines below failed the stream. Doing it on
-    /// this side is what gives one rule one implementation — the classifier is
-    /// already here, and `try_promote` has retired the head by the time an
-    /// origin fault reaches this point — whenever it got far enough to judge
-    /// one. A fault raised before that leaves the slot to the maintenance
-    /// sweep rather than to this handler.
+    /// seam cannot tell an undecodable `f:` record from `SQLITE_BUSY`. Classify
+    /// here, where `try_promote` has retired any head it could judge. A fault
+    /// raised earlier leaves the slot to the maintenance sweep.
     fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
         match Syncer::offer_head(self, head, now) {
             Ok(_) => Ok(()),
@@ -1495,14 +1467,7 @@ fn wanted_origins(theirs: &[HeadSummary], ours: &[HeadSummary]) -> Vec<OriginId>
 ///   with every other origin the same peer serves (§12).
 /// - **The peer's**: a protocol violation or a broken stream. Ends the exchange.
 /// - **Ours**: `SQLITE_BUSY` from another process, a full disk, an I/O error.
-///   These used to be contained too, because `StoreError` spans both categories
-///   and this matched the whole enum — so a full disk logged "origin left
-///   behind: its published data could not be applied" once per origin, blamed a
-///   member for a local fault, and reported the round a success. They propagate
-///   now, which is what puts them where an operator will see them.
-///
-/// [`EngineError::Blocking`] and [`EngineError::Io`] were already excluded, so
-/// the split was intended; this completes it inside `StoreError` and `MptError`.
+///   These propagate so an operator can see them.
 pub(crate) fn is_origin_fault(error: &EngineError) -> bool {
     match error {
         EngineError::Store(e) => is_origin_store_fault(e),

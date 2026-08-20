@@ -318,10 +318,6 @@ pub fn checkpoints_parse_or_are_refused_test() {
 /// and accept the appended line as one the log had put there. Splitting at
 /// the last moves the log's own signature into the signed text, where the
 /// pinned key does not match.
-///
-/// Asserted on *verification* rather than on parsing, deliberately: parsing
-/// succeeds either way, and an earlier version of the client's test asserted
-/// on the signature count and passed with the bug still in.
 pub fn a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed_test() {
   let keys.Csk(private, public) = keys.generate()
   let note =
@@ -907,11 +903,8 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
 /// same bytes still: crates/synch-net/tests/rekor_zone_key.rs reads exactly
 /// these files.
 ///
-/// The link list comes from the generator rather than being restated here,
-/// so editing `gen_crossval` without re-running it fails this test instead
-/// of leaving the checked-in bytes describing a chain nobody builds. The
-/// Rust suite restates the structure independently — that restatement, not
-/// this one, is the cross-language check.
+/// The link list comes from the generator; the Rust suite restates the
+/// structure independently as the cross-language check.
 pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
   assert cert.encode_chain(gen_crossval.links())
     == fixture("crossval/chain.der")
@@ -922,11 +915,7 @@ pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
 /// `chain.rs`'s `covers` recomputes these to decide whether a delegation
 /// walks; `rekor/chain.check_ds_covers` recomputes them to decide whether a
 /// chain is publishable. Two implementations of one hash input — lowercased
-/// owner name in wire form, then the DNSKEY rdata — and until this fixture
-/// nothing outside either of them held it still. The SHA-384 arm was in fact
-/// dead on this side: both digest types were pooled and compared against the
-/// SHA-256 hash, so a 48-byte digest could never match and a zone delegated
-/// only that way was unpublishable.
+/// owner name in wire form, then the DNSKEY rdata — are held to the same bytes.
 pub fn the_ds_digests_match_the_crossval_bytes_test() {
   let assert Ok(zone) = name.parse(gen_crossval.ds_digest_zone)
   let rd = gen_crossval.ds_digest_key()
@@ -943,10 +932,7 @@ pub fn the_ds_digests_match_the_crossval_bytes_test() {
 /// its links are deliberately large.
 ///
 /// A chain of real DNSKEY/DS/RRSIG sets is kilobytes, so long-form lengths
-/// are what production uses everywhere and short-form is the case that
-/// almost never runs. An earlier fixture was 30 bytes — two links of 3 and
-/// 2 rdata bytes — so both sides' long-form encoders were untested by the
-/// thing whose whole job is keeping them together.
+/// are what production uses everywhere and short-form is the uncommon case.
 pub fn the_crossval_chain_exercises_both_der_length_forms_test() {
   let der = fixture("crossval/chain.der")
   // 200 bytes of rdata: OCTET STRING, one-byte long form.
@@ -1336,10 +1322,8 @@ pub fn the_canonical_renderer_escapes_control_characters_test() {
   assert string.contains(text, "\"action\":\"cre\\u0001ate\\n\\t\\\"\\\\\"")
 }
 
-/// A DNSKEY rdata too short to hold the four-byte header renders as flags 0 and
-/// algorithm 0 — both of them, rather than whatever partial values could be
-/// read out of it. One rule, because the two renderers commit to one byte
-/// string, and the collector refuses such a rdata long before this.
+/// A DNSKEY rdata too short to hold the four-byte header renders both flags and
+/// algorithm as zero.
 pub fn a_truncated_dnskey_rdata_has_no_flags_and_no_algorithm_test() {
   let assert Ok(apex) = name.parse("sync.test.")
   let assert [key] = statement.for_keys(apex, [<<1, 2, 3>>], "create").keys

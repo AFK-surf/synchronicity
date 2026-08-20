@@ -493,8 +493,7 @@ fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
 /// construction, and the failure mode if a history row ever did go missing is
 /// silent: `HEAD_JOIN` is an inner join, so the head reads back as absent.
 ///
-/// It does **not** follow that the origin restarts at seq 1, which is what this
-/// comment used to claim. `next_own_seq_in` takes `MAX(seq)` over a `UNION` of
+/// The origin does not restart at seq 1: `next_own_seq_in` takes `MAX(seq)` over a `UNION` of
 /// `heads` and `head_history` and floors the result with the publish floor —
 /// none of which goes through `HEAD_JOIN` — so the seq survives a lost
 /// signature. What is actually lost is the ability to *serve* or re-sign that
@@ -712,8 +711,8 @@ CREATE TABLE s3_upload_parts (
 /// Three things rested on that column being right. `hint_source_is_sole`
 /// (`synch-engine`'s membership) asks whether every live binding for a key is
 /// a DNS binding from *this* domain before it lets an answer supply dialing
-/// data — the check the previous audit added precisely so a second domain
-/// could not repoint a key the first one vouches for. With one row it is
+/// data, so a second domain cannot repoint a key the first one vouches for.
+/// With one row it is
 /// trivially satisfied by whichever domain wrote last, so the defence was
 /// absent exactly where it was aimed. `remove_domain` filters on the same
 /// column and would miss a binding the other domain had relabelled, or delete

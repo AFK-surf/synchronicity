@@ -184,9 +184,7 @@ mod tests {
             "the DNSSEC chain OID changed"
         );
         assert_eq!(OID_DNSSEC_CHAIN[0], 40 * 2 + 25);
-        // The arc is the first four bytes of its UUID, masked to 31 bits —
-        // the derivation, so a future edit cannot quietly pick a new number
-        // and keep the comment.
+        // The arc is the first four bytes of its UUID, masked to 31 bits.
         let arc = u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff);
         assert_eq!(arc, 1_555_716_359);
         assert!(

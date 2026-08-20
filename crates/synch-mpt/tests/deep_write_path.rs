@@ -1,11 +1,7 @@
 //! The write path descends on the heap, so a deep tree cannot abort the daemon.
 //! `insert` accepts keys up to `MAX_KEY_LEN` (4 096 bytes, 8 192 nibbles, §12),
-//! and `insert_at`/`remove_at` used to recurse one frame per trie level; all
-//! store work runs on `spawn_blocking` stacks of 2 MiB, so a tree ~500 levels
-//! deep (a 4 013-byte key, inside the bound) overflowed the stack and aborted
-//! the daemon mid-publish — and the publisher's restage loop repeated the death
-//! at every start. These run under a stack no larger than the blocking pool's,
-//! so a regression aborts this test rather than passing quietly.
+//! and all store work runs on `spawn_blocking` stacks of 2 MiB. These tests use
+//! a stack no larger than the blocking pool's.
 
 use synch_core::{Hash, MAX_KEY_LEN};
 use synch_mpt::{MemStore, Trie};
@@ -49,8 +45,8 @@ fn exercise_deep(keys: &[String]) {
 #[test]
 fn a_maximal_key_depth_inserts_and_removes_without_overflowing() {
     let base = vec![b'a'; MAX_KEY_LEN];
-    // Siblings force a branch every few bytes, giving ~1 000 branch levels —
-    // twice the depth that used to overflow — without paying for all 4 096.
+    // Siblings force a branch every few bytes, giving ~1 000 branch levels
+    // without paying for all 4 096.
     let mut keys: Vec<String> = (16..MAX_KEY_LEN)
         .step_by(4)
         .map(|cut| {

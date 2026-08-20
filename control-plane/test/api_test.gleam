@@ -508,9 +508,7 @@ pub fn device_lifecycle_and_invariants_test() {
 /// through; additions wait.
 pub fn an_armed_gate_still_lets_a_revocation_through_test() {
   let h = harness()
-  // Armed for the whole test, restored at the end even if an assertion fails —
-  // then disarmed for the setup, because every step of it is a widening
-  // publish and the point of the test is what happens once it is in place.
+  // Disarm during setup because each setup mutation widens the published zone.
   use <- fixtures.with_gate_armed
   fixtures.gate_disarmed()
   let assert 200 =
@@ -882,9 +880,6 @@ pub fn invite_accept_test() {
   sqlite.close(conn2)
 }
 
-/// Invites go through the API, not only the database: the insert once bound
-/// eight parameters to a statement with seven placeholders, and every
-/// invitation came back "the change conflicts with an existing record".
 pub fn invite_creation_test() {
   let h = harness()
   let assert 200 =
@@ -1573,11 +1568,8 @@ pub fn a_read_only_node_answers_every_read_test() {
     assert simulate.read_body(from_replica) == simulate.read_body(from_primary)
   })
 
-  // And the dashboard itself: a node that answers the reads serves the pages
-  // that make them. There is no built SPA in a test tree, so what is asserted
-  // is that the request is not refused for the reason it used to be — the
-  // static handler's own "nothing to serve" 404 is indistinguishable here,
-  // but a routing refusal would be the same 404 on the primary too.
+  // There is no built SPA in a test tree, so compare the primary and replica
+  // responses rather than expecting a successful static response.
   let spa = call(replica, simulate.request(http.Get, "/orgs/acme"))
   assert spa.status == call(h, simulate.request(http.Get, "/orgs/acme")).status
 }

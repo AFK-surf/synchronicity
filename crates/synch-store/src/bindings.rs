@@ -523,12 +523,9 @@ impl Store {
             .filter(|b| &b.node_id == node_id)
             .collect();
         let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
-        // Three-valued for the same reason [`Store::publish_scope`] is, and it
-        // was two-valued here long after that one was fixed. A key with no live
-        // binding used to fold into the empty list, which is the encoding of
-        // "delegated, and to no space at all" — so a peer this node has never
-        // heard of and a peer whose grant covers nothing were indistinguishable
-        // to every caller.
+        // Three-valued for the same reason [`Store::publish_scope`] is. A key
+        // with no live binding is distinct from a delegated peer whose grant
+        // covers no spaces.
         //
         // Both readings are wrong somewhere. Answering the content gate, the
         // empty list happened to fail closed and was right by luck. Answering
@@ -686,9 +683,7 @@ impl Store {
                 tx.execute(
                     // The conflict target includes the domain, because that is
                     // what a DNS binding's identity is: an `id=`-less record
-                    // binds `OriginId::Key(nk)`, which names no domain, so two
-                    // membership domains publishing one key used to write one
-                    // row and the last writer owned its `domain` column. It
+                    // binds `OriginId::Key(nk)`, which names no domain. It
                     // includes the issuer too, which is `''` here: a DNS
                     // binding is vouched for by nobody, and the column is in
                     // the key for the same reason the domain is.

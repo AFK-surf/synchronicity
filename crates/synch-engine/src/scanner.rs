@@ -148,13 +148,9 @@ impl Node {
         // tombstone exists so `synch status`/`synch log` can tell "deleted at
         // seq N" from "never existed" (§4.2).
         //
-        // Over the *union* of what the scanner recorded and what this origin
-        // has published, not over `local_files` alone. The row is removed below
-        // as soon as the tombstone is staged, and staged is not published: a
-        // crash or a failed publish in that window used to leave the path in no
-        // source of truth a later scan reads — absent from disk, absent from
-        // `local_files` — so the deletion could never be re-derived and this
-        // origin went on publishing the file as live at its old root forever.
+        // Use the union of what the scanner recorded and what this origin has
+        // published, not `local_files` alone. A staged tombstone removes the
+        // local row before publication, while the published tree stays durable.
         // The published tree is durable and `local_files` is not, so the
         // published tree is what the sweep is anchored to; `local_files` still
         // contributes the paths this scan indexed but has not published yet.

@@ -153,13 +153,9 @@ impl Store {
     /// Every slot for every origin.
     ///
     /// A row that will not build is skipped, not propagated. This is the bulk
-    /// listing the maintenance sweep and `doctor --rebuild` walk, so one
-    /// undecodable row — a `sig` that is not 64 bytes, say — used to fail the
-    /// whole listing and take every *other* origin's maintenance down with it:
-    /// no pending head anywhere got promoted or abandoned again, on any pass, for
-    /// as long as the row was there. §12's rule is that a record this node
-    /// cannot read fails its own origin and no other, and a point read still
-    /// reports the failure to whoever asked for that origin specifically.
+    /// listing the maintenance sweep and `doctor --rebuild` walk. §12's rule is
+    /// that a record this node cannot read fails its own origin and no other; a
+    /// point read still reports the failure for that origin.
     ///
     /// One variant is *not* contained, and saying so here is the honest version
     /// of the claim: a `root` that is not a hash also breaks `gc`'s mark set,
@@ -887,17 +883,6 @@ fn put_head_in(
     let seq = i64::try_from(head.seq)
         .map_err(|_| StoreError::column("heads.seq", "past the representable range"))?;
     // `received_at` on the pending slot ages the *slot*, not the head in it.
-    //
-    // It used to take `excluded.received_at` like every other column, and the
-    // `pending_head_ttl` sweep — §5.2's only time-based escape from a floor
-    // pinned by a head nobody can serve — reads exactly this column. So a
-    // stream of unservable heads reset the clock on every arrival and the sweep
-    // never fired. The other two anti-wedge rules do not cover that case
-    // either: `MAX_UNPRODUCTIVE_ROUNDS` needs a fetch to have been attempted,
-    // and the pending fetch is refused unless some peer advertises the head
-    // complete at or above the pending one; promotion needs the trie. A node
-    // that can be pushed to but cannot dial the origin therefore stayed frozen
-    // at its last complete head for as long as the origin kept publishing.
     //
     // Occupying an empty slot starts the clock; adopting a newer head into an
     // occupied one inherits it; `touch_pending_at` restarts it when a fetch

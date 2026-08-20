@@ -545,14 +545,8 @@ fn plan_pass(
             if selected.kind == EntryKind::Dir {
                 continue;
             }
-            // Claimed before the kind is dispatched on, so a symlink competes
-            // for the folded name like anything else. The check used to sit in
-            // the regular-file branch alone, and the symlink branch reached
-            // `materialize_symlink` — which unlinks whatever it finds — without
-            // consulting it: on a case-insensitive target, `Link` was written and
-            // then `link` silently replaced it, counted in `written` rather than
-            // `skipped`. §7.2 promises the mirror writes the lexicographically
-            // first colliding path, reports the rest, and never silently clobbers.
+            // Claim before dispatching on kind so symlinks participate in the
+            // same folded-name collision rule as regular files (§7.2).
             let folded = fold(&set.path);
             match claimed.get(&folded) {
                 Some(winner) if winner != &set.path => {
@@ -1013,12 +1007,8 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf
             .unwrap_or(false);
         if is_dir {
             removed.extend(sweep(root, &path, known)?);
-            // An emptied directory goes too. Nothing else in the mirror ever
-            // removed one, so a path that used to be a directory and is now a
-            // regular file could never be written again: the rename met `EISDIR`
-            // and the path was reported `skipped` on every pass, for the life of
-            // the mirror. `remove_dir` fails harmlessly while anything is still
-            // in there, which is what makes this need no bookkeeping.
+            // Remove an emptied directory so a later pass can materialize a
+            // non-directory at the same path. Non-empty directories fail safely.
             let _ = std::fs::remove_dir(&path);
             continue;
         }
@@ -1367,8 +1357,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// §7.2: the fold claim covers symlinks too, or a link would silently
-    /// replace the file it folds onto (the audit regression this guards).
+    /// §7.2: the fold claim covers symlinks too, so a link cannot replace the
+    /// file it folds onto.
     #[tokio::test]
     async fn a_symlink_cannot_clobber_a_file_it_folds_onto() {
         let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;

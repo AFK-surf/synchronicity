@@ -547,13 +547,9 @@ ALTER TABLE zone_meta
 
 /// V7: a provider apply can partly succeed.
 ///
-/// The reconciler used to stop at the first record a provider refused, which
-/// made "applied" and "failed" the only two states a pass could be in. It
-/// now attempts every change and reports the ones that did not take, so the
-/// state row needs somewhere to say so: `last_failures` is the rendered list
-/// for an operator, `last_partial_at` when it happened. Neither is a work
-/// queue — desired state is still a pure function of the product tables, and
-/// the next sweep recomputes the diff from scratch.
+/// `last_failures` is the rendered list for an operator and `last_partial_at`
+/// records when the partial apply happened. Desired state remains a pure
+/// function of the product tables; the next sweep recomputes the diff.
 const v7 = "
 ALTER TABLE provider_sync_state ADD COLUMN last_failures TEXT;
 ALTER TABLE provider_sync_state ADD COLUMN last_partial_at INTEGER;

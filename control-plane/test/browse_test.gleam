@@ -90,10 +90,7 @@ pub fn the_attach_record_sits_at_the_apex_test() {
 /// Every node holds its own registry of attached daemons, so a node nobody
 /// has a tunnel to answers no browse question — which is why the record has
 /// to name them all, and why the daemon opens one tunnel per record rather
-/// than picking one. Separate records rather than several `url=` fields in
-/// one is what keeps a daemon built before the fleet existed working: it
-/// reads the first record it can parse and reaches one node of the fleet,
-/// where a second `url=` in one record is a duplicate field it refuses.
+/// than picking one. Each record carries one `url=` field.
 pub fn the_attach_record_names_every_node_of_the_fleet_test() {
   let urls = ["https://sync.example", "https://cp1.sync.example"]
   let assert Ok(rrsets) = build.build(fleet(urls))

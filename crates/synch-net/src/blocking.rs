@@ -13,11 +13,8 @@
 //! by object or tree size rather than by anything the runtime can interrupt, so
 //! a single large transfer served inline would stall every other connection
 //! this node has. Nothing stays inline, including the per-connection and
-//! per-stream binding check in `serve`, which used to: it is one indexed row,
-//! but the cost of a store call on a worker is the wait for the one connection
-//! mutex, not the query — and it is the only store call in the process an
-//! *unauthenticated* dialer can reach, so leaving it here let anyone who could
-//! finish a QUIC handshake park a worker behind whatever was writing.
+//! per-stream binding check in `serve`: the cost of a store call on a worker is
+//! the wait for the one connection mutex, not only the query.
 
 use crate::error::NetError;
 

@@ -321,10 +321,8 @@ pub fn browse_endpoint() -> String {
 /// question, because the registry of attached sessions is one process's
 /// memory and a node with no tunnel of its own can answer nothing; so the
 /// record has to name them all. Spelling that as extra records rather than
-/// extra `url=` fields is what keeps a daemon built before this change
-/// working: it reads the first record it can parse and attaches there, which
-/// is one node of the fleet instead of all of them, while a second `url=`
-/// in one record is a duplicate field it refuses outright.
+/// extra `url=` fields also keeps the record compatible with clients that
+/// accept only one `url=` field per record.
 ///
 /// Order is publication order and carries no precedence: a daemon opens all
 /// of them.

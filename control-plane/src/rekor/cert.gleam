@@ -48,11 +48,8 @@ import gleam/string
 /// OID component that overflows `int32` — so a full 128-bit UUID arc fails
 /// inside `x509.ParseCertificate` *before* Rekor looks at the extension, and
 /// the submission comes back `400 invalid hashedrekord request` naming no
-/// field. This version of the format did exactly that, and it was found by
-/// live submission rather than by any test: Erlang's `public_key` (which
-/// builds these certificates) and OpenSSL (which reads them back) both parse
-/// the wide form without complaint, so everything here passed against a
-/// certificate the log would refuse.
+/// field. Erlang's `public_key` and OpenSSL both accept the wide form, so their
+/// acceptance does not prove Rekor will parse it.
 ///
 /// `1555716359` is `0xdcba5907` — the first four bytes of the original UUID
 /// `dcba5907-a9a9-4de1-89fe-7b22794d9fbe` — masked into 31 bits.

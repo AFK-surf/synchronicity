@@ -235,8 +235,7 @@ impl SimZone {
     /// An RRSIG carries its own `signer_name`, and verification reconstructs
     /// the signed data from the record, so a signature made under a foreign
     /// name still verifies against the zone's DNSKEY — the key material and
-    /// the key tag both match. Only the name comparison catches it, and
-    /// without a way to build this the check had no test at all.
+    /// the key tag both match. Only the name comparison catches it.
     pub fn signer_named(&self, signer_name: &str) -> DnssecSigner {
         // A fresh key, deliberately. `verify_declaration` compares the signer
         // name *before* it verifies the signature, so what this has to
@@ -982,12 +981,8 @@ impl SimDelegation {
     /// The same ladder with the apex's key set **replaced** by `impostor`'s,
     /// leaving the parent's real DS RRset in place.
     ///
-    /// This is the one shape the harness could not previously express, and its
-    /// absence is why the DS→DNSKEY binding — the step that makes a ladder a
-    /// ladder — had no test in the workspace at all. Everywhere else the DS
-    /// and the key set it covers are derived from the same key, so they cannot
-    /// disagree, and a validator that stopped comparing digests would pass
-    /// every case the suite could build.
+    /// Everywhere else the DS and the key set it covers are derived from the
+    /// same key, so this shape exercises the DS→DNSKEY binding directly.
     ///
     /// What it produces is exactly the forgery the ladder exists to refuse: a
     /// delegation ladder is *public data*, so anyone can fetch a victim's real
@@ -1032,10 +1027,7 @@ impl SimDelegation {
     /// The same ladder with the apex delegated by a **SHA-384** DS.
     ///
     /// RFC 4509 digest type 4 is an ordinary delegation a registrar may
-    /// publish, and `chain::covers` dispatches on the type — but nothing
-    /// exercised the type-4 arm, so deleting it left the suite green while
-    /// making every such zone permanently unresolvable. That is the failure
-    /// the previous audit found on the publisher side; this is the reader's.
+    /// publish, and `chain::covers` dispatches on the type.
     pub fn chain_with_sha384_ds(&self) -> DnssecChain {
         let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
         let link = |zone: &SimZone, records: Vec<Record>| ChainLink {

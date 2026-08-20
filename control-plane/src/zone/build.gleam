@@ -144,10 +144,7 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
   // One RRset, one rdata per endpoint. A fleet's nodes each hold their own
   // registry of attached daemons, so every node that may be asked a browse
   // question has to be named here — and naming them as separate records
-  // rather than as several `url=` fields in one is what keeps a daemon built
-  // before the fleet existed working: it reads the first record it can parse
-  // and attaches to that node, where a second `url=` in one record is a
-  // duplicate field it refuses outright.
+  // avoids duplicate `url=` fields within a record.
   let browse = case input.cp_endpoints {
     [] -> []
     urls -> [
@@ -173,9 +170,8 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
 
 /// The zone-key transparency records (docs/REKOR-ZONE-KEY.md §3): one TXT
 /// record per proof, at the apex, under `_synchronicity-rekor`. They are
-/// signed like every other RRset and re-signed on every publish; a zone
-/// with no proofs simply has no such owner name, which is what phase 0
-/// looks like from a client.
+/// signed like every other RRset and re-signed on every publish. A zone with
+/// no proofs simply has no such owner name.
 fn rekor_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
   // One RRset per part, at the part's own owner name. A proof is far bigger
   // than one record, and bigger than what a managed provider will hold at a

@@ -56,8 +56,8 @@ pub type ZoneInput {
     ns_hosts: List(NsHost),
     txt_names: List(TxtName),
     /// Zone-key transparency proofs for the key the zone publishes, in the
-    /// base64url form one TXT record carries. Empty until `rekor-publish`
-    /// has run — phase 0 of the rollout serves a zone without them.
+    /// base64url form one TXT record carries. Empty until `rekor-publish` has
+    /// run.
     /// The proof records, each with the part number that decides its owner
     /// name: part 1 at `_synchronicity-rekor`, part n at
     /// `_synchronicity-rekor-<n>`.

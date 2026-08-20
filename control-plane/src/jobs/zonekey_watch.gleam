@@ -60,9 +60,8 @@ fn now_unix() -> Int
 /// Public, and in seconds, because it is one term of a relation whose other
 /// terms live in `crates/synch-net`: the window a client fails closed for
 /// after an unannounced provider key rotation has to fit inside the lifetime
-/// of the membership that client already holds. Private, it was a number two
-/// test files and a doc comment in the other language restated by hand.
-/// Held still against the shared fixture in `external_test`.
+/// of the membership that client already holds. Held still against the shared
+/// fixture in `external_test`.
 pub const watch_interval_s = 300
 
 /// How soon to look again when the declaration is not on the wire yet.

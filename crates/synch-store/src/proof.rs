@@ -770,12 +770,8 @@ impl Store {
             // out of. A proof commits no bytes, so an object first met this way
             // is recorded as held-nothing rather than not held at all.
             //
-            // What that recording does *not* do is leave an in-flight fetch
-            // alone. This used to claim it did — "a union of nothing, so a
-            // fetch that raced this proof into the same root does not have its
-            // groups erased by it" — and that is false: the union is not the
-            // only thing `commit_groups` acts on. It also settles the size, and
-            // a claim that moves the object's *group count* resets the bitmap
+            // This may affect an in-flight fetch: `commit_groups` also settles
+            // the size, and a claim that moves the object's *group count* resets the bitmap
             // (`settle_size`, rule 3), so a proof carrying a wrong size erases
             // whatever a concurrent fetch had verified. Sixty-four bytes on the
             // wire, repeatable, and reachable from any origin that publishes a
@@ -1145,10 +1141,8 @@ impl Store {
     /// claimed length, so growing to it hands a peer's assertion straight to
     /// `set_len`.
     ///
-    /// Computed from the nodes in hand, not from where the window ends. The
-    /// payload side of `write_slice` used to reason from a window end and got
-    /// this wrong — a window at the tail of the object ends *at* the claimed
-    /// size — which is why it now pre-grows nothing at all.
+    /// Computed from the nodes in hand, not from where the window ends. A tail
+    /// window ends at the claimed size, which is not itself verified.
     fn open_sparse_outboard(&self, root: &Hash, reach: u64) -> Result<File> {
         let path = self.outboard_path(root);
         if let Some(parent) = path.parent() {

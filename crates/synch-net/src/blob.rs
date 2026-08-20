@@ -420,16 +420,8 @@ impl BlobClient {
     /// Accumulates into `out`, which the caller owns, and reports how the
     /// descent ended.
     ///
-    /// The accumulator is the caller's because a failure part-way through must
-    /// not throw away what was already proven. It used to: a `?` on a later
-    /// window discarded the whole `ProofOutcome`, including every
-    /// `ProvenSubtree` — and a `ProvenSubtree` is the only thing `Store::promote`
-    /// can act on, since nothing reads the committed outboard nodes back into
-    /// one. So the doc claim that "an interrupted descent keeps what it proved"
-    /// was true of the *store* and false of the caller: a provider stalling on
-    /// window 31 of 32 lost the other 30, and a reproducibly slow provider that
-    /// ranks first turned the descent into a full transfer with no line saying
-    /// so.
+    /// The accumulator is caller-owned so a failure part-way through preserves
+    /// every `ProvenSubtree` already received for `Store::promote`.
     pub async fn fetch_proof_into(
         &self,
         store: &Arc<Store>,

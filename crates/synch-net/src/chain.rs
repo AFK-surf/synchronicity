@@ -159,9 +159,7 @@ pub struct ValidChain {
 /// one by struct literal — which it could, and which would let a monitor
 /// assemble an `Authorized` that no chain walk ever produced.
 ///
-/// That was verified once by hand and by nothing since, which for a guard
-/// whose whole job is to stop a regression is the position the regression was
-/// in. It is a doctest now, and `cargo test --workspace --doc` runs in CI:
+/// The compile-fail doctest keeps that construction impossible:
 ///
 /// ```compile_fail
 /// # use synch_net::chain::Authorized;

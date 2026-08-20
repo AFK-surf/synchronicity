@@ -102,9 +102,8 @@ fn version_lines(set: &VersionSet) -> Vec<String> {
         .map(|version| {
             let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
             // A content-less kind is identified by its target, not a root
-            // (§8), so that is what the line shows. This only shortens a root
-            // to fit the column — a second copy of the store's wording is a
-            // copy that drifts, and the two used to disagree.
+            // (§8), so that is what the line shows. Only roots are shortened
+            // to fit the column.
             let identity = version.identity_text();
             let identity = match version.kind {
                 EntryKind::Tombstone | EntryKind::Symlink => identity,

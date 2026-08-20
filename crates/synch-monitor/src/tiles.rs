@@ -1369,7 +1369,7 @@ mod tests {
         // The forged first answer does not fold to its parent.
         assert!(tree.verify_leaf(300, b"forged 300", root).await.is_err());
 
-        // Now honest, but the swapped-in body is still not the committed leaf: that is the bug.
+        // An honest tile still cannot authenticate the swapped-in body.
         let error = tree.verify_leaf(300, b"forged 300", root);
         let error = error.await.expect_err("a swapped-in body must be refused");
         assert!(

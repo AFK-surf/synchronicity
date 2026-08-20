@@ -564,10 +564,7 @@ async fn every_command_variant_round_trips() {
     )
     .await;
 
-    // Delegation, all three variants. They were the gap this test's name
-    // promised to close and did not: none of them was exercised anywhere, and
-    // every one of them read the store on the runtime worker that polled the
-    // connection, which §10's guard turns into an abort on a debug daemon.
+    // Delegation, all three variants.
     let subject = SecretKey::generate().public().to_z32();
     let delegated = says(
         data_dir,

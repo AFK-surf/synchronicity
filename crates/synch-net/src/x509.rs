@@ -147,13 +147,8 @@ impl Certificate {
                 });
             }
         }
-        // And nothing after the extensions block inside tbsCertificate. The
-        // rule the comment above claims — "applied at every level rather than
-        // only the outer one" — was not in fact applied at this level:
-        // `optional` restores its position on a mismatch and `next` never
-        // checks for a remainder, so a *second* `[3]` TLV sat there unread,
-        // carrying a second subjectAltName or a second chain extension that
-        // the exactly-one rules below never saw.
+        // Nothing may follow the extensions block inside tbsCertificate;
+        // otherwise a second `[3]` TLV could evade the exactly-one rules below.
         tbs.finish("the tbsCertificate")?;
 
         // Exactly one subjectAltName, or none. RFC 5280 says an extension
