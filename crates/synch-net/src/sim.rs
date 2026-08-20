@@ -51,9 +51,11 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
-    /// The control-plane attach record served at `_synchronicity-cp.<origin>`,
-    /// e.g. `v=synccp1 url=https://sync.example`. Empty is a deployment that
-    /// does not offer cloud attach, and the name does not exist.
+    /// The control-plane attach records served at `_synchronicity-cp.<origin>`,
+    /// e.g. `v=synccp1 url=https://sync.example`. One per node of the
+    /// deployment's fleet, since a daemon holds a tunnel to each. Empty is a
+    /// deployment that does not offer cloud attach, and the name does not
+    /// exist.
     pub cp_txt: Vec<String>,
     /// Extra DNSKEYs served at the apex after the zone's own key.
     extra_dnskeys: Vec<DNSKEY>,

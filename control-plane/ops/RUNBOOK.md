@@ -10,9 +10,11 @@ TXT records, served over port 53 (UDP+TCP) and RFC 8484 DoH.
   (`csk.key`) and the writable SQLite database. Republishes and re-signs
   the whole zone inside every mutating transaction; a background job
   re-signs when signatures come within 7 days of expiry (14-day validity).
-- **N replicas** (typically your `ns1`, `ns2` hosts): DNS/DoH only, read
+- **N replicas** (typically your `ns1`, `ns2` hosts): DNS/DoH, read
   a copy of the database, hold **no key material** — the private key never
-  enters the database, so replication never carries it.
+  enters the database, so replication never carries it. With
+  `CP_DASHBOARD=on` they also serve the dashboard, every GET of the API and
+  the file browser off that same copy; see below.
 - **Replication is external and operator-owned.** The service never runs,
   configures, or supervises litestream (or whatever tool you choose). The
   contract is only:
@@ -54,6 +56,83 @@ litestream restore -o /var/lib/synch-controlplane/db/cp.db.new "$REPLICA_URL" \
 **The database contains OAuth client secrets and per-org OIDC client
 secrets.** Protect the replication bucket accordingly.
 
+### A replica that also serves the dashboard
+
+`CP_DASHBOARD=on` mounts, off the same read-only copy the nameserver reads:
+the SPA, every GET of the product API, and — with `CP_BROWSE=on` — the file
+browser, including the `/agent/v1/attach` tunnel daemons open. Writes are not
+mounted: a mutation answers **409 `read-only-replica`** naming
+`CP_PRIMARY_URL`, and the dashboard renders that as a link rather than an
+error.
+
+Why you would: the reads are the load. A network's file listing, a version
+history, a download of a 40 GB object — all of it is a GET, and putting it on
+`ns1` and `ns2` takes it off the node that owns the zone key. The writes stay
+in one place because there is only one writable database, which is also why
+this is not a load-balancer trick: the split is in the router, not in front
+of it.
+
+Four things have to line up:
+
+1. **`CP_SESSION_SECRET` is identical on every node.** A replica verifies
+   cookies the primary minted; one byte of difference and every session
+   fails its signature check.
+2. **`CP_COOKIE_DOMAIN` covers every node's name**, if the nodes have names
+   of their own. A cookie set host-only at `sync.example` is never sent to
+   `ns1.sync.example`, so the session simply is not there. Set it to a
+   parent — `sync.example` — and every host under that name receives the
+   cookie, which is the trade you are making.
+3. **`CP_PRIMARY_URL`** names the primary. It is what a refused write and the
+   login screen point at, and nothing in the database says it.
+4. **Sign-in happens on the primary.** Minting a session is a write. The
+   replica's login screen says so and links there; once signed in, the
+   session works fleet-wide (given 1 and 2).
+
+**Attach and the file browser.** Each node's daemons attach to *that node* —
+the registry of open tunnels is one process's memory, so a node no daemon
+attached to can answer no browse question however current its copy is. Give
+each node its own `CP_PUBLIC_URL`, and list the whole fleet on the primary:
+
+```sh
+# primary
+CP_BROWSE=on
+CP_PUBLIC_URL=https://sync.example
+CP_BROWSE_ENDPOINTS=https://ns1.sync.example,https://ns2.sync.example
+
+# ns1
+CP_ROLE=replica
+CP_DASHBOARD=on
+CP_BROWSE=on
+CP_PUBLIC_URL=https://ns1.sync.example
+CP_PRIMARY_URL=https://sync.example
+CP_COOKIE_DOMAIN=sync.example
+CP_SESSION_SECRET=…the primary's, byte for byte…
+```
+
+The apex then publishes one `v=synccp1 url=` record per endpoint at
+`_synchronicity-cp.<base>`, and every daemon opens a standing tunnel to each
+(`synch cloud status` lists one line per endpoint). At most 8 endpoints:
+every one costs every daemon in every network a WebSocket, and both ends
+refuse a longer list — the control plane at boot, the daemon at discovery.
+
+A daemon built before this change reads the first record it can parse and
+attaches to one node of the fleet, which still works; it is one tunnel
+instead of several.
+
+**One thing a replica cannot do: write the download audit row.** Browse
+downloads are audited on the node that served them, and a replica's database
+is read-only, so a download served by `ns1` leaves no `browse.download` row
+in the table the org reads. It is not lost: the node prints the row it could
+not write to its service log —
+
+```
+browse.download not audited (this node cannot write): actor=u-… org=o-… {"network":…}
+```
+
+— so collect it there (journald, your log shipper) if you want a complete
+trail. If it has to be complete *in the table*, keep `CP_BROWSE` on the
+primary alone and let the replicas serve the dashboard's other reads.
+
 ## Configuration (environment; missing required values refuse to start)
 
 | Variable | Role | Meaning |
@@ -65,8 +144,12 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
 | `CP_DNS_LISTEN` | both | `address:port`, default `0.0.0.0:53` |
 | `CP_NS_HOSTS` | primary | `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53` |
-| `CP_PUBLIC_URL` | primary | external URL for links/OAuth callbacks |
-| `CP_SESSION_SECRET` | primary | ≥32 chars; signs session cookies |
+| `CP_PUBLIC_URL` | both | this node's own external URL — links and OAuth callbacks on the primary, the attach endpoint daemons dial and sign their proof over on any node with `CP_BROWSE=on` |
+| `CP_SESSION_SECRET` | primary; replica with `CP_DASHBOARD=on` | ≥32 chars; signs session cookies. **The same value on every node**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to |
+| `CP_DASHBOARD` | replica | `on` mounts the dashboard and the read half of the API off the replicated copy. Off by default — a replica serves DNS alone, which is what every replica did before the switch existed. Refused on the primary, which always serves it |
+| `CP_PRIMARY_URL` | replica with `CP_DASHBOARD=on` | the primary's public URL. Required, and the one fact a read-only node cannot derive: it is what a refused write and the login screen name, and without it the dashboard is a dead end |
+| `CP_COOKIE_DOMAIN` | nodes with a dashboard | the `Domain` session cookies are set with. Unset is host-only, which is right for one node and wrong for a fleet: a cookie set at `sync.example` is never sent to `ns1.sync.example`. Set it to a parent of every node's name — the trade is that every host under that name receives the cookie |
+| `CP_BROWSE_ENDPOINTS` | primary | the fleet's *other* attach endpoints, comma- or semicolon-separated (`https://ns1.sync.example,https://ns2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL`, and every daemon opens a tunnel to each. At most 8 endpoints in total |
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |

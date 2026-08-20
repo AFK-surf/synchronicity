@@ -339,7 +339,10 @@ pub enum CloudCommand {
     Enable,
     /// Stop answering the control plane and drop any open tunnel.
     Disable,
-    /// Per membership domain: record found, attached, last error.
+    /// One line per control-plane endpoint of per membership domain: record
+    /// found, attached, last error. An apex names every node of its control
+    /// plane and this daemon holds a tunnel to each, so one node being down
+    /// is its own line rather than a verdict on the domain.
     Status,
 }
 

@@ -17,6 +17,7 @@ import api/reads.{type Reads}
 import auth/session.{type Session as UserSession}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name}
+import gleam/io
 import gleam/json.{type Json}
 import gleam/list
 import gleam/result
@@ -461,6 +462,15 @@ fn version_json(version: agent.Version) -> Json {
 /// The row names the user, the network, the space, the path, the version root
 /// served and the bytes that reached the client — enough to answer "who read
 /// what" from the same table and the same UI the org already reads.
+///
+/// **A failure to record is reported, never swallowed.** The write cannot
+/// fail the download — the bytes have already gone, and refusing after the
+/// fact would only make the audit trail's absence *and* a confusing error —
+/// so it stays advisory. But a node serving a read-only copy (a replica with
+/// `CP_DASHBOARD=on`) cannot write this row at all, and an audit trail that
+/// quietly stops covering a whole node is worse than one an operator knows
+/// to collect from the service log. The line carries what the row would
+/// have.
 pub fn audit_download(
   db: pool.Pool,
   user_id: String,
@@ -472,23 +482,30 @@ pub fn audit_download(
   bytes: Int,
   outcome: String,
 ) -> Nil {
-  let _ =
+  let detail =
+    json.object([
+      #("network", json.string(network)),
+      #("space", json.string(space)),
+      #("path", json.string(path)),
+      #("root", json.string(root)),
+      #("bytes", json.int(bytes)),
+      #("outcome", json.string(outcome)),
+      #("at", json.int(now_unix())),
+    ])
+  let written =
     pool.with_connection(db, fn(conn) {
-      audit(
-        conn,
-        user_id,
-        org_id,
-        "browse.download",
-        json.object([
-          #("network", json.string(network)),
-          #("space", json.string(space)),
-          #("path", json.string(path)),
-          #("root", json.string(root)),
-          #("bytes", json.int(bytes)),
-          #("outcome", json.string(outcome)),
-          #("at", json.int(now_unix())),
-        ]),
-      )
+      audit(conn, user_id, org_id, "browse.download", detail)
     })
-  Nil
+  case written {
+    Ok(Ok(Nil)) -> Nil
+    _ ->
+      io.println_error(
+        "browse.download not audited (this node cannot write): actor="
+        <> user_id
+        <> " org="
+        <> org_id
+        <> " "
+        <> json.to_string(detail),
+      )
+  }
 }

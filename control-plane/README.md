@@ -76,6 +76,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   holds. File bytes pass through this service's memory in bounded chunks and
   are never stored.
 
+  The record names **every node** of the deployment, one `v=synccp1 url=`
+  each (`CP_BROWSE_ENDPOINTS` on the primary), and a daemon opens a tunnel to
+  all of them. It has to: the registry of open tunnels is one process's
+  memory, so a replica no daemon attached to can answer nothing however
+  current its copy of the database is.
+
 ## Stack
 
 - **Backend**: Gleam on OTP 27 (pinned via `.tool-versions`, asdf).
@@ -88,8 +94,10 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   mutation time and served straight from SQLite through a pool of
   reset-on-checkout workers (one read transaction per answer).
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
-- **Replication**: primary + read-only DNS replicas fed by external,
-  operator-owned tooling (e.g. litestream). See `ops/RUNBOOK.md`.
+- **Replication**: primary + read-only replicas fed by external,
+  operator-owned tooling (e.g. litestream). Replicas serve DNS, and
+  optionally the dashboard, the read half of the API and the file browser
+  off the same copy. See `ops/RUNBOOK.md`.
 
 ## Developing
 
@@ -239,8 +247,11 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_BUNNY_API_KEY` | primary | Required when the provider is `bunny`. |
 | `CP_BUNNY_ZONE_ID` | primary | Bunny DNS zone id. Default empty: discovered by zone name at boot. |
 | `CP_BUNNY_API_URL` | primary | Bunny API base URL override; default empty means the real endpoint. |
-| `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
-| `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
+| `CP_PUBLIC_URL` | both | This node's own external base URL: links and OAuth callbacks on the primary, and on any node with `CP_BROWSE=on` the attach endpoint daemons dial and sign their proof over. Default `http://127.0.0.1:<http-port>`. |
+| `CP_SESSION_SECRET` | primary; replica with `CP_DASHBOARD=on` | Required, ≥32 characters. Signs session cookies. **The same value on every node of a fleet**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to. |
+| `CP_DASHBOARD` | replica | `on` mounts the dashboard, every GET of the product API and (with `CP_BROWSE`) the file browser, all off the read-only replicated copy. Off by default — DNS alone, which is what a replica was before this existed. A write answers `409 read-only-replica` naming `CP_PRIMARY_URL`, because there is one writable database and it is the primary's. Refused on the primary, which always serves the dashboard. |
+| `CP_PRIMARY_URL` | replica with `CP_DASHBOARD=on` | Required. The primary's public URL — what a refused write and the login screen point at. Nothing in a replicated database says which node holds the pen, so this is the one fact a read-only node cannot derive. |
+| `CP_COOKIE_DOMAIN` | nodes serving a dashboard | The `Domain` session cookies carry. Unset is host-only, which is right for one node and wrong for a fleet: a cookie set at `sync.example` is never sent to `ns1.sync.example`, so the session is simply not there. Set it to a parent of every node's name; every host under that name then receives the cookie, which is the trade. |
 | `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only mail — magic links and invitations go to the service's stdout — and the login page stops offering the form unless no other sign-in method is configured. |
 | `CP_SMTP_PORT` | primary | SMTP port. Default `587`. Used only when `CP_SMTP_HOST` is set. |
 | `CP_SMTP_USER` | primary | SMTP username. Default empty. Set, the relay must offer STARTTLS and present a certificate this host trusts: the credential is never put on the wire in the clear. |
@@ -253,7 +264,8 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a metadata refresh and not a release. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
-| `CP_BROWSE` | primary | `on` or `off` (the default). `on` mounts the daemon attach endpoint at `/agent/v1/attach`, the read-only browse API, and publishes `_synchronicity-cp.<base> TXT "v=synccp1 url=<CP_PUBLIC_URL>"` at the apex so a daemon finds this deployment from the zone it already validates. Requires `CP_PUBLIC_URL` — the record names it and attaching daemons sign their proof over it — and is refused on a replica. Per-network enablement is a separate switch (`PUT /api/orgs/:slug/networks/:net/browse/enabled`, admin) that is off for every network until an org admin turns it on, and never reaches DNS. Downloads are capped at four concurrent streams per user. |
+| `CP_BROWSE` | both | `on` or `off` (the default). `on` mounts the daemon attach endpoint at `/agent/v1/attach`, the read-only browse API, and publishes `_synchronicity-cp.<base> TXT "v=synccp1 url=<CP_PUBLIC_URL>"` at the apex so a daemon finds this deployment from the zone it already validates. Requires `CP_PUBLIC_URL` — the record names it and attaching daemons sign their proof over it — and on a replica requires `CP_DASHBOARD=on`, since every browse route is session-gated. Per-network enablement is a separate switch (`PUT /api/orgs/:slug/networks/:net/browse/enabled`, admin) that is off for every network until an org admin turns it on, and never reaches DNS. Downloads are capped at four concurrent streams per user. |
+| `CP_BROWSE_ENDPOINTS` | primary | The fleet's *other* attach endpoints, comma- or semicolon-separated. Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>` beside this node's, and every daemon opens a standing tunnel to **each** — the registry of attached daemons is one node's memory, so a node no daemon attached to can answer no browse question however current its copy of the database is. At most 8 endpoints in total, refused at boot rather than by counting sockets. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

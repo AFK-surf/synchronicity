@@ -2,6 +2,17 @@ import { useState } from 'react'
 import { send } from '../lib/api'
 import { useAuthMethods } from './Shell'
 
+/// The host of an origin, for a link that reads as a place rather than a
+/// URL. A value the server validated as an origin, so a parse failure is not
+/// a case worth branching on — show what was configured.
+function hostOf(origin: string): string {
+  try {
+    return new URL(origin).host
+  } catch {
+    return origin
+  }
+}
+
 export function Login() {
   const [email, setEmail] = useState('')
   const [orgSlug, setOrgSlug] = useState('')
@@ -36,6 +47,28 @@ export function Login() {
           </p>
         )}
 
+        {/* A read-only node mints no session, so the whole form would be a
+            row of buttons that 404. What it has instead is the address of the
+            node that does — the one fact it holds that a blank screen does
+            not. */}
+        {methods?.primary && (
+          <div className="space-y-3">
+            <p className="rounded-md border border-sky-900 bg-sky-950/50 px-3 py-2 text-sm text-sky-200">
+              This node serves a read-only copy of the control plane. Signing
+              in — and every change — happens on the primary.
+            </p>
+            <a
+              href={`${methods.primary}/login`}
+              className="block w-full rounded-md bg-white px-4 py-2 text-center text-sm font-medium text-neutral-950 hover:bg-neutral-200"
+            >
+              Sign in at {hostOf(methods.primary)}
+            </a>
+            <p className="text-xs text-neutral-500">
+              Once signed in, come back here: this node answers every read.
+            </p>
+          </div>
+        )}
+
         {isPending && (
           <p className="text-sm text-neutral-500">Loading sign-in methods…</p>
         )}
@@ -45,7 +78,7 @@ export function Login() {
           </p>
         )}
 
-        {methods && (methods.google || methods.github) && (
+        {methods && !methods.primary && (methods.google || methods.github) && (
           <div className="space-y-2">
             {methods.google && (
               <a
@@ -66,7 +99,7 @@ export function Login() {
           </div>
         )}
 
-        {methods?.magic_link && (
+        {methods?.magic_link && !methods.primary && (
           <div className="border-t border-neutral-800 pt-4">
             {sent ? (
               <p className="text-sm text-neutral-300">
@@ -97,7 +130,7 @@ export function Login() {
           </div>
         )}
 
-        {methods?.oidc && (
+        {methods?.oidc && !methods.primary && (
           <div className="border-t border-neutral-800 pt-4">
             <form
               className="flex gap-2"
