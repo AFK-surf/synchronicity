@@ -690,7 +690,7 @@ impl Txn<'_> {
     /// Forgets every redaction boundary, inside the transaction.
     ///
     /// A boundary is a fact about a scope, not about a node, so the memo is
-    /// dropped whenever the scope moves — see [`Store::set_local_scope`],
+    /// dropped whenever the scope moves — see [`Store::set_read_scope`],
     /// which is the only thing that should call this.
     pub fn clear_redacted(&self) -> Result<()> {
         self.conn().execute("DELETE FROM redacted_nodes", [])?;

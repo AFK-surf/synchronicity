@@ -391,7 +391,27 @@ impl Net {
     }
 
     /// Connects to a peer on the metadata ALPN, reusing a live session.
+    ///
+    /// A delegate may pull metadata only from a full member of its own cluster
+    /// (§5.5), and this refuses before the dial: a session with a peer whose
+    /// trie this node must not walk has nothing to do. Content is unaffected —
+    /// see [`synch_store::Store::refuse_metadata_sync`].
     pub async fn connect_mpt(&self, addr: impl Into<EndpointAddr>) -> Result<MptClient, NetError> {
+        let addr = addr.into();
+        let refused = {
+            let store = self.store.clone();
+            let key = addr.id;
+            crate::blocking::offload(move || {
+                Ok(store.refuse_metadata_sync(&key, synch_core::now_ns())?)
+            })
+            .await?
+        };
+        if let Some(reason) = refused {
+            return Err(NetError::Untrusted(format!(
+                "{}: {reason}",
+                addr.id.fmt_short()
+            )));
+        }
         Ok(MptClient::new(self.connect(addr, ALPN_MPT).await?))
     }
 

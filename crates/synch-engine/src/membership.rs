@@ -1265,7 +1265,7 @@ mod tests {
 
         // What a peer's `Hello` would have left behind on a delegated node.
         node.store()
-            .set_local_scope(Some(&["photos".to_string()]))
+            .set_read_scope(Some(&["photos".to_string()]))
             .unwrap();
         let report = node.doctor().unwrap();
         assert_eq!(report.local_scope, Some(vec!["photos".to_string()]));

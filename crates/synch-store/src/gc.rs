@@ -461,7 +461,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        store.set_local_scope(Some(&["s".to_string()])).unwrap();
+        store.set_read_scope(Some(&["s".to_string()])).unwrap();
         let scoped = store.local_trie_scope().unwrap().memo_key(root);
         assert_ne!(scoped, root, "a scoped memo is keyed by more than the root");
         store.note_complete(&scoped).unwrap();

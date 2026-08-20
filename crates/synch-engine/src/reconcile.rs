@@ -412,15 +412,31 @@ impl Syncer {
 
     /// The full signed heads for the origins a peer asked about (§5.1).
     ///
-    /// Only complete heads are handed out: what this advertises is a head whose
-    /// trie this node can serve, and the pending slot's is by definition one it
-    /// cannot.
+    /// Only heads this node can back with a *servable trie*: what a peer does
+    /// with one is fetch the trie under it from us, so handing over a head
+    /// whose trie is not here costs the puller the whole
+    /// [`MAX_UNPRODUCTIVE_ROUNDS`] escape and ends with the head abandoned.
+    ///
+    /// The complete slot is not that claim. A slot says this node promoted the
+    /// head; whether the trie under it is whole is what
+    /// [`Syncer::local_summaries`] answers with `complete` in the same
+    /// exchange, and a delegate's slot holds every foreign origin over a
+    /// partial trie by construction. Memoized per root.
     pub fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>> {
+        let trie = Trie::new(self.store.as_ref());
         let mut out = Vec::new();
         for origin in origins {
-            if let Some(head) = self.store.head(origin, Slot::Complete)? {
-                out.push(head.head);
+            let Some(stored) = self.store.head(origin, Slot::Complete)? else {
+                continue;
+            };
+            if !trie.is_complete(stored.head.root)? {
+                tracing::debug!(
+                    origin = %origin,
+                    "not serving a head whose trie this node does not hold whole"
+                );
+                continue;
             }
+            out.push(stored.head);
         }
         Ok(out)
     }
@@ -1053,11 +1069,25 @@ impl Syncer {
         crate::blocking::offload(move || {
             let summaries = syncer.local_summaries()?;
             let declared = syncer.declared_scope(peer)?;
+            // Filtered by the summaries this same exchange carries, not by the
+            // complete slot: a head is worth pushing only if this node can
+            // serve the trie under it. Pushing one that cannot be served lands
+            // it in the receiver's pending slot, pinning `head_floor` until it
+            // times out — the same cost `heads_for` stopped paying, reached by
+            // the other message (§5.1).
             let servable = syncer
                 .store
                 .all_heads(Slot::Complete)?
                 .into_iter()
                 .map(|stored| stored.head)
+                .filter(|head| {
+                    summaries.iter().any(|s| {
+                        s.origin == head.origin
+                            && s.root == head.root
+                            && s.seq == head.seq
+                            && s.complete
+                    })
+                })
                 .collect();
             Ok(Advertisement {
                 summaries,
@@ -1081,7 +1111,7 @@ impl Syncer {
     /// grant — every responder enforces its own scope on every request — so its
     /// only effect is on how far the *reader* narrows itself. Sending the empty
     /// list to a peer this node has momentarily lost the binding for tells a
-    /// full member to read nothing, and it remembers that: `set_local_scope`
+    /// full member to read nothing, and it remembers that: `set_read_scope`
     /// outlives the exchange, so one lapsed binding on one side stops the other
     /// materializing every foreign origin until something declares otherwise.
     ///
@@ -1103,7 +1133,38 @@ impl Syncer {
     /// the memo goes with it. It is keyed by scope as well as root, so nothing
     /// stale can be read back — this only avoids a table of answers nobody
     /// will ask for again.
-    fn adopt_scope(&self, peer: synch_core::NodeId, scope: Option<&[String]>) -> Result<()> {
+    fn adopt_scope(
+        &self,
+        peer: synch_core::NodeId,
+        scope: Option<&[String]>,
+        summaries: &[synch_core::HeadSummary],
+    ) -> Result<()> {
+        // And only a peer that holds the trie the grant is published in. A
+        // delegation is a record in the issuing origin's trie, so a peer that
+        // cannot serve that trie has not read it and will answer from its own
+        // local `trust add` instead — two honest peers then tell this node two
+        // different things, and with one node-wide scope it flips between them
+        // once per round, discarding and refetching every foreign origin each
+        // time (§5.5).
+        //
+        // This is the enforceable half of "a delegate syncs only with full
+        // members of its cluster": membership is holding the cluster's tries,
+        // not sharing a domain suffix, and `complete` is where a peer says so.
+        // A node no delegation names skips the check, which is what lets one
+        // bootstrap.
+        let issuers = self.store.own_issuers(now_ns())?;
+        if !issuers.is_empty()
+            && !issuers
+                .iter()
+                .any(|issuer| summaries.iter().any(|s| &s.origin == issuer && s.complete))
+        {
+            tracing::debug!(
+                peer = %peer.fmt_short(),
+                "ignoring a read scope declared by a peer that does not hold this node's \
+                 issuer's trie"
+            );
+            return Ok(());
+        }
         // Only a peer this node holds a *rooted* binding for may narrow it.
         //
         // The declaration drives more than what this node asks for: it decides
@@ -1127,11 +1188,17 @@ impl Syncer {
             }
             return Ok(());
         }
-        if self.store.set_local_scope(scope)? {
+        // The one path that moves the scope, and destructive by design (§5.5):
+        // everything derived under the old one answers a question nobody is
+        // asking any more, and no diff reconciles it.
+        if self.store.set_read_scope(scope)? {
             tracing::info!(
                 spaces = ?scope,
-                "adopting the read scope a peer declared"
+                "the read scope moved: every foreign origin will be refetched and rebuilt under it"
             );
+            if let Some(wake) = &self.on_change {
+                wake.notify_one();
+            }
         }
         Ok(())
     }
@@ -1139,6 +1206,22 @@ impl Syncer {
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport> {
+        // A delegate pulls metadata only from a full member of its own cluster
+        // (§5.5). The dial refuses this too; this is the check that decides,
+        // because a session can outlive the binding it was opened under and an
+        // inbound connection never passed through the dial at all.
+        {
+            let store = self.store.clone();
+            let peer = client.remote_id();
+            if let Some(reason) =
+                crate::blocking::offload(move || Ok(store.refuse_metadata_sync(&peer, now_ns())?))
+                    .await?
+            {
+                tracing::debug!(peer = %peer.fmt_short(), %reason, "declining a metadata exchange");
+                return Ok(SyncReport::default());
+            }
+        }
+
         // Bring summaries and their servable heads over together in one hop to
         // the blocking pool. The decision below needs only those heads (§10).
         let Advertisement {
@@ -1183,7 +1266,9 @@ impl Syncer {
             let syncer = self.clone();
             let scope = theirs.scope.clone();
             let peer = client.remote_id();
-            crate::blocking::offload(move || syncer.adopt_scope(peer, scope.as_deref())).await?;
+            let seen = theirs.summaries.clone();
+            crate::blocking::offload(move || syncer.adopt_scope(peer, scope.as_deref(), &seen))
+                .await?;
         }
 
         // Every exchange is also an observation of what peers hold for our own
@@ -1218,6 +1303,14 @@ impl Syncer {
                 HeadOutcome::Refused => report.left_behind(&head.origin),
                 HeadOutcome::Pending => {
                     report.heads_accepted += 1;
+                    // Only from a peer that says it can serve the trie. The
+                    // pending-slot pass below has always applied this guard;
+                    // without it here, a head handed over by a peer that had
+                    // just advertised `complete: false` was fetched from it
+                    // anyway (§5.1).
+                    if !serves_trie(&theirs.summaries, &head.origin, head.seq, head.root.0) {
+                        continue;
+                    }
                     match self.fetch_pending(client, &head.origin).await {
                         Ok(FetchOutcome::Completed) => report.tries_completed += 1,
                         Ok(FetchOutcome::Abandoned) => report.heads_abandoned += 1,
@@ -1247,12 +1340,12 @@ impl Syncer {
         };
         for stored in pending_heads {
             let pending = stored.head;
-            let servable = theirs.summaries.iter().any(|summary| {
-                summary.origin == pending.origin
-                    && summary.complete
-                    && summary.order_key() >= (pending.seq, pending.root.0)
-            });
-            if !servable {
+            if !serves_trie(
+                &theirs.summaries,
+                &pending.origin,
+                pending.seq,
+                pending.root.0,
+            ) {
                 continue;
             }
             match self.fetch_pending(client, &pending.origin).await {
@@ -1265,6 +1358,23 @@ impl Syncer {
         }
         Ok(report)
     }
+}
+
+/// True if `summaries` says the peer can serve the trie under this head (§5.1).
+///
+/// A signed head proves the origin published it; it says nothing about whether
+/// the peer offering it holds the trie. `complete` is the claim that matters,
+/// and it has to be checked against a seq at or above the one being fetched —
+/// an older complete root cannot serve a newer head's nodes.
+fn serves_trie(
+    summaries: &[synch_core::HeadSummary],
+    origin: &OriginId,
+    seq: u64,
+    root: [u8; 32],
+) -> bool {
+    summaries.iter().any(|summary| {
+        &summary.origin == origin && summary.complete && summary.order_key() >= (seq, root)
+    })
 }
 
 /// Verifies one batch of what a peer served and commits it, refusing anything

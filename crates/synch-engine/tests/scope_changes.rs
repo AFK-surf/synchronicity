@@ -1,22 +1,21 @@
-//! A change to this node's read scope (§5.5) is applied to every *future*
-//! walk and to nothing that has already been promoted.
+//! A read scope that moves has to take the trie and the derived views with it
+//! (§5.5).
 //!
-//! `local_scope` is one node-wide value, adopted from whichever peer spoke
-//! last (`Syncer::adopt_scope`), and it decides three things at once: what
-//! `MissingWalk` asks for, what `is_complete_scoped` counts as whole, and what
-//! `materialize_diff` walks. Nothing re-derives the first two for a head that
-//! is already in the complete slot, so a scope that moves leaves the trie
-//! under that head permanently short of the new scope — and the next
-//! promotion's diff either prunes over the gap (silently) or falls into it
-//! (permanently).
+//! The read scope decides three things at once: what `MissingWalk` asks for,
+//! what `is_complete_scoped` counts as whole, and what `materialize_diff`
+//! walks. It used to be one node-wide value adopted from whichever peer spoke
+//! last, and nothing re-derived the first two for a head already in the
+//! complete slot — so a scope that moved left that trie permanently short, and
+//! the next promotion's diff, which prunes at equal node hashes, could neither
+//! reach what a narrower walk had skipped nor remove what a wider one had
+//! covered.
 //!
-//! Every test here **fails on purpose**; they are `#[ignore]`d so the suite
-//! stays green, and are meant to be read as the specification the fix has to
-//! satisfy. Run them with:
-//!
-//! ```text
-//! cargo test -p synch-engine --test audit_scope_change -- --ignored --nocapture
-//! ```
+//! It is now derived per node from the `d:` record naming it, and nothing a
+//! peer says is remembered. These pin what that has to mean: a widened grant
+//! whose new space appears, a widened grant whose new space *changed* and once
+//! wedged the origin for good, a narrowed grant that stops serving what it
+//! lost, a delegate promoted to full membership, and a scope that does not move
+//! whoever this node happens to talk to.
 
 use std::sync::Arc;
 
@@ -77,9 +76,24 @@ impl Node {
     /// Publishes `files` as `(space, path, content)` plus any raw records, as
     /// one signed head — the same shape `tests/delegation.rs` publishes in.
     fn publish(&self, seq: u64, files: &[(&str, &str, &[u8])], extra: &[(Vec<u8>, Vec<u8>)]) {
+        self.publish_removing(seq, files, extra, &[])
+    }
+
+    /// The same, also deleting `remove` — which is what revoking a delegation
+    /// is: the `d:` key vanishes from the next root (§3.5).
+    fn publish_removing(
+        &self,
+        seq: u64,
+        files: &[(&str, &str, &[u8])],
+        extra: &[(Vec<u8>, Vec<u8>)],
+        remove: &[Vec<u8>],
+    ) {
         let trie = Trie::new(self.store.as_ref());
         let old = self.root();
         let mut root = old;
+        for key in remove {
+            root = trie.remove(root, key).unwrap();
+        }
         for (space, path, content) in files {
             let object = self.store.ingest_bytes(content, now_ns()).unwrap();
             let entry = FileEntry::file(content.len() as u64, 0, object, seq);
@@ -151,8 +165,12 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-/// Runs `rounds` exchanges, printing each report, so a failure shows whether
-/// the origin is stuck or merely slow.
+/// Runs `rounds` exchanges, printing each report so a failure shows whether the
+/// origin is stuck or merely slow.
+///
+/// More than one is needed after a scope change by construction: the round that
+/// carries the new grant adopts it and discards everything derived under the
+/// old one, and the round after that refetches and rebuilds.
 async fn rounds(syncer: &Syncer, client: &synch_net::MptClient, label: &str, rounds: usize) {
     for round in 0..rounds {
         match syncer.sync_with(client).await {
@@ -162,7 +180,7 @@ async fn rounds(syncer: &Syncer, client: &synch_net::MptClient, label: &str, rou
     }
 }
 
-/// **F1a — a widened grant leaves the space it just gained unmaterialized.**
+/// **F1a — a widened grant materializes the space it just gained.**
 ///
 /// The newly granted space is untouched by the head that carries the wider
 /// grant, which is the ordinary case: an operator widens a delegation and the
@@ -170,9 +188,9 @@ async fn rounds(syncer: &Syncer, client: &synch_net::MptClient, label: &str, rou
 /// root under the wider scope, so the record *is* in its trie — but the
 /// promotion diff prunes at the shared node hash, and `entries` never learns
 /// about it. Nothing reports a problem. `doctor --rebuild` is the only repair.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1a: a widened read scope never re-materializes what it gained"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_widened_delegation_materializes_the_space_it_just_gained() {
+    let _blocking = synch_core::BlockingScope::enter();
     let issuer = Node::spawn(Some("nas")).await;
     let delegate = Node::spawn(None).await;
     trust_static(&delegate.store, &issuer.origin, &issuer.key());
@@ -250,7 +268,7 @@ async fn a_widened_delegation_materializes_the_space_it_just_gained() {
     );
 }
 
-/// **F1b — a widened grant whose new space *changed* wedges the origin.**
+/// **F1b — a widened grant whose new space *changed* still promotes.**
 ///
 /// Here the promotion diff descends into the newly granted subtree instead of
 /// pruning over it, and the *old* root has no node there — it was never
@@ -259,9 +277,9 @@ async fn a_widened_delegation_materializes_the_space_it_just_gained() {
 /// origin is left behind on every round from then on. `doctor --rebuild`
 /// cannot repair it either: the trie under the stuck complete head is itself
 /// short of the new scope.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1b: a widened read scope wedges the origin permanently"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_widened_delegation_with_a_changed_space_still_promotes() {
+    let _blocking = synch_core::BlockingScope::enter();
     let issuer = Node::spawn(Some("nas")).await;
     let delegate = Node::spawn(None).await;
     trust_static(&delegate.store, &issuer.origin, &issuer.key());
@@ -307,14 +325,21 @@ async fn a_widened_delegation_with_a_changed_space_still_promotes() {
     );
 }
 
-/// **F1c — promoting a delegate to a full member wedges the origin.**
+/// **F1c — a delegate promoted to a full member replicates everything.**
 ///
-/// The same mechanism as F1b, reached by the most ordinary operation there is:
-/// the issuer adds a rooted binding for the delegate's key, so its `Hello`
-/// declares no scope at all and the delegate widens to the whole keyspace.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1c: promoting a delegate to a member wedges the origin"]
+/// Promotion is revoking the delegation, not merely rooting the key: a node is
+/// a delegate exactly while some origin's trie names it in a `d:` record, which
+/// is the cluster-visible statement of its role. Rooting it without revoking
+/// leaves a contradictory config, and under a derived scope the record wins —
+/// which is the point, since it is the thing every other member reads too.
+///
+/// Two things have to happen and only one of them is carried by a head. The
+/// revocation is: the promotion of that publish removes the binding. The
+/// widening is not — no head follows it — so the maintenance pass is what
+/// notices, and this asserts that it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
+    let _blocking = synch_core::BlockingScope::enter();
     let issuer = Node::spawn(Some("nas")).await;
     let delegate = Node::spawn(None).await;
     trust_static(&delegate.store, &issuer.origin, &issuer.key());
@@ -340,8 +365,15 @@ async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
         Some(vec!["photos".to_string()])
     );
 
-    // The operator promotes the delegate: a rooted binding for its key.
+    // The operator promotes the delegate: a rooted binding for its key, and
+    // the delegation revoked in the same head.
     trust_static(&issuer.store, &delegate.origin, &delegate.key());
+    issuer.publish_removing(
+        2,
+        &[("photos", "b.jpg", b"another file")],
+        &[],
+        &[delegation_key(&delegate.key())],
+    );
     assert_eq!(
         issuer
             .store
@@ -349,7 +381,6 @@ async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
             .unwrap(),
         synch_store::PublishScope::Unrestricted
     );
-    issuer.publish(2, &[("photos", "b.jpg", b"another file")], &[]);
     rounds(&syncer, &client, "promote", 3).await;
 
     assert_eq!(
@@ -357,6 +388,7 @@ async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
         None,
         "the delegate is a full member now"
     );
+
     assert_eq!(
         delegate.entries(&issuer.origin, "finance"),
         1,
@@ -364,13 +396,13 @@ async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
     );
 }
 
-/// **F1d — a narrowed grant leaves the revoked space in the derived views.**
+/// **F1d — a narrowed grant drops the revoked space from the derived views.**
 ///
 /// The mirror image of F1a: nothing re-derives `entries` for a scope that
 /// shrank, so the delegate goes on listing and serving the space it lost.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1d: a narrowed read scope leaves stale rows behind"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_narrowed_delegation_drops_what_it_no_longer_covers() {
+    let _blocking = synch_core::BlockingScope::enter();
     let issuer = Node::spawn(Some("nas")).await;
     let delegate = Node::spawn(None).await;
     trust_static(&delegate.store, &issuer.origin, &issuer.key());
@@ -408,22 +440,22 @@ async fn a_narrowed_delegation_drops_what_it_no_longer_covers() {
     );
 }
 
-/// **F1e — the scope oscillates with no operator action at all.**
+/// **F1e — the scope does not depend on which peer spoke last.**
 ///
-/// A node that is a full member of one origin and a delegate of another
-/// adopts a *node-wide* read scope from whichever peer it spoke to last, so
-/// ordinary anti-entropy alternates it between the grant and the whole
-/// keyspace, once per round.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1e: the read scope depends on which peer spoke last"]
-async fn a_node_that_is_both_a_member_and_a_delegate_flaps_its_scope() {
+/// A delegate hears a different declaration from every peer that sees it
+/// differently, and each is honest about what *that* peer will serve. Two
+/// laptops in the same position, fed the same two peers in opposite orders,
+/// must hold the same rows — and no round with either peer may move them.
+///
+/// What settles it is that nothing a peer says is remembered: the scope is the
+/// grant in the `d:` record naming this node, read out of the trie it already
+/// replicates, so the answer is the same before and after any exchange with
+/// anybody. A declaration only ever narrows the walk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegates_scope_is_the_same_whatever_order_it_meets_its_peers_in() {
+    let _blocking = synch_core::BlockingScope::enter();
     let work = Node::spawn(Some("work")).await;
     let home = Node::spawn(Some("home")).await;
-    let laptop = Node::spawn(None).await;
-
-    trust_static(&laptop.store, &work.origin, &work.key());
-    trust_static(&laptop.store, &home.origin, &home.key());
-    trust_static(&home.store, &laptop.origin, &laptop.key());
 
     work.publish(
         1,
@@ -431,51 +463,91 @@ async fn a_node_that_is_both_a_member_and_a_delegate_flaps_its_scope() {
             ("reports", "q3.pdf", b"delegated"),
             ("secrets", "keys.txt", b"withheld"),
         ],
-        &[delegation(&laptop.key(), &["reports"])],
+        &[],
     );
     home.publish(1, &[("family", "a.jpg", b"pictures")], &[]);
 
-    let syncer = Syncer::new(laptop.store.clone());
-    let to_work = laptop
-        .net
-        .connect_mpt(work.net.direct_addr())
-        .await
-        .unwrap();
-    let to_home = laptop
-        .net
-        .connect_mpt(home.net.direct_addr())
-        .await
-        .unwrap();
+    // Two laptops in the same position, differing only in the order they meet
+    // their peers in — which is what §5.3's random peer choice decides.
+    let mut settled = Vec::new();
+    for order in [[0usize, 1, 0, 1], [1, 0, 1, 0]] {
+        let laptop = Node::spawn(None).await;
+        trust_static(&laptop.store, &work.origin, &work.key());
+        trust_static(&laptop.store, &home.origin, &home.key());
+        trust_static(&home.store, &laptop.origin, &laptop.key());
+        work.publish(
+            work.store
+                .complete_head(&work.origin)
+                .unwrap()
+                .map(|h| h.seq + 1)
+                .unwrap_or(1),
+            &[],
+            &[delegation(&laptop.key(), &["reports"])],
+        );
 
-    let mut seen = Vec::new();
-    for round in 0..4 {
-        let (peer, label) = match round % 2 {
-            0 => (&to_work, "work"),
-            _ => (&to_home, "home"),
-        };
-        rounds(&syncer, peer, label, 1).await;
-        let scope = laptop.store.local_scope().unwrap();
-        println!("  scope now {scope:?}");
-        seen.push(scope);
+        let syncer = Syncer::new(laptop.store.clone());
+        let to_work = laptop
+            .net
+            .connect_mpt(work.net.direct_addr())
+            .await
+            .unwrap();
+        let to_home = laptop
+            .net
+            .connect_mpt(home.net.direct_addr())
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        for &which in &order {
+            let (peer, label) = match which {
+                0 => (&to_work, "work"),
+                _ => (&to_home, "home"),
+            };
+            rounds(&syncer, peer, label, 1).await;
+            let scope = laptop.store.local_scope().unwrap();
+            println!("  [{order:?}] scope now {scope:?}");
+            seen.push(scope);
+        }
+        // The first round is the bootstrap — a delegate holds no grant until it
+        // has replicated the trie the granting record lives in, so `None` there
+        // is the honest answer and not a scope. From the moment it is known,
+        // nothing a peer says may move it: it is read out of the trie, and the
+        // trie is the same either way.
+        assert!(
+            seen[1..].iter().all(|scope| scope == &seen[1]),
+            "a peer's declaration moved this node's scope once it knew it: {seen:?}"
+        );
+        assert!(
+            seen[1].is_some(),
+            "the grant must be known after the first round: {seen:?}"
+        );
+        settled.push((
+            laptop.store.local_scope().unwrap(),
+            laptop.entries(&work.origin, "reports"),
+            laptop.entries(&work.origin, "secrets"),
+            laptop.entries(&home.origin, "family"),
+        ));
     }
-    let distinct: std::collections::HashSet<_> = seen.iter().collect();
     assert_eq!(
-        distinct.len(),
-        1,
-        "the read scope must not depend on which peer spoke last: {seen:?}"
+        settled[0], settled[1],
+        "two nodes fed the same peers in opposite orders must agree: {settled:?}"
     );
 }
 
-/// **F1f — the flap of F1e turns into the wedge of F1b, unattended.**
+/// **F1f — an unattended round through a more generous peer changes nothing.**
 ///
-/// The laptop is a delegate of `work` and a full member of `home`, and `home`
-/// also replicates `work` — an ordinary mixed cluster. One anti-entropy round
-/// that happens to pick `home` promotes `work`'s head under the wider scope,
-/// and the origin is left behind from then on. Returning to `work` does not
-/// repair it: the refusal memo holds the verdict even once the scope is back.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F1f: an unattended round wedges the delegating origin"]
-async fn a_flapped_scope_wedges_the_delegating_origin() {
+/// The laptop is a delegate of `work`, and `home` — which also replicates
+/// `work` — holds a rooted binding for the laptop, so `home` will serve it the
+/// whole keyspace. An ordinary anti-entropy round that happens to pick `home`
+/// used to promote `work`'s head under that wider scope and leave the origin
+/// behind for good, past returning to `work`.
+///
+/// Now the declaration cannot reach the promotion at all: the laptop
+/// materializes its own grant whoever it heard from, and `scope_meet` keeps
+/// the walk from pulling the rest in the first place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_through_a_wider_peer_keeps_the_delegating_origin_replicating() {
+    let _blocking = synch_core::BlockingScope::enter();
     let work = Node::spawn(Some("work")).await;
     let home = Node::spawn(Some("home")).await;
     let laptop = Node::spawn(None).await;

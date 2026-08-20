@@ -1,21 +1,17 @@
-//! `heads_for` answers a `HeadsWant` out of the complete *slot*, which is not
-//! the same question as "can I serve the trie under it".
+//! What a node hands over on `HeadsWant` has to be a head it can serve the
+//! trie of (§5.1).
 //!
-//! `Syncer::heads_for` documents itself as handing over "only heads this node
-//! can back with a servable trie: what a peer does with one is fetch the trie
-//! under it from us." A delegate's complete slot holds every foreign origin's
-//! head over a *partial* trie, and `local_summaries` says so in the same
-//! exchange (`complete: false`). The two disagree, and the puller believes the
-//! head rather than the summary: `sync_with`'s adoption loop calls
-//! `fetch_pending` against whichever peer handed the head over, without the
-//! `summary.complete` guard its own pending-slot pass applies a few lines
-//! later.
-//!
-//! Fails on purpose; `#[ignore]`d so the suite stays green. Run with:
-//!
-//! ```text
-//! cargo test -p synch-engine --test audit_unservable_head -- --ignored --nocapture
-//! ```
+//! `Syncer::heads_for` used to answer out of the complete *slot*, which is not
+//! the same question: a slot says this node promoted the head, and whether the
+//! trie under it is whole is what `local_summaries` answers with `complete` in
+//! the same exchange. A delegate's complete slot holds every foreign origin
+//! over a *partial* trie by construction, so the two disagreed — and the
+//! puller believed the head rather than the summary, because `sync_with`'s
+//! adoption loop fetched from whoever handed one over without the
+//! `summary.complete` guard its own pending-slot pass applied forty lines
+//! later. Every member pulling from a delegate burned the whole
+//! `MAX_UNPRODUCTIVE_ROUNDS` escape per origin, per exchange, to learn what
+//! the summary in that same exchange had already told it.
 
 use std::sync::Arc;
 
@@ -145,9 +141,9 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
 /// `MAX_UNPRODUCTIVE_ROUNDS` of `GetNodes` discovering that, and abandons it —
 /// every round it happens to pick the delegate, for every foreign origin the
 /// delegate carries.
-#[tokio::test]
-#[ignore = "reproduces AUDIT F2: a peer hands over a head it advertised as unservable"]
-async fn a_member_pulling_from_a_delegate_is_handed_a_head_the_delegate_cannot_serve() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegate_does_not_hand_over_the_heads_it_cannot_serve() {
+    let _blocking = synch_core::BlockingScope::enter();
     let issuer = Node::spawn(Some("nas")).await;
     let delegate = Node::spawn(None).await;
     let member = Node::spawn(Some("laptop")).await;
@@ -218,5 +214,98 @@ async fn a_member_pulling_from_a_delegate_is_handed_a_head_the_delegate_cannot_s
     assert_eq!(
         report.heads_abandoned, 0,
         "a peer that cannot serve a trie must not hand out its head"
+    );
+}
+
+/// The other half of the same rule, from the puller's side (§5.5): a delegate
+/// must not pull metadata from another delegate at all.
+///
+/// `heads_for` makes the delegate stop *offering* what it cannot serve. This is
+/// what stops a delegate asking in the first place — and it is the constraint
+/// that makes the read scope derivable from local state, because every peer a
+/// delegate can reach serves the whole of its grant. A full member of some
+/// other cluster is refused for the same reason: it has no trie of this
+/// delegate's cluster to serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delegate_pulls_metadata_only_from_a_full_member_of_its_cluster() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let issuer = Node::spawn(Some("nas")).await;
+    let sibling = Node::spawn(None).await;
+    let delegate = Node::spawn(None).await;
+
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+    trust_static(&delegate.store, &sibling.origin, &sibling.key());
+    trust_static(&sibling.store, &delegate.origin, &delegate.key());
+    trust_static(&sibling.store, &issuer.origin, &issuer.key());
+
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"granted"),
+            ("finance", "q3.pdf", b"withheld"),
+        ],
+        &[
+            delegation(&delegate.key(), &["photos"]),
+            delegation(&sibling.key(), &["photos"]),
+        ],
+    );
+
+    // The delegate bootstraps from its issuer, which is a full member.
+    let syncer = Syncer::new(delegate.store.clone());
+    let to_issuer = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    syncer.sync_with(&to_issuer).await.unwrap();
+    assert_eq!(
+        delegate.store.local_scope().unwrap(),
+        Some(vec!["photos".to_string()]),
+        "the delegate read its own grant out of the trie it just fetched"
+    );
+
+    // Now that it knows it is a delegate, the sibling delegate is refused —
+    // both at the dial and, for a session opened before the grant landed, at
+    // the exchange itself.
+    let refused = delegate.net.connect_mpt(sibling.net.direct_addr()).await;
+    assert!(
+        matches!(refused, Err(synch_net::NetError::Untrusted(_))),
+        "a delegate must not dial another delegate for metadata: {refused:?}"
+    );
+
+    // A full member of the delegate's own cluster stays reachable.
+    let member = Node::spawn(Some("desktop")).await;
+    trust_static(&delegate.store, &member.origin, &member.key());
+    trust_static(&member.store, &delegate.origin, &delegate.key());
+    assert!(
+        delegate
+            .net
+            .connect_mpt(member.net.direct_addr())
+            .await
+            .is_ok(),
+        "a full member of its own cluster is exactly who it should be pulling from"
+    );
+
+    // And a full member of a different cluster is not.
+    let stranger = Node::spawn(Some("laptop")).await;
+    let other = OriginId::named("laptop", "other.example").unwrap();
+    delegate
+        .store
+        .put_binding(&Binding {
+            origin: other,
+            node_id: stranger.key(),
+            source: BindingSource::Static,
+            domain: None,
+            issuer: None,
+            spaces: Vec::new(),
+            note: None,
+            added_at: 0,
+            expires_at: None,
+        })
+        .unwrap();
+    let refused = delegate.net.connect_mpt(stranger.net.direct_addr()).await;
+    assert!(
+        matches!(refused, Err(synch_net::NetError::Untrusted(_))),
+        "a full member of another cluster has nothing of this one to serve: {refused:?}"
     );
 }

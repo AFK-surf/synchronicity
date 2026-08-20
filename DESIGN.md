@@ -1040,13 +1040,57 @@ than inherits.
 
 **Learning the scope.** A delegate's scope lives in the delegating origin's trie,
 which it cannot read until it knows its scope. So the peer serving it says, in the
-`Hello` that opens every session. Adopting a peer's word costs nothing: every
-responder enforces the same scope on every request independently, so a wrong or stale
-value can only make a node ask for *less* than it is entitled to. `synch doctor`
-reports the scope it is holding, because a partial trie and a broken fetch look alike
-from the outside, and because the same scope decides the servable column below it: a
-foreign head on a confined node is judged whole *within the grant*, and this node's
-own head — the one trie it built rather than was served — is judged whole outright.
+`Hello` that opens every session, and the value is one node-wide setting. `synch
+doctor` reports it, because a partial trie and a broken fetch look alike from the
+outside, and because the same scope decides the servable column below it: a foreign
+head on a confined node is judged whole *within the grant*, and this node's own head —
+the one trie it built rather than was served — is judged whole outright.
+
+**A delegate talks only to peers that hold its issuer's trie whole.** A delegate holds
+every foreign trie in part, so it can be *served* one only by a node that holds it
+whole; pulling from another delegate yields a trie short in exactly the spaces that
+peer was not granted, which nothing downstream can tell from a trie still arriving.
+Membership is not a domain suffix — it is holding the cluster's tries, and `complete`
+in the `Hello` is where a peer says so. A peer that cannot serve the issuer's trie has
+not read the record that grants this node its scope, so its declaration is refused as
+well as its data. Content is unaffected: it is content-addressed and verified by hash,
+so a delegate fetches bytes from anyone (§6).
+
+That is what keeps one node-wide value honest. Every peer a delegate will listen to
+has read the same `d:` record, so every declaration it hears carries the same answer —
+and a delegation outranks a local `trust add` when a responder computes what it will
+serve, so two members of one cluster cannot answer differently for the same key.
+Promoting a delegate is therefore *revoking its delegation*, the cluster-visible
+operation, and not merely rooting its key beside a record that still confines it.
+
+**A scope that moves discards everything derived under the old one.** This section used
+to read "adopting a peer's word costs nothing … a wrong or stale value can only make a
+node ask for *less* than it is entitled to", and that was wrong. Asking for less is free
+only while nothing durable is derived from it, and three things are: what a fetch asks
+for, what `is_complete_scoped` counts as whole, and what `materialize_diff` walks.
+
+There is no diff that reconciles rows built under one scope with a walk under another,
+because the promotion diff prunes at equal node hashes: widen the grant and the space
+just gained is pruned over and never appears; narrow it and the space just revoked is
+never removed. Where the newly admitted subtree also *changed*, the diff descends into
+an old root that has no node there — it was never fetched under the old scope — and the
+`MissingNode` that follows reads as the *origin's* fault, so the head is retired into
+the refusal memo and that origin stops replicating on this node for good.
+
+So nothing is reconciled. `entries`, `blob_providers` and the delegated bindings are
+derived state, and the honest thing to do with derived state whose premise changed is to
+throw it away: the rows go, the redaction boundaries go, and every foreign complete head
+drops back to the pending slot. The ordinary fetch then fills each trie out under the
+new scope and the ordinary promotion rebuilds the rows — finding no complete head, its
+diff runs from the empty root, which touches the stale one not at all. That is what
+makes the whole class unreachable rather than handled, and it is why no per-origin
+bookkeeping is needed to detect it: the scope moves in exactly one place.
+
+The cost is paid where it belongs. A scope that has not moved costs one comparison; a
+scope that has costs a re-materialization of every foreign origin, on an operator
+action that happens rarely. Trie nodes are content-addressed and are *not* discarded, so
+the only bytes fetched are the ones the new scope actually adds. This node's own origin
+is never touched: it built that trie, and there is nobody to refetch it from.
 
 **`b:` is not served to a delegate at all.** Ads are keyed by content hash, so the
 shape of that subtree would leak how many objects an origin holds. A delegate learns

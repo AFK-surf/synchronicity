@@ -733,6 +733,39 @@ impl Txn<'_> {
         put_head_in(self.conn(), slot, head, received_at, verified_at)
     }
 
+    /// Every head in a slot, inside the transaction.
+    ///
+    /// The transactional twin of [`Store::all_heads`], for the one caller that
+    /// has to read the set and rewrite it atomically: moving the read scope
+    /// demotes every foreign complete head, and a head promoted between the
+    /// read and the write would keep a completeness claim made under a scope
+    /// that has gone.
+    pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
+        let mut stmt = self.conn().prepare(&format!(
+            "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
+        ))?;
+        let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
+            match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
+                Ok(head) => out.push(StoredHead {
+                    head,
+                    received_at,
+                    verified_at,
+                }),
+                Err(e) => tracing::warn!(
+                    origin,
+                    seq,
+                    slot = slot.as_str(),
+                    error = %e,
+                    "skipping a head row that cannot be read"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// Clears a head slot, inside the transaction.
     pub fn clear_head(&self, origin: &OriginId, slot: Slot) -> Result<()> {
         self.conn().execute(
