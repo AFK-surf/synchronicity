@@ -1799,6 +1799,10 @@ pub fn skill_md_is_served_by_every_role_test() {
   ))
   // Enough of the document to know it is the guide and not, say, index.html.
   assert string.contains(body(served), "synch daemon run")
+  // And that it still carries this service's own API, which is the half an
+  // agent holding nothing but this URL cannot get anywhere else: the node
+  // that answers /SKILL.md is the node that answers /api.
+  assert string.contains(body(served), "Authorization: Bearer")
 
   // Role-agnostic, so a read-only node serves the same document: it needs no
   // session, no writable database and no zone key, and an operator pointed at

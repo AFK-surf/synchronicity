@@ -1,6 +1,6 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, or a node's data directory.
+description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
 ---
 
 # synch
@@ -14,7 +14,8 @@ This guide assumes the cluster's membership zone is **managed by a
 synchronicity control plane**: devices are enrolled on the network's page in
 the web UI, and the control plane signs and serves the zone. No step here
 involves editing a DNS record — where the CLI prints one, it is describing
-what the control plane publishes for you.
+what the control plane publishes for you. Every such step has a second way
+round that needs no browser: see **The control-plane API** below.
 
 Two rules explain most of the surface:
 
@@ -100,9 +101,10 @@ next:       publish this record, then `synch daemon run`:
 
 The last two lines are not yours to do. Add the device on the network's page
 in the control plane — a label and the device key — and the record is
-signed and served in the same moment. Until it is, `daemon run` waits rather
-than serves: the zone does not name this key yet, so the node has no name to
-publish under.
+signed and served in the same moment; **The control-plane API** below is the
+same act as one `POST`, which is the form to reach for from this node itself.
+Until it is done, `daemon run` waits rather than serves: the zone does not name
+this key yet, so the node has no name to publish under.
 
 `scan` reports what it did and what it published:
 
@@ -235,10 +237,10 @@ and publishes your own. Once every publisher has, the path leaves the tree.
 ## Membership
 
 Membership is the zone. The control plane signs and serves one per network —
-`<network>.<org>.<apex>` — and adding a device on the network's page is the
-whole enrollment: a label, a device key, and the record exists. There is
-nothing to publish by hand, and no per-node configuration of anybody else's
-membership.
+`<network>.<org>.<apex>` — and adding a device on the network's page (or with
+one `POST`; see **The control-plane API**) is the whole enrollment: a label, a
+device key, and the record exists. There is nothing to publish by hand, and no
+per-node configuration of anybody else's membership.
 
 A node points at its zone once:
 
@@ -399,7 +401,9 @@ synch key ls
 ```
 
 What `key rotate` prints is the record a zone run by hand would need; here
-the `nk=` value is the whole payload, and the device's page takes it.
+the `nk=` value is the whole payload, and the device's page takes it — as does
+`POST …/devices/<dev>/keys`, with `POST …/keys/<old>/retire` for the last step
+(**The control-plane API**).
 
 `synch key ls` answers the question the middle step turns on — *have my peers
 picked up the new record yet?* It asks every reachable trusted peer which of
@@ -467,6 +471,152 @@ cloud attach enabled: serving the control plane's requests for (no local spaces)
 note: no membership domains are configured, so there is no zone to discover a
 control plane from; `synch domain set <domain>` first
 ```
+
+## The control-plane API
+
+The node whose `/SKILL.md` you are reading also serves an HTTP API at the same
+base URL. **Every act this guide has so far handed to a person, a program can
+take** — enrolling a device, assigning it to a network, opening and closing a
+rotation window, revoking a key. What it cannot take is the handful that would
+let it widen its own reach — **What a key can never reach**, below, is the
+whole list.
+
+### Getting a token
+
+An org owner or admin mints one under **Settings → API keys**. A key belongs to
+the *org*, not to whoever minted it: it names one org and carries its own role
+(`admin` or `member`, never `owner`), so it reaches no other org and no change
+to anybody's membership widens it. The token is shown once — the control plane
+keeps only its SHA-256 — and looks like `synch_` followed by 43 random
+characters.
+
+```sh
+cp=https://cp.acme.example.com
+token=synch_...
+
+curl -fsS -H "Authorization: Bearer $token" "$cp/api/orgs/acme"
+```
+
+That header is the whole of it. There is no CSRF token to echo — that defends a
+*cookie*, which the browser attaches to cross-site requests on its own, and
+nothing attaches an `Authorization` header for you.
+
+### Enrolling this node from this node
+
+The one flow worth spelling out, because it is what turns a waiting
+`daemon run` into a serving one. The key to hand over is the z-base-32 string
+`synch init --domain` labels `device key:`; `synch id` prints the same value
+indented under `origin:`, with its state in parentheses:
+
+```sh
+nk=qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo   # from init, or id
+
+curl -fsS -X POST "$cp/api/orgs/acme/devices" \
+  -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+  -d "{\"label\": \"nas\", \"nk\": \"$nk\"}"
+# -> {"ok":true,"soa_serial":42,"result":{"device_id":"0000068a4c…"}}
+
+# device_id is result.device_id above — the org knows the device now; this is
+# what puts it in a network's zone.
+curl -fsS -X PUT "$cp/api/orgs/acme/networks/prod/devices/$device_id" \
+  -H "Authorization: Bearer $token"
+```
+
+Both answers carry `soa_serial`, because **the commit is the publication** —
+the zone is rebuilt and re-signed inside the same transaction, so there is no
+cache to wait for and no second call to make.
+
+### What a key can reach
+
+`<org>` is the org slug, `<net>` a network name, `<dev>` and `<key>` the ids the
+listings return.
+
+| Method | Path | Role | What |
+| --- | --- | --- | --- |
+| `GET` | `/api/orgs/<org>` | member | the org: its networks, its device count, your role |
+| `GET` | `/api/orgs/<org>/members` | member | who is in it (reading only — see below) |
+| `GET` | `/api/orgs/<org>/audit` | admin | the trail, newest first; `?before=<id>` pages back |
+| `GET` | `/api/orgs/<org>/networks` | member | each network and how many devices it holds |
+| `POST` | `/api/orgs/<org>/networks` | admin | `{"name": "prod"}` — a DNS label |
+| `GET` | `/api/orgs/<org>/networks/<net>` | member | every device, its live keys, the zone's signature health |
+| `DELETE` | `/api/orgs/<org>/networks/<net>` | admin | `{"confirm": "<net>"}` — typed back, as the UI asks |
+| `GET` | `/api/orgs/<org>/devices` | member | every device, with its keys and its networks |
+| `POST` | `/api/orgs/<org>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` |
+| `PATCH` | `/api/orgs/<org>/devices/<dev>` | member | `{"relay"?, "addr"?}` — the hints, nothing else |
+| `DELETE` | `/api/orgs/<org>/devices/<dev>` | admin | the device and its keys leave the zone |
+| `PUT` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | assign; no body |
+| `DELETE` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | unassign |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys` | member | `{"nk": "<key>"}` — opens the rotation window |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys/<key>/retire` | member | closes it; no body |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys/<key>/revoke` | admin | out of the zone, and out of every open tunnel |
+
+The rotation of **Key rotation** above, in three calls: `POST …/keys` with the
+new key (both publish, the old one `retiring`), `synch key activate` on the
+device, then `POST …/<old>/retire`. A second `POST …/keys` while a window is
+open is refused with `rotation_open` rather than opening a second one.
+
+The browse surface is the same read-only tunnel `synch cloud status` reports
+from the node's side, and it stays gated on the org's per-network switch:
+
+| Method | Path | Role | What |
+| --- | --- | --- | --- |
+| `GET` | `…/networks/<net>/browse` | member | is browsing on, and which daemons are attached |
+| `PUT` | `…/networks/<net>/browse/enabled` | admin | `{"enabled": true}` |
+| `GET` | `…/browse/ls?space=&path=&origin=&cursor=&all=1` | member | one directory of the unified tree |
+| `GET` | `…/browse/stat?space=&path=&origin=` | member | every version of one path, with attestors |
+| `GET` | `…/browse/file?space=&path=&from=&origin=` | member | the bytes, streamed; `Range` honoured |
+| `GET` | `…/networks/<net>/delegations` | member | the delegated keys an attached daemon reports |
+
+Space and path are query parameters and never path segments — a file path may
+contain anything, separators included.
+
+### What a key can never reach
+
+Four families, and each is a way a scoped credential could reach past its
+scope. All four answer `403 api_key_forbidden`:
+
+- **accounts** — creating an org, accepting an invitation, `/api/me`. These are
+  about a person, and a key is not one.
+- **membership** — invitations, role changes, removals. An admin key that could
+  invite an admin would be handing out standing human access that outlives the
+  key.
+- **API keys themselves**, the listing included. A key that could mint keys
+  could mint one that never expires, and revoking the one you knew about would
+  not have ended the access.
+- **anything owner-gated** — ownership transfer, org deletion, the SSO
+  configuration. No key is an owner, so these refuse every key without knowing
+  keys exist.
+
+### Answers, and what the refusals mean
+
+Every error is `{"error": {"code": "...", "message": "..."}}`, and every
+zone-shaping mutation answers `{"ok": true, "soa_serial": N, "result": {...}}`.
+
+| Status | `code` | Means |
+| --- | --- | --- |
+| `401` | `unauthenticated` | no credential, or one that is unknown, expired or revoked |
+| `403` | `forbidden` | your role is under the route's floor; the message names it |
+| `403` | `api_key_forbidden` | a person's endpoint, reached with a key |
+| `404` | `not_found` | it does not exist, or it is not in your org — one answer for both, on purpose |
+| `409` | `conflict` | the change collides with a record that exists; the message names the invariant |
+| `409` | `rotation_open` | a second rotation window while the first is open |
+| `409` | `read-only-replica` | this node holds a read-only copy; the `primary` field names where writes go |
+| `409` | `no_rekor_record` | the transparency gate is holding the zone key back — an operator ceremony, not your request |
+| `400` | `bad_name`, `invalid_label`, `invalid_nk`, `bad_hint`, … | the request itself; the message names the field and why |
+
+A `not_found` for an org you believe you can reach is worth reading twice: an
+org is not enumerable by whoever cannot see it, so a key pointed at somebody
+else's org gets exactly what a stranger gets.
+
+`read-only-replica` is the one worth handling rather than retrying: a
+deployment's apex names every node, and reads are answered by all of them while
+writes go to one. Follow the `primary` field.
+
+Every *change* a key makes lands in the org's audit trail as `key:<id>` — the
+credential, not whoever minted it, so it stays true after that person's role has
+changed or they have left. Reads are not recorded, browse reads included: they
+are an org reading its own files through a tunnel its own daemon opened, and a
+row per download would be a log of ordinary use.
 
 ## Global flags
 
@@ -559,6 +709,8 @@ Amazon S3.
 
 - `synch <command> --help` — every flag, with the reasoning attached.
 - `synch doctor` — the state of this node, in full.
+- the control plane's own dashboard, at the host that served this document —
+  the same acts as **The control-plane API**, with a person driving.
 - `DESIGN.md` — the architecture; the `§` numbers in CLI help point into it.
   It ships in every release archive, next to the binaries.
 - `docs/REKOR-ZONE-KEY.md` — zone-key transparency, end to end. It lives in

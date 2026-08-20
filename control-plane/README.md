@@ -166,6 +166,12 @@ whoever, or whatever, has to drive a node: the daemon model, references
 and version policies, membership and delegation, key rotation, recovery,
 and the error messages each of those produces.
 
+It also documents **this service's own API**, since the node that answers
+`/SKILL.md` is the node that answers `/api`: how to hold an org-scoped API
+key, every route one can reach, the four families it never can, and what each
+refusal means. A guide that tells an agent to "add the device on the network's
+page" and stops there has handed it a step it cannot take.
+
 It is mounted beside `/healthz` rather than behind the product API, and
 so is public and role-agnostic: it needs no session, no database and no
 zone, and an operator pointed at any node of a deployment — primary,
