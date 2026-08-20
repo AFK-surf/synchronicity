@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "synch-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4042,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "synch-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "hex",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "synch-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-lc-rs",
  "directories",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "synch-monitor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",
@@ -4103,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "synch-mpt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "postcard",
@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "synch-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "synch-s3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4171,7 +4171,7 @@ dependencies = [
 
 [[package]]
 name = "synch-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bao-tree",
  "blake3",
