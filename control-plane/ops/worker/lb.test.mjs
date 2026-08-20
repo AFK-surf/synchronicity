@@ -18,6 +18,7 @@ import {
   clientAddress,
   ATTACH_PATH,
   AUTH_METHODS_PATH,
+  STICKY_CACHE,
   STICKY_TTL_SECONDS,
 } from "./lb.js";
 
@@ -299,21 +300,29 @@ test("trailing slashes in configuration do not become double slashes", async () 
 // colo and a reader who moves between them is balanced again.
 
 /// The Cache API, as one colo has it: a map, and the option of not being
-/// there at all.
+/// there at all. Namespaced, so the stub records which namespace was asked
+/// for — pins must not land in the edge cache beside real responses.
 function stubCache(entries = new Map()) {
   const original = globalThis.caches;
+  const opened = [];
   globalThis.caches = {
-    default: {
-      async match(key) {
-        const hit = entries.get(key.url);
-        return hit === undefined ? undefined : new Response(hit);
-      },
-      async put(key, response) {
-        entries.set(key.url, await response.text());
-      },
+    get default() {
+      throw new Error("the default cache is the edge cache; use a namespace");
+    },
+    async open(name) {
+      opened.push(name);
+      return {
+        async match(key) {
+          const hit = entries.get(key.url);
+          return hit === undefined ? undefined : new Response(hit);
+        },
+        async put(key, response) {
+          entries.set(key.url, await response.text());
+        },
+      };
     },
   };
-  return { entries, restore: () => (globalThis.caches = original) };
+  return { entries, opened, restore: () => (globalThis.caches = original) };
 }
 
 const FROM = (ip) => ({ headers: { "cf-connecting-ip": ip } });
@@ -383,10 +392,11 @@ test("the pin is what gets cached, with a TTL", async () => {
     const [[key, value]] = [...cache.entries];
     // Keyed on a digest of the address, not the address: this cache should
     // not be a list of who has been here.
-    // Under the request's own origin: caches.default refuses a key outside
-    // the Worker's zone, and a refused put here is swallowed — so a synthetic
-    // hostname would be stickiness that silently never happens.
-    assert.match(key, /^https:\/\/sync\.test\/__cp-lb-sticky\/[0-9a-f]{64}$/);
+    // A namespace of our own, not the edge cache: nothing but this Worker
+    // reads it and no request can name an entry in it, so the key is a
+    // synthetic origin rather than a URL of the zone's.
+    assert.deepEqual(cache.opened, [STICKY_CACHE]);
+    assert.match(key, /^https:\/\/control-plane-lb\.invalid\/[0-9a-f]{64}$/);
     assert.ok(!key.includes("203.0.113.9"));
     assert.ok(REPLICAS.includes(value));
     assert.equal(STICKY_TTL_SECONDS, 300);

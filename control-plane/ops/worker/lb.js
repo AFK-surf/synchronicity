@@ -61,14 +61,15 @@ const AUTH_METHODS_PATH = "/api/auth/methods";
 /// short enough that a node taken out of rotation drains on its own.
 const STICKY_TTL_SECONDS = 300;
 
-/// The path prefix a pin is filed under.
+/// The namespaced cache the pins live in, and the synthetic origin they are
+/// keyed under.
 ///
-/// Under the *request's own origin*, not a synthetic hostname: `caches.default`
-/// will not store a key outside the Worker's zone, and since a failed `put` is
-/// swallowed here — a reader must not fail over a cache write — getting that
-/// wrong would be stickiness that silently never happens. A reserved path
-/// keeps it clear of anything the service mounts, and nothing ever fetches it:
-/// it exists to be a key.
+/// `caches.open(...)`, not `caches.default`: the default cache is the edge
+/// cache for this zone, where an entry shares a namespace with real responses
+/// and is keyed by a URL a client could ask for. A namespace of our own has
+/// neither property — nothing but this Worker reads it, and no request can
+/// name an entry in it — so the key does not have to be a URL the zone
+/// serves, and it is better that it is not one.
 ///
 /// The Cache API is per colo, so this is sticky *within a region* and nothing
 /// more. A reader whose requests land in two colos gets two pins and two
@@ -76,7 +77,8 @@ const STICKY_TTL_SECONDS = 300;
 /// the honest shape of it: no coordination, no state to run, no request
 /// waiting on a round trip to somewhere else. Cloudflare routes a client to a
 /// colo by proximity, so in practice one reader stays in one.
-const STICKY_PREFIX = "/__cp-lb-sticky/";
+const STICKY_CACHE = "control-plane-lb-sticky";
+const STICKY_ORIGIN = "https://control-plane-lb.invalid";
 
 /// How many nodes one request may be tried against.
 ///
@@ -153,15 +155,25 @@ function clientAddress(request) {
 /// but a cache full of client IPs is a thing to avoid making, and a digest
 /// also flattens whatever an `x-forwarded-for` might contain into something
 /// that is certainly a safe path segment.
-async function stickyKey(url, address) {
+async function stickyKey(address) {
   const bytes = new TextEncoder().encode(address);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   const hex = [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
-  return new Request(new URL(STICKY_PREFIX + hex, url.origin), {
-    method: "GET",
-  });
+  return new Request(`${STICKY_ORIGIN}/${hex}`, { method: "GET" });
+}
+
+/// The pin namespace, or null where there is no Cache API at all.
+///
+/// Never fatal, like every other step of this: a balancer that cannot open a
+/// cache balances, which is what it did before any of this existed.
+async function stickyCache() {
+  try {
+    return (await globalThis.caches?.open(STICKY_CACHE)) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /// The replica this reader was last served by in this colo, or "".
@@ -240,10 +252,12 @@ export default {
     }
 
     // Pinning is for reads: a write has one node whatever this says, and
-    // looking one up would be a cache round trip bought for nothing.
-    const cache = isRead(request.method) ? globalThis.caches?.default : null;
-    const address = cache ? clientAddress(request) : "";
-    const key = address ? await stickyKey(url, address) : null;
+    // looking one up would be a cache round trip bought for nothing. The
+    // address is read first, so a request with nothing to key on does not
+    // open a cache either.
+    const address = isRead(request.method) ? clientAddress(request) : "";
+    const cache = address ? await stickyCache() : null;
+    const key = cache ? await stickyKey(address) : null;
     const pinned = key ? await readPin(cache, key) : "";
 
     let configured;
@@ -308,7 +322,8 @@ export {
   origins,
   clientAddress,
   stickyKey,
-  STICKY_PREFIX,
+  STICKY_CACHE,
+  STICKY_ORIGIN,
   ATTACH_PATH,
   AUTH_METHODS_PATH,
   STICKY_TTL_SECONDS,
