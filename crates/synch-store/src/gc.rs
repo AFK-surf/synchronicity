@@ -86,7 +86,18 @@ impl Store {
         // entry for it would be a standing lie about what this node can serve —
         // but dropping the *whole* memo would throw away the answer §5.1
         // exists to avoid recomputing on every `Hello`.
-        self.retain_complete_roots(&roots.into_iter().collect());
+        //
+        // A scoped answer is memoized under `Scope::memo_key`, not under the
+        // bare root, so retaining the roots alone dropped every one of them on
+        // every pass — a delegate re-walked its whole in-scope trie after each
+        // five-minute cycle, which is exactly the cost this retention exists
+        // to avoid. Both spellings of a retained root are kept.
+        let scope = self.local_trie_scope()?;
+        let mut keep: std::collections::HashSet<Hash> = roots.iter().copied().collect();
+        if !scope.is_full() {
+            keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
+        }
+        self.retain_complete_roots(&keep);
         Ok(stats)
     }
 
@@ -436,6 +447,35 @@ mod tests {
                 .unwrap();
         }
         root
+    }
+
+    #[test]
+    fn a_sweep_keeps_the_scoped_completeness_memo_of_a_retained_root() {
+        // A delegate memoizes "I hold all of this" under `Scope::memo_key`,
+        // not under the bare root — so retaining the roots alone dropped every
+        // scoped answer on every pass, and a delegate re-walked its whole
+        // in-scope trie after each five-minute cycle.
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let root = publish(&store, &[("a", 1), ("b", 2)]);
+        store
+            .put_head(
+                Slot::Complete,
+                &SignedHead::sign(&key, origin(), 1, root, 0),
+                0,
+                0,
+            )
+            .unwrap();
+        store.set_local_scope(Some(&["s".to_string()])).unwrap();
+        let scoped = store.local_trie_scope().unwrap().memo_key(root);
+        assert_ne!(scoped, root, "a scoped memo is keyed by more than the root");
+        store.note_complete(&scoped).unwrap();
+
+        store.gc_trie().unwrap();
+        assert!(
+            store.is_known_complete(&scoped).unwrap(),
+            "the sweep dropped the memo for a root it just marked from"
+        );
     }
 
     #[test]

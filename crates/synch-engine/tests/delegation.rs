@@ -726,3 +726,163 @@ async fn revocation_is_deletion_and_cuts_the_delegate_off() {
     );
     assert!(issuer.store.delegations(now_ns()).unwrap().is_empty());
 }
+
+/// `GetValues` refuses on coverage, not only on position.
+///
+/// The two handlers have to draw the same boundary. `GetNodes` applies the
+/// position check *and* `Scope::admits_node`, because a node sitting at an
+/// admitted position can still describe a key that runs out of scope — a leaf
+/// spells the rest of its key, and that key's value is the record. `GetValues`
+/// applied only the position check, so the node one handler redacted was the
+/// node the other served the contents of, for the price of knowing a hash the
+/// delegate holds honestly.
+#[tokio::test]
+async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    // A withheld space's own manifest record, which §5.5 names directly: it
+    // carries another space's entry count and the description its origin keeps
+    // it under. Padded past `INLINE_VALUE_MAX` so the value sits out of line
+    // and is fetched by `GetValues` rather than carried inside its node.
+    let info = synch_core::SpaceInfo {
+        v: synch_core::RECORD_VERSION,
+        description: "w".repeat(synch_core::INLINE_VALUE_MAX * 4),
+        entry_count: 9,
+    };
+    let record = postcard::to_stdvec(&info).unwrap();
+    // Only the withheld space's manifest is published, which is what puts its
+    // leaf high enough to matter: with nothing else under `m:` the trie
+    // collapses, and the leaf carrying the record sits on the very spine the
+    // grant's own `m:` keys run through. An admitted position holding a node
+    // whose coverage is not admitted is the whole shape of the leak.
+    issuer.publish(
+        1,
+        &[],
+        &[
+            delegation(&delegate.key(), &["photos"]),
+            (
+                synch_core::space_info_key("finance").unwrap(),
+                record.clone(),
+            ),
+        ],
+    );
+    let root = issuer.root();
+
+    // Walk the issuer's trie as a full member would, and find the withheld
+    // leaf together with the position it sits at.
+    let empty = synch_mpt::MemStore::new();
+    let mut walk = synch_mpt::MissingWalk::new(root);
+    let mut nodes: Vec<(Vec<u8>, Hash)> = Vec::new();
+    loop {
+        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for (path, hash) in &batch.nodes {
+            nodes.push((path.clone(), *hash));
+            let bytes = synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
+                .unwrap()
+                .unwrap();
+            synch_mpt::NodeStore::put_node(&empty, hash, &bytes).unwrap();
+        }
+        for (_, hash) in &batch.values {
+            let bytes = synch_mpt::NodeStore::get_value(issuer.store.as_ref(), hash)
+                .unwrap()
+                .unwrap();
+            synch_mpt::NodeStore::put_value(&empty, hash, &bytes).unwrap();
+        }
+        walk.resume();
+    }
+
+    // The node that carries the withheld payload, at a position the delegate's
+    // scope admits: the spine. That pairing is the whole attack — an admitted
+    // position holding a node whose coverage is not admitted.
+    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let withheld = Hash::new(&record);
+    let holder = nodes
+        .iter()
+        .find(|(path, hash)| {
+            scope.admits_path(path)
+                && synch_mpt::NodeStore::get_node(&empty, hash)
+                    .unwrap()
+                    .map(|bytes| {
+                        synch_mpt::TrieNode::decode(&bytes)
+                            .map(|n| n.value_hashes().contains(&withheld))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        })
+        .cloned();
+    let Some((path, _)) = holder else {
+        panic!("the withheld value sits at no admitted position; test is vacuous");
+    };
+
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    let answer = client
+        .get_values(root, &[(path, withheld)])
+        .await
+        .expect("the request itself is well formed");
+    assert!(
+        answer.values.is_empty(),
+        "a withheld record was served by a handler that checked only the position"
+    );
+    assert_eq!(answer.missing, vec![withheld]);
+}
+
+/// One out-of-scope position refuses that position, not the whole batch.
+///
+/// The usual cause is honest lag, not probing: a delegation widens, the
+/// delegate learns its new scope from whichever peer is serving it, and every
+/// peer that has not yet replicated the new record still enforces the old one.
+/// Failing the request outright turned that into an aborted exchange for every
+/// origin in the round — including the ones neither side disagrees about — and
+/// it self-heals a moment later, so the cost bought nothing.
+#[tokio::test]
+async fn one_out_of_scope_position_does_not_refuse_the_rest_of_the_batch() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"granted"),
+            ("finance", "q3.pdf", b"withheld"),
+        ],
+        &[delegation(&delegate.key(), &["photos"])],
+    );
+    let root = issuer.root();
+
+    // The root node, at the one position every scope admits, asked for
+    // alongside a position this delegate has no claim to.
+    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let outside = synch_mpt::Nibbles::from_bytes(b"f:finance/")
+        .as_slice()
+        .to_vec();
+    assert!(
+        !scope.admits_path(&outside),
+        "the position must fail the scope test"
+    );
+
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    let answer = client
+        .get_nodes(root, &[(Vec::new(), root), (outside, root)])
+        .await
+        .expect("one refused position must not fail the request");
+    assert_eq!(
+        answer.nodes.len(),
+        1,
+        "the admitted position was answered with the refused one"
+    );
+    assert_eq!(answer.nodes[0].0, root);
+}

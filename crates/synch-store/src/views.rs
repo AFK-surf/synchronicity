@@ -496,6 +496,14 @@ impl Store {
         self.transaction(|txn| {
             txn.delete_origin_entries(origin)?;
             txn.delete_origin_providers(origin)?;
+            // `d:` records materialize into `bindings` exactly as `f:` and
+            // `b:` materialize into the two tables above, so a rebuild that
+            // reset only those two was not a rebuild of everything the diff
+            // writes. A delegated binding whose record has since left the trie
+            // survived the pass that exists to remove precisely that — which
+            // made `doctor --rebuild` unable to repair the one table where a
+            // stale row grants trust.
+            txn.delete_origin_delegations(origin)?;
             txn.materialize_diff(origin, Hash::EMPTY, root)
         })
     }
@@ -966,6 +974,19 @@ impl Txn<'_> {
         )?)
     }
 
+    /// Deletes every delegated binding an origin issued, inside the
+    /// transaction.
+    ///
+    /// The third table `materialize_diff` writes, and the one a rebuild used
+    /// to leave standing. Scoped by `issuer`, so it removes what this origin
+    /// granted and never a binding some other origin issued for the same key.
+    pub fn delete_origin_delegations(&self, issuer: &OriginId) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM bindings WHERE source = 'delegated' AND issuer = ?1",
+            params![issuer.canonical()],
+        )?)
+    }
+
     /// Deletes every provider row for an origin, inside the transaction.
     pub fn delete_origin_providers(&self, origin: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(
@@ -1021,6 +1042,20 @@ fn apply_change(
                 let bytes = change.new.expect("non-delete change has a value");
                 let entry: FileEntry = postcard::from_bytes(bytes)
                     .map_err(|e| StoreError::Decode(format!("f: record: {e}")))?;
+                // A record from a future schema is refused rather than
+                // half-read. postcard ignores trailing bytes, so a v2 entry
+                // with a field appended decodes as a v1 entry with that field
+                // missing — silently, and into the table the mirrors write
+                // from. `Decode` is an origin fault, so the origin that
+                // published it is contained and the rest of the round is
+                // unaffected.
+                if !synch_core::record::is_supported_version(entry.v) {
+                    return Err(StoreError::Decode(format!(
+                        "f: record is schema version {}, past the {} this build reads",
+                        entry.v,
+                        synch_core::record::RECORD_VERSION
+                    )));
+                }
                 put_entry_in(tx, origin, &space, &path, &entry)?;
             }
         }
@@ -1040,6 +1075,13 @@ fn apply_change(
                 let bytes = change.new.expect("non-delete change has a value");
                 let ad: BlobAd = postcard::from_bytes(bytes)
                     .map_err(|e| StoreError::Decode(format!("b: record: {e}")))?;
+                if !synch_core::record::is_supported_version(ad.v) {
+                    return Err(StoreError::Decode(format!(
+                        "b: record is schema version {}, past the {} this build reads",
+                        ad.v,
+                        synch_core::record::RECORD_VERSION
+                    )));
+                }
                 put_provider_in(tx, &root, origin, &ad)?;
             }
         }
@@ -1501,6 +1543,79 @@ mod tests {
             42
         );
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rematerialize_rebuilds_the_delegated_bindings_too() {
+        let (_d, store) = store();
+        let issuer = origin_named("nas");
+        let subject = iroh_base::SecretKey::generate().public();
+        let trie = Trie::new(&store);
+        let delegation = synch_core::Delegation {
+            v: synch_core::RECORD_VERSION,
+            spaces: vec!["photos".to_string()],
+            not_after: synch_core::MIN_TRUSTED_NS + 86_400_000_000_000,
+            note: None,
+        };
+        let with = trie
+            .insert(
+                Hash::EMPTY,
+                &synch_core::delegation_key(&subject),
+                &postcard::to_stdvec(&delegation).unwrap(),
+            )
+            .unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&issuer, Hash::EMPTY, with))
+            .unwrap();
+        let delegated = |store: &Store| {
+            store
+                .bindings()
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.source == crate::BindingSource::Delegated)
+                .count()
+        };
+        assert_eq!(delegated(&store), 1);
+
+        // The delegation is revoked in the trie — the key is simply gone — but
+        // the rebuild is asked to derive state from a root that predates
+        // nothing else. `bindings` is the third table `materialize_diff`
+        // writes, so a rebuild that reset only `entries` and `blob_providers`
+        // left the granted trust standing, and `doctor --rebuild` could not
+        // repair the one table where a stale row grants something.
+        let without = trie
+            .remove(with, &synch_core::delegation_key(&subject))
+            .unwrap();
+        store.rematerialize(&issuer, without).unwrap();
+        assert_eq!(
+            delegated(&store),
+            0,
+            "a rebuild left a revoked delegation in the trust table"
+        );
+    }
+
+    #[test]
+    fn a_record_from_a_future_schema_is_refused_rather_than_half_read() {
+        let (_d, store) = store();
+        let o = origin_named("nas");
+        let trie = Trie::new(&store);
+        // postcard ignores trailing bytes, so a v2 record with a field
+        // appended decodes cleanly as the current shape with the new field
+        // dropped. The stamp is the only thing that can tell the difference.
+        let mut entry = FileEntry::file(42, 7, Hash::new(b"content"), 1);
+        entry.v = synch_core::RECORD_VERSION + 1;
+        let root = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("s", "f").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
+            .unwrap();
+        let out = store.transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, root));
+        assert!(
+            matches!(out, Err(StoreError::Decode(_))),
+            "a future record materialized as though it were current: {out:?}"
+        );
     }
 
     #[test]

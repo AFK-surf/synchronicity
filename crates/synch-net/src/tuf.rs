@@ -266,7 +266,23 @@ impl PinState {
     pub fn log_keys(&self) -> Option<LogKeys> {
         match self.trusted_root.is_empty() {
             true => None,
-            false => tlog_keys(&self.trusted_root).ok(),
+            // A `None` here is not the same `None` as the line above: it sends
+            // the caller back to the *embedded* bootstrap set, so an accepted
+            // trusted root this build cannot parse silently un-does every pin
+            // update ever applied. That is a downgrade, and it used to happen
+            // without a word. It still resolves the same way — falling back is
+            // better than having no pins — but it says so now.
+            false => match tlog_keys(&self.trusted_root) {
+                Ok(keys) => Some(keys),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "the accepted trusted root does not parse; \
+                         falling back to the embedded pin set"
+                    );
+                    None
+                }
+            },
         }
     }
 
@@ -1185,8 +1201,18 @@ impl Root {
         })?;
         let authorized: BTreeSet<&String> = keyids.iter().collect();
         let mut signed: BTreeSet<&str> = BTreeSet::new();
+        // Every keyid a verification was *attempted* for, which is not the
+        // same set as the ones that verified. Skipping on `signed` alone
+        // short-circuits a repeated keyid only once it has succeeded, so a
+        // file repeating one authorized keyid with a signature that fails paid
+        // for a fresh P-256 verification per copy — and the signature list is
+        // bounded only by the document, so one hostile mirror response bought
+        // tens of thousands of them. A keyid gets one attempt either way, so
+        // the first occurrence is the one that counts — a repeated keyid is
+        // malformed input, and no valid file needs a second try at one.
+        let mut tried: BTreeSet<&str> = BTreeSet::new();
         for (keyid, signature) in &meta.signatures {
-            if signed.contains(keyid.as_str()) || !authorized.contains(keyid) {
+            if !authorized.contains(keyid) || !tried.insert(keyid.as_str()) {
                 continue;
             }
             let Some(key) = self.keys.get(keyid) else {
@@ -1463,12 +1489,21 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
     let minute = number(14, 16)?;
     let second = number(17, 19)?;
     // 60 is a leap second, which RFC 3339 §5.6 admits; 61 is not a time.
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // The day is checked against the month it is in, not against 31. The
+    // conversion below rolls an overlong day forward — `2026-02-31` becomes
+    // March 3rd — and every field this parser reads is an *expiry*, so
+    // accepting one silently extended the metadata's life by the overflow.
+    // Small, but it is the one direction an expiry must never move on its own.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let last = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => 28 + i64::from(leap),
+    };
+    if !(1..=last).contains(&day) {
         return None;
     }
     // Whatever follows the seconds is a fraction, a zone, or both.
@@ -1585,8 +1620,29 @@ mod tests {
             "2026-11-20T135818ZZZ",
             "2026-11-20T13:58:61Z",
             "2026-11-20T13:58:99Z",
+            // A day that does not exist in the month it names. The conversion
+            // rolls one forward — Feb 31st becomes March 3rd — and every field
+            // this parser reads is an expiry, so accepting one silently
+            // extended the metadata's life by the overflow.
+            "2026-02-31T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            // 2026 is not a leap year; 2024 is, and 2100 is not.
+            "2026-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
         ] {
             assert_eq!(parse_rfc3339(broken), None, "{broken:?} must not parse");
+        }
+        // The leap days that do exist still parse.
+        for real in [
+            "2024-02-29T00:00:00Z",
+            "2000-02-29T00:00:00Z",
+            "2026-01-31T00:00:00Z",
+            "2026-04-30T00:00:00Z",
+        ] {
+            assert!(parse_rfc3339(real).is_some(), "{real:?} must parse");
         }
     }
 

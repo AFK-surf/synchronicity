@@ -398,6 +398,17 @@ impl MissingWalk {
             // grant: inside it there is nothing a peer could rightly refuse,
             // and treating a refusal there as satisfied would let this node
             // call a trie complete that it does not hold.
+            //
+            // It cannot be tightened to `admits_path` — the child filter below
+            // already drops every position the scope does not admit, so the
+            // walk only ever asks about admitted ones, and the memo would
+            // never fire. That is not a loose end but the shape of the
+            // problem: a refusal arrives as a bare hash, and an honest one (an
+            // `Ext` whose prefix runs out of scope, a `Leaf` whose key does)
+            // is indistinguishable here from a branch that leads back into the
+            // grant. The distinction is only visible where the node is —
+            // `Scope::admits_node`, which no longer refuses a branch it can
+            // serve.
             if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash)? {
                 continue;
             }

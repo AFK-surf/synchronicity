@@ -392,7 +392,8 @@ impl MptProtocol {
                     // payload this store holds may go — so it is answered by
                     // hash exactly as it always was, and the descent that finds
                     // the holder is not paid for at all.
-                    let holders = match store.scope_for_key(&peer, now_ns())?.is_full() {
+                    let scope = store.scope_for_key(&peer, now_ns())?;
+                    let holders = match scope.is_full() {
                         true => None,
                         false => Some(admit(&store, peer, root, &wants)?),
                     };
@@ -409,7 +410,23 @@ impl MptProtocol {
                             let carried =
                                 match holders[i].map(|h| store.get_node(&h)).transpose()? {
                                     Some(Some(data)) => TrieNode::decode(&data)
-                                        .map(|node| node.value_hashes().contains(&wanted.1))
+                                        .map(|node| {
+                                            // Coverage, not just position — the
+                                            // same second half `GetNodes`
+                                            // applies. A node sitting at an
+                                            // in-scope position can still
+                                            // describe a key that runs out of
+                                            // scope: a `Leaf` spells the rest
+                                            // of its key, and that key's value
+                                            // is the payload being asked for.
+                                            // Checking only the position here
+                                            // let one handler redact a node the
+                                            // other served the contents of, for
+                                            // the price of knowing its value
+                                            // hash.
+                                            node.value_hashes().contains(&wanted.1)
+                                                && scope.admits_node(&wanted.0, &node)
+                                        })
                                         .unwrap_or(false),
                                     _ => false,
                                 };
@@ -544,16 +561,37 @@ fn admit(
             "requested positions against a root this node holds no head for".to_string(),
         ));
     }
-    for (path, _) in wants {
-        if !scope.admits_path(path) {
-            tracing::warn!(
-                peer = %peer.fmt_short(),
-                "refusing a trie request outside the peer's scope"
-            );
-            return Err(NetError::Unexpected(
-                "requested a trie position outside this peer's scope".to_string(),
-            ));
-        }
+    // An out-of-scope position is refused as a position, not as a batch.
+    //
+    // Failing the whole request was too blunt for what is usually an honest
+    // disagreement: a delegation widens, the delegate learns its new scope
+    // from the peer serving it, and every peer that has not yet replicated the
+    // new record still holds the old one. Erroring turned that lag into an
+    // aborted exchange for *every* origin in the round, including the ones
+    // neither side disagrees about — and it self-heals a moment later, so the
+    // cost was paid for nothing. Resolving to `None` refuses exactly the
+    // position asked about, which the caller already reports as holding
+    // nothing, and leaves the rest of the batch to be answered.
+    //
+    // Nothing is conceded by the downgrade: a refused position is served no
+    // more than it was before, and the log line still names the peer.
+    let mut refused = 0usize;
+    let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
+    let admitted: Vec<bool> = paths
+        .iter()
+        .map(|path| {
+            let ok = scope.admits_path(path);
+            refused += usize::from(!ok);
+            ok
+        })
+        .collect();
+    if refused > 0 {
+        tracing::warn!(
+            peer = %peer.fmt_short(),
+            refused,
+            of = wants.len(),
+            "refusing trie positions outside the peer's scope"
+        );
     }
     // For a scoped peer the position is the *only* authorization, so what is
     // served is what the descent found and never what the request claimed.
@@ -565,8 +603,12 @@ fn admit(
     // them for the price of naming an in-scope position that happens to be
     // empty. A position that resolves to nothing holds nothing, and that is the
     // answer.
-    let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
-    Ok(Trie::new(store).resolve_paths(root, &paths)?)
+    let resolved = Trie::new(store).resolve_paths(root, &paths)?;
+    Ok(resolved
+        .into_iter()
+        .zip(admitted)
+        .map(|(at, ok)| ok.then_some(at).flatten())
+        .collect())
 }
 
 /// Bounds one positioned batch on both axes.
