@@ -50,8 +50,9 @@ pub enum EngineError {
     #[error(
         "{domain} does not name this node yet — publish a record for it:\n  \
          _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"\n\
-         or, if this node is a delegate and is not meant to be named by that \
-         zone, re-run `synch domain set {domain} --delegate`",
+         this node waits on a reduced control socket until it does; if it is a \
+         delegate and is not meant to be named by that zone, re-run \
+         `synch domain set {domain} --delegate`",
         node_id.to_z32()
     )]
     Unidentified {

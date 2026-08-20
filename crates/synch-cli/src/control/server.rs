@@ -1012,7 +1012,7 @@ async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames)
             out.line(format!("membership domain is {name}")).await?;
             out.line("takes effect at the next `synch daemon run`")
                 .await?;
-            for line in domain_set_advice(&name, pending.node_id) {
+            for line in domain_set_advice(&name, pending.node_id, delegate) {
                 out.line(line).await?;
             }
         }
@@ -1087,19 +1087,35 @@ async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames)
 
 /// What an operator has to do about a membership domain they just set (§3.1).
 ///
-/// A zone names its members; setting the domain does not ask to be named. So
-/// the node that has just been pointed at a zone with no record for its key
-/// will come back up with no name, and the daemon will wait — correctly, and
-/// unhelpfully, if the operator has already walked away. Both handlers say
-/// this, because a node without a name serves the reduced socket and a node
-/// with one serves the full one, and the advice is the same either way.
-fn domain_set_advice(domain: &str, node_id: NodeId) -> Vec<String> {
+/// A zone names its members; setting the domain does not ask to be named. So a
+/// node pointed at a zone with no record for its key comes back up with no
+/// name and waits — correctly, and unhelpfully, if the operator has already
+/// walked away. Both handlers say this, because a node without a name serves
+/// the reduced socket and a node with one serves the full one.
+///
+/// Except for a delegate, which is *defined* by that zone not naming it
+/// (§3.5). Telling it to publish a record would contradict the flag the
+/// operator just passed, so it is told what its own case actually needs.
+fn domain_set_advice(domain: &str, node_id: NodeId, delegate: bool) -> Vec<String> {
+    if delegate {
+        return vec![
+            format!("this node is a delegate of {domain}: it resolves that zone's members and"),
+            "expects no record naming itself, so it keeps its device key as its name".into(),
+            format!(
+                "an issuer in {domain} grants it spaces with `synch delegate add {}`",
+                node_id.to_z32()
+            ),
+            "`synch domain set <domain>` without --delegate if it should be named after all".into(),
+        ];
+    }
     vec![
         format!("{domain} must name this key, or this node comes up with no name and waits:"),
         format!(
             "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
             node_id.to_z32()
         ),
+        "  (or `synch domain set {domain} --delegate` if it is not meant to be named)"
+            .replace("{domain}", domain),
         "`synch domain clear` returns this node to its device key as its name".into(),
     ]
 }
@@ -1594,13 +1610,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?
             };
             out.line(format!("membership domain is {domain}")).await?;
-            if delegate {
-                out.line(
-                    "this node is a delegate of that zone: it resolves the zone's members \
-                     and expects no record naming itself",
-                )
-                .await?;
-            }
             if let Some(warning) = warning {
                 out.line(warning).await?;
             }
@@ -1612,12 +1621,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line("takes effect at the next `synch daemon run`")
                 .await?;
             // Said here, while the operator is still at the keyboard, because
-            // the consequence lands at the next start: a zone that does not
-            // name this key leaves the node with nothing to publish under, and
-            // `daemon run` then waits rather than serving. The record is the
-            // fix and the clear is the way back, so both belong with the
-            // change that makes them necessary.
-            for line in domain_set_advice(&domain, node.node_id()) {
+            // the consequence lands at the next start — and what that
+            // consequence *is* depends on the flag they just passed, which is
+            // why the advice takes it.
+            for line in domain_set_advice(&domain, node.node_id(), delegate) {
                 out.line(line).await?;
             }
         }

@@ -449,9 +449,10 @@ pub enum DomainCommand {
         /// This node is a delegate: it belongs to the zone but is not named
         /// by it, so no record for its key is expected (§3.5).
         ///
-        /// Without this, a zone that answers and does not name this node is a
-        /// refusal to start — because on a first start that is
-        /// indistinguishable from a record that has not propagated yet.
+        /// Without this, a zone that answers and does not name this node leaves
+        /// the daemon waiting on a reduced socket for a record to appear —
+        /// because on a first start that is indistinguishable from a record
+        /// that has not propagated yet.
         #[arg(long)]
         delegate: bool,
     },
