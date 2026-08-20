@@ -212,7 +212,6 @@ ok "litestream restored a copy of the live database"
 env -u CP_KEY_FILE -u CP_ENDPOINTS -u CP_NS_HOSTS \
   CP_ROLE=replica \
   CP_DB_PATH="$WORKDIR/replica-db/cp.db" \
-  CP_DASHBOARD=on \
   CP_PRIMARY_URL="http://127.0.0.1:$PRIMARY_HTTP" \
   CP_BROWSE=on \
   CP_PUBLIC_URL="http://127.0.0.1:$REPLICA_HTTP" \

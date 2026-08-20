@@ -67,13 +67,12 @@ fn harness_sized(pool_size: Int) -> Harness {
         publish.publish_in_tx(conn, csk, now, actor, change)
       },
       fn() { Nil },
-      None,
     )
   Harness(
     router.Context(
       "anchor",
       "ds",
-      Some(router.Writable(auth)),
+      router.Writable(auth),
       router.ServingZone(serve.Serving(dns_pool, apex)),
       None,
     ),
@@ -123,11 +122,8 @@ fn with_auth(
   h: Harness,
   change: fn(auth_api.AuthContext) -> auth_api.AuthContext,
 ) -> Harness {
-  let assert Some(router.Writable(auth)) = h.ctx.api
-  Harness(
-    ..h,
-    ctx: router.Context(..h.ctx, api: Some(router.Writable(change(auth)))),
-  )
+  let assert router.Writable(auth) = h.ctx.api
+  Harness(..h, ctx: router.Context(..h.ctx, api: router.Writable(change(auth))))
 }
 
 pub fn auth_methods_lists_only_configured_test() {
@@ -1455,13 +1451,10 @@ pub fn one_request_needs_one_connection_test() {
 /// exactly what the primary would, and any difference is the router's doing
 /// rather than the data's.
 fn read_only(h: Harness, primary_url: String) -> Harness {
-  let assert Some(router.Writable(auth)) = h.ctx.api
+  let assert router.Writable(auth) = h.ctx.api
   Harness(
     ..h,
-    ctx: router.Context(
-      ..h.ctx,
-      api: Some(router.ReadOnly(auth.reads, primary_url)),
-    ),
+    ctx: router.Context(..h.ctx, api: router.ReadOnly(auth.reads, primary_url)),
   )
 }
 
@@ -1660,67 +1653,13 @@ pub fn a_read_only_node_serves_the_browse_surface_test() {
   assert string.contains(simulate.read_body(flip), "read-only-replica")
 }
 
-/// A fleet needs one session readable at every node's own name, and a
-/// host-only cookie is by definition not.
-///
-/// The attribute has to be on the cookie that *clears* the session as well as
-/// the one that creates it: a `Set-Cookie` with a different `Domain` is a
-/// different cookie, so a logout without it would leave the fleet-wide one in
-/// place and signed in. And the cookie has to stay one wisp still reads —
-/// this sets it by hand to add an attribute wisp's own setter has no
-/// parameter for, so the signature is the part that must not have drifted.
-pub fn a_fleet_session_cookie_carries_its_domain_test() {
-  let h = harness()
-  let cookie_of = fn(resp: wisp.Response) {
-    let assert Ok(header) = list.key_find(resp.headers, "set-cookie")
-    header
-  }
-
-  // Host-only by default: one node, one name, nothing to widen.
-  let bare = cookie_of(call(h, authed(h, http.Post, "/api/logout")))
-  assert !string.contains(bare, "Domain=")
-
-  let fleet =
-    with_auth(h, fn(auth) {
-      auth_api.AuthContext(..auth, cookie_domain: Some("sync.test"))
-    })
-  let widened = cookie_of(call(fleet, authed(fleet, http.Post, "/api/logout")))
-  assert string.contains(widened, "Domain=sync.test")
-  // Still the clearing cookie it was, and still signed the way wisp signs.
-  assert string.contains(widened, "Max-Age=0")
-  assert string.contains(widened, "cp_session=")
-  assert string.contains(widened, "HttpOnly")
-
-  // And it is wisp's cookie with an attribute added, not a second cookie
-  // format: with no domain to widen to, this setter and `wisp.set_cookie`
-  // produce the same header byte for byte — signature, `Secure`, `HttpOnly`,
-  // `SameSite` and all. That equality is what says the value stays one
-  // `wisp.get_cookie` reads back.
-  let req = simulate.request(http.Get, "/")
-  let header_of = fn(resp: wisp.Response) {
-    let assert Ok(header) = list.key_find(resp.headers, "set-cookie")
-    header
-  }
-  let wisps =
-    wisp.response(200)
-    |> wisp.set_cookie(req, session.cookie_name, "tok", wisp.Signed, 60)
-  let ours =
-    wisp.response(200)
-    |> auth_api.set_session_cookie(req, None, "tok", 60)
-  assert header_of(ours) == header_of(wisps)
-  let widened =
-    wisp.response(200)
-    |> auth_api.set_session_cookie(req, Some("sync.test"), "tok", 60)
-  assert string.contains(header_of(widened), "Domain=sync.test")
-}
-
 pub fn with_db_discards_conn_on_panic_test() {
   // A panic inside a request handler must not leak the connection: wisp
   // rescues crashes, so the process survives — only with_db's deferred
   // close stands between a panicking handler and a csqlite process
   // holding the write lock for the life of the HTTP connection.
   let h = harness()
-  let assert router.Context(_, _, Some(router.Writable(auth)), _, _) = h.ctx
+  let assert router.Context(_, _, router.Writable(auth), _, _) = h.ctx
   let _ =
     exception.rescue(fn() {
       auth_api.with_db(auth, fn(conn) {
@@ -1782,18 +1721,14 @@ pub fn skill_md_is_served_by_every_role_test() {
   // Enough of the document to know it is the guide and not, say, index.html.
   assert string.contains(body(served), "synch daemon run")
 
-  // Role-agnostic, and that means all three surfaces — not just the two that
-  // existed when the route was written. A DNS-only replica 404s every
-  // product route and the SPA fallback; a read-only one answers the reads and
-  // refuses the writes; the primary answers everything. This URL is the same
-  // document on each, which is the only property that makes it worth handing
-  // to an operator who may reach any node.
-  let dns_only = Harness(..h, ctx: router.Context(..h.ctx, api: None))
-  list.each([dns_only, read_only(h, "https://sync.test")], fn(other) {
-    let elsewhere = call(other, simulate.request(Get, "/SKILL.md"))
-    assert elsewhere.status == 200
-    assert body(elsewhere) == body(served)
-  })
+  // Role-agnostic, so a read-only node serves the same document: it needs no
+  // session, no writable database and no zone key, and an operator pointed at
+  // any node of a deployment gets the same guide from the same URL. That is
+  // the only property that makes the URL worth handing out.
+  let replica = read_only(h, "https://sync.test")
+  let elsewhere = call(replica, simulate.request(Get, "/SKILL.md"))
+  assert elsewhere.status == 200
+  assert body(elsewhere) == body(served)
 
   // Read-only: anything but a GET is a refusal, not a fallthrough.
   assert call(h, authed(h, Post, "/SKILL.md")).status == 405

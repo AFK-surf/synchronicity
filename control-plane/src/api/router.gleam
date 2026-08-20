@@ -51,11 +51,9 @@ pub type Context {
     /// Empty in external mode — there is no zone key of ours to anchor.
     anchor: String,
     ds: String,
-    /// The product API this node mounts, or `None` for a node that serves
-    /// DNS and health alone — a replica with `CP_DASHBOARD` off, which is
-    /// the default and the shape every replica had before the switch
-    /// existed.
-    api: Option(Api),
+    /// The product API this node mounts. Every node mounts one; which half
+    /// is the only question.
+    api: Api,
     /// Read-only serving context (pool + apex) on serving roles. A replica
     /// needs no reload signal: every checkout reopens the database file,
     /// so an atomically renamed replacement is picked up on next use.
@@ -117,34 +115,25 @@ pub fn handle(req: Request, ctx: Context) -> Response {
     // read-only node offers no method and names the node that does.
     ["api", "auth", "methods"] ->
       case ctx.api, req.method {
-        Some(Writable(auth)), Get -> auth_api.methods(Some(auth), "")
-        Some(ReadOnly(_, primary_url)), Get ->
-          auth_api.methods(None, primary_url)
+        Writable(auth), Get -> auth_api.methods(Some(auth), "")
+        ReadOnly(_, primary_url), Get -> auth_api.methods(None, primary_url)
         _, _ -> wisp.not_found()
       }
     ["auth", ..] | ["api", ..] ->
-      case ctx.api {
-        Some(api) ->
-          // Reads first, whichever surface this is: the two mount the same
-          // handlers over the same tables, so a route that appears in both
-          // is written once and cannot drift between them.
-          case read_routes(req, readable(api), ctx.browse) {
-            Some(response) -> response
-            None ->
-              case api {
-                Writable(auth) -> write_routes(req, auth, ctx.browse)
-                ReadOnly(_, primary_url) -> elsewhere(req, primary_url)
-              }
+      // Reads first, whichever surface this is: the two mount the same
+      // handlers over the same tables, so a route that appears in both is
+      // written once and cannot drift between them.
+      case read_routes(req, readable(ctx.api), ctx.browse) {
+        Some(response) -> response
+        None ->
+          case ctx.api {
+            Writable(auth) -> write_routes(req, auth, ctx.browse)
+            ReadOnly(_, primary_url) -> elsewhere(req, primary_url)
           }
-        None -> wisp.not_found()
       }
-    _ ->
-      case ctx.api {
-        // The dashboard ships with the API, on either surface: a node that
-        // answers the reads serves the pages that make them.
-        Some(_) -> static.serve(req, wisp.not_found)
-        None -> wisp.not_found()
-      }
+    // The dashboard ships with the API, on either surface: a node that
+    // answers the reads serves the pages that make them.
+    _ -> static.serve(req, wisp.not_found)
   }
 }
 

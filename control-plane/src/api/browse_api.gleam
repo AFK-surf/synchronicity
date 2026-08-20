@@ -8,16 +8,21 @@
 //// Space and path travel as query parameters, never path segments: a file
 //// path may contain anything, which is the same lesson the S3 gateway learnt
 //// when it stopped putting keys through the CLI's text parser.
+////
+//// Reads are not recorded. A browse call is a read of an operator's own
+//// files through a tunnel their own daemon opened, and the durable half of
+//// the feature is the switch that permits it — `networks.browse_enabled`,
+//// whose every flip *is* audited. A per-download row would be a log of
+//// ordinary use, written on whichever node happened to serve it.
 
 import api/agent.{type Session}
 import api/auth_api.{type AuthContext}
 import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
-import api/middleware.{error_json, now_unix}
+import api/middleware.{error_json}
 import api/reads.{type Reads}
 import auth/session.{type Session as UserSession}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name}
-import gleam/io
 import gleam/json.{type Json}
 import gleam/list
 import gleam/result
@@ -455,57 +460,4 @@ fn version_json(version: agent.Version) -> Json {
     #("seq", json.int(version.seq)),
     #("attestors", json.array(version.attestors, json.string)),
   ])
-}
-
-/// Records one download in the org's audit trail.
-///
-/// The row names the user, the network, the space, the path, the version root
-/// served and the bytes that reached the client — enough to answer "who read
-/// what" from the same table and the same UI the org already reads.
-///
-/// **A failure to record is reported, never swallowed.** The write cannot
-/// fail the download — the bytes have already gone, and refusing after the
-/// fact would only make the audit trail's absence *and* a confusing error —
-/// so it stays advisory. But a node serving a read-only copy (a replica with
-/// `CP_DASHBOARD=on`) cannot write this row at all, and an audit trail that
-/// quietly stops covering a whole node is worse than one an operator knows
-/// to collect from the service log. The line carries what the row would
-/// have.
-pub fn audit_download(
-  db: pool.Pool,
-  user_id: String,
-  org_id: String,
-  network: String,
-  space: String,
-  path: String,
-  root: String,
-  bytes: Int,
-  outcome: String,
-) -> Nil {
-  let detail =
-    json.object([
-      #("network", json.string(network)),
-      #("space", json.string(space)),
-      #("path", json.string(path)),
-      #("root", json.string(root)),
-      #("bytes", json.int(bytes)),
-      #("outcome", json.string(outcome)),
-      #("at", json.int(now_unix())),
-    ])
-  let written =
-    pool.with_connection(db, fn(conn) {
-      audit(conn, user_id, org_id, "browse.download", detail)
-    })
-  case written {
-    Ok(Ok(Nil)) -> Nil
-    _ ->
-      io.println_error(
-        "browse.download not audited (this node cannot write): actor="
-        <> user_id
-        <> " org="
-        <> org_id
-        <> " "
-        <> json.to_string(detail),
-      )
-  }
 }

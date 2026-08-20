@@ -337,9 +337,9 @@ fn serve() -> Result(Nil, String) {
 /// No reload signal exists or is needed: every pooled checkout reopens
 /// the database file, so a swapped replacement is seen on the next query.
 ///
-/// With `CP_DASHBOARD=on` it also serves the dashboard and the read half of
-/// the product API off that same copy, and with `CP_BROWSE=on` the browse
-/// surface too — daemons attach *here*, to this node's own `CP_PUBLIC_URL`,
+/// It also serves the dashboard and the read half of the product API off
+/// that same copy, and with `CP_BROWSE=on` the browse surface too — daemons
+/// attach *here*, to this node's own `CP_PUBLIC_URL`,
 /// because the registry of attached sessions is one process's memory and a
 /// node with no tunnel of its own can answer no browse question however
 /// faithfully the database replicated. The primary lists the fleet's
@@ -377,10 +377,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // The dashboard reads the same pool the nameserver does: both are
   // read-only against the same replicated file, and a second pool would only
   // double the workers competing for it.
-  let api = case cfg.dashboard {
-    True -> option.Some(router.ReadOnly(reads.Reads(dns_pool), cfg.primary_url))
-    False -> option.None
-  }
+  let api = router.ReadOnly(reads.Reads(dns_pool), cfg.primary_url)
   let browse = browse_surface(cfg, agents_name)
   let ctx =
     router.Context(
@@ -392,16 +389,10 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     )
   let handler = fn(req) { router.handle(req, ctx) }
   // The secret is the primary's, byte for byte (`CP_SESSION_SECRET`), or no
-  // cookie the primary minted verifies here. A replica with no dashboard
-  // reads no cookie at all, and the placeholder says so rather than looking
-  // like a key somebody chose badly.
-  let cookie_secret = case cfg.dashboard {
-    True -> cfg.session_secret
-    False -> "replica-has-no-sessions-0000000000000000"
-  }
+  // cookie the primary minted verifies here.
   let http =
-    wisp_mist.handler(handler, cookie_secret)
-    |> edge.handler(edge.surface(browse, dns_pool, cookie_secret))
+    wisp_mist.handler(handler, cfg.session_secret)
+    |> edge.handler(edge.surface(browse, dns_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -413,7 +404,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       cfg.db_path,
       sqlite.ReadOnly,
       db.read_pragmas,
-      replica_pool_size(cfg),
+      replica_pool_size,
     ))
     |> sup.add(server_udp.supervised(
       udp_name,
@@ -448,10 +439,8 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     <> endpoint(cfg.dns_listen)
     <> " http "
     <> endpoint(cfg.http_listen)
-    <> case cfg.dashboard {
-      True -> " — read-only dashboard, writes at " <> cfg.primary_url
-      False -> " — dns only"
-    }
+    <> " — read-only dashboard, writes at "
+    <> cfg.primary_url
     <> case cfg.browse {
       True -> " — attach at " <> agent.attach_url(cfg.public_url)
       False -> ""
@@ -463,19 +452,13 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
 
 /// How many pooled readers a replica runs.
 ///
-/// Four is what a nameserver alone needs: a DNS answer is one short read
-/// transaction out of a pre-signed table. A replica that also serves the
-/// dashboard has a second kind of caller — a browse call resolves its org on
-/// a connection, and `router.with_session` borrows one to check the cookie
-/// before the handler borrows its own — so it gets the primary's eight.
-/// Sizing them the same would let a handful of dashboard tabs queue DNS
+/// The primary's eight rather than the four a nameserver alone would need. A
+/// DNS answer is one short read out of a pre-signed table, but a replica also
+/// serves the dashboard: a browse call resolves its org on a connection, and
+/// `router.with_session` borrows one to check the cookie before the handler
+/// borrows its own. At four, a handful of dashboard tabs would queue DNS
 /// answers behind them.
-fn replica_pool_size(cfg: Config) -> Int {
-  case cfg.dashboard {
-    True -> 8
-    False -> 4
-  }
-}
+const replica_pool_size = 8
 
 fn serve_primary(cfg: Config) -> Result(Nil, String) {
   use csk <- result.try(prepare_primary(cfg))
@@ -508,13 +491,12 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       },
       // Serve mode: commit is publication; there is nobody to nudge.
       fn() { Nil },
-      cfg.cookie_domain,
     )
   let ctx =
     router.Context(
       keys.anchor_line(apex, csk.public),
       keys.ds_line(apex, csk.public),
-      option.Some(router.Writable(auth)),
+      router.Writable(auth),
       router.ServingZone(serving),
       browse,
     )
@@ -638,13 +620,12 @@ fn serve_external(
       // After commit: nudge the reconciler, so a mutation reaches the
       // provider in seconds while the hourly sweep stays the safety net.
       fn() { provider_sync.poke(sync_name) },
-      cfg.cookie_domain,
     )
   let ctx =
     router.Context(
       "",
       "",
-      option.Some(router.Writable(auth)),
+      router.Writable(auth),
       router.ExternalZone(api_pool),
       browse,
     )

@@ -80,13 +80,6 @@ pub type Config {
     /// all exist only when this is on, in the same shape an unset optional
     /// provider takes.
     browse: Bool,
-    /// Whether this node mounts the dashboard and the product API.
-    ///
-    /// Always true on the primary — the dashboard is what a primary is for.
-    /// On a replica it is `CP_DASHBOARD=on`, and what it mounts is the *read*
-    /// half: the SPA, every GET route, and the browse surface. A replica's
-    /// database is a read-only copy, so there is no write half to mount.
-    dashboard: Bool,
     /// Where the writes live, as a replica's dashboard tells its users
     /// (`CP_PRIMARY_URL`). Empty on the primary, which *is* that place.
     ///
@@ -94,17 +87,6 @@ pub type Config {
     /// to go instead is a dead end, and the one fact that resolves it — the
     /// primary's public URL — is not derivable from anything a replica holds.
     primary_url: String,
-    /// The `Domain` attribute session cookies are set with
-    /// (`CP_COOKIE_DOMAIN`), or `None` for a host-only cookie — the default,
-    /// and the only correct answer for a single-node deployment.
-    ///
-    /// A fleet whose nodes have names of their own (`ns1.sync.example`
-    /// beside `sync.example`) needs one session to be readable at all of
-    /// them, and a host-only cookie is by definition not. Set to a parent of
-    /// every node's name, it is; the trade is that every host under that
-    /// name receives the cookie, which is why it is opt-in and never derived
-    /// from the apex.
-    cookie_domain: Option(String),
     /// The control-plane endpoints the apex record names, in publication
     /// order: this node's own first, then `CP_ENDPOINTS`. Empty when
     /// `CP_BROWSE` is off, which is how the record's owner name stops
@@ -166,34 +148,20 @@ pub fn load() -> Result(Config, String) {
   let public_url =
     envoy.get("CP_PUBLIC_URL")
     |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_listen.port))
-  use dashboard <- result.try(dashboard_enabled(role))
-  use session_secret <- result.try(case role, dashboard {
-    // The secret signs session cookies, so a node that reads them needs it —
-    // and a replica needs *the primary's*, byte for byte, or every cookie the
-    // primary minted fails its signature check here and the dashboard it
-    // mounts can never be signed in to.
-    Primary, _ | Replica, True -> {
-      use secret <- result.try(required("CP_SESSION_SECRET"))
-      case string.length(secret) >= 32 {
-        True -> Ok(secret)
-        False -> Error("CP_SESSION_SECRET must be at least 32 characters")
-      }
+  // Every node serves the dashboard, so every node reads session cookies and
+  // every node needs the secret that signs them — a replica needs *the
+  // primary's*, byte for byte, or every cookie the primary minted fails its
+  // signature check here.
+  use session_secret <- result.try({
+    use secret <- result.try(required("CP_SESSION_SECRET"))
+    case string.length(secret) >= 32 {
+      True -> Ok(secret)
+      False -> Error("CP_SESSION_SECRET must be at least 32 characters")
     }
-    Replica, False ->
-      case envoy.get("CP_SESSION_SECRET") {
-        Ok(_) ->
-          Error(
-            "CP_SESSION_SECRET is only read with CP_DASHBOARD=on: a replica "
-            <> "serving DNS alone reads no cookie, and a secret that signs "
-            <> "nothing is dead config",
-          )
-        Error(Nil) -> Ok("")
-      }
   })
-  use primary_url <- result.try(primary_url(role, dashboard))
-  use cookie_domain <- result.try(cookie_domain(dashboard))
+  use primary_url <- result.try(primary_url(role))
   use smtp <- result.try(smtp_config())
-  use browse <- result.try(browse_enabled(dashboard, public_url))
+  use browse <- result.try(browse_enabled(public_url))
   use endpoints <- result.try(validated_endpoints(role, browse))
   Ok(Config(
     role,
@@ -210,44 +178,22 @@ pub fn load() -> Result(Config, String) {
     credential_pair("CP_GITHUB_CLIENT_ID", "CP_GITHUB_CLIENT_SECRET"),
     dns_mode,
     browse,
-    dashboard,
     primary_url,
-    cookie_domain,
     endpoints,
   ))
 }
 
-/// `CP_DASHBOARD`: `on` or `off` (the default), and a replica's switch alone.
-///
-/// The primary always mounts the dashboard — it is what a primary is for — so
-/// the variable there is not a knob but a claim about the service that the
-/// service does not honour, and it is refused rather than ignored.
-fn dashboard_enabled(role: Role) -> Result(Bool, String) {
-  case role, envoy.get("CP_DASHBOARD") {
-    Primary, Error(Nil) -> Ok(True)
-    Primary, Ok(_) ->
-      Error(
-        "CP_DASHBOARD is replica-only: the primary always serves the "
-        <> "dashboard, so setting it here would name a switch that does not "
-        <> "exist",
-      )
-    Replica, Error(Nil) | Replica, Ok("off") -> Ok(False)
-    Replica, Ok("on") -> Ok(True)
-    Replica, Ok(other) -> Error("CP_DASHBOARD must be on or off, got " <> other)
-  }
-}
-
 /// `CP_PRIMARY_URL`: where a replica's dashboard sends the writes it cannot do.
 ///
-/// Required with `CP_DASHBOARD=on` and refused everywhere else. A replica
-/// holds a read-only copy of the database, so signing in, creating a network
-/// and every other mutation has exactly one place it can happen; a dashboard
-/// that refuses them without naming that place is a dead end, and nothing a
-/// replica holds names it — the database records the fleet's zone, not which
-/// of its nodes took the writes.
-fn primary_url(role: Role, dashboard: Bool) -> Result(String, String) {
-  case role, dashboard {
-    Replica, True -> {
+/// Required on a replica and refused on the primary. A replica holds a
+/// read-only copy of the database, so signing in, creating a network and
+/// every other mutation has exactly one place it can happen; a dashboard that
+/// refuses them without naming that place is a dead end, and nothing a
+/// replica holds names it — the database records the deployment's zone, not
+/// which of its nodes took the writes.
+fn primary_url(role: Role) -> Result(String, String) {
+  case role {
+    Replica -> {
       use url <- result.try(required("CP_PRIMARY_URL"))
       let url = trim_trailing_slash(string.trim(url))
       case is_origin(url) {
@@ -258,56 +204,15 @@ fn primary_url(role: Role, dashboard: Bool) -> Result(String, String) {
           )
       }
     }
-    _, _ ->
+    Primary ->
       case envoy.get("CP_PRIMARY_URL") {
         Ok(_) ->
           Error(
-            "CP_PRIMARY_URL is only meaningful on a replica with "
-            <> "CP_DASHBOARD=on: it names where the writes this node refuses "
-            <> "are taken, and every other node takes its own",
+            "CP_PRIMARY_URL is replica-only: it names where the writes a node "
+            <> "refuses are taken, and the primary takes its own",
           )
         Error(Nil) -> Ok("")
       }
-  }
-}
-
-/// `CP_COOKIE_DOMAIN`: the `Domain` attribute session cookies carry.
-///
-/// Unset is a host-only cookie, which is right for one node and wrong for a
-/// fleet: `ns1.sync.example` never receives a cookie the primary set at
-/// `sync.example`, so a session minted there is invisible at every replica
-/// however faithfully the row replicated. Setting it to a name that is a
-/// parent of every node's makes one session work fleet-wide, at the price
-/// that every host under that name is sent the cookie — which is why it is
-/// the operator's decision and not derived from `CP_BASE_DOMAIN`.
-///
-/// A leading dot is accepted and dropped: RFC 6265 ignores it, and operators
-/// write it from habit.
-fn cookie_domain(dashboard: Bool) -> Result(Option(String), String) {
-  case envoy.get("CP_COOKIE_DOMAIN"), dashboard {
-    Error(Nil), _ -> Ok(None)
-    Ok(_), False ->
-      Error(
-        "CP_COOKIE_DOMAIN is only read where sessions are: this node mounts "
-        <> "no dashboard, so it sets no cookie for the attribute to appear on",
-      )
-    Ok(text), True -> {
-      let host = case string.starts_with(string.trim(text), ".") {
-        True -> string.drop_start(string.trim(text), 1)
-        False -> string.trim(text)
-      }
-      // The value lands in a `Set-Cookie` header, where a semicolon or a
-      // space would end the attribute and start another one.
-      case host != "" && record_safe(host) && !string.contains(host, ";") {
-        True -> Ok(Some(host))
-        False ->
-          Error(
-            "CP_COOKIE_DOMAIN must be a bare domain name with no whitespace "
-            <> "or semicolon: it is a Set-Cookie attribute, and either one "
-            <> "ends it early",
-          )
-      }
-    }
   }
 }
 
@@ -316,9 +221,7 @@ fn cookie_domain(dashboard: Bool) -> Result(Option(String), String) {
 /// Allowed on either role, because a tunnel is not a write: a daemon's attach
 /// is resolved against `device_keys` with a SELECT, and every browse call
 /// reads the replicated tables and then asks a node on the operator's own
-/// network. What a replica cannot do is *mint* a session, which is why the
-/// switch requires `CP_DASHBOARD=on` there — a browse API with no session to
-/// authorize it answers nobody.
+/// network.
 ///
 /// Refused on any node that has not been told its own public URL, because the
 /// apex record names that URL and a daemon signs its attach proof over it — a
@@ -326,18 +229,12 @@ fn cookie_domain(dashboard: Bool) -> Result(Option(String), String) {
 /// node names *itself* here: a replica's `CP_PUBLIC_URL` is the replica's, and
 /// the primary gathers the fleet's into the record with
 /// `CP_ENDPOINTS`.
-fn browse_enabled(dashboard: Bool, public_url: String) -> Result(Bool, String) {
+fn browse_enabled(public_url: String) -> Result(Bool, String) {
   case envoy.get("CP_BROWSE") {
     Error(Nil) | Ok("off") -> Ok(False)
     Ok("on") ->
-      case dashboard, result.is_ok(envoy.get("CP_PUBLIC_URL")) {
-        False, _ ->
-          Error(
-            "CP_BROWSE=on needs CP_DASHBOARD=on on a replica: the browse API "
-            <> "is session-gated, and a node that mounts no dashboard reads "
-            <> "no session to gate it with",
-          )
-        _, False ->
+      case result.is_ok(envoy.get("CP_PUBLIC_URL")) {
+        False ->
           Error(
             "CP_BROWSE=on needs CP_PUBLIC_URL: the apex record publishes it "
             <> "and attaching daemons sign their proof over it, so the "
@@ -345,7 +242,7 @@ fn browse_enabled(dashboard: Bool, public_url: String) -> Result(Bool, String) {
             <> public_url
             <> " would send them nowhere",
           )
-        _, True ->
+        True ->
           // The value is rendered straight into a signed apex TXT record as
           // `v=synccp1 url=<it>`, and the client parses that record as
           // whitespace-separated `key=value` pairs and requires the URL to be

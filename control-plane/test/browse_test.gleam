@@ -65,9 +65,7 @@ fn browse_env() -> Nil {
   envoy.unset("CP_BROWSE")
   envoy.unset("CP_PUBLIC_URL")
   envoy.unset("CP_ENDPOINTS")
-  envoy.unset("CP_DASHBOARD")
   envoy.unset("CP_PRIMARY_URL")
-  envoy.unset("CP_COOKIE_DOMAIN")
 }
 
 // -- the apex record ---------------------------------------------------------
@@ -202,7 +200,6 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
   envoy.unset("CP_SESSION_SECRET")
-  envoy.set("CP_DASHBOARD", "on")
   envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
   envoy.set("CP_PRIMARY_URL", "https://sync.example")
   envoy.set("CP_BROWSE", "on")
@@ -255,26 +252,24 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
   let assert Error(why) = config.load()
   assert string.contains(why, "CP_PUBLIC_URL")
 
-  // A replica may browse — the tunnel is a read and the tables are
-  // replicated — but only where it also mounts the dashboard, since every
-  // browse route is session-gated and a node with no session to read gates
-  // nothing.
+  // A replica may browse: the tunnel is a read, and the tables its attach
+  // resolves against are replicated.
   envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
-  envoy.unset("CP_SESSION_SECRET")
-  let assert Error(why) = config.load()
-  assert string.contains(why, "CP_DASHBOARD=on")
 
-  envoy.set("CP_DASHBOARD", "on")
-  envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
-  envoy.set("CP_PRIMARY_URL", "https://sync.example")
+  // It still needs the primary's URL, which is the one fact a read-only node
+  // cannot derive from a database that records the deployment's zone rather
+  // than which of its nodes holds the pen.
+  let assert Error(why) = config.load()
+  assert string.contains(why, "CP_PRIMARY_URL")
+
+  envoy.set("CP_PRIMARY_URL", "https://cp0.sync.example")
   let assert Ok(cfg) = config.load()
   assert cfg.browse
-  assert cfg.dashboard
-  assert cfg.primary_url == "https://sync.example"
-  // Its own endpoint and nobody else's: the fleet's list is the primary's to
-  // publish.
+  assert cfg.primary_url == "https://cp0.sync.example"
+  // Its own endpoint and nobody else's: the deployment's list is the
+  // primary's to publish.
   assert cfg.endpoints == ["https://ns1.sync.example"]
 
   browse_env()

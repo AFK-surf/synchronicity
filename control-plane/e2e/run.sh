@@ -122,15 +122,15 @@ import sqlite3, sys
 sqlite3.connect(sys.argv[1]).execute("PRAGMA wal_checkpoint(FULL)")
 EOF
 cp "$CP_DB_PATH" "$WORKDIR/replica.db"
-# ...and with the dashboard on, so the read half of the API is exercised
-# against a genuinely read-only copy rather than only against the primary's
-# writable one. CP_SESSION_SECRET is the primary's, which is the contract.
+# The read half of the API is exercised here against a genuinely read-only
+# copy rather than only against the primary's writable one.
+# CP_SESSION_SECRET is inherited from the primary's environment, which is the
+# contract: a replica verifies the cookies the primary minted.
 # -u CP_ENDPOINTS: that list is the primary's, and a replica that
 # sets it is describing a record it does not write — config refuses it,
 # exactly as it refuses CP_KEY_FILE here.
 env -u CP_KEY_FILE -u CP_ENDPOINTS \
   CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
-  CP_DASHBOARD=on \
   CP_PRIMARY_URL="http://127.0.0.1:$HTTP_PORT" \
   CP_BROWSE=on \
   CP_PUBLIC_URL=http://127.0.0.1:8054 \
