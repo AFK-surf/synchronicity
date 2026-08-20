@@ -135,19 +135,6 @@ pub fn bearer_token(headers: List(#(String, String))) -> Result(String, Nil) {
   }
 }
 
-/// `check_session` for a caller that already holds the connection it wants
-/// to keep using, and so has nothing to hand back first.
-pub fn require_session(
-  req: Request,
-  conn: Connection,
-  next: fn(Session) -> Response,
-) -> Response {
-  case check_session(req, conn) {
-    Ok(live) -> next(live)
-    Error(response) -> response
-  }
-}
-
 /// The refusal for a route an API key may not take.
 ///
 /// Three kinds of endpoint carry it, and they have one thing in common: each
