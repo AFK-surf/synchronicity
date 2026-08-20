@@ -68,20 +68,20 @@ pub type ZoneInput {
     /// reported rather than silent when it is not, because a cap nobody is
     /// told about is how a zone quietly stops covering a live key.
     rekor_shed: Int,
-    /// The attach endpoints the apex publishes (`_synchronicity-cp`), one
-    /// record each, or empty when `CP_BROWSE` is off and the name does not
-    /// exist at all.
+    /// The control-plane endpoints the apex publishes
+    /// (`_synchronicity-cp`), one record each, or empty when `CP_BROWSE` is
+    /// off and the name does not exist at all.
     ///
     /// A deployment fact and not a policy: it says *this base's control plane
-    /// attaches at these*, never which network may be browsed. Which network
-    /// may is `networks.browse_enabled`, enforced at each endpoint.
+    /// answers here*, never which network may be browsed. Which network may
+    /// is `networks.browse_enabled`, enforced at each endpoint.
     ///
     /// A list because the control plane is a fleet: the registry of attached
     /// daemons is one node's memory, so a node nobody has a tunnel to can
     /// answer no browse question, and every node that may be asked has to be
-    /// named. `config.browse_endpoints` builds it — this node's own URL,
-    /// then `CP_BROWSE_ENDPOINTS`.
-    browse_urls: List(String),
+    /// named. `config.endpoints` builds it — this node's own URL, then
+    /// `CP_ENDPOINTS`.
+    cp_endpoints: List(String),
   )
 }
 
@@ -119,7 +119,7 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
     txt_names,
     rekor_proofs,
     shed,
-    config.browse_endpoints(),
+    config.endpoints(),
   ))
 }
 

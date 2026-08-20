@@ -77,7 +77,7 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   are never stored.
 
   The record names **every node** of the deployment, one `v=synccp1 url=`
-  each (`CP_BROWSE_ENDPOINTS` on the primary), and a daemon opens a tunnel to
+  each (`CP_ENDPOINTS` on the primary), and a daemon opens a tunnel to
   all of them. It has to: the registry of open tunnels is one process's
   memory, so a replica no daemon attached to can answer nothing however
   current its copy of the database is.
@@ -284,7 +284,7 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_BROWSE` | both | `on` or `off` (the default). `on` mounts the daemon attach endpoint at `/agent/v1/attach`, the read-only browse API, and publishes `_synchronicity-cp.<base> TXT "v=synccp1 url=<CP_PUBLIC_URL>"` at the apex so a daemon finds this deployment from the zone it already validates. Requires `CP_PUBLIC_URL` — the record names it and attaching daemons sign their proof over it — and on a replica requires `CP_DASHBOARD=on`, since every browse route is session-gated. Per-network enablement is a separate switch (`PUT /api/orgs/:slug/networks/:net/browse/enabled`, admin) that is off for every network until an org admin turns it on, and never reaches DNS. Downloads are capped at four concurrent streams per user. |
-| `CP_BROWSE_ENDPOINTS` | primary | The fleet's *other* attach endpoints, comma- or semicolon-separated. Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>` beside this node's, and every daemon opens a standing tunnel to **each** — the registry of attached daemons is one node's memory, so a node no daemon attached to can answer no browse question however current its copy of the database is. At most 8 endpoints in total, refused at boot rather than by counting sockets. |
+| `CP_ENDPOINTS` | primary | This deployment's *other* control-plane endpoints, comma- or semicolon-separated. Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>` beside this node's `CP_PUBLIC_URL`, which is how the apex says where this base's control plane answers. Cloud attach is the first thing to dial them, and today the only one: every daemon opens a standing tunnel to **each**, because the registry of attached daemons is one node's memory and a node no daemon attached to can answer no browse question however current its copy of the database is. At most 8 endpoints in total, refused at boot rather than by counting sockets. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

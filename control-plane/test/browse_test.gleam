@@ -64,7 +64,7 @@ fn browse_env() -> Nil {
   envoy.unset("CP_NS_HOSTS")
   envoy.unset("CP_BROWSE")
   envoy.unset("CP_PUBLIC_URL")
-  envoy.unset("CP_BROWSE_ENDPOINTS")
+  envoy.unset("CP_ENDPOINTS")
   envoy.unset("CP_DASHBOARD")
   envoy.unset("CP_PRIMARY_URL")
   envoy.unset("CP_COOKIE_DOMAIN")
@@ -138,19 +138,19 @@ pub fn the_attach_record_names_every_node_of_the_fleet_test() {
     ]
 }
 
-/// The primary names the fleet; each node names only itself.
-pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
+/// The primary names the deployment; each node names only itself.
+pub fn the_endpoints_come_from_the_primarys_environment_test() {
   browse_env()
   envoy.set("CP_BROWSE", "on")
   envoy.set("CP_PUBLIC_URL", "https://sync.example/")
   envoy.set(
-    "CP_BROWSE_ENDPOINTS",
+    "CP_ENDPOINTS",
     "https://ns1.sync.example, https://ns2.sync.example/;https://ns3.sync.example",
   )
   let assert Ok(cfg) = config.load()
   // This node first, then the rest, each with its trailing slash trimmed to
   // the origin the daemon signs its attach proof over.
-  assert cfg.browse_endpoints
+  assert cfg.endpoints
     == [
       "https://sync.example",
       "https://ns1.sync.example",
@@ -161,7 +161,7 @@ pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
   // The same rules as CP_PUBLIC_URL, applied where the operator can still
   // read the message: a value the daemon would reject never reaches a signed
   // record that is cached for its TTL.
-  envoy.set("CP_BROWSE_ENDPOINTS", "ns1.sync.example")
+  envoy.set("CP_ENDPOINTS", "ns1.sync.example")
   let assert Error(why) = config.load()
   assert string.contains(why, "origin")
 
@@ -170,14 +170,14 @@ pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
   // canonicalized to one by a validator, which is an RRSIG mismatch and the
   // whole zone failing closed. Listing your own CP_PUBLIC_URL among the
   // others is an ordinary mistake, so it collapses rather than refusing.
-  envoy.set("CP_BROWSE_ENDPOINTS", "https://sync.example")
+  envoy.set("CP_ENDPOINTS", "https://sync.example")
   let assert Ok(cfg) = config.load()
-  assert cfg.browse_endpoints == ["https://sync.example"]
+  assert cfg.endpoints == ["https://sync.example"]
   // And the zone builder reads the same deduplicated list — this is the
   // path that actually reaches an RRSIG, and it does not go through the
   // boot-time validator above.
-  assert config.browse_endpoints() == ["https://sync.example"]
-  let assert Ok(rrsets) = build.build(fleet(config.browse_endpoints()))
+  assert config.endpoints() == ["https://sync.example"]
+  let assert Ok(rrsets) = build.build(fleet(config.endpoints()))
   let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
   let assert Ok(rrset) =
     list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
@@ -186,15 +186,15 @@ pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
   // Every entry costs every daemon in every network a standing tunnel, so
   // the zone does not get to decide that number freely.
   envoy.set(
-    "CP_BROWSE_ENDPOINTS",
-    list.repeat(Nil, config.max_browse_endpoints)
+    "CP_ENDPOINTS",
+    list.repeat(Nil, config.max_endpoints)
       |> list.index_map(fn(_, i) {
         "https://ns" <> int.to_string(i) <> ".sync.example"
       })
       |> string.join(","),
   )
   let assert Error(why) = config.load()
-  assert string.contains(why, "attach endpoints")
+  assert string.contains(why, "names more than")
 
   // And it is the primary's list: a replica publishes no zone, so one that
   // set this would be describing a record it does not write.
@@ -207,7 +207,7 @@ pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
   envoy.set("CP_PRIMARY_URL", "https://sync.example")
   envoy.set("CP_BROWSE", "on")
   envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
-  envoy.set("CP_BROWSE_ENDPOINTS", "https://ns2.sync.example")
+  envoy.set("CP_ENDPOINTS", "https://ns2.sync.example")
   let assert Error(why) = config.load()
   assert string.contains(why, "primary-only")
   browse_env()
@@ -275,7 +275,7 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
   assert cfg.primary_url == "https://sync.example"
   // Its own endpoint and nobody else's: the fleet's list is the primary's to
   // publish.
-  assert cfg.browse_endpoints == ["https://ns1.sync.example"]
+  assert cfg.endpoints == ["https://ns1.sync.example"]
 
   browse_env()
   envoy.set("CP_BROWSE", "maybe")

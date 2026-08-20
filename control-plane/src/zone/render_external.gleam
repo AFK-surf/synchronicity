@@ -124,9 +124,9 @@ pub fn render_gated(
   // named, and a provider holds several values at one owner name the same
   // way a served RRset does.
   let browse =
-    list.map(input.browse_urls, fn(url) {
+    list.map(input.cp_endpoints, fn(url) {
       Record(
-        rdata.browse_label <> "." <> apex,
+        rdata.cp_label <> "." <> apex,
         provider.Txt,
         ttl_data,
         rdata.synccp1_text(url),

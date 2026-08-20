@@ -5,7 +5,7 @@
 # With CP_DASHBOARD=on in replica.env it also serves the dashboard and the
 # read half of the API off that same copy, and with CP_BROWSE=on the file
 # browser — daemons attach to this node's own CP_PUBLIC_URL, which the
-# primary lists in CP_BROWSE_ENDPOINTS. Writes are refused here and named
+# primary lists in CP_ENDPOINTS. Writes are refused here and named
 # to the operator's browser as CP_PRIMARY_URL. See RUNBOOK.md "A replica
 # that also serves the dashboard".
 [Unit]

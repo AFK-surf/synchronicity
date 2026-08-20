@@ -50,7 +50,7 @@ export CP_SESSION_SECRET="e2e-only-session-secret-not-for-production"
 # node of this control plane, so a daemon must hold a tunnel to it too. The
 # record's shape is cross-validated by the real client in e2e/tests.
 export CP_BROWSE=on
-export CP_BROWSE_ENDPOINTS="http://127.0.0.1:8054"
+export CP_ENDPOINTS="http://127.0.0.1:8054"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" | tee "$WORKDIR/keygen.out"
 # Zone-file syntax for the synchronicity client's --dnssec-anchor...
@@ -115,10 +115,10 @@ cp "$CP_DB_PATH" "$WORKDIR/replica.db"
 # ...and with the dashboard on, so the read half of the API is exercised
 # against a genuinely read-only copy rather than only against the primary's
 # writable one. CP_SESSION_SECRET is the primary's, which is the contract.
-# -u CP_BROWSE_ENDPOINTS: that list is the primary's, and a replica that
+# -u CP_ENDPOINTS: that list is the primary's, and a replica that
 # sets it is describing a record it does not write — config refuses it,
 # exactly as it refuses CP_KEY_FILE here.
-env -u CP_KEY_FILE -u CP_BROWSE_ENDPOINTS \
+env -u CP_KEY_FILE -u CP_ENDPOINTS \
   CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
   CP_DASHBOARD=on \
   CP_PRIMARY_URL="http://127.0.0.1:$HTTP_PORT" \
@@ -174,7 +174,7 @@ export CP_NAS_ACTIVE=$(get_seed nas_active)
 export CP_NAS_REVOKED=$(get_seed nas_revoked)
 export CP_LAPTOP_ACTIVE=$(get_seed laptop_active)
 export CP_LAPTOP_RETIRING=$(get_seed laptop_retiring)
-export CP_EXPECTED_ENDPOINTS="$CP_PUBLIC_URL,$CP_BROWSE_ENDPOINTS"
+export CP_EXPECTED_ENDPOINTS="$CP_PUBLIC_URL,$CP_ENDPOINTS"
 cargo test --manifest-path e2e/Cargo.toml -- --nocapture
 
 echo "E2E-OK"

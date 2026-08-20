@@ -148,11 +148,11 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
   // before the fleet existed working: it reads the first record it can parse
   // and attaches to that node, where a second `url=` in one record is a
   // duplicate field it refuses outright.
-  let browse = case input.browse_urls {
+  let browse = case input.cp_endpoints {
     [] -> []
     urls -> [
       Rrset(
-        [rdata.browse_label, ..apex],
+        [rdata.cp_label, ..apex],
         wire.type_txt,
         ttl_data,
         list.map(urls, fn(url) { rdata.txt(rdata.synccp1_text(url)) }),

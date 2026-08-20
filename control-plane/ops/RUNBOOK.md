@@ -97,7 +97,7 @@ each node its own `CP_PUBLIC_URL`, and list the whole fleet on the primary:
 # primary
 CP_BROWSE=on
 CP_PUBLIC_URL=https://sync.example
-CP_BROWSE_ENDPOINTS=https://ns1.sync.example,https://ns2.sync.example
+CP_ENDPOINTS=https://ns1.sync.example,https://ns2.sync.example
 
 # ns1
 CP_ROLE=replica
@@ -149,7 +149,7 @@ primary alone and let the replicas serve the dashboard's other reads.
 | `CP_DASHBOARD` | replica | `on` mounts the dashboard and the read half of the API off the replicated copy. Off by default — a replica serves DNS alone, which is what every replica did before the switch existed. Refused on the primary, which always serves it |
 | `CP_PRIMARY_URL` | replica with `CP_DASHBOARD=on` | the primary's public URL. Required, and the one fact a read-only node cannot derive: it is what a refused write and the login screen name, and without it the dashboard is a dead end |
 | `CP_COOKIE_DOMAIN` | nodes with a dashboard | the `Domain` session cookies are set with. Unset is host-only, which is right for one node and wrong for a fleet: a cookie set at `sync.example` is never sent to `ns1.sync.example`. Set it to a parent of every node's name — the trade is that every host under that name receives the cookie |
-| `CP_BROWSE_ENDPOINTS` | primary | the fleet's *other* attach endpoints, comma- or semicolon-separated (`https://ns1.sync.example,https://ns2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL`, and every daemon opens a tunnel to each. At most 8 endpoints in total |
+| `CP_ENDPOINTS` | primary | this deployment's *other* control-plane endpoints, comma- or semicolon-separated (`https://ns1.sync.example,https://ns2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL` — the apex saying where this base's control plane answers, not a browse-specific list. Cloud attach is what dials them today, one standing tunnel per endpoint per daemon. At most 8 endpoints in total |
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |

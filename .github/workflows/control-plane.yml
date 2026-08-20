@@ -113,6 +113,39 @@ jobs:
       - run: npx vitest run
       - run: npx vite build
 
+  # The replication contract, with the tool the runbook names.
+  #
+  # `ops/RUNBOOK.md` tells operators to keep the primary in WAL mode, run
+  # `litestream replicate`, and refresh each replica with `litestream
+  # restore` into a scratch file plus an atomic rename. None of that is
+  # implemented here — it is deliberately operator-owned — so nothing ran it.
+  # `e2e-crossval` stands a replica up, but hands the file over with `cp`
+  # after an explicit checkpoint, which is a weaker thing than the documented
+  # contract in exactly the way that matters: it says nothing about a write
+  # the primary made while serving.
+  litestream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: control-plane/.tool-versions
+          version-type: strict
+          rebar3-version: "3.27.0"
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev bind9-dnsutils
+      # Pinned by digest, like the TLC jar the `tla` job fetches: a smoke
+      # test whose subject can change under it is not a smoke test.
+      - name: Fetch litestream
+        run: |
+          curl -sSL -o litestream.tar.gz \
+            https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-amd64.tar.gz
+          echo "eb75a3de5cab03875cdae9f5f539e6aedadd66607003d9b1e7a9077948818ba0  litestream.tar.gz" \
+            | sha256sum -c -
+          sudo tar xzf litestream.tar.gz -C /usr/local/bin litestream
+          litestream version
+      - run: cd control-plane && gleam deps download
+      - run: cd control-plane && ./ops/litestream-smoke.sh
+
   e2e-crossval:
     runs-on: ubuntu-latest
     steps:

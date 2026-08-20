@@ -122,7 +122,7 @@ async fn control_plane_zone_validates_and_parses() {
 /// client returns all of them.
 ///
 /// The two halves of this are written in different languages: the control
-/// plane renders one `v=synccp1 url=` record per `CP_BROWSE_ENDPOINTS` entry
+/// plane renders one `v=synccp1 url=` record per `CP_ENDPOINTS` entry
 /// (plus its own `CP_PUBLIC_URL`), and the daemon opens a tunnel to each
 /// endpoint this parses out. A disagreement about the shape would look like
 /// a fleet where only one node is ever attached — which is exactly the

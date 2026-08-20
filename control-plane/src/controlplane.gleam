@@ -343,7 +343,7 @@ fn serve() -> Result(Nil, String) {
 /// because the registry of attached sessions is one process's memory and a
 /// node with no tunnel of its own can answer no browse question however
 /// faithfully the database replicated. The primary lists the fleet's
-/// endpoints in the apex record with `CP_BROWSE_ENDPOINTS`, and every daemon
+/// endpoints in the apex record with `CP_ENDPOINTS`, and every daemon
 /// opens one tunnel per endpoint.
 fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // Anchor/DS come from the replicated public key material; this also

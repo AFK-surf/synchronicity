@@ -105,11 +105,12 @@ pub type Config {
     /// name receives the cookie, which is why it is opt-in and never derived
     /// from the apex.
     cookie_domain: Option(String),
-    /// The attach endpoints the apex record names, in publication order:
-    /// this node's own first, then `CP_BROWSE_ENDPOINTS`. Empty when
+    /// The control-plane endpoints the apex record names, in publication
+    /// order: this node's own first, then `CP_ENDPOINTS`. Empty when
     /// `CP_BROWSE` is off, which is how the record's owner name stops
-    /// existing at all.
-    browse_endpoints: List(String),
+    /// existing at all — there is nothing to reach a control plane *for*
+    /// until something is mounted at one.
+    endpoints: List(String),
   )
 }
 
@@ -193,7 +194,7 @@ pub fn load() -> Result(Config, String) {
   use cookie_domain <- result.try(cookie_domain(dashboard))
   use smtp <- result.try(smtp_config())
   use browse <- result.try(browse_enabled(dashboard, public_url))
-  use browse_endpoints <- result.try(validated_browse_endpoints(role, browse))
+  use endpoints <- result.try(validated_endpoints(role, browse))
   Ok(Config(
     role,
     base_domain,
@@ -212,7 +213,7 @@ pub fn load() -> Result(Config, String) {
     dashboard,
     primary_url,
     cookie_domain,
-    browse_endpoints,
+    endpoints,
   ))
 }
 
@@ -324,7 +325,7 @@ fn cookie_domain(dashboard: Bool) -> Result(Option(String), String) {
 /// loopback default published into DNS would send every node nowhere. Each
 /// node names *itself* here: a replica's `CP_PUBLIC_URL` is the replica's, and
 /// the primary gathers the fleet's into the record with
-/// `CP_BROWSE_ENDPOINTS`.
+/// `CP_ENDPOINTS`.
 fn browse_enabled(dashboard: Bool, public_url: String) -> Result(Bool, String) {
   case envoy.get("CP_BROWSE") {
     Error(Nil) | Ok("off") -> Ok(False)
@@ -423,8 +424,8 @@ pub fn browse_endpoint() -> String {
   }
 }
 
-/// Every attach endpoint the apex record names: this node's own, then the
-/// rest of the fleet's from `CP_BROWSE_ENDPOINTS`.
+/// Every control-plane endpoint the apex record names: this node's own, then
+/// the rest of the deployment's from `CP_ENDPOINTS`.
 ///
 /// **One RRset, one rdata per endpoint** — not one record listing several.
 /// A daemon needs a live tunnel to *every* node that may be asked a browse
@@ -438,7 +439,7 @@ pub fn browse_endpoint() -> String {
 ///
 /// Order is publication order and carries no precedence: a daemon opens all
 /// of them.
-pub fn browse_endpoints() -> List(String) {
+pub fn endpoints() -> List(String) {
   case browse_endpoint() {
     "" -> []
     // Deduplicated *here*, where the zone builder reads it, and not only in
@@ -447,13 +448,18 @@ pub fn browse_endpoints() -> List(String) {
     // be signed as two, and a validator that canonicalizes to one computes a
     // different hash — an RRSIG mismatch, which is the whole zone failing
     // closed rather than one wasted record. An operator listing their own
-    // `CP_PUBLIC_URL` in `CP_BROWSE_ENDPOINTS` is an ordinary mistake.
-    own -> list.unique([own, ..extra_browse_endpoints()])
+    // `CP_PUBLIC_URL` in `CP_ENDPOINTS` is an ordinary mistake.
+    own -> list.unique([own, ..extra_endpoints()])
   }
 }
 
-/// `CP_BROWSE_ENDPOINTS`: the fleet's *other* attach endpoints, comma- or
-/// semicolon-separated, in the same origin form as `CP_PUBLIC_URL`.
+/// `CP_ENDPOINTS`: the deployment's *other* control-plane endpoints, comma-
+/// or semicolon-separated, in the same origin form as `CP_PUBLIC_URL`.
+///
+/// Named for what the record is rather than for today's only consumer: the
+/// apex publishes *where this base's control plane answers*, and a daemon's
+/// attach tunnel is the first thing to dial it, not the last. Which of those
+/// endpoints a given node exposes is that node's own configuration.
 ///
 /// Configured rather than discovered because nothing in this service knows
 /// its replicas: replication is external and operator-owned (ops/RUNBOOK.md),
@@ -461,8 +467,8 @@ pub fn browse_endpoints() -> List(String) {
 /// node that publishes the zone, which is the primary — a replica publishes
 /// nothing, and one that set this would be describing a record it does not
 /// write.
-fn extra_browse_endpoints() -> List(String) {
-  envoy.get("CP_BROWSE_ENDPOINTS")
+fn extra_endpoints() -> List(String) {
+  envoy.get("CP_ENDPOINTS")
   |> result.unwrap("")
   |> string.replace(each: ";", with: ",")
   |> string.split(",")
@@ -477,40 +483,41 @@ fn extra_browse_endpoints() -> List(String) {
 /// reason: a value that is not an origin, or that carries whitespace, is a
 /// record every daemon rejects — signed, cached for its TTL, and failing in
 /// the client rather than at the boot that produced it.
-fn validated_browse_endpoints(
+fn validated_endpoints(
   role: Role,
   browse: Bool,
 ) -> Result(List(String), String) {
-  let configured = result.is_ok(envoy.get("CP_BROWSE_ENDPOINTS"))
+  let configured = result.is_ok(envoy.get("CP_ENDPOINTS"))
   use Nil <- result.try(case role, browse, configured {
     Replica, _, True ->
       Error(
-        "CP_BROWSE_ENDPOINTS is primary-only: it names the fleet the apex "
-        <> "record lists, and only the node that publishes the zone writes "
-        <> "that record. A replica names itself with CP_PUBLIC_URL",
+        "CP_ENDPOINTS is primary-only: it names the endpoints the apex record "
+        <> "lists, and only the node that publishes the zone writes that "
+        <> "record. A replica names itself with CP_PUBLIC_URL",
       )
     _, False, True ->
       Error(
-        "CP_BROWSE_ENDPOINTS is set but CP_BROWSE is not on: with browsing "
-        <> "off there is no attach record for the endpoints to appear in",
+        "CP_ENDPOINTS is set but CP_BROWSE is not on: with nothing mounted "
+        <> "for a client to reach, this deployment publishes no endpoint "
+        <> "record for these to appear in",
       )
     _, _, _ -> Ok(Nil)
   })
-  let endpoints = browse_endpoints()
+  let endpoints = endpoints()
   use Nil <- result.try(
     list.try_each(endpoints, fn(endpoint) {
       case is_origin(endpoint), record_safe(endpoint) {
         True, True -> Ok(Nil)
         False, _ ->
           Error(
-            "CP_BROWSE_ENDPOINTS entry "
+            "CP_ENDPOINTS entry "
             <> endpoint
             <> " is not an https:// or http:// origin: daemons refuse any "
             <> "other shape, so the record would be published and rejected",
           )
         _, False ->
           Error(
-            "CP_BROWSE_ENDPOINTS entry "
+            "CP_ENDPOINTS entry "
             <> endpoint
             <> " has whitespace or a quote in it: the attach record is "
             <> "whitespace-separated key=value pairs and either one changes "
@@ -522,27 +529,27 @@ fn validated_browse_endpoints(
   // `browse_endpoints` has already deduplicated, so the cap counts the
   // records that will actually be published rather than the entries the
   // operator typed.
-  case list.length(endpoints) > max_browse_endpoints {
+  case list.length(endpoints) > max_endpoints {
     True ->
       Error(
-        "CP_BROWSE_ENDPOINTS names more than "
-        <> int.to_string(max_browse_endpoints)
-        <> " attach endpoints (including CP_PUBLIC_URL): every daemon in "
-        <> "every network opens a standing tunnel to each one, and the "
-        <> "client refuses to open more than that many",
+        "CP_ENDPOINTS names more than "
+        <> int.to_string(max_endpoints)
+        <> " endpoints (including CP_PUBLIC_URL): every daemon in every "
+        <> "network opens a standing tunnel to each one, and the client "
+        <> "refuses to open more than that many",
       )
     False -> Ok(endpoints)
   }
 }
 
-/// How many attach endpoints one apex may name.
+/// How many control-plane endpoints one apex may name.
 ///
 /// The same ceiling the client applies (`MAX_CP_ENDPOINTS` in
 /// `crates/synch-net/src/dns.rs`), restated here so the refusal reaches the
 /// operator at boot rather than the fleet at its next refresh. Every entry
 /// costs every daemon a standing WebSocket, so the zone decides how much a
 /// node spends and the bound is what keeps that decision small.
-pub const max_browse_endpoints = 8
+pub const max_endpoints = 8
 
 fn trim_trailing_slash(url: String) -> String {
   case string.ends_with(url, "/") {
