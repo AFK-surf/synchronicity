@@ -1,6 +1,6 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, admit peers by device key or DNSSEC zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, or a node's data directory.
+description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, or a node's data directory.
 ---
 
 # synch
@@ -9,6 +9,12 @@ description: Drive the `synch` CLI — a synchronicity node: initialize it, run 
 it. A node publishes **its own view** of the files it indexes, signed; peers
 replicate each other's views; what you read is the **union** of everybody's
 views, with the conflicts left visible instead of resolved behind your back.
+
+This guide assumes the cluster's membership zone is **managed by a
+synchronicity control plane**: devices are enrolled on the network's page in
+the web UI, and the control plane signs and serves the zone. No step here
+involves editing a DNS record — where the CLI prints one, it is describing
+what the control plane publishes for you.
 
 Two rules explain most of the surface:
 
@@ -73,7 +79,7 @@ install.
 ## The first five minutes
 
 ```sh
-synch init                              # or: synch init --domain cluster.example.com
+synch init --domain cluster.acme.example.com  # the zone the network's page names
 synch daemon run &                      # required from here on
 synch space add media /srv/media        # index a local directory
 synch scan                              # hash it and publish a signed root
@@ -81,23 +87,22 @@ synch ls media                          # read it back
 synch id                                # who this node is, and where it listens
 ```
 
-`synch init` prints the device key, the data directory, and the next step:
+`synch init --domain` prints the device key, the data directory, and the
+record a zone run by hand would need:
 
 ```
 device key: qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo
 data dir:   /var/lib/synch
-origin:     key:qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo
-next:       synch daemon run
-```
-
-With `--domain`, it prints the TXT record to publish instead — the node has no
-name until the zone gives it one:
-
-```
-domain:     cluster.example.com
+domain:     cluster.acme.example.com
 next:       publish this record, then `synch daemon run`:
-  _synchronicity.cluster.example.com. IN TXT "v=sync1 id=<name> nk=<device key> apex=<apex>"
+  _synchronicity.cluster.acme.example.com. IN TXT "v=sync1 id=<name> nk=<device key> apex=<apex>"
 ```
+
+The last two lines are not yours to do. Add the device on the network's page
+in the control plane — a label and the device key — and the record is
+signed and served in the same moment. Until it is, `daemon run` waits rather
+than serves: the zone does not name this key yet, so the node has no name to
+publish under.
 
 `scan` reports what it did and what it published:
 
@@ -112,11 +117,12 @@ filesystem watcher. Run it when you want the publish *now*.
 
 ## Naming things
 
-An **origin** is one publisher. It is either its device key
-(`key:qmpmjtrw…`, when `init` had no `--domain`) or a zone-issued name
-(`nas@cluster.example.com`). A **space** is an id mapped to a local directory
-on the node that indexes it; the same space id on several nodes is the same
-part of the tree.
+An **origin** is one publisher, named by the zone:
+`nas@cluster.acme.example.com` — the device's label, at its network's zone.
+An origin the zone does not name — a delegate is the common case — appears
+as its device key, `key:qmpmjtrw…`. A **space** is an id mapped to a local
+directory on the node that indexes it; the same space id on several nodes is
+the same part of the tree.
 
 Almost every read takes a **reference**:
 
@@ -125,7 +131,7 @@ Almost every read takes a **reference**:
 | `media` | the whole space, unified across every origin |
 | `media/talks` | a directory inside it |
 | `media/notes.txt` | one path — the version the policy selects |
-| `nas@cluster.example.com:media/notes.txt` | that origin's version, pinned |
+| `nas@cluster.acme.example.com:media/notes.txt` | that origin's version, pinned |
 | `key:qmpmjtrw…:media` | the same, for a key-identified origin |
 
 `synch take` is the one command that *requires* the origin-prefixed form:
@@ -139,17 +145,17 @@ synch: take needs an explicit <origin>:<space>/<path>
 ```sh
 synch ls media                       # the unified tree; divergent paths marked ⑂N
 synch ls media --all                 # every version of every path, with attestors
-synch ls nas@cluster.example.com:media
+synch ls nas@cluster.acme.example.com:media
 synch status media/notes.txt         # the version inspector
 synch status media                   # every path in the space, versions and all
 synch status                         # everything this node can see
 synch cat media/notes.txt
 synch cat media/talks/keynote.mp4 --range 0..1048576
-synch cat media/notes.txt --from nas@cluster.example.com
+synch cat media/notes.txt --from nas@cluster.acme.example.com
 synch cat media/notes.txt --strict   # refuse a divergent path, list its versions
 synch get media/notes.txt -o notes.txt
 synch log media/notes.txt            # per-origin publish history
-synch compare media --to nas@cluster.example.com          # name-status diff, no bytes fetched
+synch compare media --to nas@cluster.acme.example.com          # name-status diff, no bytes fetched
 synch compare media --to nas@… --from laptop@… --json
 ```
 
@@ -198,7 +204,7 @@ deliberately.
 
 ```sh
 synch status media/notes.txt                       # see the versions
-synch take nas@cluster.example.com:media/notes.txt # adopt one as ours
+synch take nas@cluster.acme.example.com:media/notes.txt # adopt one as ours
 ```
 
 `take` writes the bytes into the local space directory and publishes your own
@@ -228,57 +234,39 @@ and publishes your own. Once every publisher has, the path leaves the tree.
 
 ## Membership
 
-Trust is **unilateral and per-direction**: each side admits the other. There
-are three ways in.
+Membership is the zone. The control plane signs and serves one per network —
+`<network>.<org>.<apex>` — and adding a device on the network's page is the
+whole enrollment: a label, a device key, and the record exists. There is
+nothing to publish by hand, and no per-node configuration of anybody else's
+membership.
 
-### Static keys
-
-```sh
-synch trust add <their-device-key> --addr 10.0.0.7:4242 --note "the NAS"
-synch trust ls
-synch trust rm <origin>
-synch trust rm <origin> --key <one-key>    # after a rotation window closes
-```
-
-The key is the identity; names come from zones. `--as <origin>` is the
-deliberate exception, for a member that publishes under a name this node has
-no zone to learn — and it says what it costs:
-
-```
-trusted 9qs54nyt… as laptop@cluster.example.com
-this binding never expires and shadows the zone record it names; remove it with
-`synch trust rm` when the zone should govern again
-```
-
-### DNSSEC zones
+A node points at its zone once:
 
 ```sh
-synch domain set cluster.example.com    # takes effect at the next daemon start
+synch domain set cluster.acme.example.com  # takes effect at the next daemon start
 synch domain ls
-synch domain refresh                    # re-resolve now
+synch domain refresh                       # re-resolve now
 synch domain clear
 ```
 
-`domain set` prints the record the zone must carry, because the consequence
-lands at the next start — a zone that does not name this key leaves the node
-with nothing to publish under, and `daemon run` waits rather than serving.
+(`synch init --domain` is this same setting, made at init.) Enroll before
+you serve: a zone that does not name this node's key leaves it with nothing
+to publish under, and `daemon run` waits rather than serving.
 
-Membership refreshes itself: the daemon re-resolves each domain when its TTL
-runs out, and again (rate-limited) when an unknown key tries to connect, which
-is what the far side of a lagging rotation looks like. **A resolver outage
-fails closed** — cached bindings keep their own expiry and the member set
-shrinks toward static-only.
+Membership then refreshes itself: the daemon re-resolves each domain when
+its TTL runs out, and again (rate-limited) when an unknown key tries to
+connect, which is what the far side of a lagging rotation looks like. **A
+resolver outage fails closed** — cached bindings keep their own expiry and
+the member set shrinks toward nobody.
 
-Resolution is DNS-over-HTTP(S) only (`--doh`, default
-`https://1.1.1.1/dns-query`), DNSSEC-validated in process, so the transport
-carries nothing trusted. By default the zone key must *also* appear in the
-public Sigstore Rekor v2 transparency log, with the proof carried inside the
-zone and verified offline; `--rekor off` states the opt-out.
+Resolution is DNS-over-HTTPS, validated in process — the DNSSEC chain, plus
+a transparency-log proof for the zone key — so the answer needs no trusted
+transport and no configuration.
 
 ### Delegation
 
-A node whose own trust is static or DNS can admit one other key to a named
-list of spaces — no zone edit, nobody else's configuration touched:
+A zone member can admit one other key to a named list of spaces — no
+control-plane change, nobody else's configuration touched:
 
 ```sh
 synch delegate add <their-device-key> --space photos --space incoming --until 7d
@@ -296,8 +284,9 @@ else — it will not learn that any other space exists
 
 Nothing is handed to the delegate: the grant is a record in the issuer's trie,
 so every member learns it through ordinary replication. The delegate joins from
-its own side with the commands it would use anyway — `synch init`, then
-`synch trust add <issuer-key>` or `synch domain set <domain>`.
+its own side with `synch init`, then `synch trust add <issuer-key>` — a direct
+trust in the issuer alone, the one binding no zone carries — or
+`synch domain set <domain>`.
 
 On the delegate, `synch doctor` says so out loud:
 
@@ -328,7 +317,7 @@ its own. It is named by the directory it writes into.
 
 ```sh
 synch mirror add media /mnt/media                              # newest
-synch mirror add media /mnt/nas --policy origin=nas@cluster.example.com
+synch mirror add media /mnt/nas --policy origin=nas@cluster.acme.example.com
 synch mirror add media /mnt/safe --policy strict               # skip divergent paths
 synch mirror ls
 synch mirror sync                                              # bring all up to date now
@@ -345,7 +334,7 @@ node has never read fetches it first.
 
 ```sh
 synch pin add media/talks/keynote.mp4
-synch pin add nas@cluster.example.com:media/notes.txt
+synch pin add nas@cluster.acme.example.com:media/notes.txt
 synch pin add 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 synch pin ls
 synch pin rm media/talks/keynote.mp4     # or the hex root
@@ -395,16 +384,22 @@ key:qmpmjtrw… (72dab4c494)  accepted 1 head(s) · completed 1 origin trie(s) �
 ### Key rotation
 
 Every step is explicit — a node never polls its own domain and never switches
-signing keys on its own.
+signing keys on its own. The DNS half of every step is the control plane's:
+it happens on the device's page, and the zone is republished in the same
+moment.
 
 ```sh
-synch key rotate                 # generate K_new, print the TXT record
-# publish the record, wait for it to propagate
+synch key rotate                 # generate K_new
+# add the new key on the device's page — the window opens:
+# K_new active, K_old retiring, both published
 synch key activate <K_new>       # re-sign the head, serve on both keys
-# remove the old record
+# retire K_old on the same page — the window closes
 synch key retire <K_old>         # drop that endpoint, delete the secret
 synch key ls
 ```
+
+What `key rotate` prints is the record a zone run by hand would need; here
+the `nk=` value is the whole payload, and the device's page takes it.
 
 `synch key ls` answers the question the middle step turns on — *have my peers
 picked up the new record yet?* It asks every reachable trusted peer which of
@@ -417,13 +412,9 @@ qmpmjtrw… active   bound by 0 of 0 reachable peer(s)
   no peer could be reached; the tallies above count nobody
 ```
 
-Rotation needs a zone-issued name. A key-identified origin refuses outright:
-
-```
-synch: origin key:9qs54nyt… is key-identified, so its device key is its
-identity and cannot rotate. A rotatable name comes from a membership zone:
-`synch domain set <domain>`, then publish a record for this key
-```
+Rotation needs a zone-issued name — the one every enrolled node has. A
+key-identified origin, which is what a delegate the zone never named is,
+refuses outright: its device key is its identity and cannot rotate.
 
 `key retire` refuses the active key and tells you to activate the successor
 first. `--bind HOST:PORT` on `key activate` names the new endpoint's address;
@@ -431,9 +422,11 @@ without it the new key takes an ephemeral port.
 
 ### Recovery
 
-For an origin whose device key and database are gone. It keeps its name, comes
-up on a fresh key, finds peers holding history it does not, and refuses to
-publish until an operator says how far to skip ahead.
+For an origin whose device key and database are gone. The name survives
+because the zone holds it, not the key: enroll the fresh key on the device's
+page, exactly as in a rotation, and retire the lost one. The node comes up on
+that key, finds peers holding history it does not, and refuses to publish
+until an operator says how far to skip ahead.
 
 ```sh
 synch recover                       # collect peer summaries for an hour
@@ -486,11 +479,6 @@ environment variable.
 | `--bind <HOST:PORT>` | — | bind the endpoint here instead of an ephemeral port |
 | `--offline` | — | no relays, no address discovery; direct addresses only |
 | `--doh <URL>` | `SYNCH_DOH` | DoH endpoint for membership records |
-| `--dnssec-anchor <FILE>` | `SYNCH_DNSSEC_ANCHOR` | replace the ICANN root anchor |
-| `--rekor require\|off` | `SYNCH_REKOR` | require a transparency-log record for the zone key |
-| `--rekor-key <FILE>` | `SYNCH_REKOR_KEY` | verification key(s) for a self-hosted log |
-| `--tuf <URL>` | `SYNCH_TUF` | follow this Sigstore TUF repository |
-| `--no-tuf` | `SYNCH_NO_TUF` | never contact it; freeze the pin set |
 | `--relay <URL>` | `SYNCH_RELAY` | use these iroh relays (repeatable) |
 | `--discovery <URL>` | `SYNCH_DISCOVERY` | use this pkarr relay |
 | `--dht` | `SYNCH_DHT` | also publish/resolve addresses on the Mainline DHT |
@@ -504,9 +492,6 @@ Notes that bite:
   ignoring it; `--dht-bootstrap` and `--dht-publish-addrs` require `--dht`.
 - The network flags take effect **where the endpoint is bound**, which is
   `synch daemon run`. Passing them to a client command changes nothing.
-- `--dnssec-anchor`, `--rekor-key` and `--tuf`-with-a-private-root are
-  *different universes*, not additions: with one set, nothing signed under the
-  real root or the built-in log verifies any more.
 - `--strict` conflicts with `--from` on `cat` and `get` — one refuses to
   choose, the other chooses.
 
@@ -554,7 +539,7 @@ data directory for any `synch-s3` command to work.
 
 ```sh
 synch-s3 bucket add media media                             # newest
-synch-s3 bucket add nas-media nas@cluster.example.com:media  # shorthand for an origin pin
+synch-s3 bucket add nas-media nas@cluster.acme.example.com:media  # shorthand for an origin pin
 synch-s3 bucket add safe-media media --policy strict
 synch-s3 key add AKIAEXAMPLE <secret>
 synch-s3 serve --listen 127.0.0.1:9000
