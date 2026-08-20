@@ -443,10 +443,22 @@ impl Node {
             None => (None, false),
         };
 
-        // Named by no zone, and the zone said so: a delegate. It keeps the key
-        // that identifies it, and `resolving_domain` goes on returning the
-        // configured domain so its cluster's members are still resolved.
-        if resolved.is_none() && answered && usable.is_none() {
+        // Named by no zone, the zone said so, and the operator said to expect
+        // that: a delegate. It keeps the key that identifies it, and
+        // `resolving_domain` goes on returning the configured domain so its
+        // cluster's members are still resolved.
+        //
+        // The operator's word is what makes this safe. On a first start a
+        // delegate and a member whose record has not propagated give DNS the
+        // same answer, so inferring it would either refuse to start every
+        // delegate or let a member publish under a key origin on a propagation
+        // lag — and then migrate away from it, leaving that origin in every
+        // peer's view until it is swept.
+        let expects_name = {
+            let store = store.clone();
+            crate::blocking::offload(move || Ok(store.membership_expects_name()?)).await?
+        };
+        if resolved.is_none() && answered && usable.is_none() && !expects_name {
             tracing::info!(
                 domain,
                 key = %node_id.to_z32(),
@@ -1602,13 +1614,16 @@ mod tests {
         let dir = node_dir();
         let report = Node::init(dir.path(), None).unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
-        // The operator joins the cluster's zone. The zone names other members
-        // and says nothing about this key, which is what being a delegate is.
+        // The operator joins the cluster's zone as a delegate: this node
+        // belongs to it and expects no record naming itself. Without that word
+        // from the operator, a zone that answers and does not name this key is
+        // a refusal to start.
         store
             .set_membership_domain(Some("cluster.example"))
             .unwrap();
+        store.set_membership_expects_name(false).unwrap();
         let other = iroh_base::SecretKey::generate().public();
-        let zone = Answers(vec![format!("v=synch1 id=nas k={}", other.to_z32())]);
+        let zone = Answers(vec![format!("v=sync1 id=nas nk={}", other.to_z32())]);
 
         let settled = Node::settle_identity(&store, report.node_id, Some(&zone))
             .await
@@ -1617,6 +1632,189 @@ mod tests {
             settled,
             OriginId::Key(report.node_id),
             "a delegate keeps the key that identifies it"
+        );
+    }
+
+    /// A node that starts as a delegate and is *later named* by its zone
+    /// adopts the name through the ordinary identity migration.
+    ///
+    /// The interesting half is what the migration does *not* touch: a `d:`
+    /// record naming this node's key lives in the issuing origin's trie, and a
+    /// rename here cannot reach it. So a node the zone has just promoted stays
+    /// confined to its grant until the issuer revokes that record — which is
+    /// the same rule as everywhere else (a delegation outranks a rooted
+    /// binding, §3.5) and is worth pinning, because an operator who adds a DNS
+    /// record expecting a promotion will not otherwise see why nothing changed.
+    #[tokio::test]
+    async fn a_delegate_later_named_by_its_zone_adopts_the_name() {
+        #[derive(Debug)]
+        struct Answers(std::sync::Mutex<Vec<String>>);
+        impl synch_net::MemberResolver for Answers {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = self.0.lock().unwrap().clone();
+                Box::pin(async move {
+                    Ok((
+                        synch_net::MemberSet::from_records(domain, &records)
+                            .map_err(|e| synch_net::NetError::Dns(e.to_string()))?,
+                        std::time::Duration::from_secs(300),
+                    ))
+                })
+            }
+        }
+
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store
+            .set_membership_domain(Some("cluster.example"))
+            .unwrap();
+        store.set_membership_expects_name(false).unwrap();
+
+        // First start: the zone names other members, not this key.
+        let other = iroh_base::SecretKey::generate().public();
+        let zone = Answers(std::sync::Mutex::new(vec![format!(
+            "v=sync1 id=nas nk={}",
+            other.to_z32()
+        )]));
+        let first = Node::settle_identity(&store, report.node_id, Some(&zone))
+            .await
+            .unwrap();
+        assert_eq!(first, OriginId::Key(report.node_id));
+
+        // The issuer delegates `photos` to this key, as a real cluster would.
+        let issuer = OriginId::named("nas", "cluster.example").unwrap();
+        store
+            .put_binding(&synch_store::Binding {
+                origin: OriginId::Key(report.node_id),
+                node_id: report.node_id,
+                source: BindingSource::Delegated,
+                domain: None,
+                issuer: Some(issuer.clone()),
+                spaces: vec!["photos".to_string()],
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+
+        // The operator now publishes a record for this key.
+        zone.0
+            .lock()
+            .unwrap()
+            .push(format!("v=sync1 id=laptop nk={}", report.node_id.to_z32()));
+        let named = Node::settle_identity(&store, report.node_id, Some(&zone))
+            .await
+            .unwrap();
+        assert_eq!(
+            named,
+            OriginId::named("laptop", "cluster.example").unwrap(),
+            "the zone naming this key promotes it at the next start"
+        );
+        assert_eq!(store.self_origin().unwrap(), Some(named.clone()));
+        // The old key identity is migrated away from, not left beside it.
+        assert_eq!(
+            store.identity_history().unwrap().last().unwrap().adopted,
+            named
+        );
+        assert!(store
+            .complete_head(&OriginId::Key(report.node_id))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A node that expects to be named and is not still refuses to start, even
+    /// though the zone answered (§3.1).
+    ///
+    /// This is the half that makes the delegate opt-in worth having. On a first
+    /// start "the zone does not name me" and "my record has not propagated yet"
+    /// are the same answer, so without the operator's word a member joining
+    /// during a propagation lag would silently publish under a key origin and
+    /// migrate away from it later — leaving that origin in every peer's view.
+    #[tokio::test]
+    async fn a_node_that_expects_a_name_and_has_none_refuses_to_start() {
+        #[derive(Debug)]
+        struct WithoutUs(String);
+        impl synch_net::MemberResolver for WithoutUs {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = vec![self.0.clone()];
+                Box::pin(async move {
+                    Ok((
+                        synch_net::MemberSet::from_records(domain, &records)
+                            .map_err(|e| synch_net::NetError::Dns(e.to_string()))?,
+                        std::time::Duration::from_secs(300),
+                    ))
+                })
+            }
+        }
+
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        // The default: this node expects its zone to name it.
+        store
+            .set_membership_domain(Some("cluster.example"))
+            .unwrap();
+        assert!(store.membership_expects_name().unwrap());
+
+        let other = iroh_base::SecretKey::generate().public();
+        let zone = WithoutUs(format!("v=sync1 id=nas nk={}", other.to_z32()));
+        let err = Node::settle_identity(&store, report.node_id, Some(&zone))
+            .await
+            .expect_err("a member whose record is missing must not start unnamed");
+        assert!(matches!(err, EngineError::Unidentified { .. }), "{err:?}");
+        // And the message says how to proceed either way.
+        let said = err.to_string();
+        assert!(said.contains("--delegate"), "{said}");
+    }
+
+    /// A node the zone *has* named, whose record then goes missing from an
+    /// otherwise-valid answer, keeps its name (§3.1).
+    ///
+    /// This is a withdrawal, and a withdrawal must not cost a running member
+    /// its identity: propagation lags, an operator edits the zone in flight,
+    /// an answer arrives partial. The node goes on publishing under the name it
+    /// already holds. The delegate branch is guarded on having *no* usable
+    /// name for exactly this reason.
+    #[tokio::test]
+    async fn a_named_node_whose_record_goes_missing_keeps_its_name() {
+        #[derive(Debug)]
+        struct WithoutUs(String);
+        impl synch_net::MemberResolver for WithoutUs {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = vec![self.0.clone()];
+                Box::pin(async move {
+                    Ok((
+                        synch_net::MemberSet::from_records(domain, &records)
+                            .map_err(|e| synch_net::NetError::Dns(e.to_string()))?,
+                        std::time::Duration::from_secs(300),
+                    ))
+                })
+            }
+        }
+
+        let dir = node_dir();
+        let named = OriginId::named("laptop", "cluster.example").unwrap();
+        let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+
+        // The zone answers, and this node is not in the answer.
+        let other = iroh_base::SecretKey::generate().public();
+        let zone = WithoutUs(format!("v=sync1 id=nas nk={}", other.to_z32()));
+        let settled = Node::settle_identity(&store, report.node_id, Some(&zone))
+            .await
+            .expect("a withdrawal does not unname a node that already has a name");
+        assert_eq!(
+            settled, named,
+            "a member whose record is momentarily absent keeps publishing under its name"
         );
     }
 

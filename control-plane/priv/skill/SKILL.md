@@ -247,6 +247,7 @@ A node points at its zone once:
 
 ```sh
 synch domain set cluster.acme.example.com  # takes effect at the next daemon start
+synch domain set cluster.acme.example.com --delegate   # belongs to it, not named by it
 synch domain ls
 synch domain refresh                       # re-resolve now
 synch domain clear
@@ -254,7 +255,21 @@ synch domain clear
 
 (`synch init --domain` is this same setting, made at init.) Enroll before
 you serve: a zone that does not name this node's key leaves it with nothing
-to publish under, and `daemon run` waits rather than serving.
+to publish under, and `daemon run` refuses to start rather than serving,
+naming the record to publish.
+
+`--delegate` is how a node says it belongs to that zone and expects *no*
+record naming itself (§3.5). It still resolves the zone — that is how a
+delegate learns its cluster's members at all — and keeps publishing under its
+device key. The flag is needed because on a first start "the zone does not
+name me" and "my record has not propagated yet" are the same answer, and
+guessing wrong either refuses to start every delegate or lets a member
+silently publish under a key origin it must later migrate away from.
+
+A delegate that is *later* named by the zone adopts that name at the next
+daemon start, migrating everything keyed by the old identity. Identity is
+frozen for the life of a process, so the running daemon reports the change
+(`synch doctor`, and a warning in the log) rather than switching under itself.
 
 Membership then refreshes itself: the daemon re-resolves each domain when
 its TTL runs out, and again (rate-limited) when an unknown key tries to
@@ -287,9 +302,11 @@ else — it will not learn that any other space exists
 
 Nothing is handed to the delegate: the grant is a record in the issuer's trie,
 so every member learns it through ordinary replication. The delegate joins from
-its own side with `synch init`, then `synch trust add <issuer-key>` — a direct
-trust in the issuer alone, the one binding no zone carries — or
-`synch domain set <domain>`.
+its own side with `synch init`, then either `synch trust add <issuer-key>` — a
+direct trust in the issuer alone — or, to pick up the whole cluster from DNS the
+way any member does, `synch domain set <domain> --delegate`. Prefer the zone:
+those bindings expire on their own TTL, so dropping a member from the zone drops
+it here too.
 
 On the delegate, `synch doctor` says so out loud:
 
@@ -306,7 +323,10 @@ written by the issuer's clock and read by yours — so `--until 7d` reports `6d`
 a moment later. That is the rendering, not a shortened grant.
 
 A delegate cannot delegate further, and withdrawing propagates like any other
-deletion:
+deletion. Withdrawal is also how a delegate is *promoted*: a `d:` record naming
+a key outranks any local `synch trust add` of it, so a node stays confined to
+its grant until the issuer removes the record — trusting its key on the side
+does not lift the confinement, and neither does the zone later naming it.
 
 ```
 removed the delegation of 9qs54nyt…
@@ -470,7 +490,8 @@ With no domain configured it says so rather than pretending:
 ```
 cloud attach enabled: serving the control plane's requests for (no local spaces)
 note: no membership domains are configured, so there is no zone to discover a
-control plane from; `synch domain set <domain>` first
+control plane from; `synch domain set <domain>` first (add `--delegate` if this
+node is not meant to be named by that zone)
 ```
 
 ## The control-plane API

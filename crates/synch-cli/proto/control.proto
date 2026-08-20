@@ -280,8 +280,11 @@ message DelegateRm {
 message DelegateLs {}
 
 message DomainSet {
-  // The zone that will name this node (DESIGN.md 3.1).
+  // The zone this node belongs to (DESIGN.md 3.1).
   string domain = 1;
+  // This node is a delegate: it belongs to the zone but is not named by it,
+  // so no record for its key is expected (DESIGN.md 3.5).
+  bool delegate = 2;
 }
 
 message DomainClear {}

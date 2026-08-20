@@ -367,6 +367,7 @@ fn log(reference: &str) -> Command {
 fn domain_set(domain: &str) -> Command {
     Command::DomainSet(pb::DomainSet {
         domain: domain.into(),
+        delegate: false,
     })
 }
 fn domain_ls() -> Command {

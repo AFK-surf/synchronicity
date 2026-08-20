@@ -173,8 +173,9 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Domain { command } => match command {
-            DomainCommand::Set { domain } => Cmd::DomainSet(pb::DomainSet {
+            DomainCommand::Set { domain, delegate } => Cmd::DomainSet(pb::DomainSet {
                 domain: domain.clone(),
+                delegate: *delegate,
             }),
             DomainCommand::Clear => Cmd::DomainClear(pb::DomainClear {}),
             DomainCommand::Ls => Cmd::DomainLs(pb::DomainLs {}),
