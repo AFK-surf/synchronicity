@@ -1,11 +1,12 @@
 //// Who a request is, once its credential has been checked.
 ////
-//// Two credentials reach the product API and they are not the same kind of
+//// Three credentials reach the product API and they are not the same kind of
 //// thing. A **session cookie** is a person: their reach is every org they
 //// are a member of, and their role in each is read from `org_members` at the
 //// moment they ask. An **API key** is a credential an org holds: it names one
 //// org and carries its own role, so it can never reach past the org it was
-//// minted in, and never past the role it was minted with.
+//// minted in, and never past the role it was minted with. A **join key** is
+//// narrower than a role can express: one network, one operation.
 ////
 //// Keeping both in one type is what lets a handler be written once. What it
 //// must not do is let the difference blur, so the two facts a handler wants
@@ -33,6 +34,16 @@ pub type Credential {
   /// and role from its own row — never from `org_members`, which a key has
   /// no place in.
   ApiKey(key_id: String, org_id: String, role: String)
+  /// A **join key**: scoped to one network, and able to do exactly one thing
+  /// — put a device into it.
+  ///
+  /// It carries no role, because there is no rank at which "may add a member
+  /// to this network, and nothing else" sits. That is why it is a separate
+  /// constructor rather than a third role string: `api/common.check_org`
+  /// refuses this variant outright, so every org-scoped route in the service
+  /// is closed to it by construction, and the one endpoint that admits it
+  /// checks the network itself.
+  JoinKey(key_id: String, org_id: String, network_id: String)
 }
 
 /// What the audit trail records as the actor.
@@ -44,6 +55,6 @@ pub type Credential {
 pub fn actor(who: Principal) -> String {
   case who.credential {
     Cookie(_) -> who.user_id
-    ApiKey(key_id, _, _) -> "key:" <> key_id
+    ApiKey(key_id, _, _) | JoinKey(key_id, _, _) -> "key:" <> key_id
   }
 }

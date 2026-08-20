@@ -8,6 +8,7 @@ import {
   type AuditRow,
   type MemberRow,
   type MintedApiKey,
+  type NetworkSummary,
   type OidcConfig,
 } from '../lib/api'
 import { useTitle } from '../lib/title'
@@ -246,6 +247,7 @@ function ApiKeys({ slug }: { slug: string }) {
   const queryClient = useQueryClient()
   const [name, setName] = useState('')
   const [role, setRole] = useState('member')
+  const [network, setNetwork] = useState('')
   const [expiresIn, setExpiresIn] = useState(0)
   // The token, held only until the operator navigates away. Nothing can
   // fetch it back, so the panel says so plainly rather than offering a
@@ -257,6 +259,12 @@ function ApiKeys({ slug }: { slug: string }) {
     queryKey: ['api-keys', slug],
     queryFn: () => get<ApiKeyRow[]>(`/api/orgs/${slug}/api-keys`),
   })
+  // A join key names a network, so the form has to offer the org's. Nothing
+  // else on this panel needs them.
+  const { data: networks } = useQuery({
+    queryKey: ['networks', slug],
+    queryFn: () => get<NetworkSummary[]>(`/api/orgs/${slug}/networks`),
+  })
   const refresh = () =>
     queryClient.invalidateQueries({ queryKey: ['api-keys', slug] })
   const create = useMutation({
@@ -264,12 +272,16 @@ function ApiKeys({ slug }: { slug: string }) {
       send<MintedApiKey>('POST', `/api/orgs/${slug}/api-keys`, {
         name,
         role,
+        // Sent only for a join key: the server refuses a network on an org
+        // key, because it would be a bound nothing enforces.
+        ...(role === 'join' ? { network } : {}),
         expires_in: expiresIn,
       }),
     onSuccess: (key) => {
       setMinted(key)
       setName('')
       setRole('member')
+      setNetwork('')
       setExpiresIn(0)
       refresh()
     },
@@ -298,9 +310,14 @@ function ApiKeys({ slug }: { slug: string }) {
       </h2>
       <p className="mb-3 text-sm text-neutral-400">
         For programs rather than people: send the token as{' '}
-        <span className="font-mono">Authorization: Bearer …</span>. A key
+        <span className="font-mono">Authorization: Bearer …</span>. An{' '}
+        <strong className="font-medium text-neutral-300">org key</strong>{' '}
         reaches this org only, at the role it was given, and can never manage
-        members, sign-in configuration or other keys.
+        members, sign-in configuration or other keys. A{' '}
+        <strong className="font-medium text-neutral-300">join key</strong> is
+        narrower still: one network, and the only thing it can do is add a
+        device to it — which is what makes it safe to bake into a provisioning
+        image.
       </p>
       {minted && (
         // role="status" and aria-live: the one sentence a screen-reader user
@@ -312,8 +329,9 @@ function ApiKeys({ slug }: { slug: string }) {
           className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm"
         >
           <div className="font-medium text-emerald-300">
-            {minted.name} created. Copy it now — this is the only time it is
-            shown.
+            {minted.name} created
+            {minted.role === 'join' ? ` for ${minted.network}` : ''}. Copy it
+            now — this is the only time it is shown.
           </div>
           <code className="mt-2 block break-all rounded bg-neutral-950 p-2 font-mono text-xs">
             {minted.token}
@@ -354,7 +372,7 @@ function ApiKeys({ slug }: { slug: string }) {
               <tr className="border-b border-neutral-800">
                 <th className="px-4 py-2 font-medium">Name</th>
                 <th className="px-4 py-2 font-medium">Prefix</th>
-                <th className="px-4 py-2 font-medium">Role</th>
+                <th className="px-4 py-2 font-medium">Scope</th>
                 <th className="px-4 py-2 font-medium">Created by</th>
                 <th className="px-4 py-2 font-medium">Last used</th>
                 <th className="px-4 py-2 font-medium">Expires</th>
@@ -378,18 +396,28 @@ function ApiKeys({ slug }: { slug: string }) {
                     {k.prefix}…
                   </td>
                   <td className="px-4 py-2">
-                    <select
-                      value={k.role}
-                      aria-label={`Role for ${k.name}`}
-                      disabled={update.isPending}
-                      onChange={(e) =>
-                        update.mutate({ id: k.id, role: e.target.value })
-                      }
-                      className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs disabled:opacity-50"
-                    >
-                      <option value="admin">admin</option>
-                      <option value="member">member</option>
-                    </select>
+                    {/* A join key's kind is settled at minting — changing it
+                        would need a network it was never given, or would hand
+                        a deployed secret a reach nobody audited it for. So it
+                        reads rather than selects, and names its network. */}
+                    {k.role === 'join' ? (
+                      <span className="text-xs text-neutral-400">
+                        join · <span className="font-mono">{k.network}</span>
+                      </span>
+                    ) : (
+                      <select
+                        value={k.role}
+                        aria-label={`Role for ${k.name}`}
+                        disabled={update.isPending}
+                        onChange={(e) =>
+                          update.mutate({ id: k.id, role: e.target.value })
+                        }
+                        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs disabled:opacity-50"
+                      >
+                        <option value="admin">admin</option>
+                        <option value="member">member</option>
+                      </select>
+                    )}
                   </td>
                   {/* Who minted it — the column to read when somebody leaves
                       the org, since a key outlives its minter's membership. */}
@@ -446,13 +474,30 @@ function ApiKeys({ slug }: { slug: string }) {
         />
         <select
           value={role}
-          aria-label="Role for the new API key"
+          aria-label="What the new API key may do"
           onChange={(e) => setRole(e.target.value)}
           className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
         >
-          <option value="member">member</option>
-          <option value="admin">admin</option>
+          <option value="member">org key · member</option>
+          <option value="admin">org key · admin</option>
+          <option value="join">join key · one network</option>
         </select>
+        {role === 'join' && (
+          <select
+            required
+            value={network}
+            aria-label="Network the join key may add devices to"
+            onChange={(e) => setNetwork(e.target.value)}
+            className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
+          >
+            <option value="">choose a network…</option>
+            {(networks ?? []).map((n) => (
+              <option key={n.name} value={n.name}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+        )}
         <select
           value={expiresIn}
           aria-label="How long the new API key lives"
@@ -466,7 +511,7 @@ function ApiKeys({ slug }: { slug: string }) {
           ))}
         </select>
         <button
-          disabled={create.isPending}
+          disabled={create.isPending || (role === 'join' && network === '')}
           className="rounded-md bg-white px-3 py-2 text-sm font-medium text-neutral-950 disabled:opacity-50"
         >
           Create key

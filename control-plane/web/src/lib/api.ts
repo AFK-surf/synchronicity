@@ -165,13 +165,17 @@ export interface ApiKeyRow {
   id: string
   name: string
   prefix: string
-  role: 'admin' | 'member'
+  // `admin` and `member` are org keys, reaching whatever that role reaches
+  // across the org. `join` is a join key: one network, one operation.
+  role: 'admin' | 'member' | 'join'
   created_at: number
   expires_at: number
   last_used_at: number
   // The minter's email, not their id — the question a list answers is "who
   // made this", and it is the column to read when somebody leaves the org.
   created_by_email: string
+  // The network a join key is scoped to; empty for an org key.
+  network: string
 }
 
 // What minting one answers with. `token` is shown once and then cannot be
@@ -180,6 +184,7 @@ export interface MintedApiKey {
   id: string
   name: string
   role: string
+  network: string
   prefix: string
   expires_at: number
   token: string

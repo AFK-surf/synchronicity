@@ -1845,7 +1845,7 @@ fn keyed(token: String, method: http.Method, path: String) -> wisp.Request {
   |> simulate.header("authorization", "Bearer " <> token)
 }
 
-/// Mints a key through the API and returns its token.
+/// Mints an org key through the API and returns its token.
 fn mint(h: Harness, slug: String, name: String, role: String) -> String {
   let created =
     call_json(
@@ -1859,6 +1859,47 @@ fn mint(h: Harness, slug: String, name: String, role: String) -> String {
     )
   assert created.status == 200
   token_of(simulate.read_body(created))
+}
+
+/// Mints a join key scoped to one network.
+fn mint_join(
+  h: Harness,
+  slug: String,
+  network: String,
+  name: String,
+) -> String {
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/" <> slug <> "/api-keys",
+      json.object([
+        #("name", json.string(name)),
+        #("role", json.string("join")),
+        #("network", json.string(network)),
+      ]),
+    )
+  assert created.status == 200
+  token_of(simulate.read_body(created))
+}
+
+/// An org with one network, which is what a join key needs to exist at all.
+fn org_with_network(h: Harness, slug: String, network: String) -> Nil {
+  org_named(h, slug)
+  let made =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/" <> slug <> "/networks",
+      json.object([#("name", json.string(network))]),
+    )
+  assert made.status == 200
+  Nil
+}
+
+/// The body a node sends to join, with a fresh key each time.
+fn joining(label: String) -> json.Json {
+  json.object([#("label", json.string(label)), #("nk", json.string(nk()))])
 }
 
 /// The `token` field of a mint response.
@@ -1936,7 +1977,7 @@ pub fn api_key_carries_its_own_role_test() {
       ]),
     )
   assert owner_key.status == 400
-  assert string.contains(simulate.read_body(owner_key), "admin or member")
+  assert string.contains(simulate.read_body(owner_key), "admin, member or join")
   assert call(h, keyed(admin, Get, "/api/orgs/acme/oidc")).status == 403
 }
 
@@ -2361,4 +2402,283 @@ pub fn deleting_an_org_takes_its_keys_test() {
   // Not a token that authenticates to a 404 forever: the row is gone with
   // the org, so the credential is gone too.
   assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 401
+}
+
+// -- join keys ---------------------------------------------------------------
+
+/// The one thing a join key can do, and that it really does it: the device
+/// exists, it is in the network, and the zone was republished — which is what
+/// separates a node that resolves from a row in a table.
+pub fn a_join_key_adds_a_device_to_its_network_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1 provisioning")
+
+  let joined =
+    call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    )
+  assert joined.status == 200
+  let body = simulate.read_body(joined)
+  assert string.contains(body, "\"label\":\"nas\"")
+  // A zone mutation, so the answer carries the serial the publish produced.
+  assert string.contains(body, "soa_serial")
+
+  // In the network, not merely in the org: a device in no network appears in
+  // no zone, and enrolling something invisible would be enrolling nothing.
+  let detail =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/networks/prod")))
+  assert string.contains(detail, "\"label\":\"nas\"")
+
+  // And the trail names the credential, not the person who minted it.
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(actor)]]) =
+    sqlite.query(
+      conn,
+      "SELECT actor FROM audit_log WHERE action = 'network.join'",
+      [],
+    )
+  sqlite.close(conn)
+  assert string.starts_with(actor, "key:")
+}
+
+/// It is *one* network, and the refusal for any other is the refusal a
+/// stranger gets: a leaked provisioning key must not be a way to find out
+/// what else the org runs.
+pub fn a_join_key_reaches_one_network_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("lab"))]),
+    ).status
+  org_with_network(h, "other", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+
+  // Its own network: yes.
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 200
+
+  // A sibling network in the same org, and the same network name in another
+  // org — both 404, neither 403: the key learns nothing either way.
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/lab/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 404
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/other/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 404
+}
+
+/// Adding a device is the *only* thing it can do. Everything else in the
+/// service goes through `check_org`, which refuses the whole family before it
+/// reads a rank — so this is a sample of a closed set, not a list to keep up
+/// to date.
+pub fn a_join_key_can_do_nothing_else_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+  let refused = fn(res: wisp.Response) {
+    assert res.status == 403
+    assert string.contains(simulate.read_body(res), "join_key_forbidden")
+    Nil
+  }
+
+  // Reads of the org it is scoped inside, including the network it may add
+  // to: it may enrol, it may not look.
+  refused(call(h, keyed(token, Get, "/api/orgs/acme")))
+  refused(call(h, keyed(token, Get, "/api/orgs/acme/networks")))
+  refused(call(h, keyed(token, Get, "/api/orgs/acme/networks/prod")))
+  refused(call(h, keyed(token, Get, "/api/orgs/acme/devices")))
+  refused(call(h, keyed(token, Get, "/api/me")))
+
+  // The two older device routes, which between them are what this one route
+  // replaced: neither is reachable, so a join key cannot attach a device it
+  // did not create or leave one lying in the org attached to nothing.
+  refused(call(
+    h,
+    keyed(token, Post, "/api/orgs/acme/devices")
+      |> simulate.json_body(joining("stray")),
+  ))
+  refused(call(h, keyed(token, Put, "/api/orgs/acme/networks/prod/devices/d1")))
+  refused(call(
+    h,
+    keyed(token, Delete, "/api/orgs/acme/networks/prod/devices/d1"),
+  ))
+
+  // Mutations of the network itself, and of credentials.
+  refused(call(
+    h,
+    keyed(token, Post, "/api/orgs/acme/networks")
+      |> simulate.json_body(json.object([#("name", json.string("mine"))])),
+  ))
+  refused(call(
+    h,
+    keyed(token, Delete, "/api/orgs/acme/networks/prod")
+      |> simulate.json_body(json.object([#("confirm", json.string("prod"))])),
+  ))
+  refused(call(h, keyed(token, Get, "/api/orgs/acme/api-keys")))
+  refused(call(
+    h,
+    keyed(token, Post, "/api/orgs/acme/api-keys")
+      |> simulate.json_body(json.object([#("name", json.string("more"))])),
+  ))
+}
+
+/// A person and an org key take the same route, at the floor the older device
+/// routes carry — it is the same act, and a person should not need two calls
+/// to do what a machine does in one.
+pub fn everyone_else_joins_through_the_same_route_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+
+  assert call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      joining("by-person"),
+    ).status
+    == 200
+
+  let member = mint(h, "acme", "ci", "member")
+  assert call(
+      h,
+      keyed(member, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("by-key")),
+    ).status
+    == 200
+
+  // Two devices in the network, and a third that reuses a label is refused
+  // rather than published as an ambiguity.
+  let clash =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      joining("by-person"),
+    )
+  assert clash.status == 409
+  assert string.contains(simulate.read_body(clash), "already in this network")
+}
+
+/// The scope and the kind are one fact, in both directions and at both ends.
+pub fn a_join_keys_scope_is_not_optional_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let ask = fn(body) { call_json(h, Post, "/api/orgs/acme/api-keys", body) }
+
+  // `join` without a network is not a scope.
+  let unscoped =
+    ask(
+      json.object([
+        #("name", json.string("k")),
+        #("role", json.string("join")),
+      ]),
+    )
+  assert unscoped.status == 400
+  assert string.contains(simulate.read_body(unscoped), "bad_scope")
+
+  // A network on an org key would be a bound nothing enforces.
+  let overscoped =
+    ask(
+      json.object([
+        #("name", json.string("k")),
+        #("role", json.string("member")),
+        #("network", json.string("prod")),
+      ]),
+    )
+  assert overscoped.status == 400
+  assert string.contains(simulate.read_body(overscoped), "bad_scope")
+
+  // A network the org does not have is a 404, not a scope.
+  assert ask(
+      json.object([
+        #("name", json.string("k")),
+        #("role", json.string("join")),
+        #("network", json.string("nope")),
+      ]),
+    ).status
+    == 404
+
+  // The listing says which network a join key is for, and says nothing for
+  // an org key.
+  let _ = mint_join(h, "acme", "prod", "scoped")
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert string.contains(listed, "\"role\":\"join\"")
+  assert string.contains(listed, "\"network\":\"prod\"")
+}
+
+/// A key's kind is settled when it is minted. Crossing the boundary would
+/// need a network the key was never given, or would hand an already-deployed
+/// secret a reach nobody audited it for.
+pub fn a_keys_kind_cannot_be_patched_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  let assert Ok(#(_, after_id)) = string.split_once(listed, "\"id\":\"")
+  let assert Ok(#(key_id, _)) = string.split_once(after_id, "\"")
+  let path = "/api/orgs/acme/api-keys/" <> key_id
+
+  let promoted =
+    call_json(h, Patch, path, json.object([#("role", json.string("admin"))]))
+  assert promoted.status == 400
+  assert string.contains(
+    simulate.read_body(promoted),
+    "fixed when it is minted",
+  )
+
+  // Still a join key, and still only that.
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 403
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 200
+
+  // The parts that are not the kind still move.
+  assert call_json(h, Patch, path, json.object([#("name", json.string("r2"))])).status
+    == 200
+}
+
+/// A join key does not outlive the network it names.
+pub fn deleting_a_network_takes_its_join_keys_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+  assert call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/networks/prod",
+      json.object([#("confirm", json.string("prod"))]),
+    ).status
+    == 200
+  // Not a narrower credential — a token that can never be used again, so the
+  // row goes with the network rather than dangling past it.
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 401
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert !string.contains(listed, "rack-1")
 }

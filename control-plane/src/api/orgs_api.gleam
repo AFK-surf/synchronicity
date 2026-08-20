@@ -150,6 +150,14 @@ pub fn delete_org(
           // assignment is org-scoped in the API, but the delete should not
           // have to trust that.
           let work = {
+            // The org's own credentials go first, before the networks a join
+            // key names: nothing cascades them, and an API key outliving its
+            // org would be a token that authenticates to a 404 forever.
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM api_keys WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
             use _ <- result.try(
               sqlite.exec(
                 conn,
@@ -204,15 +212,6 @@ pub fn delete_org(
             )
             use _ <- result.try(
               sqlite.exec(conn, "DELETE FROM invites WHERE org_id = ?", [
-                Text(org_id),
-              ]),
-            )
-            // The org's own credentials. Nothing cascades them: an API key
-            // outliving its org would be a token that authenticates to a
-            // 404 forever, and the row's foreign key would refuse the
-            // delete below in any case.
-            use _ <- result.try(
-              sqlite.exec(conn, "DELETE FROM api_keys WHERE org_id = ?", [
                 Text(org_id),
               ]),
             )

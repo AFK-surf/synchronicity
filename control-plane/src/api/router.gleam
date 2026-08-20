@@ -10,13 +10,14 @@
 //// primary, which is the one fact a read-only node holds that a 404 does
 //// not carry.
 ////
-//// **Two credentials reach the product API**, and the split above is the
-//// reason both are resolved in one place: a session cookie (a person) and a
-//// bearer API key (an org-scoped credential). `with_principal` resolves
-//// whichever the request carries, `api/common.check_org` decides what it
-//// permits, and no route below has to know which arrived — except the
-//// handful that are a person's alone, which say so with
-//// `middleware.require_user`.
+//// **Three credentials reach the product API**, and the split above is the
+//// reason all of them are resolved in one place: a session cookie (a
+//// person), a bearer org key, and a bearer join key. `with_principal`
+//// resolves whichever the request carries, `api/common.check_org` decides
+//// what it permits, and no route below has to know which arrived — except
+//// the handful that are a person's alone, which say so with
+//// `middleware.require_user`, and the one join route, which asks
+//// `api/common.check_join_target` instead.
 ////
 //// Naming convention in api/: endpoint modules carry the `_api` suffix
 //// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
@@ -380,6 +381,13 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
     ["api", "orgs", slug, "networks", net], Delete -> {
       use who <- with_principal(req, auth.reads)
       networks_api.delete_network(req, auth, who, slug, net)
+    }
+    // A node joins a network: one call, and the only one a join key can
+    // make. Everyone else reaches it too, at the Member floor the two
+    // older routes below carry.
+    ["api", "orgs", slug, "networks", net, "devices"], Post -> {
+      use who <- with_principal(req, auth.reads)
+      networks_api.join_device(req, auth, who, slug, net)
     }
     ["api", "orgs", slug, "networks", net, "devices", dev], Put -> {
       use who <- with_principal(req, auth.reads)

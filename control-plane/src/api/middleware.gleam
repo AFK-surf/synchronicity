@@ -1,9 +1,10 @@
 //// Credential resolution for the product API: the session cookie and its
-//// CSRF double submit, and the bearer token an org-scoped API key is
-//// presented as.
+//// CSRF double submit, and the bearer token an API key — org-scoped or
+//// network-scoped — is presented as.
 
 import auth/api_key
-import auth/principal.{type Principal, ApiKey, Cookie, Principal}
+import auth/principal.{type Principal, Cookie, Principal}
+
 import auth/session.{type Session}
 import gleam/http.{Get, Head, Options}
 import gleam/json
@@ -106,8 +107,7 @@ pub fn check_principal(
   case presented(req.headers) {
     Bearer(token) ->
       case api_key.authenticate(conn, token, now_unix()) {
-        Ok(key) ->
-          Ok(Principal(key.created_by, ApiKey(key.key_id, key.org_id, key.role)))
+        Ok(who) -> Ok(who)
         Error(Nil) -> Error(bad_key())
       }
     Foreign -> Error(foreign_credential())
@@ -200,6 +200,20 @@ pub fn api_key_refused() -> Response {
 pub fn require_user(who: Principal, next: fn() -> Response) -> Response {
   case who.credential {
     Cookie(_) -> next()
-    ApiKey(..) -> api_key_refused()
+    principal.ApiKey(..) -> api_key_refused()
+    // A join key gets the refusal that names the one thing it *can* do,
+    // rather than a list of things no key may.
+    principal.JoinKey(..) -> join_key_refused()
   }
+}
+
+/// The refusal every route but one gives a join key. Defined here rather than
+/// taken from `api/common`, which imports this module.
+pub fn join_key_refused() -> Response {
+  error_json(
+    403,
+    "join_key_forbidden",
+    "a join key may only add a device to the network it was minted for: "
+      <> "POST /api/orgs/<org>/networks/<network>/devices",
+  )
 }

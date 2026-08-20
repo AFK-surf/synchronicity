@@ -78,8 +78,16 @@ pub fn require_org(
 /// same 404 a person outside the org gets, for the same reason: an org is not
 /// enumerable by whoever cannot see it.
 ///
-/// A key is never an `owner` (the schema's role grammar stops at `admin`), so
-/// every owner-gated route refuses one without naming keys at all.
+/// A key is never an `owner` (the schema's role grammar stops at `admin` for
+/// the kinds that have a rank at all), so every owner-gated route refuses one
+/// without naming keys at all.
+///
+/// **A join key never gets past here.** It carries no role, because there is
+/// no rank at which "may add a device to this one network" sits, and inventing
+/// the lowest one for it would hand it every read a member has. Refusing the
+/// whole family in the one function every org-scoped route goes through is
+/// what makes that scope real: the join endpoint admits a join key by checking
+/// the network itself, and nothing else in the service can.
 pub fn check_org(
   conn: Connection,
   slug: String,
@@ -88,6 +96,7 @@ pub fn check_org(
 ) -> Result(#(String, Role), Response) {
   case who.credential {
     principal.Cookie(_) -> member_org(conn, slug, who.user_id, minimum)
+    principal.JoinKey(_, _, _) -> Error(middleware.join_key_refused())
     principal.ApiKey(_, key_org_id, role_text) ->
       case
         sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)])
@@ -97,6 +106,66 @@ pub fn check_org(
         Ok(_) -> Error(error_json(404, "not_found", "no such org"))
         Error(_) -> Error(db_error())
       }
+  }
+}
+
+/// The gate on the one endpoint a join key can reach, and the same gate for
+/// everybody else who reaches it.
+///
+/// Resolves the org and network the path names, and answers whether this
+/// credential may put a device into that network. The two families differ in
+/// what they are allowed to *see*, not only in what they may do:
+///
+///   * A person or an org key is held to the ordinary `Member` floor, and to
+///     the ordinary 404 for an org they are not in.
+///   * A join key is held to one network — its own. Aimed anywhere else it
+///     gets the same 404 the path would give a stranger, so a leaked key
+///     cannot be used to find out what else an org has.
+pub fn check_join_target(
+  conn: Connection,
+  slug: String,
+  network: String,
+  who: Principal,
+) -> Result(#(String, String), Response) {
+  case who.credential {
+    principal.JoinKey(_, key_org_id, key_network_id) ->
+      case resolve_network(conn, slug, network) {
+        Ok(#(org_id, network_id))
+          if org_id == key_org_id && network_id == key_network_id
+        -> Ok(#(org_id, network_id))
+        Ok(_) -> Error(error_json(404, "not_found", "no such network"))
+        Error(refusal) -> Error(refusal)
+      }
+    _ -> {
+      use #(org_id, _role) <- result.try(check_org(conn, slug, who, Member))
+      case find_network(conn, org_id, network) {
+        Ok(network_id) -> Ok(#(org_id, network_id))
+        Error(Nil) -> Error(error_json(404, "not_found", "no such network"))
+      }
+    }
+  }
+}
+
+/// A network by org slug and name, without asking who wants it — the lookup
+/// `check_join_target` needs before it can compare a join key's own ids
+/// against what the path named.
+fn resolve_network(
+  conn: Connection,
+  slug: String,
+  network: String,
+) -> Result(#(String, String), Response) {
+  let lookup =
+    sqlite.query(
+      conn,
+      "SELECT o.id, n.id FROM orgs o
+       JOIN networks n ON n.org_id = o.id AND n.name = ?
+       WHERE o.slug = ?",
+      [Text(network), Text(slug)],
+    )
+  case lookup {
+    Ok([[Text(org_id), Text(network_id)]]) -> Ok(#(org_id, network_id))
+    Ok(_) -> Error(error_json(404, "not_found", "no such network"))
+    Error(_) -> Error(db_error())
   }
 }
 

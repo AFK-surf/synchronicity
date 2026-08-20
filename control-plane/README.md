@@ -62,13 +62,16 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   configured, mail relay or not: an empty login screen is worse than a
   link the operator reads off the service log.
 - **API keys** are the second credential the API takes, for callers that
-  are programs. A key belongs to an *org*, not to a person: it names one
-  org and carries its own role (`admin` or `member`, never `owner`), so it
-  can never reach another org and no change to anybody's membership can
-  widen it. Send it as `Authorization: Bearer synch_…`; a bearer request
-  needs no CSRF token, because nothing attaches that header on its own.
-  Accounts, membership and key management stay a signed-in person's — see
-  [API keys](#api-keys) below.
+  are programs. Two kinds. An **org key** belongs to an *org*, not to a
+  person: it names one org and carries its own role (`admin` or `member`,
+  never `owner`), so it can never reach another org and no change to
+  anybody's membership can widen it. A **join key** is narrower still — one
+  *network*, and the single operation of adding a device to it, which is
+  what makes it safe to bake into a provisioning image. Send either as
+  `Authorization: Bearer synch_…`; a bearer request needs no CSRF token,
+  because nothing attaches that header on its own. Accounts, membership and
+  key management stay a signed-in person's — see [API keys](#api-keys)
+  below.
 - **Cloud browse** lets the dashboard read a cluster's files. Nodes are
   unreachable from here, so the connection is one they open: a daemon
   discovers this deployment from
@@ -107,7 +110,9 @@ API itself:
 
 `POST` takes `{"name": "ci", "role": "member", "expires_in": 2592000}` —
 `role` defaults to `member`, and `expires_in` is seconds from now, `0` (the
-default) for no expiry. A duration rather than a date, so nothing depends on
+default) for no expiry. `role: "join"` mints a **join key** and additionally
+requires `network`; the two imply each other in both directions, here and in
+the schema's CHECK. A duration rather than a date, so nothing depends on
 the caller's clock agreeing with the service's. It answers with the token:
 
 ```json
@@ -121,7 +126,10 @@ which key a leaked or forgotten token is without holding enough to be one.
 Lose it and mint another.
 
 `PATCH` takes any of `name`, `role` and `expires_in`; an absent field is left
-alone, and `expires_in: 0` clears the expiry. The secret is not among them:
+alone, and `expires_in: 0` clears the expiry. It will not move a key across
+the org/join boundary: a key's kind is settled when it is minted, because a
+join key promoted to admin is not an edit but a different credential with a
+secret that is already deployed. The secret is not among them:
 rotating a credential is minting a new key and deleting the old, which is two
 audited acts rather than one that silently invalidates whatever is deployed.
 `DELETE` revokes — the row goes, and with it the hash the token
@@ -134,9 +142,38 @@ curl -H "Authorization: Bearer $SYNCH_TOKEN" \
   https://cp.example.com/api/orgs/acme/networks
 ```
 
-What a key may do is what its role may do, in its own org: networks,
+### The join key
+
+A join key names one network and can do exactly one thing with it:
+
+```
+POST /api/orgs/:slug/networks/:net/devices
+{"label": "nas", "nk": "<device key>", "relay": "", "addr": ""}
+```
+
+That route creates the device and puts it in the network in one transaction
+and one zone republish — one call, because a device in no network appears in
+no zone, so a caller that stopped halfway has enrolled nothing. Org keys and
+people reach it too, at the `member` floor; it is the same act.
+
+Everything else answers `403 join_key_forbidden`, including a `GET` on the
+very network it may add to, and including the two older routes (`POST
+/devices`, `PUT /networks/:net/devices/:dev`) that between them do the same
+job less tightly. That is not a maintained list: every org-scoped route
+resolves its caller through one function, and that function refuses the whole
+family before it reads a rank. Aimed at another network — a sibling in the
+same org, or the same name elsewhere — a join key gets the `404` a stranger
+gets, so a leaked one reveals nothing about what else the org runs.
+
+What it does not bound is *how many*. Anyone holding it can enrol devices
+until it expires or is revoked, so set `expires_in` on one; every use is in
+the audit log as `network.join` under `key:<id>`.
+
+### What an org key may do
+
+What an org key may do is what its role may do, in its own org: networks,
 devices and their keys, the browse and download surface, the audit trail.
-What no key may do, whatever its role:
+What no key of either kind may do:
 
 - **manage accounts** — create an org, accept an invitation, read
   `/api/me`. These are about a person, and a key is not one.

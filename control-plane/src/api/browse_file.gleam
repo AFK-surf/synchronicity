@@ -16,7 +16,7 @@ import api/agent.{type Session}
 import api/browse_api.{type Browse}
 import api/middleware
 import auth/api_key
-import auth/principal.{type Principal, ApiKey, Cookie, Principal}
+import auth/principal.{type Principal, Cookie, Principal}
 import auth/session
 import gleam/bit_array
 import gleam/bytes_tree
@@ -275,11 +275,7 @@ fn require_principal(
           api_key.authenticate(conn, token, now_unix())
         })
       {
-        Ok(Ok(key)) ->
-          next(Principal(
-            key.created_by,
-            ApiKey(key.key_id, key.org_id, key.role),
-          ))
+        Ok(Ok(who)) -> next(who)
         Ok(Error(Nil)) -> refused(401, middleware.bad_key_message)
         Error(_) -> refused(500, "database unavailable")
       }

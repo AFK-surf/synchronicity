@@ -65,16 +65,34 @@ fn migrations() -> List(String) {
   [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10]
 }
 
-/// V10: org-scoped API keys, for the callers that are programs.
+/// V10: API keys — the credential for a caller that is a program.
 ///
-/// A key is a credential the *org* holds, not a second way to be a person.
-/// It names one org and carries its own `role`, so authorisation never reads
-/// `org_members` for it: a key cannot reach another org, cannot be promoted
-/// by anything that happens to its creator's membership, and — because the
-/// role grammar here stops at `admin` — can never be an owner. That last one
-/// is the whole of the escalation story: every act that hands an org away
-/// (ownership transfer, deletion, the sign-in configuration) is owner-gated,
-/// and so is closed to every key by construction rather than by a list.
+/// Two kinds, one table, because everything about *being* a credential is the
+/// same for both: the hash, the display prefix, the optional expiry, the
+/// trail, the one revoke button.
+///
+/// An **org key** is a credential the org holds. It names one org and carries
+/// its own `role`, so authorisation never reads `org_members` for it: a key
+/// cannot reach another org, cannot be promoted by anything that happens to
+/// its creator's membership, and — because the role grammar stops at `admin`
+/// — can never be an owner. That last one is the whole of the escalation
+/// story: every act that hands an org away (ownership transfer, deletion, the
+/// sign-in configuration) is owner-gated, and so is closed to every key by
+/// construction rather than by a list.
+///
+/// A **join key** is scoped to one network and the only act it can take is
+/// putting a device into it. It carries no rank — `role = 'join'` is a
+/// *kind*, and `api/common.check_org` refuses the whole family before any
+/// rank is read. The two columns that say so travel together by CHECK, the
+/// shape `auth_identities` uses for `provider`/`oidc_provider_id`: a `join`
+/// row without a network, or a network on a row that is not `join`, is
+/// unrepresentable rather than merely unexpected.
+///
+/// The difference between the kinds is where each is handed out. An org key
+/// goes in a CI secret store, read by a job somebody wrote. A join key goes
+/// in a provisioning image, a cloud-init file, a QR code taped to a rack —
+/// places where a credential that could also *delete* a network has no
+/// business being.
 ///
 /// `created_by` is the person who minted it, kept because rows a key writes
 /// still need a user to name in the `created_by` columns that reference
@@ -89,16 +107,19 @@ const v10 = "
 CREATE TABLE api_keys (
   id           TEXT PRIMARY KEY,
   org_id       TEXT NOT NULL REFERENCES orgs(id),
+  network_id   TEXT REFERENCES networks(id),
   name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
   prefix       TEXT NOT NULL,
   token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
-  role         TEXT NOT NULL CHECK (role IN ('admin','member')),
+  role         TEXT NOT NULL CHECK (role IN ('admin','member','join')),
   created_by   TEXT NOT NULL REFERENCES users(id),
   created_at   INTEGER NOT NULL,
   expires_at   INTEGER,
-  last_used_at INTEGER
+  last_used_at INTEGER,
+  CHECK ((role = 'join') = (network_id IS NOT NULL))
 );
 CREATE INDEX api_keys_by_org ON api_keys (org_id);
+CREATE INDEX api_keys_by_network ON api_keys (network_id);
 "
 
 /// V9: a network says whether its files may be browsed.

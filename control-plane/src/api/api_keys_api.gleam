@@ -1,4 +1,6 @@
-//// Org-scoped API keys: the management surface an org admin uses.
+//// API keys — the management surface an org admin uses, for both kinds: the
+//// org key that carries a role across an org, and the join key that carries
+//// one network and one operation.
 ////
 //// Admin-gated in all four directions, and closed to keys themselves —
 //// `middleware.require_user` is the first thing every handler here runs, and
@@ -17,7 +19,8 @@
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
-  Admin, audit, body_decoder, constraint_response, ok_json, require_org, text_at,
+  Admin, audit, body_decoder, constraint_response, db_error, ok_json,
+  require_org, text_at,
 }
 import api/middleware.{error_json, now_unix, require_user}
 import api/reads.{type Reads}
@@ -30,7 +33,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import store/sqlite.{Int as VInt, Text}
+import store/sqlite.{type Connection, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
 
@@ -77,8 +80,10 @@ pub fn list_keys(reads: Reads, who: Principal, slug: String) -> Response {
         conn,
         "SELECT k.id, k.name, k.prefix, k.role, k.created_at,
                 coalesce(k.expires_at, 0), coalesce(k.last_used_at, 0),
-                coalesce(u.email, '')
-         FROM api_keys k LEFT JOIN users u ON u.id = k.created_by
+                coalesce(u.email, ''), coalesce(n.name, '')
+         FROM api_keys k
+         LEFT JOIN users u ON u.id = k.created_by
+         LEFT JOIN networks n ON n.id = k.network_id
          WHERE k.org_id = ? ORDER BY k.created_at, k.id",
         [Text(org_id)],
       )
@@ -100,6 +105,9 @@ pub fn list_keys(reads: Reads, who: Principal, slug: String) -> Response {
         // membership by design, so nothing else surfaces what they left
         // behind.
         #("created_by_email", json.string(text_at(row, 7))),
+        // The network a join key is scoped to; empty for an org key, which
+        // is scoped to the org and to no network in particular.
+        #("network", json.string(text_at(row, 8))),
       ])
     })
   })
@@ -107,9 +115,19 @@ pub fn list_keys(reads: Reads, who: Principal, slug: String) -> Response {
 
 /// Mints a key. The token comes back exactly once.
 ///
-/// `role` is `admin` or `member` and nothing else — an org can only be handed
-/// away by an owner, and a credential that could be one would be a way to
-/// hand an org away by copying a string.
+/// Two kinds come out of here, and `role` is what decides which:
+///
+///   * `admin` or `member` — an **org key**, reaching whatever that role
+///     reaches across the org. Never `owner`: an org can only be handed away
+///     by an owner, and a credential that could be one would be a way to hand
+///     an org away by copying a string.
+///   * `join` — a **join key**, which also takes `network` and can do exactly
+///     one thing with it: add a device to that network. It has no rank at
+///     all; see `api/common.check_org`.
+///
+/// `network` and `join` travel together in both directions — a join key with
+/// no network is not a scope, and a network on an org key would be a bound
+/// nothing enforces.
 pub fn create_key(
   req: Request,
   ctx: AuthContext,
@@ -120,23 +138,36 @@ pub fn create_key(
   let decoder = {
     use name <- decode.field("name", decode.string)
     use role <- decode.optional_field("role", "member", decode.string)
+    use network <- decode.optional_field("network", "", decode.string)
     use expires_in <- decode.optional_field("expires_in", 0, decode.int)
-    decode.success(#(name, role, expires_in))
+    decode.success(#(name, role, network, expires_in))
   }
-  use #(name_input, role, expires_in) <- body_decoder(req, decoder)
+  use #(name_input, role, network, expires_in) <- body_decoder(req, decoder)
   let name = string.trim(name_input)
-  case check_name(name), check_role(role), check_expiry(expires_in) {
-    Error(refusal), _, _ | _, Error(refusal), _ | _, _, Error(refusal) ->
-      refusal
-    Ok(Nil), Ok(Nil), Ok(expiry) ->
+  case
+    check_name(name),
+    check_role(role),
+    check_scope(role, network),
+    check_expiry(expires_in)
+  {
+    Error(refusal), _, _, _
+    | _, Error(refusal), _, _
+    | _, _, Error(refusal), _
+    | _, _, _, Error(refusal)
+    -> refusal
+    Ok(Nil), Ok(Nil), Ok(Nil), Ok(expiry) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Admin)
+        // Resolved inside the org the key is being minted for, so a network
+        // name from somewhere else is a 404 rather than a scope.
+        use network_id <- scoped_to(conn, org_id, role, network)
         let key_id = id.new()
         case
           api_key.create(
             conn,
             key_id,
             org_id,
+            network_id,
             name,
             role,
             who.user_id,
@@ -156,6 +187,7 @@ pub fn create_key(
                   #("key", json.string(key_id)),
                   #("name", json.string(name)),
                   #("role", json.string(role)),
+                  #("network", json.string(network)),
                 ]),
               )
             ok_json(
@@ -163,6 +195,7 @@ pub fn create_key(
                 #("id", json.string(key_id)),
                 #("name", json.string(name)),
                 #("role", json.string(role)),
+                #("network", json.string(network)),
                 #("prefix", json.string(prefix)),
                 #(
                   "expires_at",
@@ -216,6 +249,7 @@ pub fn update_key(
     Ok(expiry) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Admin)
+        use <- kind_is_fixed(conn, org_id, key_id, role_field)
         // `org_id` in the WHERE and not merely in the lookup: it is what
         // makes another org's key id a miss rather than an edit.
         //
@@ -287,6 +321,45 @@ pub fn update_key(
   }
 }
 
+/// A key's *kind* is settled when it is minted, and no `PATCH` moves it.
+///
+/// Not a limitation so much as the absence of a meaningless operation: an org
+/// key becoming a join key would need a network it was never given, and a
+/// join key becoming an admin key is not an edit but a different credential
+/// with the same secret already deployed. Mint the one you want and revoke
+/// the one you have — which is two audited acts, and legible afterwards.
+///
+/// A missing row falls through: the `UPDATE` is what answers 404, so this
+/// says nothing about which key ids exist.
+fn kind_is_fixed(
+  conn: Connection,
+  org_id: String,
+  key_id: String,
+  role: Option(String),
+  next: fn() -> Response,
+) -> Response {
+  let stored =
+    sqlite.query(conn, "SELECT role FROM api_keys WHERE id = ? AND org_id = ?", [
+      Text(key_id),
+      Text(org_id),
+    ])
+  case stored, role {
+    Ok([[Text(was)]]), Some(wants)
+      if was != wants
+      && { was == api_key.join_role || wants == api_key.join_role }
+    ->
+      error_json(
+        400,
+        "bad_role",
+        "a key's kind is fixed when it is minted: mint a "
+          <> wants
+          <> " key and revoke this one",
+      )
+    Error(_), _ -> db_error()
+    _, _ -> next()
+  }
+}
+
 /// Deletes a key, which is what revoking one is.
 ///
 /// The row goes rather than being tombstoned: the token authenticates by the
@@ -343,18 +416,62 @@ fn check_name(name: String) -> Result(Nil, Response) {
   }
 }
 
-/// A key is `admin` or `member`. Never `owner`: see the module note, and
-/// `store/migrate`'s v10, where the same rule is a CHECK.
+/// `admin` or `member` for an org key, `join` for a join key. Never `owner`:
+/// see the module note, and `store/migrate`'s v10, where the same rule is a
+/// CHECK.
 fn check_role(role: String) -> Result(Nil, Response) {
   case role {
-    "admin" | "member" -> Ok(Nil)
+    "admin" | "member" | "join" -> Ok(Nil)
     _ ->
       Error(error_json(
         400,
         "bad_role",
-        "an API key's role is admin or member: an org is only ever handed "
-          <> "away by an owner, and no key is one",
+        "an API key's role is admin, member or join: an org is only ever "
+          <> "handed away by an owner, and no key is one",
       ))
+  }
+}
+
+/// `network` and `join` imply each other. Refusing each half without the
+/// other here is what keeps the request honest; the schema's CHECK is what
+/// keeps the row honest.
+fn check_scope(role: String, network: String) -> Result(Nil, Response) {
+  case role == api_key.join_role, network {
+    True, "" ->
+      Error(error_json(
+        400,
+        "bad_scope",
+        "a join key is scoped to one network: name it in `network`",
+      ))
+    False, "" -> Ok(Nil)
+    True, _ -> Ok(Nil)
+    False, _ ->
+      Error(error_json(
+        400,
+        "bad_scope",
+        "only a join key is scoped to a network: drop `network`, or ask for "
+          <> "role `join`",
+      ))
+  }
+}
+
+/// Resolves a join key's network within the org it is being minted for, and
+/// hands `next` the id to store — `None` for an org key, which is scoped to
+/// no network.
+fn scoped_to(
+  conn: Connection,
+  org_id: String,
+  role: String,
+  network: String,
+  next: fn(Option(String)) -> Response,
+) -> Response {
+  case role == api_key.join_role {
+    False -> next(None)
+    True ->
+      case common.find_network(conn, org_id, network) {
+        Ok(network_id) -> next(Some(network_id))
+        Error(Nil) -> error_json(404, "not_found", "no such network")
+      }
   }
 }
 

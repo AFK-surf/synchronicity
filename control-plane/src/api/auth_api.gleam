@@ -427,8 +427,9 @@ fn configured_methods(ctx: AuthContext) -> Response {
 /// and `GET /api/orgs/<slug>` says whether it still can.
 pub fn me(reads_ctx: Reads, who: Principal) -> Response {
   case who.credential {
-    principal.ApiKey(..) -> middleware.api_key_refused()
     principal.Cookie(csrf) -> me_for(reads_ctx, who.user_id, csrf)
+    principal.ApiKey(..) -> middleware.api_key_refused()
+    principal.JoinKey(..) -> middleware.join_key_refused()
   }
 }
 

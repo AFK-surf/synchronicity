@@ -1,6 +1,6 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
+description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key or a network-scoped join key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
 ---
 
 # synch
@@ -484,12 +484,22 @@ whole list.
 
 ### Getting a token
 
-An org owner or admin mints one under **Settings → API keys**. A key belongs to
-the *org*, not to whoever minted it: it names one org and carries its own role
-(`admin` or `member`, never `owner`), so it reaches no other org and no change
-to anybody's membership widens it. The token is shown once — the control plane
-keeps only its SHA-256 — and looks like `synch_` followed by 43 random
-characters.
+An org owner or admin mints one under **Settings → API keys**. Both kinds look
+identical on the wire — `synch_` followed by 43 random characters, shown once,
+because the control plane keeps only its SHA-256 — and differ in what they can
+reach:
+
+* An **org key** belongs to the org, not to whoever minted it. It names one
+  org and carries its own role (`admin` or `member`, never `owner`), so it
+  reaches no other org and no change to anybody's membership widens it.
+* A **join key** names one *network* and can do exactly one thing: add a
+  device to it. It cannot read the network, list its devices, or see anything
+  else in the org — every other route answers `403 join_key_forbidden`. That
+  is what makes it the credential to put somewhere a person cannot guard: a
+  provisioning image, a cloud-init file, a kickstart template.
+
+Everything below is the org key's surface unless it says otherwise; the join
+key's is one route, and it has its own section.
 
 ```sh
 cp=https://cp.acme.example.com
@@ -512,20 +522,39 @@ indented under `origin:`, with its state in parentheses:
 ```sh
 nk=qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo   # from init, or id
 
-curl -sS -X POST "$cp/api/orgs/acme/devices" \
+curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
   -H "Authorization: Bearer $token" -H 'content-type: application/json' \
   -d "{\"label\": \"nas\", \"nk\": \"$nk\"}"
-# -> {"ok":true,"soa_serial":42,"result":{"device_id":"0000068a4c…"}}
-
-# device_id is result.device_id above — the org knows the device now; this is
-# what puts it in a network's zone.
-curl -sS -X PUT "$cp/api/orgs/acme/networks/prod/devices/$device_id" \
-  -H "Authorization: Bearer $token"
+# -> {"ok":true,"soa_serial":42,
+#     "result":{"device_id":"0000068a4c…","label":"nas","network":"prod"}}
 ```
 
-Both answers carry `soa_serial`, because **the commit is the publication** —
-the zone is rebuilt and re-signed inside the same transaction, so there is no
-cache to wait for and no second call to make.
+One call, and it has to be: a device that exists in the org but sits in no
+network appears in no zone, so a caller that created one and stopped has
+enrolled nothing and its daemon is still waiting. The answer carries
+`soa_serial` because **the commit is the publication** — the zone is rebuilt
+and re-signed inside the same transaction, so there is no cache to wait for
+and no second call to make.
+
+**This is the route a join key exists for**, and the only one it can take. A
+node being provisioned needs no more reach than this, so give it no more:
+
+```sh
+# baked into the image, or handed over at first boot
+token=synch_...            # a join key for acme/prod
+curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
+  -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+  -d "{\"label\": \"$(hostname)\", \"nk\": \"$nk\"}"
+```
+
+Aimed at any other network — a sibling in the same org, or the same name in
+another org — a join key gets `404`, the same answer a stranger gets, so a
+leaked one cannot be used to find out what else the org runs. Everything else
+it might try answers `403 join_key_forbidden`, including reading the very
+network it may add to.
+
+An org key or a person reaches the same route at the `member` floor, since it
+is the same act.
 
 ### What a key can reach
 
@@ -541,10 +570,11 @@ listings return.
 | `GET` | `/api/orgs/<org>/networks/<net>` | member | every device, its live keys, the zone's signature health |
 | `DELETE` | `/api/orgs/<org>/networks/<net>` | admin | `{"confirm": "<net>"}` — typed back, as the UI asks |
 | `GET` | `/api/orgs/<org>/devices` | member | every device, with its keys and its networks |
-| `POST` | `/api/orgs/<org>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` |
+| `POST` | `/api/orgs/<org>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` — org only; in no network, so in no zone |
 | `PATCH` | `/api/orgs/<org>/devices/<dev>` | member | `{"relay", "addr"}` — **both**, always: an omitted one is cleared |
 | `DELETE` | `/api/orgs/<org>/devices/<dev>` | admin | the device and its keys leave the zone |
-| `PUT` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | assign; no body |
+| `POST` | `/api/orgs/<org>/networks/<net>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` — create **and** assign, one transaction |
+| `PUT` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | assign a device that already exists; no body |
 | `DELETE` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | unassign |
 | `POST` | `/api/orgs/<org>/devices/<dev>/keys` | member | `{"nk": "<key>"}` — opens the rotation window |
 | `POST` | `/api/orgs/<org>/devices/<dev>/keys/<key>/retire` | member | closes it; no body |
@@ -573,6 +603,45 @@ contain anything, separators included.
 Downloads are capped at four open at once **per credential**: a key gets its
 own budget rather than spending the budget of whoever minted it, and the
 fifth concurrent stream is a `429` naming the limit.
+
+### The join key's surface
+
+One row, and that is the point:
+
+| Method | Path | What |
+| --- | --- | --- |
+| `POST` | `/api/orgs/<org>/networks/<net>/devices` | the network it was minted for, and no other |
+
+Everything else in the service — including `GET` on that same network —
+answers `403 join_key_forbidden`. That is not a list somebody maintains: every
+org-scoped route in the service resolves its caller through one function, and
+that function refuses the whole family before it reads a rank. A join key has
+no rank to read.
+
+Minting one is the ordinary create with `role: "join"` and the network named:
+
+```json
+POST /api/orgs/acme/api-keys
+{"name": "rack 3 provisioning", "role": "join",
+ "network": "prod", "expires_in": 2592000}
+```
+
+Shown without a `curl` because **no key can mint a key**, this one included:
+that route is a signed-in person's, so it is the dashboard's Settings → API
+keys, or a session cookie and its `x-csrf` header. A key that could mint keys
+could mint one that never expires.
+
+`network` and `role: "join"` imply each other: neither is accepted without the
+other, and the schema says the same thing, so a row that is one without the
+other cannot exist. A key's *kind* is settled at minting — `PATCH` will move
+its name and its expiry but not what it is, because a join key promoted to
+admin is not an edit, it is a different credential with a secret that is
+already deployed.
+
+**What a join key does not bound is how many.** Anyone holding it can enrol
+devices until it expires or is revoked, which is why `expires_in` is worth
+setting on one and why the audit trail records every `network.join` under
+`key:<id>`. Revoking is the same one call as any other key.
 
 ### What a key can never reach
 
@@ -609,10 +678,11 @@ wisp's own plain-text `404 Not found` / `405 Method not allowed`.
 
 | Status | `code` | Means |
 | --- | --- | --- |
-| `400` | `bad_name`, `bad_role`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
+| `400` | `bad_name`, `bad_role`, `bad_scope`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
 | `401` | `unauthenticated` | no credential, one that is unknown, expired or revoked, or an unreadable `Authorization` header |
 | `403` | `forbidden` | your role is under the route's floor; the message names it |
 | `403` | `api_key_forbidden` | a person's endpoint, reached with a key |
+| `403` | `join_key_forbidden` | anything but the one route a join key may take |
 | `404` | `not_found` | it does not exist, or it is not in your org — one answer for both, on purpose |
 | `409` | `conflict` | the change collides with a record that exists; the message names the invariant |
 | `409` | `rotation_open` / `not_retiring` | a second rotation window while one is open; retiring a key that is not the retiring one |

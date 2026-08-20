@@ -16,9 +16,10 @@ import gleam/dynamic/decode
 import gleam/json
 import gleam/result
 import gleam/string
-import store/sqlite.{Int as VInt, Text}
+import store/sqlite.{Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
+import zone/build
 import zone/model
 import zone/publish
 
@@ -187,6 +188,16 @@ pub fn delete_network(
           Ok(network_id) ->
             zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
               let work = {
+                // Join keys name this network and nothing else, so they go
+                // with it: a scope whose network is gone is not a narrower
+                // credential, it is a token that can never be used again.
+                use _ <- result.try(
+                  sqlite.exec(
+                    conn,
+                    "DELETE FROM api_keys WHERE network_id = ?",
+                    [Text(network_id)],
+                  ),
+                )
                 use _ <- result.try(
                   sqlite.exec(
                     conn,
@@ -218,6 +229,165 @@ pub fn delete_network(
 }
 
 // -- assignment -------------------------------------------------------------
+
+/// `POST /api/orgs/:slug/networks/:net/devices` — a node joins a network.
+///
+/// One call for what was two, because joining *is* one act: a device that
+/// exists in the org but sits in no network appears in no zone, so a caller
+/// that stopped after creating it has enrolled nothing and its daemon is
+/// still waiting. Creating and assigning share this transaction and the zone
+/// republish at the end of it, so the answer is either a node that resolves
+/// or a database that never heard of it.
+///
+/// **This is the one route a join key can take**, and the reason the route
+/// exists in this shape. A join key is what goes into a provisioning image, a
+/// cloud-init file, a QR code on a rack — so what it can do has to be exactly
+/// the enrolment and nothing adjacent to it. Handing that job to the two
+/// older routes would have meant a credential that can also put *any* device
+/// into the network, and leave devices lying around the org attached to
+/// nothing.
+///
+/// Everyone else reaches it too, at the `Member` floor the older routes carry:
+/// it is the same act, and a person should not have to make two calls to do
+/// what a machine does in one.
+pub fn join_device(
+  req: Request,
+  ctx: AuthContext,
+  who: Principal,
+  slug: String,
+  network: String,
+) -> Response {
+  let decoder = {
+    use label <- decode.field("label", decode.string)
+    use nk <- decode.field("nk", decode.string)
+    use relay <- decode.optional_field("relay", "", decode.string)
+    use addr <- decode.optional_field("addr", "", decode.string)
+    decode.success(#(label, nk, relay, addr))
+  }
+  use #(label, nk, relay, addr) <- body_decoder(req, decoder)
+  case
+    name.valid_device_label(label),
+    model.validate_nk(nk),
+    build.valid_hint(relay) && build.valid_hint(addr)
+  {
+    False, _, _ -> refused(build.InvalidLabel(label))
+    _, Error(Nil), _ -> refused(build.InvalidNk(nk))
+    _, _, False -> refused(bad_hint(relay, addr))
+    True, Ok(nk_bytes), True ->
+      with_db(ctx, fn(conn) {
+        case common.check_join_target(conn, slug, network, who) {
+          Error(refusal) -> refusal
+          Ok(#(org_id, network_id)) ->
+            zone_mutation(conn, ctx, who, publish.Widening, fn() {
+              // The label has to be free *in this network*; two devices under
+              // one label is what the trigger and the zone build refuse next,
+              // and saying so here is what makes the refusal readable.
+              let clash =
+                sqlite.query(
+                  conn,
+                  "SELECT 1 FROM network_devices nd
+                   JOIN devices d ON d.id = nd.device_id
+                   WHERE nd.network_id = ? AND d.label = ?",
+                  [Text(network_id), Text(label)],
+                )
+              case clash {
+                Error(_) -> Error(db_error())
+                Ok([_, ..]) ->
+                  Error(error_json(
+                    409,
+                    "conflict",
+                    "a device labeled '"
+                      <> label
+                      <> "' is already in this network",
+                  ))
+                Ok([]) -> {
+                  let device_id = id.new()
+                  let work = {
+                    use _ <- result.try(
+                      sqlite.exec(
+                        conn,
+                        "INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                          Text(device_id),
+                          Text(org_id),
+                          Text(label),
+                          sqlite.text_or_null(relay),
+                          sqlite.text_or_null(addr),
+                          Text(who.user_id),
+                          VInt(now_unix()),
+                        ],
+                      ),
+                    )
+                    use _ <- result.try(
+                      sqlite.exec(
+                        conn,
+                        "INSERT INTO device_keys
+                         VALUES (?, ?, ?, ?, 'active', ?, NULL)",
+                        [
+                          Text(id.new()),
+                          Text(device_id),
+                          Text(nk),
+                          Blob(nk_bytes),
+                          VInt(now_unix()),
+                        ],
+                      ),
+                    )
+                    use _ <- result.try(
+                      sqlite.exec(
+                        conn,
+                        "INSERT INTO network_devices VALUES (?, ?, ?)",
+                        [
+                          Text(network_id),
+                          Text(device_id),
+                          VInt(now_unix()),
+                        ],
+                      ),
+                    )
+                    audit(
+                      conn,
+                      who,
+                      org_id,
+                      "network.join",
+                      json.object([
+                        #("network", json.string(network)),
+                        #("label", json.string(label)),
+                        #("nk", json.string(nk)),
+                      ]),
+                    )
+                  }
+                  case work {
+                    Ok(Nil) ->
+                      Ok(
+                        json.object([
+                          #("device_id", json.string(device_id)),
+                          #("label", json.string(label)),
+                          #("network", json.string(network)),
+                        ]),
+                      )
+                    Error(e) -> Error(constraint_response(e))
+                  }
+                }
+              }
+            })
+        }
+      })
+  }
+}
+
+/// A per-member rule broken by the request itself — the same vocabulary
+/// `api/devices_api` refuses with, so one broken rule names itself the same
+/// way whichever route caught it.
+fn refused(fault: build.BuildError) -> Response {
+  let #(code, message) = common.build_refusal(fault)
+  error_json(400, code, message)
+}
+
+fn bad_hint(relay: String, addr: String) -> build.BuildError {
+  case build.valid_hint(relay) {
+    False -> build.InvalidHint(relay)
+    True -> build.InvalidHint(addr)
+  }
+}
 
 pub fn assign_device(
   ctx: AuthContext,

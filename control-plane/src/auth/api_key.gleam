@@ -12,10 +12,18 @@
 ////   somebody is watching the list; a key handed out for a fortnight should
 ////   stop working on its own.
 ////
-//// Authorisation is not here. A key's org and role travel in the
-//// `auth/principal` value this module hands back, and `api/common.check_org`
-//// is the one place that decides what they permit.
+//// Two kinds share the table, because everything about *being* a credential
+//// is the same for both. An **org key** names an org and carries a role. A
+//// **join key** names one network and carries no role at all: the only thing
+//// it can do is put a device into that network. Which one a row is, is
+//// `role = 'join'`, and the schema ties that to `network_id` with a CHECK so
+//// neither half can be wrong on its own.
+////
+//// Authorisation is not here. What a token resolves to travels in the
+//// `auth/principal` value this module hands back, and `api/common` is where
+//// that value becomes a permission.
 
+import auth/principal.{type Principal, ApiKey, JoinKey, Principal}
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
@@ -42,8 +50,15 @@ const display_length = 8
 /// is worth far less than a write lock on every request.
 const use_stamp_interval = 3600
 
+/// The role string that marks a join key. Not a rank — see `auth/principal`.
+pub const join_role = "join"
+
 /// Mints a key. Returns the token and the display prefix; the row's id is an
 /// argument, because the caller needs it for the audit row either way.
+///
+/// `network_id` is `Some` exactly when `role` is `join`; the schema's CHECK
+/// says the same thing, so a caller that gets it wrong is refused rather than
+/// stored.
 ///
 /// The token is the only copy — nothing stored can reproduce it, so a caller
 /// that loses it mints another.
@@ -51,6 +66,7 @@ pub fn create(
   conn: Connection,
   key_id: String,
   org_id: String,
+  network_id: Option(String),
   name: String,
   role: String,
   created_by: String,
@@ -63,10 +79,17 @@ pub fn create(
   let insert =
     sqlite.exec(
       conn,
-      "INSERT INTO api_keys VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+      // Columns named rather than positional: this table has been rebuilt
+      // once already, and a VALUES list is the thing that silently shifts
+      // when it is rebuilt again.
+      "INSERT INTO api_keys
+         (id, org_id, network_id, name, prefix, token_hash, role, created_by,
+          created_at, expires_at, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
       [
         Text(key_id),
         Text(org_id),
+        nullable_text(network_id),
         Text(name),
         Text(prefix),
         Blob(id.hash_token(token)),
@@ -80,17 +103,6 @@ pub fn create(
     Ok(_) -> Ok(#(token, prefix))
     Error(e) -> Error(e)
   }
-}
-
-/// What a presented token resolves to: the key's own org and role, and the
-/// user its writes are attributed to.
-pub type Authenticated {
-  Authenticated(
-    key_id: String,
-    org_id: String,
-    role: String,
-    created_by: String,
-  )
 }
 
 /// Resolves a bearer token, or refuses.
@@ -113,13 +125,14 @@ pub fn authenticate(
   conn: Connection,
   token: String,
   now: Int,
-) -> Result(Authenticated, Nil) {
+) -> Result(Principal, Nil) {
   case string.starts_with(token, token_prefix) {
     False -> Error(Nil)
     True -> {
       let hash = id.hash_token(token)
       let sql =
-        "SELECT id, org_id, role, created_by, coalesce(last_used_at, 0)
+        "SELECT id, org_id, coalesce(network_id, ''), role, created_by,
+                coalesce(last_used_at, 0)
          FROM api_keys
          WHERE token_hash = ? AND (expires_at IS NULL OR expires_at > ?)"
       case sqlite.query(conn, sql, [Blob(hash), VInt(now)]) {
@@ -127,6 +140,7 @@ pub fn authenticate(
           [
             Text(key_id),
             Text(org_id),
+            Text(network_id),
             Text(role),
             Text(created_by),
             VInt(last_used),
@@ -144,11 +158,27 @@ pub fn authenticate(
             }
             False -> Nil
           }
-          Ok(Authenticated(key_id, org_id, role, created_by))
+          // The schema's CHECK is what makes this exhaustive: `join` without
+          // a network, or a network without `join`, is a row that cannot be
+          // written. The empty-string arm is unreachable and answers `Error`
+          // rather than inventing a credential out of a broken row.
+          case role, network_id {
+            "join", "" -> Error(Nil)
+            "join", network ->
+              Ok(Principal(created_by, JoinKey(key_id, org_id, network)))
+            _, _ -> Ok(Principal(created_by, ApiKey(key_id, org_id, role)))
+          }
         }
         _ -> Error(Nil)
       }
     }
+  }
+}
+
+fn nullable_text(value: Option(String)) -> sqlite.Value {
+  case value {
+    Some(text) -> Text(text)
+    None -> Null
   }
 }
 
