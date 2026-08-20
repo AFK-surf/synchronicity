@@ -67,6 +67,18 @@ pub type Config {
     /// (hostname, ipv4, ipv6) — hostname relative to apex unless dotted.
     ns_hosts: List(#(String, String, String)),
     public_url: String,
+    /// The name a *browser* reaches this deployment at (`CP_ENTRY_URL`), for
+    /// OAuth callbacks, magic links and invitations. Defaults to
+    /// `CP_PUBLIC_URL`, which is right for a deployment of one node.
+    ///
+    /// Separate from `public_url` because a load-balanced deployment has two
+    /// kinds of name and these two uses fall on opposite sides of the split:
+    /// `public_url` is *this node's own*, dialed directly by daemons and
+    /// signed over in their attach proof, while every link mailed to a person
+    /// has to come back to the balanced entry name — a sign-in that lands on
+    /// one node's own name sets its cookie there, and the browser returns to
+    /// the entry name without it.
+    entry_url: String,
     /// Signs session cookies; sessions survive restarts because of it.
     session_secret: String,
     /// (host, port, username, password, from) — absent means log-only mail.
@@ -138,6 +150,7 @@ pub fn load() -> Result(Config, String) {
     Serve -> ns_hosts()
   })
   use public_url <- result.try(public_url())
+  use entry_url <- result.try(entry_url(public_url))
   // Every node serves the dashboard, so every node reads session cookies and
   // every node needs the secret that signs them — a replica needs *the
   // primary's*, byte for byte, or every cookie the primary minted fails its
@@ -161,6 +174,7 @@ pub fn load() -> Result(Config, String) {
     dns_listen,
     ns_hosts,
     public_url,
+    entry_url,
     session_secret,
     smtp,
     credential_pair("CP_GOOGLE_CLIENT_ID", "CP_GOOGLE_CLIENT_SECRET"),
@@ -315,6 +329,33 @@ pub fn endpoints() -> List(String) {
   // `CP_ENDPOINTS` is an ordinary mistake.
   list.unique([browse_endpoint(), ..extra_endpoints()])
   |> list.filter(fn(endpoint) { endpoint != "" })
+}
+
+/// `CP_ENTRY_URL`: the name a browser reaches this deployment at.
+///
+/// Defaults to this node's own `CP_PUBLIC_URL`, which is the whole of the
+/// answer for a deployment of one node. Behind a balancer they differ, and
+/// the difference matters in one direction only: a link mailed to a person —
+/// an OAuth callback, a magic link, an invitation — must return them to the
+/// entry name, because a sign-in completed on one node's own name sets its
+/// cookie there and the browser comes back to the entry name without it.
+///
+/// Checked as an origin like the others, but not for record safety: this one
+/// never reaches DNS.
+fn entry_url(public_url: String) -> Result(String, String) {
+  case envoy.get("CP_ENTRY_URL") {
+    Error(Nil) -> Ok(public_url)
+    Ok(url) -> {
+      let url = trim_trailing_slash(string.trim(url))
+      case is_origin(url) {
+        True -> Ok(url)
+        False ->
+          Error(
+            "CP_ENTRY_URL must be an https:// or http:// origin, got " <> url,
+          )
+      }
+    }
+  }
 }
 
 /// `CP_ENDPOINTS`: the deployment's *other* control-plane endpoints, comma-

@@ -75,6 +75,10 @@ in one place because there is only one writable database.
   replicas — `sync.example`. This is where the dashboard is, and the only
   name a browser sees, so the session cookie is host-only on it and works on
   whichever node the balancer picks. Nothing needs a `Domain` attribute.
+  Every node names it as `CP_ENTRY_URL`, so a magic link, an OAuth callback
+  or an invitation comes back *here* rather than to whichever node minted it
+  — a sign-in completed on one node's own name would set the cookie there,
+  and the browser would return to the entry name without it.
 - **One name per node for daemons** — `cp1.sync.example` — each node's own
   `CP_PUBLIC_URL`, published in the attach record. A daemon holds a tunnel to
   every node, so these are dialed individually and never balanced.
@@ -87,20 +91,26 @@ Two things then have to line up:
 2. **Sign-in and every other write reaches the primary.** Minting a session
    is an `INSERT`, and a replica's database is opened read-only *and*
    replaced wholesale on the next refresh — a row written there would not
-   survive the interval even if the handle allowed it. Route `/auth/*` and
-   the non-GET `/api/*` methods to the primary at the balancer; the replica's
+   survive the interval even if the handle allowed it. So the balancer sends
+   `/auth/*` and the non-GET `/api/*` methods to the primary; the replica's
    409 and its login screen, which name `CP_PRIMARY_URL`, are the backstop
    for a request that gets there anyway.
+
+   [`ops/worker/`](worker/) is that balancer as one Cloudflare Worker, if you
+   want it: two variables, the routing table above, and reads that fall back
+   through the replicas to the primary.
 
 ```sh
 # primary — behind sync.example along with the replicas
 CP_PUBLIC_URL=https://cp0.sync.example
+CP_ENTRY_URL=https://sync.example
 CP_ENDPOINTS=https://cp1.sync.example,https://cp2.sync.example
 CP_SESSION_SECRET=…
 
 # cp1 — behind sync.example too, and dialed directly by daemons
 CP_ROLE=replica
 CP_PUBLIC_URL=https://cp1.sync.example
+CP_ENTRY_URL=https://sync.example
 CP_PRIMARY_URL=https://cp0.sync.example
 CP_SESSION_SECRET=…the primary's, byte for byte…
 ```
@@ -135,6 +145,7 @@ a download.
 | `CP_PUBLIC_URL` | both | **Required.** This node's own external URL: links and OAuth callbacks on the primary, and on every node the attach endpoint daemons dial and sign their proof over. Published verbatim at `_synchronicity-cp.<base>`, so it must be an `https://` or `http://` origin with no whitespace — refused at boot rather than in every daemon a TTL later |
 | `CP_SESSION_SECRET` | both | ≥32 chars; signs session cookies. **The same value on every node**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to |
 | `CP_PRIMARY_URL` | replica | the primary's URL. Required, and the one fact a read-only node cannot derive: it is what a refused write and the login screen name, and without it the dashboard is a dead end |
+| `CP_ENTRY_URL` | both | the name a browser reaches this deployment at — the balanced entry name. Defaults to `CP_PUBLIC_URL`, which is right for a deployment of one node. OAuth callbacks, magic links and invitations are built from it, so behind a balancer it must be set or those links return people to one node's own name and their new cookie stays there |
 | `CP_ENDPOINTS` | primary | this deployment's *other* control-plane endpoints, comma- or semicolon-separated (`https://cp1.sync.example,https://cp2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL` — the apex saying where this base's control plane answers, not a browse-specific list. Cloud attach is what dials them today, one standing tunnel per endpoint per daemon. At most 8 endpoints in total |
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |

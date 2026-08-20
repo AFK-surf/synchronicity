@@ -476,7 +476,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let auth =
     auth_api.AuthContext(
       reads.Reads(api_pool),
-      cfg.public_url,
+      cfg.entry_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
@@ -602,7 +602,7 @@ fn serve_external(
   let auth =
     auth_api.AuthContext(
       reads.Reads(api_pool),
-      cfg.public_url,
+      cfg.entry_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
@@ -760,7 +760,7 @@ fn seed_admin(email: String) -> Result(Nil, String) {
   )
   io.println(
     "one-time sign-in link (15 minutes):\n"
-    <> cfg.public_url
+    <> cfg.entry_url
     <> "/auth/magic/redeem?token="
     <> token,
   )

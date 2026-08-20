@@ -63,6 +63,7 @@ fn browse_env() -> Nil {
   envoy.unset("CP_DNS_LISTEN")
   envoy.unset("CP_NS_HOSTS")
   envoy.set("CP_PUBLIC_URL", "https://sync.example")
+  envoy.unset("CP_ENTRY_URL")
   envoy.unset("CP_ENDPOINTS")
   envoy.unset("CP_PRIMARY_URL")
 }
@@ -254,6 +255,42 @@ pub fn a_node_needs_its_own_url_and_a_replica_needs_the_primarys_test() {
   // Its own endpoint and nobody else's: the deployment's list is the
   // primary's to publish.
   assert cfg.endpoints == ["https://cp1.sync.example"]
+  browse_env()
+}
+
+/// The two names a load-balanced deployment has, and which use falls on
+/// which side.
+///
+/// `CP_PUBLIC_URL` is this node's own — daemons dial it directly and sign
+/// their attach proof over it, so the apex publishes it verbatim.
+/// `CP_ENTRY_URL` is where a browser reaches the deployment, so it is what a
+/// magic link, an OAuth callback and an invitation come back to: a sign-in
+/// completed on one node's own name sets its cookie there, and the browser
+/// returns to the entry name without it.
+pub fn a_deployment_behind_a_balancer_has_two_names_test() {
+  browse_env()
+  // One node: they are the same name, and nothing has to be told twice.
+  let assert Ok(cfg) = config.load()
+  assert cfg.public_url == "https://sync.example"
+  assert cfg.entry_url == cfg.public_url
+
+  envoy.set("CP_PUBLIC_URL", "https://cp0.sync.example")
+  envoy.set("CP_ENTRY_URL", "https://sync.example")
+  let assert Ok(cfg) = config.load()
+  // The record still names this node, not the balancer: a tunnel relayed
+  // from the entry name would carry a proof signed over the wrong URL.
+  assert cfg.endpoints == ["https://cp0.sync.example"]
+  assert cfg.entry_url == "https://sync.example"
+
+  // Same origin rule as the rest, and a trailing slash trimmed the same way.
+  envoy.set("CP_ENTRY_URL", "https://sync.example/")
+  let assert Ok(cfg) = config.load()
+  assert cfg.entry_url == "https://sync.example"
+  envoy.set("CP_ENTRY_URL", "sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "origin")
+
+  envoy.unset("CP_ENTRY_URL")
   browse_env()
 }
 

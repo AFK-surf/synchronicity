@@ -113,6 +113,23 @@ jobs:
       - run: npx vitest run
       - run: npx vite build
 
+  # The entry-name balancer (ops/worker/lb.js), which decides whether each
+  # request reaches a node that can serve it. Getting that wrong is silent —
+  # a write sent to a replica comes back 409, a login sent to one comes back
+  # with no session — so the routing is asserted over the service's own read
+  # and write tables, and the handler is driven against stub origins.
+  #
+  # Plain `node --test`: the Worker is one ES module exporting `fetch`, and
+  # Node has Request/Response/fetch, so this needs no wrangler and no network.
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test control-plane/ops/worker/lb.test.mjs
+
   # The replication contract, with the tool the runbook names.
   #
   # `ops/RUNBOOK.md` tells operators to keep the primary in WAL mode, run

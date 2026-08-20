@@ -1,0 +1,18 @@
+# Deploy: `wrangler deploy` from this directory, with a route bound to the
+# deployment's *entry* name — the one browsers use and every node names as
+# CP_ENTRY_URL. Nodes' own names (CP_PUBLIC_URL) must NOT route here: daemons
+# dial those directly, and an attach proof relayed from the entry name is
+# signed over the wrong URL.
+name = "synchronicity-control-plane-lb"
+main = "lb.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+# The node that owns the writable database. Every write and every sign-in
+# goes here; with no REPLICAS set, so does everything else.
+PRIMARY = "https://cp0.sync.example"
+# The read-only nodes, comma-separated. Reads are spread across them and fall
+# back to PRIMARY.
+REPLICAS = "https://cp1.sync.example,https://cp2.sync.example"
+
+# routes = [{ pattern = "sync.example/*", zone_name = "sync.example" }]

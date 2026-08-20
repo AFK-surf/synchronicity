@@ -510,7 +510,7 @@ pub fn create_invite(
         case insert {
           Error(e) -> constraint_response(e)
           Ok(_) -> {
-            let link = ctx.public_url <> "/invite?token=" <> token
+            let link = ctx.entry_url <> "/invite?token=" <> token
             let _ =
               mailer.send(
                 ctx.mail,

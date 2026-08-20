@@ -27,7 +27,9 @@ pub type AuthContext {
     /// write handler can hand the read half straight to a read handler,
     /// which is the same half a replica mounts on its own.
     reads: Reads,
-    public_url: String,
+    /// Where a link mailed to a person comes back to — the balanced entry
+    /// name, not this node's own (`CP_ENTRY_URL`).
+    entry_url: String,
     mail: Mailer,
     google: Option(Provider),
     github: Option(Provider),
@@ -62,7 +64,7 @@ fn provider_for(ctx: AuthContext, key: String) -> Result(Provider, Nil) {
 }
 
 fn redirect_uri(ctx: AuthContext, key: String) -> String {
-  ctx.public_url <> "/auth/callback/" <> key
+  ctx.entry_url <> "/auth/callback/" <> key
 }
 
 /// `?link=1` on a start URL, from a live session, records that the
@@ -329,7 +331,7 @@ pub fn magic_request(req: Request, ctx: AuthContext) -> Response {
     Ok(email) ->
       with_db(ctx, fn(conn) {
         // Always 200: no account enumeration through this endpoint.
-        let _ = magic.request(conn, email, now_unix(), ctx.public_url, ctx.mail)
+        let _ = magic.request(conn, email, now_unix(), ctx.entry_url, ctx.mail)
         json.object([#("ok", json.bool(True))])
         |> json.to_string
         |> wisp.json_response(200)
