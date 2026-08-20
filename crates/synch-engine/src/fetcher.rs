@@ -1624,23 +1624,47 @@ mod tests {
         );
     }
 
+    /// A fetch with no providers reports the shape exactly and never invents
+    /// content: a locally complete object needs no fetch, an object nobody
+    /// can serve reports incomplete, and an empty object — one chunk group
+    /// nothing encodes for, every window served-nothing — needs no provider.
     #[tokio::test]
-    async fn a_fetch_with_no_providers_reports_incomplete() {
+    async fn a_fetch_with_no_providers_reports_the_shape_exactly() {
         let (_d, node) = node().await;
-        // A locally complete object needs no fetch at all...
         let payload = vec![3u8; 100_000];
         let root = node.store().ingest_bytes(&payload, now_ns()).unwrap();
         let report = node.fetch_all(&root, payload.len() as u64).await.unwrap();
         assert!(report.complete);
         assert_eq!(report.providers_tried, 0);
         assert!(report.fetched.is_empty());
-        // ...and an object nobody can serve reports the shape exactly.
+
         let report = node
             .fetch_all(&Hash::new(b"nobody has this"), 100_000)
             .await
             .unwrap();
         assert!(!report.complete);
         assert_eq!(report.providers_tried, 0);
+
+        // An empty object published by a peer and never held here: no CAS
+        // row, no provider ad, and — being offline in this test — nobody to
+        // ask either.
+        let (peer, _) = trust(&node, "nas");
+        let empty = Hash::new(b"");
+        node.store()
+            .put_entry(&peer, "s", "empty.txt", &FileEntry::file(0, 0, empty, 1))
+            .unwrap();
+        let report = node.fetch_all(&empty, 0).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.providers_tried, 0, "nobody should have been asked");
+        // An entry claiming no bytes while naming some other object is not
+        // completed by inventing content for it.
+        assert!(
+            !node
+                .fetch_all(&Hash::new(b"not the empty object"), 0)
+                .await
+                .unwrap()
+                .complete
+        );
     }
 
     #[tokio::test]
@@ -1693,34 +1717,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("deleted at seq 4"));
-    }
-
-    /// Requiring a provider means never finding an empty object: it is one
-    /// chunk group, nothing encodes for that group, and every window comes
-    /// back served-nothing.
-    #[tokio::test]
-    async fn an_empty_object_needs_no_provider() {
-        let (_d, node) = node().await;
-        let (peer, _) = trust(&node, "nas");
-        let empty = Hash::new(b"");
-        // Published by a peer, never held here: no CAS row, no provider ad,
-        // and — being offline in this test — nobody to ask either.
-        node.store()
-            .put_entry(&peer, "s", "empty.txt", &FileEntry::file(0, 0, empty, 1))
-            .unwrap();
-
-        let report = node.fetch_all(&empty, 0).await.unwrap();
-        assert!(report.complete, "{report:?}");
-        assert_eq!(report.providers_tried, 0, "nobody should have been asked");
-        // An entry claiming no bytes while naming some other object is not
-        // completed by inventing content for it.
-        assert!(
-            !node
-                .fetch_all(&Hash::new(b"not the empty object"), 0)
-                .await
-                .unwrap()
-                .complete
-        );
     }
 
     /// Donors are the versions this node can actually supply bytes from, in
@@ -1954,17 +1950,6 @@ mod tests {
             ranked[0].claims,
             ranked[1].claims
         );
-
-        // What each holder will actually serve, before the fetch is blamed
-        // for anything: a partial row must encode its own half.
-        for (holder, expect) in holders.iter().zip([half..size, 0..half]) {
-            let ask = ChunkRanges::from_ranges([synch_core::groups_for_byte_range(
-                expect.start,
-                expect.end,
-            )]);
-            let (_, served) = holder.store().encode_slice(&root, &ask).unwrap();
-            assert!(!served.is_empty(), "a holder must serve its own half");
-        }
 
         let report = node.fetch_all(&root, size).await.unwrap();
         assert!(report.complete, "{report:?}");

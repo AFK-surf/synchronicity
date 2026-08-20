@@ -1361,6 +1361,44 @@ mod tests {
             .unwrap();
     }
 
+    /// A fresh node under a blocking scope, as the wire tests need.
+    async fn scoped_node() -> (synch_core::BlockingScope, tempfile::TempDir, Node) {
+        let blocking = synch_core::BlockingScope::enter();
+        let (dir, node) = node().await;
+        (blocking, dir, node)
+    }
+
+    /// Runs `serve` end to end over an in-process pair of channels, returning
+    /// the Down half, the Up half, and the served task.
+    fn serve_session(
+        node: &Node,
+    ) -> (
+        mpsc::UnboundedSender<Message>,
+        mpsc::UnboundedReceiver<Message>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (to_node, node_rx) = mpsc::unbounded_channel::<Message>();
+        let (node_tx, from_node) = mpsc::unbounded_channel::<Message>();
+        let stream = Box::pin(futures_util::stream::unfold(node_rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|m| (Ok::<Message, tokio_tungstenite::tungstenite::Error>(m), rx))
+        }));
+        let sink = Box::pin(futures_util::sink::unfold(
+            node_tx,
+            |tx, m: Message| async move {
+                tx.send(m)
+                    .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
+                Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
+            },
+        ));
+        let node = node.clone();
+        let served = tokio::spawn(async move {
+            let _ = serve(&node, sink, stream).await;
+        });
+        (to_node, from_node, served)
+    }
+
     /// The control plane can ask who the cluster admits, and is told which
     /// grants still hold (§3.5).
     ///
@@ -1371,8 +1409,7 @@ mod tests {
     /// work closed locally — this is that hole closed over the tunnel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_a_delegations_query_with_the_cascade_applied() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (_dir, node) = node().await;
+        let (_blocking, _dir, node) = scoped_node().await;
 
         // A rooted issuer, and one this node holds no binding for at all.
         let rooted = origin("nas");
@@ -1397,27 +1434,7 @@ mod tests {
         delegate(&node, &rooted, held, &["photos"]);
         delegate(&node, &stranger, orphaned, &["finance"]);
 
-        let (to_node, node_rx) = mpsc::unbounded_channel::<Message>();
-        let (node_tx, mut from_node) = mpsc::unbounded_channel::<Message>();
-        let stream = Box::pin(futures_util::stream::unfold(node_rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|m| (Ok::<Message, tokio_tungstenite::tungstenite::Error>(m), rx))
-        }));
-        let sink = Box::pin(futures_util::sink::unfold(
-            node_tx,
-            |tx, m: Message| async move {
-                tx.send(m)
-                    .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
-                Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
-            },
-        ));
-        let served = {
-            let node = node.clone();
-            tokio::spawn(async move {
-                let _ = serve(&node, sink, stream).await;
-            })
-        };
+        let (to_node, mut from_node, served) = serve_session(&node);
 
         to_node
             .send(down_msg(&Down::Delegations { id: 7 }))
@@ -1464,8 +1481,7 @@ mod tests {
     /// against the control plane's; this covers everything downstream of it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_ls_resolve_and_read_over_the_wire() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (dir, node) = node().await;
+        let (_blocking, dir, node) = scoped_node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         // Larger than one chunk, so the CHUNK framing and the multi-chunk
         // credit path both run rather than fitting in a single frame.
@@ -1485,27 +1501,7 @@ mod tests {
 
         // Two halves of one socket: `to_node` carries Down frames in, `from_node`
         // collects Up frames out.
-        let (to_node, node_rx) = mpsc::unbounded_channel::<Message>();
-        let (node_tx, mut from_node) = mpsc::unbounded_channel::<Message>();
-        let stream = Box::pin(futures_util::stream::unfold(node_rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|m| (Ok::<Message, tokio_tungstenite::tungstenite::Error>(m), rx))
-        }));
-        let sink = Box::pin(futures_util::sink::unfold(
-            node_tx,
-            |tx, m: Message| async move {
-                tx.send(m)
-                    .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
-                Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
-            },
-        ));
-        let served = {
-            let node = node.clone();
-            tokio::spawn(async move {
-                let _ = serve(&node, sink, stream).await;
-            })
-        };
+        let (to_node, mut from_node, served) = serve_session(&node);
 
         // LS: the directory lists the file.
         to_node
@@ -1625,10 +1621,9 @@ mod tests {
     /// needs no enabling — and empties only when the operator opts out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_targets_follow_the_zone_and_the_opt_out() {
-        let _blocking = synch_core::BlockingScope::enter();
         // A key-identified node names no zone, so there is no apex to take a
         // control plane from — nothing to attach to, tunnel or no tunnel.
-        let (_d, node) = node().await;
+        let (_blocking, _d, node) = scoped_node().await;
         assert!(node.attach_targets().await.is_empty());
         node.shutdown().await.unwrap();
 
@@ -1654,8 +1649,7 @@ mod tests {
     /// mirror-only node is routable for what it mirrors.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_claim_covers_mirrored_spaces_too() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (dir, node) = node().await;
+        let (_blocking, dir, node) = scoped_node().await;
         node.add_space("docs", dir.path().join("docs")).unwrap();
         let mirror = tempfile::tempdir().unwrap();
         node.add_mirror("media", mirror.path(), &VersionPolicy::Newest)
@@ -1672,8 +1666,7 @@ mod tests {
     /// chunk is produced, however much of the object is already local.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_produces_nothing_without_credit() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (dir, node) = node().await;
+        let (_blocking, dir, node) = scoped_node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         let payload = vec![7u8; MAX_CHUNK * 3];
         let root = node
@@ -1747,8 +1740,7 @@ mod tests {
     /// instead of overflowing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn credit_grants_stop_at_the_ceiling() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (_dir, node) = node().await;
+        let (_blocking, _dir, node) = scoped_node().await;
         let (writes, _rx) = mpsc::channel(16);
         let (internal, _drain) = mpsc::channel(16);
         let credit = Arc::new(Semaphore::new(0));
@@ -1798,8 +1790,7 @@ mod tests {
     /// one row however many paths sit under it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_listing_collapses_subdirectories() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (dir, node) = node().await;
+        let (_blocking, dir, node) = scoped_node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         for path in [
             "a.txt",

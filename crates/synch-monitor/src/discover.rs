@@ -293,7 +293,7 @@ mod tests {
         repo: Option<&dyn Repo>,
         log: Option<&str>,
         skip: &[String],
-    ) -> (Discovered, Vec<String>) {
+    ) -> Result<(Discovered, Vec<String>), MonitorError> {
         let dir = tempfile::tempdir().unwrap();
         let mut warnings = Vec::new();
         let found = discover(
@@ -304,14 +304,13 @@ mod tests {
             None,
             NOW,
             &mut |w| warnings.push(w),
-        )
-        .unwrap();
-        (found, warnings)
+        )?;
+        Ok((found, warnings))
     }
 
     #[test]
     fn with_no_repository_the_embedded_trusted_root_names_the_log() {
-        let (found, warnings) = discover_with(None, None, &[]);
+        let (found, warnings) = discover_with(None, None, &[]).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(found.source, "embedded trusted root");
         assert!(found.base_urls.iter().all(|u| u.starts_with("https://")));
@@ -339,7 +338,7 @@ mod tests {
     /// embedded root.
     #[test]
     fn a_repository_that_serves_nothing_is_a_warning_and_not_a_failure() {
-        let (found, warnings) = discover_with(Some(&Empty), None, &[]);
+        let (found, warnings) = discover_with(Some(&Empty), None, &[]).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("keeping current pins"), "{warnings:?}");
         assert_eq!(found.source, "embedded trusted root");
@@ -350,7 +349,7 @@ mod tests {
     /// saying what the run is therefore not reading.
     #[test]
     fn naming_one_log_says_which_pinned_shards_go_unread() {
-        let (found, warnings) = discover_with(None, Some("https://log.example/"), &[]);
+        let (found, warnings) = discover_with(None, Some("https://log.example/"), &[]).unwrap();
         assert_eq!(found.base_urls, vec!["https://log.example".to_string()]);
         assert_eq!(found.source, "--log");
         // The keys are still the full pinned set, and the run says so.
@@ -369,7 +368,7 @@ mod tests {
             "this test needs a trusted root pinning more than one shard"
         );
         let skip = pinned[0].base_url.clone();
-        let (found, warnings) = discover_with(None, None, std::slice::from_ref(&skip));
+        let (found, warnings) = discover_with(None, None, std::slice::from_ref(&skip)).unwrap();
         assert!(!found.base_urls.contains(&skip));
         assert_eq!(found.base_urls.len(), pinned.len() - 1);
         // The pin set is untouched: this run still believes checkpoints from
@@ -392,17 +391,6 @@ mod tests {
             .into_iter()
             .map(|log| log.base_url)
             .collect();
-        let dir = tempfile::tempdir().unwrap();
-        let mut warnings = Vec::new();
-        assert!(discover(
-            None,
-            &pins_beside(&dir.path().join("monitor.json")),
-            None,
-            &all,
-            None,
-            NOW,
-            &mut |w| warnings.push(w),
-        )
-        .is_err());
+        discover_with(None, None, &all).expect_err("skipping every shard classifies nothing");
     }
 }

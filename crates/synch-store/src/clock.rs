@@ -179,34 +179,25 @@ mod tests {
         assert_eq!(store.trust_instant(stepped_back).unwrap(), high);
         assert!(store.clock_status(stepped_back).unwrap().stepped_back);
         assert_eq!(store.trust_instant(high + 5).unwrap(), high + 5);
-    }
 
-    /// One wild forward reading cannot pin the floor: bindings stamped from a
-    /// pinned floor would never lapse, and member removal fails open.
-    #[test]
-    fn a_reading_far_past_the_floor_does_not_pin_it() {
-        let (_d, store) = store();
-        let now = synch_core::now_ns();
-        assert_eq!(store.advance_trust_floor(now).unwrap(), now);
+        // A reading far past the floor cannot pin it — one wild reading must
+        // not jam the floor forever — while ordinary advances still land.
+        let day = 24 * 3600 * 1_000_000_000i64;
+        assert_eq!(store.advance_trust_floor(high + 400 * day).unwrap(), high);
+        assert_eq!(
+            store.advance_trust_floor(high + day / 24).unwrap(),
+            high + day / 24
+        );
 
-        let wild = now + 400 * 24 * 3600 * 1_000_000_000;
-        assert_eq!(store.advance_trust_floor(wild).unwrap(), now);
-
-        // Ordinary advances still land, so real time is not held back.
-        let later = now + 3600 * 1_000_000_000;
-        assert_eq!(store.advance_trust_floor(later).unwrap(), later);
-        assert_eq!(store.trust_instant(later).unwrap(), later);
-    }
-
-    #[test]
-    fn the_floor_survives_a_reopen() {
+        // The floor is a persisted fact, and survives a reopen.
         let dir = tempfile::tempdir().unwrap();
-        let high = MIN_TRUSTED_NS + 7;
         {
             let store = Store::open(dir.path()).unwrap();
             store.advance_trust_floor(high).unwrap();
         }
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.trust_floor().unwrap(), high);
+        assert_eq!(
+            Store::open(dir.path()).unwrap().trust_floor().unwrap(),
+            high
+        );
     }
 }

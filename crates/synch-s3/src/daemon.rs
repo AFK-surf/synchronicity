@@ -402,19 +402,13 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(chunks.iter().all(|c| c.len() == CHUNK_SIZE));
         assert_eq!(coalesce.rest().map(|r| r.len()), Some(10));
-    }
 
-    #[test]
-    fn an_empty_body_coalesces_to_nothing() {
-        let mut coalesce = Coalesce::default();
-        assert!(coalesce.push(&[]).is_empty());
-        assert_eq!(coalesce.rest(), None);
-    }
-
-    #[test]
-    fn an_exact_multiple_leaves_no_remainder() {
-        let mut coalesce = Coalesce::default();
-        assert_eq!(coalesce.push(&vec![7u8; CHUNK_SIZE]).len(), 1);
-        assert_eq!(coalesce.rest(), None);
+        // An empty body coalesces to nothing; an exact multiple leaves none.
+        let mut empty = Coalesce::default();
+        assert!(empty.push(&[]).is_empty());
+        assert_eq!(empty.rest(), None);
+        let mut exact = Coalesce::default();
+        assert_eq!(exact.push(&vec![7u8; CHUNK_SIZE]).len(), 1);
+        assert_eq!(exact.rest(), None);
     }
 }

@@ -179,26 +179,16 @@ mod tests {
     fn tampering_breaks_verification() {
         let key = SecretKey::generate();
         let head = SignedHead::sign(&key, origin(), 7, Hash::new(b"root"), 1234);
-
-        let mut h = head.clone();
-        h.seq = 8;
-        assert!(h.verify_signature().is_err());
-
-        let mut h = head.clone();
-        h.root = Hash::new(b"other");
-        assert!(h.verify_signature().is_err());
-
-        let mut h = head.clone();
-        h.created_at = 9999;
-        assert!(h.verify_signature().is_err());
-
-        let mut h = head.clone();
-        h.origin = OriginId::named("laptop", "cluster.example.com").unwrap();
-        assert!(h.verify_signature().is_err());
-
-        let mut h = head.clone();
-        h.signed_by = SecretKey::generate().public();
-        assert!(h.verify_signature().is_err());
+        let tampered = |mutate: fn(&mut SignedHead)| {
+            let mut h = head.clone();
+            mutate(&mut h);
+            assert!(h.verify_signature().is_err());
+        };
+        tampered(|h| h.seq = 8);
+        tampered(|h| h.root = Hash::new(b"other"));
+        tampered(|h| h.created_at = 9999);
+        tampered(|h| h.origin = OriginId::named("laptop", "cluster.example.com").unwrap());
+        tampered(|h| h.signed_by = SecretKey::generate().public());
     }
 
     #[test]

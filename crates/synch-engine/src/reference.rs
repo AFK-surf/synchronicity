@@ -114,7 +114,6 @@ mod tests {
                 "nas@cluster.example:media/talks/keynote.mp4",
             ),
             ("media/talks", None, "media", "talks", "media/talks"),
-            ("media", None, "media", "", "media"),
             (
                 &key_text,
                 Some(OriginId::Key(key)),

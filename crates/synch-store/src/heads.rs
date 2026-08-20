@@ -1112,8 +1112,12 @@ mod tests {
         }
     }
 
+    /// Pruning reports what it took, and what the slots point at survives
+    /// every horizon: `put_head` retains its roots by construction, and
+    /// `heads` names a `head_history` row, so taking it would make a head
+    /// unreadable.
     #[test]
-    fn history_pruning_and_retained_roots() {
+    fn pruning_keeps_the_slot_rows_and_their_roots() {
         let (_d, store) = store();
         let key = SecretKey::generate();
         for seq in 1..=5u64 {
@@ -1122,12 +1126,10 @@ mod tests {
                 .record_history(&sign_head(&key, seq, seq as u8), seq as i64)
                 .unwrap();
         }
-        store
-            .put_head(Slot::Complete, &sign_head(&key, 6, 6), 10, 0)
-            .unwrap();
-        store
-            .put_head(Slot::Pending, &sign_head(&key, 7, 7), 10, 0)
-            .unwrap();
+        let complete = sign_head(&key, 6, 6);
+        let pending = sign_head(&key, 7, 7);
+        store.put_head(Slot::Complete, &complete, 10, 0).unwrap();
+        store.put_head(Slot::Pending, &pending, 10, 0).unwrap();
 
         // Seven distinct roots: five recorded directly, plus the two the slots
         // point at, which `put_head` retains by construction.
@@ -1135,30 +1137,18 @@ mod tests {
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));
 
-        // A horizon past the first three drops them; seqs 4 and 5 remain, as do
-        // the two the slots point at.
+        // A horizon past the first three drops them; seqs 4 and 5 remain, as
+        // do the two the slots point at.
         assert_eq!(store.prune_history_before(&origin(), 4).unwrap(), 3);
         assert_eq!(store.head_history(&origin()).unwrap().len(), 4);
-    }
 
-    /// A row a slot points at is never pruned, whatever the horizon says:
-    /// `heads` names a `head_history` row, so taking it makes a head unreadable.
-    #[test]
-    fn a_row_a_slot_points_at_survives_every_prune() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let complete = sign_head(&key, 3, 3);
-        let pending = sign_head(&key, 4, 4);
-        store.put_head(Slot::Complete, &complete, 1, 1).unwrap();
-        store.put_head(Slot::Pending, &pending, 1, 1).unwrap();
-        store.record_history(&sign_head(&key, 1, 1), 1).unwrap();
-
-        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 1);
+        // A horizon past everything leaves only the slot rows: both heads
+        // still answer, and a second pass finds nothing left to take.
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 2);
         assert_eq!(store.complete_head(&origin()).unwrap(), Some(complete));
         assert_eq!(store.pending_head(&origin()).unwrap(), Some(pending));
-        // A second pass over the same horizon finds nothing left to take.
-        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
         assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
     }
 
     #[test]

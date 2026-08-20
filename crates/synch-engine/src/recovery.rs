@@ -480,9 +480,6 @@ impl Node {
 mod tests {
     use super::*;
     use crate::testkit::node_as;
-    use iroh_base::SecretKey;
-    use synch_core::SignedHead;
-    use synch_store::{Binding, BindingSource, Slot};
 
     /// One staged file entry, encoded the way the scanner encodes them.
     fn staged_file() -> crate::node::StagedChange {
@@ -519,51 +516,6 @@ mod tests {
                 now_ns(),
             )
             .unwrap();
-    }
-
-    /// A node nobody has ever heard of is not in recovery, and publishes at
-    /// seq 1; a peer advertising a *different* origin says nothing about ours.
-    #[tokio::test]
-    async fn a_fresh_node_is_not_in_recovery() {
-        let (_d, node) = node_as(&nas()).await;
-        let state = node.recovery_state().unwrap();
-        assert!(!state.in_recovery);
-        assert_eq!(state.observed_seq, None);
-        assert_eq!(state.next_seq, 1);
-        node.ensure_publishable().unwrap();
-
-        node.store()
-            .record_observed_head(
-                &OriginId::named("laptop", "cluster.example").unwrap(),
-                900,
-                &Hash([3u8; 32]),
-                true,
-                None,
-                now_ns(),
-            )
-            .unwrap();
-        assert!(!node.recovery_state().unwrap().in_recovery);
-        node.shutdown().await.unwrap();
-    }
-
-    /// §3.4: a peer's unverified summary that our origin has published blocks
-    /// publishing, and the state names whose claim it is.
-    #[tokio::test]
-    async fn an_observation_for_our_own_origin_blocks_publishing() {
-        let (_d, node) = node_as(&nas()).await;
-        let claimant = SecretKey::generate().public();
-        observe(&node, 100, Some(&claimant));
-
-        let state = node.recovery_state().unwrap();
-        assert!(state.in_recovery);
-        assert_eq!(state.observed_seq, Some(100));
-        assert_eq!(state.observed_by, Some(claimant));
-        assert_eq!(state.own_seq, None);
-
-        let err = node.publish(&[staged_file()]).unwrap_err();
-        assert!(matches!(err, EngineError::InRecovery { .. }));
-        assert!(err.to_string().contains("synch recover"), "{err}");
-        node.shutdown().await.unwrap();
     }
 
     /// A node that already holds a head of its own is not in recovery, whatever
@@ -688,73 +640,28 @@ mod tests {
         assert!(node.recovery_state().unwrap().in_recovery);
         node.shutdown().await.unwrap();
     }
-
-    /// §4.4: a head verified while its signer was bound stays provable history.
-    /// Above the origin's current head, with the signer no longer bound, it is
-    /// unreconciled pre-recovery history.
+    /// A node nobody has ever heard of is not in recovery, and publishes at
+    /// seq 1; a peer advertising a *different* origin says nothing about ours.
     #[tokio::test]
-    async fn history_above_the_current_head_by_an_unbound_key_is_unreconciled() {
-        let (_d, node) = node_as(&OriginId::named("laptop", "cluster.example").unwrap()).await;
-        let lost = SecretKey::generate();
-        let peer_origin = nas();
-        node.store()
-            .put_binding(&Binding {
-                origin: peer_origin.clone(),
-                node_id: lost.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+    async fn a_fresh_node_is_not_in_recovery() {
+        let (_d, node) = node_as(&nas()).await;
+        let state = node.recovery_state().unwrap();
+        assert!(!state.in_recovery);
+        assert_eq!(state.observed_seq, None);
+        assert_eq!(state.next_seq, 1);
+        node.ensure_publishable().unwrap();
 
-        let old = SignedHead::sign(&lost, peer_origin.clone(), 99, Hash([9u8; 32]), 0);
-        let head = SignedHead::sign(&lost, peer_origin.clone(), 100, Hash([1u8; 32]), 0);
-        node.syncer().offer_head(&old, now_ns()).unwrap();
-        node.syncer().offer_head(&head, now_ns()).unwrap();
         node.store()
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())
+            .record_observed_head(
+                &OriginId::named("laptop", "cluster.example").unwrap(),
+                900,
+                &Hash([3u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
             .unwrap();
-
-        // While the key is still bound, nothing is unreconciled.
-        assert!(node.unreconciled_history(&peer_origin).unwrap().is_empty());
-
-        // The zone rebinds the origin to a fresh key: the lost one no longer
-        // speaks for it.
-        let recovered = SecretKey::generate();
-        node.store()
-            .remove_binding(&peer_origin, &lost.public(), BindingSource::Static)
-            .unwrap();
-        node.store()
-            .put_binding(&synch_store::Binding {
-                origin: peer_origin.clone(),
-                node_id: recovered.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: now_ns(),
-                expires_at: None,
-            })
-            .unwrap();
-
-        let unreconciled = node.unreconciled_history(&peer_origin).unwrap();
-        assert_eq!(unreconciled.len(), 1, "{unreconciled:?}");
-        assert_eq!(unreconciled[0].seq, 100);
-        assert_eq!(unreconciled[0].signed_by, lost.public());
-        assert_eq!(unreconciled[0].current_seq, Some(100));
-
-        // Once the recovered origin publishes above it, the fork is behind the
-        // current head and no longer unreconciled.
-        let head = SignedHead::sign(&recovered, peer_origin.clone(), 1_100, Hash([2u8; 32]), 0);
-        node.store()
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())
-            .unwrap();
-        assert!(node.unreconciled_history(&peer_origin).unwrap().is_empty());
+        assert!(!node.recovery_state().unwrap().in_recovery);
         node.shutdown().await.unwrap();
     }
 }

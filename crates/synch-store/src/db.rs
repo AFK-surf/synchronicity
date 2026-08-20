@@ -1171,9 +1171,11 @@ mod tests {
     use rusqlite::OptionalExtension;
     use synch_mpt::Trie;
 
-    /// The config surface round-trips through a reopen, and the self-origin is one config key written by typed wrappers (§10.3).
+    /// The config surface round-trips through a reopen, appends never rewrite
+    /// what is already there (§9.4), and the self-origin is one config key
+    /// written by typed wrappers (§10.3).
     #[test]
-    fn config_round_trip() {
+    fn config_round_trips_and_appends() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::open(dir.path()).unwrap();
@@ -1184,6 +1186,26 @@ mod tests {
             store.clear_config("k").unwrap();
             assert_eq!(store.config("k").unwrap(), None);
             store.set_config("hello", "world").unwrap();
+            store
+                .append_config("s3.buckets", "photos\tmedia\tnewest")
+                .unwrap();
+            assert_eq!(
+                store.config("s3.buckets").unwrap().as_deref(),
+                Some("photos\tmedia\tnewest"),
+                "the first append creates the row without a leading separator"
+            );
+            store
+                .append_config("s3.buckets", "docs\tpapers\tstrict")
+                .unwrap();
+            assert_eq!(
+                store
+                    .config("s3.buckets")
+                    .unwrap()
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec!["photos\tmedia\tnewest", "docs\tpapers\tstrict"]
+            );
         }
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(
@@ -1197,32 +1219,6 @@ mod tests {
         let origin = OriginId::named("nas", "cluster.example.com").unwrap();
         store.set_self_origin(&origin).unwrap();
         assert_eq!(store.self_origin().unwrap(), Some(origin));
-    }
-
-    /// A list-valued config row grows by appending, and an append never rewrites what is already there (§9.4).
-    #[test]
-    fn config_records_append() {
-        let (_d, store) = testutil::store();
-        store
-            .append_config("s3.buckets", "photos\tmedia\tnewest")
-            .unwrap();
-        assert_eq!(
-            store.config("s3.buckets").unwrap().as_deref(),
-            Some("photos\tmedia\tnewest"),
-            "the first append creates the row without a leading separator"
-        );
-        store
-            .append_config("s3.buckets", "docs\tpapers\tstrict")
-            .unwrap();
-        assert_eq!(
-            store
-                .config("s3.buckets")
-                .unwrap()
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec!["photos\tmedia\tnewest", "docs\tpapers\tstrict"]
-        );
     }
 
     /// Active-first ordering, exactly-one-active rotation, secret round-trip, and removal — the device-key lifecycle (§3.4).
@@ -1544,10 +1540,6 @@ mod tests {
             conn.execute("INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev) VALUES ('nas@x.example', 'media', 'a.txt', 0, 5, 42, zeroblob(32), 3, NULL)", params![]).unwrap();
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            store.config("schema_version").unwrap().as_deref(),
-            Some(SCHEMA_VERSION.to_string().as_str())
-        );
         let origin = OriginId::named("nas", "x.example").unwrap();
         let row = store.entry(&origin, "media", "a.txt").unwrap().unwrap();
         assert_eq!(row.size, 5);

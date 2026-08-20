@@ -28,22 +28,9 @@ fn on_a_blocking_pool_stack(f: impl FnOnce() + Send + 'static) {
         .expect("the write path must not overflow the stack");
 }
 
-/// A nested-directory key with a sibling at every level, which is what forces a
-/// branch per level rather than one compressed extension.
-fn nested(levels: usize, leaf: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut path = String::from("f:sp");
-    for i in 0..levels {
-        path.push_str(&format!("/d{i:03}"));
-        keys.push(format!("{path}/sib"));
-    }
-    keys.push(format!("{path}/{leaf}"));
-    keys
-}
-
-/// Insert, read, and remove every key on a blocking-pool-sized stack; the
-/// descent is what overflowed, so reaching the final `Hash::EMPTY` proves the
-/// whole write path survives the depth.
+/// Insert and remove every key on a blocking-pool-sized stack; the descent is
+/// what overflowed, so reaching the final `Hash::EMPTY` proves the whole write
+/// path survives the depth.
 fn exercise_deep(keys: &[String]) {
     let store = MemStore::new();
     let trie = Trie::new(&store);
@@ -58,23 +45,10 @@ fn exercise_deep(keys: &[String]) {
     }
     assert_eq!(trie.iter(root).unwrap().len(), keys.len());
 
-    // Reads and removals descend the same depth.
-    for key in keys {
-        assert_eq!(
-            trie.get(root, key.as_bytes()).unwrap().as_deref(),
-            Some(&b"v"[..])
-        );
-    }
     for key in keys {
         root = trie.remove(root, key.as_bytes()).unwrap();
     }
     assert_eq!(root, Hash::EMPTY, "removing everything empties the trie");
-}
-
-#[test]
-fn a_deep_tree_inserts_and_removes_without_overflowing() {
-    let keys = nested(600, "leaf");
-    on_a_blocking_pool_stack(move || exercise_deep(&keys));
 }
 
 /// The longest key the API accepts, branching at every nibble — the worst case

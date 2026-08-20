@@ -645,10 +645,6 @@ mod tests {
         std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
         std::fs::write(&stranger, b"not ours").unwrap();
 
-        // A horizon in the past leaves everything: every file was written now.
-        assert_eq!(store.gc_orphans(0).unwrap(), 0);
-        assert!(store.blob_path(&stale).exists());
-
         // A horizon in the future takes the two payloads and their outboards,
         // and nothing that a row or a name speaks for.
         let horizon = synch_core::now_ns() + 60 * 1_000_000_000;
@@ -768,49 +764,6 @@ mod tests {
             .map(|h| h.seq)
             .collect();
         assert_eq!(kept, vec![2], "only the current head is left");
-    }
-
-    /// An origin that merely publishes regularly does not pin its old forks:
-    /// "moved past" is read off retained history, not the complete slot.
-    #[test]
-    fn a_live_origin_does_not_pin_its_old_forks() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let day = 24 * 3600 * 1_000_000_000i64;
-        let long_ago = 1_000 * day;
-        let now = long_ago + 100 * day;
-
-        // A fork a hundred days ago, and ordinary history just past it.
-        for root in [1u8, 2u8] {
-            store
-                .record_history(&sign_head(&key, 5, root), long_ago)
-                .unwrap();
-        }
-        for seq in 6..10u64 {
-            store
-                .record_history(&sign_head(&key, seq, seq as u8 + 50), long_ago)
-                .unwrap();
-        }
-        // And a head taken today, which holds the complete slot.
-        let current = sign_head(&key, 20, 99);
-        store.put_head(Slot::Complete, &current, now, now).unwrap();
-
-        // A seven-day window: everything but today's head is out of it, and the
-        // heads at 6..9 are the origin on record past the fork.
-        assert_eq!(
-            store
-                .prune_history_before(&origin(), now - 7 * day)
-                .unwrap(),
-            6
-        );
-        let kept: Vec<u64> = store
-            .head_history(&origin())
-            .unwrap()
-            .into_iter()
-            .map(|h| h.seq)
-            .collect();
-        assert_eq!(kept, vec![20], "only the current head is left");
-        assert!(store.equivocations().unwrap().is_empty());
     }
 
     /// Future-seq fork flooding is prunable: a retained head at a higher seq

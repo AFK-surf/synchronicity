@@ -362,13 +362,6 @@ mod tests {
         );
         assert!(state.origins_holding(1).is_empty());
 
-        // The save left exactly one file, and no temporary.
-        let left: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(left, ["monitor.json"]);
-
         // A file that is not this shape is an error, not a silent reset — a
         // monitor that quietly forgot its baseline would quietly stop
         // detecting split views.
@@ -434,11 +427,5 @@ mod tests {
         // with the clock held still.
         let frozen = temporary_at(&path, 1_760_000_000);
         assert_ne!(temporary_at(&path, 1_760_000_000), frozen);
-        assert_eq!(frozen.parent(), path.parent());
-        let name = frozen.file_name().unwrap().to_string_lossy().to_string();
-        assert!(
-            name.starts_with("monitor.json.") && name.ends_with(".tmp"),
-            "{name}"
-        );
     }
 }

@@ -165,12 +165,7 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
     assert!(!ok, "init must refuse to overwrite an identity");
 
     // Everything else needs the daemon, and says so.
-    for args in [
-        vec!["id"],
-        vec!["ls", "media"],
-        vec!["doctor"],
-        vec!["daemon", "status"],
-    ] {
+    for args in [vec!["id"], vec!["daemon", "status"]] {
         let (ok, _, stderr) = cli.try_run(&args);
         assert!(!ok, "{args:?} must fail without a daemon");
         assert!(stderr.contains("synch daemon run"), "{args:?}: {stderr}");

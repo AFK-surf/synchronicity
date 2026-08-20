@@ -646,7 +646,19 @@ mod tests {
     async fn maintenance_expires_bindings_and_runs_gc() {
         let (_d, node) = node().await;
         let key = iroh_base::SecretKey::generate().public();
-        bind(&node, "gone", &key, BindingSource::Dns, Some(1));
+        node.store()
+            .put_binding(&Binding {
+                origin: synch_core::OriginId::named("gone", "x.example").unwrap(),
+                node_id: key,
+                source: BindingSource::Dns,
+                domain: Some("x.example".into()),
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: Some(1),
+            })
+            .unwrap();
         node.maintenance_pass().unwrap();
         assert_eq!(
             node.store().bindings().unwrap().len(),
@@ -655,7 +667,6 @@ mod tests {
         );
         node.shutdown().await.unwrap();
     }
-
     /// A pending head nobody can serve stops holding an origin hostage.
     ///
     /// `head_floor` is the best of both slots, so a head pushed reactively by a

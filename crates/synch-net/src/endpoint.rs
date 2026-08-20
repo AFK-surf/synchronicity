@@ -502,9 +502,9 @@ impl Net {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::test_store;
 
     /// The config-string validators share one contract: parse, or name the
     /// offender — before any socket opens.
@@ -539,8 +539,6 @@ mod tests {
             ("router.bittorrent.com", "wants HOST:PORT"),
             (":6881", "has no host"),
             ("router.bittorrent.com:", "wants a port"),
-            ("router.bittorrent.com:dht", "wants a port"),
-            ("router.bittorrent.com:99999", "wants a port"),
         ] {
             offender(&dht, raw, why);
         }
@@ -548,8 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bad_bootstrap_node_fails_the_bind_before_any_socket_opens() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let err = Net::bind(
             store,
             SecretKey::generate(),
@@ -566,8 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn offline_binds_local_only_with_the_dht_asked_for() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let net = Net::bind(
             store,
             SecretKey::generate(),

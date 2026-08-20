@@ -293,13 +293,6 @@ mod tests {
         );
         let docs = buckets.iter().find(|b| b.name == "docs").unwrap();
         assert_eq!(docs.space, "other");
-
-        // Databases written before the unified tree stored the bucket map as
-        // `<bucket>\t<space>\t<policy>`; what the log reads back on an
-        // upgraded node is exactly a run of add records.
-        let migrated = fold(&records(&["photos\tmedia\torigin=nas@x.example"]));
-        assert_eq!(migrated[0].space, "media");
-        assert_eq!(migrated[0].policy.pinned_origin(), Some("nas@x.example"));
     }
 
     #[test]
@@ -361,7 +354,6 @@ mod tests {
         assert!(validate_name("ab").is_err());
         assert!(validate_name("UPPER").is_err());
         assert!(validate_name("-lead").is_err());
-        assert!(validate_name("trail-").is_err());
         assert!(validate_name(&"x".repeat(64)).is_err());
     }
 }

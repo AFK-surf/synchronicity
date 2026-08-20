@@ -819,56 +819,40 @@ mod tests {
     }
 
     #[test]
-    fn parts_are_chosen_in_order() {
+    fn choose_parts_enforces_the_selection_rules() {
         let available = vec![part(1, MIN_PART_SIZE), part(2, MIN_PART_SIZE), part(3, 10)];
-        let chosen = choose_parts(&named(&[1, 2, 3]), &available).unwrap();
-        assert_eq!(chosen.len(), 3);
-        // A subset is legal, and the parts left out are simply discarded.
+        // In order, whole or as a subset; the parts left out are discarded.
+        assert_eq!(
+            choose_parts(&named(&[1, 2, 3]), &available).unwrap().len(),
+            3
+        );
         assert_eq!(choose_parts(&named(&[1, 3]), &available).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn descending_and_repeated_parts_are_refused() {
-        let available = vec![part(1, MIN_PART_SIZE), part(2, MIN_PART_SIZE)];
+        // Descending, duplicated, or empty orders are refused.
         assert!(choose_parts(&named(&[2, 1]), &available).is_err());
         assert!(choose_parts(&named(&[1, 1]), &available).is_err());
         assert!(choose_parts(&[], &available).is_err());
+        // Only the last part may be small: a one-part upload of ten bytes is
+        // fine, and a ten-byte first part is not.
+        let small = vec![part(1, 10), part(2, 10)];
+        assert!(choose_parts(&named(&[1]), &small).is_ok());
+        assert!(choose_parts(&named(&[1, 2]), &small).is_err());
     }
 
+    /// A missing part is reported as missing even when an earlier part is also
+    /// too small: the client that shrank the wrong part retries into the same
+    /// failure. And a part that is not the one named — even when its hash is
+    /// wrong only for that reason — is refused.
     #[test]
-    fn a_missing_part_is_refused() {
-        let available = vec![part(1, MIN_PART_SIZE)];
-        assert!(choose_parts(&named(&[1, 2]), &available).is_err());
-    }
-
-    #[test]
-    fn a_part_that_is_not_the_one_named_is_refused() {
+    fn the_named_part_must_be_the_available_one() {
         let available = vec![part(1, 10)];
         let wrong = vec![(1u32, Some(Hash::new(b"something else")))];
         assert!(choose_parts(&wrong, &available).is_err());
         let right = vec![(1u32, Some(available[0].root))];
         assert!(choose_parts(&right, &available).is_ok());
-    }
-
-    /// A missing part is reported as missing even when an earlier part is also
-    /// too small: the client that shrank the wrong part retries into the same
-    /// failure.
-    #[test]
-    fn existence_is_checked_before_size() {
-        let available = vec![part(1, 10)];
         let err = choose_parts(&named(&[1, 9]), &available)
             .unwrap_err()
             .to_string();
         assert!(err.contains("part 9 was never uploaded"), "{err}");
-    }
-
-    #[test]
-    fn only_the_last_part_may_be_small() {
-        let available = vec![part(1, 10), part(2, 10)];
-        // The last part alone is exempt, so a one-part upload of ten bytes is
-        // fine and a ten-byte first part is not.
-        assert!(choose_parts(&named(&[1]), &available).is_ok());
-        assert!(choose_parts(&named(&[1, 2]), &available).is_err());
     }
 
     /// Ids have to be unguessable, not merely unique: an id is what authorizes
@@ -887,16 +871,7 @@ mod tests {
 #[cfg(test)]
 mod sweeper_tests {
     use super::*;
-    use crate::{Node, NodeConfig};
-
-    async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
-        (data, space, node)
-    }
+    use crate::testkit::node_with_space;
 
     /// The sweeper collects what nobody is coming back for, and nothing else.
     #[tokio::test]
@@ -909,7 +884,6 @@ mod sweeper_tests {
         assert!(node.store().upload(&id).unwrap().is_none());
         assert!(!node.store().upload_dir(&id).exists());
 
-        // A live upload with a long TTL is left alone.
         let id = node.create_upload("media", "b.bin", None, &target).unwrap();
         assert_eq!(node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap(), 0);
         assert!(node.store().upload(&id).unwrap().is_some());
@@ -996,37 +970,33 @@ mod sweeper_tests {
 
 #[cfg(test)]
 mod ownership_tests {
-    use crate::{Node, NodeConfig};
+    use crate::testkit::node_with_space;
 
     /// An upload id is a bearer token for one key *and* one principal.
     #[tokio::test]
     async fn another_principal_cannot_touch_an_upload() {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
+        let (_d, _s, node) = node_with_space().await;
         let target = node.upload_target("media", "a.bin").unwrap();
         let id = node
             .create_upload("media", "a.bin", Some("AKIA1"), &target)
             .unwrap();
 
-        // The owner can.
+        // The owner can; nobody else can, whichever way they hold it wrong —
+        // and they are all told the same thing, so a guessed id is never
+        // confirmed as real. Naming a different key does not help either.
         assert!(node
             .open_part(&id, "media", "a.bin", Some("AKIA1"), 1)
             .is_ok());
-        // Nobody else can, whichever way they hold it wrong — and they are all
-        // told the same thing, so a guessed id is never confirmed as real.
         for wrong in [Some("AKIA2"), None] {
             assert!(node.open_part(&id, "media", "a.bin", wrong, 1).is_err());
             assert!(node.upload_parts(&id, "media", "a.bin", wrong).is_err());
             assert!(!node.abort_upload(&id, "media", "a.bin", wrong).unwrap());
         }
-        // And not by naming a different key either.
         assert!(node
             .open_part(&id, "media", "elsewhere.bin", Some("AKIA1"), 1)
             .is_err());
-        // A listing shows it to its owner and to nobody else.
+        // A listing shows it to its owner and to nobody else; the upload is
+        // untouched by all of that, and the owner can still abort it.
         assert_eq!(
             node.open_uploads("media", "", Some("AKIA1")).unwrap().len(),
             1
@@ -1036,7 +1006,6 @@ mod ownership_tests {
             .unwrap()
             .is_empty());
         assert!(node.open_uploads("media", "", None).unwrap().is_empty());
-        // The upload is untouched by all of that.
         assert!(node
             .abort_upload(&id, "media", "a.bin", Some("AKIA1"))
             .unwrap());

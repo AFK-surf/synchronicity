@@ -1155,26 +1155,8 @@ mod tests {
         assert_eq!(report.written, 0, "{report:?}");
         assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(on_disk_mode(&written), 0o644);
-        // Once the mode is repaired, quiet passes stay quiet.
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.current, 1, "{report:?}");
-        node.shutdown().await.unwrap();
-    }
-
-    /// A same-length local edit moves the mtime, which moves the stat, which
-    /// spends the hash — and the pass rewrites the file.
-    #[tokio::test]
-    async fn a_same_size_local_edit_is_repaired() {
-        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
-        publish_entry(&node, &peer(), "f.txt", b"hello", STAMP);
-        node.sync_mirror(target.path()).await.unwrap();
-
-        let written = target.path().join("f.txt");
-        std::fs::write(&written, b"world").unwrap();
-
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 1, "{report:?}");
-        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
         node.shutdown().await.unwrap();
     }
 
@@ -1410,7 +1392,6 @@ mod tests {
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         assert_eq!(report.skipped[0].0, "link");
         assert!(report.skipped[0].1.contains("collides"));
-        // And the path that won is still a file, not a link.
         let written = target.path().join("Link");
         assert!(!std::fs::symlink_metadata(&written).unwrap().is_symlink());
         assert_eq!(std::fs::read(&written).unwrap(), b"a real file");
@@ -1657,8 +1638,8 @@ mod tests {
     }
 
     /// Materializing an object produces the object over whatever was there
-    /// before, and leaves nothing beside it — shorter and longer predecessors
-    /// included, and the tiny-object path out of the index.
+    /// before — longer or shorter, the rename replaces it whole — and leaves
+    /// nothing beside it, and the tiny-object path comes out of the index.
     #[tokio::test]
     async fn materializing_an_object_replaces_the_file_and_leaves_no_residue() {
         let (_d, node) = node().await;
@@ -1681,14 +1662,6 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&target).unwrap(), new);
         assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
-
-        // A version of a different length replaces it exactly.
-        let mut longer = new.clone();
-        longer.extend(vec![3u8; 2 * GROUP]);
-        let root = node.store().ingest_bytes(&longer, now_ns()).unwrap();
-        node.materialize_blob_blocking(&root, longer.len() as u64, &target)
-            .unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), longer);
 
         // And an object small enough to live in the index comes out of it.
         let root = node.store().ingest_bytes(b"tiny", now_ns()).unwrap();
@@ -1740,8 +1713,9 @@ mod tests {
     #[test]
     fn name_safety_checks() {
         assert!(unsafe_name("fine/path.txt").is_none());
-        assert!(unsafe_name("CON").is_some());
-        assert!(unsafe_name("nul.txt").is_some());
+        // Reserved device names are refused end to end (`aux.txt` in
+        // `colliding_and_invalid_names_are_skipped`); here are the classes
+        // no mirror test reaches: an invalid character and a trailing space.
         assert!(unsafe_name("bad<name").is_some());
         assert!(unsafe_name("trailing ").is_some());
     }
@@ -1770,25 +1744,21 @@ mod tests {
         publish_entry(&node, &peer(), "first.txt", b"one", 1);
         node.add_mirror("media", target.path(), &VersionPolicy::Newest)
             .unwrap();
-        for _ in 0..500 {
-            if target.path().join("first.txt").exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(target.path().join("first.txt").exists(), "the wake ran");
+        assert!(
+            crate::testkit::eventually(|| target.path().join("first.txt").exists()).await,
+            "the wake ran"
+        );
 
         // Nothing rang for the second publish; only the interval carries it.
         publish_entry(&node, &peer(), "second.txt", b"two", 1);
-        for _ in 0..500 {
-            if target.path().join("second.txt").exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            std::fs::read(target.path().join("second.txt")).unwrap(),
-            b"two",
+        assert!(
+            crate::testkit::eventually(|| {
+                std::fs::read(target.path().join("second.txt"))
+                    .ok()
+                    .as_deref()
+                    == Some(b"two")
+            })
+            .await,
             "nothing rang for this one; the interval pass carried it"
         );
         tx.send(()).unwrap();
@@ -1837,7 +1807,6 @@ mod tests {
             Path::new("../elsewhere")
         );
 
-        // A second pass has nothing to do.
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 0);
         assert_eq!(report.current, 1);

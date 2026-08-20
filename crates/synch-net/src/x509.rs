@@ -684,7 +684,6 @@ impl<'a> Der<'a> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -760,10 +759,7 @@ mod tests {
             &[
                 body,
                 algorithm_identifier(),
-                tlv(
-                    0x03,
-                    &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
-                ),
+                tlv(0x03, &[&[0x00], &fake_sign(&[])[..]].concat()),
             ]
             .concat(),
         );
@@ -780,10 +776,7 @@ mod tests {
     #[test]
     fn the_outer_certificate_sequence_is_closed_too() {
         let spec = spec("sync.example");
-        let signature = tlv(
-            0x03,
-            &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
-        );
+        let signature = tlv(0x03, &[&[0x00], &fake_sign(&[])[..]].concat());
 
         // Only a tbs, with no signature fields at all.
         let bare = tlv(0x30, &spec.tbs());
@@ -809,10 +802,11 @@ mod tests {
 
     #[test]
     fn a_built_certificate_parses_back_to_what_went_in() {
+        let base = spec("sync.example");
         let extra = vec![(vec![0x41, 0x01], b"payload".to_vec())];
         let spec = SelfSigned {
             extensions: &extra,
-            ..spec("sync.example")
+            ..base.clone()
         };
         let der = spec.build(fake_sign);
         let cert = Certificate::parse(&der).expect("the certificate must parse");
@@ -830,6 +824,24 @@ mod tests {
         // 2125 — the boundary RFC 5280 draws at 2050.
         assert_eq!(spec.not_before, Time::Utc("251009085320Z".into()));
         assert_eq!(spec.not_after, Time::Generalized("21250410230640Z".into()));
+
+        // And under long-form DER lengths, the path where hand-rolled DER
+        // usually dies: a 300-byte SAN and a 500-byte extension force the
+        // multi-byte length in both the writer and the reader.
+        let long = "a".repeat(300);
+        let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
+        let spec = SelfSigned {
+            dns_name: &long,
+            serial: &[0xff, 0xff],
+            not_before: x509_time(0),
+            not_after: x509_time(1),
+            extensions: &extra,
+            ..base
+        };
+        let der = spec.build(fake_sign);
+        let cert = Certificate::parse(&der).unwrap();
+        assert_eq!(cert.dns_names, vec![long]);
+        assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
     }
 
     #[test]
@@ -927,25 +939,5 @@ mod tests {
             error.to_string().contains("bytes after"),
             "refused for the wrong reason: {error}"
         );
-    }
-
-    #[test]
-    fn long_form_lengths_round_trip() {
-        // A SAN of 300 bytes forces the multi-byte length path in both the
-        // writer and the reader, which is where hand-rolled DER usually dies.
-        let long = "a".repeat(300);
-        let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
-        let spec = SelfSigned {
-            dns_name: &long,
-            serial: &[0xff, 0xff],
-            not_before: x509_time(0),
-            not_after: x509_time(1),
-            extensions: &extra,
-            ..spec("sync.example")
-        };
-        let der = spec.build(fake_sign);
-        let cert = Certificate::parse(&der).unwrap();
-        assert_eq!(cert.dns_names, vec![long]);
-        assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
     }
 }

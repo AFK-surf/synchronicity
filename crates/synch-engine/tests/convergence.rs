@@ -41,7 +41,10 @@ use std::sync::Arc;
 use iroh_base::SecretKey;
 use synch_core::{Hash, OriginId, SignedHead};
 use synch_engine::reconcile::{Syncer, MAX_RETAINED_FORKS};
-use synch_store::{Binding, BindingSource, Store};
+use synch_store::Store;
+
+mod common;
+use common::binding;
 
 /// xorshift64*, so a case is reproducible from its seed.
 struct Rng(u64);
@@ -84,17 +87,7 @@ fn node(key: &SecretKey, origins: &[OriginId]) -> Node {
     let store = Arc::new(Store::open(dir.path()).expect("a store"));
     for origin in origins {
         store
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
+            .put_binding(&binding(origin, &key.public()))
             .expect("the binding");
     }
     Node {
@@ -298,10 +291,9 @@ fn wire_case(seed: u64) {
     let entry = |n: u64| {
         postcard::to_stdvec(&FileEntry::file(n, 0, Hash::new(&n.to_le_bytes()), 1)).expect("encode")
     };
-    /// A published head and how many leaves its trie holds.
+    /// A published head.
     struct Published {
         head: SignedHead,
-        leaves: usize,
     }
     let mut published: Vec<Published> = Vec::new();
     for (i, origin) in origins.iter().enumerate() {
@@ -310,11 +302,9 @@ fn wire_case(seed: u64) {
         // offering the lesser.
         let at = i % count;
         let mut root = Hash::EMPTY;
-        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for seq in 1..=(1 + rng.below(3) as u64) {
             let key_bytes = file_key("media", &format!("{origin}-{seq}.bin")).expect("a key");
             let value = entry(seq);
-            leaves.push((key_bytes.clone(), value.clone()));
             root = Trie::new(nodes[at].store.as_ref())
                 .insert(root, &key_bytes, &value)
                 .expect("the insert");
@@ -327,10 +317,7 @@ fn wire_case(seed: u64) {
                 .store
                 .transaction(|txn| txn.materialize_diff(origin, Hash::EMPTY, root))
                 .expect("the views");
-            published.push(Published {
-                head,
-                leaves: leaves.len(),
-            });
+            published.push(Published { head });
         }
     }
 
@@ -422,20 +409,15 @@ fn wire_case(seed: u64) {
                 "seed {seed}: node {i} holds a head for {origin} it cannot serve"
             );
             // And the derived view agrees with the head, which is what the
-            // unified tree, mirrors and the gateway read.
-            let leaves = published
-                .iter()
-                .filter(|p| p.head.root == complete.root)
-                .map(|p| p.leaves)
-                .max()
-                .expect("the published head");
+            // unified tree, mirrors and the gateway read. Each published head
+            // inserted exactly one file key, so its seq is its leaf count.
             assert_eq!(
                 holder
                     .store
                     .list_entries(Some(origin), "media", "", None, None)
                     .expect("the entries")
                     .len(),
-                leaves,
+                complete.seq as usize,
                 "seed {seed}: node {i}'s entries do not match the head it holds"
             );
         }

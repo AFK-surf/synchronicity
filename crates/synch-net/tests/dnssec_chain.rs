@@ -75,18 +75,21 @@ fn a_declaration_signed_under_another_zones_name_is_refused() {
     assert!(text.contains("cluster.example"), "{text}");
 }
 
-/// The same over a real ladder shape: root → TLD → apex, three delegation
-/// links under the declaration.
+/// A declaration under a real ladder shape whose cut spans several labels
+/// (`example.` delegates `cp.acme.example.` with no zone at all at
+/// `acme.example.`): each link's DS is computed over its own zone, so the
+/// cut's width was never load-bearing. (The plain root → TLD → apex walk is
+/// the shape the delegation tests below assert against.)
 #[test]
 fn a_declared_zone_under_a_delegation_ladder_validates_too() {
-    let ladder = SimDelegation::new("cluster.example", Vec::new());
+    let ladder = SimDelegation::spanning("cp.acme.example", "example", Vec::new());
     let (proven, signing_zone, valid) = chain::validate(
         &ladder.chain(),
-        &apex("cluster.example."),
+        &apex("cp.acme.example."),
         &anchored_at(&ladder.root),
     )
     .expect("a declared zone under a ladder validates");
-    assert_eq!(signing_zone, apex("cluster.example."));
+    assert_eq!(signing_zone, apex("cp.acme.example."));
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
     assert_eq!(
@@ -220,28 +223,6 @@ fn a_wildcard_expansion_is_not_a_declaration() {
         matches!(&error, ChainError::Structure(why) if why.contains("wildcard")),
         "{error}"
     );
-}
-
-/// A zone cut that spans several labels — `example.` delegates
-/// `cp.acme.example.` with no zone at all at `acme.example.` — is a chain a
-/// client can walk: each link's DS is computed over its own zone, so the
-/// cut's width was never load-bearing.
-#[test]
-fn a_delegation_that_spans_several_labels_still_validates() {
-    let ladder = SimDelegation::spanning("cp.acme.example", "example", Vec::new());
-    let (proven, signing_zone, valid) = chain::validate(
-        &ladder.chain(),
-        &apex("cp.acme.example."),
-        &anchored_at(&ladder.root),
-    )
-    .expect("a zone delegated several labels below its parent must validate");
-    assert_eq!(signing_zone, apex("cp.acme.example."));
-    assert_eq!(valid.anchor_zone, ".");
-    assert_eq!(
-        valid.links, 3,
-        "apex, the zone that delegated it, root — with nothing at acme.example."
-    );
-    assert_eq!(proven, vec![ladder.apex.dnskey_rdata()]);
 }
 
 /// A DNSKEY with no Zone Key flag cannot anchor or sign a chain (RFC 4034

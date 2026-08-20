@@ -987,10 +987,9 @@ impl MptClient {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, trusting_pair, StalledPeer};
+    use crate::testing::{bare_endpoint, test_store, trusting_pair, StalledPeer};
     use synch_core::{BlobAd, ALPN_MPT};
 
     /// How long a test waits before calling a request hung rather than slow.
@@ -1099,8 +1098,7 @@ mod tests {
     /// by the runtime's own clock.
     #[tokio::test]
     async fn find_providers_never_blocks_the_runtime_on_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let root = Hash::new(b"an object someone advertises");
         store
             .put_provider(
@@ -1164,8 +1162,7 @@ mod tests {
     /// answered.
     #[tokio::test]
     async fn a_contained_origin_does_not_stop_a_hello_exchange() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let signer = iroh_base::SecretKey::generate();
         let bad = OriginId::named("bad", "x.example").unwrap();
         let good = OriginId::named("good", "x.example").unwrap();
@@ -1216,8 +1213,7 @@ mod tests {
     /// keeps the session usable either way.
     #[tokio::test]
     async fn a_stalled_stream_does_not_hold_the_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let (server, client, _client_dir) =
             trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
         let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
@@ -1257,8 +1253,7 @@ mod tests {
         // (§5.5), so the request has to name real positions in a real trie —
         // and the wants are produced the way a requester produces them, by
         // walking a store that holds the nodes and not yet the payloads.
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let payload = |len: usize, tag: u64| {
             let mut bytes = vec![0u8; len];
             bytes[..8].copy_from_slice(&tag.to_le_bytes());
@@ -1321,16 +1316,15 @@ mod tests {
 
         // The positions a requester would name: every node, none of the values.
         let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {
-            let dir = tempfile::tempdir().unwrap();
-            let bare = synch_store::Store::open(dir.path()).unwrap();
+            let (dir, bare) = test_store();
             let reachable = Trie::new(store.as_ref()).reachable(root).unwrap();
             for node in &reachable.nodes {
                 let bytes = synch_mpt::NodeStore::get_node(store.as_ref(), node)
                     .unwrap()
                     .unwrap();
-                synch_mpt::NodeStore::put_node(&bare, node, &bytes).unwrap();
+                synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
             }
-            let missing = Trie::new(&bare).missing(root, MAX_BATCH).unwrap();
+            let missing = Trie::new(bare.as_ref()).missing(root, MAX_BATCH).unwrap();
             assert!(missing.nodes.is_empty(), "every node was copied across");
             (dir, missing.values)
         };

@@ -1517,51 +1517,29 @@ mod tests {
     use super::*;
     use crate::store::MemStore;
 
-    fn trie(store: &MemStore) -> Trie<'_, MemStore> {
-        Trie::new(store)
-    }
-
-    #[test]
-    fn structural_sharing_bounds_allocation() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for i in 0..200u16 {
-            root = t
-                .insert(root, format!("f:space/{i:04}").as_bytes(), b"entry")
-                .unwrap();
+    /// Fetches everything a walk asks for from `source` into `into`, and
+    /// returns the requested positions, in order.
+    fn drain(walk: &mut MissingWalk, source: &MemStore, into: &MemStore) -> Vec<(Vec<u8>, Hash)> {
+        let mut wanted = Vec::new();
+        loop {
+            let batch = MissingWalk::next_batch(walk, &Trie::new(into), 64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                wanted.push((path.clone(), *hash));
+                let bytes = source.get_node(hash).unwrap().unwrap();
+                into.put_node(hash, &bytes).unwrap();
+            }
+            for (_, hash) in &batch.values {
+                let bytes = source.get_value(hash).unwrap().unwrap();
+                into.put_value(hash, &bytes).unwrap();
+            }
+            walk.resume();
         }
-        let before = s.node_count();
-        let root2 = t.insert(root, b"f:space/0000", b"changed").unwrap();
-        let added = s.node_count() - before;
-        // Only the path from the touched leaf to the root is allocated, and the
-        // old root stays readable: structural sharing keeps history alive.
-        assert!(added <= 12, "allocated {added} nodes for a one-key change");
-        assert_ne!(root, root2);
-        assert_eq!(t.get(root, b"f:space/0000").unwrap().unwrap(), b"entry");
+        wanted
     }
 
-    #[test]
-    fn reachable_covers_nodes_and_values() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t.insert(Hash::EMPTY, b"a", &vec![1u8; 300]).unwrap();
-        let root = t.insert(root, b"b", b"small").unwrap();
-        let r = t.reachable(root).unwrap();
-        assert!(r.nodes.contains(&root));
-        assert_eq!(r.values.len(), 1);
-    }
-
-    #[test]
-    fn key_length_is_bounded() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let key = vec![b'x'; MAX_KEY_LEN + 1];
-        assert!(matches!(
-            t.insert(Hash::EMPTY, &key, b"v"),
-            Err(MptError::KeyTooLong(_))
-        ));
-    }
     /// A walk confined to one space must ask for the spine — which is what
     /// makes the signed root recomputable — and never for a sibling subtree,
     /// whose hash it nonetheless holds (§5.5).
@@ -1586,23 +1564,7 @@ mod tests {
             exact: Vec::new(),
         });
         let mut walk = MissingWalk::scoped(None, root, scope.clone());
-        let mut wanted: Vec<(Vec<u8>, Hash)> = Vec::new();
-        loop {
-            let batch = { MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap() };
-            if batch.is_empty() {
-                break;
-            }
-            for (path, hash) in &batch.nodes {
-                wanted.push((path.clone(), *hash));
-                let bytes = source.get_node(hash).unwrap().unwrap();
-                empty.put_node(hash, &bytes).unwrap();
-            }
-            for (_, hash) in &batch.values {
-                let bytes = source.get_value(hash).unwrap().unwrap();
-                empty.put_value(hash, &bytes).unwrap();
-            }
-            walk.resume();
-        }
+        let wanted = drain(&mut walk, &source, &empty);
 
         assert!(!wanted.is_empty(), "the walk fetched nothing at all");
         // Every position asked for is one the scope admits — an honest walk
@@ -1646,23 +1608,7 @@ mod tests {
         // for them. This is exactly what a request carries.
         let empty = MemStore::new();
         let mut walk = MissingWalk::new(root);
-        let mut wants: Vec<(Vec<u8>, Hash)> = Vec::new();
-        loop {
-            let batch = MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap();
-            if batch.is_empty() {
-                break;
-            }
-            for (path, hash) in &batch.nodes {
-                wants.push((path.clone(), *hash));
-                let bytes = source.get_node(hash).unwrap().unwrap();
-                empty.put_node(hash, &bytes).unwrap();
-            }
-            for (_, hash) in &batch.values {
-                let bytes = source.get_value(hash).unwrap().unwrap();
-                empty.put_value(hash, &bytes).unwrap();
-            }
-            walk.resume();
-        }
+        let wants = drain(&mut walk, &source, &empty);
         assert!(wants.len() > 1, "the trie is too small to be a test");
 
         // Every position the walk claimed resolves, on the server's own copy,

@@ -345,16 +345,7 @@ impl Node {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
-    use std::path::Path;
-
-    async fn node(dir: &Path, id: Option<OriginId>) -> Node {
-        match id {
-            Some(origin) => Node::init_named_by_zone(dir, origin),
-            None => Node::init(dir, None),
-        }
-        .unwrap();
-        Node::open(NodeConfig::loopback(dir)).await.unwrap()
-    }
+    use crate::testkit::{node, node_as};
 
     fn named() -> OriginId {
         OriginId::named("nas", "cluster.example").unwrap()
@@ -362,8 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_generates_a_key_without_switching() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), Some(named())).await;
+        let (_d, node) = node_as(&named()).await;
         let before = node.node_id();
 
         let plan = node.rotate_key().unwrap();
@@ -388,8 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_identified_origin_cannot_rotate() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), None).await;
+        let (_d, node) = node().await;
         // Refused upfront, before a key is generated: refusing later would
         // leave a `staged` key that could never be activated and that nothing
         // ever cleans up.
@@ -411,12 +400,9 @@ mod tests {
 
     #[tokio::test]
     async fn activate_re_signs_the_head_and_serves_both_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), Some(named())).await;
+        let (_d, node) = node_as(&named()).await;
         let old_key = node.node_id();
-        let old_addr = node.net().direct_addr();
 
-        // Refusals first: an unknown key, and the already-active one.
         let stranger = SecretKey::generate().public();
         let err = node.activate_key(&stranger, None).await.unwrap_err();
         assert!(err.to_string().contains("no such device key"), "{err}");
@@ -444,7 +430,6 @@ mod tests {
         assert_eq!(activation.head.signed_by, new_key);
         activation.head.verify_signature().unwrap();
 
-        // The stored head is the re-signed one, and the node can verify it.
         let stored = node.store().complete_head(node.origin()).unwrap().unwrap();
         assert_eq!(stored.signed_by, new_key);
         assert!(node
@@ -462,12 +447,10 @@ mod tests {
 
         // Both endpoints are live: the new one dials, the old one still serves.
         assert_eq!(node.net().id(), new_key);
-        assert_ne!(node.net().direct_addr(), old_addr);
         let retiring = node.retiring_nets();
         assert_eq!(retiring.len(), 1);
         assert_eq!(retiring[0].id(), old_key);
 
-        // Publishing now signs under the new key.
         let next = node
             .publish(&[(node.key_for("s", "a.txt").unwrap(), None)])
             .unwrap()
@@ -479,12 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn retire_drops_the_endpoint_and_the_secret() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), Some(named())).await;
+        let (_d, node) = node_as(&named()).await;
         let old_key = node.node_id();
         let new_key = node.rotate_key().unwrap().new_key;
 
-        // The active key is not retirable.
         let err = node.retire_key(&old_key).await.unwrap_err();
         assert!(err.to_string().contains("is the active key"), "{err}");
 
@@ -510,8 +491,7 @@ mod tests {
     /// `device_keys` table, nothing in memory.
     #[tokio::test]
     async fn a_rotation_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), Some(named())).await;
+        let (dir, node) = node_as(&named()).await;
         let new_key = node.rotate_key().unwrap().new_key;
         node.activate_key(&new_key, None).await.unwrap();
         node.shutdown().await.unwrap();
@@ -540,7 +520,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Mutual trust, direct addresses only.
         for (here, there, origin) in [(&a, &b, &b_origin), (&b, &a, &a_origin)] {
             here.store()
                 .put_binding(&Binding {
@@ -558,14 +537,12 @@ mod tests {
             here.remember_peer(&there.net().direct_addr()).unwrap();
         }
 
-        // Before the rotation: B holds exactly A's current key for A.
         let answers = a.peer_bindings(&a_origin).await.unwrap();
         assert_eq!(answers.len(), 1);
         assert!(answers[0].reachable(), "{:?}", answers[0].keys);
         assert_eq!(answers[0].peer, b.node_id());
         assert!(answers[0].holds(&a.node_id()));
 
-        // A generates K_new. B has not heard of it yet.
         let plan = a.rotate_key().unwrap();
         let answers = a.peer_bindings(&a_origin).await.unwrap();
         assert!(!answers[0].holds(&plan.new_key), "not published yet");

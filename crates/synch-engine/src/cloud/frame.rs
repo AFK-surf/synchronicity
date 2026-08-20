@@ -392,7 +392,6 @@ mod tests {
         assert_eq!(row["added_at"], 12);
         assert_eq!(row["note"], "laptop");
 
-        // The request side too: the tag the control plane sends.
         let ask: serde_json::Value = serde_json::to_value(Down::Delegations { id: 4 }).unwrap();
         assert_eq!(ask["t"], "delegations");
         assert_eq!(ask["id"], 4);

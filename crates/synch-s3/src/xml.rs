@@ -562,10 +562,8 @@ mod tests {
             <CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
             <ETag>&x;</ETag></Part></CompleteMultipartUpload>";
         assert!(parse_complete_upload(xxe).is_err());
-        // The guard is belt-and-braces: there is no entity table to expand
-        // into, so a lower-case declaration that slips past the substring check
-        // still yields the literal text and fails as a malformed ETag rather
-        // than reading a file.
+        // Belt-and-braces: a lower-case declaration that slips past the
+        // substring check still fails as a malformed ETag, not a file read.
         assert!(parse_complete_upload(&xxe.replace("<!DOCTYPE", "<!doctype")).is_err());
         // The cap is on the body, before anything is parsed out of it.
         let huge = format!("<a>{}</a>", "x".repeat(MAX_COMPLETE_BODY));

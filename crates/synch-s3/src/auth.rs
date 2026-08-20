@@ -440,7 +440,6 @@ mod tests {
         );
         assert_eq!(header.signature, "deadbeef");
 
-        // Malformed shapes are refused by the same parser.
         assert!(parse_authorization("Basic abc").is_err());
         assert!(parse_authorization("AWS4-HMAC-SHA256 Signature=x").is_err());
         assert!(parse_authorization(
@@ -614,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn uri_encoding_follows_sigv4() {
+    fn canonicalization_encodes_uris_and_sorts_queries() {
         assert_eq!(uri_encode("a b", true), "a%20b");
         assert_eq!(uri_encode("a/b", false), "a/b");
         assert_eq!(uri_encode("a/b", true), "a%2Fb");
@@ -622,11 +621,7 @@ mod tests {
         assert_eq!(uri_encode("é", true), "%C3%A9");
         assert_eq!(canonical_uri(""), "/");
         assert_eq!(canonical_uri("/a b/c"), "/a%20b/c");
-    }
 
-    #[test]
-    fn query_parameters_are_sorted_and_encoded() {
-        let empty = headers(&[]);
         let query = vec![
             ("prefix".to_string(), "a b".to_string()),
             ("list-type".to_string(), "2".to_string()),
@@ -635,14 +630,10 @@ mod tests {
             method: "GET",
             path: "/bucket",
             query: &query,
-            headers: &empty,
+            headers: &headers(&[]),
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        let canonical = canonical_request(&request, &[]);
-        assert!(
-            canonical.contains("list-type=2&prefix=a%20b"),
-            "{canonical}"
-        );
+        assert!(canonical_request(&request, &[]).contains("list-type=2&prefix=a%20b"));
     }
 
     fn records(lines: &[&str]) -> Vec<String> {

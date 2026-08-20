@@ -623,21 +623,12 @@ mod tests {
 
         // The DHT joins the pkarr/DNS lookup rather than replacing it, so
         // --dht and --discovery are usable together.
-        let cli = Cli::try_parse_from([
-            "synch",
-            "daemon",
-            "run",
-            "--dht",
-            "--dht-bootstrap",
-            "boot1.example:6881,boot2.example:6881",
-            "--dht-publish-addrs",
-            "--discovery",
-            "https://dns.example.com/pkarr",
-            "--relay",
-            "https://relay-a.example.com",
-            "--relay",
-            "https://relay-b.example.com",
-        ])
+        let cli = Cli::try_parse_from(
+            "synch daemon run --dht --dht-bootstrap boot1.example:6881,boot2.example:6881 \
+             --dht-publish-addrs --discovery https://dns.example.com/pkarr \
+             --relay https://relay-a.example.com --relay https://relay-b.example.com"
+                .split_whitespace(),
+        )
         .unwrap();
         assert!(cli.dht && cli.dht_publish_addrs);
         assert_eq!(
@@ -657,45 +648,21 @@ mod tests {
         // it, the DHT sub-knobs need --dht, cat/get refuse --from with
         // --strict, and cloud enable takes no --space.
         for args in [
-            vec!["synch", "daemon", "run", "--offline", "--dht"],
-            vec![
-                "synch",
-                "daemon",
-                "run",
-                "--offline",
-                "--dht-bootstrap",
-                "boot.example:6881",
-            ],
-            vec!["synch", "daemon", "run", "--offline", "--dht-publish-addrs"],
-            vec![
-                "synch",
-                "daemon",
-                "run",
-                "--offline",
-                "--relay",
-                "https://r.example.com",
-            ],
-            vec![
-                "synch",
-                "daemon",
-                "run",
-                "--offline",
-                "--discovery",
-                "https://d.example.com",
-            ],
-            vec![
-                "synch",
-                "daemon",
-                "run",
-                "--dht-bootstrap",
-                "boot.example:6881",
-            ],
-            vec!["synch", "daemon", "run", "--dht-publish-addrs"],
-            vec!["synch", "cat", "media/a.txt", "--from", "nas@x", "--strict"],
-            vec!["synch", "get", "media/a.txt", "--from", "nas@x", "--strict"],
-            vec!["synch", "cloud", "enable", "--space", "media"],
+            "synch daemon run --offline --dht",
+            "synch daemon run --offline --dht-bootstrap boot.example:6881",
+            "synch daemon run --offline --dht-publish-addrs",
+            "synch daemon run --offline --relay https://r.example.com",
+            "synch daemon run --offline --discovery https://d.example.com",
+            "synch daemon run --dht-bootstrap boot.example:6881",
+            "synch daemon run --dht-publish-addrs",
+            "synch cat media/a.txt --from nas@x --strict",
+            "synch get media/a.txt --from nas@x --strict",
+            "synch cloud enable --space media",
         ] {
-            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+            assert!(
+                Cli::try_parse_from(args.split_whitespace()).is_err(),
+                "{args}"
+            );
         }
     }
 

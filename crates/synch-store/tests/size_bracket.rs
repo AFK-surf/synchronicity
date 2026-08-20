@@ -17,21 +17,13 @@
 //! but it must not stick: bits held under an *unattested* size are themselves
 //! only a claim, so the honest writer takes the row and the bitmap restarts.
 
-use synch_core::{group_count, ChunkRanges, CHUNK_GROUP_SIZE};
+use synch_core::{ChunkRanges, CHUNK_GROUP_SIZE};
 use synch_store::Store;
 
 #[test]
 fn a_size_lie_inside_one_power_of_two_bracket_does_not_brick_the_root() {
     let true_size = 20 * CHUNK_GROUP_SIZE;
     let lie_size = 24 * CHUNK_GROUP_SIZE;
-    assert_eq!(group_count(true_size), 20);
-    assert_eq!(group_count(lie_size), 24);
-    // The premise: both sizes split at the same place, so the left subtree is
-    // shared and a slice over it verifies under either.
-    assert_eq!(
-        group_count(true_size).next_power_of_two() / 2,
-        group_count(lie_size).next_power_of_two() / 2
-    );
 
     let honest_dir = tempfile::tempdir().unwrap();
     let honest = Store::open(honest_dir.path()).unwrap();

@@ -223,33 +223,52 @@ mod tests {
     use super::*;
     use crate::testutil::{origin, store};
 
+    /// §3.4: detection rests on unauthenticated summaries, so the operator
+    /// judges a bogus-seq claim by which peer made it: the row keeps the
+    /// greatest seq — same seq, greater root wins (§5.2) — and the claimant
+    /// moves with the claim, a lower one changing neither.
     #[test]
-    fn observations_keep_the_greatest_seq_root() {
+    fn observed_heads_keep_the_greatest_seq_root_and_its_claimant() {
         let (_d, store) = store();
+        let loud = SecretKey::generate().public();
+        let quiet = SecretKey::generate().public();
         assert_eq!(store.observed_head(&origin()).unwrap(), None);
 
         assert!(store
-            .record_observed_head(&origin(), 5, &Hash([1u8; 32]), true, None, 10)
+            .record_observed_head(&origin(), 5, &Hash([1u8; 32]), true, Some(&quiet), 10)
             .unwrap());
+        assert_eq!(
+            store.observed_head(&origin()).unwrap().unwrap().claimed_by,
+            Some(quiet)
+        );
         // A lower seq from another peer does not lower the observation.
         assert!(!store
             .record_observed_head(&origin(), 3, &Hash([9u8; 32]), true, None, 11)
             .unwrap());
         assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 5);
 
-        // Same seq, greater root wins — the acceptance rule's order (§5.2).
+        // Same seq, greater root wins — the acceptance rule's order (§5.2) —
+        // and the claimant moves with the claim.
         assert!(store
-            .record_observed_head(&origin(), 5, &Hash([2u8; 32]), false, None, 12)
+            .record_observed_head(&origin(), 5, &Hash([2u8; 32]), false, Some(&loud), 12)
             .unwrap());
         let observed = store.observed_head(&origin()).unwrap().unwrap();
         assert_eq!(observed.root, Hash([2u8; 32]));
         assert!(!observed.complete);
         assert_eq!(observed.observed_at, 12);
+        assert_eq!(observed.claimed_by, Some(loud));
 
+        // A higher claim takes the row, claim and all; a lower one then
+        // changes nothing, claimant included.
         assert!(store
-            .record_observed_head(&origin(), 9, &Hash([0u8; 32]), true, None, 13)
+            .record_observed_head(&origin(), 5_000, &Hash([0u8; 32]), true, Some(&loud), 13)
             .unwrap());
-        assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 9);
+        store
+            .record_observed_head(&origin(), 9, &Hash([3u8; 32]), true, Some(&quiet), 14)
+            .unwrap();
+        let observed = store.observed_head(&origin()).unwrap().unwrap();
+        assert_eq!(observed.seq, 5_000);
+        assert_eq!(observed.claimed_by, Some(loud));
 
         // Per-origin: another origin's observation neither collides nor is
         // overwritten by ours.
@@ -262,57 +281,17 @@ mod tests {
     }
 
     #[test]
-    fn the_publishing_floor_only_rises() {
-        let (_d, store) = store();
-        assert_eq!(store.publish_floor().unwrap(), None);
-        assert_eq!(store.raise_publish_floor(1_001).unwrap(), 1_001);
-        assert_eq!(store.raise_publish_floor(500).unwrap(), 1_001);
-        assert_eq!(store.publish_floor().unwrap(), Some(1_001));
-        assert_eq!(store.raise_publish_floor(2_000).unwrap(), 2_000);
-    }
-
-    #[test]
-    fn the_floor_survives_a_reopen() {
+    fn the_publishing_floor_only_rises_and_survives_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::open(dir.path()).unwrap();
-            store.raise_publish_floor(4_242).unwrap();
+            assert_eq!(store.publish_floor().unwrap(), None);
+            assert_eq!(store.raise_publish_floor(1_001).unwrap(), 1_001);
+            assert_eq!(store.raise_publish_floor(500).unwrap(), 1_001);
+            assert_eq!(store.publish_floor().unwrap(), Some(1_001));
+            assert_eq!(store.raise_publish_floor(2_000).unwrap(), 2_000);
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.publish_floor().unwrap(), Some(4_242));
-    }
-
-    /// §3.4: detection rests on unauthenticated summaries, so the operator
-    /// judges a bogus-seq claim by which peer made it.
-    #[test]
-    fn an_observation_records_which_peer_claimed_it() {
-        let (_d, store) = store();
-        let loud = SecretKey::generate().public();
-        let quiet = SecretKey::generate().public();
-
-        store
-            .record_observed_head(&origin(), 10, &Hash([1u8; 32]), true, Some(&quiet), 1)
-            .unwrap();
-        assert_eq!(
-            store.observed_head(&origin()).unwrap().unwrap().claimed_by,
-            Some(quiet)
-        );
-
-        // The claimant moves with the claim: whoever asserted the highest seq
-        // is the one named, and a lower claim changes nothing, claimant included.
-        store
-            .record_observed_head(&origin(), 5_000, &Hash([2u8; 32]), true, Some(&loud), 2)
-            .unwrap();
-        let observed = store.observed_head(&origin()).unwrap().unwrap();
-        assert_eq!(observed.seq, 5_000);
-        assert_eq!(observed.claimed_by, Some(loud));
-
-        store
-            .record_observed_head(&origin(), 9, &Hash([3u8; 32]), true, Some(&quiet), 3)
-            .unwrap();
-        assert_eq!(
-            store.observed_head(&origin()).unwrap().unwrap().claimed_by,
-            Some(loud)
-        );
+        assert_eq!(store.publish_floor().unwrap(), Some(2_000));
     }
 }

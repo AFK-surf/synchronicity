@@ -2,13 +2,8 @@
 //! deployed synchronicity cluster runs (hickory's DnssecDnsHandle inside
 //! synch-net's DnssecResolver) resolves the membership domain against the
 //! control plane's DoH endpoint, anchored at the control plane's key.
-//!
-//! Environment (exported by control-plane/e2e/run.sh):
-//!   CP_DOH_URL      e.g. http://127.0.0.1:8053/dns-query
-//!   CP_ANCHOR_FILE  trust-anchor file in --dnssec-anchor syntax
-//!   CP_DOMAIN       membership domain, e.g. prod.acme.sync.test
-//!   CP_NAS_ACTIVE / CP_NAS_REVOKED / CP_LAPTOP_ACTIVE / CP_LAPTOP_RETIRING
-//!                   z-base-32 device keys the seeded zone published
+//! Skips without the CP_* environment e2e/run.sh exports (DoH URL, anchor
+//! file, membership domain, and the seeded device keys).
 
 use synch_core::OriginId;
 use synch_net::dns::{DnssecResolver, RekorPolicy, ResolverOptions};
@@ -17,9 +12,14 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// Skips when the e2e environment is absent; run via e2e/run.sh.
-fn e2e_env() -> Option<(String, String, String)> {
-    Some((env("CP_DOH_URL")?, env("CP_ANCHOR_FILE")?, env("CP_DOMAIN")?))
+/// The e2e context, or `None` when the environment is absent (skip).
+fn e2e_ctx() -> Option<(String, String, String)> {
+    install_provider();
+    Some((
+        env("CP_DOH_URL")?,
+        env("CP_ANCHOR_FILE")?,
+        env("CP_DOMAIN")?,
+    ))
 }
 
 /// A resolver against the control plane's zone, with or without the log gate.
@@ -49,9 +49,7 @@ fn install_provider() {
 
 #[tokio::test]
 async fn control_plane_zone_validates_and_parses() {
-    install_provider();
-    let Some((doh_url, anchor, domain)) = e2e_env() else {
-        eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
+    let Some((doh_url, anchor, domain)) = e2e_ctx() else {
         return;
     };
     // DNSSEC-only coverage here: the zone-key transparency path has its own
@@ -104,9 +102,12 @@ async fn control_plane_zone_validates_and_parses() {
         (env("CP_LAPTOP_RETIRING"), true),
         (env("CP_NAS_REVOKED"), false),
     ] {
-        if let Some(key) = key {
-            assert_eq!(ids.iter().any(|(_, k)| k == &key), present, "{key}: {ids:?}");
-        }
+        let Some(key) = key else { continue };
+        assert_eq!(
+            ids.iter().any(|(_, k)| k == &key),
+            present,
+            "{key}: {ids:?}"
+        );
     }
 
     // TTL is the zone's 300s, inside the client clamp window.
@@ -160,19 +161,16 @@ async fn the_fleets_attach_endpoints_cross_validate() {
 /// whatever it had cached.
 #[tokio::test]
 async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
-    install_provider();
-    let Some((doh_url, anchor, domain)) = e2e_env() else {
-        eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
+    let Some((doh_url, anchor, domain)) = e2e_ctx() else {
         return;
     };
     // No `rekor` field at all: `require` is the default everywhere.
     let resolver = test_resolver(doh_url, anchor, None);
 
-    let error = resolver
+    resolver
         .member_set(&domain)
         .await
         .expect_err("a zone with no proof record must not resolve by default");
-    eprintln!("ok: unlogged zone refused under the default policy: {error}");
 
     // And the ungated TXT lookup still works — it is the member-set path that
     // gained a requirement, not every query the resolver makes.

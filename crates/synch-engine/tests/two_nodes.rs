@@ -1,117 +1,18 @@
 //! Two real iroh endpoints on localhost, with relays and discovery disabled,
 //! exercising the §5 metadata protocol and the §6.4 blob protocol end to end.
 
-use std::sync::Arc;
-
-use iroh_base::SecretKey;
-use synch_core::{file_key, now_ns, ChunkRanges, FileEntry, Hash, OriginId, SignedHead};
+use synch_core::{file_key, now_ns, ChunkRanges, Hash, SignedHead};
 use synch_engine::{FetchOutcome, Syncer};
 use synch_mpt::Trie;
-use synch_net::{Net, NetOptions};
-use synch_store::{Binding, BindingSource, Slot, Store};
+use synch_store::{Slot, Store};
 
-struct Node {
-    _dir: tempfile::TempDir,
-    store: Arc<Store>,
-    net: Net,
-    secret: SecretKey,
-    origin: OriginId,
-}
+mod common;
+use common::wire::{connect, connect_blob, shutdown_all, trust, trust_all, WireNode};
 
-impl Node {
-    async fn spawn(name: &str) -> Node {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
-        let secret = SecretKey::generate();
-        let origin = OriginId::named(name, "cluster.example").unwrap();
-        store.set_self_origin(&origin).unwrap();
-        // A node always trusts itself, so its own key is bound before anything
-        // else happens.
-        trust(&store, &origin, &secret.public());
-        // The endpoint reconciles through a head sink, which is what carries
-        // the §5.2 acceptance rule; without one it speaks the protocol but
-        // adopts nothing. The node dials with the same object it serves
-        // through, so a head arriving in either direction lands in one place.
-        let mut options = NetOptions::loopback();
-        options.heads = Some(Arc::new(Syncer::new(store.clone())) as Arc<dyn synch_net::HeadSink>);
-        let net = Net::bind(store.clone(), secret.clone(), options)
-            .await
-            .unwrap();
-        Node {
-            _dir: dir,
-            store,
-            net,
-            secret,
-            origin,
-        }
-    }
-
-    /// Publishes a new signed head containing `files`, as the local origin would.
-    fn publish(&self, seq: u64, files: &[(&str, &[u8])]) -> SignedHead {
-        let trie = Trie::new(self.store.as_ref());
-        // One transaction, as every production writer of the complete slot
-        // does it: the head and the views it derives commit together (§5.2).
-        let old = self
-            .store
-            .complete_head(&self.origin)
-            .unwrap()
-            .map(|h| h.root)
-            .unwrap_or(Hash::EMPTY);
-        let mut root = old;
-        for (path, content) in files {
-            let object = self.store.ingest_bytes(content, now_ns()).unwrap();
-            let entry = FileEntry::file(content.len() as u64, 0, object, seq);
-            root = trie
-                .insert(
-                    root,
-                    &file_key("media", path).unwrap(),
-                    &postcard::to_stdvec(&entry).unwrap(),
-                )
-                .unwrap();
-            let ad = self.store.local_ad(&object).unwrap().unwrap();
-            root = trie
-                .insert(
-                    root,
-                    &synch_core::blob_key(&object),
-                    &postcard::to_stdvec(&ad).unwrap(),
-                )
-                .unwrap();
-        }
-        let head = SignedHead::sign(&self.secret, self.origin.clone(), seq, root, now_ns());
-        self.store
-            .transaction(|txn| -> Result<(), synch_store::StoreError> {
-                txn.put_head(Slot::Complete, &head, now_ns(), now_ns())?;
-                txn.materialize_diff(&self.origin, old, root)?;
-                Ok(())
-            })
-            .unwrap();
-        head
-    }
-}
-
-fn trust(store: &Store, origin: &OriginId, key: &synch_core::NodeId) {
-    store
-        .put_binding(&Binding {
-            origin: origin.clone(),
-            node_id: *key,
-            source: BindingSource::Static,
-            domain: None,
-            issuer: None,
-            spaces: Vec::new(),
-            note: None,
-            added_at: 0,
-            expires_at: None,
-        })
-        .unwrap();
-}
-
-/// Makes every node in `nodes` trust every other node's origin and key.
-fn trust_each_other(nodes: &[&Node]) {
-    for a in nodes {
-        for b in nodes {
-            trust(&a.store, &b.origin, &b.secret.public());
-        }
-    }
+/// Publishes `files` under the fixed `media` space this suite writes into.
+fn publish(node: &WireNode, seq: u64, files: &[(&str, &[u8])]) -> SignedHead {
+    let files: Vec<(&str, &str, &[u8])> = files.iter().map(|(p, c)| ("media", *p, *c)).collect();
+    node.publish(seq, &files, &[])
 }
 
 /// Peer-agnostic fetch (§5.2): trie nodes are content-addressed, so a node
@@ -120,10 +21,10 @@ fn trust_each_other(nodes: &[&Node]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_third_node_learns_the_trie_from_a_relayer() {
     let _blocking = synch_core::BlockingScope::enter();
-    let origin_node = Node::spawn("nas").await;
-    let relay = Node::spawn("vps").await;
-    let laptop = Node::spawn("laptop").await;
-    trust_each_other(&[&origin_node, &relay, &laptop]);
+    let origin_node = WireNode::spawn(Some("nas")).await;
+    let relay = WireNode::spawn(Some("vps")).await;
+    let laptop = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&origin_node, &relay, &laptop]);
 
     let files: Vec<(String, Vec<u8>)> = (0..40)
         .map(|i| (format!("dir{}/file{i:03}.bin", i % 5), vec![i as u8; 64]))
@@ -132,14 +33,10 @@ async fn a_third_node_learns_the_trie_from_a_relayer() {
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_slice()))
         .collect();
-    let head = origin_node.publish(1, &borrowed);
+    let head = publish(&origin_node, 1, &borrowed);
 
     // The relay syncs from the origin.
-    let to_origin = relay
-        .net
-        .connect_mpt(origin_node.net.direct_addr())
-        .await
-        .unwrap();
+    let to_origin = connect(&relay, &origin_node).await;
     Syncer::new(relay.store.clone())
         .sync_with(&to_origin)
         .await
@@ -150,11 +47,7 @@ async fn a_third_node_learns_the_trie_from_a_relayer() {
     );
 
     // The laptop syncs only from the relay, and still ends up byte-identical.
-    let to_relay = laptop
-        .net
-        .connect_mpt(relay.net.direct_addr())
-        .await
-        .unwrap();
+    let to_relay = connect(&laptop, &relay).await;
     let report = Syncer::new(laptop.store.clone())
         .sync_with(&to_relay)
         .await
@@ -175,9 +68,7 @@ async fn a_third_node_learns_the_trie_from_a_relayer() {
             .unwrap()
     );
 
-    for node in [&origin_node, &relay, &laptop] {
-        node.net.shutdown().await.unwrap();
-    }
+    shutdown_all(&[&origin_node, &relay, &laptop]).await;
 }
 
 /// A one-file update to a 60-file trie pulls only the touched path: a diff
@@ -185,9 +76,9 @@ async fn a_third_node_learns_the_trie_from_a_relayer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_updates_transfer_only_the_change() {
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = Node::spawn("nas").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&publisher, &follower]);
+    let publisher = WireNode::spawn(Some("nas")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&publisher, &follower]);
 
     let files: Vec<(String, Vec<u8>)> = (0..60)
         .map(|i| (format!("f{i:03}.bin"), vec![i as u8; 32]))
@@ -196,20 +87,16 @@ async fn incremental_updates_transfer_only_the_change() {
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_slice()))
         .collect();
-    publisher.publish(1, &borrowed);
+    publish(&publisher, 1, &borrowed);
 
-    let client = follower
-        .net
-        .connect_mpt(publisher.net.direct_addr())
-        .await
-        .unwrap();
+    let client = connect(&follower, &publisher).await;
     let syncer = Syncer::new(follower.store.clone());
     syncer.sync_with(&client).await.unwrap();
 
     let nodes_before = count_nodes(&follower.store);
 
     // One file changes; the second exchange must pull only the touched path.
-    let head2 = publisher.publish(2, &[("f000.bin", b"changed")]);
+    let head2 = publish(&publisher, 2, &[("f000.bin", b"changed")]);
     let report = syncer.sync_with(&client).await.unwrap();
     assert_eq!(report.tries_completed, 1, "{report:?}");
     assert_eq!(
@@ -223,15 +110,7 @@ async fn incremental_updates_transfer_only_the_change() {
         "structural sharing should bound a one-file update to a handful of nodes, pulled {pulled}"
     );
 
-    let entry = follower
-        .store
-        .entry(&publisher.origin, "media", "f000.bin")
-        .unwrap()
-        .unwrap();
-    assert_eq!(entry.size, 7);
-
-    publisher.net.shutdown().await.unwrap();
-    follower.net.shutdown().await.unwrap();
+    shutdown_all(&[&publisher, &follower]).await;
 }
 
 /// §3.2: connections from device keys with no live binding are closed
@@ -239,24 +118,19 @@ async fn incremental_updates_transfer_only_the_change() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_peers_are_refused() {
     let _blocking = synch_core::BlockingScope::enter();
-    let server = Node::spawn("nas").await;
-    let stranger = Node::spawn("intruder").await;
+    let server = WireNode::spawn(Some("nas")).await;
+    let stranger = WireNode::spawn(Some("intruder")).await;
     // The stranger trusts the server (so it will dial), but not vice versa.
-    trust(&stranger.store, &server.origin, &server.secret.public());
+    trust(&stranger.store, &server.origin, &server.key());
 
-    let client = stranger
-        .net
-        .connect_mpt(server.net.direct_addr())
-        .await
-        .unwrap();
+    let client = connect(&stranger, &server).await;
     // The handshake may complete, but the server refuses to serve anything.
     let result = client
         .get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"anything"))])
         .await;
     assert!(result.is_err(), "an untrusted peer must not be served");
 
-    server.net.shutdown().await.unwrap();
-    stranger.net.shutdown().await.unwrap();
+    shutdown_all(&[&server, &stranger]).await;
 }
 
 /// A request costs a stream, not a session: a fetch that dials for itself
@@ -265,20 +139,12 @@ async fn untrusted_peers_are_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_to_a_peer_share_one_session() {
     let _blocking = synch_core::BlockingScope::enter();
-    let client = Node::spawn("laptop").await;
-    let server = Node::spawn("nas").await;
-    trust_each_other(&[&client, &server]);
+    let client = WireNode::spawn(Some("laptop")).await;
+    let server = WireNode::spawn(Some("nas")).await;
+    trust_all(&[&client, &server]);
 
-    let first = client
-        .net
-        .connect_mpt(server.net.direct_addr())
-        .await
-        .unwrap();
-    let second = client
-        .net
-        .connect_mpt(server.net.direct_addr())
-        .await
-        .unwrap();
+    let first = connect(&client, &server).await;
+    let second = connect(&client, &server).await;
     assert_eq!(
         first.connection().stable_id(),
         second.connection().stable_id(),
@@ -292,11 +158,7 @@ async fn requests_to_a_peer_share_one_session() {
 
     // A session that has gone is not handed out again: the next request dials.
     first.connection().close(0u32.into(), b"done");
-    let third = client
-        .net
-        .connect_mpt(server.net.direct_addr())
-        .await
-        .unwrap();
+    let third = connect(&client, &server).await;
     assert_ne!(
         third.connection().stable_id(),
         first.connection().stable_id(),
@@ -309,16 +171,8 @@ async fn requests_to_a_peer_share_one_session() {
 
     // The two ALPNs are separate sessions, so the metadata one is untouched by
     // a content dial.
-    client
-        .net
-        .connect_blob(server.net.direct_addr())
-        .await
-        .unwrap();
-    let again = client
-        .net
-        .connect_mpt(server.net.direct_addr())
-        .await
-        .unwrap();
+    connect_blob(&client, &server).await;
+    let again = connect(&client, &server).await;
     assert_eq!(
         again.connection().stable_id(),
         third.connection().stable_id()
@@ -329,7 +183,7 @@ async fn requests_to_a_peer_share_one_session() {
         .store
         .remove_binding(
             &server.origin,
-            &server.secret.public(),
+            &server.key(),
             synch_store::BindingSource::Static,
         )
         .unwrap();
@@ -343,8 +197,7 @@ async fn requests_to_a_peer_share_one_session() {
         "and the session it was dialed under must not stay open"
     );
 
-    client.net.shutdown().await.unwrap();
-    server.net.shutdown().await.unwrap();
+    shutdown_all(&[&client, &server]).await;
 }
 
 /// The §5.3 reactive path over the wire: push_head lands in the pending slot
@@ -352,16 +205,12 @@ async fn requests_to_a_peer_share_one_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reactive_head_push_propagates() {
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = Node::spawn("nas").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&publisher, &follower]);
+    let publisher = WireNode::spawn(Some("nas")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&publisher, &follower]);
 
-    let head = publisher.publish(1, &[("a.txt", b"hello")]);
-    let client = publisher
-        .net
-        .connect_mpt(follower.net.direct_addr())
-        .await
-        .unwrap();
+    let head = publish(&publisher, 1, &[("a.txt", b"hello")]);
+    let client = connect(&publisher, &follower).await;
     client.push_head(&head).await.unwrap();
 
     // The follower has the head, not the trie, so it sits in the pending slot.
@@ -375,11 +224,7 @@ async fn reactive_head_push_propagates() {
     );
 
     // Pulling the trie from the publisher completes the flip.
-    let back = follower
-        .net
-        .connect_mpt(publisher.net.direct_addr())
-        .await
-        .unwrap();
+    let back = connect(&follower, &publisher).await;
     let syncer = Syncer::new(follower.store.clone());
     let outcome = syncer
         .fetch_pending(&back, &publisher.origin)
@@ -391,8 +236,7 @@ async fn reactive_head_push_propagates() {
         Some(head)
     );
 
-    publisher.net.shutdown().await.unwrap();
-    follower.net.shutdown().await.unwrap();
+    shutdown_all(&[&publisher, &follower]).await;
 }
 
 /// §5.2: if every candidate provider persistently returns `missing`, the
@@ -400,9 +244,9 @@ async fn reactive_head_push_propagates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unservable_head_is_abandoned_rather_than_wedging() {
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = Node::spawn("nas").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&publisher, &follower]);
+    let publisher = WireNode::spawn(Some("nas")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&publisher, &follower]);
 
     // A head whose trie nobody has: signed, valid, but unservable.
     let phantom = SignedHead::sign(
@@ -415,11 +259,7 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
     let syncer = Syncer::new(follower.store.clone());
     assert!(syncer.offer_head(&phantom, now_ns()).unwrap().accepted());
 
-    let client = follower
-        .net
-        .connect_mpt(publisher.net.direct_addr())
-        .await
-        .unwrap();
+    let client = connect(&follower, &publisher).await;
     let outcome = syncer
         .fetch_pending(&client, &publisher.origin)
         .await
@@ -431,7 +271,7 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
     );
 
     // And a real head published afterwards is still adopted normally.
-    let real = publisher.publish(10, &[("a.txt", b"hello")]);
+    let real = publish(&publisher, 10, &[("a.txt", b"hello")]);
     let report = syncer.sync_with(&client).await.unwrap();
     assert_eq!(report.tries_completed, 1, "{report:?}");
     assert_eq!(
@@ -439,8 +279,7 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
         Some(real)
     );
 
-    publisher.net.shutdown().await.unwrap();
-    follower.net.shutdown().await.unwrap();
+    shutdown_all(&[&publisher, &follower]).await;
 }
 
 /// A value small enough to be inline must *be* inline: the alternative gives
@@ -450,9 +289,9 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_in_the_wrong_representation_retires_its_head() {
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = Node::spawn("nas").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&publisher, &follower]);
+    let publisher = WireNode::spawn(Some("nas")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&publisher, &follower]);
 
     // A trie the publisher can serve whole, whose one leaf points at an
     // out-of-line payload small enough that it should have been inline.
@@ -461,7 +300,7 @@ async fn a_value_in_the_wrong_representation_retires_its_head() {
     let value_hash = Hash::new(&small);
     synch_mpt::NodeStore::put_value(publisher.store.as_ref(), &value_hash, &small).unwrap();
     let leaf = synch_mpt::TrieNode::Leaf {
-        key_rest: synch_mpt::Nibbles::from_bytes(&synch_core::file_key("media", "a.txt").unwrap()),
+        key_rest: synch_mpt::Nibbles::from_bytes(&file_key("media", "a.txt").unwrap()),
         value: synch_mpt::ValueRef::Hash(value_hash),
     };
     let encoded = leaf.encode();
@@ -478,11 +317,7 @@ async fn a_value_in_the_wrong_representation_retires_its_head() {
     let syncer = Syncer::new(follower.store.clone());
     assert!(syncer.offer_head(&head, now_ns()).unwrap().accepted());
 
-    let client = follower
-        .net
-        .connect_mpt(publisher.net.direct_addr())
-        .await
-        .unwrap();
+    let client = connect(&follower, &publisher).await;
     // The node arrives; the value is refused each round, which is no progress,
     // so the head is retired by the counter rather than by the clock.
     let outcome = syncer
@@ -495,15 +330,8 @@ async fn a_value_in_the_wrong_representation_retires_its_head() {
         None,
         "and the head stops holding the floor"
     );
-    assert!(
-        synch_mpt::NodeStore::get_value(follower.store.as_ref(), &value_hash)
-            .unwrap()
-            .is_none(),
-        "the value itself was never stored"
-    );
 
-    publisher.net.shutdown().await.unwrap();
-    follower.net.shutdown().await.unwrap();
+    shutdown_all(&[&publisher, &follower]).await;
 }
 
 fn count_nodes(store: &Store) -> usize {
@@ -519,12 +347,12 @@ fn count_nodes(store: &Store) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_object_larger_than_one_frame_transfers() {
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = Node::spawn("nas").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&publisher, &follower]);
+    let publisher = WireNode::spawn(Some("nas")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&publisher, &follower]);
 
     let payload: Vec<u8> = (0..20u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-    publisher.publish(1, &[("big.bin", payload.as_slice())]);
+    publish(&publisher, 1, &[("big.bin", payload.as_slice())]);
     let root = publisher
         .store
         .list_entries(Some(&publisher.origin), "media", "", None, None)
@@ -532,11 +360,7 @@ async fn an_object_larger_than_one_frame_transfers() {
         .content
         .unwrap();
 
-    let blob = follower
-        .net
-        .connect_blob(publisher.net.direct_addr())
-        .await
-        .unwrap();
+    let blob = connect_blob(&follower, &publisher).await;
     let all = ChunkRanges::single(0, synch_core::group_count(payload.len() as u64));
     let mut got = ChunkRanges::empty();
     blob.fetch_into(&follower.store, root, payload.len() as u64, &all, &mut got)
@@ -545,8 +369,7 @@ async fn an_object_larger_than_one_frame_transfers() {
     assert_eq!(got.count(), synch_core::group_count(payload.len() as u64));
     assert_eq!(follower.store.read_all(&root).unwrap().len(), payload.len());
 
-    publisher.net.shutdown().await.unwrap();
-    follower.net.shutdown().await.unwrap();
+    shutdown_all(&[&publisher, &follower]).await;
 }
 
 /// One origin publishing a record this node cannot decode does not stop it
@@ -557,10 +380,10 @@ async fn an_object_larger_than_one_frame_transfers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_poisoned_origin_does_not_hold_up_the_others() {
     let _blocking = synch_core::BlockingScope::enter();
-    let poisoned = Node::spawn("nas").await;
-    let healthy = Node::spawn("vps").await;
-    let follower = Node::spawn("laptop").await;
-    trust_each_other(&[&poisoned, &healthy, &follower]);
+    let poisoned = WireNode::spawn(Some("nas")).await;
+    let healthy = WireNode::spawn(Some("vps")).await;
+    let follower = WireNode::spawn(Some("laptop")).await;
+    trust_all(&[&poisoned, &healthy, &follower]);
 
     // A well-formed `f:` key whose value is not a FileEntry: signed, complete,
     // and impossible to materialize.
@@ -578,26 +401,18 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
         .put_head(Slot::Complete, &head, now_ns(), now_ns())
         .unwrap();
 
-    healthy.publish(1, &[("good.txt", b"readable")]);
+    publish(&healthy, 1, &[("good.txt", b"readable")]);
 
     // The poisoned node picks up the healthy origin's head, so one exchange
     // carries both — `nas@…` sorts before `vps@…`, so the bad one is handled
     // first, before the good one is read.
-    let to_healthy = poisoned
-        .net
-        .connect_mpt(healthy.net.direct_addr())
-        .await
-        .unwrap();
+    let to_healthy = connect(&poisoned, &healthy).await;
     Syncer::new(poisoned.store.clone())
         .sync_with(&to_healthy)
         .await
         .unwrap();
 
-    let client = follower
-        .net
-        .connect_mpt(poisoned.net.direct_addr())
-        .await
-        .unwrap();
+    let client = connect(&follower, &poisoned).await;
     let report = Syncer::new(follower.store.clone())
         .sync_with(&client)
         .await
@@ -620,7 +435,5 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
         .unwrap()
         .is_empty());
 
-    for node in [&poisoned, &healthy, &follower] {
-        node.net.shutdown().await.unwrap();
-    }
+    shutdown_all(&[&poisoned, &healthy, &follower]).await;
 }

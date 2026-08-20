@@ -746,32 +746,27 @@ mod tests {
     }
 
     #[test]
-    fn file_keys_round_trip() {
+    fn file_and_blob_keys_round_trip_and_reject_bad_input() {
         let key = file_key("photos", "2024/summer/a.jpg").unwrap();
         assert_eq!(&key[..2], b"f:");
         let (space, path) = parse_file_key(&key).unwrap();
-        assert_eq!(space, "photos");
-        assert_eq!(path, "2024/summer/a.jpg");
+        assert_eq!(
+            (space.as_str(), path.as_str()),
+            ("photos", "2024/summer/a.jpg")
+        );
+        assert!(key.starts_with(&space_prefix("photos").unwrap()));
+        assert_eq!(dir_prefix("photos", "").unwrap(), b"f:photos/".to_vec());
 
-        // The b: namespace round-trips the same way.
+        let key = file_key("photos", "a/b.jpg").unwrap();
+        assert!(key.starts_with(&dir_prefix("photos", "a").unwrap()));
+        assert!(!key.starts_with(&dir_prefix("photos", "b").unwrap()));
+
         let h = Hash::new(b"object");
         let key = blob_key(&h);
         assert_eq!(key.len(), 34);
         assert_eq!(parse_blob_key(&key).unwrap(), h);
         assert!(key.starts_with(&blob_prefix()));
-    }
 
-    #[test]
-    fn prefixes_are_key_prefixes() {
-        let key = file_key("photos", "a/b.jpg").unwrap();
-        assert!(key.starts_with(&space_prefix("photos").unwrap()));
-        assert!(key.starts_with(&dir_prefix("photos", "a").unwrap()));
-        assert!(!key.starts_with(&dir_prefix("photos", "b").unwrap()));
-        assert_eq!(dir_prefix("photos", "").unwrap(), b"f:photos/".to_vec());
-    }
-
-    #[test]
-    fn rejects_bad_keys() {
         assert!(file_key("has/slash", "a").is_err());
         assert!(file_key("", "a").is_err());
         assert!(file_key("s", "/abs").is_err());
@@ -794,40 +789,38 @@ mod tests {
         assert_eq!(parse_file_key(&key).unwrap().1, "a/b/c.txt");
     }
 
+    /// Round-trips a record through postcard unchanged.
+    fn round_trips<
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+    >(
+        v: T,
+    ) {
+        assert_eq!(
+            postcard::from_bytes::<T>(&postcard::to_stdvec(&v).unwrap()).unwrap(),
+            v
+        );
+    }
+
     #[test]
     fn record_round_trips_via_postcard() {
-        let e = FileEntry::file(1234, 42, Hash::new(b"x"), 7);
-        let bytes = postcard::to_stdvec(&e).unwrap();
-        assert_eq!(postcard::from_bytes::<FileEntry>(&bytes).unwrap(), e);
-
-        let ad = BlobAd::partial(100 * 1024 * 1024, [(0, 20 * 1024 * 1024)]);
-        let bytes = postcard::to_stdvec(&ad).unwrap();
-        assert_eq!(postcard::from_bytes::<BlobAd>(&bytes).unwrap(), ad);
-
-        let m = NodeManifest {
+        round_trips(FileEntry::file(1234, 42, Hash::new(b"x"), 7));
+        round_trips(BlobAd::partial(100 * 1024 * 1024, [(0, 20 * 1024 * 1024)]));
+        round_trips(NodeManifest {
             v: RECORD_VERSION,
             name: "nas".into(),
             software: "synchronicity/0.1.0".into(),
-        };
-        let bytes = postcard::to_stdvec(&m).unwrap();
-        assert_eq!(postcard::from_bytes::<NodeManifest>(&bytes).unwrap(), m);
-
-        let info = SpaceInfo {
+        });
+        round_trips(SpaceInfo {
             v: RECORD_VERSION,
             description: "movies".into(),
             entry_count: 40_000,
-        };
-        let bytes = postcard::to_stdvec(&info).unwrap();
-        assert_eq!(postcard::from_bytes::<SpaceInfo>(&bytes).unwrap(), info);
-
-        let d = Delegation {
+        });
+        round_trips(Delegation {
             v: RECORD_VERSION,
             spaces: vec!["photos".into(), "incoming".into()],
             not_after: 1_800_000_000_000_000_000,
             note: Some("zeynep's phone".into()),
-        };
-        let bytes = postcard::to_stdvec(&d).unwrap();
-        assert_eq!(postcard::from_bytes::<Delegation>(&bytes).unwrap(), d);
+        });
     }
 
     /// A record naming a million spans decodes to at most the cap.
@@ -868,13 +861,6 @@ mod tests {
         // peer's decode unchanged.
         let ours = BlobAd::partial(u64::MAX, spans);
         assert_eq!(ours.state.spans.len(), MAX_AD_SPANS);
-
-        // An ordinary ad is untouched by any of it.
-        let honest = BlobAd::partial(10 * g, [(0, 2 * g)]);
-        assert_eq!(
-            postcard::from_bytes::<BlobAd>(&postcard::to_stdvec(&honest).unwrap()).unwrap(),
-            honest
-        );
     }
 
     /// Coalescing under-reports rather than over-reports: rounding a run *out*
@@ -886,20 +872,19 @@ mod tests {
         let g = AD_SPAN_GRANULARITY;
         let size = 10 * g;
 
-        // Two byte-sized runs are not two granules.
+        // Byte-sized runs round to nothing; a run covering whole granules
+        // keeps only them, losing the partial granule at each end; runs that
+        // meet at a boundary merge.
         assert_eq!(coalesce_spans([(1, 2), (g + 5, g + 6)], size), vec![]);
         assert_eq!(coalesce_spans([(0, 1), (5 * g, 5 * g + 1)], size), vec![]);
-
-        // A run that covers whole granules keeps them, and loses only the
-        // partial granule at each end.
         assert_eq!(coalesce_spans([(g - 1, 3 * g + 1)], size), vec![(g, 3 * g)]);
-        // Runs that meet at a boundary merge.
         assert_eq!(
             coalesce_spans([(0, 2 * g), (2 * g, 4 * g)], size),
             vec![(0, 4 * g)]
         );
 
-        // The object's own end is exact, and a claim past it clamps to it.
+        // The object's own end is exact: a claim past it clamps, and a run
+        // inside the last partial granule rounds away entirely.
         let size = g / 2;
         assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
         assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);

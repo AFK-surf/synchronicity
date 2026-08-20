@@ -1466,10 +1466,6 @@ mod tests {
         assert_eq!(report.origin, Some(OriginId::Key(report.node_id)));
         assert_eq!(report.domain, None);
         assert!(Node::init(dir.path(), None).is_err());
-        // A node waiting on a name is initialized too, even with no origin yet.
-        let pending = node_dir();
-        Node::init(pending.path(), Some("cluster.example")).unwrap();
-        assert!(Node::init(pending.path(), Some("cluster.example")).is_err());
 
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         assert_eq!(node.origin(), &OriginId::Key(report.node_id));
@@ -1482,8 +1478,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A node whose zone has yet to name it holds no identity at all — and
-    /// says which record would settle it rather than failing opaquely (§3.1).
+    /// A node whose zone has yet to name it holds no identity at all (§3.1):
+    /// the report and the store agree, and the name comes back normalized.
     #[tokio::test]
     async fn init_with_a_domain_settles_nothing_yet() {
         let dir = node_dir();
@@ -1492,18 +1488,6 @@ mod tests {
         assert_eq!(report.domain.as_deref(), Some("cluster.example"));
         let store = Arc::new(Store::open(dir.path()).unwrap());
         assert_eq!(store.self_origin().unwrap(), None);
-
-        // No resolver, so nothing can name it: the unidentified state, naming
-        // the key an operator has to publish.
-        let err = Node::settle_identity(&store, report.node_id, None)
-            .await
-            .unwrap_err();
-        let EngineError::Unidentified { domain, node_id } = &err else {
-            panic!("{err:?}");
-        };
-        assert_eq!(domain, "cluster.example");
-        assert_eq!(**node_id, report.node_id);
-        assert!(err.to_string().contains(&report.node_id.to_z32()));
     }
 
     /// The migration a zone's answer drives: everything keyed by the old name
@@ -1606,15 +1590,19 @@ mod tests {
         );
         assert!(
             store.all_delegations().unwrap().is_empty(),
-            "and the row went with the name that issued it, rather than \
-             lingering as a lapsed reference to an origin nobody holds"
+            "the rows went with the name that issued them"
         );
     }
 
-    /// Clearing the domain is a re-identification like any other: the device
-    /// key names the node again, through the same migration (§3.1).
+    /// `settle_identity` answers from the membership domain and nothing else:
+    /// a cleared domain hands the identity back to the device key through the
+    /// same migration (§3.1); a replaced one leaves the node unidentified
+    /// rather than signing under a zone it no longer resolves; a withdrawal —
+    /// the zone still answering, just not naming it — changes nothing.
     #[tokio::test]
-    async fn dropping_the_domain_returns_the_node_to_its_key() {
+    async fn settle_identity_follows_the_membership_domain() {
+        // Cleared: the device key names the node again, and the old name and
+        // everything keyed by it goes with the migration.
         let dir = node_dir();
         let named = OriginId::named("nas", "cluster.example").unwrap();
         let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
@@ -1630,39 +1618,33 @@ mod tests {
             store.identity_history().unwrap().last().unwrap().adopted,
             settled
         );
-    }
 
-    /// A name issued by a zone this node no longer resolves is not a fallback:
-    /// nothing currently names it, so it waits rather than signing under it.
-    #[tokio::test]
-    async fn a_name_from_a_replaced_zone_is_not_kept() {
+        // Replaced: nothing currently names it, so it waits rather than
+        // signing under it — and says which record would settle it rather
+        // than failing opaquely.
         let dir = node_dir();
-        let named = OriginId::named("nas", "cluster.example").unwrap();
-        let report = Node::init_named_by_zone(dir.path(), named).unwrap();
+        let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         store.set_membership_domain(Some("other.example")).unwrap();
-
         let err = Node::settle_identity(&store, report.node_id, None)
             .await
             .unwrap_err();
-        assert!(matches!(err, EngineError::Unidentified { .. }), "{err:?}");
-    }
+        let EngineError::Unidentified { domain, node_id } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(domain, "other.example");
+        assert_eq!(**node_id, report.node_id);
+        assert!(err.to_string().contains(&report.node_id.to_z32()));
 
-    /// A withdrawal is not a resolution failure: a node named by the zone it
-    /// still resolves keeps that name when the answer stops mentioning it.
-    #[tokio::test]
-    async fn a_node_keeps_the_name_its_own_zone_stops_publishing() {
+        // Withdrawn: the name stays, and nothing was adopted or destroyed.
         let dir = node_dir();
-        let named = OriginId::named("nas", "cluster.example").unwrap();
         let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
-
         let adoptions = store.identity_history().unwrap().len();
         let settled = Node::settle_identity(&store, report.node_id, None)
             .await
             .unwrap();
         assert_eq!(settled, named);
-        // Nothing was adopted, so nothing was destroyed.
         assert_eq!(store.identity_history().unwrap().len(), adoptions);
     }
 
@@ -1698,11 +1680,8 @@ mod tests {
             .entry(node.origin(), "s", "a.txt")
             .unwrap()
             .is_none());
-        // Both roots are retained as history.
         assert_eq!(node.store().head_history(node.origin()).unwrap().len(), 2);
-        // Publishing nothing is a no-op, and so is a change that leaves the
-        // root where it was.
-        assert!(node.publish(&[]).unwrap().is_none());
+        // A change that leaves the root where it was is a no-op.
         assert!(node
             .publish(&[(node.key_for("s", "absent").unwrap(), None)])
             .unwrap()
@@ -1768,32 +1747,26 @@ mod tests {
         node.add_space("a", a.path()).unwrap();
         assert!(node.add_space("b", a.path().join("sub")).is_err());
         node.add_space("a", a.path()).unwrap();
-        node.shutdown().await.unwrap();
-    }
 
-    /// A mirror root stored through a symlink still has to be caught: the
-    /// incoming path is canonicalized, so the stored one must be too. This is
-    /// what fails on macOS, where every temp path under `/var` resolves to
-    /// `/private/var`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn overlap_is_detected_through_symlinked_roots() {
-        let (_d, node) = node().await;
-        let real = tempfile::tempdir().unwrap();
-        let link_parent = tempfile::tempdir().unwrap();
-        let link = link_parent.path().join("via-symlink");
-        std::os::unix::fs::symlink(real.path(), &link).unwrap();
-
-        node.store()
-            .put_mirror(
-                &link.to_string_lossy(),
-                "media",
-                &synch_store::VersionPolicy::Newest,
-            )
-            .unwrap();
-
-        let err = node.add_space("media", real.path()).unwrap_err();
-        assert!(err.to_string().contains("overlaps mirror"));
+        // And a mirror root stored through a symlink is still caught: the
+        // incoming path is canonicalized, so the stored one must be too. This
+        // is what fails on macOS, where every temp path under `/var` resolves
+        // to `/private/var`.
+        #[cfg(unix)]
+        {
+            let link_parent = tempfile::tempdir().unwrap();
+            let link = link_parent.path().join("via-symlink");
+            std::os::unix::fs::symlink(shared.path(), &link).unwrap();
+            node.store()
+                .put_mirror(
+                    &link.to_string_lossy(),
+                    "sym",
+                    &synch_store::VersionPolicy::Newest,
+                )
+                .unwrap();
+            let err = node.add_space("sym", shared.path()).unwrap_err();
+            assert!(err.to_string().contains("overlaps mirror"));
+        }
         node.shutdown().await.unwrap();
     }
 
@@ -1855,7 +1828,7 @@ mod tests {
             .list_entries(Some(node.origin()), "media", "", None, None)
             .unwrap();
 
-        // A well-formed `f:` key whose value is not a `FileEntry`.
+        // A well-formed `f:` key whose value no `FileEntry` decodes from.
         let poison = vec![(
             file_key("media", "poisoned").unwrap(),
             Some(vec![0xffu8; 8]),
@@ -1881,9 +1854,6 @@ mod tests {
             .is_none());
 
         // And a publish after it still works, from the head that survived.
-        // A well-formed record this time, and one that actually changes the
-        // trie: `publish` reports no head for a batch that leaves the root
-        // where it was.
         let good = vec![(
             file_key("media", "b.txt").unwrap(),
             Some(

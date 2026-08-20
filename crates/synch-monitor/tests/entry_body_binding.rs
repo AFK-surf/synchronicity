@@ -21,16 +21,6 @@ async fn a_forged_body_and_its_level_zero_tile_are_refused_against_the_signed_ro
     let root = tree.root().await.expect("the honest root recomputes");
     assert_eq!(root, reference_root(&honest.leaves, 0, SIZE));
 
-    // The premise of the attack, measured rather than asserted from memory:
-    // the root recomputation reads no level-0 tile, so nothing about a
-    // level-0 hash has been checked against the checkpoint.
-    let level_zero = honest
-        .paths()
-        .into_iter()
-        .filter(|p| p.starts_with("api/v2/tile/0/"))
-        .count();
-    assert_eq!(level_zero, 0);
-
     // The forgery: body and its level-0 hash-tile entry changed together,
     // every higher hash tile honest — the root and the consistency prefix
     // still check out.

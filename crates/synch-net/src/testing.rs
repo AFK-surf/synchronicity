@@ -25,6 +25,14 @@ pub(crate) async fn bare_endpoint(alpn: &'static [u8]) -> Endpoint {
         .expect("a loopback endpoint binds")
 }
 
+/// A scratch store in a temporary directory, kept alive for the store's
+/// lifetime.
+pub(crate) fn test_store() -> (tempfile::TempDir, std::sync::Arc<synch_store::Store>) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).expect("a store"));
+    (dir, store)
+}
+
 /// The directly bound address of an endpoint, which is all a loopback dial
 /// needs.
 pub(crate) fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {

@@ -862,20 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_ranges_normalize() {
-        let r = ChunkRanges::from_ranges([
-            GroupRange::new(5, 8),
-            GroupRange::new(0, 3),
-            GroupRange::new(3, 4),
-            GroupRange::new(9, 9),
-        ]);
-        assert_eq!(r.ranges, vec![GroupRange::new(0, 4), GroupRange::new(5, 8)]);
-        assert_eq!(r.count(), 7);
-        assert!(r.contains(0));
-        assert!(!r.contains(4));
-    }
-
-    #[test]
     fn chunk_ranges_take_bounds_a_window() {
         let r = ChunkRanges::from_ranges([GroupRange::new(0, 4), GroupRange::new(10, 20)]);
         assert_eq!(r.take(0), ChunkRanges::empty());
@@ -891,7 +877,19 @@ mod tests {
     }
 
     #[test]
-    fn chunk_ranges_set_ops() {
+    fn chunk_ranges_normalize_and_set_ops() {
+        // Normalization: unsorted and inverted input is sorted and merged.
+        let r = ChunkRanges::from_ranges([
+            GroupRange::new(5, 8),
+            GroupRange::new(0, 3),
+            GroupRange::new(3, 4),
+            GroupRange::new(9, 9),
+        ]);
+        assert_eq!(r.ranges, vec![GroupRange::new(0, 4), GroupRange::new(5, 8)]);
+        assert_eq!(r.count(), 7);
+        assert!(r.contains(0));
+        assert!(!r.contains(4));
+
         let a = ChunkRanges::from_ranges([GroupRange::new(0, 10)]);
         let b = ChunkRanges::from_ranges([GroupRange::new(3, 5), GroupRange::new(8, 20)]);
         assert_eq!(
@@ -946,85 +944,61 @@ mod bounded_decode_tests {
     /// `Serde Deserialization Error`, so the assertion is that decoding fails
     /// at all; the at-cap control below says the failure is the cap and not
     /// the encoding.
-    fn refuses_past(bytes: &[u8]) {
+    fn refuses(msg: &MptMessage) {
         assert!(
-            postcard::from_bytes::<MptMessage>(bytes).is_err(),
+            postcard::from_bytes::<MptMessage>(&postcard::to_stdvec(msg).unwrap()).is_err(),
             "a sequence past its cap must not decode"
         );
     }
 
     #[test]
-    fn a_heads_summary_list_past_the_cap_is_refused_while_decoding() {
-        // The at-cap control: the failure above is the cap, not the encoding.
-        let wants: Vec<(Vec<u8>, Hash)> = (0..MAX_BATCH)
-            .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
-            .collect();
-        let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
-            root: Hash([0u8; 32]),
-            wants: wants.clone(),
-        })
-        .unwrap();
-        let decoded: MptMessage = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded,
-            MptMessage::GetNodes {
-                root: Hash([0u8; 32]),
-                wants
-            }
-        );
-
-        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
-            .map(|i| HeadSummary {
-                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-                seq: i as u64,
-                root: Hash([0u8; 32]),
-                complete: false,
-            })
-            .collect();
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::Hello {
-                proto: 1,
-                heads,
-                scope: None,
-            })
-            .unwrap(),
-        );
-
-        // The same mechanism on the other capped batch fields.
+    fn a_sequence_past_its_cap_is_refused_while_decoding() {
         let wants = |n: usize| -> Vec<(Vec<u8>, Hash)> {
             (0..n)
                 .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
                 .collect()
         };
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::GetNodes {
-                root: Hash([0u8; 32]),
-                wants: wants(MAX_BATCH + 1),
-            })
-            .unwrap(),
-        );
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::GetValues {
-                root: Hash([0u8; 32]),
-                wants: wants(MAX_BATCH + 1),
-            })
-            .unwrap(),
+        let origin = || OriginId::Key(iroh_base::SecretKey::generate().public());
+
+        // The at-cap control: a batch at exactly MAX_BATCH decodes, so the
+        // failures below are the caps and not the encoding.
+        let at_cap = MptMessage::GetNodes {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH),
+        };
+        assert_eq!(
+            postcard::from_bytes::<MptMessage>(&postcard::to_stdvec(&at_cap).unwrap()).unwrap(),
+            at_cap
         );
 
-        let keys = vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1];
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::BindingsFor {
-                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-                keys,
+        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
+            .map(|i| HeadSummary {
+                origin: origin(),
+                seq: i as u64,
+                root: Hash([0u8; 32]),
+                complete: false,
             })
-            .unwrap(),
-        );
-
-        // Provider hints are capped at MAX_PROVIDER_ADS the same way.
-        let origin = OriginId::Key(iroh_base::SecretKey::generate().public());
-        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
-            .map(|i| (origin.clone(), BlobAd::complete(i as u64)))
             .collect();
-        refuses_past(&postcard::to_stdvec(&MptMessage::Providers { ads }).unwrap());
+        refuses(&MptMessage::Hello {
+            proto: 1,
+            heads,
+            scope: None,
+        });
+        refuses(&MptMessage::GetNodes {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        });
+        refuses(&MptMessage::GetValues {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        });
+        refuses(&MptMessage::BindingsFor {
+            origin: origin(),
+            keys: vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1],
+        });
+        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
+            .map(|i| (origin(), BlobAd::complete(i as u64)))
+            .collect();
+        refuses(&MptMessage::Providers { ads });
     }
 }

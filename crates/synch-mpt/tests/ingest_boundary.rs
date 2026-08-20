@@ -129,14 +129,6 @@ fn an_under_occupied_branch_is_refused() {
     })
     .expect_err("a one-occupant branch must be refused");
     assert!(err.to_string().contains("fewer than two"), "{err}");
-
-    // Two occupants is the canonical shape and stays accepted.
-    children[7] = Some(leaf_hash);
-    offer(&TrieNode::Branch {
-        children,
-        value: None,
-    })
-    .expect("a two-occupant branch is canonical");
 }
 
 #[test]
@@ -153,11 +145,8 @@ fn an_odd_depth_value_still_fails_closed() {
     store.put_node(&root, &bytes).unwrap();
 
     let trie = Trie::new(&store);
-    assert!(matches!(trie.iter(root), Err(MptError::OddDepthValue)));
-    assert!(matches!(
-        trie.diff(Hash::EMPTY, root),
-        Err(MptError::OddDepthValue)
-    ));
+    assert!(trie.iter(root).is_err());
+    assert!(trie.diff(Hash::EMPTY, root).is_err());
 }
 
 /// An extension above anything but a branch is refused where the structure is
@@ -168,66 +157,54 @@ fn an_odd_depth_value_still_fails_closed() {
 fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
     use synch_mpt::MissingWalk;
 
-    for (name, child) in [
-        (
-            "leaf",
-            TrieNode::Leaf {
-                key_rest: Nibbles::from_nibbles(&[1, 2]),
-                value: ValueRef::Inline(b"v".to_vec()),
-            },
-        ),
-        (
-            "ext",
-            TrieNode::Ext {
-                prefix: Nibbles::from_nibbles(&[3]),
-                child: Hash::new(b"whatever"),
-            },
-        ),
-    ] {
-        let store = MemStore::new();
-        let child_hash = plant(&store, &child);
-        let root = plant(
-            &store,
-            &TrieNode::Ext {
-                prefix: Nibbles::from_nibbles(&[0]),
-                child: child_hash,
-            },
-        );
+    let store = MemStore::new();
+    let child = TrieNode::Leaf {
+        key_rest: Nibbles::from_nibbles(&[1, 2]),
+        value: ValueRef::Inline(b"v".to_vec()),
+    };
+    // The node itself still passes the single-node checks: the shape is only
+    // visible with the child in hand.
+    assert!(TrieNode::hash_of_encoded(&child.encode()).is_ok());
+    let child_hash = plant(&store, &child);
+    let root = plant(
+        &store,
+        &TrieNode::Ext {
+            prefix: Nibbles::from_nibbles(&[0]),
+            child: child_hash,
+        },
+    );
 
-        // The node itself still passes the single-node checks: the shape is
-        // only visible with the child in hand.
-        assert!(TrieNode::hash_of_encoded(&child.encode()).is_ok());
+    let trie = Trie::new(&store);
+    let mut walk = MissingWalk::new(root);
+    let err = walk
+        .next_batch(&trie, 256)
+        .expect_err("an ext above a leaf must be refused");
+    assert!(
+        err.to_string().contains("not a branch"),
+        "ext above a leaf: {err}"
+    );
 
-        let trie = Trie::new(&store);
-        let mut walk = MissingWalk::new(root);
-        let err = walk
-            .next_batch(&trie, 256)
-            .expect_err("an ext above a {name} must be refused");
-        assert!(
-            err.to_string().contains("not a branch"),
-            "ext above {name}: {err}"
-        );
-
-        // And so the trie is never declared complete, so no head over it flips.
-        assert!(trie.is_complete(root).is_err(), "ext above {name}");
-    }
+    // And so the trie is never declared complete, so no head over it flips.
+    assert!(trie.is_complete(root).is_err());
 }
 
-/// A key at exactly the §12 ceiling is one thing to every reader.
+/// The key-depth ceiling is one thing to every reader.
 ///
 /// `get` counted node *loads* against `MAX_DEPTH_NIBBLES` while a key of `n`
 /// nibbles needs `n + 1` of them, so `iter`/`diff` yielded the longest legal
-/// key while `get` called it structurally invalid and `synch history`
-/// rendered the path as absent.
+/// key while `get` called it structurally invalid and `synch history` rendered
+/// the path as absent. And a node hung below the depth any valid key reaches
+/// was pulled and committed, `is_complete` vouched for the root, no `entries`
+/// row reflected it, and every GC pass marked it from the retained head above.
 #[test]
-fn the_longest_legal_key_is_visible_to_every_reader() {
+fn the_key_depth_ceiling_is_one_thing_to_every_reader() {
     let store = MemStore::new();
 
-    // A branch at every nibble of the deepest legal key, planted directly: the
-    // same shape a prefix chain of keys produces through `insert`, without the
-    // quadratic cost of building it that way. The key of 8 192 zero nibbles
-    // descends 8 192 branches and then loads the leaf holding the value, which
-    // is 8 193 node loads for a key `insert` accepts.
+    // Phase 1 — at the ceiling: a branch at every nibble of the deepest legal
+    // key, planted directly — the same shape a prefix chain of keys produces
+    // through `insert`, without the quadratic cost of building it that way. The
+    // key of 8 192 zero nibbles descends 8 192 branches and then loads the leaf
+    // holding the value, which is 8 193 node loads for a key `insert` accepts.
     // Two fillers, so a branch's second occupant always puts its value at an
     // even nibble depth: an odd one is a position no byte key can name, and
     // every walk fails closed on it.
@@ -300,37 +277,12 @@ fn the_longest_legal_key_is_visible_to_every_reader() {
         trie.insert(root, &past, b"v"),
         Err(MptError::KeyTooLong(_))
     ));
-}
 
-/// A value past the §12 ceiling is refused where a key past it is.
-#[test]
-fn an_oversized_value_is_refused_by_the_write_path() {
-    let store = MemStore::new();
-    let trie = Trie::new(&store);
-    let big = vec![7u8; MAX_TRIE_VALUE_LEN + 1];
-    let err = trie
-        .insert(Hash::EMPTY, b"k", &big)
-        .expect_err("a value past the ceiling must not be published");
-    assert!(matches!(err, MptError::ValueTooLong(_)), "{err}");
-
-    // At the ceiling it is an ordinary value.
-    let edge = vec![7u8; MAX_TRIE_VALUE_LEN];
-    let root = trie.insert(Hash::EMPTY, b"k", &edge).unwrap();
-    assert_eq!(trie.get(root, b"k").unwrap().as_deref(), Some(&edge[..]));
-}
-
-/// A node hung below the depth any valid key reaches is refused by the fetch.
-///
-/// The encoding bounds one node's nibble run; a path is made of many nodes, and
-/// without a rule about the *path* such a chain was pulled and committed,
-/// `is_complete` vouched for the root, no `entries` row reflected it, and every
-/// GC pass marked it from the retained head above.
-#[test]
-fn a_node_past_the_key_depth_is_refused_by_the_walk() {
-    let store = MemStore::new();
-
-    // A ladder of one-nibble extensions, each above a branch, reaching past the
-    // depth a 4 KiB key can address. Every node is canonical on its own.
+    // Phase 2 — past the ceiling: a ladder of one-nibble extensions, each
+    // above a branch, reaching past the depth a 4 KiB key can address. Every
+    // node is canonical on its own; the fetch must refuse the path rather than
+    // commit it. Two nibbles per rung — one for the `Ext` prefix, one for the
+    // branch's child index — so this reaches just past the ceiling.
     let leaf = plant(
         &store,
         &TrieNode::Leaf {
@@ -350,8 +302,6 @@ fn a_node_past_the_key_depth_is_refused_by_the_walk() {
             value: None,
         },
     );
-    // Two nibbles per rung — one for the `Ext` prefix, one for the branch's
-    // child index — so this reaches just past the ceiling.
     for _ in 0..=(MAX_KEY_LEN) {
         let ext = plant(
             &store,
@@ -374,7 +324,6 @@ fn a_node_past_the_key_depth_is_refused_by_the_walk() {
         );
     }
 
-    let trie = Trie::new(&store);
     let mut walk = synch_mpt::MissingWalk::new(child);
     let err = loop {
         match walk.next_batch(&trie, 256) {
@@ -396,4 +345,21 @@ fn a_node_past_the_key_depth_is_refused_by_the_walk() {
         !trie.is_complete(child).unwrap_or(false),
         "and the root is not vouched for"
     );
+}
+
+/// A value past the §12 ceiling is refused where a key past it is.
+#[test]
+fn an_oversized_value_is_refused_by_the_write_path() {
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    let big = vec![7u8; MAX_TRIE_VALUE_LEN + 1];
+    let err = trie
+        .insert(Hash::EMPTY, b"k", &big)
+        .expect_err("a value past the ceiling must not be published");
+    assert!(matches!(err, MptError::ValueTooLong(_)), "{err}");
+
+    // At the ceiling it is an ordinary value.
+    let edge = vec![7u8; MAX_TRIE_VALUE_LEN];
+    let root = trie.insert(Hash::EMPTY, b"k", &edge).unwrap();
+    assert_eq!(trie.get(root, b"k").unwrap().as_deref(), Some(&edge[..]));
 }

@@ -406,6 +406,9 @@ mod tests {
             root = t.insert(root, &[i], b"v").unwrap();
         }
 
+        // Nothing changed is nothing reported, however the walk is invoked.
+        assert!(t.diff(Hash::EMPTY, Hash::EMPTY).unwrap().is_empty());
+
         let mut seen = 0usize;
         let stopped: Result<usize, MptError> =
             t.for_each_resolved_change(Hash::EMPTY, root, |_change| {
@@ -416,7 +419,9 @@ mod tests {
         assert_eq!(seen, 1, "the walk stopped at the first refusal");
 
         // And a caller that takes everything sees every change exactly once,
-        // with only the new side resolved.
+        // with only the new side resolved; the same set, sorted, is what
+        // `diff` returns (the classification is asserted by the
+        // `diff_completeness` property test).
         let mut keys = Vec::new();
         let count: usize = t
             .for_each_resolved_change(Hash::EMPTY, root, |change| {
@@ -427,37 +432,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 64);
-        keys.sort();
-        keys.dedup();
-        assert_eq!(keys.len(), 64);
-    }
-
-    #[test]
-    fn diff_reports_add_change_delete() {
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        assert!(t.diff(Hash::EMPTY, Hash::EMPTY).unwrap().is_empty());
-
-        let mut a = Hash::EMPTY;
-        a = t.insert(a, b"keep", b"same").unwrap();
-        a = t.insert(a, b"edit", b"before").unwrap();
-        a = t.insert(a, b"gone", b"bye").unwrap();
-
-        let mut b = a;
-        b = t.insert(b, b"edit", b"after").unwrap();
-        b = t.remove(b, b"gone").unwrap();
-        b = t.insert(b, b"new", b"hello").unwrap();
-
-        assert!(t.diff(a, a).unwrap().is_empty());
-        let changes = t.diff_resolved(a, b).unwrap();
-        assert_eq!(changes.len(), 3);
-        assert_eq!(changes[0].key, b"edit".to_vec());
-        assert_eq!(changes[0].kind(), ChangeKind::Changed);
-        assert_eq!(changes[0].old.as_deref(), Some(b"before".as_slice()));
-        assert_eq!(changes[0].new.as_deref(), Some(b"after".as_slice()));
-        assert_eq!(changes[1].key, b"gone".to_vec());
-        assert_eq!(changes[1].kind(), ChangeKind::Deleted);
-        assert_eq!(changes[2].key, b"new".to_vec());
-        assert_eq!(changes[2].kind(), ChangeKind::Added);
+        let changes = t.diff(Hash::EMPTY, root).unwrap();
+        assert_eq!(changes.len(), 64);
+        assert!(changes.windows(2).all(|w| w[0].key <= w[1].key));
     }
 }

@@ -257,13 +257,12 @@ mod tests {
     /// indexing 2 000 small files, and proportional to the tree from there.
     #[test]
     fn reads_are_not_change_hints_but_writes_are() {
+        // One literal per decision in the classifier: every non-`Close(Write)`
+        // access variant is read-shaped, and a scan's own reads must not
+        // rescan; a plain read and the read half of a close pin that arm.
         for read in [
             EventKind::Access(AccessKind::Read),
-            EventKind::Access(AccessKind::Open(AccessMode::Read)),
-            EventKind::Access(AccessKind::Open(AccessMode::Any)),
             EventKind::Access(AccessKind::Close(AccessMode::Read)),
-            EventKind::Access(AccessKind::Any),
-            EventKind::Access(AccessKind::Other),
         ] {
             assert!(!changes_something(&event(read)), "{read:?}");
         }
@@ -276,7 +275,6 @@ mod tests {
             EventKind::Access(AccessKind::Close(AccessMode::Write)),
             // Unclassifiable: hint, and let the scan decide.
             EventKind::Any,
-            EventKind::Other,
         ] {
             assert!(changes_something(&event(change)), "{change:?}");
         }

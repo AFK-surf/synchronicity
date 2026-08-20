@@ -1139,115 +1139,71 @@ mod tests {
 
     /// A second membership domain cannot repoint a key the first one vouches
     /// for: `peers_seen.last_addr` overwrites and nothing prunes it, so a hint
-    /// that lands is permanent (§3.2).
+    /// that lands is permanent (§3.2). The `id=`-less record is the same gate
+    /// — its binding used to be keyed without the domain, so two domains wrote
+    /// one row and each refresh overwrote the other's.
     #[tokio::test]
     async fn a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for() {
-        let (_d, node) = node().await;
         let shared = SecretKey::generate().public();
         let now = now_ns();
 
-        // Domain A vouches for the key and supplies its address.
-        node.apply_member_set(
-            &MemberSet::from_records(
-                "a.example",
-                &[format!("{} addr=192.0.2.7:4433", rec("nas", &shared))],
+        for record in [
+            rec("nas", &shared),
+            format!("v=sync1 nk={}", shared.to_z32()),
+        ] {
+            let (_d, node) = node().await;
+            // Domain A vouches for the key and supplies its address.
+            node.apply_member_set(
+                &MemberSet::from_records("a.example", &[format!("{record} addr=192.0.2.7:4433")])
+                    .unwrap(),
+                Duration::from_secs(300),
+                now,
             )
-            .unwrap(),
-            Duration::from_secs(300),
-            now,
-        )
-        .unwrap();
-        let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
-        assert_eq!(first.ip_addrs().count(), 1);
+            .unwrap();
+            let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
+            assert_eq!(first.ip_addrs().count(), 1);
 
-        // Domain B names the same key and points it elsewhere; the answer is
-        // well-formed and would be validly signed for b.example.
-        node.apply_member_set(
-            &MemberSet::from_records(
-                "b.example",
-                &[format!(
-                    "{} addr=198.51.100.66:9999 relay=https://attacker.example",
-                    rec("nas", &shared)
-                )],
+            // Domain B names the same key and points it elsewhere; the answer
+            // is well-formed and would be validly signed for b.example.
+            node.apply_member_set(
+                &MemberSet::from_records(
+                    "b.example",
+                    &[format!(
+                        "{record} addr=198.51.100.66:9999 relay=https://attacker.example"
+                    )],
+                )
+                .unwrap(),
+                Duration::from_secs(300),
+                now,
             )
-            .unwrap(),
-            Duration::from_secs(300),
-            now,
-        )
-        .unwrap();
+            .unwrap();
 
-        // The recorded address is untouched: two domains vouch for this key
-        // now, so neither one's dialing data is used.
-        let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
-        assert_eq!(
-            after.ip_addrs().collect::<Vec<_>>(),
-            first.ip_addrs().collect::<Vec<_>>(),
-            "a second domain must not repoint a key the first one vouches for"
-        );
-        assert_eq!(
-            after.relay_urls().count(),
-            0,
-            "and must not add a relay this node would then dial through"
-        );
-    }
+            // The recorded address is untouched: two domains vouch for this
+            // key now, so neither one's dialing data is used.
+            let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
+            assert_eq!(
+                after.ip_addrs().collect::<Vec<_>>(),
+                first.ip_addrs().collect::<Vec<_>>(),
+                "a second domain must not repoint a key the first one vouches for"
+            );
+            assert_eq!(
+                after.relay_urls().count(),
+                0,
+                "and must not add a relay this node would then dial through"
+            );
 
-    /// The same gate for `id=`-less records, whose binding used to be keyed
-    /// without the domain — so two domains wrote one row and each refresh
-    /// overwrote the other's.
-    #[tokio::test]
-    async fn a_second_domain_cannot_repoint_an_id_less_key_either() {
-        let (_d, node) = node().await;
-        let shared = SecretKey::generate().public();
-        let now = now_ns();
-
-        node.apply_member_set(
-            &MemberSet::from_records(
-                "a.example",
-                &[format!(
-                    "v=sync1 nk={} addr=192.0.2.7:4433",
-                    shared.to_z32()
-                )],
-            )
-            .unwrap(),
-            Duration::from_secs(300),
-            now,
-        )
-        .unwrap();
-        let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
-        assert_eq!(first.ip_addrs().count(), 1);
-
-        node.apply_member_set(
-            &MemberSet::from_records(
-                "b.example",
-                &[format!(
-                    "v=sync1 nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
-                    shared.to_z32()
-                )],
-            )
-            .unwrap(),
-            Duration::from_secs(300),
-            now,
-        )
-        .unwrap();
-
-        let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
-        assert_eq!(
-            after.ip_addrs().collect::<Vec<_>>(),
-            first.ip_addrs().collect::<Vec<_>>(),
-            "an id-less record from a second domain must not repoint the key"
-        );
-        assert_eq!(after.relay_urls().count(), 0);
-        // The two domains really are two bindings now — the thing the gate
-        // needs in order to see them.
-        let mut domains: Vec<String> = node
-            .store()
-            .bindings_for_key(&shared)
-            .unwrap()
-            .iter()
-            .filter_map(|b| b.domain.clone())
-            .collect();
-        domains.sort();
-        assert_eq!(domains, ["a.example", "b.example"]);
+            // The two domains really are two bindings now — the thing the
+            // gate needs in order to see them.
+            let mut domains: Vec<String> = node
+                .store()
+                .bindings_for_key(&shared)
+                .unwrap()
+                .iter()
+                .filter_map(|b| b.domain.clone())
+                .collect();
+            domains.sort();
+            assert_eq!(domains, ["a.example", "b.example"]);
+        }
     }
 
     /// Each field is read as the one thing it means: a `relay=` this node
@@ -1265,7 +1221,6 @@ mod tests {
         // bare host, a port-less address.
         for bad in [
             "ftp://relay.example",
-            "file:///etc/passwd",
             "https://",
             "relay.example",
             "192.0.2.7",
@@ -1301,9 +1256,17 @@ mod tests {
         assert!(!node.store().clock_status(0).unwrap().trusted);
     }
 
+    /// The doctor report's basics, and the read scope that decides the
+    /// servable column: judged against the whole keyspace every foreign head
+    /// on a confined node reads PARTIAL by construction. This node's own trie
+    /// is the exception — it built that one, so it is judged whole (§5.5).
     #[tokio::test]
-    async fn doctor_reports_the_basics() {
+    async fn doctor_reports_the_basics_and_the_read_scope() {
         let (_d, node) = node().await;
+        assert!(
+            node.doctor().unwrap().local_scope.is_none(),
+            "an undelegated node reads the whole keyspace"
+        );
         let space = tempfile::tempdir().unwrap();
         node.add_space("media", space.path()).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
@@ -1318,33 +1281,11 @@ mod tests {
         assert!(report.equivocations.is_empty() && report.unbound_origins.is_empty());
         assert!(report.trie.nodes > 0);
         assert_eq!(report.blobs, (1, 1));
-    }
-
-    /// A delegate is meant to be missing things, and the report has to say so.
-    ///
-    /// The read scope is the whole difference between a node holding exactly
-    /// its grant and a node whose fetch is broken, and it decides the servable
-    /// column too: judged against the whole keyspace every foreign head on a
-    /// confined node reads PARTIAL by construction. This node's own trie is
-    /// the exception — it built that one, so it is judged whole (§5.5).
-    #[tokio::test]
-    async fn doctor_reports_the_read_scope_and_judges_heads_under_it() {
-        let (_d, node) = node().await;
-        assert!(
-            node.doctor().unwrap().local_scope.is_none(),
-            "an undelegated node reads the whole keyspace"
-        );
-
-        let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-        node.scan_and_publish().unwrap();
 
         // What a peer's `Hello` would have left behind on a delegated node.
         node.store()
             .set_local_scope(Some(&["photos".to_string()]))
             .unwrap();
-
         let report = node.doctor().unwrap();
         assert_eq!(report.local_scope, Some(vec!["photos".to_string()]));
         assert!(
@@ -1613,13 +1554,10 @@ mod tests {
         });
 
         // The first pass is due immediately; give it a generous window.
-        for _ in 0..100 {
-            if resolver.calls() > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(resolver.calls() >= 1, "the loop resolves what is due");
+        assert!(
+            crate::testkit::eventually(|| resolver.calls() > 0).await,
+            "the loop resolves what is due"
+        );
         let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
 

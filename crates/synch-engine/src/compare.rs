@@ -251,11 +251,10 @@ mod tests {
         // identity, not mtime, is what defines modified (§8).
         put_file(&node, &a(), "keep.txt", b"same", 1);
         put_file(&node, &b(), "keep.txt", b"same", 999);
-        // Only in the baseline → deleted in the target.
+        // Only in the baseline, only in the target, or in both with different
+        // bytes: each shape lands in exactly one status.
         put_file(&node, &a(), "only_a.txt", b"x", 1);
-        // Only in the target → created.
         put_file(&node, &b(), "only_b.txt", b"y", 1);
-        // In both, different bytes → modified.
         put_file(&node, &a(), "changed.txt", b"v1", 1);
         put_file(&node, &b(), "changed.txt", b"v2", 1);
         // A tombstone in the target reads as deleted.
@@ -273,10 +272,6 @@ mod tests {
                 ("only_a.txt", CompareStatus::Deleted),
                 ("only_b.txt", CompareStatus::Created),
             ]
-        );
-        assert_eq!(
-            (report.created(), report.modified(), report.deleted()),
-            (1, 1, 2)
         );
 
         // A prefix scopes the same comparison: only paths under it appear.

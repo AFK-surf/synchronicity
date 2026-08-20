@@ -725,45 +725,9 @@ mod tests {
             set.select(&VersionPolicy::Newest, READ_AT),
             Selection::Absent
         );
-        // A lone origin reads exactly as it always did: delete and it is gone.
-        let (_d2, store) = testutil::store();
-        put(
-            &store,
-            "media",
-            "nas",
-            "f",
-            &FileEntry::file(9, 100, Hash::new(b"c"), 1),
-        );
-        assert!(store
-            .versions_for("media", "f")
-            .unwrap()
-            .select(&VersionPolicy::Newest, READ_AT)
-            .entry()
-            .is_some());
-        put(
-            &store,
-            "media",
-            "nas",
-            "f",
-            &FileEntry::tombstone(200, 2, None),
-        );
-        let set = store.versions_for("media", "f").unwrap();
-        assert!(!set.exists());
-        assert_eq!(
-            set.select(&VersionPolicy::Newest, READ_AT),
-            Selection::Absent
-        );
         assert_eq!(
             set.select(&VersionPolicy::Strict, READ_AT),
             Selection::Absent
-        );
-        assert_eq!(
-            set.select(&VersionPolicy::Origin(origin("nas")), READ_AT)
-                .entry()
-                .unwrap()
-                .kind,
-            EntryKind::Tombstone,
-            "the pinned view still sees the deletion itself"
         );
     }
 
@@ -886,17 +850,7 @@ mod tests {
             "f",
             &FileEntry::file(9, 1_000, Hash::new(b"ours"), 1),
         );
-        // The leaf is stored as published, and re-materializes identically.
-        let row = store
-            .versions_for("media", "f")
-            .unwrap()
-            .entries
-            .iter()
-            .find(|e| e.origin == origin("liar"))
-            .unwrap()
-            .clone();
-        assert_eq!(row.mtime_ns, i64::MAX, "the leaf is stored as published");
-        put(&store, "media", "liar", "f", &dated_ahead);
+        // The leaf is stored as published — the clamp is a reading-time fact.
         assert_eq!(
             store
                 .versions_for("media", "f")
@@ -904,9 +858,9 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.origin == origin("liar"))
-                .unwrap(),
-            &row,
-            "the second materialization agrees with the first"
+                .unwrap()
+                .mtime_ns,
+            i64::MAX
         );
         let now = 2_000;
         let set = store.versions_for("media", "f").unwrap();

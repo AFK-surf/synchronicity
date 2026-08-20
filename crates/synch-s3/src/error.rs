@@ -333,21 +333,15 @@ mod tests {
 
     #[test]
     fn multipart_codes_are_distinct() {
-        assert_eq!(S3Error::invalid_part("no part 3").code, "InvalidPart");
-        assert_eq!(S3Error::invalid_part_order().code, "InvalidPartOrder");
-        assert_eq!(
-            S3Error::entity_too_small("too small").code,
-            "EntityTooSmall"
-        );
-        assert_eq!(S3Error::malformed_xml("bad").code, "MalformedXML");
         // All four are client mistakes the client can fix, so all four are 400.
-        for e in [
-            S3Error::invalid_part("x"),
-            S3Error::invalid_part_order(),
-            S3Error::entity_too_small("x"),
-            S3Error::malformed_xml("x"),
+        for (error, code) in [
+            (S3Error::invalid_part("x"), "InvalidPart"),
+            (S3Error::invalid_part_order(), "InvalidPartOrder"),
+            (S3Error::entity_too_small("x"), "EntityTooSmall"),
+            (S3Error::malformed_xml("x"), "MalformedXML"),
         ] {
-            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{}", e.code);
+            assert_eq!(error.code, code);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{code}");
         }
     }
 }

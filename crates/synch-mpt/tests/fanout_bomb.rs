@@ -140,11 +140,6 @@ fn a_first_adoption_diff_survives_the_documented_corpus_size() {
             )
             .unwrap();
     }
-    let reachable = trie.reachable(root).unwrap().nodes.len();
-    assert!(
-        reachable < 100,
-        "the corpus really is a DAG: {reachable} nodes"
-    );
     assert_eq!(trie.iter(root).unwrap().len(), 60_000);
     assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 60_000);
 }

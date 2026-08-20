@@ -290,8 +290,6 @@ mod tests {
             .expect("a permit staged before the wait must still be seen");
     }
 
-    // ---- the publisher against a real node --------------------------------
-
     use crate::testkit::{eventually, node_with};
 
     /// A node whose batch triggers are set for a test rather than for a desk.

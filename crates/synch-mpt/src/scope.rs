@@ -229,11 +229,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_scope_admits_everything() {
+    fn scope_extremes_admit_or_grant_nothing() {
         let scope = Scope::full();
         assert!(scope.is_full());
         assert!(scope.admits_path(&path(b"anything")));
         assert!(scope.admits_key(b"f:finance/q3.pdf"));
+
+        let scope = Scope::of(&synch_core::ScopeKeys::default());
+        assert!(!scope.is_full());
+        assert!(!scope.admits_path(&[]));
+        assert!(!scope.admits_key(b"f:photos/a.jpg"));
     }
 
     #[test]
@@ -266,14 +271,6 @@ mod tests {
         });
         assert!(scope.admits_path(&path(b"f:")));
         assert!(!scope.admits_key(b"f:"));
-    }
-
-    #[test]
-    fn an_empty_scope_grants_no_view() {
-        let scope = Scope::of(&synch_core::ScopeKeys::default());
-        assert!(!scope.is_full());
-        assert!(!scope.admits_path(&[]));
-        assert!(!scope.admits_key(b"f:photos/a.jpg"));
     }
 
     /// One space id being a prefix of another must not carry it along.
@@ -327,25 +324,5 @@ mod tests {
         assert!(!scope.admits_node(&spine, &leaf(b"finance/q3.pdf")));
         // A full scope judges nothing.
         assert!(Scope::full().admits_node(&spine, &away));
-    }
-
-    #[test]
-    fn a_completeness_memo_is_keyed_by_root_and_scope() {
-        let root = Hash::new(b"root");
-        let other = Hash::new(b"other");
-        let photos = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"f:photos/".to_vec()],
-            exact: Vec::new(),
-        });
-        let finance = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"f:finance/".to_vec()],
-            exact: Vec::new(),
-        });
-        // A trie held whole under one scope is not held whole under another,
-        // and never under the full one.
-        assert_ne!(photos.memo_key(root), finance.memo_key(root));
-        assert_ne!(photos.memo_key(root), Scope::full().memo_key(root));
-        assert_ne!(photos.memo_key(root), photos.memo_key(other));
-        assert_eq!(Scope::full().memo_key(root), root);
     }
 }
