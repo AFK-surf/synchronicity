@@ -240,7 +240,16 @@ fn primary_url(role: Role) -> Result(String, String) {
 /// published it is gated on the transparency log, and on `https://` WebPKI
 /// sits on top of that rather than under it.
 fn public_url() -> Result(String, String) {
-  use url <- result.try(required("CP_PUBLIC_URL"))
+  use url <- result.try(
+    envoy.get("CP_PUBLIC_URL")
+    |> result.replace_error(
+      "CP_PUBLIC_URL is required: every published zone names this node's "
+      <> "attach endpoint at _synchronicity-cp.<base>, and a daemon signs "
+      <> "its attach proof over exactly this URL. Behind a load balancer "
+      <> "this is the node's *own* name; CP_ENTRY_URL is the balanced one "
+      <> "that links mailed to people come back to",
+    ),
+  )
   let url = trim_trailing_slash(string.trim(url))
   case is_origin(url), record_safe(url) {
     True, True -> Ok(url)

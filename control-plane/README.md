@@ -115,9 +115,10 @@ would boot, serve, and pass every other check.
   reset-on-checkout workers (one read transaction per answer).
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
 - **Replication**: primary + read-only replicas fed by external,
-  operator-owned tooling (e.g. litestream). Replicas serve DNS, and
-  optionally the dashboard, the read half of the API and the file browser
-  off the same copy. See `ops/RUNBOOK.md`.
+  operator-owned tooling (e.g. litestream). Replicas serve the dashboard,
+  the read half of the API and the file browser off the same copy, and DNS
+  too where this deployment serves its own zone. See `ops/RUNBOOK.md`, and
+  `ops/worker/` for a Cloudflare Worker that balances the entry name.
 
 ## Developing
 
@@ -132,7 +133,13 @@ just dev                # backend :8080 + vite dev server
 just e2e                # delv + the real synchronicity resolver validate
                         # a served zone end to end (needs bind9-dnsutils,
                         # rust, and the repo's crates/)
+node --test ops/worker/lb.test.mjs   # the entry-name balancer
 ```
+
+`just dev` reads the `CP_*` environment (see the table below); every node
+needs at least `CP_ROLE`, `CP_BASE_DOMAIN`, `CP_DB_PATH`, `CP_SESSION_SECRET`
+and `CP_PUBLIC_URL`, plus `CP_KEY_FILE` on a serving primary and
+`CP_PRIMARY_URL` on a replica.
 
 The e2e is the load-bearing test: `delv` must report `fully validated`
 for positive, NODATA and NXDOMAIN answers over UDP and TCP, and the

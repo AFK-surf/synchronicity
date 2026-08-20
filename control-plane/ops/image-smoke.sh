@@ -52,6 +52,9 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 # One-shot subcommand containers: same image, same volumes, same
 # environment the serving container gets.
+# CP_PUBLIC_URL here too, not only on the serving container below: every
+# published zone names this node's attach endpoint at `_synchronicity-cp`, so
+# `seed` — which publishes one — needs it exactly as `serve` does.
 run_cmd() {
   docker run --rm \
     -e CP_ROLE=primary \
@@ -59,6 +62,7 @@ run_cmd() {
     -e CP_KEY_FILE=/etc/synch-controlplane/csk.key \
     -e CP_SESSION_SECRET="image-smoke-only-session-secret-not-for-production" \
     -e CP_NS_HOSTS="ns1=192.0.2.1" \
+    -e CP_PUBLIC_URL="http://127.0.0.1:$HTTP_PORT" \
     -v "$KEYS_VOL:/etc/synch-controlplane" \
     -v "$DATA_VOL:/var/lib/synch-controlplane" \
     "$IMAGE" "$@"
