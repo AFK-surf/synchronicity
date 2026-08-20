@@ -1539,11 +1539,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::DomainSet(pb::DomainSet { domain }) => {
-            {
+            let warning = {
+                let node = node.clone();
                 let domain = domain.clone();
-                read(node, move |n| Ok(n.set_domain(&domain)?)).await?;
-            }
+                read(&node, move |n| {
+                    let warning = delegation_warning(&n);
+                    n.set_domain(&domain)?;
+                    Ok(warning)
+                })
+                .await?
+            };
             out.line(format!("membership domain is {domain}")).await?;
+            if let Some(warning) = warning {
+                out.line(warning).await?;
+            }
             // Deliberately no refresh here: this process goes on resolving the
             // zone its current name came from, and pulling bindings out of a
             // zone that has not named this node yet would leave it holding
@@ -1554,7 +1563,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::DomainClear(pb::DomainClear {}) => {
-            let dropped = read(node, move |n| Ok(n.clear_domain()?)).await?;
+            let (dropped, warning) = {
+                let node = node.clone();
+                read(&node, move |n| {
+                    let warning = delegation_warning(&n);
+                    Ok((n.clear_domain()?, warning))
+                })
+                .await?
+            };
             if !dropped {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
@@ -1567,6 +1583,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                  which is also what drops the zone's bindings",
             )
             .await?;
+            if let Some(warning) = warning {
+                out.line(warning).await?;
+            }
         }
 
         Command::DomainLs(pb::DomainLs {}) => {
@@ -2761,6 +2780,37 @@ fn policy_for(
 /// Revocation is a deletion that propagates on the ordinary push, so on a
 /// connected cluster this number never comes into it — it is the backstop for
 /// the case where the push cannot arrive.
+/// What a pending rename will cost in delegated trust, as a line to print.
+///
+/// The rename revokes what the old name vouched for (§3.5), and it happens at
+/// the next start — so this is said here, where the operator can still choose
+/// otherwise, rather than only in the log line the migration writes.
+fn delegation_warning(node: &Node) -> Option<String> {
+    let own = node.origin().clone();
+    let issued: Vec<synch_store::Binding> = node
+        .delegations()
+        .ok()?
+        .into_iter()
+        .filter(|b| b.issuer.as_ref() == Some(&own))
+        .collect();
+    match issued.len() {
+        0 => None,
+        n => Some(format!(
+            "this revokes {n} delegation{} this node issued ({}); re-issue them \
+             with `synch delegate add` once the new name is in use",
+            match n {
+                1 => "",
+                _ => "s",
+            },
+            issued
+                .iter()
+                .map(|b| b.node_id.fmt_short().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 const DEFAULT_DELEGATION_TTL: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 60 * 60);
 

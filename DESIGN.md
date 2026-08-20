@@ -509,6 +509,18 @@ years. There is no revocation state to retain and nothing to expire. Propagation
 epidemic, so a partitioned member honors a withdrawn delegation until it syncs;
 `not_after` is the hard bound on that, and it is the only job expiry has here.
 
+**Renaming an issuer revokes what it issued.** A node takes its own name from its
+membership zone (§3.1), and adopting a new one retires the origin the old name
+named — its heads, its derived views and its own binding all go. The delegations
+it issued go with them: a `d:` record lives only in the trie of the origin that
+published it, so the record is gone from what the node publishes, and the row it
+materialized into is deleted rather than left pointing at an origin nobody holds.
+Vouching is something an *origin* does, and the origin that vouched has ceased to
+exist; re-vouching under the new name is a deliberate act, not something a rename
+should perform on an operator's behalf. `synch domain set` and `synch domain
+clear` say how many delegations the pending rename will revoke, because the rename
+lands at the next start and that is while there is still a choice.
+
 **Derived trust cannot outlive its source.** A delegated binding is live only while
 the issuing origin's own rooted binding is live, evaluated on read rather than
 stamped on write — so `synch trust rm nas` and `nas`'s TXT record lapsing each cut

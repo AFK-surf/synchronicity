@@ -306,6 +306,31 @@ impl Node {
             txn.delete_dns_bindings_other_than(&domain)?;
             if let Some(previous) = &previous {
                 txn.remove_binding(previous, &node_id, BindingSource::Static)?;
+                // A rename revokes what the old name vouched for (§3.5). The
+                // cascade already stops honoring these the moment the previous
+                // origin's own binding goes, one line above — so the choice
+                // here is not whether trust ends but whether the rows that
+                // recorded it are left behind, pointing at an origin that no
+                // longer exists and that nothing will ever publish a delta for.
+                //
+                // Said out loud, because it is the one consequence of a rename
+                // an operator does not go looking for: the files come back
+                // under the new name and the delegates simply stop.
+                let revoked = txn.delete_delegations_by(previous)?;
+                if !revoked.is_empty() {
+                    tracing::warn!(
+                        previous = %previous,
+                        adopted = %adopted,
+                        count = revoked.len(),
+                        subjects = revoked
+                            .iter()
+                            .map(|k| k.fmt_short().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        "adopting a new name revoked the delegations the old one had issued; \
+                         re-issue them with `synch delegate add` if they are still wanted"
+                    );
+                }
                 // Drop the old name's view so the unified tree does not keep a
                 // second copy of every path under it.
                 txn.clear_head(previous, Slot::Complete)?;
@@ -1497,6 +1522,61 @@ mod tests {
         assert_eq!(history[0].previous, Some(previous));
         assert_eq!(history[0].adopted, named);
         assert_eq!(history[0].domain, "cluster.example");
+    }
+
+    /// A rename revokes what the old name vouched for, and leaves nothing
+    /// behind pointing at it (§3.5).
+    ///
+    /// The cascade would already stop honoring these — the previous origin's
+    /// own binding goes in the same transaction — so what this pins is the
+    /// second half: the rows are *gone*, not left as debris naming an origin
+    /// that no longer exists and that will never publish a delta to remove
+    /// them. `d:` records live only in the trie, and the trie of the old name
+    /// is dropped here, so nothing else ever would.
+    #[tokio::test]
+    async fn adopting_a_name_revokes_the_delegations_the_old_name_issued() {
+        let dir = node_dir();
+        let named = OriginId::named("nas", "cluster.example").unwrap();
+        let report = Node::init(dir.path(), None).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+
+        let subject = {
+            let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+            let subject = iroh_base::SecretKey::generate().public();
+            let change = node
+                .delegate_add(
+                    subject,
+                    &["photos".to_string()],
+                    now_ns() + 86_400_000_000_000,
+                    None,
+                )
+                .unwrap();
+            node.publish(&[change]).unwrap().unwrap();
+            assert!(store.is_trusted_key(&subject, now_ns()).unwrap());
+            assert_eq!(store.all_delegations().unwrap().len(), 1);
+            node.shutdown().await.unwrap();
+            subject
+        };
+        let previous = store.self_origin().unwrap().unwrap();
+
+        Node::migrate_identity(
+            &store,
+            Some(&previous),
+            &named,
+            report.node_id,
+            "cluster.example",
+        )
+        .unwrap();
+
+        assert!(
+            !store.is_trusted_key(&subject, now_ns()).unwrap(),
+            "the delegate is no longer admitted"
+        );
+        assert!(
+            store.all_delegations().unwrap().is_empty(),
+            "and the row went with the name that issued it, rather than \
+             lingering as a lapsed reference to an origin nobody holds"
+        );
     }
 
     /// Clearing the domain is a re-identification like any other: the device
