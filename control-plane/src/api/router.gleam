@@ -58,10 +58,9 @@ pub type Context {
     /// needs no reload signal: every checkout reopens the database file,
     /// so an atomically renamed replacement is picked up on next use.
     zone: ZoneSurface,
-    /// Where the attached daemons are, with `CP_BROWSE=on`. Absent is how
-    /// the feature is off: the routes are not mounted at all, rather than
-    /// mounted and refusing.
-    browse: Option(Browse),
+    /// Where this node's attached daemons are. Every node has a registry:
+    /// the apex names every node, and a daemon opens a tunnel to each.
+    browse: Browse,
   )
 }
 
@@ -214,11 +213,7 @@ fn auth_path(req: Request) -> String {
 /// `None` means "not one of mine", which is a different fact from a 404 —
 /// the caller decides whether the request falls through to the write table
 /// or to a refusal.
-fn read_routes(
-  req: Request,
-  reads: Reads,
-  browse: Option(Browse),
-) -> Option(Response) {
+fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
   case wisp.path_segments(req), req.method {
     ["api", "me"], Get -> Some(auth_api.me(req, reads))
     // Anonymous by the same reasoning as /api/auth/methods: the invite page
@@ -264,33 +259,25 @@ fn read_routes(
     // connection and then asks a daemon on the operator's own network. A
     // replica with daemons attached answers all of it.
     ["api", "orgs", slug, "networks", net, "browse"], Get ->
-      Some(
-        with_browse(browse, fn(browse) {
-          use live <- with_session(req, reads)
-          browse_api.status(reads, browse, live, slug, net)
-        }),
-      )
+      Some({
+        use live <- with_session(req, reads)
+        browse_api.status(reads, browse, live, slug, net)
+      })
     ["api", "orgs", slug, "networks", net, "delegations"], Get ->
-      Some(
-        with_browse(browse, fn(browse) {
-          use live <- with_session(req, reads)
-          browse_api.delegations(reads, browse, live, slug, net)
-        }),
-      )
+      Some({
+        use live <- with_session(req, reads)
+        browse_api.delegations(reads, browse, live, slug, net)
+      })
     ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
-      Some(
-        with_browse(browse, fn(browse) {
-          use live <- with_session(req, reads)
-          browse_api.ls(req, reads, browse, live, slug, net)
-        }),
-      )
+      Some({
+        use live <- with_session(req, reads)
+        browse_api.ls(req, reads, browse, live, slug, net)
+      })
     ["api", "orgs", slug, "networks", net, "browse", "stat"], Get ->
-      Some(
-        with_browse(browse, fn(browse) {
-          use live <- with_session(req, reads)
-          browse_api.stat(req, reads, browse, live, slug, net)
-        }),
-      )
+      Some({
+        use live <- with_session(req, reads)
+        browse_api.stat(req, reads, browse, live, slug, net)
+      })
 
     ["api", "orgs", slug, "devices"], Get ->
       Some({
@@ -306,11 +293,7 @@ fn read_routes(
 /// rest are gated on. Mounted on the primary alone, because a replica's
 /// database is opened read-only and every one of these would fail at the
 /// sqlite layer with a message about a file rather than about a topology.
-fn write_routes(
-  req: Request,
-  auth: AuthContext,
-  browse: Option(Browse),
-) -> Response {
+fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
   case wisp.path_segments(req), req.method {
     ["auth", "oidc", org_slug], Get -> auth_api.oidc_start(req, auth, org_slug)
     ["auth", "callback", "oidc"], Get -> auth_api.oidc_callback(req, auth)
@@ -374,11 +357,10 @@ fn write_routes(
       networks_api.unassign_device(auth, live, slug, net, dev)
     }
 
-    ["api", "orgs", slug, "networks", net, "browse", "enabled"], Put ->
-      with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth.reads)
-        browse_api.set_enabled(req, auth, browse, live, slug, net)
-      })
+    ["api", "orgs", slug, "networks", net, "browse", "enabled"], Put -> {
+      use live <- with_session(req, auth.reads)
+      browse_api.set_enabled(req, auth, browse, live, slug, net)
+    }
 
     ["api", "orgs", slug, "devices"], Post -> {
       use live <- with_session(req, auth.reads)
@@ -406,19 +388,6 @@ fn write_routes(
     }
 
     _, _ -> wisp.not_found()
-  }
-}
-
-/// The browse surface, or the 404 a deployment with `CP_BROWSE` off gives —
-/// the same answer a replica gives for the whole product API, and for the
-/// same reason: the route does not exist here.
-fn with_browse(
-  browse: Option(Browse),
-  next: fn(Browse) -> Response,
-) -> Response {
-  case browse {
-    Some(browse) -> next(browse)
-    None -> wisp.not_found()
   }
 }
 

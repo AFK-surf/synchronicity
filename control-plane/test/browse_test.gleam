@@ -62,22 +62,12 @@ fn browse_env() -> Nil {
   envoy.unset("CP_HTTP_LISTEN")
   envoy.unset("CP_DNS_LISTEN")
   envoy.unset("CP_NS_HOSTS")
-  envoy.unset("CP_BROWSE")
-  envoy.unset("CP_PUBLIC_URL")
+  envoy.set("CP_PUBLIC_URL", "https://sync.example")
   envoy.unset("CP_ENDPOINTS")
   envoy.unset("CP_PRIMARY_URL")
 }
 
 // -- the apex record ---------------------------------------------------------
-
-/// With the feature off the name does not exist at all, which is what a
-/// daemon's fail-closed discovery reads as "there is nowhere to attach".
-pub fn a_zone_without_browsing_has_no_attach_name_test() {
-  let assert Ok(rrsets) = build.build(input(""))
-  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
-  assert list.all(rrsets, fn(r) { r.owner != owner })
-  assert !list.contains(build.owners_in_order(rrsets), owner)
-}
 
 /// One record, at the apex, naming the deployment's endpoint and nothing
 /// about which network may be browsed.
@@ -139,7 +129,6 @@ pub fn the_attach_record_names_every_node_of_the_fleet_test() {
 /// The primary names the deployment; each node names only itself.
 pub fn the_endpoints_come_from_the_primarys_environment_test() {
   browse_env()
-  envoy.set("CP_BROWSE", "on")
   envoy.set("CP_PUBLIC_URL", "https://sync.example/")
   envoy.set(
     "CP_ENDPOINTS",
@@ -202,7 +191,6 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
   envoy.unset("CP_SESSION_SECRET")
   envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
   envoy.set("CP_PRIMARY_URL", "https://sync.example")
-  envoy.set("CP_BROWSE", "on")
   envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
   envoy.set("CP_ENDPOINTS", "https://ns2.sync.example")
   let assert Error(why) = config.load()
@@ -223,37 +211,33 @@ pub fn external_mode_reconciles_the_attach_record_test() {
   assert list.all(without, fn(r) { r.name != "_synchronicity-cp.sync.test" })
 }
 
-// -- the flag ----------------------------------------------------------------
+// -- the endpoints -----------------------------------------------------------
 
-pub fn browsing_is_off_unless_it_is_turned_on_test() {
+/// A node names itself, always. There is no deployment-level switch: the
+/// apex says where this base's control plane answers, and a node that
+/// answers nowhere is not a node of it. What a *network* may be browsed is
+/// the org admin's switch, which is a different question asked at the
+/// endpoint.
+pub fn a_node_always_names_its_own_endpoint_test() {
   browse_env()
   let assert Ok(cfg) = config.load()
-  assert cfg.browse == False
-  assert config.browse_endpoint() == ""
-
-  envoy.set("CP_BROWSE", "off")
-  let assert Ok(cfg) = config.load()
-  assert cfg.browse == False
-
-  envoy.set("CP_BROWSE", "on")
-  envoy.set("CP_PUBLIC_URL", "https://sync.example")
-  let assert Ok(cfg) = config.load()
-  assert cfg.browse == True
+  assert cfg.endpoints == ["https://sync.example"]
   assert config.browse_endpoint() == "https://sync.example"
   browse_env()
 }
 
 /// The record publishes the public URL and a daemon signs its proof over it,
-/// so a deployment that has not been told its own URL must not turn the
-/// feature on with a loopback default.
-pub fn browsing_needs_a_public_url_and_a_primary_test() {
+/// so a node that has not been told its own URL cannot start: a loopback
+/// default published into DNS would send every node in every network
+/// nowhere.
+pub fn a_node_needs_its_own_url_and_a_replica_needs_the_primarys_test() {
   browse_env()
-  envoy.set("CP_BROWSE", "on")
+  envoy.unset("CP_PUBLIC_URL")
   let assert Error(why) = config.load()
   assert string.contains(why, "CP_PUBLIC_URL")
 
-  // A replica may browse: the tunnel is a read, and the tables its attach
-  // resolves against are replicated.
+  // A replica offers the surface too: the tunnel is a read, and the tables
+  // its attach resolves against are replicated.
   envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
@@ -266,16 +250,10 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
 
   envoy.set("CP_PRIMARY_URL", "https://cp0.sync.example")
   let assert Ok(cfg) = config.load()
-  assert cfg.browse
   assert cfg.primary_url == "https://cp0.sync.example"
   // Its own endpoint and nobody else's: the deployment's list is the
   // primary's to publish.
   assert cfg.endpoints == ["https://ns1.sync.example"]
-
-  browse_env()
-  envoy.set("CP_BROWSE", "maybe")
-  let assert Error(why) = config.load()
-  assert string.contains(why, "must be on or off")
   browse_env()
 }
 
@@ -293,7 +271,6 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
 pub fn a_public_url_the_client_would_reject_is_refused_at_boot_test() {
   let with_url = fn(url) {
     browse_env()
-    envoy.set("CP_BROWSE", "on")
     envoy.set("CP_PUBLIC_URL", url)
     config.load()
   }

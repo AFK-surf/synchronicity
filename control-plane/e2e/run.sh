@@ -56,10 +56,9 @@ export CP_DNS_LISTEN=127.0.0.1:$DNS_PORT
 export CP_NS_HOSTS="ns1=127.0.0.1"
 export CP_PUBLIC_URL="http://127.0.0.1:$HTTP_PORT"
 export CP_SESSION_SECRET="e2e-only-session-secret-not-for-production"
-# Browsing on, and the apex naming the whole fleet: the replica below is a
-# node of this control plane, so a daemon must hold a tunnel to it too. The
-# record's shape is cross-validated by the real client in e2e/tests.
-export CP_BROWSE=on
+# The apex names the whole deployment: the replica below is a node of this
+# control plane, so a daemon must hold a tunnel to it too. The record's shape
+# is cross-validated by the real client in e2e/tests.
 export CP_ENDPOINTS="http://127.0.0.1:8054"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" | tee "$WORKDIR/keygen.out"
@@ -132,7 +131,6 @@ cp "$CP_DB_PATH" "$WORKDIR/replica.db"
 env -u CP_KEY_FILE -u CP_ENDPOINTS \
   CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
   CP_PRIMARY_URL="http://127.0.0.1:$HTTP_PORT" \
-  CP_BROWSE=on \
   CP_PUBLIC_URL=http://127.0.0.1:8054 \
   CP_HTTP_LISTEN=127.0.0.1:8054 \
   CP_DNS_LISTEN=127.0.0.1:5360 \

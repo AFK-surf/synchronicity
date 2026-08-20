@@ -15,7 +15,6 @@ import auth/session.{type Session}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
-import gleam/option.{type Option, Some}
 import gleam/result
 import store/sqlite.{Blob, Int as VInt, Text}
 import util/id
@@ -372,16 +371,16 @@ pub fn retire_key(
 /// revocation exists to close.
 pub fn revoke_key(
   ctx: AuthContext,
-  browse: Option(Browse),
+  browse: Browse,
   live: Session,
   slug: String,
   device_id: String,
   key_id: String,
 ) -> Response {
   let outcome = key_state_change(ctx, live, slug, device_id, key_id, Revoke)
-  case outcome.status, browse {
-    200, Some(browse) -> agent.drop_key(browse_api.registry(browse), key_id)
-    _, _ -> Nil
+  case outcome.status {
+    200 -> agent.drop_key(browse_api.registry(browse), key_id)
+    _ -> Nil
   }
   outcome
 }

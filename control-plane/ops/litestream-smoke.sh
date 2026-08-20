@@ -80,7 +80,6 @@ export CP_PUBLIC_URL="http://127.0.0.1:$PRIMARY_HTTP"
 # The same secret the replica gets: a replica verifies cookies the primary
 # minted, and this test is here partly to prove that it does.
 export CP_SESSION_SECRET="litestream-smoke-only-secret-not-for-production"
-export CP_BROWSE=on
 export CP_ENDPOINTS="http://127.0.0.1:$REPLICA_HTTP"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" > "$WORKDIR/keygen.out"
@@ -213,7 +212,6 @@ env -u CP_KEY_FILE -u CP_ENDPOINTS -u CP_NS_HOSTS \
   CP_ROLE=replica \
   CP_DB_PATH="$WORKDIR/replica-db/cp.db" \
   CP_PRIMARY_URL="http://127.0.0.1:$PRIMARY_HTTP" \
-  CP_BROWSE=on \
   CP_PUBLIC_URL="http://127.0.0.1:$REPLICA_HTTP" \
   CP_HTTP_LISTEN=127.0.0.1:$REPLICA_HTTP \
   CP_DNS_LISTEN=127.0.0.1:$REPLICA_DNS \

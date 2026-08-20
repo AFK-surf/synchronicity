@@ -69,8 +69,7 @@ pub type ZoneInput {
     /// told about is how a zone quietly stops covering a live key.
     rekor_shed: Int,
     /// The control-plane endpoints the apex publishes
-    /// (`_synchronicity-cp`), one record each, or empty when `CP_BROWSE` is
-    /// off and the name does not exist at all.
+    /// (`_synchronicity-cp`), one record each.
     ///
     /// A deployment fact and not a policy: it says *this base's control plane
     /// answers here*, never which network may be browsed. Which network may

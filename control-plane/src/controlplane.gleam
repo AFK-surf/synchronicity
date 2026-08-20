@@ -307,18 +307,17 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
   Ok(csk)
 }
 
-/// The browse surface a deployment offers, or `option.None` with `CP_BROWSE`
-/// off — which is how every route, the tunnel and the apex record disappear
-/// together rather than one of them being left behind.
+/// The browse surface this node offers.
+///
+/// Every node offers one: the apex names it, and a daemon opens a tunnel to
+/// each name. What a *network* may be browsed is the org admin's switch
+/// (`networks.browse_enabled`), enforced at the endpoint, where a change
+/// takes effect at once rather than a TTL away.
 fn browse_surface(
   cfg: Config,
   agents: process.Name(agent.Msg),
-) -> option.Option(browse_api.Browse) {
-  case cfg.browse {
-    True ->
-      option.Some(browse_api.Browse(agents, agent.attach_url(cfg.public_url)))
-    False -> option.None
-  }
+) -> browse_api.Browse {
+  browse_api.Browse(agents, agent.attach_url(cfg.public_url))
 }
 
 fn serve() -> Result(Nil, String) {
@@ -338,8 +337,8 @@ fn serve() -> Result(Nil, String) {
 /// the database file, so a swapped replacement is seen on the next query.
 ///
 /// It also serves the dashboard and the read half of the product API off
-/// that same copy, and with `CP_BROWSE=on` the browse surface too — daemons
-/// attach *here*, to this node's own `CP_PUBLIC_URL`,
+/// that same copy, and the browse surface too — daemons attach *here*, to
+/// this node's own `CP_PUBLIC_URL`,
 /// because the registry of attached sessions is one process's memory and a
 /// node with no tunnel of its own can answer no browse question however
 /// faithfully the database replicated. The primary lists the fleet's
@@ -392,7 +391,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // cookie the primary minted verifies here.
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
-    |> edge.handler(edge.surface(browse, dns_pool, cfg.session_secret))
+    |> edge.handler(edge.Surface(browse, dns_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -422,12 +421,9 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // attach or a browse call reaches a `cp_agents` name nothing has
   // registered yet, and the request kills its connection handler instead of
   // being answered.
-  let tree = case browse {
-    option.Some(_) -> sup.add(tree, agent.supervised(agents_name))
-    option.None -> tree
-  }
   use _ <- result.try(
     tree
+    |> sup.add(agent.supervised(agents_name))
     |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
@@ -441,10 +437,8 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     <> endpoint(cfg.http_listen)
     <> " — read-only dashboard, writes at "
     <> cfg.primary_url
-    <> case cfg.browse {
-      True -> " — attach at " <> agent.attach_url(cfg.public_url)
-      False -> ""
-    },
+    <> " — attach at "
+    <> agent.attach_url(cfg.public_url),
   )
   process.sleep_forever()
   Ok(Nil)
@@ -503,7 +497,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
-    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
+    |> edge.handler(edge.Surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -632,7 +626,7 @@ fn serve_external(
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
-    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
+    |> edge.handler(edge.Surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)

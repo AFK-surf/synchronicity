@@ -13,13 +13,10 @@ import api/browse_file
 import gleam/http.{Get}
 import gleam/http/request.{type Request as HttpRequest}
 import gleam/http/response.{type Response as HttpResponse}
-import gleam/option.{type Option, None, Some}
 import mist
 import store/pool.{type Pool}
 
-/// What the two below-wisp routes need. Absent with `CP_BROWSE` off, which is
-/// how the whole surface disappears: not a flag consulted per request, but
-/// routes that are not mounted.
+/// What the two below-wisp routes need.
 pub type Surface {
   Surface(browse: Browse, db: Pool, session_secret: String)
 }
@@ -27,11 +24,11 @@ pub type Surface {
 /// Wraps a wisp-derived handler with the routes wisp cannot serve.
 pub fn handler(
   next: fn(HttpRequest(mist.Connection)) -> HttpResponse(mist.ResponseData),
-  surface: Option(Surface),
+  surface: Surface,
 ) -> fn(HttpRequest(mist.Connection)) -> HttpResponse(mist.ResponseData) {
   fn(req: HttpRequest(mist.Connection)) {
-    case surface, request.path_segments(req), req.method {
-      Some(surface), ["agent", "v1", "attach"], Get ->
+    case request.path_segments(req), req.method {
+      ["agent", "v1", "attach"], Get ->
         agent.handle(
           req,
           agent.Attach(
@@ -40,10 +37,7 @@ pub fn handler(
             surface.browse.attach_url,
           ),
         )
-      Some(surface),
-        ["api", "orgs", slug, "networks", network, "browse", "file"],
-        Get
-      ->
+      ["api", "orgs", slug, "networks", network, "browse", "file"], Get ->
         browse_file.handle(
           req,
           surface.browse,
@@ -52,19 +46,7 @@ pub fn handler(
           slug,
           network,
         )
-      _, _, _ -> next(req)
+      _, _ -> next(req)
     }
-  }
-}
-
-/// The surface a deployment with browsing on exposes, or `None`.
-pub fn surface(
-  browse: Option(Browse),
-  db: Pool,
-  secret: String,
-) -> Option(Surface) {
-  case browse {
-    Some(browse) -> Some(Surface(browse, db, secret))
-    None -> None
   }
 }

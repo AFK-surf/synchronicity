@@ -68,13 +68,15 @@ fn harness_sized(pool_size: Int) -> Harness {
       },
       fn() { Nil },
     )
+  let agents = process.new_name("cp_agents_test_" <> id.new())
+  let assert Ok(_) = agent.start(agents)
   Harness(
     router.Context(
       "anchor",
       "ds",
       router.Writable(auth),
       router.ServingZone(serve.Serving(dns_pool, apex)),
-      None,
+      browse_api.Browse(agents, "https://cp.test/agent/v1/attach"),
     ),
     db_path,
     token,
@@ -161,74 +163,15 @@ pub fn auth_methods_lists_only_configured_test() {
   assert string.contains(both, "\"magic_link\":true")
 }
 
-/// With `CP_BROWSE` off the browse routes do not exist. Not mounted and
-/// refusing — absent, the same answer a replica gives for the whole product
-/// API, so a deployment that has not turned the feature on has no surface to
-/// have got wrong.
-pub fn browse_routes_are_absent_unless_the_feature_is_on_test() {
-  let h = harness()
-  let assert Ok(_) =
-    call_json(
-      h,
-      Post,
-      "/api/orgs",
-      json.object([
-        #("slug", json.string("acme")),
-        #("name", json.string("Acme")),
-      ]),
-    )
-    |> fn(r) {
-      case r.status {
-        200 -> Ok(Nil)
-        _ -> Error(Nil)
-      }
-    }
-  let assert Ok(_) =
-    call_json(
-      h,
-      Post,
-      "/api/orgs/acme/networks",
-      json.object([#("name", json.string("prod"))]),
-    )
-    |> fn(r) {
-      case r.status {
-        200 -> Ok(Nil)
-        _ -> Error(Nil)
-      }
-    }
-  for_each_browse_route(fn(method, path) {
-    let resp = case method {
-      Get -> call(h, authed(h, Get, path))
-      _ ->
-        call_json(h, method, path, json.object([#("enabled", json.bool(True))]))
-    }
-    assert resp.status == 404
-  })
-}
-
-/// Every route the feature adds, so a new one cannot be added without
-/// deciding what it does with the feature off.
-fn for_each_browse_route(check: fn(http.Method, String) -> Nil) -> Nil {
-  let base = "/api/orgs/acme/networks/prod/browse"
-  check(Get, base)
-  check(Get, base <> "/ls?space=media&path=")
-  check(Get, base <> "/stat?space=media&path=a.txt")
-  check(Put, base <> "/enabled")
-}
-
-/// With it on: the org's switch is off until an admin flips it, flipping it
-/// is audited, and a network nobody has attached to answers honestly rather
-/// than emptily.
+/// The org's switch is off until an admin flips it, flipping it is audited,
+/// and a network nobody has attached to answers honestly rather than emptily.
+///
+/// The deployment always offers the surface — the apex names this node and
+/// daemons dial it — so this switch is the whole of the gate, and it is the
+/// org's to hold.
 pub fn the_org_switch_gates_browsing_test() {
   let h = harness()
-  let name = process.new_name("cp_agents_test")
-  let assert Ok(_) = agent.start(name)
-  let ctx =
-    router.Context(
-      ..h.ctx,
-      browse: Some(browse_api.Browse(name, "https://cp.test/agent/v1/attach")),
-    )
-  let browsing = Harness(..h, ctx: ctx)
+  let browsing = h
   let assert Ok(_) =
     call_json(
       browsing,
@@ -1585,10 +1528,7 @@ pub fn a_read_only_node_serves_the_browse_surface_test() {
       ..h,
       ctx: router.Context(
         ..h.ctx,
-        browse: Some(browse_api.Browse(
-          name,
-          "https://ns1.cp.test/agent/v1/attach",
-        )),
+        browse: browse_api.Browse(name, "https://ns1.cp.test/agent/v1/attach"),
       ),
     )
   let assert 200 =
