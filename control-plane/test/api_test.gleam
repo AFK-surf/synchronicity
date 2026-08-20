@@ -617,6 +617,145 @@ pub fn last_owner_protected_test() {
   assert remove.status == 409
 }
 
+/// Leaving is removing your own row, and it needs only the membership being
+/// given up — a plain member who can only be let go by an admin is held, not
+/// governed. Removing somebody *else's* row still needs admin.
+pub fn member_can_leave_org_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO users VALUES ('u-member', 'm@example.com', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO users VALUES ('u-other', 'o@example.com', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO org_members VALUES
+       ((SELECT id FROM orgs WHERE slug = 'acme'), 'u-member', 'member', 0),
+       ((SELECT id FROM orgs WHERE slug = 'acme'), 'u-other', 'member', 0)",
+      [],
+    )
+  let assert Ok(#(member_token, member_live)) =
+    session.create(conn, "u-member", now_unix())
+  sqlite.close(conn)
+  let as_member = fn(method, path) {
+    simulate.request(method, path)
+    |> simulate.cookie(session.cookie_name, member_token, wisp.Signed)
+    |> simulate.header("x-csrf", member_live.csrf)
+  }
+
+  // Somebody else's row is still an administrative act...
+  let other = call(h, as_member(Delete, "/api/orgs/acme/members/u-other"))
+  assert other.status == 403
+
+  // ...their own is not, and the answer says the caller is the one who left.
+  let left = call(h, as_member(Delete, "/api/orgs/acme/members/u-member"))
+  assert left.status == 200
+  assert string.contains(simulate.read_body(left), "\"left\":true")
+
+  let conn2 = read_db(h)
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT count(*) FROM org_members WHERE user_id = 'u-member'",
+      [],
+    )
+  // Recorded as leaving, not as being removed: the actor and the subject are
+  // the same person, and the log is where that distinction survives.
+  let assert Ok([[sqlite.Int(1)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT count(*) FROM audit_log WHERE action = 'member.leave'",
+      [],
+    )
+  // The org and everyone else in it are untouched.
+  let assert Ok([[sqlite.Int(2)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM org_members", [])
+  sqlite.close(conn2)
+
+  // A former member sees the org the way a stranger does, and has nothing
+  // left to leave.
+  let stranger = call(h, as_member(Get, "/api/orgs/acme"))
+  assert stranger.status == 404
+  let again = call(h, as_member(Delete, "/api/orgs/acme/members/u-member"))
+  assert again.status == 404
+}
+
+/// The last owner is the one member who cannot leave: every path back to
+/// `owner` is owner-gated, so an org they walked out of could never be given
+/// one again. The refusal names the two ways out.
+pub fn last_owner_cannot_leave_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let stuck = call(h, authed(h, Delete, "/api/orgs/acme/members/u-admin"))
+  assert stuck.status == 409
+  assert string.contains(simulate.read_body(stuck), "transfer ownership")
+
+  // Hand the org over and the way out opens: the stepped-down admin leaves
+  // their own row like anybody else.
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO users VALUES ('u-member', 'm@example.com', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO org_members VALUES
+       ((SELECT id FROM orgs WHERE slug = 'acme'), 'u-member', 'member', 0)",
+      [],
+    )
+  sqlite.close(conn)
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/transfer",
+      json.object([#("to", json.string("u-member"))]),
+    ).status
+  let gone = call(h, authed(h, Delete, "/api/orgs/acme/members/u-admin"))
+  assert gone.status == 200
+  let conn2 = read_db(h)
+  let assert Ok([[sqlite.Text("u-member")]]) =
+    sqlite.query(conn2, "SELECT user_id FROM org_members", [])
+  sqlite.close(conn2)
+}
+
 pub fn member_role_cannot_admin_test() {
   let h = harness()
   let assert 200 =
