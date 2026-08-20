@@ -26,19 +26,9 @@ pub type GateError {
   Db(sqlite.Error)
 }
 
-/// Whether the gate is armed.
+/// Whether the gate is armed. Defaults to off.
 ///
-/// **A spelling this does not recognise is refused, not read as off.** The
-/// value is a security posture, and `CP_REKOR_REQUIRE=TRUE`, `=1`, `=yes` or
-/// a trailing space all used to leave the gate silently open — while the
-/// cosmetic `CP_BROWSE` two files away refuses anything but `on`/`off`. An
-/// operator following the phase-1 recipe in `docs/REKOR-ZONE-KEY.md` and
-/// typing `1` got the opposite of what they asked for, with nothing anywhere
-/// saying so.
-///
-/// Off remains the default, and deliberately: the rollout is phased (§7), so
-/// a control plane that has not run `rekor-publish` yet keeps serving. That is
-/// a decision about the *absent* value, not about an unreadable one.
+/// **A spelling this does not recognise is refused, not read as off.**
 pub fn required() -> Bool {
   case envoy.get(require_env) {
     Ok("true") -> True

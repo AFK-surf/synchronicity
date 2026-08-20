@@ -2229,11 +2229,6 @@ pub fn the_collected_chain_matches_the_shape_the_crossval_fixture_pins_test() {
 
 /// The gate refuses a spelling it does not recognise rather than reading it
 /// as off.
-///
-/// `CP_REKOR_REQUIRE` decides whether this service will publish device
-/// bindings under a zone key that is not on the public record. `TRUE`, `1`,
-/// `yes` and a trailing space all used to leave it silently open, while the
-/// cosmetic `CP_BROWSE` next door refuses anything but `on`/`off`.
 pub fn the_gate_refuses_a_spelling_it_does_not_recognise_test() {
   fixtures.gate_disarmed()
   assert gate.required() == False
