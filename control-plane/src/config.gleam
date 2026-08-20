@@ -441,7 +441,14 @@ pub fn browse_endpoint() -> String {
 pub fn browse_endpoints() -> List(String) {
   case browse_endpoint() {
     "" -> []
-    own -> [own, ..extra_browse_endpoints()]
+    // Deduplicated *here*, where the zone builder reads it, and not only in
+    // the boot-time validator: an RRset is a set, and RFC 4034 §6.3 has a
+    // signer remove duplicate RRs before signing. Two identical rdatas would
+    // be signed as two, and a validator that canonicalizes to one computes a
+    // different hash — an RRSIG mismatch, which is the whole zone failing
+    // closed rather than one wasted record. An operator listing their own
+    // `CP_PUBLIC_URL` in `CP_BROWSE_ENDPOINTS` is an ordinary mistake.
+    own -> list.unique([own, ..extra_browse_endpoints()])
   }
 }
 
@@ -512,11 +519,10 @@ fn validated_browse_endpoints(
       }
     }),
   )
-  // Deduplicated because the RRset is a set: two identical rdatas at one
-  // owner name are not two answers but one malformed RRset, and a daemon
-  // that read them would open the same tunnel twice.
-  let unique = list.unique(endpoints)
-  case list.length(unique) > max_browse_endpoints {
+  // `browse_endpoints` has already deduplicated, so the cap counts the
+  // records that will actually be published rather than the entries the
+  // operator typed.
+  case list.length(endpoints) > max_browse_endpoints {
     True ->
       Error(
         "CP_BROWSE_ENDPOINTS names more than "
@@ -525,7 +531,7 @@ fn validated_browse_endpoints(
         <> "every network opens a standing tunnel to each one, and the "
         <> "client refuses to open more than that many",
       )
-    False -> Ok(unique)
+    False -> Ok(endpoints)
   }
 }
 

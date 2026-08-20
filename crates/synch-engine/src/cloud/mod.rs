@@ -140,12 +140,88 @@ impl Node {
         self.cloud_slot()
             .remove(&(domain.to_string(), Some(endpoint.to_string())));
     }
+
+    /// Forgets the endpoint-less row a failed discovery round leaves — the
+    /// one that says "no validated record" for the domain as a whole.
+    ///
+    /// Its own key, because nothing else can clear it: it names no endpoint,
+    /// so the per-endpoint sweep never reaches it, and one transient resolver
+    /// failure at startup would otherwise sit above the real rows in `synch
+    /// cloud status` for the life of the daemon.
+    pub(crate) fn forget_cloud_endpoint_none(&self, domain: &str) {
+        self.cloud_slot().remove(&(domain.to_string(), None));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testkit::node;
+
+    /// Status is per endpoint, and the two kinds of row are forgotten
+    /// separately.
+    ///
+    /// A failed discovery round writes a row that names no endpoint — "this
+    /// domain has no validated record" — and the per-endpoint sweep cannot
+    /// reach it, because it is keyed by an endpoint that is not there. One
+    /// transient resolver failure at startup would otherwise leave a
+    /// permanent bogus line above the real ones in `synch cloud status`.
+    #[tokio::test]
+    async fn cloud_status_is_per_endpoint_and_forgettable() {
+        let (_d, node) = node().await;
+        node.set_cloud_status("cluster.example", None, false, Some("no record".into()));
+        node.set_cloud_status(
+            "cluster.example",
+            Some("https://cp.example".into()),
+            true,
+            None,
+        );
+        node.set_cloud_status(
+            "cluster.example",
+            Some("https://ns1.cp.example".into()),
+            false,
+            Some("refused".into()),
+        );
+        node.set_cloud_status("other.example", Some("https://cp.other".into()), true, None);
+        assert_eq!(node.cloud_status().len(), 4);
+
+        // Discovery recovers: the endpoint-less row goes, the tunnels stay.
+        node.forget_cloud_endpoint_none("cluster.example");
+        assert!(node.cloud_status().iter().all(|s| s.endpoint.is_some()));
+
+        // The zone stops naming one node: its row goes and no other does.
+        node.forget_cloud_endpoint("cluster.example", "https://ns1.cp.example");
+        let left: Vec<(String, Option<String>)> = node
+            .cloud_status()
+            .into_iter()
+            .map(|s| (s.domain, s.endpoint))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                (
+                    "cluster.example".to_string(),
+                    Some("https://cp.example".to_string())
+                ),
+                (
+                    "other.example".to_string(),
+                    Some("https://cp.other".to_string())
+                ),
+            ]
+        );
+
+        // The operator removes the domain: every one of its rows goes, and
+        // the other domain's do not.
+        node.forget_cloud_status("cluster.example");
+        assert_eq!(
+            node.cloud_status()
+                .iter()
+                .map(|s| s.domain.clone())
+                .collect::<Vec<_>>(),
+            ["other.example"]
+        );
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn attach_is_on_by_default_until_opted_out() {

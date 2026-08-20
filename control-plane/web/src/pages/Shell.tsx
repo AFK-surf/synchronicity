@@ -76,15 +76,35 @@ export function Shell() {
           )}
           <div className="ml-auto flex items-center gap-3 text-sm text-neutral-400">
             <span>{me.user.email}</span>
-            <button
-              className="rounded-md border border-neutral-700 px-2 py-1 hover:bg-neutral-800"
-              onClick={async () => {
-                await send('POST', '/api/logout')
-                window.location.href = '/login'
-              }}
-            >
-              Sign out
-            </button>
+            {/* Signing out is a write — the session is a row, and revoking it
+                is deleting that row — so on a read-only node it happens where
+                the row lives. A button posting here would be refused, and a
+                button that says "Sign out" and leaves the session live is
+                worse than a link that goes where it can be ended. */}
+            {methods?.primary ? (
+              <a
+                className="rounded-md border border-neutral-700 px-2 py-1 hover:bg-neutral-800"
+                href={`${methods.primary}/`}
+              >
+                Sign out on the primary
+              </a>
+            ) : (
+              <button
+                className="rounded-md border border-neutral-700 px-2 py-1 hover:bg-neutral-800"
+                onClick={async () => {
+                  // The redirect runs whatever the answer was: a logout that
+                  // could not reach the server must still take the operator
+                  // off a page that is about to 401 on every query.
+                  try {
+                    await send('POST', '/api/logout')
+                  } finally {
+                    window.location.href = '/login'
+                  }
+                }}
+              >
+                Sign out
+              </button>
+            )}
           </div>
         </div>
       </header>

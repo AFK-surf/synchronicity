@@ -165,11 +165,23 @@ pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
   let assert Error(why) = config.load()
   assert string.contains(why, "origin")
 
-  // An RRset is a set: the same endpoint twice is one malformed RRset, not
-  // two answers.
+  // An RRset is a set, and RFC 4034 §6.3 has a signer drop duplicate RRs
+  // before signing: two identical rdatas would be signed as two and
+  // canonicalized to one by a validator, which is an RRSIG mismatch and the
+  // whole zone failing closed. Listing your own CP_PUBLIC_URL among the
+  // others is an ordinary mistake, so it collapses rather than refusing.
   envoy.set("CP_BROWSE_ENDPOINTS", "https://sync.example")
   let assert Ok(cfg) = config.load()
   assert cfg.browse_endpoints == ["https://sync.example"]
+  // And the zone builder reads the same deduplicated list — this is the
+  // path that actually reaches an RRSIG, and it does not go through the
+  // boot-time validator above.
+  assert config.browse_endpoints() == ["https://sync.example"]
+  let assert Ok(rrsets) = build.build(fleet(config.browse_endpoints()))
+  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
+  let assert Ok(rrset) =
+    list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+  assert list.length(rrset.rdatas) == 1
 
   // Every entry costs every daemon in every network a standing tunnel, so
   // the zone does not get to decide that number freely.

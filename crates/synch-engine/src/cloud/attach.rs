@@ -207,16 +207,26 @@ async fn attach_forever(
     resolver: Option<Arc<synch_net::DnssecResolver>>,
     domain: String,
 ) {
-    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // `AbortOnDrop`, not a bare handle, because this task is itself stopped by
+    // being aborted — `run_cloud` does exactly that when the operator opts out
+    // or the domain goes away. An abort drops this future and everything it
+    // owns; a bare `JoinHandle` dropped is a task that keeps running, so the
+    // tunnels would outlive the supervisor that was told to stop them and go
+    // on serving browse requests for a node that has opted out.
+    let mut running: HashMap<String, AbortOnDrop> = HashMap::new();
     let mut backoff = MIN_BACKOFF;
     loop {
         let wait = match discover(resolver.as_deref(), &domain).await {
             Ok((endpoints, ttl)) => {
                 backoff = MIN_BACKOFF;
+                // The row a failed round left behind. Discovery works now, so
+                // "no validated record" is no longer true of this domain, and
+                // nothing else would ever remove it — `forget_cloud_endpoint`
+                // only reaches rows that name an endpoint.
+                node.forget_cloud_endpoint_none(&domain);
                 running.retain(|url, task| {
-                    let keep = endpoints.iter().any(|e| e == url) && !task.is_finished();
+                    let keep = endpoints.iter().any(|e| e == url) && !task.0.is_finished();
                     if !keep {
-                        task.abort();
                         node.forget_cloud_endpoint(&domain, url);
                     }
                     keep
@@ -230,9 +240,9 @@ async fn attach_forever(
                     let endpoint = url.clone();
                     running.insert(
                         url,
-                        tokio::spawn(async move {
+                        AbortOnDrop(tokio::spawn(async move {
                             attach_endpoint_forever(node, domain, endpoint).await
-                        }),
+                        })),
                     );
                 }
                 ttl.clamp(MIN_REDISCOVERY, MAX_REDISCOVERY)

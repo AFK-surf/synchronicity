@@ -426,12 +426,18 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       cfg.dns_listen.port,
       serving,
     ))
-    |> sup.add(mist.supervised(http))
+  // The registry before the listener, as on the primary: `sup` starts
+  // children in order, so mounting HTTP first would open a window where an
+  // attach or a browse call reaches a `cp_agents` name nothing has
+  // registered yet, and the request kills its connection handler instead of
+  // being answered.
+  let tree = case browse {
+    option.Some(_) -> sup.add(tree, agent.supervised(agents_name))
+    option.None -> tree
+  }
   use _ <- result.try(
-    case browse {
-      option.Some(_) -> sup.add(tree, agent.supervised(agents_name))
-      option.None -> tree
-    }
+    tree
+    |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
