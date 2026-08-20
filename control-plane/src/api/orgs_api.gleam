@@ -302,14 +302,34 @@ pub fn change_role(
   }
 }
 
+/// Removing a member — and the case where the member is the caller, which
+/// is leaving.
+///
+/// **The role floor depends on whose row it is.** Removing somebody else is
+/// an administrative act and needs `Admin`; removing your own is not, and
+/// needs only the membership being given up. A plain member held in an org
+/// with no way out has to ask an admin to be let go, which is not a
+/// permission model — it is a lock on the wrong side of the door.
+///
+/// Nothing below the floor moves. Only owners may remove *other* owners, and
+/// the last owner may not go by anyone's hand, their own included: an org
+/// with no owner can never be given one again, since every path to `owner`
+/// (`change_role`, `transfer_ownership`) is owner-gated. A sole owner
+/// transfers ownership or deletes the org, and the refusal says so.
 pub fn remove_member(
   ctx: AuthContext,
   live: Session,
   slug: String,
   target_user: String,
 ) -> Response {
+  let leaving = target_user == live.user_id
+  let removing_other = !leaving
+  let minimum = case leaving {
+    True -> Member
+    False -> Admin
+  }
   with_db(ctx, fn(conn) {
-    use org_id, my_role <- require_org(conn, slug, live.user_id, Admin)
+    use org_id, my_role <- require_org(conn, slug, live.user_id, minimum)
     let target_role =
       sqlite.query(
         conn,
@@ -317,28 +337,52 @@ pub fn remove_member(
         [Text(org_id), Text(target_user)],
       )
     case target_role {
-      Ok([[Text("owner")]]) if my_role != Owner ->
+      Ok([[Text("owner")]]) if removing_other && my_role != Owner ->
         error_json(403, "forbidden", "only owners may remove owners")
       Ok([[Text(role_text)]]) ->
         case role_text == "owner" && last_owner(conn, org_id, target_user) {
+          True if leaving ->
+            error_json(
+              409,
+              "last_owner",
+              "you are the last owner of this org: transfer ownership or "
+                <> "delete the org before leaving",
+            )
           True ->
             error_json(409, "last_owner", "an org must keep at least one owner")
           False -> {
-            let _ =
+            let removal =
               sqlite.exec(
                 conn,
                 "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
                 [Text(org_id), Text(target_user)],
               )
-            let _ =
-              audit(
-                conn,
-                live.user_id,
-                org_id,
-                "member.remove",
-                json.object([#("user", json.string(target_user))]),
-              )
-            ok_json(json.object([#("ok", json.bool(True))]))
+            case removal {
+              Ok(_) -> {
+                let _ =
+                  audit(
+                    conn,
+                    live.user_id,
+                    org_id,
+                    case leaving {
+                      True -> "member.leave"
+                      False -> "member.remove"
+                    },
+                    json.object([#("user", json.string(target_user))]),
+                  )
+                ok_json(
+                  json.object([
+                    #("ok", json.bool(True)),
+                    // What the caller's own access just became, which a bare
+                    // `ok` does not say: a leaver's next request to this org
+                    // is a 404, and the SPA needs to know that before it
+                    // makes one.
+                    #("left", json.bool(leaving)),
+                  ]),
+                )
+              }
+              Error(e) -> constraint_response(e)
+            }
           }
         }
       Ok(_) -> error_json(404, "not_found", "no such member")

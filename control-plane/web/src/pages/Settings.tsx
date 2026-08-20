@@ -35,6 +35,7 @@ function Members({
   myId: string
 }) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [role, setRole] = useState('member')
   const canAdmin = myRole === 'owner' || myRole === 'admin'
@@ -68,6 +69,20 @@ function Members({
       // The acting owner just became an admin: what this page offers is
       // role-dependent, and `me` is where the role comes from.
       queryClient.invalidateQueries({ queryKey: ['me'] })
+    },
+  })
+  // Leaving is the same DELETE as removing anyone else, aimed at your own
+  // row — but the aftermath is `DeleteOrg`'s rather than `remove`'s: the
+  // page you are standing on now answers 404 for you, so every org-scoped
+  // query goes with the membership and the picker is refetched without it.
+  const leave = useMutation({
+    mutationFn: () => send('DELETE', `/api/orgs/${slug}/members/${myId}`),
+    onSuccess: async () => {
+      queryClient.removeQueries({
+        predicate: (q) => Array.isArray(q.queryKey) && q.queryKey[1] === slug,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['me'] })
+      navigate('/')
     },
   })
 
@@ -128,6 +143,26 @@ function Members({
                         Remove
                       </button>
                     )}
+                    {/* Offered at every role, the owner's included: a sole
+                        owner is refused by the server with the two ways out
+                        named, and hiding the button would say instead that
+                        leaving is something only some members may do. */}
+                    {m.user_id === myId && (
+                      <button
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Leave ${slug}? You lose access to its networks, devices and files until you are invited back.`,
+                            )
+                          )
+                            leave.mutate()
+                        }}
+                        disabled={leave.isPending}
+                        className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
+                      >
+                        Leave org
+                      </button>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -135,7 +170,15 @@ function Members({
           </tbody>
         </table>
       </div>
-      <ErrorNote error={error || changeRole.error || remove.error || transfer.error} />
+      <ErrorNote
+        error={
+          error ||
+          changeRole.error ||
+          remove.error ||
+          transfer.error ||
+          leave.error
+        }
+      />
       {canAdmin && (
         <form
           className="mt-3 flex flex-wrap gap-2"
