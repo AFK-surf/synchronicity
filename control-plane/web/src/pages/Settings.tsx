@@ -254,6 +254,18 @@ function ApiKeys({ slug }: { slug: string }) {
   // "show again" that would have to lie.
   const [minted, setMinted] = useState<MintedApiKey | null>(null)
   const [copied, setCopied] = useState(false)
+  // Which row is being edited, and the draft for it. One row at a time, and
+  // the draft lives beside the id it belongs to — so a failed save cannot
+  // leave rejected text sitting in a box that no longer matches anything,
+  // and no control on another row is disabled by this one's request.
+  const [editing, setEditing] = useState<{
+    id: string
+    name: string
+    role: string
+    // '' means "leave the expiry alone"; otherwise seconds from now, where
+    // '0' clears it. The server takes exactly this.
+    expiresIn: string
+  } | null>(null)
 
   const { data: keys, error } = useQuery({
     queryKey: ['api-keys', slug],
@@ -286,8 +298,8 @@ function ApiKeys({ slug }: { slug: string }) {
       refresh()
     },
   })
-  // Any of the three fields PATCH takes. The kind is not among them and
-  // cannot be: it is settled when the key is minted.
+  // Any of the three fields PATCH takes, sent once when the operator saves.
+  // The kind is not among them and cannot be: it is settled at minting.
   const update = useMutation({
     mutationFn: (args: {
       id: string
@@ -298,8 +310,28 @@ function ApiKeys({ slug }: { slug: string }) {
       const { id, ...fields } = args
       return send('PATCH', `/api/orgs/${slug}/api-keys/${id}`, fields)
     },
-    onSuccess: refresh,
+    onSuccess: () => {
+      setEditing(null)
+      refresh()
+    },
+    // A failed save keeps the row open with the draft intact, so the operator
+    // can see what was refused and correct it rather than losing the edit.
   })
+
+  const saveEdit = (key: ApiKeyRow) => {
+    if (!editing || editing.id !== key.id) return
+    const fields: { name?: string; role?: string; expires_in?: number } = {}
+    const trimmed = editing.name.trim()
+    if (trimmed !== '' && trimmed !== key.name) fields.name = trimmed
+    if (editing.role !== key.role) fields.role = editing.role
+    if (editing.expiresIn !== '') fields.expires_in = Number(editing.expiresIn)
+    // Nothing moved: close the row rather than sending an empty PATCH.
+    if (Object.keys(fields).length === 0) {
+      setEditing(null)
+      return
+    }
+    update.mutate({ id: key.id, ...fields })
+  }
   const revoke = useMutation({
     mutationFn: (id: string) =>
       send('DELETE', `/api/orgs/${slug}/api-keys/${id}`),
@@ -326,15 +358,20 @@ function ApiKeys({ slug }: { slug: string }) {
         device to it — which is what makes it safe to bake into a provisioning
         image.
       </p>
+      {/* Permanently mounted and usually empty. A live region inserted at the
+          same moment as its content is the case screen readers routinely miss,
+          and the one sentence on this page that must not be missed is the one
+          saying a secret is on screen once. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {minted
+          ? `${minted.name} created${
+              minted.role === 'join' ? ` for ${minted.network}` : ''
+            }. The token is shown once; copy it now.`
+          : ''}
+        {copied ? ' Token copied to the clipboard.' : ''}
+      </div>
       {minted && (
-        // role="status" and aria-live: the one sentence a screen-reader user
-        // must not miss on this page is the one saying a secret is on screen
-        // once. A panel inserted silently says it to nobody.
-        <div
-          role="status"
-          aria-live="polite"
-          className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm"
-        >
+        <div className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm">
           <div className="font-medium text-emerald-300">
             {minted.name} created
             {minted.role === 'join' ? ` for ${minted.network}` : ''}. Copy it
@@ -367,7 +404,9 @@ function ApiKeys({ slug }: { slug: string }) {
               Dismiss
             </button>
             {copied && (
-              <span className="text-xs text-emerald-400">Copied.</span>
+              <span aria-hidden="true" className="text-xs text-emerald-400">
+                Copied.
+              </span>
             )}
           </div>
         </div>
@@ -392,28 +431,19 @@ function ApiKeys({ slug }: { slug: string }) {
               {(keys ?? []).map((k) => (
                 <tr key={k.id}>
                   <td className="px-4 py-2">
-                    {/* Uncontrolled, keyed on the server's value: a rename
-                        that fails remounts the input back to what the server
-                        still holds, with no per-row state to keep in step. */}
-                    <input
-                      key={`${k.id}:${k.name}`}
-                      defaultValue={k.name}
-                      aria-label={`Name of ${k.name}`}
-                      disabled={update.isPending}
-                      onBlur={(e) => {
-                        const next = e.target.value.trim()
-                        if (next !== '' && next !== k.name)
-                          update.mutate({ id: k.id, name: next })
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') e.currentTarget.blur()
-                        if (e.key === 'Escape') {
-                          e.currentTarget.value = k.name
-                          e.currentTarget.blur()
+                    {editing?.id === k.id ? (
+                      <input
+                        autoFocus
+                        value={editing.name}
+                        aria-label={`Name of ${k.name}`}
+                        onChange={(e) =>
+                          setEditing({ ...editing, name: e.target.value })
                         }
-                      }}
-                      className="w-40 rounded border border-transparent bg-transparent px-1 py-0.5 hover:border-neutral-700 focus:border-neutral-600 focus:bg-neutral-950 disabled:opacity-50"
-                    />
+                        className="w-40 rounded border border-neutral-700 bg-neutral-950 px-2 py-1"
+                      />
+                    ) : (
+                      k.name
+                    )}
                     {k.expires_at !== 0 && k.expires_at <= now && (
                       <span className="ml-2 text-xs text-amber-400">
                         expired
@@ -427,24 +457,25 @@ function ApiKeys({ slug }: { slug: string }) {
                     {/* A join key's kind is settled at minting — changing it
                         would need a network it was never given, or would hand
                         a deployed secret a reach nobody audited it for. So it
-                        reads rather than selects, and names its network. */}
+                        never becomes a select, editing or not. */}
                     {k.role === 'join' ? (
                       <span className="text-xs text-neutral-400">
                         join · <span className="font-mono">{k.network}</span>
                       </span>
-                    ) : (
+                    ) : editing?.id === k.id ? (
                       <select
-                        value={k.role}
+                        value={editing.role}
                         aria-label={`Role for ${k.name}`}
-                        disabled={update.isPending}
                         onChange={(e) =>
-                          update.mutate({ id: k.id, role: e.target.value })
+                          setEditing({ ...editing, role: e.target.value })
                         }
-                        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs disabled:opacity-50"
+                        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
                       >
                         <option value="admin">admin</option>
                         <option value="member">member</option>
                       </select>
+                    ) : (
+                      <span className="text-xs text-neutral-400">{k.role}</span>
                     )}
                   </td>
                   {/* Who minted it — the column to read when somebody leaves
@@ -457,47 +488,86 @@ function ApiKeys({ slug }: { slug: string }) {
                   </td>
                   <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
                     {/* The server takes a duration from now, so that is what
-                        this offers: the current expiry is shown as the label
-                        and the choices reset it, they do not extend it. */}
-                    <select
-                      value=""
-                      aria-label={`Change expiry of ${k.name}`}
-                      disabled={update.isPending}
-                      onChange={(e) =>
-                        update.mutate({
-                          id: k.id,
-                          expires_in: Number(e.target.value),
-                        })
-                      }
-                      className="rounded border border-transparent bg-transparent px-1 py-0.5 text-xs hover:border-neutral-700 focus:border-neutral-600 focus:bg-neutral-950 disabled:opacity-50"
-                    >
-                      <option value="">{stamp(k.expires_at)}</option>
-                      {EXPIRIES.map((choice) => (
-                        <option key={choice.seconds} value={choice.seconds}>
-                          set to {choice.label}
-                        </option>
-                      ))}
-                    </select>
+                        this offers — and it only takes effect on Save, so
+                        arrowing through the list changes nothing. */}
+                    {editing?.id === k.id ? (
+                      <select
+                        value={editing.expiresIn}
+                        aria-label={`Expiry of ${k.name}`}
+                        onChange={(e) =>
+                          setEditing({ ...editing, expiresIn: e.target.value })
+                        }
+                        className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                      >
+                        <option value="">leave as {stamp(k.expires_at)}</option>
+                        {EXPIRIES.map((choice) => (
+                          <option key={choice.seconds} value={choice.seconds}>
+                            set to {choice.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      stamp(k.expires_at)
+                    )}
                   </td>
                   <td className="px-4 py-2 text-right">
-                    <button
-                      aria-label={`Revoke ${k.name}`}
-                      // Disabled while a revoke is in flight: a second DELETE
-                      // for the same row answers 404, which would render as a
-                      // failure of an operation that had in fact succeeded.
-                      disabled={revoke.isPending}
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `Revoke ${k.name}? Anything using this token stops working at once.`,
+                    <div className="flex justify-end gap-2">
+                      {editing?.id === k.id ? (
+                        <>
+                          <button
+                            onClick={() => saveEdit(k)}
+                            disabled={update.isPending}
+                            className="rounded border border-neutral-600 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+                          >
+                            {update.isPending ? 'Saving…' : 'Save'}
+                          </button>
+                          <button
+                            onClick={() => {
+                              update.reset()
+                              setEditing(null)
+                            }}
+                            className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          aria-label={`Edit ${k.name}`}
+                          onClick={() => {
+                            update.reset()
+                            setEditing({
+                              id: k.id,
+                              name: k.name,
+                              role: k.role,
+                              expiresIn: '',
+                            })
+                          }}
+                          className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                        >
+                          Edit
+                        </button>
+                      )}
+                      <button
+                        aria-label={`Revoke ${k.name}`}
+                        // Disabled while a revoke is in flight: a second
+                        // DELETE for the same row answers 404, which would
+                        // render as a failure of an operation that had in
+                        // fact succeeded.
+                        disabled={revoke.isPending}
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Revoke ${k.name}? Anything using this token stops working at once.`,
+                            )
                           )
-                        )
-                          revoke.mutate(k.id)
-                      }}
-                      className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
-                    >
-                      Revoke
-                    </button>
+                            revoke.mutate(k.id)
+                        }}
+                        className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
+                      >
+                        Revoke
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}

@@ -102,10 +102,10 @@ next:       publish this record, then `synch daemon run`:
 The last two lines are not yours to do. Add the device on the network's page
 in the control plane — a label and the device key — and the record is
 signed and served in the same moment; **The control-plane API** below is the
-same act as a `POST` and a `PUT` — the device, then its network — which is the
-form to reach for from this node itself. Until it is done, `daemon run` waits
-rather than serves: the zone does not name this key yet, so the node has no
-name to publish under.
+same act as one `POST` to the network — which is the form to reach for from
+this node itself, and the only one a join key can make. Until it is done,
+`daemon run` waits rather than serves: the zone does not name this key yet, so
+the node has no name to publish under.
 
 `scan` reports what it did and what it published:
 
@@ -526,7 +526,7 @@ curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
   -H "Authorization: Bearer $token" -H 'content-type: application/json' \
   -d "{\"label\": \"nas\", \"nk\": \"$nk\"}"
 # -> {"ok":true,"soa_serial":42,
-#     "result":{"device_id":"0000068a4c…","label":"nas","network":"prod"}}
+#     "result":{"device_id":"0068a4c1f2…","label":"nas","network":"prod"}}
 ```
 
 One call, and it has to be: a device that exists in the org but sits in no
@@ -550,8 +550,10 @@ curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
 Aimed at any other network — a sibling in the same org, or the same name in
 another org — a join key gets `404`, the same answer a stranger gets, so a
 leaked one cannot be used to find out what else the org runs. Everything else
-it might try answers `403 join_key_forbidden`, including reading the very
-network it may add to.
+it might try is refused, including reading the very network it may add to:
+`403 join_key_forbidden` from the JSON API, and a plain-text `404` from
+`…/browse/file`, which lives below that layer and collapses every reason it
+will not serve you into one answer.
 
 An org key or a person reaches the same route at the `member` floor, since it
 is the same act.
@@ -612,11 +614,12 @@ One row, and that is the point:
 | --- | --- | --- |
 | `POST` | `/api/orgs/<org>/networks/<net>/devices` | the network it was minted for, and no other |
 
-Everything else in the service — including `GET` on that same network —
-answers `403 join_key_forbidden`. That is not a list somebody maintains: every
-org-scoped route in the service resolves its caller through one function, and
-that function refuses the whole family before it reads a rank. A join key has
-no rank to read.
+Everything else in the service — including `GET` on that same network — is
+refused: `403 join_key_forbidden` from the JSON API, and a plain-text `404`
+from the streaming `…/browse/file`, which sits below that layer. That is not a
+list somebody maintains: every org-scoped route resolves its caller through
+one function, and that function refuses the whole family before it reads a
+rank. A join key has no rank to read.
 
 Minting one is the ordinary create with `role: "join"` and the network named:
 
@@ -659,27 +662,28 @@ scope. The first three answer `403 api_key_forbidden`:
   could mint one that never expires, and revoking the one you knew about would
   not have ended the access.
 
-The fourth answers `403 forbidden` — *"requires owner role"* — because it is
-not a rule about keys at all:
-
-- **anything owner-gated** — ownership transfer, org deletion, the SSO
-  configuration. No key is ever an owner, so the ordinary role floor refuses
-  every one of them. Match on the status, not the code, if you want to catch
-  both families with one branch.
+**Owner-gated routes** — ownership transfer, org deletion, the SSO
+configuration — refuse every key too, because no key is ever an owner. Which
+code you get depends on which check runs first, so do not branch on it:
+ownership transfer and org deletion name keys (`api_key_forbidden` /
+`join_key_forbidden`), while the SSO configuration is refused by the ordinary
+role floor and answers `forbidden`, *"requires owner role"*. **Match on the
+403, not on the code.**
 
 ### Answers, and what the refusals mean
 
 A JSON error is `{"error": {"code": "...", "message": "..."}}`, and every
 zone-shaping mutation answers `{"ok": true, "soa_serial": N, "result": {...}}`.
 
-**Three answers are not JSON**, so parse defensively: `…/browse/file` refuses
-in plain text at every status (its success is a byte stream, and its failures
-are not dressed as this API's), and a path or method no route matches is
-wisp's own plain-text `404 Not found` / `405 Method not allowed`.
+**Two answers are not JSON**, so parse defensively: `…/browse/file` refuses in
+plain text at every status (its success is a byte stream, and its failures are
+not dressed as this API's), and a path *or method* no route matches is wisp's
+own plain-text `404 Not found`. There is no `405` under `/api` — a wrong
+method is a route that does not exist, so it is a 404 like any other.
 
 | Status | `code` | Means |
 | --- | --- | --- |
-| `400` | `bad_name`, `bad_role`, `bad_scope`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
+| `400` | `bad_request` (a malformed body, or a missing `space=`), `bad_name`, `bad_role`, `bad_scope`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
 | `401` | `unauthenticated` | no credential, one that is unknown, expired or revoked, or an unreadable `Authorization` header |
 | `403` | `forbidden` | your role is under the route's floor; the message names it |
 | `403` | `api_key_forbidden` | a person's endpoint, reached with a key |
@@ -691,12 +695,18 @@ wisp's own plain-text `404 Not found` / `405 Method not allowed`.
 | `409` | `duplicate_label`, `ambiguous_nk`, `bad_glue`, … | the zone the change would produce is refused — the 400 vocabulary, caught later |
 | `409` | `read-only-replica` | this node holds a read-only copy; the `primary` field names where writes go |
 | `409` | `no_rekor_record` | the transparency gate is holding the zone key back — an operator ceremony, not your request |
+| `416` | — | plain text from `…/browse/file`: a `Range` this route will not serve (multi-range, or past the end); the `Content-Range` header names the size |
+| `500` | `internal` | this service's fault, not the request's — a storage failure, or a publish that could not complete. The detail is in its log, never in the body |
+| `502` | `internal`, or a code relayed verbatim | the attached daemon answered wrongly, or with something this build does not know |
 | `503` | `no-device-attached`, `unavailable` | no daemon is attached to answer this browse call, or the one that is went away |
 
-Two shapes to match on, not one. Codes this service raises are
-`snake_case`; codes **relayed from a daemon** through the browse surface are
-`kebab-case` — `not-found`, `invalid`, `divergent`, `unavailable`. A client
-matching `not_found` will miss a browse 404.
+**Codes come in both shapes, and the shape means nothing.** Most are
+`snake_case`, but `browse-disabled`, `no-device-attached` and
+`read-only-replica` are this service's own, and `not-found`, `invalid`,
+`divergent` and `unavailable` are relayed from a daemon — all `kebab-case`. A
+client that matches `not_found` will miss a browse 404, and one that infers
+"kebab means it came from a daemon" will be wrong three times. Match the exact
+strings in this table.
 
 A `not_found` for an org you believe you can reach is worth reading twice: an
 org is not enumerable by whoever cannot see it, so a key pointed at somebody

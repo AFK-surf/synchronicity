@@ -116,9 +116,12 @@ the schema's CHECK. A duration rather than a date, so nothing depends on
 the caller's clock agreeing with the service's. It answers with the token:
 
 ```json
-{ "id": "…", "name": "ci", "role": "member", "prefix": "synch_A1b2C3d4",
-  "expires_at": 0, "token": "synch_…" }
+{ "id": "…", "name": "ci", "role": "member", "network": "",
+  "prefix": "synch_A1b2C3d4", "expires_at": 1795123456, "token": "synch_…" }
 ```
+
+`network` is empty for an org key and names the network for a join key;
+`expires_at` is `0` when the key never expires.
 
 **That is the only time the token exists outside the holder's hands.** The
 row keeps its SHA-256 and the `prefix` above, which is what lets the list say
@@ -187,10 +190,11 @@ What no key of either kind may do:
   would not have ended the access.
 
 Those three answer `403 api_key_forbidden`. **Owner-gated routes** —
-ownership transfer, org deletion, the SSO configuration — answer the
-ordinary `403 forbidden`, *"requires owner role"*: no key is ever an owner,
-so the role floor refuses them without the question of keys arising. A
-client that wants one branch for both should match the status, not the code.
+ownership transfer, org deletion, the SSO configuration — refuse every key
+too, since no key is ever an owner, but which code you get depends on which
+check runs first: transfer and deletion name keys, while the SSO
+configuration is refused by the ordinary role floor and answers `forbidden`,
+*"requires owner role"*. Branch on the 403, not on the code.
 
 A key aimed at an org that is not its own answers `404` — the same answer a
 person outside that org gets, since an org is not enumerable by whoever
