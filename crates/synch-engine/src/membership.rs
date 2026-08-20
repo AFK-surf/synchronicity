@@ -415,6 +415,10 @@ impl Node {
             return Ok(false);
         };
         self.store().set_membership_domain(None)?;
+        // The delegate expectation belonged to that zone: a node with no zone
+        // is named by its key outright, and leaving the flag set would carry a
+        // claim about a cluster this node has left into the next one it joins.
+        self.store().set_membership_expects_name(true)?;
         // A node this zone *names* keeps them: its identity is frozen for the
         // life of the process, so it is still publishing under that name and
         // still talking to those peers (§3.1). A node it does not name was

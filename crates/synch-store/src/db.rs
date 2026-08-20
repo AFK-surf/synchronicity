@@ -95,6 +95,7 @@ impl KeyState {
 }
 
 /// The config key holding the one membership domain (§3.1).
+const UNNAMED_KEY: &str = "membership.unnamed";
 const DOMAIN_KEY: &str = "membership.domain";
 
 /// One identity this node adopted from its membership zone (§3.1).
@@ -519,6 +520,26 @@ impl Store {
         match domain {
             Some(domain) => self.set_config(DOMAIN_KEY, domain),
             None => self.clear_config(DOMAIN_KEY),
+        }
+    }
+
+    /// Whether this node expects its zone to name it (§3.1).
+    ///
+    /// `false` for a delegate, which belongs to a cluster and takes its name
+    /// from no zone in it (§3.5). This cannot be inferred: on a first start,
+    /// "the zone answered and does not name me" and "my record has not
+    /// propagated yet" are the same answer, and guessing wrong either refuses
+    /// to start a delegate or lets a member silently publish under a key origin
+    /// it will have to migrate away from. So the operator says which, once.
+    pub fn membership_expects_name(&self) -> Result<bool> {
+        Ok(self.config(UNNAMED_KEY)?.as_deref() != Some("1"))
+    }
+
+    /// Records whether the zone is expected to name this node.
+    pub fn set_membership_expects_name(&self, expects: bool) -> Result<()> {
+        match expects {
+            true => self.clear_config(UNNAMED_KEY),
+            false => self.set_config(UNNAMED_KEY, "1"),
         }
     }
 

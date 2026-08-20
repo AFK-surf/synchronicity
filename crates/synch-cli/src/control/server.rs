@@ -998,12 +998,14 @@ async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames)
     }
 
     match command {
-        Command::DomainSet(pb::DomainSet { domain }) => {
+        Command::DomainSet(pb::DomainSet { domain, delegate }) => {
             let name = synch_core::origin::normalize_domain(&domain)
                 .map_err(|e| ControlError::invalid(e.to_string()))?;
             let stored = name.clone();
             store(pending, move |s| {
                 s.set_membership_domain(Some(&stored))
+                    .map_err(|e| ControlError::new(ErrorCode::Internal, e.to_string()))?;
+                s.set_membership_expects_name(!delegate)
                     .map_err(|e| ControlError::new(ErrorCode::Internal, e.to_string()))
             })
             .await?;
@@ -1579,18 +1581,26 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::DomainSet(pb::DomainSet { domain }) => {
+        Command::DomainSet(pb::DomainSet { domain, delegate }) => {
             let warning = {
                 let node = node.clone();
                 let domain = domain.clone();
                 read(&node, move |n| {
                     let warning = delegation_warning(&n);
                     n.set_domain(&domain)?;
+                    n.store().set_membership_expects_name(!delegate)?;
                     Ok(warning)
                 })
                 .await?
             };
             out.line(format!("membership domain is {domain}")).await?;
+            if delegate {
+                out.line(
+                    "this node is a delegate of that zone: it resolves the zone's members \
+                     and expects no record naming itself",
+                )
+                .await?;
+            }
             if let Some(warning) = warning {
                 out.line(warning).await?;
             }
