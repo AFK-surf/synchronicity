@@ -66,6 +66,7 @@ fn harness_sized(pool_size: Int) -> Harness {
         publish.publish_in_tx(conn, csk, now, actor, change)
       },
       fn() { Nil },
+      None,
     )
   Harness(
     router.Context(
@@ -1441,6 +1442,265 @@ pub fn one_request_needs_one_connection_test() {
       ]),
     )
   assert resp.status == 200
+}
+
+// -- the read-only surface ---------------------------------------------------
+
+/// The same harness reading through a replica's surface: the read half of
+/// the API over the same tables, and the primary's URL for the other half.
+///
+/// The database is the primary's own file rather than a copy, which is the
+/// point — a replica's copy is byte-identical, so what the surface answers is
+/// exactly what the primary would, and any difference is the router's doing
+/// rather than the data's.
+fn read_only(h: Harness, primary_url: String) -> Harness {
+  let assert Some(router.Writable(auth)) = h.ctx.api
+  Harness(
+    ..h,
+    ctx: router.Context(
+      ..h.ctx,
+      api: Some(router.ReadOnly(auth.reads, primary_url)),
+    ),
+  )
+}
+
+/// Every GET the primary answers, a read-only node answers identically:
+/// the tables are the same and the handlers are mounted once.
+pub fn a_read_only_node_answers_every_read_test() {
+  let h = harness()
+  let replica = read_only(h, "https://sync.test")
+  let reads = [
+    "/api/me",
+    "/api/orgs/acme",
+    "/api/orgs/acme/members",
+    "/api/orgs/acme/networks",
+    "/api/orgs/acme/devices",
+    "/api/orgs/acme/audit",
+  ]
+  // An org to read, created through the surface that can create one.
+  let created =
+    call_json(
+      h,
+      http.Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+  assert created.status == 200
+
+  list.each(reads, fn(path) {
+    let from_primary = call(h, authed(h, http.Get, path))
+    let from_replica = call(replica, authed(replica, http.Get, path))
+    assert from_replica.status == from_primary.status
+    assert simulate.read_body(from_replica) == simulate.read_body(from_primary)
+  })
+
+  // And the dashboard itself: a node that answers the reads serves the pages
+  // that make them. There is no built SPA in a test tree, so what is asserted
+  // is that the request is not refused for the reason it used to be — the
+  // static handler's own "nothing to serve" 404 is indistinguishable here,
+  // but a routing refusal would be the same 404 on the primary too.
+  let spa = call(replica, simulate.request(http.Get, "/orgs/acme"))
+  assert spa.status == call(h, simulate.request(http.Get, "/orgs/acme")).status
+}
+
+/// A write is refused with the address of the node that takes it — not a
+/// 404, which tells an operator nothing, and not a 500 from sqlite about a
+/// read-only file, which tells them about the wrong layer.
+pub fn a_read_only_node_names_where_the_writes_go_test() {
+  let replica = read_only(harness(), "https://sync.test")
+  let refused =
+    call_json(
+      replica,
+      http.Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+  assert refused.status == 409
+  let body = simulate.read_body(refused)
+  assert string.contains(body, "read-only-replica")
+  assert string.contains(body, "\"primary\":\"https://sync.test\"")
+
+  // The sign-in flows are writes too — they mint the session everything else
+  // is gated on — so they are refused by the same rule.
+  let magic =
+    call_json(
+      replica,
+      http.Post,
+      "/auth/magic",
+      json.object([#("email", json.string("someone@example.com"))]),
+    )
+  assert magic.status == 409
+
+  // A path that exists on no node is still the 404 it would be anywhere: the
+  // refusal names a place to go, and there is nowhere to send a typo.
+  let nonsense = call(replica, authed(replica, http.Get, "/api/nope"))
+  assert nonsense.status == 404
+}
+
+/// The login screen asks what it may offer before a session exists. On a
+/// read-only node the honest answer is "nothing here, and here is where":
+/// every method false, and the primary named.
+pub fn a_read_only_node_offers_no_sign_in_but_names_one_test() {
+  let replica = read_only(harness(), "https://sync.test")
+  let body =
+    simulate.read_body(call(
+      replica,
+      simulate.request(http.Get, "/api/auth/methods"),
+    ))
+  assert string.contains(body, "\"magic_link\":false")
+  assert string.contains(body, "\"google\":false")
+  assert string.contains(body, "\"primary\":\"https://sync.test\"")
+
+  // The primary names no one else: it is the place.
+  let here =
+    simulate.read_body(call(
+      harness(),
+      simulate.request(http.Get, "/api/auth/methods"),
+    ))
+  assert string.contains(here, "\"primary\":\"\"")
+}
+
+/// The browse surface is a read surface, so a read-only node serves it — and
+/// must, since the registry of attached daemons is one node's memory and a
+/// node no daemon attached to answers nothing.
+///
+/// The one write in the surface is the org's own switch, and that goes where
+/// every other write goes.
+pub fn a_read_only_node_serves_the_browse_surface_test() {
+  let h = harness()
+  let name = process.new_name("cp_agents_replica_test")
+  let assert Ok(_) = agent.start(name)
+  let browsing =
+    Harness(
+      ..h,
+      ctx: router.Context(
+        ..h.ctx,
+        browse: Some(browse_api.Browse(
+          name,
+          "https://ns1.cp.test/agent/v1/attach",
+        )),
+      ),
+    )
+  let assert 200 =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let assert 200 =
+    call_json(
+      browsing,
+      Put,
+      "/api/orgs/acme/networks/prod/browse/enabled",
+      json.object([#("enabled", json.bool(True))]),
+    ).status
+
+  let replica = read_only(browsing, "https://sync.test")
+
+  // Status reads, and names *this* node's attach URL — the one its own
+  // daemons dialled, not the primary's.
+  let status =
+    call(replica, authed(replica, Get, "/api/orgs/acme/networks/prod/browse"))
+  assert status.status == 200
+  let body = simulate.read_body(status)
+  assert string.contains(body, "\"enabled\":true")
+  assert string.contains(body, "https://ns1.cp.test/agent/v1/attach")
+
+  // A listing reaches the same refusal the primary gives with nothing
+  // attached, which is what says the route ran rather than 404ing.
+  let listing =
+    call(
+      replica,
+      authed(
+        replica,
+        Get,
+        "/api/orgs/acme/networks/prod/browse/ls?space=media&path=",
+      ),
+    )
+  assert listing.status == 503
+  assert string.contains(simulate.read_body(listing), "no-device-attached")
+
+  // The org's switch is a write like any other.
+  let flip =
+    call_json(
+      replica,
+      Put,
+      "/api/orgs/acme/networks/prod/browse/enabled",
+      json.object([#("enabled", json.bool(False))]),
+    )
+  assert flip.status == 409
+  assert string.contains(simulate.read_body(flip), "read-only-replica")
+}
+
+/// A fleet needs one session readable at every node's own name, and a
+/// host-only cookie is by definition not.
+///
+/// The attribute has to be on the cookie that *clears* the session as well as
+/// the one that creates it: a `Set-Cookie` with a different `Domain` is a
+/// different cookie, so a logout without it would leave the fleet-wide one in
+/// place and signed in. And the cookie has to stay one wisp still reads —
+/// this sets it by hand to add an attribute wisp's own setter has no
+/// parameter for, so the signature is the part that must not have drifted.
+pub fn a_fleet_session_cookie_carries_its_domain_test() {
+  let h = harness()
+  let cookie_of = fn(resp: wisp.Response) {
+    let assert Ok(header) = list.key_find(resp.headers, "set-cookie")
+    header
+  }
+
+  // Host-only by default: one node, one name, nothing to widen.
+  let bare = cookie_of(call(h, authed(h, http.Post, "/api/logout")))
+  assert !string.contains(bare, "Domain=")
+
+  let fleet =
+    with_auth(h, fn(auth) {
+      auth_api.AuthContext(..auth, cookie_domain: Some("sync.test"))
+    })
+  let widened = cookie_of(call(fleet, authed(fleet, http.Post, "/api/logout")))
+  assert string.contains(widened, "Domain=sync.test")
+  // Still the clearing cookie it was, and still signed the way wisp signs.
+  assert string.contains(widened, "Max-Age=0")
+  assert string.contains(widened, "cp_session=")
+  assert string.contains(widened, "HttpOnly")
+
+  // And it is wisp's cookie with an attribute added, not a second cookie
+  // format: with no domain to widen to, this setter and `wisp.set_cookie`
+  // produce the same header byte for byte — signature, `Secure`, `HttpOnly`,
+  // `SameSite` and all. That equality is what says the value stays one
+  // `wisp.get_cookie` reads back.
+  let req = simulate.request(http.Get, "/")
+  let header_of = fn(resp: wisp.Response) {
+    let assert Ok(header) = list.key_find(resp.headers, "set-cookie")
+    header
+  }
+  let wisps =
+    wisp.response(200)
+    |> wisp.set_cookie(req, session.cookie_name, "tok", wisp.Signed, 60)
+  let ours =
+    wisp.response(200)
+    |> auth_api.set_session_cookie(req, None, "tok", 60)
+  assert header_of(ours) == header_of(wisps)
+  let widened =
+    wisp.response(200)
+    |> auth_api.set_session_cookie(req, Some("sync.test"), "tok", 60)
+  assert string.contains(header_of(widened), "Domain=sync.test")
 }
 
 pub fn with_db_discards_conn_on_panic_test() {

@@ -502,6 +502,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       },
       // Serve mode: commit is publication; there is nobody to nudge.
       fn() { Nil },
+      cfg.cookie_domain,
     )
   let ctx =
     router.Context(
@@ -631,6 +632,7 @@ fn serve_external(
       // After commit: nudge the reconciler, so a mutation reaches the
       // provider in seconds while the hourly sweep stays the safety net.
       fn() { provider_sync.poke(sync_name) },
+      cfg.cookie_domain,
     )
   let ctx =
     router.Context(

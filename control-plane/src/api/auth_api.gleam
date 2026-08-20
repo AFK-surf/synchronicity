@@ -11,7 +11,12 @@ import auth/oauth.{type Provider}
 import auth/oidc
 import auth/session
 import email/mailer.{type Mailer}
+import gleam/crypto
 import gleam/dynamic/decode
+import gleam/http
+import gleam/http/cookie
+import gleam/http/request
+import gleam/http/response
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -42,6 +47,15 @@ pub type AuthContext {
     /// is publication), the reconciler poke in external mode. Never inside
     /// the transaction: provider calls must not hold the write lock.
     published: fn() -> Nil,
+    /// The `Domain` the session cookie is set with (`CP_COOKIE_DOMAIN`), or
+    /// `None` for a host-only cookie.
+    ///
+    /// Threaded rather than read where the cookie is set, because it has to
+    /// be identical on the cookie that *clears* the session as on the one
+    /// that creates it: a `Set-Cookie` with a different `Domain` is a
+    /// different cookie, so logging out with the attribute missing leaves
+    /// the fleet-wide one in place and signed in.
+    cookie_domain: Option(String),
   )
 }
 
@@ -168,6 +182,7 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
                       Ok(who) ->
                         conclude(
                           req,
+                          ctx,
                           conn,
                           "oidc",
                           option.Some(provider_id),
@@ -189,6 +204,7 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
 /// flow was started with ?link=1, otherwise log in under the policy.
 fn conclude(
   req: Request,
+  ctx: AuthContext,
   conn: Connection,
   provider_key: String,
   oidc_provider_id: Option(String),
@@ -223,7 +239,7 @@ fn conclude(
           now_unix(),
         )
       {
-        Ok(user_id) -> sign_in(req, conn, user_id)
+        Ok(user_id) -> sign_in(req, ctx, conn, user_id)
         Error(identity.NeedsExplicitLink(_)) ->
           wisp.redirect("/login?error=needs-link")
         Error(identity.Db(_)) ->
@@ -289,25 +305,69 @@ fn finish_oauth(
       }
       case fetched {
         Error(message) -> error_json(502, "identity_failed", message)
-        Ok(who) -> conclude(req, conn, key, None, who, flow.link_user_id)
+        Ok(who) -> conclude(req, ctx, conn, key, None, who, flow.link_user_id)
       }
     }
   }
 }
 
 /// Creates the session and sets the signed cookie.
-pub fn sign_in(req: Request, conn: Connection, user_id: String) -> Response {
+pub fn sign_in(
+  req: Request,
+  ctx: AuthContext,
+  conn: Connection,
+  user_id: String,
+) -> Response {
   case session.create(conn, user_id, now_unix()) {
     Ok(#(token, _session)) ->
       wisp.redirect("/")
-      |> wisp.set_cookie(
-        req,
-        session.cookie_name,
-        token,
-        wisp.Signed,
-        session.ttl_seconds,
-      )
+      |> set_session_cookie(req, ctx.cookie_domain, token, session.ttl_seconds)
     Error(_) -> error_json(500, "internal", "could not create session")
+  }
+}
+
+/// Sets (or, with `max_age` 0, clears) the signed session cookie.
+///
+/// `wisp.set_cookie` with a `Domain` attribute added, because wisp's does not
+/// take one and a fleet needs one: a host-only cookie set at `sync.example`
+/// is never sent to `ns1.sync.example`, so a session minted on the primary
+/// is invisible at every replica however faithfully the row replicated.
+/// Everything else — the signature, the `Secure` rule and its localhost
+/// exception — is wisp's own, reproduced rather than reinvented so a cookie
+/// this sets and a cookie `wisp.get_cookie` reads stay the same object.
+pub fn set_session_cookie(
+  resp: Response,
+  req: Request,
+  domain: Option(String),
+  value: String,
+  max_age: Int,
+) -> Response {
+  let attributes =
+    cookie.Attributes(
+      ..cookie.defaults(cookie_scheme(req)),
+      max_age: option.Some(max_age),
+      domain: domain,
+    )
+  response.set_cookie(
+    resp,
+    session.cookie_name,
+    wisp.sign_message(req, <<value:utf8>>, crypto.Sha512),
+    attributes,
+  )
+}
+
+/// `Secure`, unless this is plain http to a loopback name and no reverse
+/// proxy said otherwise — wisp's rule, because most browsers treat localhost
+/// as secure and Safari does not, and a development login that silently
+/// drops the cookie is a bad first hour.
+fn cookie_scheme(req: Request) -> http.Scheme {
+  case req.host {
+    "localhost" | "127.0.0.1" | "[::1]" if req.scheme == http.Http ->
+      case request.get_header(req, "x-forwarded-proto") {
+        Ok(_) -> http.Https
+        Error(_) -> http.Http
+      }
+    _ -> http.Https
   }
 }
 
@@ -336,7 +396,7 @@ pub fn magic_redeem(req: Request, ctx: AuthContext) -> Response {
     Ok(token) ->
       with_db(ctx, fn(conn) {
         case magic.redeem(conn, token, now_unix()) {
-          Ok(user_id) -> sign_in(req, conn, user_id)
+          Ok(user_id) -> sign_in(req, ctx, conn, user_id)
           Error(magic.BadToken) -> wisp.redirect("/login?error=bad-magic-link")
           Error(_) -> error_json(500, "internal", "could not redeem")
         }
@@ -353,7 +413,7 @@ pub fn logout(req: Request, ctx: AuthContext) -> Response {
     json.object([#("ok", json.bool(True))])
     |> json.to_string
     |> wisp.json_response(200)
-    |> wisp.set_cookie(req, session.cookie_name, "", wisp.Signed, 0)
+    |> set_session_cookie(req, ctx.cookie_domain, "", 0)
   })
 }
 
