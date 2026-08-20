@@ -119,8 +119,7 @@ async fn control_plane_zone_validates_and_parses() {
 /// failure the record exists to prevent, and it would show up nowhere else.
 #[tokio::test]
 async fn the_fleets_attach_endpoints_cross_validate() {
-    install_provider();
-    let Some((doh_url, anchor, domain)) = e2e_env() else {
+    let Some((doh_url, anchor, domain)) = e2e_ctx() else {
         eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
         return;
     };
