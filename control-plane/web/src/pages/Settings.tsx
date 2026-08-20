@@ -286,11 +286,18 @@ function ApiKeys({ slug }: { slug: string }) {
       refresh()
     },
   })
+  // Any of the three fields PATCH takes. The kind is not among them and
+  // cannot be: it is settled when the key is minted.
   const update = useMutation({
-    mutationFn: (args: { id: string; role: string }) =>
-      send('PATCH', `/api/orgs/${slug}/api-keys/${args.id}`, {
-        role: args.role,
-      }),
+    mutationFn: (args: {
+      id: string
+      name?: string
+      role?: string
+      expires_in?: number
+    }) => {
+      const { id, ...fields } = args
+      return send('PATCH', `/api/orgs/${slug}/api-keys/${id}`, fields)
+    },
     onSuccess: refresh,
   })
   const revoke = useMutation({
@@ -385,7 +392,28 @@ function ApiKeys({ slug }: { slug: string }) {
               {(keys ?? []).map((k) => (
                 <tr key={k.id}>
                   <td className="px-4 py-2">
-                    {k.name}
+                    {/* Uncontrolled, keyed on the server's value: a rename
+                        that fails remounts the input back to what the server
+                        still holds, with no per-row state to keep in step. */}
+                    <input
+                      key={`${k.id}:${k.name}`}
+                      defaultValue={k.name}
+                      aria-label={`Name of ${k.name}`}
+                      disabled={update.isPending}
+                      onBlur={(e) => {
+                        const next = e.target.value.trim()
+                        if (next !== '' && next !== k.name)
+                          update.mutate({ id: k.id, name: next })
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.currentTarget.blur()
+                        if (e.key === 'Escape') {
+                          e.currentTarget.value = k.name
+                          e.currentTarget.blur()
+                        }
+                      }}
+                      className="w-40 rounded border border-transparent bg-transparent px-1 py-0.5 hover:border-neutral-700 focus:border-neutral-600 focus:bg-neutral-950 disabled:opacity-50"
+                    />
                     {k.expires_at !== 0 && k.expires_at <= now && (
                       <span className="ml-2 text-xs text-amber-400">
                         expired
@@ -428,7 +456,28 @@ function ApiKeys({ slug }: { slug: string }) {
                     {stamp(k.last_used_at)}
                   </td>
                   <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
-                    {stamp(k.expires_at)}
+                    {/* The server takes a duration from now, so that is what
+                        this offers: the current expiry is shown as the label
+                        and the choices reset it, they do not extend it. */}
+                    <select
+                      value=""
+                      aria-label={`Change expiry of ${k.name}`}
+                      disabled={update.isPending}
+                      onChange={(e) =>
+                        update.mutate({
+                          id: k.id,
+                          expires_in: Number(e.target.value),
+                        })
+                      }
+                      className="rounded border border-transparent bg-transparent px-1 py-0.5 text-xs hover:border-neutral-700 focus:border-neutral-600 focus:bg-neutral-950 disabled:opacity-50"
+                    >
+                      <option value="">{stamp(k.expires_at)}</option>
+                      {EXPIRIES.map((choice) => (
+                        <option key={choice.seconds} value={choice.seconds}>
+                          set to {choice.label}
+                        </option>
+                      ))}
+                    </select>
                   </td>
                   <td className="px-4 py-2 text-right">
                     <button
@@ -480,7 +529,13 @@ function ApiKeys({ slug }: { slug: string }) {
         >
           <option value="member">org key · member</option>
           <option value="admin">org key · admin</option>
-          <option value="join">join key · one network</option>
+          {/* A join key is scoped to a network, so there has to be one. The
+              option stays visible and disabled rather than vanishing: an
+              absent choice reads as a missing feature. */}
+          <option value="join" disabled={(networks ?? []).length === 0}>
+            join key · one network
+            {(networks ?? []).length === 0 ? ' (no networks yet)' : ''}
+          </option>
         </select>
         {role === 'join' && (
           <select
