@@ -20,7 +20,7 @@ import api/auth_api.{type AuthContext}
 import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
 import api/middleware.{error_json}
 import api/reads.{type Reads}
-import auth/session.{type Session as UserSession}
+import auth/principal.{type Principal}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name}
 import gleam/json.{type Json}
@@ -50,11 +50,11 @@ type Network {
 pub fn status(
   reads: Reads,
   browse: Browse,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(reads, live, slug, network, Member)
+  use net <- with_network(reads, who, slug, network, Member)
   let sessions = attached(browse, net)
   ok_json(
     json.object([
@@ -85,11 +85,11 @@ pub fn status(
 pub fn delegations(
   reads: Reads,
   browse: Browse,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(reads, live, slug, network, Member)
+  use net <- with_network(reads, who, slug, network, Member)
   case net.enabled, attached(browse, net) {
     False, _ ->
       error_json(
@@ -139,11 +139,11 @@ pub fn ls(
   req: Request,
   reads: Reads,
   browse: Browse,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(reads, live, slug, network, Member)
+  use net <- with_network(reads, who, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -173,11 +173,11 @@ pub fn stat(
   req: Request,
   reads: Reads,
   browse: Browse,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(reads, live, slug, network, Member)
+  use net <- with_network(reads, who, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -211,7 +211,7 @@ pub fn set_enabled(
   req: Request,
   ctx: AuthContext,
   browse: Browse,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
@@ -220,7 +220,7 @@ pub fn set_enabled(
     decode.success(enabled)
   }
   use enabled <- common.body_decoder(req, decoder)
-  use net <- with_network(ctx.reads, live, slug, network, Admin)
+  use net <- with_network(ctx.reads, who, slug, network, Admin)
   let written =
     pool.with_connection(ctx.reads.pool, fn(conn) {
       common.transaction(conn, fn() {
@@ -240,7 +240,7 @@ pub fn set_enabled(
           Ok(_) ->
             audit(
               conn,
-              live.user_id,
+              who,
               net.org_id,
               case enabled {
                 True -> "browse.enable"
@@ -285,7 +285,7 @@ pub fn set_enabled(
 /// back before `next` runs.
 fn with_network(
   reads: Reads,
-  live: UserSession,
+  who: Principal,
   slug: String,
   network: String,
   minimum: common.Role,
@@ -293,7 +293,7 @@ fn with_network(
 ) -> Response {
   let looked =
     pool.with_connection(reads.pool, fn(conn) {
-      resolve(conn, slug, network, live.user_id, minimum)
+      resolve(conn, slug, network, who, minimum)
     })
   case looked {
     Ok(Ok(net)) -> next(net)
@@ -306,10 +306,10 @@ fn resolve(
   conn: Connection,
   slug: String,
   network: String,
-  user_id: String,
+  who: Principal,
   minimum: common.Role,
 ) -> Result(Network, Response) {
-  use #(org_id, _role) <- result.try(check_org(conn, slug, user_id, minimum))
+  use #(org_id, _role) <- result.try(check_org(conn, slug, who, minimum))
   case
     sqlite.query(
       conn,
@@ -401,13 +401,13 @@ pub fn pick(
 /// wisp has no streaming body — so it cannot use the continuation form above.
 pub fn for_download(
   db: pool.Pool,
-  user_id: String,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Result(#(String, String, Bool), Nil) {
   case
     pool.with_connection(db, fn(conn) {
-      resolve(conn, slug, network, user_id, Member)
+      resolve(conn, slug, network, who, Member)
     })
   {
     Ok(Ok(net)) -> Ok(#(net.org_id, net.network_id, net.enabled))

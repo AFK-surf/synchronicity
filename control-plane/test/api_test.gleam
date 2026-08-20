@@ -1815,3 +1815,369 @@ pub fn skill_md_is_served_by_every_role_test() {
   // And the file really is where the shipment puts it.
   assert skill.read() != Error(Nil)
 }
+
+// -- org-scoped API keys -----------------------------------------------------
+
+/// An org for the harness's user to hold keys in.
+fn org_named(h: Harness, slug: String) -> Nil {
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string(slug)),
+        #("name", json.string(string.uppercase(slug))),
+      ]),
+    )
+  assert created.status == 200
+  Nil
+}
+
+/// A request carrying a bearer token and no cookie — which is what a program
+/// sends, and the shape every claim about keys below has to hold for.
+fn keyed(token: String, method: http.Method, path: String) -> wisp.Request {
+  simulate.request(method, path)
+  |> simulate.header("authorization", "Bearer " <> token)
+}
+
+/// Mints a key through the API and returns its token.
+fn mint(h: Harness, slug: String, name: String, role: String) -> String {
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/" <> slug <> "/api-keys",
+      json.object([
+        #("name", json.string(name)),
+        #("role", json.string(role)),
+      ]),
+    )
+  assert created.status == 200
+  token_of(simulate.read_body(created))
+}
+
+/// The `token` field of a mint response. The body is this suite's own JSON
+/// and the field is the last one in it, so the split is enough — a decoder
+/// here would only restate the encoder.
+fn token_of(body: String) -> String {
+  let assert Ok(#(_, after)) = string.split_once(body, "\"token\":\"")
+  let assert Ok(#(token, _)) = string.split_once(after, "\"")
+  token
+}
+
+/// The one property the whole feature rests on: a key reaches its own org
+/// and nothing else, whatever its minter can reach.
+pub fn api_key_is_scoped_to_one_org_test() {
+  let h = harness()
+  org_named(h, "acme")
+  org_named(h, "other")
+  let token = mint(h, "acme", "ci", "admin")
+
+  // The org it was minted in.
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 200
+
+  // Another org the *minter* owns, and the key does not: the same 404 a
+  // stranger gets, because an org is not enumerable by whoever cannot see it.
+  let elsewhere = call(h, keyed(token, Get, "/api/orgs/other"))
+  assert elsewhere.status == 404
+  assert string.contains(simulate.read_body(elsewhere), "no such org")
+
+  // A token nobody minted is a 401 and not a 404: the credential is what
+  // failed, and saying so is not saying which orgs exist.
+  let unknown = call(h, keyed("synch_nope", Get, "/api/orgs/acme"))
+  assert unknown.status == 401
+  // And a token that is not one of ours at all fails the same way, without
+  // a lookup: the scheme is right, the prefix is not.
+  assert call(h, keyed("ghp_something", Get, "/api/orgs/acme")).status == 401
+}
+
+/// A key's role is the key's, not its minter's — the reason the role lives on
+/// the row rather than being read from `org_members`.
+pub fn api_key_carries_its_own_role_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+
+  // Minted by the org's owner, and still only a member: the member floor
+  // opens, the admin floor does not.
+  let member = mint(h, "acme", "read-mostly", "member")
+  assert call(h, keyed(member, Get, "/api/orgs/acme/networks")).status == 200
+  let refused = call(h, keyed(member, Get, "/api/orgs/acme/audit"))
+  assert refused.status == 403
+  assert string.contains(simulate.read_body(refused), "requires admin role")
+
+  // An admin key clears the same floor.
+  let admin = mint(h, "acme", "deployer", "admin")
+  assert call(h, keyed(admin, Get, "/api/orgs/acme/audit")).status == 200
+
+  // No key is ever an owner, in either direction: the role cannot be asked
+  // for, and the owner-gated routes refuse the keys that do exist.
+  let owner_key =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/api-keys",
+      json.object([
+        #("name", json.string("too much")),
+        #("role", json.string("owner")),
+      ]),
+    )
+  assert owner_key.status == 400
+  assert string.contains(simulate.read_body(owner_key), "admin or member")
+  assert call(h, keyed(admin, Get, "/api/orgs/acme/oidc")).status == 403
+}
+
+/// What a key may never do, and why each one is on the list: every entry is
+/// a way a scoped credential could reach past its scope.
+pub fn api_key_may_not_manage_accounts_membership_or_keys_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "admin")
+  let forbidden = fn(res: wisp.Response) {
+    assert res.status == 403
+    assert string.contains(simulate.read_body(res), "api_key_forbidden")
+    Nil
+  }
+  let post = fn(path, body) {
+    call(h, keyed(token, Post, path) |> simulate.json_body(body))
+  }
+
+  // An account is a person's, and so is the org a person creates.
+  forbidden(post(
+    "/api/orgs",
+    json.object([
+      #("slug", json.string("mine")),
+      #("name", json.string("Mine")),
+    ]),
+  ))
+  forbidden(call(h, keyed(token, Get, "/api/me")))
+
+  // Membership: an admin key that could invite an admin would be handing out
+  // standing human access that outlives the key.
+  forbidden(post(
+    "/api/orgs/acme/invites",
+    json.object([#("email", json.string("someone@example.com"))]),
+  ))
+  forbidden(call(h, keyed(token, Delete, "/api/orgs/acme/members/u-admin")))
+
+  // And keys themselves, in all four directions — including the listing,
+  // which would otherwise tell a key what else to go looking for.
+  forbidden(call(h, keyed(token, Get, "/api/orgs/acme/api-keys")))
+  forbidden(post(
+    "/api/orgs/acme/api-keys",
+    json.object([#("name", json.string("another"))]),
+  ))
+  forbidden(call(h, keyed(token, Delete, "/api/orgs/acme/api-keys/whatever")))
+}
+
+/// A bearer token needs no CSRF header, and never falls back to the cookie.
+pub fn api_key_mutations_need_no_csrf_and_never_fall_back_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "admin")
+
+  // No cookie, no `x-csrf`, and a mutation goes through: nothing attaches an
+  // Authorization header on its own, so there is no ambient authority to
+  // defend against.
+  let made =
+    call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks")
+        |> simulate.json_body(json.object([#("name", json.string("prod"))])),
+    )
+  assert made.status == 200
+
+  // A request that names a credential is judged on that credential. A junk
+  // token beside a good cookie is a 401, not a signed-in request — the
+  // fallback would be a way to make a cross-site request look deliberate.
+  let mixed =
+    authed(h, Get, "/api/orgs/acme")
+    |> simulate.header("authorization", "Bearer synch_junk")
+  assert call(h, mixed).status == 401
+
+  // An empty bearer is no credential rather than a bad one.
+  let empty =
+    simulate.request(Get, "/api/orgs/acme")
+    |> simulate.header("authorization", "Bearer ")
+  let answer = call(h, empty)
+  assert answer.status == 401
+  assert string.contains(simulate.read_body(answer), "sign in first")
+}
+
+/// The management surface end to end: mint, list, update, delete — and what
+/// each step does to the credential itself.
+pub fn api_keys_are_created_listed_updated_and_deleted_test() {
+  let h = harness()
+  org_named(h, "acme")
+
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/api-keys",
+      json.object([
+        #("name", json.string("ci")),
+        #("role", json.string("member")),
+        #("expires_in", json.int(3600)),
+      ]),
+    )
+  assert created.status == 200
+  let minted = simulate.read_body(created)
+  let token = token_of(minted)
+  assert string.starts_with(token, "synch_")
+  assert string.contains(minted, "\"role\":\"member\"")
+
+  // The list identifies the key by its prefix and never carries the token.
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert string.contains(listed, "\"name\":\"ci\"")
+  assert string.contains(listed, "\"prefix\":\"synch_")
+  assert !string.contains(listed, token)
+  assert string.contains(listed, "\"created_by\":\"admin@example.com\"")
+
+  let assert Ok(#(_, after_id)) = string.split_once(listed, "\"id\":\"")
+  let assert Ok(#(key_id, _)) = string.split_once(after_id, "\"")
+
+  // An update renames, re-roles and clears the expiry, leaving the token
+  // it was minted with working: rotating a secret is minting a new key.
+  let updated =
+    call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> key_id,
+      json.object([
+        #("name", json.string("deployer")),
+        #("role", json.string("admin")),
+        #("expires_in", json.int(0)),
+      ]),
+    )
+  assert updated.status == 200
+  let after_update =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert string.contains(after_update, "\"name\":\"deployer\"")
+  assert string.contains(after_update, "\"role\":\"admin\"")
+  assert string.contains(after_update, "\"expires_at\":0")
+
+  // The new role is in force on the next request, not on the next mint.
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/devices")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("nas")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    ).status
+    == 200
+
+  // A key id from another org — or one that never existed — is a miss, not
+  // an edit.
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/nosuchkey",
+      json.object([#("name", json.string("x"))]),
+    ).status
+    == 404
+
+  // Deleting the row is what ends the access: the token authenticates by the
+  // hash that row held.
+  assert call(h, authed(h, Delete, "/api/orgs/acme/api-keys/" <> key_id)).status
+    == 200
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 401
+  assert call(h, authed(h, Delete, "/api/orgs/acme/api-keys/" <> key_id)).status
+    == 404
+
+  // Three acts, three audit rows, all naming the key by id.
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(
+      conn,
+      "SELECT action FROM audit_log WHERE action LIKE 'apikey.%' ORDER BY id",
+      [],
+    )
+  sqlite.close(conn)
+  assert list.map(rows, fn(row) {
+      let assert [sqlite.Text(action)] = row
+      action
+    })
+    == ["apikey.create", "apikey.update", "apikey.delete"]
+}
+
+/// The audit trail names the credential that acted, not the person who
+/// minted it — which stays true after that person's membership changes.
+pub fn a_keys_work_is_audited_as_the_key_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "admin")
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks")
+        |> simulate.json_body(json.object([#("name", json.string("prod"))])),
+    ).status
+    == 200
+
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(actor)]]) =
+    sqlite.query(
+      conn,
+      "SELECT actor FROM audit_log WHERE action = 'network.create'",
+      [],
+    )
+  sqlite.close(conn)
+  assert string.starts_with(actor, "key:")
+}
+
+/// An expired key is refused, and refused the way an unknown one is: the
+/// expiry is part of the lookup, so there is nothing for a caller to learn
+/// from the difference.
+pub fn expired_api_key_is_refused_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "fortnight", "member")
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 200
+
+  // Reach past the API to age the key: the surface deliberately takes a
+  // duration forward, and there is no way to ask it for the past.
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE api_keys SET expires_at = ?", [
+      sqlite.Int(now_unix() - 1),
+    ])
+  sqlite.close(conn)
+
+  let refused = call(h, keyed(token, Get, "/api/orgs/acme"))
+  assert refused.status == 401
+  assert string.contains(simulate.read_body(refused), "expired")
+
+  // It is still listed, so an operator can see what stopped working and
+  // clean it up rather than wondering.
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert string.contains(listed, "\"name\":\"fortnight\"")
+}
+
+/// A key does not outlive the org it is scoped to.
+pub fn deleting_an_org_takes_its_keys_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "admin")
+  assert call_json(
+      h,
+      Delete,
+      "/api/orgs/acme",
+      json.object([#("confirm", json.string("acme"))]),
+    ).status
+    == 200
+  // Not a token that authenticates to a 404 forever: the row is gone with
+  // the org, so the credential is gone too.
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 401
+}

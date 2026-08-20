@@ -10,7 +10,7 @@ import api/common.{
 }
 import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
-import auth/session.{type Session}
+import auth/principal.{type Principal}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
@@ -22,9 +22,9 @@ import wisp.{type Request, type Response}
 import zone/model
 import zone/publish
 
-pub fn list_networks(reads: Reads, live: Session, slug: String) -> Response {
+pub fn list_networks(reads: Reads, who: Principal, slug: String) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _ <- require_org(conn, slug, who, Member)
     let rows =
       sqlite.query(
         conn,
@@ -45,7 +45,7 @@ pub fn list_networks(reads: Reads, live: Session, slug: String) -> Response {
 pub fn create_network(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
@@ -57,8 +57,8 @@ pub fn create_network(
     False -> error_json(400, "bad_name", "network name must be a DNS label")
     True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
-        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
+        use org_id, _ <- require_org(conn, slug, who, Admin)
+        zone_mutation(conn, ctx, who, publish.Widening, fn() {
           let insert =
             sqlite.exec(
               conn,
@@ -76,7 +76,7 @@ pub fn create_network(
               let _ =
                 audit(
                   conn,
-                  live.user_id,
+                  who,
                   org_id,
                   "network.create",
                   json.object([#("name", json.string(network))]),
@@ -92,12 +92,12 @@ pub fn create_network(
 
 pub fn network_detail(
   reads: Reads,
-  live: Session,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _ <- require_org(conn, slug, who, Member)
     case find_network(conn, org_id, network) {
       Error(Nil) -> error_json(404, "not_found", "no such network")
       Ok(network_id) -> {
@@ -167,7 +167,7 @@ fn domain_of(meta: model.ZoneMeta) -> String {
 pub fn delete_network(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   network: String,
 ) -> Response {
@@ -181,11 +181,11 @@ pub fn delete_network(
       error_json(400, "confirm", "body confirm must equal the network name")
     True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
+        use org_id, _ <- require_org(conn, slug, who, Admin)
         case find_network(conn, org_id, network) {
           Error(Nil) -> error_json(404, "not_found", "no such network")
           Ok(network_id) ->
-            zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+            zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
               let work = {
                 use _ <- result.try(
                   sqlite.exec(
@@ -201,7 +201,7 @@ pub fn delete_network(
                 )
                 audit(
                   conn,
-                  live.user_id,
+                  who,
                   org_id,
                   "network.delete",
                   json.object([#("name", json.string(network))]),
@@ -221,13 +221,13 @@ pub fn delete_network(
 
 pub fn assign_device(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   network: String,
   device_id: String,
 ) -> Response {
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _ <- require_org(conn, slug, who, Member)
     case
       find_network(conn, org_id, network),
       find_device(conn, org_id, device_id)
@@ -235,7 +235,7 @@ pub fn assign_device(
       Error(Nil), _ -> error_json(404, "not_found", "no such network")
       _, Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(network_id), Ok(label) ->
-        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
+        zone_mutation(conn, ctx, who, publish.Widening, fn() {
           // App-level label check first for a friendly message; the trigger
           // and zone build re-verify.
           let clash =
@@ -263,7 +263,7 @@ pub fn assign_device(
                 )
                 audit(
                   conn,
-                  live.user_id,
+                  who,
                   org_id,
                   "network.assign",
                   json.object([
@@ -286,17 +286,17 @@ pub fn assign_device(
 
 pub fn unassign_device(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   network: String,
   device_id: String,
 ) -> Response {
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _ <- require_org(conn, slug, who, Member)
     case find_network(conn, org_id, network) {
       Error(Nil) -> error_json(404, "not_found", "no such network")
       Ok(network_id) ->
-        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+        zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           let delete =
             sqlite.exec(
               conn,
@@ -308,7 +308,7 @@ pub fn unassign_device(
               let _ =
                 audit(
                   conn,
-                  live.user_id,
+                  who,
                   org_id,
                   "network.unassign",
                   json.object([#("device", json.string(device_id))]),

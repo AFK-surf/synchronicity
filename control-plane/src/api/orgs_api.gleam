@@ -5,10 +5,10 @@ import api/common.{
   Admin, Member, Owner, audit, body_decoder, constraint_response, db_error,
   ok_json, require_org, text_at, transaction, zone_mutation,
 }
-import api/middleware.{error_json, now_unix}
+import api/middleware.{error_json, now_unix, require_user}
 import api/reads.{type Reads}
 import auth/oidc
-import auth/session.{type Session}
+import auth/principal.{type Principal}
 import dns/name
 import email/mailer
 import gleam/dynamic/decode
@@ -22,7 +22,11 @@ import util/id
 import wisp.{type Request, type Response}
 import zone/publish
 
-pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
+/// Creating an org is a person's act: the creator becomes its owner, and a
+/// key has no account to be one with. `require_user` here is also what keeps
+/// an org-scoped credential from making an org it would not be scoped to.
+pub fn create_org(req: Request, ctx: AuthContext, who: Principal) -> Response {
+  use <- require_user(who)
   let decoder = {
     use slug <- decode.field("slug", decode.string)
     use org_name <- decode.field("name", decode.string)
@@ -57,14 +61,14 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
                   "INSERT INTO org_members VALUES (?, ?, 'owner', ?)",
                   [
                     Text(org_id),
-                    Text(live.user_id),
+                    Text(who.user_id),
                     VInt(now_unix()),
                   ],
                 ),
               )
               audit(
                 conn,
-                live.user_id,
+                who,
                 org_id,
                 "org.create",
                 json.object([#("slug", json.string(slug))]),
@@ -86,9 +90,9 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
   }
 }
 
-pub fn get_org(reads: Reads, live: Session, slug: String) -> Response {
+pub fn get_org(reads: Reads, who: Principal, slug: String) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, role <- require_org(conn, slug, live.user_id, Member)
+    use org_id, role <- require_org(conn, slug, who, Member)
     let networks =
       sqlite.query(
         conn,
@@ -126,20 +130,21 @@ pub fn get_org(reads: Reads, live: Session, slug: String) -> Response {
 pub fn delete_org(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
     use confirm <- decode.field("confirm", decode.string)
     decode.success(confirm)
   }
+  use <- require_user(who)
   use confirm <- body_decoder(req, decoder)
   case confirm == slug {
     False -> error_json(400, "confirm", "body confirm must equal the org slug")
     True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
-        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+        use org_id, _ <- require_org(conn, slug, who, Owner)
+        zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           // Foreign keys are ON, so children leave before parents. The two
           // IN-clauses on network_devices cover both halves of the join —
           // assignment is org-scoped in the API, but the delete should not
@@ -202,6 +207,15 @@ pub fn delete_org(
                 Text(org_id),
               ]),
             )
+            // The org's own credentials. Nothing cascades them: an API key
+            // outliving its org would be a token that authenticates to a
+            // 404 forever, and the row's foreign key would refuse the
+            // delete below in any case.
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM api_keys WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
             use _ <- result.try(
               sqlite.exec(conn, "DELETE FROM org_members WHERE org_id = ?", [
                 Text(org_id),
@@ -212,7 +226,7 @@ pub fn delete_org(
             // The slug rides in the detail because the row naming it is next.
             use _ <- result.try(audit(
               conn,
-              live.user_id,
+              who,
               org_id,
               "org.delete",
               json.object([#("slug", json.string(slug))]),
@@ -229,9 +243,9 @@ pub fn delete_org(
   }
 }
 
-pub fn list_members(reads: Reads, live: Session, slug: String) -> Response {
+pub fn list_members(reads: Reads, who: Principal, slug: String) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _role <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _role <- require_org(conn, slug, who, Member)
     let rows =
       sqlite.query(
         conn,
@@ -254,7 +268,7 @@ pub fn list_members(reads: Reads, live: Session, slug: String) -> Response {
 pub fn change_role(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   target_user: String,
 ) -> Response {
@@ -262,12 +276,13 @@ pub fn change_role(
     use role <- decode.field("role", decode.string)
     decode.success(role)
   }
+  use <- require_user(who)
   use role_text <- body_decoder(req, decoder)
   case common.role_from_string(role_text) {
     Error(Nil) -> error_json(400, "bad_role", "role must be owner|admin|member")
     Ok(_) ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+        use org_id, _ <- require_org(conn, slug, who, Owner)
         case would_lose_last_owner(conn, org_id, target_user, role_text) {
           True ->
             error_json(409, "last_owner", "an org must keep at least one owner")
@@ -283,7 +298,7 @@ pub fn change_role(
                 let _ =
                   audit(
                     conn,
-                    live.user_id,
+                    who,
                     org_id,
                     "member.role",
                     json.object([
@@ -318,18 +333,19 @@ pub fn change_role(
 /// transfers ownership or deletes the org, and the refusal says so.
 pub fn remove_member(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   target_user: String,
 ) -> Response {
-  let leaving = target_user == live.user_id
+  use <- require_user(who)
+  let leaving = target_user == who.user_id
   let removing_other = !leaving
   let minimum = case leaving {
     True -> Member
     False -> Admin
   }
   with_db(ctx, fn(conn) {
-    use org_id, my_role <- require_org(conn, slug, live.user_id, minimum)
+    use org_id, my_role <- require_org(conn, slug, who, minimum)
     let target_role =
       sqlite.query(
         conn,
@@ -362,7 +378,7 @@ pub fn remove_member(
                 let _ =
                   audit(
                     conn,
-                    live.user_id,
+                    who,
                     org_id,
                     case leaving {
                       True -> "member.leave"
@@ -405,15 +421,16 @@ pub fn remove_member(
 pub fn transfer_ownership(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
     use to <- decode.field("to", decode.string)
     decode.success(to)
   }
+  use <- require_user(who)
   use to <- body_decoder(req, decoder)
-  case to == live.user_id {
+  case to == who.user_id {
     True ->
       error_json(
         400,
@@ -422,7 +439,7 @@ pub fn transfer_ownership(
       )
     False ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+        use org_id, _ <- require_org(conn, slug, who, Owner)
         let applied =
           transaction(conn, fn() {
             {
@@ -446,7 +463,7 @@ pub fn transfer_ownership(
                     conn,
                     "UPDATE org_members SET role = 'admin'
                      WHERE org_id = ? AND user_id = ? AND role = 'owner'",
-                    [Text(org_id), Text(live.user_id)],
+                    [Text(org_id), Text(who.user_id)],
                   )
                 {
                   Ok(sqlite.Done(1, _)) -> Ok(Nil)
@@ -464,7 +481,7 @@ pub fn transfer_ownership(
               )
               audit(
                 conn,
-                live.user_id,
+                who,
                 org_id,
                 "org.transfer",
                 json.object([#("to", json.string(to))]),
@@ -512,7 +529,7 @@ fn would_lose_last_owner(
 pub fn create_invite(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
@@ -520,6 +537,7 @@ pub fn create_invite(
     use role <- decode.optional_field("role", "member", decode.string)
     decode.success(#(email, role))
   }
+  use <- require_user(who)
   use #(email_input, role) <- body_decoder(req, decoder)
   // Normalised the way the magic-link path normalises: the address is
   // about to be an SMTP recipient, and a pasted `  Name@Example.COM  `
@@ -533,7 +551,7 @@ pub fn create_invite(
     _, False -> error_json(400, "bad_email", "invite needs an email address")
     True, True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
+        use org_id, _ <- require_org(conn, slug, who, Admin)
         let token = id.secret()
         let token_hash = id.hash_token(token)
         let insert =
@@ -546,7 +564,7 @@ pub fn create_invite(
               Text(email),
               Text(role),
               Blob(token_hash),
-              Text(live.user_id),
+              Text(who.user_id),
               VInt(now_unix()),
               VInt(now_unix() + 604_800),
             ],
@@ -565,7 +583,7 @@ pub fn create_invite(
             let _ =
               audit(
                 conn,
-                live.user_id,
+                who,
                 org_id,
                 "invite.create",
                 json.object([
@@ -640,12 +658,13 @@ pub fn preview_invite(req: Request, reads: Reads) -> Response {
 pub fn accept_invite(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
 ) -> Response {
   let decoder = {
     use token <- decode.field("token", decode.string)
     decode.success(token)
   }
+  use <- require_user(who)
   use token <- body_decoder(req, decoder)
   with_db(ctx, fn(conn) {
     let token_hash = id.hash_token(token)
@@ -668,7 +687,7 @@ pub fn accept_invite(
                   "INSERT OR IGNORE INTO org_members VALUES (?, ?, ?, ?)",
                   [
                     Text(org_id),
-                    Text(live.user_id),
+                    Text(who.user_id),
                     Text(role),
                     VInt(now_unix()),
                   ],
@@ -683,7 +702,7 @@ pub fn accept_invite(
               )
               audit(
                 conn,
-                live.user_id,
+                who,
                 org_id,
                 "invite.accept",
                 json.object([#("invite", json.string(invite_id))]),
@@ -714,9 +733,9 @@ pub fn accept_invite(
 
 /// OIDC configuration is owner-only in both directions: it is
 /// takeover-adjacent (it decides who can sign in under the org's issuer).
-pub fn get_oidc(reads: Reads, live: Session, slug: String) -> Response {
+pub fn get_oidc(reads: Reads, who: Principal, slug: String) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    use org_id, _ <- require_org(conn, slug, who, Owner)
     let rows =
       sqlite.query(
         conn,
@@ -745,7 +764,7 @@ pub fn get_oidc(reads: Reads, live: Session, slug: String) -> Response {
 pub fn put_oidc(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
@@ -756,7 +775,7 @@ pub fn put_oidc(
   }
   use #(issuer, client_id, client_secret) <- body_decoder(req, decoder)
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    use org_id, _ <- require_org(conn, slug, who, Owner)
     // Discovery runs now, over verified TLS; a mismatched or unreachable
     // issuer refuses the whole save.
     case oidc.save(conn, org_id, issuer, client_id, client_secret, now_unix()) {
@@ -764,7 +783,7 @@ pub fn put_oidc(
         let _ =
           audit(
             conn,
-            live.user_id,
+            who,
             org_id,
             "oidc.configure",
             json.object([#("issuer", json.string(issuer))]),
@@ -785,9 +804,9 @@ pub fn put_oidc(
   })
 }
 
-pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
+pub fn delete_oidc(ctx: AuthContext, who: Principal, slug: String) -> Response {
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    use org_id, _ <- require_org(conn, slug, who, Owner)
     // Identities and their provider row go together: a provider without
     // its identities is fine, identities without their provider are not.
     let removed =
@@ -814,7 +833,7 @@ pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
               Text(org_id),
             ]),
           )
-          audit(conn, live.user_id, org_id, "oidc.remove", json.object([]))
+          audit(conn, who, org_id, "oidc.remove", json.object([]))
         }
         |> result.map_error(constraint_response)
       })
@@ -828,11 +847,11 @@ pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
 pub fn audit_log(
   req: Request,
   reads: Reads,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
+    use org_id, _ <- require_org(conn, slug, who, Admin)
     let cursor =
       wisp.get_query(req)
       |> list.key_find("before")

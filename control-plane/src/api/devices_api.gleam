@@ -11,7 +11,7 @@ import api/common.{
 }
 import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
-import auth/session.{type Session}
+import auth/principal.{type Principal}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
@@ -42,9 +42,9 @@ fn bad_hint(relay: String, addr: String) -> build.BuildError {
   }
 }
 
-pub fn list_devices(reads: Reads, live: Session, slug: String) -> Response {
+pub fn list_devices(reads: Reads, who: Principal, slug: String) -> Response {
   reads.with_db(reads, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+    use org_id, _ <- require_org(conn, slug, who, Member)
     let rows =
       sqlite.query(
         conn,
@@ -78,7 +78,7 @@ pub fn list_devices(reads: Reads, live: Session, slug: String) -> Response {
 pub fn create_device(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
 ) -> Response {
   let decoder = {
@@ -103,8 +103,8 @@ pub fn create_device(
     _, _, False -> refused(bad_hint(relay, addr))
     True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Member)
-        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
+        use org_id, _ <- require_org(conn, slug, who, Member)
+        zone_mutation(conn, ctx, who, publish.Widening, fn() {
           let device_id = id.new()
           let work = {
             use _ <- result.try(
@@ -117,7 +117,7 @@ pub fn create_device(
                   Text(label),
                   sqlite.text_or_null(relay),
                   sqlite.text_or_null(addr),
-                  Text(live.user_id),
+                  Text(who.user_id),
                   VInt(now_unix()),
                 ],
               ),
@@ -137,7 +137,7 @@ pub fn create_device(
             )
             audit(
               conn,
-              live.user_id,
+              who,
               org_id,
               "device.create",
               json.object([
@@ -158,7 +158,7 @@ pub fn create_device(
 pub fn patch_device(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
 ) -> Response {
@@ -173,11 +173,11 @@ pub fn patch_device(
     False -> refused(bad_hint(relay, addr))
     True ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+        use org_id, _ <- require_org(conn, slug, who, Member)
         case find_device(conn, org_id, device_id) {
           Error(Nil) -> error_json(404, "not_found", "no such device")
           Ok(_) ->
-            zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
+            zone_mutation(conn, ctx, who, publish.Widening, fn() {
               let update =
                 sqlite.exec(
                   conn,
@@ -193,7 +193,7 @@ pub fn patch_device(
                   let _ =
                     audit(
                       conn,
-                      live.user_id,
+                      who,
                       org_id,
                       "device.update",
                       json.object([#("device", json.string(device_id))]),
@@ -210,16 +210,16 @@ pub fn patch_device(
 
 pub fn delete_device(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
 ) -> Response {
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
+    use org_id, _ <- require_org(conn, slug, who, Admin)
     case find_device(conn, org_id, device_id) {
       Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(label) ->
-        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+        zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           let work = {
             use _ <- result.try(
               sqlite.exec(
@@ -240,7 +240,7 @@ pub fn delete_device(
             )
             audit(
               conn,
-              live.user_id,
+              who,
               org_id,
               "device.delete",
               json.object([#("label", json.string(label))]),
@@ -262,7 +262,7 @@ pub fn delete_device(
 pub fn add_key(
   req: Request,
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
 ) -> Response {
@@ -275,7 +275,7 @@ pub fn add_key(
     Error(Nil) -> refused(build.InvalidNk(nk))
     Ok(nk_bytes) ->
       with_db(ctx, fn(conn) {
-        use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+        use org_id, _ <- require_org(conn, slug, who, Member)
         case find_device(conn, org_id, device_id) {
           Error(Nil) -> error_json(404, "not_found", "no such device")
           Ok(_) -> {
@@ -294,7 +294,7 @@ pub fn add_key(
                   "a rotation window is already open — retire the old key first",
                 )
               Ok(_) ->
-                zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
+                zone_mutation(conn, ctx, who, publish.Widening, fn() {
                   let work = {
                     use _ <- result.try(
                       sqlite.exec(
@@ -319,7 +319,7 @@ pub fn add_key(
                     )
                     audit(
                       conn,
-                      live.user_id,
+                      who,
                       org_id,
                       "device.key.add",
                       json.object([
@@ -354,12 +354,12 @@ type KeyChange {
 
 pub fn retire_key(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
   key_id: String,
 ) -> Response {
-  key_state_change(ctx, live, slug, device_id, key_id, Retire)
+  key_state_change(ctx, who, slug, device_id, key_id, Retire)
 }
 
 /// Revoking a key takes it out of the zone — and out of every tunnel
@@ -372,12 +372,12 @@ pub fn retire_key(
 pub fn revoke_key(
   ctx: AuthContext,
   browse: Browse,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
   key_id: String,
 ) -> Response {
-  let outcome = key_state_change(ctx, live, slug, device_id, key_id, Revoke)
+  let outcome = key_state_change(ctx, who, slug, device_id, key_id, Revoke)
   case outcome.status {
     200 -> agent.drop_key(browse_api.registry(browse), key_id)
     _ -> Nil
@@ -387,7 +387,7 @@ pub fn revoke_key(
 
 fn key_state_change(
   ctx: AuthContext,
-  live: Session,
+  who: Principal,
   slug: String,
   device_id: String,
   key_id: String,
@@ -399,11 +399,11 @@ fn key_state_change(
     Revoke -> #(Admin, "state != 'revoked'", "device.key.revoke", "revoked")
   }
   with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, minimum)
+    use org_id, _ <- require_org(conn, slug, who, minimum)
     case find_device(conn, org_id, device_id) {
       Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(_) ->
-        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+        zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           let update =
             sqlite.exec(
               conn,
@@ -416,7 +416,7 @@ fn key_state_change(
               let _ =
                 audit(
                   conn,
-                  live.user_id,
+                  who,
                   org_id,
                   action,
                   json.object([#("key", json.string(key_id))]),

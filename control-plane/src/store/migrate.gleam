@@ -62,8 +62,44 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10]
 }
+
+/// V10: org-scoped API keys, for the callers that are programs.
+///
+/// A key is a credential the *org* holds, not a second way to be a person.
+/// It names one org and carries its own `role`, so authorisation never reads
+/// `org_members` for it: a key cannot reach another org, cannot be promoted
+/// by anything that happens to its creator's membership, and — because the
+/// role grammar here stops at `admin` — can never be an owner. That last one
+/// is the whole of the escalation story: every act that hands an org away
+/// (ownership transfer, deletion, the sign-in configuration) is owner-gated,
+/// and so is closed to every key by construction rather than by a list.
+///
+/// `created_by` is the person who minted it, kept because rows a key writes
+/// still need a user to name in the `created_by` columns that reference
+/// `users`. It is not who the key *is*: the audit trail records `key:<id>`,
+/// which stays truthful after the minter has left.
+///
+/// The row keeps the SHA-256 of the token and never the token — the shape
+/// sessions, invites and magic links already store. `prefix` is the leading
+/// characters in clear, which is what lets a list say which key a leaked
+/// token belongs to without holding enough to be one.
+const v10 = "
+CREATE TABLE api_keys (
+  id           TEXT PRIMARY KEY,
+  org_id       TEXT NOT NULL REFERENCES orgs(id),
+  name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+  prefix       TEXT NOT NULL,
+  token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+  role         TEXT NOT NULL CHECK (role IN ('admin','member')),
+  created_by   TEXT NOT NULL REFERENCES users(id),
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER
+);
+CREATE INDEX api_keys_by_org ON api_keys (org_id);
+"
 
 /// V9: a network says whether its files may be browsed.
 ///

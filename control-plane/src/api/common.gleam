@@ -3,6 +3,7 @@
 
 import api/auth_api.{type AuthContext}
 import api/middleware.{error_json, now_unix}
+import auth/principal.{type Principal}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
@@ -50,11 +51,11 @@ pub fn role_from_string(text: String) -> Result(Role, Nil) {
 pub fn require_org(
   conn: Connection,
   slug: String,
-  user_id: String,
+  who: Principal,
   minimum: Role,
   next: fn(String, Role) -> Response,
 ) -> Response {
-  case check_org(conn, slug, user_id, minimum) {
+  case check_org(conn, slug, who, minimum) {
     Ok(#(org_id, role)) -> next(org_id, role)
     Error(refusal) -> refusal
   }
@@ -66,8 +67,40 @@ pub fn require_org(
 /// The browse API is that caller: its work is a round trip to a daemon on
 /// somebody's LAN, and holding a pooled connection across one would put the
 /// whole pool behind the slowest cluster on the internet — the same reasoning
-/// `router.with_session` spells out for sessions.
+/// `router.with_principal` spells out for credential resolution.
+///
+/// **This is the one place a credential becomes a permission**, and the two
+/// credentials answer differently on purpose. A person's role is looked up in
+/// `org_members`, because it is a fact about a membership that can change
+/// under them. A key's role rides on the key: it is checked against the org
+/// the key names and nothing else, so no membership — not its minter's, not
+/// anybody's — can widen what it may do. A key aimed at another org gets the
+/// same 404 a person outside the org gets, for the same reason: an org is not
+/// enumerable by whoever cannot see it.
+///
+/// A key is never an `owner` (the schema's role grammar stops at `admin`), so
+/// every owner-gated route refuses one without naming keys at all.
 pub fn check_org(
+  conn: Connection,
+  slug: String,
+  who: Principal,
+  minimum: Role,
+) -> Result(#(String, Role), Response) {
+  case who.credential {
+    principal.Cookie(_) -> member_org(conn, slug, who.user_id, minimum)
+    principal.ApiKey(_, key_org_id, role_text) ->
+      case
+        sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)])
+      {
+        Ok([[Text(org_id)]]) if org_id == key_org_id ->
+          admit(org_id, role_text, minimum)
+        Ok(_) -> Error(error_json(404, "not_found", "no such org"))
+        Error(_) -> Error(db_error())
+      }
+  }
+}
+
+fn member_org(
   conn: Connection,
   slug: String,
   user_id: String,
@@ -82,22 +115,31 @@ pub fn check_org(
       [Text(user_id), Text(slug)],
     )
   case lookup {
-    Ok([[Text(org_id), Text(role_text)]]) ->
-      case role_from_string(role_text) {
-        Ok(role) ->
-          case rank(role) >= rank(minimum) {
-            True -> Ok(#(org_id, role))
-            False ->
-              Error(error_json(
-                403,
-                "forbidden",
-                "requires " <> role_to_string(minimum) <> " role",
-              ))
-          }
-        Error(Nil) -> Error(error_json(500, "internal", "corrupt role"))
-      }
+    Ok([[Text(org_id), Text(role_text)]]) -> admit(org_id, role_text, minimum)
     Ok(_) -> Error(error_json(404, "not_found", "no such org"))
     Error(_) -> Error(db_error())
+  }
+}
+
+/// The role floor, applied to a role that has already been established for
+/// this org — by membership or by the key's own row.
+fn admit(
+  org_id: String,
+  role_text: String,
+  minimum: Role,
+) -> Result(#(String, Role), Response) {
+  case role_from_string(role_text) {
+    Ok(role) ->
+      case rank(role) >= rank(minimum) {
+        True -> Ok(#(org_id, role))
+        False ->
+          Error(error_json(
+            403,
+            "forbidden",
+            "requires " <> role_to_string(minimum) <> " role",
+          ))
+      }
+    Error(Nil) -> Error(error_json(500, "internal", "corrupt role"))
   }
 }
 
@@ -129,7 +171,7 @@ pub fn transaction(
 pub fn zone_mutation(
   conn: Connection,
   ctx: AuthContext,
-  actor: String,
+  who: Principal,
   change: publish.Change,
   work: fn() -> Result(Json, Response),
 ) -> Response {
@@ -137,7 +179,7 @@ pub fn zone_mutation(
     transaction(conn, fn() {
       use payload <- result.try(work())
       use serial <- result.try(
-        ctx.publish_in_tx(conn, now_unix(), actor, change)
+        ctx.publish_in_tx(conn, now_unix(), principal.actor(who), change)
         |> result.map_error(publish_error),
       )
       Ok(#(payload, serial))
@@ -269,9 +311,15 @@ pub fn db_error() -> Response {
   error_json(500, "internal", "database error")
 }
 
+/// Records what was done and by whom.
+///
+/// `actor` is `principal.actor`'s answer rather than a user id: a request
+/// made with an API key names the key, which stays true after its minter has
+/// changed role or left. The column carries no foreign key, precisely so it
+/// can hold something that is not a user.
 pub fn audit(
   conn: Connection,
-  actor: String,
+  who: Principal,
   org_id: String,
   action: String,
   detail: Json,
@@ -282,7 +330,7 @@ pub fn audit(
      VALUES (?, ?, ?, ?, ?)",
     [
       VInt(now_unix()),
-      Text(actor),
+      Text(principal.actor(who)),
       Text(org_id),
       Text(action),
       Text(json.to_string(detail)),
