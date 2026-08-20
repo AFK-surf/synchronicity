@@ -11,8 +11,7 @@ pub type NodeId = PublicKey;
 /// The stable identity that owns a trie and keys all replicated state.
 ///
 /// It never changes for the lifetime of a node, across any number of device-key
-/// rotations (§3.1). Canonical text rendering is `key:<z-base-32>` for
-/// key-identified origins and `<id>@<domain>` for named ones.
+/// rotations (§3.1). Canonical rendering: `key:<z-base-32>` or `<id>@<domain>`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum OriginId {
     /// No name: the device key is the identity (not rotatable).
@@ -72,11 +71,10 @@ impl OriginId {
 
 /// Decoding re-validates, because an `OriginId` arriving here is a peer's word.
 ///
-/// Every other way to build one — [`OriginId::named`], [`FromStr`] — checks the
-/// label and the domain, and the value that comes off a wire or out of a stored
-/// record is the one place that would otherwise be taken as given. It keys
+/// Every other way to build one checks the label and domain; the value off a
+/// wire or out of a stored record is the one place that would not. It keys
 /// `blob_providers`, `bindings` and `entries` by its canonical rendering, so an
-/// unvalidated one is an arbitrary row key: a 64 KB label, or a thousand
+/// unvalidated one is an arbitrary row key — a 64 KB label, or a thousand
 /// spellings of one member.
 impl<'de> Deserialize<'de> for OriginId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -218,11 +216,9 @@ mod tests {
         assert!(normalize_domain("ok.example.com").is_ok());
     }
 
-    /// An origin off the wire is checked the way a constructed one is.
-    ///
-    /// The encoding is a peer's to choose, and what comes out of it keys rows
-    /// in three tables — so a label no constructor would produce must not
-    /// become a row key here either.
+    /// An origin off the wire is checked the way a constructed one is: what
+    /// decodes keys rows in three tables, so a label no constructor would
+    /// produce must not become a row key here either.
     #[test]
     fn a_decoded_origin_is_validated_like_a_constructed_one() {
         let good = OriginId::named("nas", "cluster.example").unwrap();

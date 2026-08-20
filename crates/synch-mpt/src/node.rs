@@ -106,8 +106,8 @@ impl TrieNode {
 
     /// Computes the hash of an already-encoded node, re-deriving its tag.
     ///
-    /// This is the function the sync path uses to verify that a received node
-    /// really hashes to the hash it was requested by (§5.2).
+    /// The sync path's verification that a received node hashes to the hash it
+    /// was requested by (§5.2).
     pub fn hash_of_encoded(bytes: &[u8]) -> Result<Hash, MptError> {
         let node = TrieNode::decode(bytes)?;
         // Re-encode: a node whose encoding is not canonical must not verify,
@@ -116,15 +116,14 @@ impl TrieNode {
         if canonical != bytes {
             return Err(MptError::Decode("non-canonical node encoding".into()));
         }
-        // Bound the node's key portion at the sync trust boundary. A key is
+        // Bound the node's key portion at the sync trust boundary: a key is
         // never longer than MAX_KEY_LEN bytes (§12), so a single node's nibble
         // run can never exceed twice that. Without it a peer could serve a
-        // hash-valid Leaf whose key_rest is megabytes of nibbles, and every
-        // reader would then walk it: `collect` and `diff_walk` use heap stacks
-        // and prune at MAX_DEPTH_NIBBLES, so what it costs is work rather than a
-        // stack overflow, but it is work proportional to a number the peer
-        // chose. This bounds one node; `MissingWalk::next_batch` bounds the
-        // *path*, which is the half a per-node cap cannot see.
+        // hash-valid Leaf with megabytes of key nibbles and every reader would
+        // walk it — heap-stacked walks prune at MAX_DEPTH_NIBBLES, so it costs
+        // work proportional to a number the peer chose. This bounds one node;
+        // `MissingWalk::next_batch` bounds the *path*, the half a per-node cap
+        // cannot see.
         let nibble_len = match &node {
             TrieNode::Leaf { key_rest, .. } => key_rest.len(),
             TrieNode::Ext { prefix, .. } => prefix.len(),
@@ -143,26 +142,24 @@ impl TrieNode {
     /// `merge_down` and `wrap_in_ext` exist precisely to — so this is only ever
     /// about nodes that arrived from a peer. Each one is load-bearing:
     ///
-    /// - An **empty extension prefix** is what a canonical trie never contains:
-    ///   `collapse` and `merge_down` exist to remove the shape. Accepting one
-    ///   would give a single key/value map two roots, which is exactly what
-    ///   structural sharing and the reference-pruning walk rest on not
-    ///   happening. (`Trie::get` refuses to follow one as well, and
-    ///   `ingest_boundary`'s `get_and_the_structural_walks_agree_even_if_one_slips_through`
-    ///   pins that the two readers answer alike — so the *reader disagreement*
-    ///   this used to describe is closed at both ends, and this check is what
-    ///   keeps the shape from being stored at all.)
+    /// - An **empty extension prefix** is what a canonical trie never contains;
+    ///   accepting one gives a single key/value map two roots, exactly what
+    ///   structural sharing and reference pruning rest on not happening.
+    ///   `Trie::get` refuses to follow one too, and `ingest_boundary`'s
+    ///   `get_and_the_structural_walks_agree_even_if_one_slips_through` pins
+    ///   that the two readers answer alike — the reader disagreement is closed
+    ///   at both ends, and this check keeps the shape from being stored.
     /// - An **oversized inline value** is 128 bytes by construction
-    ///   ([`INLINE_VALUE_MAX`]); decoded, it is bounded only by the frame, so a
-    ///   peer could put 16 MiB in a single node and have every diff clone it.
+    ///   ([`INLINE_VALUE_MAX`]); decoded it is bounded only by the frame, so a
+    ///   peer could put 16 MiB in one node and have every diff clone it.
     /// - An **under-occupied branch** and an **extension above a non-branch**
-    ///   are read consistently, so they corrupt nothing — but they give one
-    ///   key/value map several distinct roots, which is exactly what structural
-    ///   sharing and the reference-pruning walk rely on not happening.
+    ///   read consistently, so they corrupt nothing — but they give one
+    ///   key/value map several distinct roots, which structural sharing and
+    ///   reference pruning rely on not happening.
     ///
-    /// Two halves of this need more than one node and are therefore checked
-    /// where the structure is walked and where values arrive, not here:
-    /// **an extension above a non-branch** needs the child node
+    /// Two halves need more than one node and are checked where the structure
+    /// is walked and where values arrive, not here: **an extension above a
+    /// non-branch** needs the child node
     /// ([`crate::MissingWalk::next_batch`]), and **an out-of-line value small
     /// enough to be inline** needs the payload, which only the fetch that
     /// carries it has seen.

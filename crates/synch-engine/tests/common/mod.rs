@@ -1,8 +1,6 @@
 //! Shared fixtures for the engine's integration tests: in-process nodes on
-//! loopback iroh endpoints with static, unilateral trust (§3.2).
-//!
-//! A test opts in with `mod common;` and builds a cluster out of these
-//! pieces instead of re-typing the spawn/trust/payload boilerplate.
+//! loopback iroh endpoints with static, unilateral trust (§3.2) — a test opts
+//! in with `mod common;` instead of re-typing the spawn/trust boilerplate.
 
 pub(crate) mod wire;
 
@@ -36,9 +34,8 @@ pub(crate) async fn spawn_node(name: &str) -> Peer {
     spawn_node_with(name, |_| {}).await
 }
 
-/// A node named `name@cluster.example` whose configuration is adjusted
-/// before it opens. The store opens off the runtime worker, so even a test
-/// whose own body holds the §10 rule may spawn safely.
+/// A node named `name@cluster.example` whose configuration is adjusted before
+/// it opens; the store opens off the runtime worker, so a test may spawn safely (§10).
 #[allow(dead_code)]
 pub(crate) async fn spawn_node_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
     let data = tempfile::tempdir().unwrap();
@@ -74,8 +71,7 @@ pub(crate) fn binding(origin: &OriginId, key: &NodeId) -> Binding {
     }
 }
 
-/// Trust is unilateral (§3.2): `node` admits `peer` and learns how to dial
-/// it — a direct address only, since these tests never touch the network.
+/// Trust is unilateral (§3.2): `node` admits `peer` and learns a direct address to dial.
 #[allow(dead_code)]
 pub(crate) fn trust(node: &Node, peer: &Node) {
     node.store()
@@ -96,8 +92,15 @@ pub(crate) fn trust_all(peers: &[&Peer]) {
     }
 }
 
-/// A deterministic payload of `len` bytes, varied enough that a chunk of it
-/// is never mistaken for another.
+/// Shuts a cluster down, so a test can tear down in one line.
+#[allow(dead_code)]
+pub(crate) async fn shutdown(nodes: &[&Node]) {
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A deterministic payload of `len` bytes, varied so no chunk is mistaken for another.
 #[allow(dead_code)]
 pub(crate) fn big_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 37 + 11) as u8).collect()

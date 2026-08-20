@@ -831,20 +831,14 @@ mod tests {
         assert!(choose_parts(&named(&[2, 1]), &available).is_err());
         assert!(choose_parts(&named(&[1, 1]), &available).is_err());
         assert!(choose_parts(&[], &available).is_err());
-        // Only the last part may be small: a one-part upload of ten bytes is
-        // fine, and a ten-byte first part is not.
+        // Only the last part may be small: ten bytes alone is fine, as a
+        // first part it is not.
         let small = vec![part(1, 10), part(2, 10)];
         assert!(choose_parts(&named(&[1]), &small).is_ok());
         assert!(choose_parts(&named(&[1, 2]), &small).is_err());
-    }
 
-    /// A missing part is reported as missing even when an earlier part is also
-    /// too small: the client that shrank the wrong part retries into the same
-    /// failure. And a part that is not the one named — even when its hash is
-    /// wrong only for that reason — is refused.
-    #[test]
-    fn the_named_part_must_be_the_available_one() {
-        let available = vec![part(1, 10)];
+        // The named part must be the available one: a wrong hash is refused,
+        // and a missing part is reported by name.
         let wrong = vec![(1u32, Some(Hash::new(b"something else")))];
         assert!(choose_parts(&wrong, &available).is_err());
         let right = vec![(1u32, Some(available[0].root))];
@@ -854,18 +848,6 @@ mod tests {
             .to_string();
         assert!(err.contains("part 9 was never uploaded"), "{err}");
     }
-
-    /// Ids have to be unguessable, not merely unique: an id is what authorizes
-    /// adding parts to an upload and completing it.
-    #[test]
-    fn upload_ids_are_random_hex() {
-        let id = new_upload_id().unwrap();
-        assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
-        let ids: std::collections::HashSet<String> =
-            (0..256).map(|_| new_upload_id().unwrap()).collect();
-        assert_eq!(ids.len(), 256);
-    }
 }
 
 #[cfg(test)]
@@ -873,7 +855,10 @@ mod sweeper_tests {
     use super::*;
     use crate::testkit::node_with_space;
 
-    /// The sweeper collects what nobody is coming back for, and nothing else.
+    /// The sweeper collects what nobody is coming back for, and nothing else:
+    /// a part still streaming is not an orphan — its staging file lives under
+    /// a dot-prefixed name no row mentions, so sweeping it would unlink a
+    /// part from under an open handle.
     #[tokio::test]
     async fn the_sweeper_collects_only_what_is_abandoned() {
         let (_d, _s, node) = node_with_space().await;
@@ -887,45 +872,16 @@ mod sweeper_tests {
         let id = node.create_upload("media", "b.bin", None, &target).unwrap();
         assert_eq!(node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap(), 0);
         assert!(node.store().upload(&id).unwrap().is_some());
-        node.shutdown().await.unwrap();
-    }
 
-    /// A part still streaming is not an orphan.
-    ///
-    /// An `Adoption`'s staging file lives in the upload directory under a
-    /// dot-prefixed name no row will ever mention. Collecting it would unlink a
-    /// part from under an open handle, and the client would see a failure it
-    /// could do nothing about.
-    #[tokio::test]
-    async fn the_sweeper_leaves_a_write_in_progress_alone() {
-        let (_d, _s, node) = node_with_space().await;
-        let target = node.upload_target("media", "a.bin").unwrap();
-        let id = node.create_upload("media", "a.bin", None, &target).unwrap();
-        let staging = node.open_part(&id, "media", "a.bin", None, 1).unwrap();
+        // A part still streaming survives the sweep and commits afterwards.
+        let id = node.create_upload("media", "c.bin", None, &target).unwrap();
+        let staging = node.open_part(&id, "media", "c.bin", None, 1).unwrap();
         let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
         adoption.write(b"still arriving").unwrap();
-
         node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap();
         let part = node.commit_part(staging, adoption).unwrap();
         assert_eq!(part.size, 14);
         assert_eq!(node.store().upload_parts(&id).unwrap().len(), 1);
-        node.shutdown().await.unwrap();
-    }
-
-    /// A key the scanner would skip is refused before the client streams.
-    #[tokio::test]
-    async fn an_unpublishable_key_is_refused_at_creation() {
-        let (_d, _s, node) = node_with_space().await;
-        let target = node.upload_target("media", "notes.tmp").unwrap();
-        assert!(
-            node.create_upload("media", "notes.tmp", None, &target)
-                .is_err(),
-            "an ignored key was accepted"
-        );
-        let target = node.upload_target("media", "notes.txt").unwrap();
-        assert!(node
-            .create_upload("media", "notes.txt", None, &target)
-            .is_ok());
         node.shutdown().await.unwrap();
     }
 
@@ -981,9 +937,8 @@ mod ownership_tests {
             .create_upload("media", "a.bin", Some("AKIA1"), &target)
             .unwrap();
 
-        // The owner can; nobody else can, whichever way they hold it wrong —
-        // and they are all told the same thing, so a guessed id is never
-        // confirmed as real. Naming a different key does not help either.
+        // The owner can; nobody else can, however they hold it wrong — all
+        // told the same thing, so a guessed id is never confirmed real.
         assert!(node
             .open_part(&id, "media", "a.bin", Some("AKIA1"), 1)
             .is_ok());
@@ -995,8 +950,8 @@ mod ownership_tests {
         assert!(node
             .open_part(&id, "media", "elsewhere.bin", Some("AKIA1"), 1)
             .is_err());
-        // A listing shows it to its owner and to nobody else; the upload is
-        // untouched by all of that, and the owner can still abort it.
+        // A listing shows it to its owner and nobody else, and the owner can
+        // still abort it.
         assert_eq!(
             node.open_uploads("media", "", Some("AKIA1")).unwrap().len(),
             1

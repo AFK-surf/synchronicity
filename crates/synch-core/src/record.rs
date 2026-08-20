@@ -12,15 +12,12 @@ pub const RECORD_VERSION: u8 = 1;
 
 /// True if a record stamped `v` is one this build understands.
 ///
-/// The stamp is only worth carrying if something reads it, and until this
-/// existed nothing did. postcard decodes structurally and ignores trailing
-/// bytes, so a future record with a field appended decodes cleanly *as the
-/// current shape* — the new field silently dropped, the record materialized as
-/// though the publisher had never set it. That is the one failure a version
-/// stamp is for, and the whole cost of catching it is comparing one byte.
-///
-/// Older versions stay readable: `v` below the current one is a shape this
-/// build has already seen. Only the future is refused.
+/// The stamp is only worth carrying if something reads it. postcard decodes
+/// structurally and ignores trailing bytes, so a future record with a field
+/// appended decodes cleanly *as the current shape* — the new field silently
+/// dropped, as though the publisher had never set it. That is the one failure
+/// a version stamp is for, and catching it costs one byte. Older versions stay
+/// readable; only the future is refused.
 pub fn is_supported_version(v: u8) -> bool {
     v <= RECORD_VERSION
 }
@@ -34,11 +31,10 @@ pub const PREFIX_MANIFEST: u8 = b'm';
 /// The `d:` key prefix: a delegation this origin has issued (§3.5).
 pub const PREFIX_DELEGATION: u8 = b'd';
 
-/// The most spaces one [`Delegation`] may name.
-///
-/// A delegation is a restriction, so a list long enough to be unreadable is
-/// already the wrong shape — and the record is replicated to every member, so
-/// the bound is what keeps one issuer from growing everybody's trie.
+/// The most spaces one [`Delegation`] may name. A delegation is a restriction,
+/// so a list too long to be unreadable is the wrong shape — and the record is
+/// replicated to every member, so the bound keeps one issuer from growing
+/// everybody's trie.
 pub const MAX_DELEGATION_SPACES: usize = 32;
 
 /// What a [`FileEntry`] describes.
@@ -151,12 +147,10 @@ impl FileEntry {
 /// How much of an object a holder has: the byte spans it holds, coalesced at
 /// 16 MiB granularity.
 ///
-/// One representation, not two. A `Complete` variant beside `Partial` would
-/// be exactly `Partial { spans: [(0, size)] }`, so every consumer would branch
-/// on the distinction to arrive back at the same answer, and the
-/// `blob_providers` table would carry the same duplication as a `complete`
-/// column beside the spans. Completeness is a question you ask of the spans
-/// and the size, not a second thing to keep in step with them.
+/// One representation, not two: a `Complete` variant would be exactly
+/// `Partial { spans: [(0, size)] }`, so every consumer would branch on the
+/// distinction to arrive back at the same answer. Completeness is a question
+/// you ask of the spans and the size, not a second thing to keep in step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdState {
     /// Held `[start, end)` byte spans.
@@ -165,21 +159,17 @@ pub struct AdState {
 
 /// The most spans one advertisement may carry, on the wire or in memory.
 ///
-/// A `b:` record is a trie value, bounded only by `MAX_FRAME_LEN` (16 MiB), and
-/// a span is sixteen bytes — so an origin can publish one record naming a
-/// million spans, and every peer that materializes it, and every peer that
-/// answers `FindProviders` for it, decodes the lot. §12 promises to cap the
-/// cost of any single extreme message; without this the cap could only be
-/// applied after the decode, which is after the allocation it is meant to
-/// bound.
-///
-/// Generous next to anything honest: spans are 16 MiB-granular runs of held
-/// bytes, a fetch walks windows in order, and `coalesce_spans` merges what
-/// touches, so a real partial holder publishes a handful. What is over the cap
-/// is dropped rather than merged across the gaps between runs, because merging
-/// would claim bytes the holder does not have — over-reporting availability
-/// sends a fetcher to a provider that cannot serve it, while under-reporting
-/// costs at most a re-fetch (§6.3).
+/// A `b:` record is a trie value bounded only by `MAX_FRAME_LEN` (16 MiB) and a
+/// span is sixteen bytes, so an origin can publish one record naming a million
+/// spans and every peer that materializes it — or answers `FindProviders` over
+/// it — decodes the lot; §12's per-message cap cannot apply after the decode,
+/// which is after the allocation it is meant to bound. Generous next to
+/// anything honest: spans are 16 MiB-granular runs, a fetch walks windows in
+/// order, and `coalesce_spans` merges what touches, so a real partial holder
+/// publishes a handful. What is over the cap is dropped rather than merged
+/// across gaps, because merging would claim bytes the holder does not have:
+/// over-reporting sends a fetcher to a provider that cannot serve it, while
+/// under-reporting costs at most a re-fetch (§6.3).
 pub const MAX_AD_SPANS: usize = 1024;
 
 /// Granularity at which partial spans are coalesced before publishing (§4.2).
@@ -196,9 +186,9 @@ impl<'de> Deserialize<'de> for AdState {
     where
         D: serde::Deserializer<'de>,
     {
-        /// The struct shape [`AdState`] serializes as, with the field bounded.
-        /// Written out rather than hand-decoding a sequence so a
-        /// self-describing format still sees a struct with a `spans` field.
+        /// The struct shape [`AdState`] serializes as, with the field bounded
+        /// (rather than hand-decoding a sequence, so a self-describing format
+        /// still sees a `spans` field).
         #[derive(Deserialize)]
         struct Wire {
             spans: BoundedSpans,
@@ -234,8 +224,7 @@ impl<'de> Deserialize<'de> for BoundedSpans {
                 let mut spans: Vec<(u64, u64)> = Vec::new();
                 while let Some(span) = seq.next_element::<(u64, u64)>()? {
                     // Truncating the tail keeps the claim a subset of what was
-                    // published, which is the direction that costs a re-fetch
-                    // rather than a wasted dial.
+                    // published — a re-fetch rather than a wasted dial.
                     if spans.len() < MAX_AD_SPANS {
                         spans.push(span);
                     }
@@ -285,9 +274,8 @@ impl BlobAd {
         }
     }
 
-    /// True if the ad covers the whole object.
-    ///
-    /// Derived, not stored: one span reaching from nothing to the object's end.
+    /// True if the ad covers the whole object. Derived, not stored: one span
+    /// reaching from nothing to the object's end.
     pub fn is_complete(&self) -> bool {
         self.size == 0 || matches!(self.state.spans.as_slice(), [(0, end)] if *end >= self.size)
     }
@@ -302,37 +290,30 @@ impl BlobAd {
 /// touches.
 ///
 /// Ads are hints, not promises (§6.3) — the fetcher learns exact availability
-/// from `SliceEnd` — but the direction of the error is not a free choice, and
-/// this is where the policy stated at [`MAX_AD_SPANS`] is kept:
-/// over-reporting availability sends a fetcher to a provider that cannot serve
-/// it, while under-reporting costs at most a re-fetch.
+/// from `SliceEnd` — but the direction of the error is not a free choice:
+/// over-reporting sends a fetcher to a provider that cannot serve it, while
+/// under-reporting costs at most a re-fetch.
 ///
-/// This used to round the start down and the end *up*, which over-claims at both
-/// ends of every run — up to a 16 MiB granule of bytes the node does not hold on
-/// each side. Not an edge case: a slice window is 8 MiB, so a fetch in progress
-/// almost never lands on a granule boundary, and `ad_update_due` republishes
-/// mid-window every 60 s. Worse, the clamp to `size` made it *claim the whole
-/// object*: a holder of the first 8 MiB of a 10 MiB object published
-/// `[(0, 10 485 760)]`, which is exactly the shape [`BlobAd::is_complete`] reads
-/// as "I hold all of this". Peers wrote `complete = 1` into `blob_providers`,
-/// ordered it first, and handed it a full `1/fanout` share of the object.
-///
-/// So a run contributes the largest granule-aligned span inside it. The object's
-/// own boundaries are exact rather than rounded — 0 is a granule boundary
-/// anyway, and the final partial granule is real bytes the holder has — so a
-/// holder of the whole object still advertises the whole object, and
-/// `is_complete` means what its name says again.
+/// This used to round the start down and the end *up*, over-claiming up to a
+/// 16 MiB granule at each end of every run — not an edge case, since a slice
+/// window is 8 MiB and a fetch in progress almost never lands on a boundary.
+/// Worse, the clamp to `size` made it *claim the whole object*: a holder of
+/// the first 8 MiB of a 10 MiB object published `[(0, 10 485 760)]`, exactly
+/// the shape [`BlobAd::is_complete`] reads as "I hold all of this" — peers
+/// ranked it first and handed it a full `1/fanout` share. So a run now
+/// contributes the largest granule-aligned span inside it; the object's own
+/// boundaries stay exact (0 is a granule boundary anyway, and the final partial
+/// granule is real bytes), so a whole-object holder still advertises the whole
+/// object.
 pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = spans
         .into_iter()
         .filter(|(s, e)| s < e)
         .map(|(s, e)| {
             // Clamped to the object first, so nothing downstream has to reason
-            // about a span past the end.
+            // about a span past the end — and the tail granule at the object's
+            // end survives as real bytes, not a rounding artifact.
             let (s, e) = (s.min(size), e.min(size));
-            // The start rounds *up* to the next boundary and the end *down* to
-            // the previous one — except at the object's end, where the tail
-            // granule is not a rounding artifact but the last real bytes.
             let start = s
                 .div_ceil(AD_SPAN_GRANULARITY)
                 .saturating_mul(AD_SPAN_GRANULARITY);
@@ -353,8 +334,7 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
         }
     }
     // The same cap the decode applies, so what this node publishes is what a
-    // peer will keep of it. Dropped from the tail, never merged across the
-    // gaps: a merge would advertise bytes this node does not hold.
+    // peer will keep of it; dropped from the tail, never merged across gaps.
     out.truncate(MAX_AD_SPANS);
     out
 }
@@ -363,8 +343,8 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
 /// `m:space/<space-id>`.
 ///
 /// One record per space rather than a list inside the manifest, because the
-/// redaction boundary is a key prefix (§5.5): a delegate is served the spaces it
-/// was granted and learns nothing of the rest, and a single leaf holding every
+/// redaction boundary is a key prefix (§5.5): a delegate is served the spaces
+/// it was granted and nothing of the rest, so a single leaf holding every
 /// space's name and count could not be shown to it at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceInfo {
@@ -378,9 +358,8 @@ pub struct SpaceInfo {
 
 /// Node info published under `m:self`.
 ///
-/// Carries nothing space-specific: what a node advertises about its spaces
-/// lives under `m:space/<id>`, one record each, so that it can be redacted per
-/// space (§5.5).
+/// Carries nothing space-specific: space advertisements live under
+/// `m:space/<id>`, one record each, so they can be redacted per space (§5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeManifest {
     /// Schema version.
@@ -394,11 +373,11 @@ pub struct NodeManifest {
 /// A delegation this origin has issued, published under `d:<device key>`
 /// (§3.5).
 ///
-/// The delegated key *is* the trie key, which settles three things at once:
-/// re-issuing is an update rather than a second record, revoking is a deletion
-/// of the obvious key, and the accept-time question is a direct lookup. The
-/// issuer is implicit — the record sits in the issuer's trie — so there is no
-/// issuer field to check, and none to forge.
+/// The delegated key *is* the trie key, settling three things at once:
+/// re-issuing is an update, revoking is a deletion of the obvious key, and the
+/// accept-time question is a direct lookup. The issuer is implicit — the
+/// record sits in the issuer's trie — so there is no issuer field to check,
+/// and none to forge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
     /// Schema version.
@@ -436,8 +415,7 @@ impl Delegation {
     ///
     /// An instant no trust decision may be dated by ([`crate::clock_is_trusted`])
     /// dates nothing: a node whose clock cannot place it reads as holding no
-    /// delegated trust rather than as holding all of it, exactly as it treats
-    /// DNS bindings.
+    /// delegated trust rather than all of it, exactly as with DNS bindings.
     pub fn is_live(&self, now: i64) -> bool {
         crate::clock_is_trusted(now) && now < self.not_after
     }
@@ -523,13 +501,12 @@ pub fn parse_file_key(key: &[u8]) -> Result<(String, String), KeyError> {
     if path.is_empty() {
         return Err(KeyError::Malformed);
     }
-    // The path invariant (no `.`/`..`, no leading/empty segments, NFC — §4.1)
-    // must be enforced at the trust boundary, not just when we build our own
-    // keys. A peer's origin trie is single-writer and replicated wholesale, so
-    // a malicious peer can publish `f:space//etc/x` or `f:space/../../x`; if we
-    // accept it, the raw path flows into the entries view and then into
-    // `root_dir.join(path)` during mirror materialization, escaping the mirror
-    // root. Reject any key whose path is not already canonical.
+    // The path invariant (§4.1) is enforced at the trust boundary, not just
+    // when we build our own keys: a peer's origin trie is single-writer and
+    // replicated wholesale, so a malicious peer can publish `f:space//etc/x`
+    // or `f:space/../../x`; accepted, the raw path flows into the entries view
+    // and then `root_dir.join(path)` during mirror materialization, escaping
+    // the mirror root. Reject any key whose path is not already canonical.
     let normalized = normalize_path(path).map_err(|_| KeyError::Malformed)?;
     if normalized != path {
         return Err(KeyError::Malformed);
@@ -611,15 +588,13 @@ pub fn delegation_prefix() -> Vec<u8> {
 
 /// The trie key prefixes a peer delegated `spaces` may be *served* (§5.5).
 ///
-/// Everything a delegate is entitled to see, expressed as key prefixes,
-/// because that is the only shape the redaction boundary can take:
-/// authorization is a statement about *where* a node sits, and the walk on
-/// both sides tests exactly this list.
+/// Everything a delegate is entitled to see, expressed as key prefixes — the
+/// only shape the redaction boundary can take: authorization is about *where*
+/// a node sits, and the walk on both sides tests exactly this list.
 ///
-/// `b:` is deliberately absent. A delegate learns object availability through
-/// `FindProviders`, the path §5.1 already provides for a node holding no ads
-/// for a root it wants — which makes the `b:` namespace not merely filtered
-/// for a delegate but invisible, down to how many objects an origin holds.
+/// `b:` is deliberately absent: a delegate learns object availability through
+/// `FindProviders` (§5.1), making the `b:` namespace invisible to it, down to
+/// how many objects an origin holds.
 pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
     let mut out = ScopeKeys {
         prefixes: vec![delegation_prefix()],
@@ -638,13 +613,13 @@ pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
 
 /// What part of the keyspace a scope covers, as the two shapes it takes.
 ///
-/// The distinction is load-bearing. `f:<space>/` ends in a separator that
+/// The distinction is load-bearing. `f:<space>/` ends in a separator
 /// `validate_space` forbids inside an id, so it bounds itself and everything
 /// under it belongs to that space. `m:space/<id>` and `m:self` bound nothing:
-/// treated as prefixes they admit every key that merely *starts* with them, so
-/// a delegation of `photos` would carry `m:space/photos-raw` — another space's
-/// entry count and the absolute local path its origin keeps it at — and a
-/// delegate could publish under it too.
+/// as prefixes they admit every key that merely *starts* with them, so a
+/// delegation of `photos` would carry `m:space/photos-raw` — another space's
+/// entry count and its absolute local path — and a delegate could publish
+/// under it too.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScopeKeys {
     /// Every key beneath these belongs to the scope.
@@ -655,13 +630,11 @@ pub struct ScopeKeys {
 
 /// The trie key prefixes a delegated origin may *publish* under (§3.5).
 ///
-/// Not the same set as what it may read, and the difference is in both
-/// directions. `b:` is here because a delegate that holds content must be able
-/// to advertise it, or no member could fetch from it and the swarm loses a
-/// source for bytes the delegate legitimately has. `d:` is not, because a
-/// delegation is exactly what a delegate may not issue — R1 already means
-/// nobody would read one, and refusing the head keeps the rule visible at the
-/// point it is broken rather than silently ignored.
+/// Not the same set as what it may read. `b:` is here because a delegate that
+/// holds content must be able to advertise it, or the swarm loses a source for
+/// bytes the delegate legitimately has. `d:` is not, because a delegation is
+/// exactly what a delegate may not issue — R1 already means nobody would read
+/// one, and refusing the head keeps the rule visible where it is broken.
 pub fn publish_prefixes(spaces: &[String]) -> ScopeKeys {
     let mut out = ScopeKeys {
         prefixes: vec![blob_prefix()],
@@ -825,12 +798,10 @@ mod tests {
 
     /// A record naming a million spans decodes to at most the cap.
     ///
-    /// `spans` is a bare `Vec` on the wire and a `b:` record is a trie value
-    /// bounded only by `MAX_FRAME_LEN`, so one 16 MiB record names on the order
-    /// of a million spans — 128 MB of allocation and decode for whoever
-    /// materializes it or answers `FindProviders` over it. The cap has to apply
-    /// during the decode, since a vector that has been deserialized has already
-    /// cost what the cap exists to deny (§12).
+    /// `spans` is a bare `Vec` on the wire: one 16 MiB record names on the order
+    /// of a million spans — 128 MB of allocation and decode. The cap must apply
+    /// during the decode, since a deserialized vector has already cost what the
+    /// cap exists to deny (§12).
     #[test]
     fn an_extreme_span_list_is_capped_as_it_decodes() {
         let g = AD_SPAN_GRANULARITY;
@@ -863,10 +834,8 @@ mod tests {
         assert_eq!(ours.state.spans.len(), MAX_AD_SPANS);
     }
 
-    /// Coalescing under-reports rather than over-reports: rounding a run *out*
-    /// to granule boundaries claims up to 16 MiB of unheld bytes at each end,
-    /// which is what a holder of two bytes used to advertise as the whole first
-    /// granule — the direction `MAX_AD_SPANS` states.
+    /// Coalescing under-reports rather than over-reports: rounding a run out to
+    /// granule boundaries claims up to 16 MiB of unheld bytes at each end.
     #[test]
     fn spans_coalesce_at_16mib() {
         let g = AD_SPAN_GRANULARITY;
@@ -899,10 +868,8 @@ mod tests {
 
     /// A holder of part of an object never advertises the whole of it.
     ///
-    /// `is_complete` reads one span reaching from 0 to the size, and clamping an
-    /// outward-rounded end to `size` produced exactly that shape for a node
-    /// holding one window: peers derived `complete = 1`, ranked it first, and
-    /// handed it a full share of the object.
+    /// Clamping an outward-rounded end to `size` once made a node holding one
+    /// window look complete: peers ranked it first and handed it a full share.
     #[test]
     fn a_partial_holder_never_reports_complete() {
         let g = AD_SPAN_GRANULARITY;

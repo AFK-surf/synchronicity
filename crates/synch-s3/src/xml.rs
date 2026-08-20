@@ -504,10 +504,8 @@ mod tests {
         const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let body = format!(
-            "<CompleteMultipartUpload>\
-             <Part><PartNumber>1</PartNumber><ETag>&quot;{A}&quot;</ETag></Part>\
-             <Part><PartNumber>2</PartNumber><ETag>\"{B}\"</ETag></Part>\
-             </CompleteMultipartUpload>"
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;{A}&quot;</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"{B}\"</ETag></Part></CompleteMultipartUpload>"
         );
         let parts = parse_complete_upload(&body).unwrap();
         assert_eq!(parts.len(), 2);
@@ -516,11 +514,9 @@ mod tests {
         assert_eq!(parts[1].etag, B);
         assert_eq!(parts[1].number, 2);
 
-        // Namespaces and attributes are legal S3 and must not read as
-        // unrecognized elements.
+        // Namespaces and attributes are legal S3 and must not read as unrecognized elements.
         let decorated = format!(
-            "<s3:CompleteMultipartUpload xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <s3:Part foo=\"bar\"><s3:PartNumber>7</s3:PartNumber>\
+            "<s3:CompleteMultipartUpload xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\"><s3:Part foo=\"bar\"><s3:PartNumber>7</s3:PartNumber>\
              <s3:ETag>\"{A}\"</s3:ETag></s3:Part></s3:CompleteMultipartUpload>"
         );
         let parts = parse_complete_upload(&decorated).unwrap();
@@ -533,18 +529,14 @@ mod tests {
         // A checksum element the gateway does not read must not derail the parse.
         let root = "c".repeat(64);
         let body = format!(
-            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
-             <ChecksumCRC32C>aaaa</ChecksumCRC32C><ETag>\"{root}\"</ETag></Part>\
-             </CompleteMultipartUpload>"
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ChecksumCRC32C>aaaa</ChecksumCRC32C>\
+             <ETag>\"{root}\"</ETag></Part></CompleteMultipartUpload>"
         );
         assert_eq!(parse_complete_upload(&body).unwrap().len(), 1);
-        // An ETag this gateway could never have issued is a malformed body, not
-        // an absence of opinion — reading it as "no opinion" silently turns off
-        // the one check the element exists for.
+        // An ETag the gateway could never issue is malformed, not no-opinion — the element's one check must not silently turn off.
         assert!(parse_complete_upload(&body.replace(&root, "abc")).is_err());
         assert!(parse_complete_upload(&body.replace(&format!("\"{root}\""), "")).is_err());
-        // Part numbers outside S3's range, or spelled oddly, are refused where
-        // they are read.
+        // Part numbers outside S3's range, or oddly spelled, are refused where read.
         for bad in ["0", "10001", "-1", "+5", ""] {
             let body = body.replace("<PartNumber>1<", &format!("<PartNumber>{bad}<"));
             assert!(parse_complete_upload(&body).is_err(), "{bad}");
@@ -562,8 +554,7 @@ mod tests {
             <CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
             <ETag>&x;</ETag></Part></CompleteMultipartUpload>";
         assert!(parse_complete_upload(xxe).is_err());
-        // Belt-and-braces: a lower-case declaration that slips past the
-        // substring check still fails as a malformed ETag, not a file read.
+        // Belt-and-braces: a case-variant declaration still fails as a malformed ETag, not a file read.
         assert!(parse_complete_upload(&xxe.replace("<!DOCTYPE", "<!doctype")).is_err());
         // The cap is on the body, before anything is parsed out of it.
         let huge = format!("<a>{}</a>", "x".repeat(MAX_COMPLETE_BODY));
@@ -601,9 +592,7 @@ mod tests {
 
     #[test]
     fn timestamps_format_as_rfc3339() {
-        // Epoch, an arbitrary instant, a leap day, and the negative clamp —
-        // each in both the XML and the HTTP-date shapes. The epoch was a
-        // Thursday, and the header format carries no millis.
+        // Epoch, an arbitrary instant, a leap day, and the negative clamp, in both shapes.
         let nanos = 1_704_164_645_678_000_000i64;
         let leap = 1_709_208_000_000_000_000i64;
         assert_eq!(format_timestamp(0), "1970-01-01T00:00:00.000Z");

@@ -1,7 +1,6 @@
-//! What the §5.2 frontier *costs*, asserted by counting node reads rather than
-//! by timing: a fetch must read each node about once rather than once per
-//! batch, and a fetch of a root matching one already held must touch what
-//! changed rather than the whole tree.
+//! What the §5.2 frontier *costs*, by counting node reads rather than timing:
+//! a fetch reads each node about once, and one against a held root touches
+//! only what changed.
 
 use std::{cell::Cell, convert::Infallible};
 
@@ -64,8 +63,8 @@ fn populate(store: &MemStore, count: usize, marker: &str) -> Hash {
 
 #[test]
 fn a_fetch_reads_each_node_about_once() {
-    // The walk is resumed between batches, not restarted at the root: a restart
-    // makes a cold fetch quadratic — invisible in a small test, fatal at scale.
+    // The walk is resumed between batches, not restarted at the root — a restart
+    // makes a cold fetch quadratic: invisible in a small test, fatal at scale.
     let source = MemStore::new();
     let root = populate(&source, 2_000, "v1");
     // Reachable from the final root, not everything the store holds: building
@@ -102,8 +101,7 @@ fn a_fetch_reads_each_node_about_once() {
     }
 
     assert_eq!(destination.node_count(), total, "every node arrived");
-    // Each node is read once when found absent and once after it lands; the
-    // restart-per-batch version read roughly `total²/batch` reads.
+    // Each node is read once absent and once landed; a restart per batch read `total²/batch` times.
     assert!(
         counting.reads() < total * 4,
         "a cold fetch of {total} nodes read {} times; it is re-walking what it \
@@ -120,8 +118,8 @@ fn a_fetch_against_a_held_root_touches_only_what_changed() {
     let old_root = populate(&store, 2_000, "v1");
     let full = Trie::new(&store).reachable(old_root).unwrap().nodes.len();
 
-    // One key changes. Both roots' nodes live in this store, so anything the
-    // walk reads, it reads because it chose to descend there.
+    // One key changes; both roots' nodes live here, so anything the walk reads
+    // it reads because it chose to descend there.
     let trie = Trie::new(&store);
     let new_root = trie
         .insert(old_root, b"f:media/dir00/file000000", b"changed")
@@ -142,8 +140,7 @@ fn a_fetch_against_a_held_root_touches_only_what_changed() {
         counting.reads()
     );
 
-    // And without the reference it costs the whole tree, which is the contrast
-    // the pruning exists to make.
+    // Without the reference it costs the whole tree — the contrast the pruning exists to make.
     let counting = Counting::new(&store);
     let counted = Trie::new(&counting);
     let mut blind = MissingWalk::new(new_root);
@@ -157,9 +154,8 @@ fn a_fetch_against_a_held_root_touches_only_what_changed() {
 
 #[test]
 fn pruning_never_reports_a_partial_trie_complete() {
-    // The pruning rule leans on the reference root being held *whole*: a
-    // reference sharing structure with the new root where the shared part is
-    // genuinely absent must still be reported missing.
+    // The pruning rule leans on the reference being held *whole*: shared structure
+    // that is genuinely absent must still be reported missing.
     let source = MemStore::new();
     let old_root = populate(&source, 500, "v1");
     let trie = Trie::new(&source);
@@ -167,15 +163,11 @@ fn pruning_never_reports_a_partial_trie_complete() {
         .insert(old_root, b"f:media/dir00/file000000", b"changed")
         .unwrap();
 
-    // A destination holding nothing at all, handed the old root as a reference
-    // it does not actually have.
+    // A destination holding nothing, handed the old root as a reference it does not have.
     let destination = MemStore::new();
     let trie = Trie::new(&destination);
     let mut walk = MissingWalk::since(Some(old_root), new_root);
     let missing = walk.next_batch(&trie, 256).unwrap();
-    assert!(
-        !missing.is_empty(),
-        "a walk over a trie held nowhere must report it missing"
-    );
+    assert!(!missing.is_empty());
     assert!(!walk.is_exhausted());
 }

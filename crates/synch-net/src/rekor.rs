@@ -1,29 +1,29 @@
 //! Zone-key transparency: the offline half (docs/REKOR-ZONE-KEY.md).
 //!
 //! DNSSEC answers *is this key authorized for this zone?* by delegation, and
-//! every link in that delegation is an institution that can be compromised or
-//! compelled. A substituted DS names an attacker's key, the attacker signs a
-//! perfectly valid zone, and nothing in DNSSEC makes the substitution visible
-//! to the zone's real operator. Requiring the zone key to appear in a public,
-//! append-only log does not prevent the substitution — it makes it *public*.
-//! An attacker must either log their key under the operator's apex, where a
-//! monitor sees it, or fail validation here.
+//! every link in that delegation is an institution that can be compromised
+//! or compelled: a substituted DS names an attacker's key, the attacker
+//! signs a perfectly valid zone, and nothing in DNSSEC makes the substitution
+//! visible. Requiring the zone key to appear in a public, append-only log
+//! does not prevent the substitution — it makes it *public*: an attacker
+//! must either log their key under the operator's apex, where a monitor sees
+//! it, or fail validation here.
 //!
 //! Everything in this module is pure and offline. A proof arrives inside the
 //! zone (a TXT record at `_synchronicity-rekor.<apex>`), so the client never
 //! talks to Rekor: the proof verifies against the DNSKEY the chain already
 //! validated and against a *pinned* log key, never against where it came
-//! from. Fail closed — every check below refuses rather than degrades, and
-//! the caller keeps its previously cached member set (§4.3).
+//! from. Fail closed — every check refuses rather than degrades, and the
+//! caller keeps its cached member set (§4.3).
 //!
 //! What an entry claims is an authorized **key set**: the apex DNSKEY RRset
 //! its embedded chain proves. The entry's own signature is *attribution* —
-//! it names whoever built the entry, via the certificate's key — and
-//! authorizes nothing. Authorization is the chain, and only the chain: an
-//! attacker able to forge a chain for a rogue key necessarily holds that key
-//! and could sign anything it liked, so a possession requirement would add
-//! no security while making a provider-held zone key (Cloudflare's, Bunny's)
-//! impossible to log at all. See docs/EXTERNAL-DNS-PROVIDER.md.
+//! it names whoever built the entry — and authorizes nothing. Authorization
+//! is the chain, and only the chain: an attacker able to forge a chain for a
+//! rogue key holds that key and could sign anything it liked, so a
+//! possession requirement would add no security while making a
+//! provider-held zone key (Cloudflare's, Bunny's) impossible to log at all.
+//! See docs/EXTERNAL-DNS-PROVIDER.md.
 //!
 //! # Wire format
 //!
@@ -76,7 +76,7 @@
 //! The Statement travels alongside the body (not inside it) because the body
 //! commits only to the PAE *digest*; the client re-derives that digest from
 //! the Statement bytes and refuses the proof if they disagree. None of this
-//! is negotiable per deployment: a v4 of the record format is how it changes.
+//! is negotiable per deployment — a v4 of the record format is how it changes.
 
 use std::path::Path;
 
@@ -389,36 +389,30 @@ pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>
 /// Reassembles one group: one reading per part count its records claim.
 ///
 /// **One chunk per index, and a duplicated index is a contradiction rather
-/// than a candidate.** The alternative — treating duplicates as alternatives
-/// and trying every combination — is a product over the per-index counts, so
-/// it needs a cap, and the cap is what the injector then aims at: past it the
-/// group is refused whole, honest assembly and all.
+/// than a candidate.** The alternative — duplicates as alternatives, trying
+/// every combination — is a product over the per-index counts, needs a cap,
+/// and the cap is what an injector then aims at; past it the group is refused
+/// whole, honest assembly and all. It bought nothing to be worth that: every
+/// record arrives DNSSEC-validated, so the only party who can duplicate an
+/// index is the zone's own signer, who can delete the records or refuse the
+/// name instead — availability against the zone is not defensible, and
+/// *authorization* is what the group digest and the chain walk hold.
 ///
-/// It bought nothing to be worth that. Every record here arrives
-/// DNSSEC-validated, so the only party who can duplicate an index is the party
-/// who signs the zone — in external mode the managed provider the threat model
-/// names. That party can delete the records or refuse the name outright, so no
-/// amount of combinatorial patience changes what they can do to availability.
-/// What the design defends is *authorization*, and that is the group digest
-/// and the chain walk, which hold whatever the records look like.
-///
-/// So the rule is the one a self-contradicting answer gets everywhere else
-/// here: read it one way, and refuse if the records do not agree on what that
-/// way is. Distinct claimed totals are still separate readings — that is a sum
-/// over the records, not a product, and it is what lets a `1/5` set and a
-/// `1/9` set coexist at one name during a rollover.
+/// So the rule is the one a self-contradicting answer gets everywhere else:
+/// read it one way, refuse when the records do not agree on what that way is.
+/// Distinct claimed totals are still separate readings — a sum over the
+/// records, not a product — which is what lets a `1/5` set and a `1/9` set
+/// coexist at one name during a rollover.
 fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<RekorProof, ProofError> {
     use std::collections::BTreeMap;
 
     // Indexed once, by `(total, index)`. The obvious shape — rescanning
     // `parts` for every index of every claimed total — is quadratic in the
-    // record count and the records are attacker-chosen: sixteen names of
-    // validated TXT hold on the order of 27,000 minimal `sync1p` records, and
-    // one group whose records spread their claimed totals across 1..=255 costs
-    // roughly 9x10^8 tuple comparisons. That is about a second of CPU inside
-    // one `poll`, with no await in it for a timeout to fire at and no
-    // `spawn_blocking` under it, on a task that walks configured domains one at
-    // a time. The candidate cap runs after this, so it does not bound it.
+    // record count, and the records are attacker-chosen: sixteen names of
+    // validated TXT hold ~27,000 minimal records, and one group spread across
+    // totals 1..=255 costs about a second of CPU inside one `poll`, with no
+    // await for a timeout to fire at. The candidate cap runs after this, so
+    // it does not bound it.
     //
     // A BTreeMap rather than a HashMap: the keys are the zone's, and iteration
     // order is not something an answer should get to choose.
@@ -488,34 +482,27 @@ pub fn part_index_of(record: &str) -> Option<usize> {
     parse_chunk(record).ok().map(|(_, index, _, _)| index)
 }
 
-/// The most parts a client will gather to reassemble one proof.
-///
-/// An ICANN-rooted proof is ~6.1 KB encoded — 8202 base64url characters,
-/// five records at [`PROOF_CHUNK_CHARS`] apiece (docs/REKOR-ZONE-KEY.md §3).
-/// Sixteen is a little over three times that, so every proof this design
-/// actually produces fits with room for a chain that grows, while the work
-/// a single record can demand stays bounded at fifteen extra lookups
-/// instead of the format's 254.
+/// The most parts a client will gather to reassemble one proof. An
+/// ICANN-rooted proof is ~6.1 KB encoded — five records at
+/// [`PROOF_CHUNK_CHARS`] apiece (docs/REKOR-ZONE-KEY.md §3) — and sixteen
+/// covers that with room for a chain that grows, while the work a single
+/// record can demand stays bounded at fifteen extra lookups instead of the
+/// format's 254.
 pub const MAX_PROOF_PARTS: usize = 16;
 
 /// The largest part count any record at this name claims, capped at
-/// [`MAX_PROOF_PARTS`].
-///
-/// This is what tells a client how many more names to ask for. It is read
-/// from records that have already been DNSSEC-validated, so it is the zone's
-/// own statement — but it is still only a hint about *work*, never about
-/// truth: a wrong count yields a set that fails to reassemble, which is a
-/// refusal, not an acceptance.
+/// [`MAX_PROOF_PARTS`] — what tells a client how many more names to ask
+/// for. Read from already-DNSSEC-validated records, so it is the zone's own
+/// statement, but still only a hint about *work*, never about truth: a
+/// wrong count yields a set that fails to reassemble — a refusal, not an
+/// acceptance.
 ///
 /// The cap is what keeps "a hint about work" from being a hint about *how
-/// much* work. The format allows a `total` up to 255, and the client fetches
-/// parts 2..=N sequentially with a per-query timeout — so one record
-/// spelling `1/255` cost every resolving client 254 round trips before a
-/// byte of proof was verified, inside a refresh loop that walks configured
-/// domains one at a time. One hostile or simply mistaken zone could stall
-/// membership refresh for every other domain past the grace window after
-/// which cached bindings expire. The threat model's attacker *is* the zone,
-/// so "it would only be hurting itself" does not hold.
+/// much*: the format allows a `total` of 255, and one record spelling
+/// `1/255` would cost every resolving client 254 round trips before a byte
+/// was verified — a hostile or mistaken zone stalling every other domain's
+/// refresh past the grace window, and the threat model's attacker *is* the
+/// zone, so "it would only be hurting itself" does not hold.
 pub fn parts_claimed(records: &[String]) -> usize {
     records
         .iter()
@@ -630,48 +617,40 @@ pub struct VerifiedRecord {
 /// certificate (apex binding) carrying a DNSSEC chain that proves an
 /// authorized key set (authorization), whose own key signed the entry
 /// (attribution), whose digest is the DSSE PAE of this Statement, and whose
-/// Statement describes exactly that proven set — a set the key that signed
+/// Statement describes exactly that proven set — which the key that signed
 /// this answer is a member of (key binding). Any single failure refuses the
-/// whole record — there is no partial credit.
+/// whole record — no partial credit.
 ///
-/// There is deliberately no possession check. The entry signature names
-/// whoever built the entry, and that is all it can honestly do: an attacker
-/// able to forge an authorized chain for a rogue key holds that key and
-/// could sign possession too, so requiring the *zone* key's signature would
-/// add nothing — while making a provider-held key (a zone hosted and signed
-/// by Cloudflare or Bunny) impossible to log. Authorization is the chain.
+/// There is deliberately no possession check: an attacker able to forge an
+/// authorized chain for a rogue key holds that key and could sign possession
+/// too, so requiring the *zone* key's signature would add nothing — while
+/// making a provider-held key (a zone hosted and signed by Cloudflare or
+/// Bunny) impossible to log. Authorization is the chain.
 ///
 /// # The chain extension, and why the client verifies a chain it does not need
 ///
-/// The client learns nothing from it: it validated this zone's delegation
-/// natively, all the way to its trust anchor, before reaching this function.
-/// But *the client enforces whatever property makes an entry discoverable, or
-/// an attacker simply omits it* — and the chain is that property.
+/// The client validated this zone's delegation natively, all the way to its
+/// trust anchor, before reaching this function — but *the client enforces
+/// whatever property makes an entry discoverable, or an attacker simply
+/// omits it*. **The chain is required, and verified cryptographically**: its
+/// absence would *silence* a monitor — a chainless entry is tier B, recorded
+/// and not reported — handing an attacker a key that works against victims
+/// and rings no bell. So the client refuses it, which makes "client-accepted"
+/// imply "tier A" (docs/REKOR-ZONE-KEY.md §5.5). RRSIG validity *windows*
+/// are deliberately not checked here; see [`crate::chain`] for the reasons.
 ///
-/// **The DNSSEC chain is required, and verified cryptographically.** Its
-/// absence would *silence* a monitor: a chainless or broken-chain entry is
-/// tier B, the bin a monitor records and does not report. An attacker who
-/// could get such an entry accepted would hold a key that works against
-/// victims and rings no bell — strictly worse than no log at all. So the
-/// client refuses it, which makes "client-accepted" imply "tier A"
-/// (docs/REKOR-ZONE-KEY.md §5.5). RRSIG validity *windows* are deliberately
-/// not checked here; see [`crate::chain`] for the two reasons.
+/// **Unknown extensions are ignored, and that is load-bearing.** Nothing here
+/// refuses a certificate for carrying an extension this build has no name
+/// for — the conformance fixture carries some — and it still verifies.
 ///
-/// **Unknown extensions are ignored, and that is load-bearing.**
-/// [`Certificate::parse`] collects every extension verbatim and looks them up
-/// by OID; nothing here refuses a certificate for carrying one this build has
-/// no name for. An entry may therefore carry extensions this design says
-/// nothing about — the conformance fixture does — and still verify.
-///
-/// A `retire` entry is refused, and the order is worth stating because it is
-/// the reverse of what this comment used to say. The action is the last thing
-/// `check_binds` tests and `check_binds` is the last thing here, so a retire
-/// carrying a chain is chain-checked first and refused on its action — while
-/// the chainless retire the publish side is actually allowed to emit (a
-/// retired zone may have no DS left) never reaches that arm at all: it is
-/// refused as `Chain` several steps earlier. Either way retirement is a
-/// monitor breadcrumb (§2) and never authorization, which is the point;
-/// accepting one would reopen exactly the hole the chain requirement closes.
+/// A `retire` entry is refused, in an order worth stating because it is the
+/// reverse of what this comment used to say: the action is the last thing
+/// `check_binds` tests, so a retire carrying a chain is chain-checked first
+/// and refused on its action, while the chainless retire the publish side may
+/// emit (a retired zone may have no DS left) is refused as `Chain` several
+/// steps earlier. Either way retirement is a monitor breadcrumb (§2), never
+/// authorization — accepting one would reopen the hole the chain requirement
+/// closes.
 pub fn verify(
     proof: &RekorProof,
     key: &ZoneKey<'_>,
@@ -931,14 +910,15 @@ impl ZoneKeyStatement {
     /// order is applied here.
     ///
     /// A DNSKEY rdata is `flags(2) protocol(1) algorithm(1) key`, so anything
-    /// under four bytes has no complete header to read. **Such an rdata renders
-    /// as `flags: 0, algorithm: 0` — both zero together, never one real value
-    /// beside one invented one** — and the Gleam publisher renders it the same
-    /// way. Deriving each field on its own would let a three-byte rdata come out
-    /// as `flags: 258, algorithm: 0` here and all-zero there, and the Statement
-    /// is the artifact the two sides have to agree on byte for byte. Nothing
-    /// legitimate reaches it either way: the chain walk's rdatas come out of
-    /// parsed DNSKEY records, which cannot be shorter than their fixed header.
+    /// under four bytes has no complete header to read. **Such an rdata
+    /// renders as `flags: 0, algorithm: 0` — both zero together, never one
+    /// real value beside one invented one** — and the Gleam publisher renders
+    /// it the same way: deriving each field on its own would let a three-byte
+    /// rdata come out as `flags: 258, algorithm: 0` here and all-zero there,
+    /// and the Statement is what the two sides have to agree on byte for
+    /// byte. Nothing legitimate reaches it either way — the chain walk's
+    /// rdatas come out of parsed DNSKEY records, never shorter than their
+    /// fixed header.
     pub fn for_keys(apex: &str, rdatas: &[Vec<u8>], action: &str) -> ZoneKeyStatement {
         let mut keys: Vec<StatementKey> = rdatas
             .iter()
@@ -1173,19 +1153,18 @@ pub struct Checkpoint {
     pub root_hash: [u8; 32],
     /// The exact bytes the signatures cover.
     signed: Vec<u8>,
-    /// One entry per signature line: the key name it claims, its four-byte key
-    /// hint, and the signature itself.
+    /// One entry per signature line: the key name it claims, its four-byte
+    /// key hint, and the signature itself.
     ///
-    /// **This is a list, and it must stay one.** A real Sigstore checkpoint
+    /// **This is a list, and it must stay one**: a real Sigstore checkpoint
     /// carries the log's own signature *plus* a line per witness that
     /// cosigned the tree — the checked-in fixtures have four. This design
     /// does not interpret cosignatures in any way, but it has to tolerate
-    /// them: narrowing the parser to a single signature would reject every
-    /// checkpoint the production log actually serves.
-    ///
-    /// The *name* is kept because it is what says which line is the log
-    /// speaking about its own tree, and the hint because it is the one field
-    /// that binds a key to an origin (see [`Checkpoint::verify_signature`]).
+    /// them: a single-signature parser would reject every checkpoint the
+    /// production log actually serves. The *name* is kept because it says
+    /// which line is the log speaking about its own tree, and the hint
+    /// because it is the one field that binds a key to an origin (see
+    /// [`Checkpoint::verify_signature`]).
     signatures: Vec<Signature>,
 }
 
@@ -1936,12 +1915,10 @@ mod tests {
         assert_eq!(got, &big);
     }
 
-    /// Chunks of different proofs cannot be spliced into one that decodes.
-    ///
-    /// The group is the digest of the whole encoded record, so a mixed set
+    /// Chunks of different proofs cannot be spliced into one that decodes:
+    /// the group is the digest of the whole encoded record, so a mixed set
     /// either fails to reassemble or reassembles to something whose digest
-    /// is not the group it claimed — checked, because base64url of two
-    /// unrelated halves can still decode to *bytes*.
+    /// is not the group it claimed.
     #[test]
     fn chunks_from_two_proofs_do_not_splice() {
         let a = RekorProof {
@@ -2101,12 +2078,11 @@ mod tests {
     }
 
     /// The one external reality anchor for the checkpoint half: a genuine
-    /// signed checkpoint fetched from log2025-1.rekor.sigstore.dev, verified
-    /// here against the key this build embeds — nothing in this file
-    /// authored it. It also pins the parse *shape*: a real note carries the
-    /// log's signature plus three witness cosignatures, and a parser
-    /// narrowed to a single signature would reject everything the production
-    /// log serves.
+    /// signed checkpoint from log2025-1.rekor.sigstore.dev, verified against
+    /// the key this build embeds — nothing in this file authored it. It also
+    /// pins the parse *shape*: a real note carries the log's signature plus
+    /// three witness cosignatures, which a single-signature parser would
+    /// reject.
     #[test]
     fn a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set() {
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
@@ -2168,12 +2144,11 @@ mod tests {
     ///
     /// A witness key signs other logs' notes, so an unpinned log's checkpoint
     /// cosigned by a pinned key could travel under the pinned key's log_id;
-    /// the origin is inside the signed bytes, so requiring the signer's own
-    /// name to *be* that origin binds the key to the log. For Ed25519 the
-    /// note key id is SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32), so the hint is a
-    /// checkable statement of the same binding; Sigstore's P-256 logs publish
-    /// SHA-256 over the SubjectPublicKeyInfo instead, so no derivation is
-    /// right for that arm and none is claimed.
+    /// requiring the signer's own name to *be* the origin binds the key to
+    /// the log. For Ed25519 the note key id is SHA-256(origin ‖ 0x0A ‖ 0x01 ‖
+    /// raw32), so the hint is a checkable statement of the same binding;
+    /// Sigstore's P-256 logs publish SHA-256 over the SubjectPublicKeyInfo
+    /// instead, so no derivation is right for that arm and none is claimed.
     #[test]
     fn only_the_line_naming_the_origin_can_vouch_for_a_checkpoint() {
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
@@ -2249,14 +2224,12 @@ mod tests {
     }
 
     /// A pinned key does not vouch for a tree that is not its own log's,
-    /// however the note's *unsigned* tail is spelled.
-    ///
-    /// The line name and the four-byte hint are the two things a reader used
-    /// to read to decide which log signed, and both sit after the blank line
-    /// where no signature reaches. The binding has to come from the pin,
-    /// which is where the trusted root put it. Built rather than captured:
-    /// the shape needs a key that signed a note whose origin names a log the
-    /// key is not pinned for, and no real Sigstore checkpoint is one.
+    /// however the note's *unsigned* tail is spelled. The line name and the
+    /// four-byte hint — the two things a reader used to read to decide which
+    /// log signed — both sit after the blank line where no signature
+    /// reaches; the binding has to come from the pin, where the trusted root
+    /// put it. Built rather than captured: no real Sigstore checkpoint has a
+    /// key signing a note whose origin is not its own log.
     #[test]
     fn a_pinned_key_vouches_only_for_the_log_it_is_pinned_for() {
         use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
@@ -2299,15 +2272,13 @@ mod tests {
             .expect("a key pinned for this origin vouches for it");
     }
 
-    /// Reassembly is linear in the records offered, not quadratic.
-    ///
-    /// The records are the zone's, and the threat model's attacker *is* the
-    /// zone: sixteen validated TXT names hold tens of thousands of minimal
-    /// `sync1p` records, and spreading their claimed totals across 1..=255
-    /// made the old rescan-per-index cost about a second of CPU inside one
-    /// `poll`, with no await for a timeout to fire at. Asserted as a
-    /// wall-clock ceiling rather than an operation count, because the count
-    /// is what changed.
+    /// Reassembly is linear in the records offered, not quadratic. The
+    /// records are the zone's and the threat model's attacker *is* the zone:
+    /// sixteen validated TXT names hold tens of thousands of minimal
+    /// `sync1p` records, and spreading claimed totals across 1..=255 made
+    /// the old rescan-per-index cost about a second of CPU inside one
+    /// `poll`. Asserted as a wall-clock ceiling rather than an operation
+    /// count, because the count is what changed.
     #[test]
     fn reassembly_does_not_rescan_every_part_for_every_claimed_total() {
         let chunk = "A".repeat(8);
@@ -2358,15 +2329,13 @@ mod tests {
     }
 
     /// A group is one reading of its records, and a zone that contradicts
-    /// itself is refused rather than guessed at.
-    ///
-    /// Records claiming different totals are separate readings — a rollover
-    /// legitimately serves a five-part set beside a nine-part one — so a
-    /// raised total cannot hole the real set. Within one reading each index
-    /// arrives once; every record arrives DNSSEC-validated, so duplicating an
-    /// index takes the zone's signing key, and whoever holds that can delete
-    /// the records or refuse the name instead (the honest trade: this makes
-    /// a denial cheaper for the party who can mount one).
+    /// itself is refused rather than guessed at. Records claiming different
+    /// totals are separate readings — a rollover legitimately serves a
+    /// five-part set beside a nine-part one — so a raised total cannot hole
+    /// the real set. Within one reading each index arrives once; every
+    /// record arrives DNSSEC-validated, so duplicating an index takes the
+    /// zone's signing key, who can delete the records instead (the honest
+    /// trade: this makes a denial cheaper for the party who can mount one).
     #[test]
     fn a_group_is_one_reading_and_a_contradiction_is_refused() {
         let big = big_proof();

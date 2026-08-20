@@ -394,16 +394,14 @@ mod tests {
 
     #[test]
     fn coalescing_produces_protocol_sized_chunks() {
+        // Under a chunk: held; spanning a boundary: whole chunks; empty or exact: nothing left over.
         let mut coalesce = Coalesce::default();
-        // Nothing under a chunk is emitted early.
         assert!(coalesce.push(&[1u8; 10]).is_empty());
-        // A piece that spans a boundary emits exactly the whole chunks in it.
         let chunks = coalesce.push(&vec![2u8; CHUNK_SIZE * 2]);
         assert_eq!(chunks.len(), 2);
         assert!(chunks.iter().all(|c| c.len() == CHUNK_SIZE));
         assert_eq!(coalesce.rest().map(|r| r.len()), Some(10));
 
-        // An empty body coalesces to nothing; an exact multiple leaves none.
         let mut empty = Coalesce::default();
         assert!(empty.push(&[]).is_empty());
         assert_eq!(empty.rest(), None);

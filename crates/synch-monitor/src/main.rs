@@ -1082,9 +1082,7 @@ mod tests {
     use super::*;
     use synch_net::sim::{SimLog, SimZone};
 
-    /// A log served through the tile layout, from a `SimLog`'s leaves, with
-    /// the shared in-memory tile log carrying the tests' knobs (a bundle that
-    /// fails, a forged leaf).
+    /// A log served through the tile layout, with the tile log carrying the tests' knobs.
     struct Fixture {
         log: SimLog,
         tiles: synch_monitor::testsupport::MemoryLog,
@@ -1170,14 +1168,28 @@ mod tests {
         )
     }
 
-    /// **C3.** A walk that dies after the bundle holding a tier A entry still
-    /// returns that finding, and the position it records does not step over
-    /// it.
-    ///
-    /// The audited party triggers this deliberately: fail one tile request
-    /// once the monitor has crossed the bundle boundary, and a findings vector
-    /// dropped on the error takes the alarm with it while the cursor advances
-    /// past the entry that raised it.
+    /// One walk against the fixture, at the fixed test log.
+    async fn do_walk(
+        fixture: &Fixture,
+        keys: &LogKeys,
+        anchors: &TrustAnchors,
+        known: &KnownKeys,
+        state: &mut MonitorState,
+        args: &RunArgs,
+    ) -> Walked {
+        walk_log(
+            fixture,
+            "https://log.example",
+            keys,
+            anchors,
+            known,
+            state,
+            args,
+        )
+        .await
+    }
+
+    /// **C3.** A walk that dies mid-tree still returns its finding; the cursor stays put.
     #[tokio::test]
     async fn a_walk_that_fails_partway_still_returns_what_it_classified() {
         let dir = tempfile::tempdir().unwrap();
@@ -1191,31 +1203,18 @@ mod tests {
         let mut state = MonitorState::default();
         let known = watching("cluster.example");
         let args = run_args(&path);
-        let walked = walk_log(
-            &fixture,
-            "https://log.example",
-            &keys,
-            &anchors,
-            &known,
-            &mut state,
-            &args,
-        )
-        .await;
+        let walked = do_walk(&fixture, &keys, &anchors, &known, &mut state, &args).await;
 
         assert!(walked.failure.is_some(), "the second bundle must fail");
         let [found] = walked.classified.as_slice() else {
-            panic!(
-                "the finding must survive the failure: {:?}",
-                walked.classified
-            );
+            panic!("the finding must survive: {:?}", walked.classified);
         };
         assert_eq!(found.finding.log_index, 100);
         assert_eq!(found.finding.tier, Tier::A);
         assert_eq!(found.origin, "log2025-1.rekor.example");
         assert!(!found.body.is_empty(), "the evidence comes back with it");
 
-        // And the cursor stopped at the boundary of the bundle that
-        // completed, so nothing above it was skipped.
+        // The cursor stopped at the completed bundle's boundary, so nothing above it was skipped.
         assert_eq!(state.position("log2025-1.rekor.example").next_index, 256);
     }
 
@@ -1238,29 +1237,22 @@ mod tests {
         assert!(!default.is_empty());
     }
 
-    /// **D7.** A watch list that watches nothing is refused, whether it is
-    /// empty or unparseable.
-    ///
-    /// Non-emptiness was the only test, so a mistyped apex — the state file is
-    /// hand-edited — watched nothing forever and every run said "no alarm".
+    /// **D7.** A watch list that watches nothing is refused, empty or
+    /// unparseable: non-emptiness alone let a mistyped apex watch nothing forever.
     #[test]
     fn a_watch_list_that_watches_nothing_is_refused() {
         let path = Path::new("/nonexistent/monitor.json");
         let empty = KnownKeys::default();
-        let Err(err) = check_watch_list(&empty, path) else {
-            panic!("an empty watch list must be refused");
-        };
+        let err = check_watch_list(&empty, path).expect_err("an empty watch list must be refused");
         assert!(err.to_string().contains("no apex to watch"), "{err}");
 
-        // An entry that is not a name never matches a parsed SAN, so it
-        // watches nothing however long it sits there.
+        // An entry that is not a name never matches a parsed SAN.
         let mut hand_edited = KnownKeys::default();
         hand_edited
             .keys
             .insert("cluster.example..".into(), Vec::new());
-        let Err(err) = check_watch_list(&hand_edited, path) else {
-            panic!("an unparseable watch entry must be refused");
-        };
+        let err = check_watch_list(&hand_edited, path)
+            .expect_err("an unparseable watch entry must be refused");
         let err = err.to_string();
         assert!(err.contains("cluster.example.."), "{err}");
         assert!(err.contains("watches nothing"), "{err}");
@@ -1270,48 +1262,32 @@ mod tests {
             .expect("a domain name is a watchable apex");
     }
 
-    /// A watch list that widened since the positions were recorded is a
-    /// coverage gap, and the same permanent kind `--from-index` is refused
-    /// for: the filter runs per entry inside the walk, so nothing reaches
-    /// back for the entries it stepped over.
+    /// A watch list that widened since the positions were recorded is the
+    /// same permanent gap `--from-index` is refused for: nothing reaches back.
     #[test]
     fn a_watch_list_that_widened_since_the_last_walk_is_a_gap() {
         let recorded = vec!["a.example.com.".to_string()];
 
-        // A sibling: watched now, watched by nothing before.
-        assert_eq!(
-            watching("cp.example.com").widening_over(&recorded),
-            vec!["cp.example.com.".to_string()]
-        );
-        // The same name is not a widening, nor is a subdomain the old list
-        // already watched — which is exactly what the auto-insert writes when
-        // it records the apex of an entry it just reported.
-        assert!(watching("a.example.com")
-            .widening_over(&recorded)
-            .is_empty());
-        assert!(watching("sub.a.example.com")
-            .widening_over(&recorded)
-            .is_empty());
+        // A sibling: watched now, by nothing before.
+        let widened = watching("cp.example.com").widening_over(&recorded);
+        assert_eq!(widened, vec!["cp.example.com.".to_string()]);
+        // The same name and a subdomain are not widenings — exactly what the auto-insert records.
+        let same = watching("a.example.com").widening_over(&recorded);
+        assert!(same.is_empty());
+        let sub = watching("sub.a.example.com").widening_over(&recorded);
+        assert!(sub.is_empty());
 
-        // An **ancestor** is a widening, and this is the half that matters:
-        // `watches` is bidirectional, so the old list did match the parent
-        // itself — but watching it now covers every sibling subtree beneath
-        // it, and none of those were matched before.
-        assert_eq!(
-            watching("example.com").widening_over(&recorded),
-            vec!["example.com.".to_string()]
-        );
+        // An **ancestor** is a widening too, and the half that matters:
+        // `watches` is bidirectional, so watching it now covers every sibling subtree beneath it.
+        let widened = watching("example.com").widening_over(&recorded);
+        assert_eq!(widened, vec!["example.com.".to_string()]);
 
         // And a first run, with nothing recorded, is not a widening either.
         assert_eq!(watching("cp.example.com").widening_over(&[]).len(), 1);
     }
 
-    /// The watch-coverage guard actually refuses a run, and `--allow-gap`
-    /// actually lets one through.
-    ///
-    /// Deleting the whole `if let Some(covered)` block — reinstating the
-    /// defect a previous audit filed and fixed — left the workspace green,
-    /// because nothing exercised the refusal, the message or the escape.
+    /// The watch-coverage guard refuses a run and `--allow-gap` lets one through:
+    /// deleting `if let Some(covered)` — a filed-and-fixed audit defect — left the workspace green.
     #[test]
     fn a_widened_watch_list_refuses_the_run_until_the_operator_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -1327,8 +1303,7 @@ mod tests {
         state.position("log2025-1.rekor.example").next_index = 500;
         coverage_gap(&state, &args).expect("an unchanged list is not a gap");
 
-        // A sibling: matched by nothing before, so everything already in the
-        // log for it was stepped over.
+        // A sibling, matched by nothing before: everything in the log for it was stepped over.
         state.known.keys.insert("other.example.com.".into(), vec![]);
         let refused = coverage_gap(&state, &args).expect_err("a widened list is a gap");
         let message = refused.to_string();
@@ -1345,16 +1320,12 @@ mod tests {
     #[test]
     fn a_wildcard_label_anywhere_is_unwatchable() {
         for spelling in ["*.example.com", "a.*.example.com"] {
-            assert!(
-                !watching(spelling).unwatchable().is_empty(),
-                "{spelling} watches almost nothing and must be refused"
-            );
+            assert!(!watching(spelling).unwatchable().is_empty(), "{spelling}");
         }
         assert!(watching("cp.example.com").unwatchable().is_empty());
     }
 
-    /// **D7.** A `--from-index` that leaves a permanent hole is refused, not
-    /// mentioned on the commentary channel.
+    /// **D7.** A `--from-index` leaving a permanent hole is refused, not merely mentioned.
     #[tokio::test]
     async fn a_from_index_that_skips_a_range_forever_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1367,40 +1338,17 @@ mod tests {
         let mut args = run_args(&path);
         args.from_index = Some(100);
         let mut state = MonitorState::default();
-        let walked = walk_log(
-            &fixture,
-            "https://log.example",
-            &keys,
-            &anchors,
-            &known,
-            &mut state,
-            &args,
-        )
-        .await;
+        let walked = do_walk(&fixture, &keys, &anchors, &known, &mut state, &args).await;
         let failure = walked.failure.expect("a permanent gap must be refused");
         assert!(failure.to_string().contains("--allow-gap"), "{failure}");
-        // Nothing was read, so no position moved: the entries 0..100 are still
-        // there to be classified by a run without the flag.
+        // Nothing was read, so no position moved — 0..100 is still there for the next run.
         assert_eq!(state.position("log2025-1.rekor.example").next_index, 0);
 
-        // Said out loud in the same breath, it proceeds — and the entry above
-        // the gap is still classified.
+        // Said out loud, it proceeds — the entry above the gap is still classified.
         args.allow_gap = true;
-        let walked = walk_log(
-            &fixture,
-            "https://log.example",
-            &keys,
-            &anchors,
-            &known,
-            &mut state,
-            &args,
-        )
-        .await;
+        let walked = do_walk(&fixture, &keys, &anchors, &known, &mut state, &args).await;
         assert!(walked.failure.is_none(), "{:?}", walked.failure);
-        assert_eq!(
-            state.position("log2025-1.rekor.example").next_index,
-            300,
-            "the run read to the end of the tree"
-        );
+        let next = state.position("log2025-1.rekor.example").next_index;
+        assert_eq!(next, 300, "the run read to the end of the tree");
     }
 }

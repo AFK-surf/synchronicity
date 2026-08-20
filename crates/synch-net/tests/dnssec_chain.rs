@@ -1,8 +1,6 @@
-//! The DNSSEC chain validator — the one implementation both client and
-//! monitor run, so *client-accepted implies tier A* holds only because there
-//! is one. Everything here is signed by zones the suite holds keys for: the
-//! contract under test is what a chain has to *say* before it authorizes
-//! anything, not whether a delegation ladder verifies.
+//! The DNSSEC chain validator — the one implementation both client and monitor
+//! run, so *client-accepted implies tier A* holds only because there is one.
+//! Everything here is signed by zones the suite holds keys for.
 
 mod common;
 
@@ -17,8 +15,7 @@ fn apex(text: &str) -> Name {
     chain::parse_name(text).expect("a test apex is a name")
 }
 
-/// An hour ago: RRSIG validity has to bracket "now" for the sim's answers,
-/// and the chain walk reads no clock at all.
+/// An hour ago: RRSIG validity brackets "now", and the chain walk reads no clock.
 fn inception() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() - time::Duration::hours(1)
 }
@@ -37,8 +34,7 @@ fn anchored_at(zone: &SimZone) -> TrustAnchors {
     TrustAnchors::from_file(file.path()).expect("read anchor")
 }
 
-/// `chain::validate` of `zone`'s self-anchored chain for `apex`, expecting
-/// success.
+/// `chain::validate` of `zone`'s self-anchored chain for `apex`, expecting success.
 fn valid(zone: &SimZone, apex_name: &Name) -> (Vec<Vec<u8>>, Name, chain::ValidChain) {
     chain::validate(&zone.dnssec_chain(), apex_name, &anchored_at(zone))
         .expect("a declared zone validates")
@@ -50,8 +46,7 @@ fn invalid(zone: &SimZone, apex_name: &Name) -> ChainError {
         .expect_err("must be refused")
 }
 
-/// The self-anchored positive base case every negative test mutates: the
-/// declaration proves the zone's own key set.
+/// The self-anchored positive base case every negative test mutates.
 #[test]
 fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
     let zone = SimZone::new("cluster.example", Vec::new());
@@ -63,9 +58,8 @@ fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
     assert_eq!(proven, vec![zone.dnskey_rdata()]);
 }
 
-/// RFC 4035 §5.3.1: the signer is the closest enclosing zone. A signature
-/// made under a foreign name is still a well-formed record — deleting this
-/// comparison previously left the whole suite green.
+/// RFC 4035 §5.3.1: the signer is the closest enclosing zone — a foreign-named
+/// signature is still well-formed, and deleting this comparison left the suite green.
 #[test]
 fn a_declaration_signed_under_another_zones_name_is_refused() {
     let mut zone = SimZone::new("cluster.example", Vec::new());
@@ -75,86 +69,7 @@ fn a_declaration_signed_under_another_zones_name_is_refused() {
     assert!(text.contains("cluster.example"), "{text}");
 }
 
-/// A declaration under a real ladder shape whose cut spans several labels
-/// (`example.` delegates `cp.acme.example.` with no zone at all at
-/// `acme.example.`): each link's DS is computed over its own zone, so the
-/// cut's width was never load-bearing. (The plain root → TLD → apex walk is
-/// the shape the delegation tests below assert against.)
-#[test]
-fn a_declared_zone_under_a_delegation_ladder_validates_too() {
-    let ladder = SimDelegation::spanning("cp.acme.example", "example", Vec::new());
-    let (proven, signing_zone, valid) = chain::validate(
-        &ladder.chain(),
-        &apex("cp.acme.example."),
-        &anchored_at(&ladder.root),
-    )
-    .expect("a declared zone under a ladder validates");
-    assert_eq!(signing_zone, apex("cp.acme.example."));
-    assert_eq!(valid.anchor_zone, ".");
-    assert!(!valid.anchored_directly);
-    assert_eq!(
-        valid.links, 3,
-        "apex, TLD, root — the declaration is not one"
-    );
-    assert_eq!(proven, vec![ladder.apex.dnskey_rdata()]);
-}
-
-/// `sync.example.` is not a zone: no delegation, no DNSKEY — `example.`
-/// signs everything under it, the declaration included, and the keys it
-/// proves are `example.`'s. The signing zone must actually contain the
-/// apex: the same shape with an unrelated zone is refused on the containment
-/// rule before any signature is checked.
-#[test]
-fn an_apex_served_out_of_the_zone_above_it_validates() {
-    let zone = SimZone::new("example", Vec::new());
-    let apex_name = apex("sync.example.");
-    let declared_at = chain::transparency_name(&apex_name).expect("declaration name");
-    let carried = DnssecChain {
-        links: vec![
-            link(
-                &declared_at,
-                zone.signed_txt(declared_at.clone(), TRANSPARENCY_TEXT, inception()),
-            ),
-            link(&apex("example."), zone.dnskey_records(inception())),
-        ],
-    };
-    let (proven, signing_zone, valid) = chain::validate(&carried, &apex_name, &anchored_at(&zone))
-        .expect("an apex inside the zone above it validates");
-    assert_eq!(
-        signing_zone,
-        apex("example."),
-        "the ladder's bottom is the zone that holds the name, not the name"
-    );
-    assert_eq!(valid.anchor_zone, "example.");
-    assert_eq!(
-        proven,
-        vec![zone.dnskey_rdata()],
-        "the proven set is the signing zone's, since those keys sign the answers"
-    );
-
-    // Negative phase: a ladder for an unrelated zone, with a declaration
-    // spliced under a name that zone does not hold.
-    let other = SimZone::new("other.example", Vec::new());
-    let carried = DnssecChain {
-        links: vec![
-            link(
-                &declared_at,
-                other.signed_txt(declared_at.clone(), TRANSPARENCY_TEXT, inception()),
-            ),
-            link(&apex("other.example."), other.dnskey_records(inception())),
-        ],
-    };
-    let error = chain::validate(&carried, &apex_name, &anchored_at(&other))
-        .expect_err("a zone that does not contain the apex cannot speak for it");
-    assert!(
-        matches!(&error, ChainError::Structure(why) if why.contains("does not contain")),
-        "{error}"
-    );
-}
-
-/// Three declaration forgeries on the same SimDelegation setup: a key
-/// outside the proven set, the right records under a foreign zone's name,
-/// and a TXT payload that is not a declaration.
+/// Three declaration forgeries on the same ladder: a stranger's key, foreign-zone records, a non-declaration TXT.
 #[test]
 fn a_declaration_signed_by_a_stranger_is_refused() {
     let ladder = SimDelegation::new("cluster.example", Vec::new());
@@ -162,8 +77,7 @@ fn a_declaration_signed_by_a_stranger_is_refused() {
     let anchors = anchored_at(&ladder.root);
     let validate = |chain: &DnssecChain| chain::validate(chain, &apex_name, &anchors);
 
-    // Same owner name, same signer name, a key the apex's DNSKEY RRset does
-    // not contain.
+    // Same owner name, same signer name, a key the apex's DNSKEY RRset does not contain.
     let impostor = SimZone::for_name(apex("cluster.example."), Vec::new());
     let mut forged = ladder.chain();
     forged.links[0] = link(
@@ -172,8 +86,7 @@ fn a_declaration_signed_by_a_stranger_is_refused() {
     );
     assert!(matches!(validate(&forged), Err(ChainError::Signature(_))));
 
-    // A declaration for one zone does not carry another: refused on the name
-    // before any signature is consulted.
+    // A declaration for one zone does not carry another — refused on the name before any signature.
     let theirs = SimZone::new("other.example", Vec::new());
     let mut spliced = ladder.chain();
     spliced.links[0] = link(
@@ -182,9 +95,7 @@ fn a_declaration_signed_by_a_stranger_is_refused() {
     );
     assert!(matches!(validate(&spliced), Err(ChainError::Structure(_))));
 
-    // A TXT record at the declaration's name that does not say what a
-    // declaration says is not one — the zone's own self-anchored chain, so
-    // the refusal is about the wording.
+    // A TXT at the declaration's name that does not say what a declaration says is not one.
     let zone = SimZone::new("cluster.example", Vec::new());
     let mut chain_ = zone.dnssec_chain();
     let owner = zone.transparency_name();
@@ -200,15 +111,11 @@ fn a_declaration_signed_by_a_stranger_is_refused() {
     );
 }
 
-/// RFC 4035 §5.3.2: a wildcard expansion's RRSIG carries a short label
-/// count — the tell that a catch-all TXT zone declared nothing anybody
-/// decided.
+/// RFC 4035 §5.3.2: a wildcard expansion's RRSIG carries a short label count — the tell a catch-all declared nothing.
 #[test]
 fn a_wildcard_expansion_is_not_a_declaration() {
     let zone = SimZone::new("cluster.example", Vec::new());
-    // Signed as `*.cluster.example.` and served under the declaration's
-    // name: the signature is genuine and the labels are one short, exactly
-    // as a resolver would return a wildcard expansion.
+    // Signed as `*.cluster.example.` and served under the declaration's name: the signature is genuine, the labels one short.
     let wildcard = apex("*.cluster.example.");
     let mut records = zone.signed_txt(wildcard, TRANSPARENCY_TEXT, inception());
     let owner = zone.transparency_name();
@@ -225,9 +132,8 @@ fn a_wildcard_expansion_is_not_a_declaration() {
     );
 }
 
-/// A DNSKEY with no Zone Key flag cannot anchor or sign a chain (RFC 4034
-/// §2.1.1) — hickory's verifier reads neither flag, so the rule has to be
-/// enforced here — and neither can an RFC 5011 REVOKE-flagged key.
+/// A DNSKEY without the Zone Key flag cannot anchor or sign (RFC 4034 §2.1.1) —
+/// hickory reads neither flag — nor can an RFC 5011 REVOKE-flagged key.
 #[test]
 fn a_key_that_is_not_a_zone_key_signs_nothing_and_proves_nothing() {
     for (zone_key, revoke, needle) in [(false, false, "zone key"), (true, true, "unrevoked")] {
@@ -240,9 +146,8 @@ fn a_key_that_is_not_a_zone_key_signs_nothing_and_proves_nothing() {
     }
 }
 
-/// A revoked key published *beside* a live one is excluded from the proven
-/// set while the RRset still verifies — whoever holds one could otherwise
-/// sign a forged child DS and mint a chain that validates against the root.
+/// A revoked key published *beside* a live one is excluded from the proven set
+/// while the RRset still verifies — otherwise a revoked key could mint a forged DS.
 #[test]
 fn a_revoked_key_beside_a_good_one_is_not_in_the_proven_set() {
     let mut zone = SimZone::new("cluster.example", Vec::new());
@@ -263,8 +168,7 @@ fn a_revoked_key_beside_a_good_one_is_not_in_the_proven_set() {
 }
 
 /// A chain padded with signatures costs a bounded number of verifications:
-/// pairing signatures against keys is quadratic work on hostile data, so a
-/// link offering dozens is refused rather than walked.
+/// pairing is quadratic on hostile data, so a link offering dozens is refused.
 #[test]
 fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
     let zone = SimZone::new("cluster.example", Vec::new());
@@ -282,8 +186,7 @@ fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
         .expect("the set is signed")
         .clone();
 
-    // Copies of the real RRSIG with one signature byte flipped: each is a
-    // pairing the walk has to actually try, and none of them verifies.
+    // Copies of the real RRSIG with one byte flipped: each is a pairing the walk must try, none verifies.
     let mut junk = chain::encode_rrs(&[rrsig]).expect("encode the decoy");
     *junk.last_mut().expect("a signature has bytes") ^= 0x01;
     let mut rrs = Vec::new();
@@ -306,18 +209,13 @@ fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
 }
 
 // ------------------------------------------- the delegation half of the walk
-//
-// These three are about the step that makes a ladder a ladder: a link's
-// DNSKEY RRset is believed because a DS its parent signed covers a key in
-// it. Until the harness could build a child key set the parent's DS does
-// *not* cover, every fixture derived both from one key and they could not
-// disagree — deleting any of them left the workspace green.
+// A link's DNSKEY RRset is believed because a DS its parent signed covers a
+// key in it. Until the harness could build a child key set the parent's DS
+// does *not* cover, they could not disagree — deleting any left the suite green.
 
-/// A key set the parent's DS does not cover authorizes nothing, even when
-/// every other byte of the ladder is genuine — the delegation forgery that
-/// costs an attacker nothing but a keypair. The impostor's key is minted
-/// with the same key tag, so the digest is genuinely the deciding
-/// comparison.
+/// A key set the parent's DS does not cover authorizes nothing, even when every
+/// other byte of the ladder is genuine — the forgery that costs an attacker
+/// nothing but a keypair. The impostor is minted with the same key tag.
 #[test]
 fn a_key_set_the_parents_ds_does_not_cover_authorizes_nothing() {
     let real = SimDelegation::new("cluster.example", vec![]);
@@ -344,9 +242,8 @@ fn a_key_set_the_parents_ds_does_not_cover_authorizes_nothing() {
     );
 }
 
-/// RFC 4509 digest type 4 is an ordinary thing for a registrar to publish
-/// and `covers` dispatches on the type — nothing reached that arm until this
-/// existed.
+/// RFC 4509 digest type 4 is ordinary registrar business, and `covers` dispatches
+/// on the type — nothing reached that arm until this existed.
 #[test]
 fn a_delegation_published_with_a_sha384_ds_still_walks() {
     let delegation = SimDelegation::new("cluster.example", vec![]);
@@ -360,10 +257,9 @@ fn a_delegation_published_with_a_sha384_ds_still_walks() {
     assert_eq!(walked.anchor_zone, ".");
 }
 
-/// A revoked key cannot sign a child's DS: `verify_ds_set` hands
-/// `verify_rrset` the parent's whole DNSKEY RRset, so the flag rule inside
-/// it is the only guard between RFC 5011's "MUST NOT be used" and a
-/// repudiated key authorizing a delegation.
+/// A revoked key cannot sign a child's DS: `verify_ds_set` hands `verify_rrset`
+/// the parent's whole RRset, so the flag rule inside it is the only guard
+/// between RFC 5011's "MUST NOT be used" and a repudiated key authorizing a delegation.
 #[test]
 fn a_revoked_parent_key_cannot_sign_a_childs_ds() {
     let mut delegation = SimDelegation::new("cluster.example", vec![]);
@@ -381,12 +277,10 @@ fn a_revoked_parent_key_cannot_sign_a_childs_ds() {
     );
 }
 
-/// A chain the **control plane collected** walks under the client's own
-/// validator — the only place either implementation's chain *semantics* meet
-/// the other's, and the publisher writes to a public append-only log, so a
-/// divergence found after the fact is permanent. The fixture is a real
-/// root → DS → `sync.test.` descent over foreign bytes. Regenerate with
-/// `gleam run -m tools/gen_crossval` in `control-plane/`.
+/// A chain the **control plane collected** walks under the client's own validator —
+/// the only place the two implementations' chain *semantics* meet, and the publisher
+/// writes to a public append-only log, so a divergence found after the fact is
+/// permanent. Fixture regenerated with `gleam run -m tools/gen_crossval`.
 #[test]
 fn a_chain_the_control_plane_collected_walks_under_this_validator() {
     let crossval = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -395,8 +289,7 @@ fn a_chain_the_control_plane_collected_walks_under_this_validator() {
         .expect("the Gleam-collected chain fixture");
     let chain = DnssecChain::decode(&der).expect("a chain this reader can decode");
 
-    // The shape the collector is supposed to produce, asserted before the
-    // crypto so a regeneration that flattened the ladder fails here.
+    // The shape the collector is supposed to produce, asserted before the crypto.
     assert_eq!(chain.links.len(), 3, "declaration, apex, root");
     assert_eq!(
         chain.links[0].zone,

@@ -278,8 +278,7 @@ mod tests {
     /// A fixed instant inside the embedded trusted root's service windows.
     const NOW: u64 = 1_786_854_774;
 
-    /// A repository that has nothing, which is how an unreachable mirror and
-    /// an empty one both end up looking from here.
+    /// A repository that has nothing — how unreachable and empty mirrors both look.
     struct Empty;
 
     impl Repo for Empty {
@@ -315,27 +314,19 @@ mod tests {
         assert_eq!(found.source, "embedded trusted root");
         assert!(found.base_urls.iter().all(|u| u.starts_with("https://")));
         assert!(!found.keys.is_empty());
-        // **Every pinned shard is read, and every shard read is pinned** —
-        // retired ones included, asserted as a set rather than as hostnames.
+        // **Every pinned shard is read and every shard read is pinned**, retired ones included.
         let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
         assert_eq!(found.base_urls.len(), pinned.len());
         for log in &pinned {
-            assert!(
-                found.base_urls.contains(&log.base_url),
-                "{} is pinned but would not be read",
-                log.base_url
-            );
-            assert!(
-                found.keys.find(&log.log_id).is_some(),
-                "{} would be read but its key is not pinned",
-                log.base_url
-            );
+            let unread = found.base_urls.contains(&log.base_url);
+            assert!(unread, "pinned but unread: {}", log.base_url);
+            let unpinned = found.keys.find(&log.log_id).is_some();
+            assert!(unpinned, "read but unpinned: {}", log.base_url);
         }
     }
 
-    /// The documented posture: TUF trouble is never worse than not having
-    /// asked — a failed refresh warns, keeps the pins, and runs on the
-    /// embedded root.
+    /// The documented posture: TUF trouble is never worse than not asking —
+    /// a failed refresh warns, keeps the pins, and runs on the embedded root.
     #[test]
     fn a_repository_that_serves_nothing_is_a_warning_and_not_a_failure() {
         let (found, warnings) = discover_with(Some(&Empty), None, &[]).unwrap();
@@ -345,8 +336,7 @@ mod tests {
         assert!(!found.keys.is_empty());
     }
 
-    /// `--log` is the operator's word and is taken as given — with one line
-    /// saying what the run is therefore not reading.
+    /// `--log` is the operator's word, taken as given — one line says what the run is not reading.
     #[test]
     fn naming_one_log_says_which_pinned_shards_go_unread() {
         let (found, warnings) = discover_with(None, Some("https://log.example/"), &[]).unwrap();
@@ -358,39 +348,28 @@ mod tests {
         assert!(warnings[0].contains("not read this run"), "{warnings:?}");
     }
 
-    /// A shard the operator has named as unreadable is skipped, loudly, and
-    /// the rest of the run proceeds.
+    /// A shard the operator named unreadable is skipped, loudly; the rest proceed.
     #[test]
     fn a_skipped_shard_is_named_and_the_rest_are_still_read() {
         let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
-        assert!(
-            pinned.len() > 1,
-            "this test needs a trusted root pinning more than one shard"
-        );
+        assert!(pinned.len() > 1, "needs more than one pinned shard");
         let skip = pinned[0].base_url.clone();
         let (found, warnings) = discover_with(None, None, std::slice::from_ref(&skip)).unwrap();
         assert!(!found.base_urls.contains(&skip));
         assert_eq!(found.base_urls.len(), pinned.len() - 1);
-        // The pin set is untouched: this run still believes checkpoints from
-        // the skipped shard, which is why the loss of coverage is worth saying.
+        // The pin set is untouched — this run still believes the skipped shard — hence the loss of coverage is worth saying.
         assert_eq!(found.keys.keys().len(), pinned.len());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains(&skip) && w.contains("unclassified")),
-            "the skipped shard must be named: {warnings:?}"
-        );
+        let named = warnings.iter().any(|w| w.contains(&skip));
+        assert!(named, "the skipped shard must be named");
+        let said = warnings.iter().any(|w| w.contains("unclassified"));
+        assert!(said, "the loss of coverage must be said");
     }
 
-    /// Skipping every shard would classify nothing, and says so rather than
-    /// exiting 0 over an empty walk.
+    /// Skipping every shard would classify nothing, and says so rather than exiting 0 over an empty walk.
     #[test]
     fn skipping_every_shard_is_refused() {
-        let all: Vec<String> = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes())
-            .unwrap()
-            .into_iter()
-            .map(|log| log.base_url)
-            .collect();
+        let logs = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
+        let all: Vec<String> = logs.into_iter().map(|log| log.base_url).collect();
         discover_with(None, None, &all).expect_err("skipping every shard classifies nothing");
     }
 }

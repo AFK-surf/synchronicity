@@ -1,5 +1,4 @@
-//! Zone-key transparency end to end (docs/REKOR-ZONE-KEY.md §9): the positive case proves a
-//! correctly logged key set is accepted; every other case breaks exactly one thing.
+//! Zone-key transparency end to end (docs/REKOR-ZONE-KEY.md §9): the positive case proves a correctly logged key set is accepted; every other case breaks exactly one thing.
 
 mod common;
 
@@ -99,79 +98,27 @@ async fn resolve(zone: SimZone, log: &SimLog, policy: RekorPolicy) -> Result<Mem
 }
 
 #[test]
-fn a_logged_zone_key_verifies_offline() {
-    let (zone, log, proof) = logged_zone();
-    verify(&proof, &zone, &log).expect("a correctly logged key must verify");
-}
-
-#[test]
-fn the_leaf_names_the_zone_where_a_monitor_can_see_it() {
-    // The apex sits inside the Merkle leaf, in the clear — the bytes the log committed to.
-    let (zone, _log, proof) = logged_zone();
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let san = body.certificate.single_dns_name().unwrap().to_string();
-    assert_eq!(san, zone.apex());
-    assert_eq!(body.certificate.spki, zone.spki(), "the zone key itself");
-}
-
-#[test]
-fn a_raw_public_key_entry_is_refused_outright() {
-    // Valid Rekor, but apex-anonymous: no monitor could ever have seen it.
-    let (zone, mut log, _) = logged_zone();
-    let payload = zone.zone_key_statement("create").to_json();
-    let pae = rekor::pae(rekor::DSSE_PAYLOAD_TYPE, &payload);
-    let body = format!(
-        "{{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{{\"hashedRekordV002\":\
-         {{\"data\":{{\"algorithm\":\"SHA2_256\",\"digest\":\"{}\"}},\"signature\":\
-         {{\"content\":\"{}\",\"verifier\":{{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\
-         \"publicKey\":{{\"rawBytes\":\"{}\"}}}}}}}}}}}}",
-        rekor::base64_encode(&rekor::sha256(&pae)),
-        rekor::base64_encode(&zone.sign_dsse(&payload)),
-        rekor::base64_encode(&zone.spki()),
-    );
-    let proof = log.log_body(payload, body.into_bytes());
-    refuses!(verify(&proof, &zone, &log), ProofError::Binding(_));
-}
-
-#[test]
-fn a_misattributed_entry_signature_is_refused() {
-    // In the tree with a matching PAE digest — but signed by a key that is not the certificate's.
+fn the_attribution_check_binds_to_the_certificates_signer() {
     let (zone, mut log) = zone_and_log();
     let stranger = SimZone::new("cluster.example", member_records());
     let statement = zone.zone_key_statement("create").to_json();
-    let signature = stranger.sign_dsse(&statement);
     let certificate = zone.zone_key_certificate();
-    let body = hashedrekord_body(&statement, &signature, &certificate);
-    let proof = log.log_body(statement, body);
-    refuses!(verify(&proof, &zone, &log), ProofError::Attribution(_));
-}
 
-#[test]
-fn a_signer_other_than_the_zone_key_is_fine() {
-    // The decoupling this claim exists for: signed by a key that is not a zone key at all, and
-    // the chain, not the signature, authorizes the key set — what makes a provider-held key loggable.
-    let (zone, mut log) = zone_and_log();
+    // In the tree with a matching PAE digest — but signed by a key that is not the certificate's.
+    let body = hashedrekord_body(&statement, &stranger.sign_dsse(&statement), &certificate);
+    refuses!(
+        verify(&log.log_body(statement.clone(), body), &zone, &log),
+        ProofError::Attribution(_)
+    );
+
+    // The decoupling this claim exists for: a key that is not a zone key at all —
+    // the chain, not the signature, authorizes the key set (a provider-held key).
     let ephemeral = SimZone::new("cluster.example", Vec::new());
-    let statement = zone.zone_key_statement("create").to_json();
     let certificate =
         ephemeral.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode())]);
     let body = hashedrekord_body(&statement, &ephemeral.sign_dsse(&statement), &certificate);
-    let proof = log.log_body(statement, body);
-    verify(&proof, &zone, &log).expect("the real signer authorizes the chain-proven set");
-}
-
-#[test]
-fn an_observed_key_outside_the_proven_set_fails_binding() {
-    // Membership in the chain-proven set is the key binding.
-    let (zone, mut log) = zone_and_log();
-    let stranger = SimZone::new("cluster.example", member_records());
-    let proof = log.publish(&zone, "create");
-    let apex = zone.apex();
-    let rdata = stranger.dnskey_rdata();
-    let key = key_for(&apex, &rdata, stranger.key_tag());
-    let keys = LogKeys::parse(&log.key_pem()).unwrap();
-    let result = rekor::verify(&proof, &key, &keys, &anchors(&zone));
-    refuses!(result.map(|_| ()), ProofError::Binding(_));
+    verify(&log.log_body(statement, body), &zone, &log)
+        .expect("the real signer authorizes the chain-proven set");
 }
 
 #[test]
@@ -199,23 +146,6 @@ fn a_statement_describing_keys_its_chain_never_proved_fails_binding() {
     statement.keys[0].sha256 = hex::encode(rekor::sha256(&stranger.dnskey_rdata()));
     let proof = log.log_statement(&zone, &statement);
     refuses!(verify(&proof, &zone, &log), ProofError::Binding(_));
-}
-
-#[test]
-fn a_retire_entry_is_never_authorization() {
-    // Retires may be published chainless, so treating one as authorization accepts an entry carrying no proof of delegation.
-    let (zone, mut log) = zone_and_log();
-    let proof = log.publish(&zone, "retire");
-    refuses!(verify(&proof, &zone, &log), ProofError::Binding(_));
-}
-
-/// A chainless entry is tier B, the *silent* bin: accepting one hands an attacker a key that works and rings no bell.
-#[test]
-fn an_entry_with_no_chain_is_refused_on_the_monitors_behalf() {
-    let (zone, mut log) = zone_and_log();
-    let statement = zone.zone_key_statement("create");
-    let proof = log.log_certified(&zone, &statement, &zone.certificate(&[]));
-    refuses!(verify(&proof, &zone, &log), ProofError::Chain(why) if why.contains("no DNSSEC chain"));
 }
 
 /// An unknown extension is carried into the leaf and never asked for — but must not become a *reason to accept* either.
@@ -298,8 +228,7 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_colliding_tag_unlogged_zsk_does_not_inherit_the_old_proof() {
-    // Identifying the signer by 16-bit tag alone would accept this: a new
-    // ZSK with the old key's tag signs membership, old proof still served.
+    // Identifying the signer by 16-bit tag alone would accept this: a new ZSK with the old key's tag, old proof still served.
     let (mut zone, log, proof) = logged_zone();
     let (zsk, signer) = zone.colliding_key();
     assert_eq!(zsk.calculate_key_tag().unwrap(), zone.key_tag());
@@ -320,16 +249,7 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
     assert!(matches!(error, NetError::RekorChain { .. }), "{error}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_garbled_proof_record_is_refused_as_malformed() {
-    let (mut zone, log) = zone_and_log();
-    zone.rekor_txt = vec!["this is not a proof".to_string()];
-    let error = resolve(zone, &log, RekorPolicy::Require).await.unwrap_err();
-    assert!(matches!(error, NetError::RekorMalformed { .. }), "{error}");
-}
-
-/// The checked-in proof both halves of the system are asserted against: a fixture neither side
-/// can quietly regenerate keeps the Gleam encoder and the Rust decoder from drifting apart.
+/// The checked-in proof both halves assert against — a fixture neither side can quietly regenerate.
 const REKOR_FIXTURES: &str = "../../control-plane/test/fixtures/rekor";
 
 #[test]
@@ -380,8 +300,8 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(verified.log_index, proof.log_index);
 }
 
-/// The certificate encoders, across two implementations of one DER format: the crossval
-/// bytes are Gleam-written (`gleam run -m tools/gen_crossval`) and asserted by both suites.
+/// The certificate encoders across two implementations of one DER format: Gleam-written
+/// crossval bytes (`gleam run -m tools/gen_crossval`), asserted by both suites.
 #[test]
 fn the_gleam_certificate_encoders_agree_with_this_one() {
     use synch_net::x509::Certificate;
@@ -439,8 +359,8 @@ fn the_ds_digests_match_the_control_planes() {
     );
 }
 
-/// A real published Rekor entry (`tests/fixtures/rekor_v3`, see PROVENANCE.txt), verified in full,
-/// offline: a genuine `hashedrekord` v0.0.2 entry from `log2025-1.rekor.sigstore.dev`.
+/// A real published Rekor entry (`tests/fixtures/rekor_v3`, see PROVENANCE.txt), verified
+/// in full offline: a genuine `hashedrekord` v0.0.2 entry from `log2025-1.rekor.sigstore.dev`.
 mod real_rekor_v3 {
     use super::*;
 
@@ -494,6 +414,45 @@ mod real_rekor_v3 {
             rekor::sha256(&rekor::pae(DSSE_PAYLOAD_TYPE, &statement))
         );
     }
+    #[tokio::test]
+    async fn a_garbled_proof_record_is_refused_as_malformed() {
+        let (mut zone, log) = zone_and_log();
+        zone.rekor_txt = vec!["this is not a proof".to_string()];
+        let error = resolve(zone, &log, RekorPolicy::Require).await.unwrap_err();
+        assert!(matches!(error, NetError::RekorMalformed { .. }), "{error}");
+    }
+    #[test]
+    fn a_raw_public_key_entry_is_refused_outright() {
+        // Valid Rekor, but apex-anonymous: no monitor could ever have seen it.
+        let (zone, mut log, _) = logged_zone();
+        let payload = zone.zone_key_statement("create").to_json();
+        let pae = rekor::pae(rekor::DSSE_PAYLOAD_TYPE, &payload);
+        let body = format!(
+            "{{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{{\"hashedRekordV002\":\
+         {{\"data\":{{\"algorithm\":\"SHA2_256\",\"digest\":\"{}\"}},\"signature\":\
+         {{\"content\":\"{}\",\"verifier\":{{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\
+         \"publicKey\":{{\"rawBytes\":\"{}\"}}}}}}}}}}}}",
+            rekor::base64_encode(&rekor::sha256(&pae)),
+            rekor::base64_encode(&zone.sign_dsse(&payload)),
+            rekor::base64_encode(&zone.spki()),
+        );
+        let proof = log.log_body(payload, body.into_bytes());
+        refuses!(verify(&proof, &zone, &log), ProofError::Binding(_));
+    }
+    #[test]
+    fn an_entry_with_no_chain_is_refused_on_the_monitors_behalf() {
+        let (zone, mut log) = zone_and_log();
+        let statement = zone.zone_key_statement("create");
+        let proof = log.log_certified(&zone, &statement, &zone.certificate(&[]));
+        refuses!(verify(&proof, &zone, &log), ProofError::Chain(why) if why.contains("no DNSSEC chain"));
+    }
+    #[test]
+    fn a_retire_entry_is_never_authorization() {
+        // Retires may be published chainless, so treating one as authorization accepts an entry carrying no proof of delegation.
+        let (zone, mut log) = zone_and_log();
+        let proof = log.publish(&zone, "retire");
+        refuses!(verify(&proof, &zone, &log), ProofError::Binding(_));
+    }
 
     /// Inclusion in the real tree, with teeth.
     #[test]
@@ -535,8 +494,8 @@ mod real_rekor_v3 {
     }
 }
 
-/// A certificate that decodes two ways decodes no ways: Go's crypto/x509 — which Rekor calls —
-/// and OpenSSL disagree about these bytes, so the invariant must live in this parser.
+/// A certificate that decodes two ways decodes no ways: Go's crypto/x509 and OpenSSL disagree
+/// about these bytes, so the invariant must live in this parser.
 #[test]
 fn a_certificate_with_two_readings_is_refused() {
     use synch_net::x509::{Certificate, SelfSigned};

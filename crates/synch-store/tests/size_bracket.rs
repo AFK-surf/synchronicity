@@ -1,21 +1,13 @@
-//! A wrong size inside one power-of-two bracket verifies against the tree,
-//! and must not be allowed to brick the root.
-//!
-//! DESIGN.md and `docs/DELTA-SYNC.md` §6 both rest on the claim that
-//! "anything that changes the object's group count changes the shape of its
-//! tree, so no proof or slice for it would verify". That is false. bao splits
-//! at the largest power of two below the chunk count, so 20 groups and 24
-//! groups *both* split at 16: their left subtrees are the same tree, and the
-//! right sibling's chaining value is supplied by the encoder as opaque bytes
-//! that join to the true root either way.
-//!
-//! Nothing here is forged — the slice comes from a fully honest provider's
-//! `encode_slice`. Only the `size` the victim is told is wrong, and that comes
-//! from `FileEntry.size`, which any origin publishes for itself.
-//!
-//! The lie still lands (it verifies, so nothing can reject it at write time),
-//! but it must not stick: bits held under an *unattested* size are themselves
-//! only a claim, so the honest writer takes the row and the bitmap restarts.
+//! A wrong size inside one power-of-two bracket verifies against the tree, and
+//! must not be allowed to brick the root. DESIGN.md / `docs/DELTA-SYNC.md` §6
+//! claim "anything that changes the group count changes the tree's shape, so
+//! no proof or slice for it would verify" — false: bao splits at the largest
+//! power of two below the chunk count, so 20 groups and 24 both split at 16
+//! and share the left subtree. Nothing here is forged — the slice is an honest
+//! provider's `encode_slice`; only the `size` the victim is told is wrong,
+//! which `FileEntry.size` lets any origin publish. The lie still lands
+//! (nothing rejects it at write time) but must not stick: the honest writer
+//! takes the row back and the bitmap restarts.
 
 use synch_core::{ChunkRanges, CHUNK_GROUP_SIZE};
 use synch_store::Store;
@@ -43,8 +35,8 @@ fn a_size_lie_inside_one_power_of_two_bracket_does_not_brick_the_root() {
         .expect("a slice over the shared left subtree verifies under either size");
     assert_eq!(victim.blob(&root).unwrap().unwrap().size, lie_size);
 
-    // An honest writer with the true size is accepted rather than refused
-    // forever, and the bitmap restarts because the group count moved.
+    // An honest writer with the true size is accepted rather than refused forever;
+    // the bitmap restarts because the group count moved.
     let (rest_encoded, rest_served) = honest
         .encode_slice(&root, &ChunkRanges::single(0, 20))
         .unwrap();
@@ -58,7 +50,7 @@ fn a_size_lie_inside_one_power_of_two_bracket_does_not_brick_the_root() {
     assert_eq!(victim.read_all(&root).unwrap(), bytes);
 
     // Once the final group is held the size is attested, and a differing
-    // claim is refused — which is what stops the yielding above from churning.
+    // claim is refused — which stops the yielding above from churning.
     let (encoded, served) = honest
         .encode_slice(&root, &ChunkRanges::single(0, 16))
         .unwrap();

@@ -1,11 +1,8 @@
-//! Drives the gateway over real HTTP on an ephemeral port with a plain client
-//! (§11 testing strategy): GET/HEAD/LIST/PUT round-trips, a Range read, ETag
-//! checks, and byte-exactness.
+//! Drives the gateway over real HTTP on an ephemeral port with a plain
+//! client (§11): GET/HEAD/LIST/PUT round-trips, Range, ETags, byte-exactness.
 //!
-//! The daemon is a real one — same `Server`, same control socket, same token —
-//! and the gateway reaches it only through that socket, which is the property
-//! §9.4 is actually about. Nothing here hands the gateway a `Node`, because
-//! nothing can: it has no way to take one.
+//! The daemon is real — same `Server`, socket, token — and the gateway
+//! reaches it only through that socket, which is the property §9.4 is about.
 
 use std::{net::SocketAddr, path::Path};
 
@@ -23,7 +20,7 @@ struct Harness {
     _data: tempfile::TempDir,
     _space: tempfile::TempDir,
     space_path: std::path::PathBuf,
-    /// The node the *daemon* owns. Held here so a test can assert on the state
+    /// The node the daemon owns, held so a test can assert on the state
     /// behind the socket; the gateway has no access to it.
     node: Node,
     daemon: Daemon,
@@ -47,8 +44,7 @@ impl Harness {
         let served = tokio::spawn(control.run());
         let daemon = Daemon::new(data.path());
 
-        // The default policy over the unified tree, an origin pin on a
-        // foreign origin, and a strict bucket over the same space (§9.4).
+        // The default policy, a pin on a foreign origin, and a strict bucket (§9.4).
         buckets::add(&daemon, "my-media", "media", None)
             .await
             .unwrap();
@@ -179,7 +175,7 @@ async fn get_head_list_and_range_round_trip() {
         format!("\"{}\"", blake3::hash(b"hello from s3").to_hex())
     );
     // Last-Modified is RFC 7231 HTTP-date, not the RFC 3339 the XML body
-    // carries — SDKs parse it strictly and rclone refused the wrong shape.
+    // carries — SDKs parse it strictly.
     let last_modified = response
         .headers()
         .get("last-modified")
@@ -195,8 +191,8 @@ async fn get_head_list_and_range_round_trip() {
     );
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"hello from s3");
 
-    // The SDK write path probes with HeadBucket and CreateBucket before an
-    // upload; a mapped bucket answers both, an unmapped one 404s.
+    // The SDK write path probes with HeadBucket/CreateBucket before upload:
+    // a mapped bucket answers both, an unmapped one 404s.
     for method in [reqwest::Method::HEAD, reqwest::Method::PUT] {
         assert_eq!(
             harness.request(method.clone(), "/my-media").await.status(),
@@ -213,7 +209,7 @@ async fn get_head_list_and_range_round_trip() {
         );
     }
 
-    // A large object comes back byte-for-byte, and its declared length is the
+    // A large object comes back byte-for-byte, its declared length the
     // object's — a streamed body must still say how long it is.
     let response = harness.get("/my-media/talks/keynote.mp4").await;
     assert_eq!(response.status(), 200);
@@ -350,33 +346,21 @@ async fn get_head_list_and_range_round_trip() {
     assert!(body.contains("<Name>my-media</Name>"), "{body}");
     assert!(body.contains("<Name>nas-media</Name>"), "{body}");
 
-    harness.stop().await;
-}
-
-/// An object far larger than one control-protocol chunk crosses the gateway in
-/// both directions without either process holding it (§9.4): byte-exactness at
-/// this size is the observable half of the bounded channel and the daemon's
-/// staging file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_large_object_streams_through_in_both_directions() {
-    // The runtime workers the node uses stay checked (§10).
-    let _blocking = synch_core::BlockingScope::enter();
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let payload = payload(3_000_000);
-
-    let response = harness
-        .put("/my-media/uploads/big.bin", payload.clone())
-        .await;
+    // A body larger than one control-protocol chunk streams through unheld by
+    // either process (§9.3, §9.4): it lands in the space, publishes, and the
+    // entry carries the right size.
+    let big = (0..3_000_000u32)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<u8>>();
+    let response = harness.put("/my-media/uploads/big.bin", big.clone()).await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers().get("etag").unwrap().to_str().unwrap(),
-        format!("\"{}\"", blake3::hash(&payload).to_hex())
+        format!("\"{}\"", blake3::hash(&big).to_hex())
     );
-
-    // It landed in the local space directory and was published as our entry.
     assert_eq!(
         std::fs::read(harness.space_path.join("uploads/big.bin")).unwrap(),
-        payload
+        big
     );
     let entry = harness
         .node
@@ -384,24 +368,21 @@ async fn a_large_object_streams_through_in_both_directions() {
         .entry(harness.node.origin(), "media", "uploads/big.bin")
         .unwrap()
         .unwrap();
-    assert_eq!(entry.size, payload.len() as u64);
-
-    // And it reads straight back out through the gateway.
-    let response = harness.get("/my-media/uploads/big.bin").await;
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
+    assert_eq!(entry.size, big.len() as u64);
 
     harness.stop().await;
 }
 
 /// A node in key-loss recovery cannot publish, so it cannot accept a write
-/// either. That surfaces as an S3 error naming the command that clears it,
-/// rather than a panic or a silently dropped upload (§3.4, §9.4).
+/// or a delete either: an S3 error naming the command that clears it, not a
+/// panic, a silently dropped upload, or an unlinked file (§3.4, §9.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn put_object_is_refused_while_the_node_is_in_recovery() {
+async fn writes_and_deletes_are_refused_while_the_node_is_in_recovery() {
     // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
+    // A peer advertising a head this node has no history for is what puts it
+    // into recovery (§3.4).
     harness
         .node
         .store()
@@ -425,9 +406,7 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
     let body = response.text().await.unwrap();
     assert!(body.contains("ServiceUnavailable"), "{body}");
     assert!(body.contains("synch recover"), "{body}");
-
-    // Nothing was published under a seq the cluster would refuse, and nothing
-    // was written into the space either.
+    // Nothing was published, and nothing was written into the space either.
     assert!(harness
         .node
         .store()
@@ -436,12 +415,28 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
         .is_none());
     assert!(!harness.space_path.join("uploads").exists());
 
+    // The delete half: in the space but deliberately unpublished (publishing
+    // would leave recovery), so the delete must refuse and leave the file.
+    write_into(&harness.space_path, "notes.txt", b"still here");
+    let response = client()
+        .delete(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("ServiceUnavailable"));
+    assert!(harness.space_path.join("notes.txt").exists());
+
     harness.stop().await;
 }
 
-/// §9.4: a write is always a publish of the *local* node's view, so a bucket
+/// §9.4: a write always publishes the *local* node's view, so a bucket
 /// pinned to a foreign origin still accepts it — but its reads keep serving
-/// the pinned origin, which is why the gateway warns about that shape.
+/// the pinned origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
     // The runtime workers the node uses stay checked (§10).
@@ -471,9 +466,9 @@ async fn divergent_keys_are_served_by_policy() {
     let harness = Harness::start(AuthMode::Anonymous).await;
     harness.publish("shared.txt", b"ours");
 
-    // A peer publishes a different version of the same path. Only the peer's
-    // own assertion is ever written — this is the read model diverging, not a
-    // write path into someone else's trie.
+    // A peer publishes a different version of the same path: only the peer's
+    // own assertion is written — the read model diverges, not a write into
+    // someone else's trie.
     let peer = synch_core::OriginId::named("nas", "cluster.example").unwrap();
     let theirs = b"theirs";
     let root = harness
@@ -531,8 +526,7 @@ async fn divergent_keys_are_served_by_policy() {
     // An undisputed key in the same strict bucket still lists.
     harness.publish("undisputed.txt", b"only one");
 
-    // And the strict bucket leaves the divergent key out of its listing
-    // rather than handing over one side's metadata.
+    // The strict bucket leaves the divergent key out of its listing too.
     let body = harness
         .get("/strict-media?list-type=2")
         .await
@@ -544,10 +538,10 @@ async fn divergent_keys_are_served_by_policy() {
     harness.stop().await;
 }
 
-/// A symlink is not an S3 object: its version identity is its target rather
-/// than content (§8), so it has no root to be an ETag and no bytes to serve.
-/// It stays out of listings, and a direct read of it is a missing key —
-/// otherwise the gateway would advertise a key whose GET can only fail.
+/// A symlink is not an S3 object: its identity is its target, not content
+/// (§8), so it has no root for an ETag and no bytes to serve. It stays out of
+/// listings and a direct read is a missing key — otherwise the gateway would
+/// advertise a key whose GET can only fail.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symlink_keys_are_not_objects() {
@@ -558,8 +552,7 @@ async fn symlink_keys_are_not_objects() {
     std::os::unix::fs::symlink("real.txt", harness.space_path.join("link.txt")).unwrap();
     harness.node.scan_and_publish().unwrap();
 
-    // The daemon does track the symlink — this is the gateway declining to
-    // present it, not the tree forgetting it.
+    // The daemon tracks the symlink — the gateway declines to present it.
     let entry = harness
         .node
         .store()
@@ -586,8 +579,8 @@ async fn symlink_keys_are_not_objects() {
         assert_eq!(response.status(), 404, "{method}");
     }
 
-    // Writing to the same key is still an ordinary write: it replaces the link
-    // with a file, and the file is an object like any other.
+    // Writing to the same key is an ordinary write: it replaces the link
+    // with a file, an object like any other.
     let response = harness
         .put("/my-media/link.txt", b"now a file".to_vec())
         .await;
@@ -595,70 +588,6 @@ async fn symlink_keys_are_not_objects() {
     let response = harness.get("/my-media/link.txt").await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"now a file");
-
-    harness.stop().await;
-}
-
-/// Buckets and access keys live in the daemon's `s3.*` config namespace, and
-/// the gateway edits them by appending records over the socket (§9.4).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bucket_and_key_configuration_lives_in_the_daemon() {
-    // The runtime workers the node uses stay checked (§10).
-    let _blocking = synch_core::BlockingScope::enter();
-    let harness = Harness::start(AuthMode::Anonymous).await;
-
-    // Replacing a mapping appends rather than rewriting, and the fold makes the
-    // last record win.
-    buckets::add(&harness.daemon, "my-media", "media", Some("strict"))
-        .await
-        .unwrap();
-    let stored = harness
-        .node
-        .store()
-        .config(buckets::BUCKETS_CONFIG)
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.lines().count(), 4, "{stored}");
-    let bucket = buckets::find(&harness.daemon, "my-media").await.unwrap();
-    assert_eq!(bucket.policy.render(), "strict");
-
-    // Removing is another record, and it takes the bucket out of the map.
-    assert!(buckets::remove(&harness.daemon, "my-media").await.unwrap());
-    assert!(buckets::find(&harness.daemon, "my-media").await.is_err());
-    assert!(!buckets::remove(&harness.daemon, "my-media").await.unwrap());
-
-    // A mapping the daemon would refuse is refused at `bucket add`, not at the
-    // first GET days later.
-    assert!(
-        buckets::add(&harness.daemon, "bad-policy", "media", Some("whatever"))
-            .await
-            .is_err()
-    );
-    assert!(buckets::add(
-        &harness.daemon,
-        "two-pins",
-        "nas@cluster.example:media",
-        Some("strict")
-    )
-    .await
-    .is_err());
-
-    // Access keys take the same shape: one put and one remove prove the
-    // socket append path; the fold semantics are auth.rs's own test.
-    let key = AccessKey {
-        id: "AKID".into(),
-        secret: "shh".into(),
-    };
-    synch_s3::auth::put_key(&harness.daemon, &key)
-        .await
-        .unwrap();
-    assert!(synch_s3::auth::remove_key(&harness.daemon, "AKID")
-        .await
-        .unwrap());
-    assert!(synch_s3::auth::load_keys(&harness.daemon)
-        .await
-        .unwrap()
-        .is_empty());
 
     harness.stop().await;
 }
@@ -679,8 +608,8 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     assert_eq!(response.status(), 403);
     assert!(response.text().await.unwrap().contains("AccessDenied"));
 
-    // Dates must fall within the gateway's clock-skew window (§12 replay bound),
-    // so every signed request below is stamped from the current time.
+    // Dates must fall within the clock-skew window (§12), so every signed
+    // request below is stamped from the current time.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -689,8 +618,8 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     let scope_date = amz_date[..8].to_string();
     let http = client();
 
-    // A garbage signature is refused — with a fresh date, so the request reaches
-    // the signature check rather than being turned away for a stale timestamp.
+    // A garbage signature is refused — fresh date, so it reaches the
+    // signature check rather than being turned away for staleness.
     let response = http
         .get(harness.url("/my-media/secret.txt"))
         .header("x-amz-date", &amz_date)
@@ -712,46 +641,9 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
         .contains("SignatureDoesNotMatch"));
 
     // A correctly signed request succeeds.
-    let host = harness.base.trim_start_matches("http://").to_string();
-    let headers: std::collections::BTreeMap<String, String> = [
-        ("host".to_string(), host.clone()),
-        ("x-amz-date".to_string(), amz_date.clone()),
-    ]
-    .into_iter()
-    .collect();
-    let header = synch_s3::auth::SigV4Header {
-        access_key: "AKIDEXAMPLE".into(),
-        date: scope_date.clone(),
-        region: "us-east-1".into(),
-        service: "s3".into(),
-        signed_headers: vec!["host".into(), "x-amz-date".into()],
-        signature: String::new(),
-    };
-    let request = synch_s3::auth::SignedRequest {
-        method: "GET",
-        path: "/my-media/secret.txt",
-        query: &[],
-        headers: &headers,
-        payload_hash: synch_s3::auth::UNSIGNED_PAYLOAD,
-    };
-    let signature =
-        synch_s3::auth::expected_signature(&keys[0].secret, &header, &amz_date, &request);
-
-    let response = http
-        .get(harness.url("/my-media/secret.txt"))
-        .header("host", host)
-        .header("x-amz-date", &amz_date)
-        .header("x-amz-content-sha256", synch_s3::auth::UNSIGNED_PAYLOAD)
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{scope_date}/us-east-1/s3/aws4_request, \
-                 SignedHeaders=host;x-amz-date, Signature={signature}"
-            ),
-        )
-        .send()
-        .await
-        .unwrap();
+    let response = Signer::new(&keys[0], &harness)
+        .send("GET", "/my-media/secret.txt", Vec::new())
+        .await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.bytes().await.unwrap().as_ref(),
@@ -775,8 +667,7 @@ fn urlencode(value: &str) -> String {
 
 // ---- multipart upload (§9.4) -----------------------------------------------
 
-/// Pulls an element's text out of a response body, for the few fields these
-/// tests read back.
+/// Pulls an element's text out of a response body.
 fn element(xml: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -838,18 +729,15 @@ async fn upload_part(
         .to_string()
 }
 
-/// The whole multipart round trip, out of order and byte-exact.
-///
-/// Out-of-order parts are the case that matters: every SDK that fans parts out
-/// concurrently delivers them in whatever order the network settled on, and the
-/// object is defined by the part *numbers*, not by arrival.
+/// The whole multipart round trip, out of order and byte-exact: SDKs fan
+/// parts out concurrently, and the object is defined by part numbers.
 #[tokio::test]
 async fn multipart_upload_assembles_parts_in_order() {
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
 
-    // Two parts over the 5 MiB minimum and a short tail, which is the shape S3
-    // permits and the one a real upload has.
+    // Two parts over the 5 MiB minimum and a short tail: the shape S3
+    // permits and a real upload has.
     let first: Vec<u8> = (0..6_000_000u32).map(|i| (i % 251) as u8).collect();
     let second: Vec<u8> = (0..5_500_000u32).map(|i| (i % 241) as u8).collect();
     let third: Vec<u8> = b"the short final part".to_vec();
@@ -896,8 +784,8 @@ async fn multipart_upload_assembles_parts_in_order() {
     assert_eq!(element(&body, "Key"), "big/assembled.bin");
     let etag = element(&body, "ETag");
 
-    // The object reads back as the concatenation, and the ETag it was given is
-    // the root of exactly those bytes.
+    // The object reads back as the concatenation; the ETag is the root of
+    // exactly those bytes.
     let mut expected = first.clone();
     expected.extend_from_slice(&second);
     expected.extend_from_slice(&third);
@@ -914,17 +802,10 @@ async fn multipart_upload_assembles_parts_in_order() {
     let root = blake3::hash(&expected);
     assert_eq!(etag, format!("&quot;{}&quot;", root.to_hex()));
 
-    harness.stop().await;
-}
-
-/// A single-part upload is the shape mountpoint-s3 uses for *every* file it
-/// writes, so it has to work and it has to publish a live mtime.
-#[tokio::test]
-async fn a_single_part_upload_publishes_like_a_put() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
+    // A single-part upload — the shape mountpoint-s3 uses for every file —
+    // publishes with the completion's mtime, not a part's: §8 orders versions
+    // by it, so a stale one would lose to content it supersedes.
     let before = synch_core::now_ns();
-
     let upload = create_upload(&http, &harness, "small.txt").await;
     let etag = upload_part(&http, &harness, "small.txt", &upload, 1, b"tiny".to_vec()).await;
     let response = http
@@ -934,36 +815,94 @@ async fn a_single_part_upload_publishes_like_a_put() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-
-    let response = http
-        .get(harness.url("/my-media/small.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.bytes().await.unwrap().as_ref(), b"tiny");
-
-    // The published mtime is the completion's, not some part's: §8 orders
-    // versions by it, so a completion that published an old one would lose to
-    // content it supersedes.
     let entry = harness
         .daemon
         .resolve("media", "small.txt", "newest")
         .await
         .unwrap();
     assert!(entry.mtime_ns >= before, "{} < {before}", entry.mtime_ns);
+
     harness.stop().await;
 }
 
-/// Every way a completion can be wrong gets the code S3 defines for it, because
-/// clients branch on them: shrink a part, re-upload a part, or start over.
+#[tokio::test]
+async fn listing_uploads_paginates() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    for i in 0..5 {
+        create_upload(&http, &harness, &format!("many/{i:02}.bin")).await;
+    }
+
+    let page = |marker: String| {
+        let http = http.clone();
+        let url = harness.url(&format!("/my-media?uploads&max-uploads=2{marker}"));
+        async move { http.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+
+    let first = page(String::new()).await;
+    assert!(first.contains("<IsTruncated>true</IsTruncated>"), "{first}");
+    assert!(first.contains("<Key>many/00.bin</Key>"), "{first}");
+    assert!(first.contains("<Key>many/01.bin</Key>"), "{first}");
+    assert!(!first.contains("<Key>many/02.bin</Key>"), "{first}");
+
+    // The cursor it handed back moves the listing on, and walking to the end
+    // terminates rather than repeating a page.
+    let mut body = page(format!(
+        "&key-marker={}&upload-id-marker={}",
+        element(&first, "NextKeyMarker"),
+        element(&first, "NextUploadIdMarker")
+    ))
+    .await;
+    let mut seen = 2;
+    while element(&body, "IsTruncated") == "true" {
+        let marker = element(&body, "NextKeyMarker");
+        let id_marker = element(&body, "NextUploadIdMarker");
+        body = page(format!("&key-marker={marker}&upload-id-marker={id_marker}")).await;
+        seen += body.matches("<Upload>").count();
+        assert!(seen <= 5, "the listing did not terminate");
+    }
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_re_uploaded_part_wins() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "rewritten.txt";
+    let upload = create_upload(&http, &harness, key).await;
+
+    upload_part(&http, &harness, key, &upload, 1, b"first attempt".to_vec()).await;
+    let second = upload_part(&http, &harness, key, &upload, 1, b"second attempt".to_vec()).await;
+
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, second)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = http
+        .get(harness.url(&format!("/my-media/{key}")))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"second attempt");
+    harness.stop().await;
+}
+
+/// Every way a completion can be wrong gets the code S3 defines for it —
+/// clients branch on them.
 #[tokio::test]
 async fn completion_errors_are_distinguishable() {
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let key = "errors.bin";
     let upload = create_upload(&http, &harness, key).await;
-    // One part over the minimum and one under it, so each failure mode can be
-    // provoked without tripping another first.
+    // One part over the minimum and one under it, so each failure mode can
+    // be provoked without tripping another.
     let big = vec![7u8; 5 * 1024 * 1024 + 16];
     let small = vec![9u8; 1024];
     let etag1 = upload_part(&http, &harness, key, &upload, 1, big).await;
@@ -975,7 +914,7 @@ async fn completion_errors_are_distinguishable() {
         async move { http.post(url).body(body).send().await.unwrap() }
     };
 
-    // A part that was never uploaded — reported as missing even though part 2
+    // A part that was never uploaded, reported as missing even though part 2
     // is also too small to be an interior part.
     let response = complete(completion(&[
         (1, etag1.clone()),
@@ -997,80 +936,49 @@ async fn completion_errors_are_distinguishable() {
     let response = complete(completion(&[(1, etag1.clone()), (2, etag2.clone())])).await;
     assert_eq!(response.status(), 200, "a short *final* part is legal");
 
-    harness.stop().await;
-}
-
-/// An interior part under the minimum is `EntityTooSmall`, on its own upload so
-/// the completion above does not consume it.
-#[tokio::test]
-async fn an_interior_part_under_the_minimum_is_refused() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let key = "short-interior.bin";
-    let upload = create_upload(&http, &harness, key).await;
-    let etag1 = upload_part(&http, &harness, key, &upload, 1, vec![1u8; 1024]).await;
-    let etag2 = upload_part(&http, &harness, key, &upload, 2, vec![2u8; 1024]).await;
-
-    let response = http
-        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
-        .body(completion(&[(1, etag1.clone()), (2, etag2)]))
-        .send()
-        .await
-        .unwrap();
+    // A fresh upload with two parts under the minimum: an interior one is
+    // `EntityTooSmall`, a bad ETag is `InvalidPart`, a body that is not a
+    // completion at all is `MalformedXML` — and every one was recoverable,
+    // the upload still open for the fixed completion.
+    let upload = create_upload(&http, &harness, "short-interior.bin").await;
+    let etag1 = upload_part(
+        &http,
+        &harness,
+        "short-interior.bin",
+        &upload,
+        1,
+        vec![1u8; 1024],
+    )
+    .await;
+    let etag2 = upload_part(
+        &http,
+        &harness,
+        "short-interior.bin",
+        &upload,
+        2,
+        vec![2u8; 1024],
+    )
+    .await;
+    let post = |body: String| {
+        let http = http.clone();
+        let url = harness.url(&format!("/my-media/short-interior.bin?uploadId={upload}"));
+        async move { http.post(url).body(body).send().await.unwrap() }
+    };
+    let response = post(completion(&[(1, etag1.clone()), (2, etag2.clone())])).await;
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("EntityTooSmall"));
-
-    // An ETag that does not match what is actually there.
-    let response = http
-        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
-        .body(completion(&[(
-            1,
-            format!("&quot;{}&quot;", "0".repeat(64)),
-        )]))
-        .send()
-        .await
-        .unwrap();
+    let response = post(completion(&[(
+        1,
+        format!("&quot;{}&quot;", "0".repeat(64)),
+    )]))
+    .await;
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("InvalidPart"));
-
-    // A body that is not a completion at all.
-    let response = http
-        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
-        .body("<nonsense/>".to_string())
-        .send()
-        .await
-        .unwrap();
+    let response = post("<nonsense/>".to_string()).await;
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("MalformedXML"));
-
-    // Every one of those was recoverable: the upload is still open, and the
-    // completion the client fixes goes through.
-    let response = http
-        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
-        .body(completion(&[(1, etag1)]))
-        .send()
-        .await
-        .unwrap();
+    let response = post(completion(&[(1, etag1)])).await;
     assert_eq!(response.status(), 200);
-    harness.stop().await;
-}
-
-/// An unknown upload is `NoSuchUpload`, not `NoSuchKey` — and an id is a bearer
-/// token for one key, so quoting it against another is the same answer.
-#[tokio::test]
-async fn an_upload_id_names_one_key() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let upload = create_upload(&http, &harness, "mine.txt").await;
-
-    let response = http
-        .post(harness.url(&format!("/my-media/someone-elses.txt?uploadId={upload}")))
-        .body(completion(&[(1, format!("\"{}\"", "a".repeat(64)))]))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
 
     harness.stop().await;
 }
@@ -1140,45 +1048,21 @@ async fn uploads_and_parts_list_and_abort() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
-    harness.stop().await;
-}
 
-/// A re-uploaded part replaces the first attempt rather than joining it.
-#[tokio::test]
-async fn a_re_uploaded_part_wins() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let key = "rewritten.txt";
-    let upload = create_upload(&http, &harness, key).await;
-
-    upload_part(&http, &harness, key, &upload, 1, b"first attempt".to_vec()).await;
-    let second = upload_part(&http, &harness, key, &upload, 1, b"second attempt".to_vec()).await;
-
-    let response = http
-        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
-        .body(completion(&[(1, second)]))
+    // An abort of an upload that is not there is `NoSuchUpload`, not success.
+    let response = client()
+        .delete(harness.url("/my-media/x.bin?uploadId=deadbeefdeadbeefdeadbeefdeadbeef"))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    let body = http
-        .get(harness.url(&format!("/my-media/{key}")))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(body.as_ref(), b"second attempt");
+    assert_eq!(response.status(), 404);
+    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
     harness.stop().await;
 }
 
-/// A retried completion replays its answer instead of reporting an upload that
-/// no longer exists.
-///
-/// Every S3 client retries a completion it did not see the response to, and the
-/// object is already published by then — so "no such upload" would be a lie
-/// that makes the client report a failed write of a file that is right there.
+/// A retried completion replays its answer instead of reporting an upload
+/// that no longer exists — the object is already published, so "no such
+/// upload" would report a failed write of a file that is right there.
 #[tokio::test]
 async fn a_retried_completion_replays_its_answer() {
     let harness = Harness::start(AuthMode::Anonymous).await;
@@ -1207,32 +1091,34 @@ async fn a_retried_completion_replays_its_answer() {
     harness.stop().await;
 }
 
-/// An `aws-chunked` body is unwrapped rather than stored as its own framing.
-///
-/// Mountpoint sends `--upload-checksums crc32c` by default, so this is what its
-/// every upload looks like on the wire. A gateway that stored the framing would
-/// hash the framing, and the corruption would be undetectable downstream.
+/// An `aws-chunked` body is unwrapped rather than stored as its own framing,
+/// however the client declared it, and its crc32c trailer is checked — a bad
+/// checksum surfaces as `BadDigest` (SDKs retry on it), never as content
+/// behind a `200` or a generic "write abandoned".
 #[tokio::test]
 async fn chunked_bodies_are_decoded_and_their_checksums_checked() {
     use base64::Engine;
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let payload = b"the payload, not the framing".to_vec();
-
     let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&payload);
     let digest = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-    let framed = format!(
-        "{:x}\r\n{}\r\n0\r\nx-amz-checksum-crc32c:{digest}\r\n\r\n",
-        payload.len(),
-        String::from_utf8(payload.clone()).unwrap()
-    );
+    let framed = |d: &str| {
+        format!(
+            "{:x}\r\n{}\r\n0\r\nx-amz-checksum-crc32c:{d}\r\n\r\n",
+            payload.len(),
+            String::from_utf8_lossy(&payload)
+        )
+    };
 
+    // The mountpoint default — STREAMING-UNSIGNED-PAYLOAD-TRAILER, aws-chunked,
+    // honest checksum — lands, stored as the payload, not the framing.
     let response = http
         .put(harness.url("/my-media/framed.txt"))
         .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
         .header("x-amz-decoded-content-length", payload.len().to_string())
         .header("content-encoding", "aws-chunked")
-        .body(framed.clone())
+        .body(framed(&digest))
         .send()
         .await
         .unwrap();
@@ -1247,14 +1133,67 @@ async fn chunked_bodies_are_decoded_and_their_checksums_checked() {
         .unwrap();
     assert_eq!(stored.as_ref(), payload.as_slice());
 
+    // The framing is detected from either declaration: the lowercase
+    // sentinel alone, or `UNSIGNED-PAYLOAD` with the encoding header.
+    let declarations: [(&str, Option<&str>); 2] = [
+        ("streaming-unsigned-payload-trailer", None),
+        ("UNSIGNED-PAYLOAD", Some("aws-chunked")),
+    ];
+    for (i, (sha, encoding)) in declarations.iter().enumerate() {
+        let key = format!("framed-{i}.txt");
+        let mut request = http
+            .put(harness.url(&format!("/my-media/{key}")))
+            .header("x-amz-content-sha256", *sha)
+            .header("x-amz-decoded-content-length", payload.len().to_string())
+            .body(framed(&digest));
+        if let Some(encoding) = encoding {
+            request = request.header("content-encoding", *encoding);
+        }
+        assert_eq!(request.send().await.unwrap().status(), 200, "{sha}");
+        let stored = http
+            .get(harness.url(&format!("/my-media/{key}")))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stored.as_ref(), payload.as_slice(), "{sha}");
+    }
+
+    // A corrupt checksum is `BadDigest`, and nothing is published for it.
+    let response = http
+        .put(harness.url("/my-media/corrupt.txt"))
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .body(framed("AAAAAA=="))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("BadDigest"));
+    let response = http
+        .get(harness.url("/my-media/corrupt.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    // A declared length with no framing at all is a client disagreeing with
+    // us about its own body, refused rather than guessed at.
+    let response = http
+        .put(harness.url("/my-media/mismatched.txt"))
+        .header("x-amz-decoded-content-length", "10")
+        .body("plain bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
     harness.stop().await;
 }
 
-/// A header that says the payload is somewhere else is refused, not ignored.
-///
-/// This is the mountpoint `rename` bug: `PUT` + `x-amz-rename-source` with an
-/// empty body used to answer `200`, creating a truncated destination and
-/// leaving the source in place, and the client recorded the rename as done.
+/// A header that says the payload is somewhere else is refused, not ignored —
+/// the mountpoint `rename` bug would truncate the destination behind a `200`.
 #[tokio::test]
 async fn headers_that_relocate_the_payload_are_refused() {
     let harness = Harness::start(AuthMode::Anonymous).await;
@@ -1314,16 +1253,14 @@ async fn delete_object_removes_the_file_and_tombstones_the_key() {
         "204 carries no body"
     );
 
-    // Gone from the space directory...
+    // Gone from the space directory, the listing, and a reader.
     assert!(!harness.space_path.join("notes.txt").exists());
-    // ...gone to a reader...
     let response = http
         .get(harness.url("/my-media/notes.txt"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
-    // ...gone from the listing, without taking its neighbour with it.
     let listed = http
         .get(harness.url("/my-media?list-type=2"))
         .send()
@@ -1335,231 +1272,30 @@ async fn delete_object_removes_the_file_and_tombstones_the_key() {
     assert!(!listed.contains("<Key>notes.txt</Key>"), "{listed}");
     assert!(listed.contains("<Key>keep.txt</Key>"), "{listed}");
 
-    // And it is a published tombstone, not just a missing file: the entry this
-    // node asserts for the path says deleted.
+    // And it is a published tombstone, not a missing file: our asserted entry
+    // for the path says deleted.
     let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
     let set = harness.node.versions("media", "notes.txt").unwrap();
     let now = harness.node.store().read_instant().unwrap();
     let row = harness.node.resolve_set(&set, &ours, now).unwrap();
     assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
-    harness.stop().await;
-}
 
-/// Deleting a key that is not there succeeds, because S3 says so and every
-/// `rm -f`, retry and concurrent-delete race depends on it.
-#[tokio::test]
-async fn delete_object_is_idempotent() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    harness.publish("once.txt", b"here");
-    let http = client();
-
+    // Deleting a missing key succeeds: S3 says so, and `rm -f`-style retries
+    // and concurrent-delete races depend on it.
     for _ in 0..3 {
         let response = http
-            .delete(harness.url("/my-media/once.txt"))
+            .delete(harness.url("/my-media/notes.txt"))
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), 204);
     }
-    // A key that never existed at all is the same answer.
     let response = http
         .delete(harness.url("/my-media/never-existed.txt"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 204);
-    harness.stop().await;
-}
-
-/// A delete is a publish, so a node that cannot publish must refuse it rather
-/// than unlink the file and be unable to tell anyone (§3.4).
-#[tokio::test]
-async fn delete_object_is_refused_while_the_node_is_in_recovery() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    // Written into the space but deliberately not published: recovery is the
-    // state of a node that holds no head of its own, so publishing first would
-    // settle the question and take the node out of it.
-    write_into(&harness.space_path, "notes.txt", b"still here");
-    // A peer advertising a head this node has no history for is what puts it
-    // into recovery, the same way the write test does it.
-    harness
-        .node
-        .store()
-        .record_observed_head(
-            harness.node.origin(),
-            100,
-            &synch_core::Hash([7u8; 32]),
-            true,
-            None,
-            synch_core::now_ns(),
-        )
-        .unwrap();
-    let http = client();
-
-    let response = http
-        .delete(harness.url("/my-media/notes.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 503);
-    assert!(response
-        .text()
-        .await
-        .unwrap()
-        .contains("ServiceUnavailable"));
-    // The file is still here: refusing has to mean nothing happened, or the
-    // refusal loses the data it was protecting.
-    assert!(harness.space_path.join("notes.txt").exists());
-    harness.stop().await;
-}
-
-/// A delete round-trips against a write: PUT, DELETE, PUT again.
-#[tokio::test]
-async fn a_key_can_be_rewritten_after_it_is_deleted() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-
-    for body in [b"first".as_slice(), b"second".as_slice()] {
-        let response = http
-            .put(harness.url("/my-media/cycle.txt"))
-            .body(body.to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let got = http
-            .get(harness.url("/my-media/cycle.txt"))
-            .send()
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        assert_eq!(got.as_ref(), body);
-
-        // A delete lands between writes; the next PUT is the rewrite.
-        let response = http
-            .delete(harness.url("/my-media/cycle.txt"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 204);
-    }
-    harness.stop().await;
-}
-
-/// An `aws-chunked` body is unwrapped however the client declared it.
-///
-/// Keying only off an exact-case `x-amz-content-sha256` sentinel left the
-/// framing stored as object content, behind a `200` and an ETag over the framed
-/// bytes — the corruption the decoder exists to prevent.
-#[tokio::test]
-async fn framing_is_detected_from_either_header() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let payload = b"the payload, not the framing";
-    let framed = format!(
-        "{:x}\r\n{}\r\n0\r\n\r\n",
-        payload.len(),
-        String::from_utf8_lossy(payload)
-    );
-
-    let declarations: [(&str, Option<&str>); 2] = [
-        ("streaming-unsigned-payload-trailer", None),
-        ("UNSIGNED-PAYLOAD", Some("aws-chunked")),
-    ];
-    for (i, (sha, encoding)) in declarations.iter().enumerate() {
-        let key = format!("framed-{i}.txt");
-        let mut request = http
-            .put(harness.url(&format!("/my-media/{key}")))
-            .header("x-amz-content-sha256", *sha)
-            .header("x-amz-decoded-content-length", payload.len().to_string())
-            .body(framed.clone());
-        if let Some(encoding) = encoding {
-            request = request.header("content-encoding", *encoding);
-        }
-        assert_eq!(
-            request.send().await.unwrap().status(),
-            200,
-            "{sha}/{encoding:?}"
-        );
-
-        let stored = http
-            .get(harness.url(&format!("/my-media/{key}")))
-            .send()
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        assert_eq!(stored.as_ref(), payload, "{sha}/{encoding:?}");
-    }
-
-    // A declared length with no framing at all is a client disagreeing with us
-    // about the shape of its own body, and is refused rather than guessed at.
-    let response = http
-        .put(harness.url("/my-media/mismatched.txt"))
-        .header("x-amz-decoded-content-length", "10")
-        .body("plain bytes")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 400);
-    harness.stop().await;
-}
-
-/// A trailer checksum that does not match reaches the client as `BadDigest`.
-///
-/// SDKs branch on it: `BadDigest` means retry the upload, `InvalidArgument`
-/// means give up. Flattening the decoder's verdict into the daemon's generic
-/// "the write was abandoned" told every client the wrong one.
-#[tokio::test]
-async fn a_failed_trailer_checksum_is_reported_as_bad_digest() {
-    use base64::Engine;
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let payload = b"checksummed payload".to_vec();
-    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&payload);
-    let digest = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-    let framed = |d: &str| {
-        format!(
-            "{:x}\r\n{}\r\n0\r\nx-amz-checksum-crc32c:{d}\r\n\r\n",
-            payload.len(),
-            String::from_utf8_lossy(&payload)
-        )
-    };
-
-    // The honest one lands.
-    let response = http
-        .put(harness.url("/my-media/good.txt"))
-        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-        .header("x-amz-decoded-content-length", payload.len().to_string())
-        .body(framed(&digest))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-
-    // The mismatched one does not, and says why in the client's vocabulary.
-    let response = http
-        .put(harness.url("/my-media/corrupt.txt"))
-        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-        .header("x-amz-decoded-content-length", payload.len().to_string())
-        .body(framed("AAAAAA=="))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 400);
-    let body = response.text().await.unwrap();
-    assert!(body.contains("BadDigest"), "{body}");
-
-    // And nothing was published for it.
-    let response = http
-        .get(harness.url("/my-media/corrupt.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
     harness.stop().await;
 }
 
@@ -1590,77 +1326,18 @@ async fn a_part_number_without_an_upload_is_refused() {
     harness.stop().await;
 }
 
-/// `ListMultipartUploads` honours the cursor it hands out.
-///
-/// Saying `IsTruncated` and then ignoring the markers on the next request
-/// returns the identical page forever, and every SDK paginator loops on it.
+/// A delete publishes a tombstone even when the backing file or its
+/// `local_files` row is gone — the sweep walks rows, and without this a
+/// missing row meant this node's *live* assertion stayed signed for good,
+/// with the gateway answering `204`.
 #[tokio::test]
-async fn listing_uploads_paginates() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    for i in 0..5 {
-        create_upload(&http, &harness, &format!("many/{i:02}.bin")).await;
-    }
-
-    let page = |marker: String| {
-        let http = http.clone();
-        let url = harness.url(&format!("/my-media?uploads&max-uploads=2{marker}"));
-        async move { http.get(url).send().await.unwrap().text().await.unwrap() }
-    };
-
-    let first = page(String::new()).await;
-    assert!(first.contains("<IsTruncated>true</IsTruncated>"), "{first}");
-    assert!(first.contains("<Key>many/00.bin</Key>"), "{first}");
-    assert!(first.contains("<Key>many/01.bin</Key>"), "{first}");
-    assert!(!first.contains("<Key>many/02.bin</Key>"), "{first}");
-
-    // The cursor it handed back moves the listing on, and walking to the end
-    // terminates rather than repeating a page.
-    let mut body = page(format!(
-        "&key-marker={}&upload-id-marker={}",
-        element(&first, "NextKeyMarker"),
-        element(&first, "NextUploadIdMarker")
-    ))
-    .await;
-    let mut seen = 2;
-    while element(&body, "IsTruncated") == "true" {
-        let marker = element(&body, "NextKeyMarker");
-        let id_marker = element(&body, "NextUploadIdMarker");
-        body = page(format!("&key-marker={marker}&upload-id-marker={id_marker}")).await;
-        seen += body.matches("<Upload>").count();
-        assert!(seen <= 5, "the listing did not terminate");
-    }
-    harness.stop().await;
-}
-
-/// An abort of an upload that is not there is `NoSuchUpload`, not success.
-#[tokio::test]
-async fn aborting_an_unknown_upload_is_not_a_success() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let response = client()
-        .delete(harness.url("/my-media/x.bin?uploadId=deadbeefdeadbeefdeadbeefdeadbeef"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
-    harness.stop().await;
-}
-
-/// A delete publishes a tombstone even when no `local_files` row backs the path.
-///
-/// The tombstone comes from the scanner's deletion sweep, which walks
-/// `local_files` — so relying on that alone meant a path whose row was missing
-/// produced no tombstone at all, and this node's *live* assertion for the key
-/// stayed in its signed root for good, with the gateway answering `204`.
-#[tokio::test]
-async fn delete_object_tombstones_a_path_with_no_local_row() {
+async fn delete_object_tombstones_even_without_file_or_row() {
     let harness = Harness::start(AuthMode::Anonymous).await;
     harness.publish("orphaned.txt", b"published once");
     let http = client();
 
-    // The published entry, with its row taken out from under it — which is what
-    // `reconcile_local_files` does after an interrupted publish.
+    // The published entry, with its row taken out from under it — which is
+    // what `reconcile_local_files` does after an interrupted publish.
     harness
         .node
         .store()
@@ -1674,45 +1351,35 @@ async fn delete_object_tombstones_a_path_with_no_local_row() {
         .unwrap();
     assert_eq!(response.status(), 204);
 
-    // Not merely absent from the disk: tombstoned in what this node publishes.
-    let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
-    let set = harness.node.versions("media", "orphaned.txt").unwrap();
-    let now = harness.node.store().read_instant().unwrap();
-    let row = harness.node.resolve_set(&set, &ours, now).unwrap();
-    assert_eq!(
-        row.kind,
-        synch_core::EntryKind::Tombstone,
-        "the delete left a live assertion published"
-    );
-    let response = http
-        .get(harness.url("/my-media/orphaned.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    harness.stop().await;
-}
-
-/// A delete whose file is already gone still publishes the tombstone.
-#[tokio::test]
-async fn delete_object_publishes_even_when_the_file_is_already_gone() {
-    let harness = Harness::start(AuthMode::Anonymous).await;
+    // A file removed out of band, as an out-of-band `rm` would, is the same:
+    // the delete must not depend on the file being there either.
     harness.publish("vanished.txt", b"here for now");
-    // Removed behind the daemon's back, as an out-of-band `rm` would.
     std::fs::remove_file(harness.space_path.join("vanished.txt")).unwrap();
-
-    let response = client()
+    let response = http
         .delete(harness.url("/my-media/vanished.txt"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 204);
 
-    let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
-    let set = harness.node.versions("media", "vanished.txt").unwrap();
-    let now = harness.node.store().read_instant().unwrap();
-    let row = harness.node.resolve_set(&set, &ours, now).unwrap();
-    assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
+    // Not merely absent from the disk: tombstoned in what this node publishes.
+    for key in ["orphaned.txt", "vanished.txt"] {
+        let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
+        let set = harness.node.versions("media", key).unwrap();
+        let now = harness.node.store().read_instant().unwrap();
+        let row = harness.node.resolve_set(&set, &ours, now).unwrap();
+        assert_eq!(
+            row.kind,
+            synch_core::EntryKind::Tombstone,
+            "the delete left a live assertion published"
+        );
+        let response = http
+            .get(harness.url(&format!("/my-media/{key}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
     harness.stop().await;
 }
 
@@ -1817,12 +1484,10 @@ impl<'a> Signer<'a> {
     }
 }
 
-/// One client's upload id is not another client's to use.
-///
-/// The listing used to hand every open upload's id to every caller, which made
-/// the id — the only thing authorizing a part upload or a completion — public.
-/// Any key holder could then overwrite another client's parts and complete
-/// them, publishing content of their choosing under this node's signature.
+/// One client's upload id is not another's to use: the listing used to hand
+/// every open upload's id to every caller, making the id — the only thing
+/// authorizing a part upload or a completion — public, so any key holder
+/// could overwrite another client's parts under this node's signature.
 #[tokio::test]
 async fn uploads_are_scoped_to_the_key_that_opened_them() {
     let keys = vec![

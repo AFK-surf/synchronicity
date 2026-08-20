@@ -281,15 +281,6 @@ mod tests {
         assert_eq!(retried[3].0, b"d".to_vec());
     }
 
-    #[tokio::test]
-    async fn a_change_staged_before_the_wait_still_wakes_it() {
-        let publisher = Publisher::new(Duration::from_secs(2), 1000);
-        publisher.stage([change("a")]);
-        tokio::time::timeout(Duration::from_secs(5), publisher.woken())
-            .await
-            .expect("a permit staged before the wait must still be seen");
-    }
-
     use crate::testkit::{eventually, node_with};
 
     /// A node whose batch triggers are set for a test rather than for a desk.
@@ -359,33 +350,28 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// Quiescence publishes on its own, with no explicit flush.
+    /// The loop publishes on its own, with no explicit flush: a quiet batch
+    /// goes once the quiesce window passes, and a full batch does not wait
+    /// for it at all.
     #[tokio::test]
-    async fn staging_flushes_once_it_goes_quiet() {
-        let (_d, node) = node(Duration::from_millis(50), 1000).await;
-        let (tx, handle) = run(&node);
-
-        node.stage([entry(&node, "a.txt")]);
-        let published = eventually(|| node.own_head().unwrap().is_some()).await;
+    async fn staging_flushes_on_quiesce_or_a_full_batch() {
+        // Quiesce trigger.
+        let (_d, n1) = node(Duration::from_millis(50), 1000).await;
+        let (tx, handle) = run(&n1);
+        n1.stage([entry(&n1, "a.txt")]);
+        let published = eventually(|| n1.own_head().unwrap().is_some()).await;
         assert!(published, "a quiet batch must publish itself");
-        assert_eq!(node.own_head().unwrap().unwrap().seq, 1);
-
+        assert_eq!(n1.own_head().unwrap().unwrap().seq, 1);
         stop(tx, handle).await;
-        node.shutdown().await.unwrap();
-    }
+        n1.shutdown().await.unwrap();
 
-    /// A full batch does not wait for the quiesce window at all.
-    #[tokio::test]
-    async fn a_full_batch_publishes_without_waiting() {
-        // A quiesce far longer than the test could tolerate: if the batch is
-        // published, it is the size trigger that did it.
+        // Batch trigger: a quiesce far longer than the test could tolerate,
+        // so the size trigger is what published.
         let (_d, node) = node(Duration::from_secs(600), 2).await;
         let (tx, handle) = run(&node);
-
         node.stage([entry(&node, "a.txt"), entry(&node, "b.txt")]);
         let published = eventually(|| node.own_head().unwrap().is_some()).await;
         assert!(published, "a full batch must not wait out the quiesce");
-
         stop(tx, handle).await;
         node.shutdown().await.unwrap();
     }

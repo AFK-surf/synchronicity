@@ -1312,7 +1312,7 @@ fn with_id(frame: Up, id: u32) -> Up {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cloud::frame::decode_chunk, config::NodeConfig, testkit::node};
+    use crate::{cloud::frame::decode_chunk, testkit::node, NodeConfig};
     use synch_core::{FileEntry, Hash};
 
     fn origin(name: &str) -> OriginId {
@@ -1400,13 +1400,10 @@ mod tests {
     }
 
     /// The control plane can ask who the cluster admits, and is told which
-    /// grants still hold (§3.5).
-    ///
-    /// The cascade is the whole point of the answer: both rows below are inside
-    /// their own expiry, and they differ only in whether the origin that issued
-    /// them is still trusted here. A dashboard reading dates alone would show
-    /// them identically, which is exactly the reporting hole the delegation
-    /// work closed locally — this is that hole closed over the tunnel.
+    /// grants still hold (§3.5). The cascade is the point: both rows below
+    /// are inside their own expiry and differ only in whether their issuer
+    /// is still trusted here — the reporting hole the delegation work closed
+    /// locally, closed over the tunnel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_a_delegations_query_with_the_cascade_applied() {
         let (_blocking, _dir, node) = scoped_node().await;
@@ -1459,13 +1456,9 @@ mod tests {
             .iter()
             .find(|d| d.key == orphaned.to_z32())
             .expect("the stranger's delegation");
-        assert!(
-            !lapsed.live,
-            "an issuer this node does not trust vouches for nobody, whatever the date says"
-        );
+        assert!(!lapsed.live, "an untrusted issuer vouches for nobody");
         // Reported rather than hidden: "never delegated" and "delegated by
-        // someone since cut off" are different states and call for different
-        // actions.
+        // someone since cut off" are different states, different actions.
         assert_eq!(lapsed.issuer, stranger.canonical());
         assert_eq!(lapsed.spaces, ["finance"]);
 
@@ -1474,17 +1467,15 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// Runs `serve` end to end against an in-process socket, exercising the real
-    /// framing: JSON control frames, the binary CHUNK codec, credit flow, and
-    /// the request-id multiplexing across LS → RESOLVE → READ → PING. The
-    /// attach handshake itself is `attach_once`, tested for its signing bytes
-    /// against the control plane's; this covers everything downstream of it.
+    /// Runs `serve` end to end over an in-process socket: JSON control frames,
+    /// the binary CHUNK codec, credit flow, and the request-id multiplexing
+    /// across LS → RESOLVE → READ → PING. The attach handshake itself is
+    /// `attach_once`, tested against the control plane's signing bytes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_ls_resolve_and_read_over_the_wire() {
         let (_blocking, dir, node) = scoped_node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
-        // Larger than one chunk, so the CHUNK framing and the multi-chunk
-        // credit path both run rather than fitting in a single frame.
+        // Larger than one chunk, so the CHUNK framing and multi-chunk credit path run.
         let payload = vec![0xABu8; MAX_CHUNK + 4321];
         let root = node
             .store()
@@ -1499,8 +1490,7 @@ mod tests {
             )
             .unwrap();
 
-        // Two halves of one socket: `to_node` carries Down frames in, `from_node`
-        // collects Up frames out.
+        // Two halves of one socket: Down frames in, Up frames out.
         let (to_node, mut from_node, served) = serve_session(&node);
 
         // LS: the directory lists the file.
@@ -1534,8 +1524,7 @@ mod tests {
         assert_eq!(id, 2);
         assert_eq!(size, payload.len() as u64);
 
-        // READ by pinned root: META, then the content in ≤64 KiB chunks under
-        // the initial credit, then DONE. The bytes must match exactly.
+        // READ by pinned root: META, ≤64 KiB chunks under the initial credit, then DONE.
         to_node
             .send(down_msg(&Down::Read {
                 id: 3,
@@ -1704,12 +1693,10 @@ mod tests {
         // The header, and then nothing: the producer is parked on a permit.
         let first = rx.recv().await.unwrap();
         assert!(matches!(first, Message::Text(_)), "{first:?}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .is_err(),
-            "a chunk was produced with no credit granted"
-        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err();
+        assert!(quiet);
 
         // One credit, one chunk, and then parked again.
         credit.add_permits(1);
@@ -1722,12 +1709,10 @@ mod tests {
         };
         let (id, seq, data) = decode_chunk(&bytes).unwrap();
         assert_eq!((id, seq, data.len()), (3, 0, MAX_CHUNK));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .is_err(),
-            "the second chunk was produced on the first chunk's credit"
-        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err();
+        assert!(quiet);
 
         // And a cancelled stream ends the producer rather than leaking it.
         credit.close();
@@ -1828,8 +1813,7 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["1.jpg", "2.jpg", "trips"]);
 
-        // Divergence is data the listing carries, not something it resolves: a
-        // path with two origins' versions reports both.
+        // Divergence is data the listing carries: two origins' versions report both.
         for (name, content) in [("nas", b"a"), ("laptop", b"b")] {
             node.store()
                 .put_entry(

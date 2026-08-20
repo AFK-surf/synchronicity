@@ -1,9 +1,8 @@
-//! The highest-value test in the control plane: the very validator every
-//! deployed synchronicity cluster runs (hickory's DnssecDnsHandle inside
-//! synch-net's DnssecResolver) resolves the membership domain against the
-//! control plane's DoH endpoint, anchored at the control plane's key.
-//! Skips without the CP_* environment e2e/run.sh exports (DoH URL, anchor
-//! file, membership domain, and the seeded device keys).
+//! The highest-value test in the control plane: the validator every deployed
+//! cluster runs (hickory's DnssecDnsHandle inside synch-net's DnssecResolver)
+//! resolves the membership domain against the control plane's DoH endpoint,
+//! anchored at the control plane's key. Skips without the CP_* environment
+//! e2e/run.sh exports (DoH URL, anchor file, membership domain, device keys).
 
 use synch_core::OriginId;
 use synch_net::dns::{DnssecResolver, RekorPolicy, ResolverOptions};
@@ -14,7 +13,9 @@ fn env(key: &str) -> Option<String> {
 
 /// The e2e context, or `None` when the environment is absent (skip).
 fn e2e_ctx() -> Option<(String, String, String)> {
-    install_provider();
+    // `DnssecResolver` builds a reqwest client that panics without a crypto provider,
+    // and this crate has no `main` or `sim` feature to reach `synch_net::tls`'s install paths.
+    synch_net::tls::install_crypto_provider();
     Some((
         env("CP_DOH_URL")?,
         env("CP_ANCHOR_FILE")?,
@@ -31,20 +32,11 @@ fn test_resolver(doh_url: String, anchor: String, rekor: Option<RekorPolicy>) ->
         rekor_key: None,
         rekor_state: None,
         tuf_url: None,
-        // An e2e run never needs Sigstore's CDN: the refusal the second test
-        // asserts is about this zone's missing proof, and nothing about the
-        // pin set can change it.
+        // An e2e run never needs Sigstore's CDN: the refusal the second test asserts is about this zone's missing proof.
         no_tuf: true,
         tuf_root: None,
     })
     .expect("resolver construction")
-}
-
-/// Installs the rustls provider: `DnssecResolver` builds a reqwest client
-/// that panics without one, and this crate has no `main` or `sim` feature
-/// to reach the install paths `synch_net::tls` describes.
-fn install_provider() {
-    synch_net::tls::install_crypto_provider();
 }
 
 #[tokio::test]
@@ -52,9 +44,7 @@ async fn control_plane_zone_validates_and_parses() {
     let Some((doh_url, anchor, domain)) = e2e_ctx() else {
         return;
     };
-    // DNSSEC-only coverage here: the zone-key transparency path has its own
-    // suite, and this zone logs nothing — its silence is the next test's
-    // subject.
+    // DNSSEC-only coverage: this zone logs nothing — its silence is the next test's subject.
     let resolver = test_resolver(doh_url, anchor, Some(RekorPolicy::Off));
 
     let (set, ttl) = resolver.member_set(&domain).await.expect(
@@ -113,8 +103,7 @@ async fn control_plane_zone_validates_and_parses() {
     // TTL is the zone's 300s, inside the client clamp window.
     assert!(ttl.as_secs() >= 60 && ttl.as_secs() <= 86_400);
 
-    // A domain that does not exist must fail closed (validated NXDOMAIN),
-    // not hang or fall open.
+    // A domain that does not exist must fail closed (validated NXDOMAIN), not hang or fall open.
     let missing = resolver.member_set(&format!("nope.{domain}")).await;
     assert!(missing.is_err(), "nonexistent domain must not resolve");
 }
@@ -152,13 +141,10 @@ async fn the_fleets_attach_endpoints_cross_validate() {
     assert_eq!(got, want, "every node the primary named must come back");
 }
 
-/// The same zone, under the default policy: refused.
-///
-/// The e2e zone deliberately logs nothing, and "logs nothing" must mean "no
-/// client resolves it" rather than "clients quietly carry on". This is the
-/// §4.3 posture asserted against a real control plane rather than a
-/// simulated one — the answer is discarded entirely and a caller keeps
-/// whatever it had cached.
+/// The same zone, under the default policy: refused. The e2e zone deliberately
+/// logs nothing, and "logs nothing" must mean "no client resolves it" rather
+/// than "clients quietly carry on" — the §4.3 posture against a real control
+/// plane: the answer is discarded and a caller keeps whatever it had cached.
 #[tokio::test]
 async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
     let Some((doh_url, anchor, domain)) = e2e_ctx() else {
@@ -172,8 +158,7 @@ async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
         .await
         .expect_err("a zone with no proof record must not resolve by default");
 
-    // And the ungated TXT lookup still works — it is the member-set path that
-    // gained a requirement, not every query the resolver makes.
+    // And the ungated TXT lookup still works — the member-set path gained the requirement, not every query.
     resolver
         .lookup_txt_ungated(&domain)
         .await

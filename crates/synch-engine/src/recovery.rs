@@ -518,8 +518,8 @@ mod tests {
             .unwrap();
     }
 
-    /// A node that already holds a head of its own is not in recovery, whatever
-    /// peers advertise: it has published under this origin itself (§3.4).
+    /// A node holding a head of its own is not in recovery, whatever peers
+    /// advertise: it has published itself (§3.4).
     #[tokio::test]
     async fn holding_our_own_head_settles_the_question() {
         let (_d, node) = node_as(&nas()).await;
@@ -531,9 +531,11 @@ mod tests {
     }
 
     /// `--wait 0` collects one round and returns; the floor lands above
-    /// everything seen, and a second observation below it changes nothing.
+    /// everything seen (§3.4). A node holding its own head ignores the echo
+    /// of its published history, but never real evidence.
     #[tokio::test]
     async fn recover_sets_the_floor_above_every_observation() {
+        // A headless node: the floor lands above everything seen.
         let (_d, node) = node_as(&nas()).await;
 
         // A node no peer knows: no floor, and seq 1 is left alone.
@@ -543,8 +545,8 @@ mod tests {
         assert_eq!(report.floor, None);
         assert_eq!(node.next_seq().unwrap(), 1);
 
-        // The gap is not an optimization to remove: a floor at the highest seq
-        // peers advertised is exactly the collision it exists to prevent.
+        // The gap is not an optimization to remove: it exists to prevent a
+        // collision at the highest advertised seq.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let err = node
             .recover(
@@ -570,7 +572,7 @@ mod tests {
         assert!(!node.recovery_state().unwrap().in_recovery);
         node.ensure_publishable().unwrap();
 
-        // An observation below the floor is not a return to recovery: the floor
+        // An observation below the floor is no return to recovery: the floor
         // already clears it.
         observe(&node, 200, None);
         assert!(!node.recovery_state().unwrap().in_recovery);
@@ -579,28 +581,22 @@ mod tests {
         observe(&node, 5_000, None);
         assert!(node.recovery_state().unwrap().in_recovery);
         node.shutdown().await.unwrap();
-    }
 
-    /// Re-running recover on a node that holds its own head leaves the floor
-    /// alone: peers echoing our published history back is not history to leap
-    /// over, and an accidental re-run would otherwise burn another gap of seqs
-    /// every time.
-    #[tokio::test]
-    async fn recover_is_idempotent_once_the_node_holds_its_own_head() {
+        // Holding our own head, the echo of our published history leaves the
+        // floor alone; an accidental re-run would otherwise burn another gap.
         let (_d, node) = node_as(&nas()).await;
         node.publish(&[staged_file()]).unwrap().unwrap();
         let own = node.store().complete_head(node.origin()).unwrap().unwrap();
         node.store()
             .record_observed_head(node.origin(), own.seq, &own.root, true, None, now_ns())
             .unwrap();
-
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let report = node.recover(quick(1_000), tx).await.unwrap();
         assert_eq!(report.floor, None, "{report:?}");
         assert_eq!(node.next_seq().unwrap(), own.seq + 1);
 
-        // A peer holding genuinely newer history than our own head still
-        // raises the floor: only the echo is ignored, not real evidence.
+        // Genuinely newer history still raises the floor: only the echo is
+        // ignored, not real evidence.
         node.store()
             .record_observed_head(
                 node.origin(),
@@ -617,29 +613,6 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A client that walks away interrupts the quiesce, and nothing is written.
-    #[tokio::test]
-    async fn a_dropped_progress_receiver_interrupts_the_quiesce() {
-        let (_d, node) = node_as(&nas()).await;
-        observe(&node, 100, None);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(rx);
-        let err = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::from_secs(3_600),
-                    poll: Duration::from_millis(10),
-                    ..quick(1_000)
-                },
-                tx,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("interrupted"), "{err}");
-        assert_eq!(node.store().publish_floor().unwrap(), None);
-        assert!(node.recovery_state().unwrap().in_recovery);
-        node.shutdown().await.unwrap();
-    }
     /// A node nobody has ever heard of is not in recovery, and publishes at
     /// seq 1; a peer advertising a *different* origin says nothing about ours.
     #[tokio::test]
@@ -662,6 +635,29 @@ mod tests {
             )
             .unwrap();
         assert!(!node.recovery_state().unwrap().in_recovery);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_progress_receiver_interrupts_the_quiesce() {
+        let (_d, node) = node_as(&nas()).await;
+        observe(&node, 100, None);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let err = node
+            .recover(
+                RecoveryOptions {
+                    wait: Duration::from_secs(3_600),
+                    poll: Duration::from_millis(10),
+                    ..quick(1_000)
+                },
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert_eq!(node.store().publish_floor().unwrap(), None);
+        assert!(node.recovery_state().unwrap().in_recovery);
         node.shutdown().await.unwrap();
     }
 }

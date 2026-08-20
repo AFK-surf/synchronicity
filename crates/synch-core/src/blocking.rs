@@ -2,46 +2,28 @@
 //!
 //! Almost everything this system does to durable state is blocking, and
 //! deliberately so: the store is runtime-agnostic, the scanner hashes files, the
-//! CAS fsyncs payloads, a head offer walks a trie inside a SQLite transaction.
-//! `tokio::fs` would only hide the same blocking calls behind a slower façade.
-//!
-//! What matters is *where* it runs. A worker thread hashing a 10 GB file is not
-//! polling anything: the endpoint stops answering peers, the control socket
-//! stops answering `synch status`, and the timers driving anti-entropy fire
-//! late. The multi-thread runtime has one worker per core, so a handful of
-//! concurrent scans stalls the daemon outright.
-//!
-//! So every blocking operation reachable from an async context goes through
-//! [`offload`] — every one, with no "short enough to stay inline" exception.
-//! There used to be one, for a single indexed `SELECT` or a `stat`, and it
-//! measured the wrong thing: what a store call costs on a worker is not the
-//! query but the wait for the one connection mutex, which a publish batch or a
-//! GC pass holds for as long as it runs.
-//!
-//! One helper, generic over the caller's error. Without [`TaskLost`] each
-//! crate that needs it carries a near-identical copy, differing only in which
-//! error type it builds on failure.
+//! CAS fsyncs payloads. What matters is *where* it runs. A worker thread hashing
+//! a 10 GB file is not polling anything: the endpoint stops answering peers, the
+//! control socket stops answering `synch status`, and the timers driving
+//! anti-entropy fire late. So every blocking operation reachable from an async
+//! context goes through [`offload`] — every one, with no "short enough to stay
+//! inline" exception. There used to be one, for a single indexed `SELECT`, and
+//! it measured the wrong thing: what a store call costs on a worker is the wait
+//! for the one connection mutex, which a publish batch or a GC pass holds for as
+//! long as it runs.
 //!
 //! # Making the rule checkable
 //!
-//! "Everything blocking is offloaded" was a convention with a couple of hundred
-//! decision points and nothing to enforce it, and four separate audit passes
-//! have moved call sites off the runtime and still left some behind. The
-//! problem is that a violation is invisible: the code compiles, the tests pass,
-//! and the only symptom is a daemon that goes silent while some *other* thread
-//! holds the store's one connection.
-//!
-//! [`offload`] therefore marks its thread with a [`BlockingScope`] for the
-//! duration of the closure, and [`assert_off_runtime`] turns "am I allowed to
-//! block here?" into a question code can ask. `synch_store::Store` asks it
-//! before every acquisition of its connection mutex. The same shape as the
-//! `reentry::Scope` guard that made "no `Store::conn()` inside a transaction"
-//! checkable rather than a comment.
-//!
-//! The check fires only on a **multi-thread** runtime, which is what the daemon
-//! runs and what makes a parked worker matter: a `#[tokio::test]`'s
-//! current-thread runtime has one worker that the test is driving anyway, so
-//! blocking it costs nothing and flagging it would be noise.
+//! "Everything blocking is offloaded" was a convention with nothing to enforce
+//! it, and four audit passes still left violations behind — invisible ones: the
+//! code compiles, the tests pass, and the only symptom is a daemon that goes
+//! silent while some *other* thread holds the store's one connection.
+//! [`offload`] therefore marks its thread with a [`BlockingScope`], and
+//! [`assert_off_runtime`] turns "am I allowed to block here?" into a question
+//! code can ask — the same shape as the `reentry::Scope` guard that made "no
+//! `Store::conn()` inside a transaction" checkable. The check fires only on a
+//! **multi-thread** runtime, which is what the daemon runs and what makes a
+//! parked worker matter.
 
 use std::cell::Cell;
 

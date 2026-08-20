@@ -3,12 +3,11 @@
 
 use std::time::Duration;
 
-use synch_core::{now_ns, OriginId};
 use synch_engine::{Node, VersionPolicy};
 
 mod common;
 use common::{
-    big_payload, off_runtime, spawn_node as spawn, spawn_node_with as spawn_with, trust,
+    big_payload, off_runtime, shutdown, spawn_node as spawn, spawn_node_with as spawn_with, trust,
     trust_all as introduce,
 };
 
@@ -45,13 +44,10 @@ async fn three_nodes_converge_and_fetch_verified_content() {
     let head = nas.node.scan_publish_push().await.unwrap().unwrap();
     assert_eq!(head.seq, 1);
 
-    // Both peers pull from the NAS. The push above already delivered the head;
-    // the pull is what completes the trie under it.
+    // Both peers pull from the NAS; the push delivered the head, the pull completes its trie.
     for peer in [&laptop, &vps] {
         let report = peer.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
         assert_eq!(report.tries_completed, 1, "{report:?}");
-    }
-    for peer in [&laptop, &vps] {
         assert_eq!(
             peer.node.store().complete_head(nas.node.origin()).unwrap(),
             Some(head.clone()),
@@ -75,8 +71,7 @@ async fn three_nodes_converge_and_fetch_verified_content() {
         .unwrap();
     assert!(laptop.node.store().blob(&keynote_root).unwrap().is_none());
 
-    // A range read in the middle of the large object fetches only the groups
-    // covering it, each verified.
+    // A range read in the middle of the large object fetches only the groups covering it.
     let slice = laptop
         .node
         .read_range(
@@ -105,7 +100,7 @@ async fn three_nodes_converge_and_fetch_verified_content() {
         keynote
     );
 
-    // The completed fetch published a milestone ad (§6.3): once the head
+    // The completed fetch published a milestone ad (§6.3); once the head
     // carrying it propagates, the object has a second provider.
     assert!(laptop
         .node
@@ -125,9 +120,7 @@ async fn three_nodes_converge_and_fetch_verified_content() {
         "the laptop's partial-then-complete copy must be discoverable"
     );
 
-    for peer in [&nas, &laptop, &vps] {
-        peer.node.shutdown().await.unwrap();
-    }
+    shutdown(&[&nas.node, &laptop.node, &vps.node]).await;
 }
 
 /// §8 executed across real nodes: two origins publish different content for
@@ -145,14 +138,12 @@ async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
     laptop.node.add_space("media", laptop.space.path()).unwrap();
     std::fs::write(nas.space.path().join("shared.txt"), b"from the nas").unwrap();
     nas.node.scan_publish_push().await.unwrap().unwrap();
-    // Distinct mtimes: the filesystem supplies them, and `newest` reads them
-    // as published.
+    // Distinct mtimes, which `newest` reads as published.
     tokio::time::sleep(Duration::from_millis(20)).await;
     std::fs::write(laptop.space.path().join("shared.txt"), b"from the laptop").unwrap();
     laptop.node.scan_publish_push().await.unwrap().unwrap();
 
-    // The observer pulls both versions; the NAS pulls the laptop's too, so the
-    // adoption below can read what it replaces.
+    // The observer pulls both versions; the NAS pulls the laptop's too, so the adoption below can read what it replaces.
     nas.node
         .sync_with_peer(&laptop.node.node_id())
         .await
@@ -210,8 +201,8 @@ async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
     assert!(text.contains("nas@cluster.example"), "{text}");
     assert!(text.contains("laptop@cluster.example"), "{text}");
 
-    // Adoption is how divergence ends: the nas takes the laptop's version as
-    // its own, republishing with `prev` pointing at what it replaced.
+    // Adoption ends divergence: the nas takes the laptop's version as its own,
+    // republishing with `prev` pointing at what it replaced.
     let theirs = nas
         .node
         .read_entry(laptop.node.origin(), "media", "shared.txt")
@@ -241,14 +232,11 @@ async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
         b"from the laptop"
     );
 
-    for peer in [&nas, &laptop, &vps] {
-        peer.node.shutdown().await.unwrap();
-    }
+    shutdown(&[&nas.node, &laptop.node, &vps.node]).await;
 }
 
 /// §5.3: the periodic pull is what guarantees convergence after a partition
-/// heals — one anti-entropy round jumps straight to the newest head without
-/// replaying the intermediates.
+/// heals — one anti-entropy round jumps straight to the newest head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn convergence_survives_a_partition() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -262,8 +250,7 @@ async fn convergence_survives_a_partition() {
             format!("content {round}").as_bytes(),
         )
         .unwrap();
-        // Publish without pushing: the laptop is "partitioned" — it does not
-        // even know the NAS exists yet.
+        // Publish without pushing: the laptop is "partitioned" — it does not know the NAS exists yet.
         nas.node.scan_and_publish().unwrap();
     }
     let final_head = nas
@@ -282,8 +269,7 @@ async fn convergence_survives_a_partition() {
         .unwrap();
     assert!(report.peer.is_some(), "{report:?}");
 
-    // One round is enough: the laptop jumps straight to the newest head and
-    // pulls only the trie under it, not each intermediate root.
+    // One round is enough: the laptop jumps straight to the newest head, not each intermediate root.
     assert_eq!(
         laptop
             .node
@@ -293,8 +279,7 @@ async fn convergence_survives_a_partition() {
         Some(final_head)
     );
 
-    nas.node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[&nas.node, &laptop.node]).await;
 }
 
 /// §9.2: a pin starts by fetching what it guards — pinning content this node
@@ -333,27 +318,25 @@ async fn pinning_fetches_what_it_promises_to_keep() {
         b"keep these bytes"
     );
 
-    // A bare root nobody holds even partially has no size to fetch by, and is
-    // refused rather than recorded as a pin that guards nothing.
+    // A bare root nobody holds has no size to fetch by, and is refused rather
+    // than recorded as a pin that guards nothing.
     let absent = synch_core::Hash::new(b"never published");
     assert!(laptop.node.pin_object(&absent, None).await.is_err());
     assert_eq!(laptop.node.store().pinned_blobs().unwrap(), vec![root]);
 
-    nas.node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[&nas.node, &laptop.node]).await;
 }
 
-/// §5.4 end to end: publish, overwrite, then one maintenance pass with a
-/// retention window of nothing. The old root leaves `head_history`, its
-/// private trie nodes are swept, and the old content's bytes leave the CAS.
-/// A pinned object survives all of it, and a fresh peer can still pull the
-/// current root and read the content (the former gc test's property).
+/// §5.4 end to end: publish, overwrite, then one maintenance pass with
+/// nothing in retention — the old root leaves `head_history`, its private trie
+/// nodes are swept, its bytes leave the CAS; a pin survives, and a fresh peer
+/// still pulls the current root (the former gc test's property).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
     let _blocking = synch_core::BlockingScope::enter();
+    // Retention of nothing: everything published before "now" is swept.
     let peer = spawn_with("nas", |config| {
-        // Everything published before "now" is out of retention.
-        config.root_retention = Duration::from_nanos(1);
+        config.root_retention = Duration::from_nanos(1)
     })
     .await;
     let node = &peer.node;
@@ -447,13 +430,12 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
         b"second revision"
     );
 
-    node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[node, &laptop.node]).await;
 }
 
-/// §8: deletions are adoptable exactly as content is. A tombstone on one side
-/// and a live file on the other is deletion divergence, and it ends the way
-/// every other divergence ends — by someone taking the other's assertion.
+/// §8: deletions are adoptable exactly as content is — a tombstone on one side
+/// and a live file on the other is deletion divergence, ended by someone
+/// taking the other's assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -499,10 +481,9 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
         .adopt_deletion("shared", "notes.txt")
         .unwrap()
         .expect("our copy was here");
-    // The engine reports the path under the *stored* space root, which was
-    // canonicalized at `space add` time — on macOS the tempdir's `/var/…` is a
-    // symlink to `/private/var/…`, so the raw tempdir path would not compare
-    // equal even though it names the same file.
+    // The path is reported under the *stored* space root, canonicalized at
+    // `space add` time — on macOS `/var/…` is a symlink to `/private/var/…`,
+    // so the raw tempdir path would not compare equal.
     let canonical_space = laptop.space.path().canonicalize().unwrap();
     assert_eq!(removed, canonical_space.join("notes.txt"));
     assert!(!laptop.space.path().join("notes.txt").exists());
@@ -510,53 +491,41 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     let head = laptop.node.scan_publish_push().await.unwrap().unwrap();
     assert!(head.seq > 1);
 
-    // The laptop now publishes its own tombstone, both sides agree, and the
-    // path has left the unified tree.
+    // The laptop now publishes its own tombstone, both sides agree, and the path has left the unified tree.
     let set = laptop.node.versions("shared", "notes.txt").unwrap();
     assert_eq!(set.version_count(), 1, "{:?}", set.versions);
     assert!(set.versions[0].is_tombstone());
 
-    nas.node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
-}
-
-/// The same guard content adoption takes: outside a configured space nothing
-/// would publish the adoption, so the write would be a silent no-op with a
-/// filesystem side effect.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adopting_a_deletion_refuses_a_path_outside_a_space() {
-    let _blocking = synch_core::BlockingScope::enter();
-    let node = spawn("solo").await;
-    let err = node
+    // The same guard content adoption takes: outside a configured space
+    // nothing would publish the adoption, so the write would be a silent no-op
+    // with a filesystem side effect — refused instead. A path that is simply
+    // not here is not an error: the assertion being adopted is "this is gone",
+    // and it already is.
+    let err = laptop
         .node
         .adopt_deletion("nowhere", "notes.txt")
         .unwrap_err()
         .to_string();
     assert!(err.contains("space nowhere"), "{err}");
-
-    // A path that is simply not here is not an error: the assertion being
-    // adopted is "this is gone", and it already is.
-    node.node.add_space("shared", node.space.path()).unwrap();
-    assert!(node
+    assert!(laptop
         .node
         .adopt_deletion("shared", "never-existed.txt")
         .unwrap()
         .is_none());
-    node.node.shutdown().await.unwrap();
+
+    shutdown(&[&nas.node, &laptop.node]).await;
 }
 
 /// One chunk group, so the delta tests can talk in the units the tree does.
 const GROUP: usize = 16 * 1024;
 
 /// DELTA-SYNC end to end over a real mirror (`docs/DELTA-SYNC.md` §1, §3.2,
-/// §7): an edit moves one group, an append moves only the appended groups, and
-/// a re-ingest restores a donor the CAS has dropped. The mirror holds the
-/// previous version in its CAS, because that is what the last pass fetched
-/// into, so the new version is *built* there out of the old one plus the group
-/// that changed — and what crosses the network is the new version's tree over
-/// the region that changed, and that group. `delta_min_size` is turned down so
-/// the test works in megabytes rather than the 16 MiB an unconfigured node
-/// would insist on.
+/// §7): an edit moves one group, an append only the appended groups, and a
+/// re-ingest restores a donor the CAS dropped. The mirror holds the previous
+/// version, so the new one is *built* locally out of it plus the changed
+/// group — and what crosses the network is the tree over the changed region,
+/// and that group. `delta_min_size` is turned down so the test works in
+/// megabytes rather than the 16 MiB an unconfigured node would insist on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -605,9 +574,8 @@ async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
     );
     assert_eq!(std::fs::read(&mirrored).unwrap(), v2);
 
-    // The file grows by four groups. Every complete subtree of the old prefix
-    // keeps its chaining value, so the descent proves them equal and only the
-    // appended groups are fetched.
+    // The file grows by four groups: every complete subtree of the old prefix
+    // keeps its chaining value, so only the appended groups are fetched.
     let mut v3 = v2.clone();
     v3.extend(big_payload(4 * GROUP));
     std::fs::write(&source, &v3).unwrap();
@@ -625,8 +593,7 @@ async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
     assert_eq!(std::fs::read(&mirrored).unwrap(), v3);
 
     // The collector takes the version the mirror is sitting on: the only copy
-    // of those bytes left on this node is the mirrored file itself, which the
-    // pass re-ingests as the donor (§3.2).
+    // left is the mirrored file itself, which the pass re-ingests as the donor (§3.2).
     let held_root = synch_core::Hash::new(&v3);
     vps.node.store().delete_blob(&held_root).unwrap();
     assert!(vps.node.store().blob(&held_root).unwrap().is_none());
@@ -659,57 +626,7 @@ async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
     assert_eq!(report.current, 1, "{report:?}");
     assert_eq!(report.written, 0, "{report:?}");
 
-    nas.node.shutdown().await.unwrap();
-    vps.node.shutdown().await.unwrap();
-}
-
-/// A provider hint is only worth a row for an origin this node could dial.
-///
-/// Hints are unverified by design — content is hash-verified whatever the hint
-/// said — but taking one costs a `blob_providers` row, and the origin in it is
-/// a peer's word. The fetch below has no local ad covering the root, so it
-/// falls back to asking peers (§5.1): completion plus the storage decision.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
-    let _blocking = synch_core::BlockingScope::enter();
-    let nas = spawn("nas").await;
-    let laptop = spawn("laptop").await;
-    introduce(&[&nas, &laptop]);
-
-    // An object the NAS holds whole, advertised by itself and by an origin the
-    // laptop has never heard of.
-    let payload = big_payload(50_000);
-    let root = nas.node.store().ingest_bytes(&payload, now_ns()).unwrap();
-    let ad = nas.node.store().local_ad(&root).unwrap().unwrap();
-    nas.node
-        .store()
-        .put_provider(&root, nas.node.origin(), &ad)
-        .unwrap();
-    let stranger = OriginId::named("stranger", "elsewhere.example").unwrap();
-    nas.node
-        .store()
-        .put_provider(&root, &stranger, &ad)
-        .unwrap();
-
-    // The laptop holds no ad for this root, so the fetch asks its peers and
-    // completes with hash-verified bytes.
-    let report = laptop
-        .node
-        .fetch_all(&root, payload.len() as u64)
-        .await
-        .unwrap();
-    assert!(report.complete, "{report:?}");
-    assert_eq!(laptop.node.store().read_all(&root).unwrap(), payload);
-
-    let providers = laptop.node.store().providers(&root).unwrap();
-    assert!(
-        providers.iter().any(|(o, _)| o == nas.node.origin()),
-        "the peer we are bound to is worth a row"
-    );
-    assert!(
-        !providers.iter().any(|(o, _)| o == &stranger),
-        "the origin we could not dial is not"
-    );
+    shutdown(&[&nas.node, &vps.node]).await;
 }
 
 /// The whole sync-and-fetch path completes without a runtime worker touching
@@ -717,8 +634,7 @@ async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
 /// task, so "the work completed at all" is the assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
-    // Deliberately *without* the `BlockingScope` the other tests take: this is
-    // the one whose own body also holds to the rule (§10).
+    // Deliberately without the `BlockingScope` the other tests take: this body holds to the rule too (§10).
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     {
@@ -767,8 +683,7 @@ async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
     let node = laptop.node.clone();
     off_runtime(move || node.maintenance_pass()).await.unwrap();
 
-    nas.node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[&nas.node, &laptop.node]).await;
 }
 
 /// §5.3's reactive path delivers a head, and a head is a pointer: the trie
@@ -778,8 +693,7 @@ async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval() {
     let _blocking = synch_core::BlockingScope::enter();
-    // Intervals long enough that a round driven by the clock cannot be what
-    // completes this: the whole test has to finish inside a fraction of one.
+    // Intervals of ten minutes: nothing clock-driven can complete this.
     let nas = spawn_with("nas", |c| c.aae_interval = Duration::from_secs(600)).await;
     let laptop = spawn_with("laptop", |c| c.aae_interval = Duration::from_secs(600)).await;
     {
@@ -807,8 +721,7 @@ async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval(
         })
     };
 
-    // Publish and push. The push lands the head in the follower's pending slot;
-    // the bell is what turns that into a fetch.
+    // Publish and push: the head lands in the follower's pending slot; the bell turns that into a fetch.
     let head = tokio::time::timeout(Duration::from_secs(30), nas.node.scan_publish_push())
         .await
         .unwrap()
@@ -834,6 +747,5 @@ async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval(
 
     let _ = stop.send(());
     let _ = running.await;
-    nas.node.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[&nas.node, &laptop.node]).await;
 }

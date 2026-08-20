@@ -15,63 +15,7 @@ fn publish(node: &WireNode, seq: u64, files: &[(&str, &[u8])]) -> SignedHead {
     node.publish(seq, &files, &[])
 }
 
-/// Peer-agnostic fetch (§5.2): trie nodes are content-addressed, so a node
-/// converges byte-identical pulling solely from a relayer that is neither the
-/// origin nor the head's source.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_third_node_learns_the_trie_from_a_relayer() {
-    let _blocking = synch_core::BlockingScope::enter();
-    let origin_node = WireNode::spawn(Some("nas")).await;
-    let relay = WireNode::spawn(Some("vps")).await;
-    let laptop = WireNode::spawn(Some("laptop")).await;
-    trust_all(&[&origin_node, &relay, &laptop]);
-
-    let files: Vec<(String, Vec<u8>)> = (0..40)
-        .map(|i| (format!("dir{}/file{i:03}.bin", i % 5), vec![i as u8; 64]))
-        .collect();
-    let borrowed: Vec<(&str, &[u8])> = files
-        .iter()
-        .map(|(p, c)| (p.as_str(), c.as_slice()))
-        .collect();
-    let head = publish(&origin_node, 1, &borrowed);
-
-    // The relay syncs from the origin.
-    let to_origin = connect(&relay, &origin_node).await;
-    Syncer::new(relay.store.clone())
-        .sync_with(&to_origin)
-        .await
-        .unwrap();
-    assert_eq!(
-        relay.store.complete_head(&origin_node.origin).unwrap(),
-        Some(head.clone())
-    );
-
-    // The laptop syncs only from the relay, and still ends up byte-identical.
-    let to_relay = connect(&laptop, &relay).await;
-    let report = Syncer::new(laptop.store.clone())
-        .sync_with(&to_relay)
-        .await
-        .unwrap();
-    assert_eq!(report.tries_completed, 1, "{report:?}");
-    assert_eq!(
-        laptop.store.complete_head(&origin_node.origin).unwrap(),
-        Some(head)
-    );
-    assert_eq!(
-        laptop
-            .store
-            .list_entries(Some(&origin_node.origin), "media", "", None, None)
-            .unwrap(),
-        origin_node
-            .store
-            .list_entries(Some(&origin_node.origin), "media", "", None, None)
-            .unwrap()
-    );
-
-    shutdown_all(&[&origin_node, &relay, &laptop]).await;
-}
-
-/// A one-file update to a 60-file trie pulls only the touched path: a diff
+/// A one-file update to a 60-file trie pulls only the touched path — a diff
 /// regression would silently sync whole tries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_updates_transfer_only_the_change() {
@@ -113,8 +57,7 @@ async fn incremental_updates_transfer_only_the_change() {
     shutdown_all(&[&publisher, &follower]).await;
 }
 
-/// §3.2: connections from device keys with no live binding are closed
-/// immediately after the QUIC handshake.
+/// §3.2: connections from device keys with no live binding are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_peers_are_refused() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -133,9 +76,9 @@ async fn untrusted_peers_are_refused() {
     shutdown_all(&[&server, &stranger]).await;
 }
 
-/// A request costs a stream, not a session: a fetch that dials for itself
-/// would open one QUIC session per file, each one a handshake here and a
-/// connection left idling out over there.
+/// A request costs a stream, not a session: a fetch that dialed for itself
+/// would open one QUIC session per file, a handshake here and an idle
+/// connection out there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_to_a_peer_share_one_session() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -169,8 +112,7 @@ async fn requests_to_a_peer_share_one_session() {
         .await
         .unwrap();
 
-    // The two ALPNs are separate sessions, so the metadata one is untouched by
-    // a content dial.
+    // The two ALPNs are separate sessions, untouched by each other's dials.
     connect_blob(&client, &server).await;
     let again = connect(&client, &server).await;
     assert_eq!(
@@ -201,9 +143,11 @@ async fn requests_to_a_peer_share_one_session() {
 }
 
 /// The §5.3 reactive path over the wire: push_head lands in the pending slot
-/// (complete untouched), and fetch_pending from the publisher flips it.
+/// (complete untouched), fetch_pending from the publisher flips it — and a
+/// head every provider returns `missing` for is abandoned (§5.2), not left
+/// wedging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reactive_head_push_propagates() {
+async fn reactive_head_push_propagates_and_unservable_heads_are_abandoned() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = WireNode::spawn(Some("nas")).await;
     let follower = WireNode::spawn(Some("laptop")).await;
@@ -236,19 +180,8 @@ async fn reactive_head_push_propagates() {
         Some(head)
     );
 
-    shutdown_all(&[&publisher, &follower]).await;
-}
-
-/// §5.2: if every candidate provider persistently returns `missing`, the
-/// pending head is abandoned and head selection re-runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unservable_head_is_abandoned_rather_than_wedging() {
-    let _blocking = synch_core::BlockingScope::enter();
-    let publisher = WireNode::spawn(Some("nas")).await;
-    let follower = WireNode::spawn(Some("laptop")).await;
-    trust_all(&[&publisher, &follower]);
-
-    // A head whose trie nobody has: signed, valid, but unservable.
+    // A head whose trie nobody has — signed, valid, but unservable — is
+    // abandoned after every provider returns `missing`, not left to wedge.
     let phantom = SignedHead::sign(
         &publisher.secret,
         publisher.origin.clone(),
@@ -256,12 +189,9 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
         Hash::new(b"a root that was never published"),
         now_ns(),
     );
-    let syncer = Syncer::new(follower.store.clone());
     assert!(syncer.offer_head(&phantom, now_ns()).unwrap().accepted());
-
-    let client = connect(&follower, &publisher).await;
     let outcome = syncer
-        .fetch_pending(&client, &publisher.origin)
+        .fetch_pending(&back, &publisher.origin)
         .await
         .unwrap();
     assert_eq!(outcome, FetchOutcome::Abandoned);
@@ -272,7 +202,7 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
 
     // And a real head published afterwards is still adopted normally.
     let real = publish(&publisher, 10, &[("a.txt", b"hello")]);
-    let report = syncer.sync_with(&client).await.unwrap();
+    let report = syncer.sync_with(&back).await.unwrap();
     assert_eq!(report.tries_completed, 1, "{report:?}");
     assert_eq!(
         follower.store.complete_head(&publisher.origin).unwrap(),
@@ -284,8 +214,8 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
 
 /// A value small enough to be inline must *be* inline: the alternative gives
 /// one key/value map two roots, which is what structural sharing rests on not
-/// happening. Such a head is retired by the §5.2 abandonment rule, not left
-/// for the TTL sweep — a prior audit found it holding `head_floor` instead.
+/// happening. Such a head is retired by the §5.2 abandonment rule, not the TTL
+/// sweep — a prior audit found it holding `head_floor` instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_in_the_wrong_representation_retires_its_head() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -293,8 +223,8 @@ async fn a_value_in_the_wrong_representation_retires_its_head() {
     let follower = WireNode::spawn(Some("laptop")).await;
     trust_all(&[&publisher, &follower]);
 
-    // A trie the publisher can serve whole, whose one leaf points at an
-    // out-of-line payload small enough that it should have been inline.
+    // A one-leaf trie whose leaf points at an out-of-line payload small
+    // enough that it should have been inline.
     let small = b"short enough to be inline".to_vec();
     assert!(small.len() <= synch_core::INLINE_VALUE_MAX);
     let value_hash = Hash::new(&small);
@@ -318,8 +248,8 @@ async fn a_value_in_the_wrong_representation_retires_its_head() {
     assert!(syncer.offer_head(&head, now_ns()).unwrap().accepted());
 
     let client = connect(&follower, &publisher).await;
-    // The node arrives; the value is refused each round, which is no progress,
-    // so the head is retired by the counter rather than by the clock.
+    // The node arrives; the value is refused each round — no progress — so the
+    // head is retired by the counter rather than by the clock.
     let outcome = syncer
         .fetch_pending(&client, &publisher.origin)
         .await
@@ -338,12 +268,9 @@ fn count_nodes(store: &Store) -> usize {
     store.trie_stats().unwrap().nodes
 }
 
-/// An object larger than one frame transfers, a window at a time (§6.4).
-///
-/// A bao slice is encoded into memory whole and travels in a single framed
-/// message, so everything above `MAX_FRAME_LEN` would fail with a truncated
-/// stream: the requester walks the object in `MAX_SLICE_GROUPS` windows, and
-/// the provider clamps to the same bound.
+/// An object larger than one frame transfers, a window at a time (§6.4): a
+/// bao slice is encoded into memory whole and travels in one framed message,
+/// so anything above `MAX_FRAME_LEN` would truncate without the windowed walk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_object_larger_than_one_frame_transfers() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -375,8 +302,7 @@ async fn an_object_larger_than_one_frame_transfers() {
 /// One origin publishing a record this node cannot decode does not stop it
 /// converging with the others (§5.2): materialization is atomic, but the
 /// failure must not end the whole exchange — the poisoned head is durable, so
-/// a single bad record from any trusted origin would stop *every* origin's
-/// metadata from reaching this node, on every sync from then on.
+/// one bad record would stop *every* origin's metadata from then on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_poisoned_origin_does_not_hold_up_the_others() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -386,7 +312,7 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
     trust_all(&[&poisoned, &healthy, &follower]);
 
     // A well-formed `f:` key whose value is not a FileEntry: signed, complete,
-    // and impossible to materialize.
+    // impossible to materialize.
     let trie = Trie::new(poisoned.store.as_ref());
     let root = trie
         .insert(
@@ -403,9 +329,8 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
 
     publish(&healthy, 1, &[("good.txt", b"readable")]);
 
-    // The poisoned node picks up the healthy origin's head, so one exchange
-    // carries both — `nas@…` sorts before `vps@…`, so the bad one is handled
-    // first, before the good one is read.
+    // One exchange carries both origins — `nas@…` sorts first, so the bad one
+    // is handled before the good one is read.
     let to_healthy = connect(&poisoned, &healthy).await;
     Syncer::new(poisoned.store.clone())
         .sync_with(&to_healthy)

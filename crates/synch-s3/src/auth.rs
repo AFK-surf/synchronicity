@@ -448,9 +448,8 @@ mod tests {
         .is_err());
     }
 
-    /// Pins the canonical request string against the layout SigV4 defines:
-    /// method, URI, query, canonical headers (each terminated by a newline),
-    /// a blank line, the signed-header list, and the payload hash.
+    /// Pins the canonical request layout SigV4 defines: method, URI, query,
+    /// headers (newline-terminated), blank line, signed-header list, payload hash.
     #[test]
     fn canonical_requests_match_the_documented_layout() {
         let headers = headers(&[
@@ -460,9 +459,8 @@ mod tests {
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
             ("x-amz-date", "20130524T000000Z"),
-            // Padded on both ends and doubled inside: SigV4 trims the first
-            // and collapses the second, and a client that signs the collapsed
-            // form gets a 403 from a gateway that only trims.
+            // Padded and doubled inside: SigV4 trims the first and collapses
+            // the second; a client signing the collapsed form gets a 403 if the gateway only trims.
             ("range", "  bytes=0-9,   20-29  "),
         ]);
         let request = SignedRequest {
@@ -472,12 +470,7 @@ mod tests {
             headers: &headers,
             payload_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         };
-        let signed = vec![
-            "host".to_string(),
-            "range".to_string(),
-            "x-amz-content-sha256".to_string(),
-            "x-amz-date".to_string(),
-        ];
+        let signed = ["host", "range", "x-amz-content-sha256", "x-amz-date"].map(String::from);
         let canonical = canonical_request(&request, &signed);
         assert_eq!(
             canonical,
@@ -497,8 +490,7 @@ mod tests {
         );
     }
 
-    /// Pins the string-to-sign layout and the four-step key derivation, both of
-    /// which the signature depends on entirely.
+    /// Pins the string-to-sign layout and the four-step key derivation.
     #[test]
     fn string_to_sign_and_key_derivation_are_stable() {
         assert_eq!(
@@ -515,8 +507,7 @@ mod tests {
             )
         );
 
-        // The signing key is HMAC-chained date -> region -> service -> suffix,
-        // so changing any scope component must change the key.
+        // The key is HMAC-chained date -> region -> service -> suffix; any scope change alters it.
         let base = signing_key("secret", "20130524", "us-east-1", "s3");
         assert_eq!(base.len(), 32);
         assert_ne!(base, signing_key("secret", "20130525", "us-east-1", "s3"));
@@ -524,8 +515,7 @@ mod tests {
         assert_ne!(base, signing_key("other", "20130524", "us-east-1", "s3"));
     }
 
-    /// A correctly signed GET against `host` stamped at `amz_date`, plus the
-    /// request's own signing time to verify at.
+    /// A correctly signed GET against `host` stamped at `amz_date`, plus its signing time.
     fn signed_request(host: &str, amz_date: &str) -> (BTreeMap<String, String>, i64) {
         let mut map = headers(&[("host", host), ("x-amz-date", amz_date)]);
         let header = SigV4Header {
@@ -586,8 +576,7 @@ mod tests {
         };
         assert!(verify(&AuthMode::SigV4(keys.clone()), &tampered, now).is_err());
 
-        // The clock an hour past the window rejects the same signature; within
-        // the window it is accepted (§12 replay bound).
+        // An hour past the window rejects; within it, accepts (§12 replay bound).
         let (map, now) = signed_request("example.com", "20240102T030405Z");
         let signed = request(&map);
         assert!(verify(
@@ -622,10 +611,8 @@ mod tests {
         assert_eq!(canonical_uri(""), "/");
         assert_eq!(canonical_uri("/a b/c"), "/a%20b/c");
 
-        let query = vec![
-            ("prefix".to_string(), "a b".to_string()),
-            ("list-type".to_string(), "2".to_string()),
-        ];
+        let query =
+            [("prefix", "a b"), ("list-type", "2")].map(|(k, v)| (k.to_string(), v.to_string()));
         let request = SignedRequest {
             method: "GET",
             path: "/bucket",

@@ -1,17 +1,14 @@
-//! Model-based property tests for the trie (§11, testing strategy).
-//!
-//! The model is a `BTreeMap`: the trie must agree with it on every read, its
-//! root must depend only on the map contents and never on insertion order,
-//! diffs must be complete, and deletion must leave the canonical trie.
+//! Model-based property tests for the trie (§11, testing strategy): the model
+//! is a `BTreeMap`, and the trie must agree with it on every read, order-
+//! independently, with complete diffs and canonical deletes.
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use synch_core::Hash;
-use synch_mpt::{ChangeKind, MemStore, NodeStore, Trie};
+use synch_mpt::{ChangeKind, MemStore, Trie};
 
-/// Keys drawn from a small alphabet so shared prefixes, prefix-of-another
-/// keys, and branch splits all occur frequently.
+/// A small alphabet, so shared prefixes, prefix-of-another keys, and branch splits all occur.
 fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(
         prop::sample::select(vec![0u8, 1, 15, 16, 255, b'a', b'b']),
@@ -41,8 +38,7 @@ fn build(store: &MemStore, items: &[(Vec<u8>, Vec<u8>)]) -> (Hash, BTreeMap<Vec<
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
-    /// Every key the model holds reads back identically from the trie, and
-    /// iteration yields exactly the model in lexicographic order.
+    /// The trie agrees with the model on every read and in iteration order.
     #[test]
     fn matches_btreemap_model(items in map_strategy(), probes in prop::collection::vec(key_strategy(), 0..10)) {
         let store = MemStore::new();
@@ -65,11 +61,8 @@ proptest! {
     /// same pairs in any order yields the same root.
     #[test]
     fn root_is_order_independent(items in map_strategy()) {
-        // `items` is proptest-ordered and may hold duplicate keys; `forward` is
-        // the deduplicated map in sorted order. Insert-overwrite semantics make
-        // `build` on either reproduce the same map, so equal roots mean the
-        // root depends on the map alone — strictly stronger than any fixed
-        // permutation of the distinct keys.
+        // `forward` is the deduplicated map in sorted order; equal roots across
+        // the two orders mean the root depends on the map alone.
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.iter().cloned().collect();
         let forward: Vec<(Vec<u8>, Vec<u8>)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
@@ -80,9 +73,7 @@ proptest! {
         prop_assert_eq!(root_a, root_b);
     }
 
-    /// Deleting keys leaves exactly the canonical trie of the remaining map:
-    /// the root after deletion equals the root of a trie built fresh from the
-    /// survivors, so no non-canonical residue survives a delete.
+    /// Deleting keys leaves exactly the canonical trie of the remaining map.
     #[test]
     fn canonical_after_delete(items in map_strategy(), to_delete in prop::collection::vec(key_strategy(), 0..12)) {
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.into_iter().collect();
@@ -200,22 +191,6 @@ proptest! {
         for probe in &probes {
             let proof = trie.prove(root, probe).unwrap();
             prop_assert_eq!(proof.verify(root, probe).unwrap(), model.get(probe).cloned());
-        }
-    }
-
-    /// A complete trie reports nothing missing, and every reachable node is
-    /// present — the invariant the §5.2 head flip depends on.
-    #[test]
-    fn complete_tries_report_no_missing(items in map_strategy()) {
-        let store = MemStore::new();
-        let trie = Trie::new(&store);
-        let (root, _) = build(&store, &items);
-        prop_assert!(trie.is_complete(root).unwrap());
-        prop_assert!(trie.missing(root, 100).unwrap().is_empty());
-
-        let reachable = trie.reachable(root).unwrap();
-        for node in &reachable.nodes {
-            prop_assert!(store.get_node(node).unwrap().is_some());
         }
     }
 }

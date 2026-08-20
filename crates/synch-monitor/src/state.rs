@@ -1,34 +1,14 @@
-//! What a monitor remembers between runs.
-//!
-//! Three things, and each is load-bearing for a different reason. The **last
-//! checkpoint** is what makes split-view detection possible at all: a log that
-//! shows this monitor a tree which does not extend the one it showed last time
-//! has equivocated, and that is the single strongest thing a monitor can
-//! notice on its own. Note the scope — *this* monitor, over time. A log that
-//! showed a **different** monitor a different history is invisible from here;
-//! catching that needs either cross-witnessing, which this design does not
-//! implement, or a second monitor run somewhere else and compared by hand.
-//! The **known keys** are what make reporting bearable: without a record of
-//! which keys have already been surfaced for an apex, every run would report
-//! every key the zone has ever authorized, and an alert that fires every hour
-//! about the same key is an alert nobody reads. They are bookkeeping, not
-//! trust — see [`crate::classify::KnownKeys`], whose apexes are also the watch
-//! list, which is why a hand-edited entry that is not a domain name is refused
-//! rather than left to watch nothing. The **entry bodies** are the evidence:
-//! the full log entry behind every report, per log and by index, so "what
-//! exactly does the log hold for this report" is a local lookup — the `entry`
-//! subcommand — never a re-fetch from the log under watch.
-//!
-//! The file also records the **trust surface** the run was made under: which
-//! DNSSEC anchor set and which log key set the verdicts were computed against.
-//! Tier B means "no client holding *these* would have accepted it", so a
-//! second run against a different anchor set would be writing verdicts about a
-//! different client population into the same memory. That is refused rather
-//! than merged.
-//!
-//! The file is plain JSON on purpose: an operator has to be able to read it,
-//! seed it by hand for a zone whose history predates the monitor, and check it
-//! into whatever they keep their runbooks in.
+//! What a monitor remembers between runs, in one hand-readable JSON file: the
+//! last checkpoint per log (split-view detection — a tree that does not extend
+//! the last one shown *this* monitor has equivocated), the keys already
+//! reported per apex (bookkeeping, not trust — without them every run
+//! re-reports every key the zone ever authorized), the evidence bodies behind
+//! each report (a local lookup, never a re-fetch from the log under watch),
+//! and the trust surface the verdicts were computed under: tier B means "no
+//! client holding *these* would have accepted it", so a later run under a
+//! different surface writes verdicts about a different client population, and
+//! is refused rather than merged. Plain JSON, so an operator can read it, seed
+//! it by hand, and check it into a runbook.
 
 use std::collections::BTreeMap;
 
@@ -309,6 +289,15 @@ fn temporary_at(path: &std::path::Path, nanos: u128) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    /// Records a position, so the tests do not spell the struct out.
+    fn positioned(state: &mut MonitorState, origin: &str, size: u64, root: &str, next: u64) {
+        *state.position(origin) = LogPosition {
+            tree_size: size,
+            root: root.to_string(),
+            next_index: next,
+        };
+    }
+
     #[test]
     fn a_state_file_round_trips_and_an_absent_one_is_a_fresh_monitor() {
         let dir = tempfile::tempdir().unwrap();
@@ -316,42 +305,32 @@ mod tests {
         assert!(MonitorState::load(&path).unwrap().is_fresh());
 
         let mut state = MonitorState::default();
-        *state.position("log2025-1.rekor.example") = LogPosition {
-            tree_size: 67_686_055,
-            root: "bcae".repeat(16),
-            next_index: 67_673_584,
-        };
-        // A second shard, tracked beside the first rather than instead of it:
-        // the client accepts proofs from both, so the monitor follows both.
-        *state.position("log2026-1.rekor.example") = LogPosition {
-            tree_size: 12,
-            root: "0f0f".repeat(16),
-            next_index: 12,
-        };
-        state.known.insert(
-            &synch_net::chain::parse_name("sync.example").unwrap(),
-            b"a key",
+        positioned(
+            &mut state,
+            "log2025-1.rekor.example",
+            67_686_055,
+            &"bcae".repeat(16),
+            67_673_584,
         );
+        // A second shard, beside the first — the client accepts proofs from both.
+        positioned(
+            &mut state,
+            "log2026-1.rekor.example",
+            12,
+            &"0f0f".repeat(16),
+            12,
+        );
+        let apex = synch_net::chain::parse_name("sync.example").unwrap();
+        state.known.insert(&apex, b"a key");
         assert_eq!(state.logs.len(), 2);
-        assert!(state
-            .record_entry(
-                "log2025-1.rekor.example",
-                67_673_583,
-                b"the full body of the finding's entry",
-            )
-            .is_empty());
+        let dropped = state.record_entry("log2025-1.rekor.example", 67_673_583, b"a body");
+        assert!(dropped.is_empty());
         state.save(&path).unwrap();
         assert_eq!(MonitorState::load(&path).unwrap(), state);
         assert!(!MonitorState::load(&path).unwrap().is_fresh());
-        assert_eq!(
-            state
-                .entry("log2025-1.rekor.example", 67_673_583)
-                .unwrap()
-                .as_deref(),
-            Some(b"the full body of the finding's entry".as_slice())
-        );
-        // The same index under the other shard is a different entry, and
-        // this state holds neither.
+        let entry = state.entry("log2025-1.rekor.example", 67_673_583).unwrap();
+        assert_eq!(entry.as_deref(), Some(b"a body".as_slice()));
+        // The same index under the other shard is a different entry; this state holds neither.
         assert_eq!(
             state.entry("log2026-1.rekor.example", 67_673_583).unwrap(),
             None
@@ -362,9 +341,8 @@ mod tests {
         );
         assert!(state.origins_holding(1).is_empty());
 
-        // A file that is not this shape is an error, not a silent reset — a
-        // monitor that quietly forgot its baseline would quietly stop
-        // detecting split views.
+        // Not this shape is an error, not a silent reset — which would stop
+        // detecting split views altogether.
         std::fs::write(&path, b"{").unwrap();
         assert!(MonitorState::load(&path).is_err());
     }
@@ -374,47 +352,32 @@ mod tests {
     fn the_evidence_drawer_is_bounded_and_reports_what_it_dropped() {
         let mut state = MonitorState::default();
         for index in 0..MAX_STORED_ENTRIES as u64 {
-            assert!(state
-                .record_entry("log.example", index, b"a body")
-                .is_empty());
+            let dropped = state.record_entry("log.example", index, b"a body");
+            assert!(dropped.is_empty());
         }
-        assert_eq!(
-            state.record_entry("log.example", MAX_STORED_ENTRIES as u64, b"a body"),
-            vec![0]
-        );
+        let dropped = state.record_entry("log.example", MAX_STORED_ENTRIES as u64, b"a body");
+        assert_eq!(dropped, vec![0]);
         assert_eq!(state.entries["log.example"].len(), MAX_STORED_ENTRIES);
         assert_eq!(state.entry("log.example", 0).unwrap(), None);
-        assert!(state
-            .entry("log.example", MAX_STORED_ENTRIES as u64)
-            .unwrap()
-            .is_some());
+        let entry = state.entry("log.example", MAX_STORED_ENTRIES as u64);
+        assert!(entry.unwrap().is_some());
     }
 
-    /// Two overlapping saves must not rename each other's partial bytes over
-    /// the target: each writes its own temporary, even on a frozen clock.
+    /// Two overlapping saves write their own temporaries, even on a frozen clock.
     #[test]
     fn concurrent_saves_do_not_share_a_temporary_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monitor.json");
         let mut first = MonitorState::default();
-        *first.position("one.example") = LogPosition {
-            tree_size: 1,
-            root: "11".repeat(32),
-            next_index: 1,
-        };
+        positioned(&mut first, "one.example", 1, &"11".repeat(32), 1);
         let mut second = MonitorState::default();
-        *second.position("two.example") = LogPosition {
-            tree_size: 2,
-            root: "22".repeat(32),
-            next_index: 2,
-        };
+        positioned(&mut second, "two.example", 2, &"22".repeat(32), 2);
         std::thread::scope(|scope| {
             scope.spawn(|| first.save(&path).unwrap());
             scope.spawn(|| second.save(&path).unwrap());
         });
         let loaded = MonitorState::load(&path).unwrap();
-        // Whichever won, the file is one of the two whole states, not a
-        // splice of both.
+        // Whichever won, the file is one whole state, not a splice.
         assert!(loaded == first || loaded == second, "{loaded:?}");
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -422,9 +385,7 @@ mod tests {
             .collect();
         assert_eq!(left, ["monitor.json"]);
 
-        // The uniqueness is pinned directly as well: on a coarse clock two
-        // writes can read the same nanosecond, so the names must differ even
-        // with the clock held still.
+        // Pinned directly too: on a coarse clock the names must still differ.
         let frozen = temporary_at(&path, 1_760_000_000);
         assert_ne!(temporary_at(&path, 1_760_000_000), frozen);
     }

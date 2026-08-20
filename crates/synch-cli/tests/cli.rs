@@ -1,8 +1,6 @@
-//! End-to-end tests that drive the real `synch` binary.
-//!
-//! `synch init` creates the datadir; `synch daemon run` owns the node; every
-//! other command is a control-socket request to that daemon (§9.1). These
-//! tests walk that path through the actual binary — the in-process
+//! End-to-end tests that drive the real `synch` binary: `synch init` creates
+//! the datadir, `synch daemon run` owns the node, every other command is a
+//! control-socket request to that daemon (§9.1). The in-process
 //! control-socket coverage lives in `tests/control.rs`.
 
 use std::{
@@ -106,8 +104,7 @@ impl Cli {
             .trim()
             .to_string();
 
-        // The banner is printed after the socket is bound, but the first
-        // command still has to find a daemon that has finished opening.
+        // The banner precedes the daemon being fully open; wait until it is.
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if self.try_run(&["daemon", "status"]).0 {
@@ -154,6 +151,11 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
 
+    // With no datadir at all, even `daemon run` has nothing to open.
+    let (ok, _, stderr) = cli.try_run(&["daemon", "run"]);
+    assert!(!ok);
+    assert!(stderr.contains("synch init"), "{stderr}");
+
     // No domain: the device key is the identity and nothing has to be
     // published for the node to know what it is (§3.1).
     let out = cli.run(&["init"]);
@@ -174,16 +176,6 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
             "{args:?}: {stderr} must name the socket"
         );
     }
-}
-
-#[test]
-fn commands_refuse_to_run_without_an_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let cli = Cli::new(dir.path());
-    // No datadir at all: `daemon run` has nothing to open.
-    let (ok, _, stderr) = cli.try_run(&["daemon", "run"]);
-    assert!(!ok);
-    assert!(stderr.contains("synch init"), "{stderr}");
 }
 
 #[test]
@@ -243,16 +235,14 @@ fn the_command_surface_works_over_the_socket() {
         .run(&["mirror", "rm", &mirror_dir.path().to_string_lossy()])
         .contains("removed"));
 
-    // A pin may name a path, in which case the version the reading policy
-    // selects supplies the root (§8).
+    // A pin may name a path; the reading policy's version supplies the root (§8).
     let root = blake3::hash(b"hello").to_hex().to_string();
     assert!(cli.run(&["pin", "add", "media/notes.txt"]).contains(&root));
     assert!(cli.run(&["pin", "ls"]).contains(&root));
     assert!(cli.run(&["pin", "rm", "media/notes.txt"]).contains(&root));
     assert!(!cli.run(&["pin", "ls"]).contains(&root));
 
-    // A daemon-side failure is this process's exit status, not a transport
-    // error.
+    // A daemon-side failure is this process's exit status, not a transport error.
     let (ok, _, stderr) = cli.try_run(&["pin", "add", "nothex"]);
     assert!(!ok);
     assert!(stderr.contains("hex"), "{stderr}");
@@ -262,8 +252,7 @@ fn the_command_surface_works_over_the_socket() {
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
     assert!(cli.run(&["daemon", "status"]).contains("head: seq"));
 
-    // `synch recover` on a node no peer has ever advertised: it collects one
-    // round, finds nothing to resume from, and leaves the seq alone (§3.4).
+    // `synch recover` with no peer ever advertising: one round, nothing to resume (§3.4).
     let recover = cli.run(&["recover", "--wait", "0"]);
     assert!(recover.contains("nothing to recover"), "{recover}");
     let (ok, _, stderr) = cli.try_run(&["recover", "--wait", "whenever"]);
@@ -296,8 +285,7 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     let nas_daemon = nas.daemon();
     let laptop_daemon = laptop.daemon();
 
-    // Each side learns the other's key. Addresses are exchanged explicitly
-    // because these nodes run with discovery disabled, and static trust
+    // Addresses are exchanged explicitly: discovery is off, and static trust
     // binds the key and names nobody (§3.2).
     let nas_key = key_of(&nas);
     let laptop_key = key_of(&laptop);
@@ -313,8 +301,7 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     nas.run(&["space", "add", "media", &nas_space.path().to_string_lossy()]);
     nas.run(&["scan"]);
 
-    // The publish is pushed reactively; the periodic round repairs whatever
-    // the push missed.
+    // The push is reactive; the periodic round repairs what the push missed.
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut converged = false;
     while Instant::now() < deadline {
@@ -333,8 +320,7 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     assert!(ls.contains("small.txt"), "{ls}");
     assert!(ls.contains("120000"), "{ls}");
 
-    // A verified full read, a verified range read, and a `get`, all streamed
-    // from the laptop's daemon over the control socket.
+    // A verified full read, a range read, and a `get`, streamed over the socket.
     let nas_origin = format!("key:{nas_key}");
     let got = laptop.run_bytes(&["cat", &format!("{nas_origin}:media/small.txt")]);
     assert_eq!(got, b"a small file");

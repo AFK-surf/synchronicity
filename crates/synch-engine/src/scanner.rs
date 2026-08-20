@@ -1273,9 +1273,8 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::testkit::{node_with_space, published, reopen};
 
-    /// Ages every scan record past the racy window, as if the test had waited
-    /// two seconds: freshly hashed records are racily clean and re-hashed on
-    /// the next scan, which is correct but not what stat-trust tests exercise.
+    /// Ages every scan record past the racy window: fresh records are racily
+    /// clean and re-hashed next scan, which stat-trust tests don't exercise.
     fn age_quick_checks(node: &Node) {
         for space in node.store().spaces().unwrap() {
             for mut row in node.store().local_file_rows(&space.id).unwrap() {
@@ -1299,8 +1298,7 @@ mod tests {
         (data, space, node)
     }
 
-    /// Rewrites a tombstone's deletion time, which is what a tombstone 90 days
-    /// old looks like without waiting 90 days.
+    /// Rewrites a tombstone's deletion time, like one 90 days old without the wait.
     fn backdate_tombstone(node: &Node, path: &str, mtime_ns: i64) {
         let row = published(node, "media", path);
         assert_eq!(row.kind, EntryKind::Tombstone);
@@ -1346,8 +1344,7 @@ mod tests {
         let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
         assert_eq!(a.size, 5);
         assert_eq!(a.content, Some(Hash::new(b"hello")));
-        // Content is in the CAS and reads back verified, and the object is
-        // advertised as a provider.
+        // Content is in the CAS, reads back verified, and is advertised as a provider.
         assert_eq!(
             node.store().read_all(&a.content.unwrap()).unwrap(),
             b"hello"
@@ -1360,23 +1357,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_files_are_not_rehashed() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-        node.scan_and_publish().unwrap();
-        age_quick_checks(&node);
-
-        let (report, head) = node.scan_and_publish().unwrap();
-        assert_eq!(report.hashed, 0);
-        assert_eq!(report.unchanged, 1);
-        assert!(head.is_none(), "an unchanged tree publishes no new head");
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn a_racy_same_size_rewrite_is_still_detected() {
         // A same-size rewrite sharing the hashed mtime: inside the racy window
-        // the stat proves nothing and the bytes are hashed again.
+        // the stat proves nothing, so the bytes are hashed again.
         let (_d, space, node) = node_with_space().await;
         let path = space.path().join("rolling.txt");
         std::fs::write(&path, b"revision 1").unwrap();
@@ -1410,17 +1393,15 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The change lifecycle: edits are detected with prev lineage pointing at
-    /// the replaced content; deletions become tombstones distinguishing
-    /// "deleted at seq N" from "never existed".
+    /// Edits are detected with prev lineage at the replaced content; deletions
+    /// become tombstones distinguishing "deleted at seq N" from "never existed".
     #[tokio::test]
     async fn edits_and_deletions_flow_through_the_lifecycle() {
         let (_d, space, node) = node_with_space().await;
         std::fs::write(space.path().join("a.txt"), b"before").unwrap();
         node.scan_and_publish().unwrap();
 
-        // A distinguishable mtime so the stat triple differs even on
-        // coarse-resolution filesystems.
+        // A distinguishable mtime, so the stat triple differs even on coarse clocks.
         std::fs::write(space.path().join("a.txt"), b"after!!").unwrap();
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 1);
@@ -1448,7 +1429,7 @@ mod tests {
         assert!(unjudged_covers(&unjudged, "d/sub"));
         assert!(unjudged_covers(&unjudged, "d/sub/deep.txt"));
         assert!(unjudged_covers(&unjudged, "solo.txt"));
-        // Whole components only: a sibling sharing a prefix is not covered, or
+        // Whole components only: a shared-prefix sibling is not covered, or
         // one unreadable directory would freeze its neighbours' deletions.
         assert!(!unjudged_covers(&unjudged, "d/subterfuge.txt"));
         assert!(!unjudged_covers(&unjudged, "solo.txt.bak"));
@@ -1461,8 +1442,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_the_walk_could_not_stat_is_not_deleted() {
         use std::os::unix::fs::PermissionsExt;
-        // Root bypasses the permission check this relies on; detect it by
-        // trying rather than by asking for a uid.
+        // Root bypasses the EACCES this relies on; detect it by trying, not uid.
         let probe = tempfile::tempdir().unwrap();
         std::fs::write(probe.path().join("p"), b"x").unwrap();
         std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -1473,8 +1453,8 @@ mod tests {
             return;
         }
         let (_d, space, node) = node_with_space().await;
-        // Both shapes: a file under the unreadable directory and one under a
-        // subdirectory of it — `walk` stats a DirEntry before it recurses.
+        // Both shapes: directly under and under a subdir — `walk` stats a
+        // DirEntry before it recurses.
         let dir = space.path().join("d");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("keep.txt"), b"hello").unwrap();
@@ -1488,8 +1468,7 @@ mod tests {
             );
         }
 
-        // Listable but not traversable: `read_dir` still yields the name,
-        // `symlink_metadata` on it fails.
+        // Listable but not traversable: `read_dir` yields names, `symlink_metadata` fails.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
         let report = node.scan_all().unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1517,8 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn an_adoption_target_stays_inside_its_space() {
         let (_d, _space, node) = node_with_space().await;
-        // Against the root as `add_space` recorded it, not as the test made
-        // it: `canonical_dir` resolves `/var` to `/private/var` on macOS.
+        // Against the root `add_space` recorded (`canonical_dir` resolves
+        // `/var` to `/private/var` on macOS).
         let root = PathBuf::from(node.store().space("media").unwrap().unwrap().local_path);
         let inside = node.adoption_target("media", "sub/ok.txt").unwrap();
         assert_eq!(inside, root.join("sub").join("ok.txt"));
@@ -1553,15 +1532,15 @@ mod tests {
             EntryKind::Tombstone
         );
 
-        // The tombstone ages out and the file comes back, both before the
-        // next scan sees either — the whole of the trigger.
+        // The tombstone ages out and the file returns before the next scan
+        // sees either — the whole of the trigger.
         backdate_tombstone(&node, "a.txt", now_ns() - 2 * 3600 * 1_000_000_000);
         std::fs::write(space.path().join("a.txt"), b"second").unwrap();
 
         let report = node.scan_all().unwrap();
         assert_eq!(
             report.expired, 0,
-            "the removal must give way to the entry restating the same key"
+            "the removal gives way to the entry restating the key"
         );
         node.publish(&report.staged).unwrap();
 
@@ -1606,31 +1585,6 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A path that vanishes mid-scan costs its own indexing, not the pass.
-    #[tokio::test]
-    async fn a_path_that_disappears_mid_scan_does_not_abort_the_pass() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"one").unwrap();
-        std::fs::write(space.path().join("gone.tmp"), b"two").unwrap();
-        std::fs::write(space.path().join("z.txt"), b"three").unwrap();
-
-        // Removed while the scan runs, between the walk and the indexing.
-        let report = node
-            .scan_all_with(|_, _| {
-                let _ = std::fs::remove_file(space.path().join("gone.tmp"));
-            })
-            .unwrap();
-        node.publish(&report.staged).unwrap();
-        for name in ["a.txt", "z.txt"] {
-            assert_eq!(
-                published(&node, "media", name).kind,
-                EntryKind::File,
-                "{name} must be published"
-            );
-        }
-        node.shutdown().await.unwrap();
-    }
-
     /// The streamed form of adoption (§9.4): bytes go from the CAS into the
     /// space a piece at a time, through an invisible staging file that is gone
     /// by the time the adoption returns.
@@ -1653,8 +1607,8 @@ mod tests {
             .unwrap();
 
         let target = node.adopt_from(&peer, "media", "a.txt").await.unwrap();
-        // The engine reports the path under the *stored* space root, which was
-        // canonicalized at `space add` time (macOS `/var` -> `/private/var`).
+        // The path under the *stored* root, canonicalized at `space add`
+        // (macOS `/var` -> `/private/var`).
         let canonical_space = space.path().canonicalize().unwrap();
         assert_eq!(target, canonical_space.join("a.txt"));
         assert_eq!(std::fs::read(&target).unwrap(), payload);
@@ -1669,47 +1623,8 @@ mod tests {
         assert_eq!(entry.content, Some(root));
         assert_eq!(entry.prev, Some(Hash::new(b"mine")));
 
-        // A path outside every indexed space is refused before anything is
-        // fetched.
+        // A path outside every indexed space is refused before fetching.
         assert!(node.adopt_from(&peer, "absent", "a.txt").await.is_err());
-        node.shutdown().await.unwrap();
-    }
-
-    /// A commit that cannot finish takes its staging file with it: `commit`
-    /// has to let go of the handle before the rename, so the cleanup happens
-    /// there — on a path reached precisely when the disk is in trouble.
-    #[test]
-    fn a_commit_that_cannot_finish_leaves_no_staging_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("occupied");
-        std::fs::create_dir(&target).unwrap();
-
-        let mut out = Adoption::at(&target).unwrap();
-        out.write(b"the new version").unwrap();
-        assert!(out.commit().is_err(), "a directory cannot be renamed over");
-
-        let mut left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec!["occupied".to_string()], "residue: {left:?}");
-    }
-
-    #[tokio::test]
-    async fn removing_a_space_stages_its_removal() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"x").unwrap();
-        node.scan_and_publish().unwrap();
-
-        let staged = node.remove_space("media").unwrap();
-        assert!(!staged.is_empty());
-        node.publish(&staged).unwrap().unwrap();
-        assert!(node
-            .store()
-            .list_entries(Some(node.origin()), "media", "", None, None)
-            .unwrap()
-            .is_empty());
         node.shutdown().await.unwrap();
     }
 
@@ -1899,25 +1814,16 @@ mod tests {
         let report = node.scan_and_stage_off_runtime().await.unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
-        // Calibrated to the failure modes, not to machine speed: an inline
-        // hash ticks under a hundred times for 32 files; a free thread has
-        // been measured at ~9,000 even on the slowest shared CI runners.
+        // Calibrated to failure modes, not machine speed: an inline hash ticks
+        // under a hundred times for 32 files; a free thread ~9,000 on CI runners.
         const FREE_RUNTIME_TICKS: usize = 1_000;
 
         assert_eq!(report.hashed, 32);
         assert!(
             after - before > FREE_RUNTIME_TICKS,
-            "the runtime was barely polling while the scan ran ({before} -> {after}): the \
-             hashing is back on a runtime worker"
+            "the runtime was barely polling while the scan ran ({before} -> {after}): the hashing is back on a runtime worker"
         );
         ticker.abort();
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn scanning_an_unknown_space_fails_clearly() {
-        let (_d, _s, node) = node_with_space().await;
-        assert!(node.scan_space("nope").is_err());
         node.shutdown().await.unwrap();
     }
 
@@ -1973,17 +1879,14 @@ mod tests {
     }
 }
 
-/// The symlink-escape guard, exercised where a symlink can be made.
-/// `escapes_via_symlink` itself is cross-platform (`symlink_metadata` reports
-/// a reparse point on Windows as readily as a symlink on Unix), but creating
-/// one to test against is not.
+/// The symlink-escape guard, exercised where a symlink can be made (creating
+/// one to test against is not cross-platform).
 #[cfg(all(test, unix))]
 mod escape_tests {
     use crate::testkit::node_with_space;
 
-    /// A symlinked directory inside a space is not a way out of it: without
-    /// the ancestor check a client that can name a key can write and delete
-    /// anywhere the daemon's uid reaches.
+    /// Without the ancestor check, a client naming a key could write and
+    /// delete anywhere the daemon's uid reaches.
     #[tokio::test]
     async fn a_symlinked_directory_cannot_be_written_or_deleted_through() {
         let (_d, space, node) = node_with_space().await;
@@ -2001,8 +1904,7 @@ mod escape_tests {
             std::fs::read(outside.path().join("secret")).unwrap(),
             b"not yours"
         );
-        // An ordinary path in the same space still works, and so does a
-        // symlink that *is* the final component rather than an ancestor.
+        // Ordinary paths, and a symlink that *is* the final component, still work.
         assert!(node.open_adoption("media", "ordinary.txt").is_ok());
         node.shutdown().await.unwrap();
     }

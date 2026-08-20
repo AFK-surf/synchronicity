@@ -11,11 +11,11 @@
 //! *monitorable name* out of a log that has exactly one entry type and no
 //! room for a payload (docs/REKOR-ZONE-KEY.md §2).
 //!
-//! So the certificate here is a **key envelope, not a trust assertion**.
-//! Nothing validates its signature, its issuer or its validity window; it
-//! exists to carry three things — the SubjectPublicKeyInfo, the apex, and one
-//! custom extension (see [`crate::zonecert`]) — through a field Rekor
-//! serializes verbatim.
+//! So the certificate here is a **key envelope, not a trust assertion**:
+//! nothing validates its signature, issuer or validity window; it exists to
+//! carry three things — the SubjectPublicKeyInfo, the apex, and one custom
+//! extension (see [`crate::zonecert`]) — through a field Rekor serializes
+//! verbatim.
 //!
 //! This module is deliberately a *narrow* DER reader rather than a general
 //! X.509 stack: it extracts a SPKI, the `dNSName` SANs and an extension by
@@ -191,18 +191,14 @@ impl Certificate {
     /// The value of the extension with this OID, if the certificate has
     /// exactly one.
     ///
-    /// **Exactly one, for the same reason `subjectAltName` is.** Returning
+    /// **Exactly one, for the same reason `subjectAltName` is:** returning
     /// the first of two would let a certificate mean one thing to this
-    /// parser and another to any reader that took the last — and the
-    /// extension this is used for carries the DNSSEC chain, the evidence
-    /// that decides whether a monitor reports an entry or files it in the
-    /// silent bin. The SAN path had this rule and spelled out why; the
-    /// extension lookup beside it did not.
-    ///
-    /// Go's `crypto/x509` rejects duplicate extensions outright, so the
-    /// public log would not have accepted such a certificate anyway. That is
-    /// a property of somebody else's parser, which is not where this design
-    /// should be keeping its invariants.
+    /// parser and another to any reader that took the last — and this
+    /// extension carries the DNSSEC chain, the evidence that decides whether
+    /// a monitor reports an entry or files it in the silent bin. Go's
+    /// `crypto/x509` rejects duplicate extensions outright, so the public
+    /// log would not have accepted such a certificate anyway — but that is
+    /// somebody else's parser, not where this design keeps its invariants.
     pub fn extension(&self, oid: &[u8]) -> Option<&[u8]> {
         let mut matching = self.extensions.iter().filter(|e| e.oid == oid);
         match (matching.next(), matching.next()) {
@@ -234,23 +230,20 @@ impl Certificate {
             }
         };
         // The SAN must be the name *spelled canonically*, not merely a string
-        // that parses to it.
+        // that parses to it. This is the one field the whole certificate
+        // exists to carry: the apex is written into the Merkle leaf so that
+        // anyone reading the log can index it (docs/REKOR-ZONE-KEY.md §2.1).
+        // `Name::from_utf8` reads DNS *presentation* format, where
+        // `CLUSTER.EXAMPLE` and `clus\ter.example` are both
+        // `cluster.example.` — so an attacker who has taken the delegation
+        // can mint an entry this client accepts for `cluster.example` while
+        // the leaf contains no such string, and every reader that indexes by
+        // byte pattern — a `grep`, a CT-style indexer, an operator watching
+        // for their own apex — misses it. Accepted and unfindable is the
+        // exact shape §4.2.1 forbids: a client must enforce whatever property
+        // makes an entry discoverable, or an attacker simply omits it.
         //
-        // This is the one field the whole certificate exists to carry: the
-        // apex is written into the Merkle leaf so that anyone reading the log
-        // can index it (docs/REKOR-ZONE-KEY.md §2.1). `Name::from_utf8` reads
-        // DNS *presentation* format, where `CLUSTER.EXAMPLE` and
-        // `clus\ter.example` are both `cluster.example.` — so an attacker who
-        // has taken the delegation can mint an entry that this client accepts
-        // for `cluster.example` while the leaf contains no such string. Every
-        // reader that indexes the log by byte pattern rather than by this
-        // parser — a `grep`, a CT-style indexer, an operator watching for
-        // their own apex — misses it. The entry is accepted and unfindable,
-        // which is the exact shape §4.2.1 forbids: a client must enforce
-        // whatever property makes an entry discoverable, or an attacker
-        // simply omits it.
-        //
-        // So the bytes have to be the canonical presentation of the name they
+        // So the bytes must be the canonical presentation of the name they
         // decode to. A trailing dot is the one tolerated difference, because
         // it is the same name written absolute.
         let mut name = Name::from_utf8(text)

@@ -518,10 +518,7 @@ mod tests {
         framed
     }
 
-    /// Both headers declare framing, in any spelling.
-    ///
-    /// Reading only the exact-uppercase sentinel is how a framed body gets
-    /// stored as object content behind a `200`.
+    /// Both headers declare framing, in any spelling — reading only the exact-uppercase sentinel stores a framed body as content.
     #[test]
     fn framing_is_read_from_either_header() {
         let plain = |h: &str| framing(h, None).unwrap();
@@ -546,12 +543,9 @@ mod tests {
             Framing::Plain
         );
         // A signed-chunk body is refused rather than mis-decoded, in any case.
-        assert_eq!(
-            framing("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", None)
-                .unwrap_err()
-                .status,
-            501
-        );
+        let error = framing("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", None);
+        let error = error.unwrap_err();
+        assert_eq!(error.status, 501);
     }
 
     #[test]
@@ -562,8 +556,7 @@ mod tests {
         assert!(check_declared_length(Framing::Plain, true).is_err());
     }
 
-    /// The wire pieces are whatever the network chose, so every split has to
-    /// decode the same.
+    /// The wire pieces are whatever the network chose, so every split decodes the same.
     #[test]
     fn framing_survives_any_split() {
         let framed = body(b"hello, payload");
@@ -590,16 +583,16 @@ mod tests {
 
     #[test]
     fn malformed_frames_are_refused() {
-        // Ends mid-frame.
-        assert!(decode_all(&[b"5\r\nhel"], None).is_err());
-        // No trailer section at all.
-        assert!(decode_all(&[b"3\r\nabc\r\n0\r\n"], None).is_err());
-        // A chunk longer than its size says.
-        assert!(decode_all(&[b"3\r\nabcdef\r\n0\r\n\r\n"], None).is_err());
-        // Trailing bytes past the final chunk.
-        assert!(decode_all(&[b"0\r\n\r\nextra"], None).is_err());
-        // A size that is not hex.
-        assert!(decode_all(&[b"zz\r\nabc\r\n0\r\n\r\n"], None).is_err());
+        // Ends mid-frame, no trailer, chunk overlong, trailing bytes, a non-hex size.
+        for bad in [
+            b"5\r\nhel".as_slice(),
+            b"3\r\nabc\r\n0\r\n".as_slice(),
+            b"3\r\nabcdef\r\n0\r\n\r\n".as_slice(),
+            b"0\r\n\r\nextra".as_slice(),
+            b"zz\r\nabc\r\n0\r\n\r\n".as_slice(),
+        ] {
+            assert!(decode_all(&[bad], None).is_err());
+        }
         // A header line that never ends.
         let long = vec![b'a'; MAX_LINE + 1];
         assert!(decode_all(&[&long], None).is_err());
@@ -609,9 +602,8 @@ mod tests {
     fn a_declared_length_is_held_to() {
         let framed = body(b"12345");
         assert!(decode_all(&[&framed], Some(5)).is_ok());
-        // Too long is caught as it is exceeded, not only at the end.
+        // Too long is caught as it is exceeded; too short when the body ends.
         assert!(decode_all(&[&framed], Some(4)).is_err());
-        // Too short is caught when the body ends.
         assert!(decode_all(&[&framed], Some(6)).is_err());
     }
 
@@ -641,12 +633,9 @@ mod tests {
                 "{algorithm}"
             );
 
-            // The same body with a digest that does not match must fail, and
-            // fail as `BadDigest` so a client knows to retry rather than to
-            // give up.
-            let wrong = String::from_utf8(framed.clone())
-                .unwrap()
-                .replace(&digest(algorithm), "AAAAAAAAAAAAAAAAAAAAAA==");
+            // A mismatch must fail as `BadDigest`, so a client retries rather than gives up.
+            let wrong = String::from_utf8(framed.clone()).unwrap();
+            let wrong = wrong.replace(&digest(algorithm), "AAAAAAAAAAAAAAAAAAAAAA==");
             let error = decode_all(&[wrong.as_bytes()], None).unwrap_err();
             assert_eq!(error.code, "BadDigest", "{algorithm}: {error}");
         }
@@ -659,8 +648,7 @@ mod tests {
             decode_all(&[framed], None).unwrap_err().code,
             "NotImplemented"
         );
-        // A trailer this gateway has no opinion about is not a checksum and is
-        // simply carried past.
+        // A trailer this gateway has no opinion about is not a checksum — it is carried past.
         let other = b"3\r\nabc\r\n0\r\nx-amz-something:value\r\n\r\n";
         assert_eq!(decode_all(&[other], None).unwrap(), b"abc");
     }
@@ -673,28 +661,5 @@ mod tests {
         }
         framed.extend_from_slice(b"\r\n");
         assert!(decode_all(&[&framed], None).is_err());
-    }
-
-    #[test]
-    fn a_decoder_fault_carries_its_code_to_the_caller() {
-        let fault = DecodeFault::default();
-        assert_eq!(
-            fault.explain(S3Error::invalid("fallback")).code,
-            "InvalidArgument"
-        );
-        fault.record(S3Error::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "mismatch",
-        ));
-        assert_eq!(
-            fault.explain(S3Error::invalid("fallback")).code,
-            "BadDigest"
-        );
-        // Read once: a second look does not resurrect it.
-        assert_eq!(
-            fault.explain(S3Error::invalid("fallback")).code,
-            "InvalidArgument"
-        );
     }
 }

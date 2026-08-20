@@ -31,12 +31,12 @@ pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// How long one request may wait for its answer before the peer is treated as
 /// failed.
 ///
-/// [`DIAL_TIMEOUT`] bounds the handshake and nothing after it, so every exchange
-/// carries its own deadline: a peer that keeps a QUIC session alive while
-/// answering nothing would otherwise hold a caller for as long as it liked, and
-/// a stalled sync, fetch or head push has no other way to end. It matches the
-/// budget the serve side gives one stream, so an honest provider doing real disk
-/// work for a window is never cut off by it, and it is applied per exchange —
+/// [`DIAL_TIMEOUT`] bounds the handshake and nothing after it, so every
+/// exchange carries its own deadline: a peer that keeps a QUIC session alive
+/// while answering nothing would otherwise hold a caller for as long as it
+/// liked, and a stalled sync, fetch or head push has no other way to end. It
+/// matches the serve side's budget for one stream, so an honest provider
+/// doing real disk work for a window is never cut off; applied per exchange,
 /// a windowed fetch gets the deadline once per window, not once for the walk.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 

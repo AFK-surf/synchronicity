@@ -35,17 +35,17 @@ const MAX_BARREN_WINDOWS: u32 = 4;
 
 /// The largest prefix of `remaining` whose proof fits one exchange.
 ///
-/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
-/// for still comes in under [`MAX_PROOF_NODES`] and never truncates. Ranges are
-/// taken whole where they fit and split where they do not, and the count is
-/// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
-/// sides (§12).
+/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything
+/// asked for still comes in under [`MAX_PROOF_NODES`] and never truncates.
+/// Ranges are taken whole where they fit and split where they do not, and
+/// the count is clamped to [`MAX_RANGES`] so the set operations under it
+/// stay cheap on both sides (§12).
 ///
 /// Public because a caller walking a large region in rounds has to cut it the
 /// same way: what fits depends on the level and on how fragmented the ranges
 /// are — a contiguous run costs one node per subtree plus a root path, a
-/// scattered set costs a root path each — so any second answer to "how much per
-/// round?" would disagree with this one.
+/// scattered set costs a root path each — so any second answer to "how much
+/// per round?" would disagree with this one.
 pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
     let mut taken: Vec<synch_core::GroupRange> = Vec::new();
     for range in remaining.ranges.iter().take(MAX_RANGES) {

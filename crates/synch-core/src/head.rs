@@ -30,14 +30,14 @@ pub struct SignedHead {
     pub sig: Signature,
 }
 
-/// Builds the exact byte string that a head signature covers (§4.4):
+/// Builds the exact byte string a head signature covers (§4.4):
 ///
 /// ```text
 /// "sync-head/1" || origin || seq || root || created_at || signed_by
 /// ```
 ///
-/// Each variable-length field is length-prefixed so that no two distinct field
-/// assignments can produce the same signing input.
+/// Each variable-length field is length-prefixed so no two field assignments
+/// produce the same signing input.
 pub fn head_signing_input(
     origin: &OriginId,
     seq: u64,
@@ -91,9 +91,9 @@ impl SignedHead {
 
     /// Verifies the signature under `signed_by`.
     ///
-    /// This is only half of validity: the caller must *also* check that
-    /// `signed_by` is bound to `origin` (§3.1, enforced in `synch-store`'s
-    /// bindings table). Both checks together make a head valid (§4.4).
+    /// Only half of validity: the caller must *also* check that `signed_by` is
+    /// bound to `origin` (§3.1, `synch-store`'s bindings table). Both checks
+    /// together make a head valid (§4.4).
     pub fn verify_signature(&self) -> Result<(), HeadError> {
         let input = head_signing_input(
             &self.origin,
@@ -112,15 +112,13 @@ impl SignedHead {
         (self.seq, self.root.0)
     }
 
-    /// Lexicographic `(seq, root)` comparison against another head.
-    ///
-    /// `created_at` is never used for ordering — clocks lie.
+    /// Lexicographic `(seq, root)` comparison; `created_at` never orders — clocks lie.
     pub fn cmp_order(&self, other: &SignedHead) -> Ordering {
         self.order_key().cmp(&other.order_key())
     }
 
-    /// True if this head should displace `current` under the §5.2 acceptance
-    /// rule: strictly greater `(seq, root)` lexicographically.
+    /// True if this head displaces `current` under the §5.2 rule: strictly
+    /// greater `(seq, root)` lexicographically.
     pub fn supersedes(&self, current: Option<&(u64, Hash)>) -> bool {
         match current {
             None => true,
@@ -144,9 +142,8 @@ pub struct HeadSummary {
     pub seq: u64,
     /// The root of the summarized head.
     pub root: Hash,
-    /// True if the sender holds the full trie under `root` and can serve it.
-    ///
-    /// A signed head alone proves nothing about that (§5.1).
+    /// True if the sender holds the full trie under `root` and can serve it
+    /// (a signed head alone proves nothing about that, §5.1).
     pub complete: bool,
 }
 

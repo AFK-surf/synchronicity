@@ -32,10 +32,8 @@ pub enum PathError {
 }
 
 /// Normalizes a slash-separated relative path into canonical trie form.
-///
-/// Backslashes are *not* treated as separators here: callers converting from
-/// native paths should use [`normalize_native_path`], which splits on the
-/// platform separator first.
+/// Backslashes are *not* separators here — use [`normalize_native_path`],
+/// which splits on the platform separator first.
 pub fn normalize_path(path: &str) -> Result<String, PathError> {
     if path.is_empty() {
         return Err(PathError::Empty);
@@ -98,8 +96,8 @@ pub fn is_normalized(path: &str) -> bool {
     matches!(normalize_path(path), Ok(p) if p == path)
 }
 
-/// Splits a normalized path into its parent directory prefix (with trailing
-/// slash, empty at the root) and its final component.
+/// Splits a normalized path into its parent prefix (trailing slash, empty at
+/// the root) and its final component.
 pub fn split_parent(path: &str) -> (&str, &str) {
     match path.rfind('/') {
         Some(idx) => (&path[..idx + 1], &path[idx + 1..]),

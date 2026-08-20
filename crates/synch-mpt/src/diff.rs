@@ -58,11 +58,10 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
 
     /// The same diff, confined to the part of the keyspace `scope` admits.
     ///
-    /// A node reading a trie under a scope holds only that part of it, so an
-    /// unscoped diff would descend into a subtree it was never sent and fail
-    /// for a node that is absent by design rather than by fault (§5.5). The
-    /// materialization that promotion runs is therefore scoped exactly as the
-    /// fetch that filled the trie was.
+    /// A node reading under a scope holds only that part of it, so an unscoped
+    /// diff would descend into a subtree it was never sent and fail on an
+    /// absence that is the design working (§5.5). Promotion's materialization
+    /// is scoped exactly as the fetch that filled the trie was.
     pub fn diff_scoped(
         &self,
         old_root: Hash,
@@ -109,13 +108,11 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
 
     /// Walks both tries in lockstep with an explicit heap stack.
     ///
-    /// The new root is a peer's, reached over the network, and the *shape* it
-    /// describes is not canonicalized by anything the fetch checks — a hostile
-    /// peer can chain extension nodes to any depth. Recursion here would meet
-    /// that with a stack overflow, which aborts the process rather than
-    /// returning an error, and this walk runs inside head promotion (§5.2), so
-    /// the frames live on the heap and the descent stops at
-    /// [`MAX_DEPTH_NIBBLES`] — past which no key short enough to be valid can
+    /// The new root is a peer's and nothing the fetch checks canonicalizes its
+    /// *shape*, so a hostile peer can chain extensions to any depth; recursion
+    /// would meet that with a stack overflow — an abort rather than an error —
+    /// inside head promotion (§5.2). The frames live on the heap and the
+    /// descent stops at [`MAX_DEPTH_NIBBLES`], past which no valid key can
     /// begin (§12).
     fn diff_walk(
         &self,
@@ -145,26 +142,23 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             }
             stack[top].0.next += 1;
             path.push(nibble);
-            // The boundary, the same one the fetch stopped at: a position out
-            // of scope holds nothing this node was sent, so descending it
-            // would fail on an absence that is the design working. Tested
-            // before the cursors are taken, because taking them is what would
-            // read the absent node (§5.5).
+            // The same boundary the fetch stopped at: an out-of-scope position
+            // holds nothing this node was sent, so descending it would fail on
+            // an absence that is the design working. Tested before the cursors
+            // are taken, since taking them reads the absent node (§5.5).
             if !scope.admits_path(&path) {
                 path.pop();
                 continue;
             }
             let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
             let cb = self.cursor_child(&stack[top].1, nibble)?;
-            // Charged only where something is actually there, exactly as
-            // `collect` charges only a non-empty child. A branch node has
-            // sixteen slots and an ordinary trie leaves most of them empty, so
-            // billing all sixteen made the guard measure *frames entered*
-            // rather than positions visited — sixteen times the cost per real
-            // position, against the same ceiling the scan walk is measured by.
-            // At §14's one-`f:`-and-one-`b:`-per-file shape that refused the
-            // first-adoption diff of ~57 k files, well inside the 100 k initial
-            // index §7.1 names.
+            // Charged only where something is actually there, as `collect`
+            // charges only a non-empty child: a branch has sixteen slots and an
+            // ordinary trie leaves most empty, so billing all sixteen measured
+            // *frames entered* — sixteen times per real position — against the
+            // ceiling the scan walk is measured by, and refused the first-
+            // adoption diff of ~57 k files at §14's shape, well inside the
+            // 100 k initial index §7.1 names.
             if ca.is_empty() && cb.is_empty() {
                 path.pop();
                 continue;
@@ -250,20 +244,17 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// changes were handed over.
     ///
     /// This is what a head promotion applies, and the difference from
-    /// [`Trie::diff_resolved`] is a bound rather than a style. `FanoutGuard`
-    /// caps a structural walk at `WALK_POSITION_CEILING` *positions*, which is
-    /// a bound on the walk's work and says nothing about the bytes hanging off
-    /// it: a trie can put one large value at very many positions and still come
-    /// in well under the ceiling — six canonical nodes describe 65 536
-    /// positions — so collecting `Vec<ResolvedChange>` first meant resolving
-    /// that payload once per position, into memory, inside the transaction the
-    /// flip runs in. An allocation failure there is an abort rather than an
-    /// `Err`, so the per-origin containment §12 promises never runs, and the
-    /// pending head is durable: the next start reproduces it.
+    /// [`Trie::diff_resolved`] is a bound rather than a style: the walk ceiling
+    /// bounds positions, not the bytes hanging off them — six canonical nodes
+    /// describe 65 536 positions — so collecting `Vec<ResolvedChange>` meant
+    /// resolving one large payload once per position, into memory, inside the
+    /// transaction the flip runs in. An allocation failure there aborts rather
+    /// than returning `Err`, so §12's per-origin containment never runs, and
+    /// the pending head is durable: the next start reproduces it.
     ///
     /// Only the **new** side is resolved. The old side decides nothing but
-    /// whether the change is a deletion, which its presence already says, and
-    /// resolving it doubled the reads and the peak for a value nothing reads.
+    /// whether the change is a deletion, which its presence already says;
+    /// resolving it doubled the reads and peak for a value nothing reads.
     pub fn for_each_resolved_change<E, F>(
         &self,
         old_root: Hash,
@@ -279,11 +270,10 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
 
     /// The same stream, confined to the part of the keyspace `scope` admits.
     ///
-    /// A node reading a trie under a scope holds only that part of it, so an
-    /// unscoped walk would descend into a subtree it was never sent and fail
-    /// for a node that is absent by design rather than by fault (§5.5). The
-    /// materialization a promotion applies is therefore scoped exactly as the
-    /// fetch that filled the trie was.
+    /// A node reading under a scope holds only that part of it, so an unscoped
+    /// walk would descend into a subtree it was never sent and fail on an
+    /// absence that is the design working (§5.5). Promotion's materialization
+    /// is scoped exactly as the fetch that filled the trie was.
     pub fn for_each_resolved_change_scoped<E, F>(
         &self,
         old_root: Hash,
@@ -328,16 +318,15 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
 ///
 /// `ValueRef` has two representations for one value — inline, or a hash of an
 /// out-of-line payload — and which one a node carries is a storage decision,
-/// not part of the value. Comparing the references directly would report a
-/// change where there is none: `Inline(x)` and `Hash(blake3(x))` resolve
-/// identically. That produces no false negatives, so nothing would be
-/// corrupted by it, but it would re-materialize rows that have not changed,
-/// break the "every reported key really differs" contract the property tests
-/// assert, and let a peer force a full re-materialization of an unchanged trie
-/// by republishing it with the representations flipped.
+/// not part of the value. Comparing references directly would report a change
+/// where there is none: `Inline(x)` and `Hash(blake3(x))` resolve identically.
+/// Nothing would be corrupted, but rows would re-materialize unchanged, the
+/// "every reported key really differs" contract would break, and a peer could
+/// force a full re-materialization by republishing with representations
+/// flipped.
 ///
-/// Compared without touching the store: the out-of-line hash *is* the BLAKE3 of
-/// the value, so the inline side can be hashed and the two compared directly.
+/// Compared without touching the store: the out-of-line hash *is* the BLAKE3
+/// of the value, so the inline side can be hashed and compared directly.
 fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -352,8 +341,8 @@ fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
     }
 }
 
-/// One change as a promotion applies it: the key, what kind of change it is,
-/// and the new value's bytes.
+/// One change as a promotion applies it: the key, its kind, and the new
+/// value's bytes.
 ///
 /// Borrowed, and missing the old side on purpose — see
 /// [`Trie::for_each_resolved_change`].

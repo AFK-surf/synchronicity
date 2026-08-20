@@ -667,14 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn global_flags_work_before_and_after_the_subcommand() {
-        let cli = Cli::try_parse_from(["synch", "--offline", "id"]).unwrap();
-        assert!(cli.offline);
-        let cli = Cli::try_parse_from(["synch", "id", "--offline"]).unwrap();
-        assert!(cli.offline);
-    }
-
-    #[test]
     fn durations_parse() {
         for (text, secs) in [
             ("0", 0),

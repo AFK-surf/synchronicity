@@ -1049,8 +1049,7 @@ mod tests {
         Arc, Mutex, PoisonError,
     };
 
-    /// A node named by `cluster.example`, which is therefore the zone it
-    /// refreshes (§3.1).
+    /// A node named by `cluster.example`, the zone it refreshes (§3.1).
     async fn node() -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
         Node::init_named_by_zone(
@@ -1069,8 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn applying_a_member_set_writes_dns_bindings() {
-        // §3.2: records become live bindings, an addr hint becomes dialable,
-        // and a binding lapses at ttl + grace — never later.
+        // §3.2: records bind, addr hints become dialable, expiry is ttl + grace.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
         let laptop = SecretKey::generate().public();
@@ -1107,10 +1105,8 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguity_reaches_doctor_from_the_scheduled_path() {
-        // §3.2/§3.4: a finding on the unattended scheduled path is held in
-        // schedule state — the refresh's own output is dropped there — and
-        // `synch doctor` has to say it, ambiguous key and self-origin
-        // mismatch alike.
+        // §3.2/§3.4: scheduled-path findings are held for `doctor` to say —
+        // ambiguous key and self-origin mismatch alike.
         let (_d, node) = node().await;
         let key = SecretKey::generate().public();
         let resolver = FakeResolver::new(
@@ -1137,11 +1133,8 @@ mod tests {
         );
     }
 
-    /// A second membership domain cannot repoint a key the first one vouches
-    /// for: `peers_seen.last_addr` overwrites and nothing prunes it, so a hint
-    /// that lands is permanent (§3.2). The `id=`-less record is the same gate
-    /// — its binding used to be keyed without the domain, so two domains wrote
-    /// one row and each refresh overwrote the other's.
+    /// `peers_seen.last_addr` overwrites and nothing prunes it, so a hint
+    /// that lands is permanent; the `id=`-less record is the same gate (§3.2).
     #[tokio::test]
     async fn a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for() {
         let shared = SecretKey::generate().public();
@@ -1163,8 +1156,7 @@ mod tests {
             let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
             assert_eq!(first.ip_addrs().count(), 1);
 
-            // Domain B names the same key and points it elsewhere; the answer
-            // is well-formed and would be validly signed for b.example.
+            // Domain B names the same key and points it elsewhere.
             node.apply_member_set(
                 &MemberSet::from_records(
                     "b.example",
@@ -1178,8 +1170,8 @@ mod tests {
             )
             .unwrap();
 
-            // The recorded address is untouched: two domains vouch for this
-            // key now, so neither one's dialing data is used.
+            // Untouched: two domains vouch for the key now, so neither's
+            // dialing data is used.
             let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
             assert_eq!(
                 after.ip_addrs().collect::<Vec<_>>(),
@@ -1192,8 +1184,7 @@ mod tests {
                 "and must not add a relay this node would then dial through"
             );
 
-            // The two domains really are two bindings now — the thing the
-            // gate needs in order to see them.
+            // The two domains are two bindings now — what the gate needs.
             let mut domains: Vec<String> = node
                 .store()
                 .bindings_for_key(&shared)
@@ -1206,9 +1197,7 @@ mod tests {
         }
     }
 
-    /// Each field is read as the one thing it means: a `relay=` this node
-    /// makes outbound requests to can never be supplied by `addr=`, and vice
-    /// versa.
+    /// A `relay=` can never be supplied by `addr=`, and vice versa.
     #[test]
     fn a_dialing_hint_means_one_thing() {
         assert!(direct_address("192.0.2.7:4433").is_some());
@@ -1217,8 +1206,7 @@ mod tests {
         // Neither field accepts the other's shape.
         assert!(direct_address("https://relay.example./").is_none());
         assert!(relay_url("192.0.2.7:4433").is_none());
-        // A scheme this node would not dial a relay over, a hostless URL, a
-        // bare host, a port-less address.
+        // Un-dialable schemes, hostless URLs, bare hosts, port-less addresses.
         for bad in [
             "ftp://relay.example",
             "https://",
@@ -1234,8 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn a_clock_that_dates_nothing_refuses_to_extend_membership() {
         // Every expiry check is `now < expires_at`, so an undatable clock
-        // would honor every binding forever; the fail-closed answer is to
-        // refuse to extend trust, loudly (§3.2).
+        // honors every binding forever; refuse to extend trust, loudly (§3.2).
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
         let set = MemberSet::from_records("cluster.example", &[rec("nas", &nas)]).unwrap();
@@ -1256,10 +1243,9 @@ mod tests {
         assert!(!node.store().clock_status(0).unwrap().trusted);
     }
 
-    /// The doctor report's basics, and the read scope that decides the
-    /// servable column: judged against the whole keyspace every foreign head
-    /// on a confined node reads PARTIAL by construction. This node's own trie
-    /// is the exception — it built that one, so it is judged whole (§5.5).
+    /// Judged against the whole keyspace, every foreign head on a confined
+    /// node reads PARTIAL by construction; this node's own trie is the
+    /// exception — it built that one, so it is judged whole (§5.5).
     #[tokio::test]
     async fn doctor_reports_the_basics_and_the_read_scope() {
         let (_d, node) = node().await;
@@ -1295,8 +1281,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// §12: an origin whose trust was withdrawn keeps its head and entries,
-    /// and doctor has to flag it until it republishes under a bound key.
+    /// §12: a trust-withdrawn origin keeps its head and entries; doctor flags
+    /// it until it republishes under a bound key.
     #[tokio::test]
     async fn doctor_surfaces_unbound_origins() {
         let (_d, node) = node().await;
@@ -1379,54 +1365,9 @@ mod tests {
         }
     }
 
-    /// One stalling domain does not spend the whole pass: `refresh_these` is
-    /// serial and unrelated domains share the budget, so a zone that answers
-    /// slowly enough would starve every other refresh (§3.2).
-    #[tokio::test(start_paused = true)]
-    async fn one_stalling_domain_does_not_spend_the_whole_pass() {
-        let (_d, node) = node().await;
-        let nas = SecretKey::generate().public();
-        let resolver = FakeResolver::new(
-            vec![rec("nas", &nas)],
-            MIN_TTL,
-            Some(("slow.example".to_string(), Duration::from_secs(86_400))),
-        );
-        let started = tokio::time::Instant::now();
-        let outcomes = node
-            .refresh_these(
-                &resolver,
-                &["slow.example".to_string(), "fast.example".to_string()],
-                now_ns(),
-            )
-            .await
-            .expect("the pass itself must not fail");
-
-        // The stalling domain is reported as a failure and named.
-        assert_eq!(outcomes.len(), 2);
-        let slow = outcomes
-            .iter()
-            .find(|o| o.domain == "slow.example")
-            .unwrap();
-        let why = slow.result.as_ref().expect_err("it never answered");
-        assert!(
-            why.contains("slow.example") && why.contains("abandoned"),
-            "{why}"
-        );
-
-        // The domain behind it in the queue was still resolved, and the pass
-        // ended on the deadline, not on the stall.
-        let fast = outcomes
-            .iter()
-            .find(|o| o.domain == "fast.example")
-            .unwrap();
-        assert!(fast.result.is_ok(), "{:?}", fast.result);
-        assert!(started.elapsed() < REFRESH_DEADLINE * 2);
-    }
-
     #[tokio::test]
     async fn bindings_survive_past_their_ttl_while_the_resolver_answers() {
-        // §3.2: records are re-resolved on the TTL, and a resolver that fails
-        // mid-flight keeps the cached bindings instead of shrinking the set.
+        // §3.2: a failing resolver keeps the cached bindings, never shrinking the set.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
         let resolver = FakeResolver::new(vec![rec("nas", &nas)], MIN_TTL, None);
@@ -1450,9 +1391,8 @@ mod tests {
             .is_empty());
         assert_eq!(resolver.calls(), 1);
 
-        // The TTL ticks over while the resolver is down: the failed attempt
-        // is an outcome and a health entry, not a silence, and the cached
-        // binding keeps its own expiry while only the retry time moves.
+        // TTL ticks over while the resolver is down: the failure is an outcome
+        // and a health entry, and the cached binding keeps its own expiry.
         let ttl = MIN_TTL.as_nanos() as i64;
         resolver.fail(true);
         let later = start + ttl + 1;
@@ -1479,8 +1419,7 @@ mod tests {
             "the retry waits out a clamped TTL rather than spinning"
         );
 
-        // Recovered, the next due refresh renews the binding out past the
-        // maintenance sweep.
+        // Recovered, the next due refresh renews past the maintenance sweep.
         resolver.fail(false);
         let again = later + ttl;
         assert_eq!(
@@ -1498,9 +1437,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_unknown_key_trigger_fires_once_per_cooldown() {
-        // §3.4: an inbound connection from an unknown key triggers an
-        // immediate re-resolution, rate-limited against a peer that keeps
-        // retrying.
+        // §3.4: an unknown-key inbound triggers immediate re-resolution,
+        // rate-limited against a peer that keeps retrying.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
         let resolver = FakeResolver::new(vec![rec("nas", &nas)], Duration::from_secs(3600), None);
@@ -1566,5 +1504,46 @@ mod tests {
             .await
             .expect("the loop must stop promptly")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_stalling_domain_does_not_spend_the_whole_pass() {
+        let (_d, node) = node().await;
+        let nas = SecretKey::generate().public();
+        let resolver = FakeResolver::new(
+            vec![rec("nas", &nas)],
+            MIN_TTL,
+            Some(("slow.example".to_string(), Duration::from_secs(86_400))),
+        );
+        let started = tokio::time::Instant::now();
+        let outcomes = node
+            .refresh_these(
+                &resolver,
+                &["slow.example".to_string(), "fast.example".to_string()],
+                now_ns(),
+            )
+            .await
+            .expect("the pass itself must not fail");
+
+        // The stalling domain is reported as a failure and named.
+        assert_eq!(outcomes.len(), 2);
+        let slow = outcomes
+            .iter()
+            .find(|o| o.domain == "slow.example")
+            .unwrap();
+        let why = slow.result.as_ref().expect_err("it never answered");
+        assert!(
+            why.contains("slow.example") && why.contains("abandoned"),
+            "{why}"
+        );
+
+        // The domain behind it in the queue was still resolved, and the pass
+        // ended on the deadline, not on the stall.
+        let fast = outcomes
+            .iter()
+            .find(|o| o.domain == "fast.example")
+            .unwrap();
+        assert!(fast.result.is_ok(), "{:?}", fast.result);
+        assert!(started.elapsed() < REFRESH_DEADLINE * 2);
     }
 }

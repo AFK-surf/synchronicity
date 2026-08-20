@@ -1,20 +1,18 @@
 //! Which part of a trie a peer may see (§5.5).
 //!
 //! Scope is a statement about *where* a node sits, never about which node it
-//! is. A hash cannot carry it: the hash of a redacted subtree is inside the
-//! branch node that makes the root verify, so possession of one proves nothing
-//! about entitlement to it — and position cannot be recovered from a hash
-//! either, because structural sharing lets one node sit under several prefixes.
-//! So both sides of a fetch work in nibble paths, and this is the predicate
-//! they share.
+//! is: a hash cannot carry it — the hash of a redacted subtree sits inside the
+//! branch node that makes the root verify, and position cannot be recovered
+//! from a hash because structural sharing lets one node sit under several
+//! prefixes — so both sides of a fetch work in nibble paths, and this is the
+//! predicate they share.
 //!
-//! Redaction itself is free. A branch node already carries the hashes of all
-//! sixteen children, so withholding a subtree means declining to send its
-//! nodes: the parent that *was* sent already commits to it, and the signed root
-//! recomputes exactly as it would from a whole trie. The boundary is therefore
-//! the child hash inside the last in-scope node, never the first out-of-scope
-//! node — an [`crate::node::TrieNode::Ext`] above an undelegated space spells
-//! that space's name in its prefix, so it is the node that must not travel.
+//! Redaction itself is free: a branch node already carries all sixteen child
+//! hashes, so withholding a subtree means declining to send its nodes, and the
+//! signed root recomputes exactly as from a whole trie. The boundary is the
+//! child hash inside the last in-scope node, never the first out-of-scope node
+//! — an [`crate::node::TrieNode::Ext`] above an undelegated space spells that
+//! space's name in its prefix, so it must not travel.
 
 use synch_core::Hash;
 
@@ -67,10 +65,9 @@ impl Scope {
     /// True if a node sitting at nibble `path` may be served.
     ///
     /// A node at `path` commits to every key beginning with `path`, so it is
-    /// in scope when it is an ancestor of an allowed prefix or sits inside
-    /// one. Both directions matter: the ancestors are the spine that makes the
-    /// root verify, and without them a scoped peer could not check the
-    /// signature it was handed.
+    /// in scope as an ancestor of an allowed prefix or inside one. Both
+    /// directions matter: the ancestors are the spine that makes the signed
+    /// root recompute.
     pub fn admits_path(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
@@ -89,8 +86,7 @@ impl Scope {
     /// True if everything below `path` is inside this scope.
     ///
     /// Once a position sits inside a granted prefix, no descent below it can
-    /// leave the scope — which is what lets a scope check stop at the boundary
-    /// instead of walking the subtree it has just admitted. Exact keys are
+    /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
     pub fn contains_subtree(&self, path: &[u8]) -> bool {
@@ -107,31 +103,27 @@ impl Scope {
 
     /// True if a node at `path` may be served whole, given what it reveals.
     ///
-    /// Position alone is not enough, and this is the subtle half of the
-    /// boundary. A `Branch` reveals only child hashes, so its position is the
-    /// whole story — but the trie compresses, and a compressed node carries
-    /// key material of its own: an `Ext` spells the nibbles between its
-    /// position and its child, and a `Leaf` spells the rest of a key together
-    /// with that key's value. Both sit at a position on the spine that the
-    /// scope legitimately admits — the spine is what makes the signed root
-    /// recompute — while describing a key range that runs out of the scope
-    /// entirely. Serving one hands over the name of a space the peer was never
-    /// granted, and in a leaf's case its record too.
+    /// Position alone is not enough. A `Branch` reveals only child hashes, so
+    /// its position is the whole story — but the trie compresses, and a
+    /// compressed node carries key material: an `Ext` spells the nibbles
+    /// between its position and its child, a `Leaf` the rest of a key and its
+    /// value. Both sit on the spine the scope legitimately admits while
+    /// describing a key range running out of it entirely, so serving one hands
+    /// over the name of a space never granted — and in a leaf's case its
+    /// record too.
     ///
-    /// So what is tested here is the node's *coverage*, not its position.
+    /// What is tested here is the node's *coverage*, not its position.
     pub fn admits_node(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
         if self.is_full() {
             return true;
         }
         match node {
-            // A branch's sixteen child hashes are the spine itself, and one of
-            // them may lead into the grant — so refusing the node whole over
-            // its own value costs the peer every subtree below it, not just
-            // the value. Only an `Inline` value forces that: its bytes are in
-            // the node, so the node cannot travel. A `Hash` value puts nothing
-            // in the node but the hash, which is the same thing every redacted
-            // child already contributes, and the payload behind it is refused
-            // separately when the peer asks for it.
+            // A branch's child hashes are the spine itself, and one may lead
+            // into the grant — refusing the node whole over its value costs
+            // the peer every subtree below it. Only an `Inline` value forces
+            // that: its bytes are in the node, so it cannot travel. A `Hash`
+            // value contributes only a hash, like every redacted child; the
+            // payload is refused separately when the peer asks.
             crate::node::TrieNode::Branch { value, .. } => match value {
                 None => true,
                 Some(crate::node::ValueRef::Hash(_)) => true,
@@ -165,11 +157,9 @@ impl Scope {
     /// The key a completeness answer for `root` may be memoized under.
     ///
     /// "Do I hold all of this?" is a question about a root *and* a scope: a
-    /// trie held whole under one scope is not held whole under a wider one,
-    /// and a memo keyed by the root alone would answer the second question
-    /// with the first one's answer. Folding the scope into the key makes a
-    /// widened scope re-derive rather than inherit, with nothing to
-    /// invalidate.
+    /// memo keyed by the root alone would answer a wider scope with a narrower
+    /// one's answer. Folding the scope in makes a widened scope re-derive
+    /// rather than inherit.
     pub fn memo_key(&self, root: Hash) -> Hash {
         match &self.prefixes {
             None => root,
@@ -276,10 +266,9 @@ mod tests {
     /// One space id being a prefix of another must not carry it along.
     ///
     /// `f:<space>/` bounds itself with a separator no id may contain, but a
-    /// space's own `m:space/<id>` record does not — treated as a prefix it
-    /// would hand a delegate of `photos` the record of `photos-raw`, which
-    /// carries that space's entry count and the absolute local path its origin
-    /// keeps it at.
+    /// space's own `m:space/<id>` record does not — as a prefix it would hand
+    /// a delegate of `photos` the record of `photos-raw`, with its entry count
+    /// and absolute local path.
     #[test]
     fn an_exact_key_does_not_carry_its_extensions() {
         let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));

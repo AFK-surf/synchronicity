@@ -223,9 +223,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The disable/enable round-trip itself is exercised in `attach`, against
-    /// what it actually gates (`attach_targets`); what belongs here is that no
-    /// row at all means attached.
+    /// The disable/enable round-trip lives in `attach` against what it gates;
+    /// what belongs here is that no row at all means attached.
     #[tokio::test]
     async fn attach_is_on_by_default() {
         let (_d, node) = node().await;

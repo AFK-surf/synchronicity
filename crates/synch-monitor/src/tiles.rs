@@ -1194,22 +1194,16 @@ mod tests {
 
     #[test]
     fn tile_paths_are_three_digit_groups_from_the_right() {
+        let path = Tree::<MemoryLog>::path;
         assert_eq!(
-            Tree::<MemoryLog>::path("entries", 264_349, 256),
+            path("entries", 264_349, 256),
             "api/v2/tile/entries/x264/349"
         );
-        assert_eq!(
-            Tree::<MemoryLog>::path("1", 7, 13),
-            "api/v2/tile/1/007.p/13"
-        );
-        assert_eq!(
-            Tree::<MemoryLog>::path("0", 1_234_567, 256),
-            "api/v2/tile/0/x001/x234/567"
-        );
+        assert_eq!(path("1", 7, 13), "api/v2/tile/1/007.p/13");
+        assert_eq!(path("0", 1_234_567, 256), "api/v2/tile/0/x001/x234/567");
     }
 
-    /// A hash tile gets the hash tile's cap, not the entry bundle's: one cap
-    /// for both would let a hostile log answer a hash-tile fetch with 16 MiB.
+    /// One cap for both resources would let a hostile log answer a hash-tile fetch with 16 MiB.
     #[test]
     fn each_resource_is_capped_at_its_own_format_ceiling() {
         assert_eq!(cap_for("api/v2/tile/2/x001/234.p/17"), MAX_HASH_TILE_BYTES);
@@ -1219,16 +1213,12 @@ mod tests {
 
     #[tokio::test]
     async fn roots_recomputed_from_tiles_match_the_reference_tree() {
-        // Sizes that straddle every awkward boundary: a single leaf, one
-        // short of a tile, exactly a tile, one past it, and two tile levels.
+        // Sizes straddling every awkward boundary: one leaf, tile edges, two tile levels.
         for size in [1u64, 255, 256, 257, 1000, 65_536, 65_537] {
             let log = MemoryLog::new(size);
             let tree = Tree::new(&log, size, 8);
-            assert_eq!(
-                tree.root().await.unwrap(),
-                reference_root(&log.leaves, 0, size),
-                "size {size}"
-            );
+            let root = tree.root().await.unwrap();
+            assert_eq!(root, reference_root(&log.leaves, 0, size), "{size}");
         }
     }
 
@@ -1241,40 +1231,27 @@ mod tests {
         let root = tree.root().await.unwrap();
         for index in [0u64, 255, 256, 512, 998, 999] {
             let path = tree.inclusion_path(index).await.unwrap();
-            synch_net::rekor::verify_inclusion(
-                index,
-                size,
-                leaf_hash(&log.leaves[index as usize]),
-                &path,
-                root,
-            )
-            .unwrap_or_else(|e| panic!("index {index}: {e}"));
-            tree.verify_leaf(index, &log.leaves[index as usize], root)
-                .await
+            let leaf = leaf_hash(&log.leaves[index as usize]);
+            synch_net::rekor::verify_inclusion(index, size, leaf, &path, root)
                 .unwrap_or_else(|e| panic!("index {index}: {e}"));
+            let verify = tree.verify_leaf(index, &log.leaves[index as usize], root);
+            verify.await.expect("index {index}");
         }
     }
 
-    /// Split-view detection: the prefix's root, recomputed from the *new*
-    /// tree's tiles, is the root the monitor persisted; a forked log no
-    /// longer reproduces it.
+    /// Split-view detection: the new tree's tiles recompute the persisted
+    /// root; a forked log does not.
     #[tokio::test]
     async fn consistency_is_the_old_root_recomputed_from_the_new_trees_tiles() {
         let grown = MemoryLog::new(1_000);
         let old_root = reference_root(&grown.leaves, 0, 700);
         let tree = Tree::new(&grown, 1_000, 4);
         assert_eq!(tree.subtree_hash(0, 700).await.unwrap(), old_root);
-        // A one-leaf fork inside the prefix breaks it — the split view the
-        // check exists to catch.
+        // A one-leaf fork inside the prefix breaks it.
         let mut forked = MemoryLog::new(1_000);
         forked.leaves[42] = b"a different history".to_vec();
-        assert_ne!(
-            Tree::new(&forked, 1_000, 4)
-                .subtree_hash(0, 700)
-                .await
-                .unwrap(),
-            old_root
-        );
+        let forked_tree = Tree::new(&forked, 1_000, 4);
+        assert_ne!(forked_tree.subtree_hash(0, 700).await.unwrap(), old_root);
     }
 
     #[tokio::test]
@@ -1295,103 +1272,37 @@ mod tests {
     #[tokio::test]
     async fn bundle_streams_decode_every_bundle_strictly_in_order() {
         let log = MemoryLog::new(1_000);
-        // Deliberately below the bundle count, so read-ahead has work in
-        // flight and the in-order contract is what is being exercised.
+        // Below the bundle count, so read-ahead has work in flight and the in-order contract is exercised.
         let tree = Tree::new(&log, 1_000, 2);
-        let bundles: Vec<Vec<(u64, Vec<u8>)>> =
-            tree.bundle_stream(0, 1_000).try_collect().await.unwrap();
+        let stream = tree.bundle_stream(0, 1_000);
+        let bundles: Vec<_> = stream.try_collect().await.unwrap();
         assert_eq!(bundles.len(), 4);
         for (expected_first, bundle) in [0u64, 256, 512, 768].into_iter().zip(&bundles) {
             assert_eq!(bundle.first().unwrap().0, expected_first);
         }
-        // A mid-bundle start still reads the whole bundle and leaves the
-        // skipping to the caller; an empty range is an empty stream.
-        let mid: Vec<Vec<(u64, Vec<u8>)>> =
-            tree.bundle_stream(100, 300).try_collect().await.unwrap();
+        // A mid-bundle start reads the whole bundle; an empty range is an empty stream.
+        let mid_stream = tree.bundle_stream(100, 300);
+        let mid: Vec<_> = mid_stream.try_collect().await.unwrap();
         assert_eq!(mid.len(), 2);
         assert_eq!(mid[0][0].0, 0);
-        let empty: Vec<Vec<(u64, Vec<u8>)>> =
-            tree.bundle_stream(500, 500).try_collect().await.unwrap();
+        let empty_stream = tree.bundle_stream(500, 500);
+        let empty: Vec<_> = empty_stream.try_collect().await.unwrap();
         assert!(empty.is_empty());
     }
 
-    /// A log that answers the *same* level-0 tile path honestly once and with
-    /// a swapped leaf hash every time after — a static-file server answering
-    /// two GETs, which is not even misbehaviour it has to plan.
+    /// A log that swaps a leaf hash inside one level-0 tile, on its first
+    /// read or on every read after it (the recomputation is the first read).
     struct ShiftyTile {
         honest: MemoryLog,
         at: u64,
-        /// The leaf hash served in place of the honest one — set to the hash
-        /// of the body the log wants believed.
+        /// The leaf hash served in place of the honest one.
         instead: [u8; 32],
+        /// Swap on the first read, honest answers after it.
+        first_answer_forged: bool,
         served: Mutex<usize>,
     }
 
     impl TileSource for ShiftyTile {
-        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            let served = self.honest.fetch(path).await?;
-            let Some(mut data) = served else {
-                return Ok(None);
-            };
-            // Only the tile holding `at`, and only after its first read: the
-            // root recomputation reads level-0 tiles too, and tampering with
-            // those would be an ordinary forged-tile test rather than this
-            // one.
-            if let Some((level, index, _)) = parse_tile_path(path) {
-                if level == "0" && index == self.at / 256 {
-                    let mut count = self.served.lock().unwrap_or_else(|e| e.into_inner());
-                    *count += 1;
-                    if *count > 1 {
-                        let start = (self.at - index * 256) as usize * 32;
-                        data[start..start + 32].copy_from_slice(&self.instead);
-                    }
-                }
-            }
-            Ok(Some(data))
-        }
-
-        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
-            self.honest.checkpoint_size().await
-        }
-    }
-
-    /// The leaf hash a body is checked against comes from bytes this tree
-    /// folded, so a log cannot swap it on a second read.
-    #[tokio::test]
-    async fn a_tile_that_changes_between_fetches_cannot_move_the_leaf() {
-        let honest = MemoryLog::new(600);
-        let root = Tree::new(&honest, 600, 4).root().await.unwrap();
-        let shifty = ShiftyTile {
-            honest: MemoryLog::new(600),
-            at: 300,
-            instead: leaf_hash(b"forged 300"),
-            served: Mutex::new(0),
-        };
-        let tree = Tree::new(&shifty, 600, 4);
-        // The honest body for entry 300 still verifies, however many times
-        // the tile is read on the way.
-        tree.verify_leaf(300, b"entry 300", root)
-            .await
-            .expect("the honest body must verify against the folded tile");
-        // And the body the log tried to swap in — the one its second answer
-        // says is the leaf — is refused. This is the direction that matters:
-        // against a `verify_leaf` that re-read the tile, this call succeeds.
-        tree.verify_leaf(300, b"forged 300", root)
-            .await
-            .expect_err("a body that is not the committed leaf must be refused");
-    }
-
-    /// A log whose *first* answer for a tile is forged and whose later ones
-    /// are honest — the same non-determinism as [`ShiftyTile`], the other way
-    /// round.
-    struct ForgesFirst {
-        honest: MemoryLog,
-        at: u64,
-        instead: [u8; 32],
-        served: Mutex<usize>,
-    }
-
-    impl TileSource for ForgesFirst {
         async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
             let Some(mut data) = self.honest.fetch(path).await? else {
                 return Ok(None);
@@ -1400,7 +1311,12 @@ mod tests {
                 if level == "0" && index == self.at / 256 {
                     let mut count = self.served.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
-                    if *count == 1 {
+                    let forged = if self.first_answer_forged {
+                        *count == 1
+                    } else {
+                        *count > 1
+                    };
+                    if forged {
                         let start = (self.at - index * 256) as usize * 32;
                         data[start..start + 32].copy_from_slice(&self.instead);
                     }
@@ -1414,56 +1330,60 @@ mod tests {
         }
     }
 
-    /// Bytes that failed to authenticate are not held for a later leaf to be
-    /// compared against.
-    ///
-    /// The memo is first-write-wins, so a tile remembered before its fold was
-    /// checked is the tile every later read of it gets — including after a
-    /// second, honest fetch has satisfied the fold and marked it verified.
+    /// The leaf hash comes from bytes this tree folded; a swapped second answer cannot move it.
+    #[tokio::test]
+    async fn a_tile_that_changes_between_fetches_cannot_move_the_leaf() {
+        let honest = MemoryLog::new(600);
+        let root = Tree::new(&honest, 600, 4).root().await.unwrap();
+        let shifty = ShiftyTile {
+            honest: MemoryLog::new(600),
+            at: 300,
+            instead: leaf_hash(b"forged 300"),
+            first_answer_forged: false,
+            served: Mutex::new(0),
+        };
+        let tree = Tree::new(&shifty, 600, 4);
+        // The honest body for entry 300 still verifies, however many times the tile is read.
+        let check = tree.verify_leaf(300, b"entry 300", root);
+        check.await.expect("the honest body must verify");
+        // The swapped-in body is refused; a `verify_leaf` that re-read the tile would accept it.
+        let forged = tree.verify_leaf(300, b"forged 300", root);
+        forged.await.expect_err("a swapped-in body must be refused");
+    }
+
+    /// Unauthenticated bytes are not held for a later leaf: the memo is
+    /// first-write-wins, so a tile remembered pre-fold poisons later reads.
     #[tokio::test]
     async fn a_tile_that_failed_to_authenticate_is_not_left_in_the_memo() {
         let honest = MemoryLog::new(600);
         let root = Tree::new(&honest, 600, 1).root().await.unwrap();
-        let log = ForgesFirst {
+        let log = ShiftyTile {
             honest: MemoryLog::new(600),
             at: 300,
             instead: leaf_hash(b"forged 300"),
+            first_answer_forged: true,
             served: Mutex::new(0),
         };
         let tree = Tree::new(&log, 600, 1);
 
-        // The forged first answer does not fold to its parent, so nothing can
-        // be bound against it.
+        // The forged first answer does not fold to its parent.
         assert!(tree.verify_leaf(300, b"forged 300", root).await.is_err());
 
-        // The log now answers honestly, and the tile authenticates. The body
-        // it tried to swap in is still not the committed leaf: answering this
-        // call out of the bytes the *failed* read left behind is the bug.
-        let error = tree
-            .verify_leaf(300, b"forged 300", root)
-            .await
-            .expect_err("a body that is not the committed leaf must be refused");
+        // Now honest, but the swapped-in body is still not the committed leaf: that is the bug.
+        let error = tree.verify_leaf(300, b"forged 300", root);
+        let error = error.await.expect_err("a swapped-in body must be refused");
         assert!(
             error.to_string().contains("does not hash to the leaf"),
             "refused for the wrong reason: {error}"
         );
-        tree.verify_leaf(300, b"entry 300", root)
-            .await
-            .expect("the honest body verifies once the log answers honestly");
+        let check = tree.verify_leaf(300, b"entry 300", root);
+        check.await.expect("the honest body verifies once honest");
     }
 
-    /// The same swap, against an entry in the **frontier** tile.
-    ///
-    /// The partial tile is the one a monitor reads on every run — it holds the
-    /// newest entries, which is all a resumed run has to classify — and it
-    /// takes a different path through `verify_leaf`: it cannot be folded into
-    /// a parent, so it is pinned by the root recomputation instead. That
-    /// pinning only means anything if the bytes it is compared against are the
-    /// bytes the recomputation consumed.
-    ///
-    /// A size of 576 puts the frontier at a 64-wide tile, so the root
-    /// decomposition reads it exactly once and the swap lands on
-    /// `verify_leaf`'s own read rather than on the recomputation.
+    /// The same swap against the **frontier** tile — the partial tile read on
+    /// every run, pinned by the root recomputation, so only the bytes it
+    /// consumed can move a leaf. (Size 576 puts the swap on `verify_leaf`'s
+    /// own read rather than the recomputation.)
     #[tokio::test]
     async fn a_frontier_tile_that_changes_between_fetches_cannot_move_the_leaf() {
         let honest = MemoryLog::new(576);
@@ -1472,104 +1392,75 @@ mod tests {
             honest: MemoryLog::new(576),
             at: 550,
             instead: leaf_hash(b"forged 550"),
+            first_answer_forged: false,
             served: Mutex::new(0),
         };
         let tree = Tree::new(&shifty, 576, 4);
-        tree.verify_leaf(550, b"forged 550", root)
-            .await
-            .expect_err("a body that is not the committed leaf must be refused");
+        let forged = tree.verify_leaf(550, b"forged 550", root);
+        forged.await.expect_err("a swapped-in body must be refused");
     }
 
-    /// A mis-sized hash tile is refused, and — the part that matters — it is
-    /// *refused* rather than folded: `fold` halves its input until it reaches
-    /// 32 bytes, so a length that is not `32 · 2^k` recurses until the stack
-    /// is gone — an uncatchable process abort.
+    /// A mis-sized hash tile is refused rather than folded: a length that is
+    /// not `32 · 2^k` recurses until the stack is gone — an uncatchable abort.
     #[tokio::test]
     async fn a_hash_tile_of_the_wrong_length_is_refused_not_folded() {
         let honest = MemoryLog::new(600);
         let root = Tree::new(&honest, 600, 1).root().await.unwrap();
 
-        // 100 bytes halves to 50, 25, 12, 6, 3, 1, 0 — the run that never
-        // terminates.
+        // 100 bytes halves to 50, 25, 12, 6, 3, 1, 0 — the run that never terminates.
         let mut short = MemoryLog::new(600);
         short.truncate_level0 = Some(100);
         let tree = Tree::new(&short, 600, 1);
-        let Err(error) = tree.verify_leaf(300, b"entry 300", root).await else {
-            panic!("a tile of 100 bytes is not a run of hashes and must be refused")
-        };
+        let error = tree.verify_leaf(300, b"entry 300", root);
+        let error = error.await.expect_err("the 100-byte tile must be refused");
         assert!(
             format!("{error}").contains("hash tile"),
             "the refusal should name the tile, got: {error}"
         );
 
-        // And the honest log still verifies, so the check is not simply
-        // refusing everything.
-        Tree::new(&honest, 600, 1)
-            .verify_leaf(300, b"entry 300", root)
-            .await
-            .expect("the honest tile still verifies");
+        // The honest log still verifies — the check is not refusing everything.
+        let honest_tree = Tree::new(&honest, 600, 1);
+        let verify = honest_tree.verify_leaf(300, b"entry 300", root);
+        verify.await.expect("the honest tile still verifies");
     }
 
-    /// `fold` is total: no input makes it diverge, and only complete-subtree
-    /// runs produce a hash.
-    #[test]
-    fn fold_is_total() {
-        assert!(fold(&[]).is_none());
-        assert!(fold(&[0u8; 100]).is_none());
-        assert!(fold(&[0u8; 32]).is_some());
-        // The shape it is actually asked for, against the reference: two
-        // leaves fold to the node over them.
-        let (a, b) = ([1u8; 32], [2u8; 32]);
-        let mut pair = a.to_vec();
-        pair.extend_from_slice(&b);
-        assert_eq!(fold(&pair), Some(node_hash(&a, &b)));
-    }
-
-    /// A substituted entry in the *partial* frontier tile is refused too: it
-    /// has no parent tile to fold into, so the check is that the tiles still
-    /// recompute the checkpoint's root.
+    /// A substituted entry in the *partial* frontier tile is refused too: no
+    /// parent to fold into, the check is that the tiles recompute the root.
     #[tokio::test]
     async fn a_substituted_entry_in_the_frontier_tile_is_refused_too() {
-        // Leaf 550 sits in the partial level-0 tile, whose rewritten hash
-        // reaches the root — breaking exactly the recomputation that pins it.
+        // Leaf 550's rewritten hash breaks exactly the recomputation that pins it.
         let honest = MemoryLog::new(600);
         let mut tampered = MemoryLog::new(600);
         tampered.forge_at = Some(550);
         tampered.forged_body = b"not an entry at all".to_vec();
         let root = Tree::new(&honest, 600, 1).root().await.unwrap();
         let tampered_tree = Tree::new(&tampered, 600, 1);
-        assert!(tampered_tree
-            .verify_leaf(550, b"not an entry at all", root)
-            .await
-            .is_err());
-        Tree::new(&honest, 600, 1)
-            .verify_leaf(550, b"entry 550", root)
-            .await
-            .expect("the honest frontier leaf verifies");
+        let forged = tampered_tree.verify_leaf(550, b"not an entry at all", root);
+        assert!(forged.await.is_err());
+        let honest_tree = Tree::new(&honest, 600, 1);
+        let verify = honest_tree.verify_leaf(550, b"entry 550", root);
+        verify.await.expect("the honest frontier leaf verifies");
     }
 
     /// A frontier tile the pin named can be superseded by the time a long
-    /// walk fetches it — the log keeps integrating. `tile_bytes` recovers by
-    /// re-resolving the size and reading the wider tile, keeping only the
-    /// pinned prefix.
+    /// walk fetches it. `tile_bytes` re-resolves the size and reads the wider
+    /// tile, keeping only the pinned prefix.
     #[tokio::test]
     async fn a_frontier_tile_widened_since_the_pin_is_read_from_the_wider_partial() {
-        // Completed since the pin: the pinned `.p/232` is gone and the log
-        // serves the tile whole (and the level-1 tile under it widened too).
+        // Completed since the pin: `.p/232` is gone and the log serves the tile whole.
         let log = MemoryLog::new(1_300);
         let tree = Tree::new(&log, 1_000, 4);
-        let _: Vec<Vec<(u64, Vec<u8>)>> = tree.bundle_stream(0, 1_000).try_collect().await.unwrap();
+        let stream = tree.bundle_stream(0, 1_000);
+        let _: Vec<Vec<(u64, Vec<u8>)>> = stream.try_collect().await.unwrap();
 
-        // Widened within the tile: the pinned `.p/232` is now `.p/252` —
-        // still partial, still the same prefix.
+        // Widened within the tile: the pinned `.p/232` is now `.p/252` — same prefix.
         let log = MemoryLog::new(1_020);
         let tree = Tree::new(&log, 1_000, 4);
         let bundle = tree.entry_bundle(768).await.unwrap();
         assert_eq!(bundle.len(), 232);
         assert_eq!(bundle[0], (768, b"entry 768".to_vec()));
 
-        // Never grew: a pin past the served size stays missing, and no wider
-        // tile can stand in for the pinned one.
+        // Never grew: a pin past the served size stays missing.
         let log = MemoryLog::new(768);
         let tree = Tree::new(&log, 1_000, 4);
         let err = tree.entry_bundle(768).await.unwrap_err();

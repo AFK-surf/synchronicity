@@ -1,9 +1,6 @@
-//! A low-level in-process node: a store, a bound signing key, and a real
-//! iroh endpoint speaking the metadata and blob protocols. The harness for
-//! tests that drive the wire directly (delegation, two_nodes) instead of
-//! through the engine's `Node` API.
-//!
-//! Each test binary that includes it uses only part of the harness.
+//! A low-level in-process node: a store, a bound signing key, and a real iroh
+//! endpoint speaking the metadata and blob protocols — the harness for tests
+//! that drive the wire directly (delegation, two_nodes) instead of the `Node` API.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -35,13 +32,10 @@ impl WireNode {
             None => OriginId::Key(secret.public()),
         };
         store.set_self_origin(&origin).unwrap();
-        // A node always trusts itself, so its own key is bound before anything
-        // else happens.
+        // A node always trusts itself, so its own key is bound first.
         trust(&store, &origin, &secret.public());
-        // The endpoint reconciles through a head sink, which is what carries
-        // the §5.2 acceptance rule; without one it speaks the protocol but
-        // adopts nothing. The node dials with the same object it serves
-        // through, so a head arriving in either direction lands in one place.
+        // The endpoint reconciles through a head sink — the §5.2 acceptance
+        // rule — and dials with the same object it serves through.
         let mut options = NetOptions::loopback();
         options.heads = Some(Arc::new(Syncer::new(store.clone())) as Arc<dyn synch_net::HeadSink>);
         let net = Net::bind(store.clone(), secret.clone(), options)
@@ -69,8 +63,7 @@ impl WireNode {
             .unwrap_or(Hash::EMPTY)
     }
 
-    /// Publishes `files` as `(space, path, content)`, plus any extra raw
-    /// records, as a new signed head.
+    /// Publishes `files` as `(space, path, content)` plus raw records, as a new signed head.
     pub(crate) fn publish(
         &self,
         seq: u64,
@@ -78,8 +71,7 @@ impl WireNode {
         extra: &[(Vec<u8>, Vec<u8>)],
     ) -> SignedHead {
         let trie = Trie::new(self.store.as_ref());
-        // One transaction, as every production writer of the complete slot
-        // does it: the head and the views it derives commit together (§5.2).
+        // One transaction, as every production writer of the complete slot does it (§5.2).
         let old = self.root();
         let mut root = old;
         for (space, path, content) in files {

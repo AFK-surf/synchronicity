@@ -182,9 +182,9 @@ mod tests {
 
     #[test]
     fn single_star_does_not_cross_directories() {
-        // (patterns, path, is_dir, expected). One row per pattern-semantics
-        // case: `*`/`?` scope, anchoring, directory-only, negation order, `**`,
-        // and blanks/comments.
+        // (patterns, path, is_dir, expected): one row per pattern-semantics
+        // case — `*`/`?` scope, anchoring, directory-only, negation order,
+        // `**`, blanks/comments.
         let cases: &[(&[&str], &str, bool, bool)] = &[
             (&["a/*.txt"], "a/b.txt", false, true),
             (&["a/*.txt"], "a/b/c.txt", false, false),
@@ -236,11 +236,8 @@ mod tests {
         assert!(!set.is_ignored("photos/a.jpg", false));
     }
 
-    /// An absent ignore file is the ordinary case; an unreadable one is not.
-    ///
-    /// Degrading to the builtins on a read failure means the next scan
-    /// publishes every path the operator excluded, which is the one outcome
-    /// this file exists to prevent — so the scan is refused instead.
+    /// An absent ignore file is ordinary; an unreadable one refuses the scan:
+    /// degrading to the builtins would publish every excluded path.
     #[test]
     fn an_unreadable_ignore_file_is_not_silently_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -250,7 +247,7 @@ mod tests {
         );
 
         // A directory where the file should be: readable as a name, not as
-        // text, on every platform this builds for.
+        // text, on every platform.
         std::fs::create_dir(dir.path().join(IGNORE_FILE)).unwrap();
         let refused = IgnoreSet::for_space(dir.path())
             .expect_err("an ignore file that cannot be read must fail the scan");

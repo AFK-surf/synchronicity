@@ -1,30 +1,21 @@
 //! A trie DAG fans out exponentially in `diff`, but not in the fetch that
-//! admits it.
+//! admits it. Nothing canonicalises a peer's node graph, and a branch may
+//! point all sixteen children at the same hash: `MissingWalk` deduplicates on
+//! hash, so the structure is `k + 1` nodes on the wire and `is_complete`
+//! answers yes, while `diff_walk` walks *positions* and expands into 16^k
+//! paths — one SQLite read each, one `Change` per leaf visit, inside the
+//! promotion transaction (measured: k = 6 is 7 nodes on the wire, 16.7M
+//! changes, 155 s). `MAX_DEPTH_NIBBLES` bounds depth, not breadth.
 //!
-//! Nothing canonicalises a peer's node graph, and a branch may point all
-//! sixteen children at the same hash. `MissingWalk` deduplicates on hash, so
-//! such a structure is `k + 1` nodes on the wire and `is_complete` answers yes.
-//! `diff_walk` walks *positions*, so without a bound it expands into 16^k
-//! paths — one SQLite read each, one `Change` per leaf visit — inside the
-//! promotion transaction, holding the write lock. Measured: k = 6 is 7 nodes
-//! on the wire, 16 777 216 changes, 155 s. `MAX_DEPTH_NIBBLES` bounds depth,
-//! not breadth, so it is no defence.
-//!
-//! Note what such a structure *is*: a valid trie describing 16^k entries in
-//! k + 1 nodes. Nothing about its *shape* distinguishes it from honest data —
-//! give sixty thousand keys under dense structured paths one identical value
-//! and content addressing collapses the whole lower trie to about ten distinct
-//! nodes carrying sixty thousand positions — which is why the bound is on work
-//! alone (`FanoutGuard`, `WALK_POSITION_CEILING`). Deduplicating positions by
-//! node hash is the other obvious defence and is also wrong: one leaf
-//! legitimately sits at as many positions as there are keys carrying its
-//! value, so pruning repeats silently drops keys.
+//! The shape is *not* distinguishable from honest data: sixty thousand keys
+//! sharing one value collapse to ~10 distinct nodes, which is why the bound is
+//! on work alone (`FanoutGuard`, `WALK_POSITION_CEILING`) — deduplicating
+//! positions by node hash instead silently drops keys.
 
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
-/// Stores a node the way a peer's `Nodes` response would, through the same
-/// check the sync path applies.
+/// Stores a node the way a peer's `Nodes` response would, through the sync path's check.
 fn plant(store: &MemStore, node: &TrieNode) -> Hash {
     let encoded = node.encode();
     let hash = TrieNode::hash_of_encoded(&encoded).expect("accepted at the trust boundary");
@@ -33,11 +24,10 @@ fn plant(store: &MemStore, node: &TrieNode) -> Hash {
     hash
 }
 
-/// A `k`-level DAG whose every branch points all sixteen children at one node.
-/// `k + 1` distinct nodes; 16^k distinct positions.
-///
-/// `k` must be even: an odd nibble depth puts the values at a depth no byte key
-/// can address, and the walk fails with `OddDepthValue` first.
+/// A `k`-level DAG whose every branch points all sixteen children at one node:
+/// `k + 1` distinct nodes, 16^k positions. `k` must be even — an odd nibble
+/// depth puts the values at a depth no byte key can address, and the walk
+/// fails with `OddDepthValue`.
 fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
     assert_eq!(k % 2, 0, "an odd depth trips OddDepthValue instead");
     let mut child = plant(
@@ -98,22 +88,17 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
 
 /// First adoption of an origin diffs from `Hash::EMPTY`, and that must survive
 /// a corpus the size §7.1 names — including the shape that most stresses the
-/// guard.
-///
-/// The guard used to be charged once per *nibble slot* of every frame entered —
-/// all sixteen, before checking whether either side had anything there — so it
-/// measured frames rather than positions and billed sixteen times the real
-/// cost. At §14's one-`f:`-and-one-`b:`-per-file shape that refused the
-/// first-adoption diff at ~57 k files, inside the 100 k initial index §7.1
-/// names, and `doctor --rebuild` was dead for the same origin.
+/// guard. The guard used to be charged per *nibble slot* of every frame
+/// entered, billing sixteen times the real cost; at §14's one-`f:`-and-one-
+/// `b:`-per-file shape that refused first adoption at ~57 k files, inside the
+/// 100 k initial index §7.1 names, and `doctor --rebuild` was dead likewise.
 #[test]
 fn a_first_adoption_diff_survives_the_documented_corpus_size() {
     let store = MemStore::new();
     let trie = Trie::new(&store);
     let mut root = Hash::EMPTY;
-    // Sixty thousand files, which is where this actually broke: two records
-    // each, so 120 000 entries. Bigger proves nothing more and costs debug CI
-    // time on every run.
+    // Sixty thousand files — where this actually broke (120 000 entries);
+    // bigger proves nothing more and costs debug CI time on every run.
     for i in 0..60_000u32 {
         let entry = format!("f:media/photos/2024/07/IMG_{i:07}.jpg");
         root = trie.insert(root, entry.as_bytes(), &[7u8; 55]).unwrap();
@@ -122,12 +107,10 @@ fn a_first_adoption_diff_survives_the_documented_corpus_size() {
     }
     assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 120_000);
 
-    // Many distinct keys all carrying one value: content addressing collapses
-    // the lower trie to ~10 distinct nodes — structurally a fan-out DAG, built
-    // by ordinary inserts — and the previous per-node-arrival ratio refused it
-    // at ~65 k positions. The iter count is the shared-leaf regression the cut
-    // `scan_pagination` used to catch: deduping positions by hash would
-    // silently drop keys here.
+    // Many distinct keys, one value: content addressing collapses the lower
+    // trie to ~10 nodes — a fan-out DAG built by ordinary inserts, which the
+    // per-node-arrival ratio refused. The iter count is the shared-leaf
+    // regression: deduping positions by hash would silently drop keys.
     let store = MemStore::new();
     let trie = Trie::new(&store);
     let mut root = Hash::EMPTY;

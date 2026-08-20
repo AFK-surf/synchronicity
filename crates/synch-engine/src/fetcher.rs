@@ -1358,7 +1358,7 @@ const DESCENT_MIN_RANGE: u64 = synch_core::AD_SPAN_GRANULARITY;
 mod tests {
     use super::*;
     use crate::testkit::node;
-    use synch_core::{BlobAd, FileEntry, GroupRange, AD_SPAN_GRANULARITY};
+    use synch_core::{BlobAd, FileEntry, GroupRange};
     use synch_store::{Binding, BindingSource};
 
     fn peer_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
@@ -1371,9 +1371,9 @@ mod tests {
         )
     }
 
-    fn trust(node: &Node, name: &str) -> (OriginId, synch_core::NodeId) {
-        let key = iroh_base::SecretKey::generate().public();
-        let origin = OriginId::named(name, "x.example").unwrap();
+    /// Binds `key` to `origin` as a static trust: the shape every test
+    /// partner is introduced with.
+    fn bind(node: &Node, origin: &OriginId, key: synch_core::NodeId) {
         node.store()
             .put_binding(&Binding {
                 origin: origin.clone(),
@@ -1387,28 +1387,21 @@ mod tests {
                 expires_at: None,
             })
             .unwrap();
+    }
+
+    fn trust(node: &Node, name: &str) -> (OriginId, synch_core::NodeId) {
+        let key = iroh_base::SecretKey::generate().public();
+        let origin = OriginId::named(name, "x.example").unwrap();
+        bind(node, &origin, key);
         (origin, key)
     }
 
     fn link(node: &Node, peer: &Node, origin: &OriginId) {
-        node.store()
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: peer.node_id(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+        bind(node, origin, peer.node_id());
         node.remember_peer(&peer.net().direct_addr()).unwrap();
     }
 
-    /// A peer that answers `FindProviders` with a canned answer per root, and
-    /// counts what it was asked.
+    /// A peer answering `FindProviders` with a canned ad per root, counting asks.
     struct CountingPeer {
         origin: OriginId,
         key: synch_core::NodeId,
@@ -1417,8 +1410,7 @@ mod tests {
     }
 
     impl CountingPeer {
-        /// Binds one that answers `known` with an ad for `holder` and every
-        /// other root with nothing.
+        /// Binds one that answers `known` with an ad for `holder`, every other root with nothing.
         async fn bind(name: &str, known: Hash, holder: OriginId) -> CountingPeer {
             let secret = iroh_base::SecretKey::generate();
             let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -1477,19 +1469,7 @@ mod tests {
 
         /// Makes the node trust this peer and know where to reach it.
         fn known_to(&self, node: &Node) {
-            node.store()
-                .put_binding(&Binding {
-                    origin: self.origin.clone(),
-                    node_id: self.key,
-                    source: BindingSource::Static,
-                    domain: None,
-                    issuer: None,
-                    spaces: Vec::new(),
-                    note: None,
-                    added_at: 0,
-                    expires_at: None,
-                })
-                .unwrap();
+            bind(node, &self.origin, self.key);
             let addr = peer_addr(&self.endpoint);
             node.store()
                 .record_peer_seen(&self.key, Some(&crate::node::encode_addr(&addr)), now_ns())
@@ -1497,9 +1477,8 @@ mod tests {
         }
     }
 
-    /// Provider discovery stops at the first answer and backs off after a
-    /// fruitless round — re-entered by every mirror pass for unheld roots,
-    /// which would otherwise re-dial the whole cluster on each one (§6.3).
+    /// Discovery stops at the first answer and backs off after a fruitless
+    /// round — or every mirror pass would re-dial the cluster (§6.3).
     #[tokio::test]
     async fn provider_discovery_stops_early_and_then_backs_off() {
         let (_d, node) = node().await;
@@ -1522,8 +1501,7 @@ mod tests {
         );
         assert!(!node.provider_discovery_backed_off(&held, now_ns()));
 
-        // A root nobody can name costs one full round, and the miss then
-        // dials nobody until it clears.
+        // A root nobody can name costs one full round; the miss then dials nobody.
         let before = first.asked() + second.asked();
         assert!(node
             .ask_peers_for_providers(&unheld, 1000)
@@ -1547,8 +1525,7 @@ mod tests {
             "and asking again dials nobody while the miss is warm"
         );
 
-        // The miss is a delay, not a verdict: it lets go on its own, and a
-        // root that turns out to be held clears it outright.
+        // The miss is a delay, not a verdict: it lets go on its own, and a held root clears it.
         let past_it = now_ns() + 2 * crate::node::PROVIDER_MISS_MAX_BACKOFF.as_nanos() as i64;
         assert!(!node.provider_discovery_backed_off(&unheld, past_it));
         node.store()
@@ -1582,52 +1559,15 @@ mod tests {
             .unwrap();
 
         let ranked = node.providers_for(&root, 0, 1000).unwrap();
-        // A never-measured peer ranks at the median of the measured ones, not
-        // behind all of them: "unknown" is not "slow".
+        // A never-measured peer ranks at the median, not behind all: "unknown" is not "slow".
         assert_eq!(
             ranked.iter().map(|p| &p.origin).collect::<Vec<_>>(),
             vec![&fast, &unknown, &slow]
         );
     }
 
-    #[tokio::test]
-    async fn partial_ads_narrow_what_we_ask_for() {
-        let (_d, node) = node().await;
-        let g = AD_SPAN_GRANULARITY;
-        let root = Hash::new(b"object");
-        let (origin, _) = trust(&node, "partial");
-        node.store()
-            .put_provider(&root, &origin, &BlobAd::partial(4 * g, [(0, g)]))
-            .unwrap();
-        // Self-ads and unbound origins are filtered out of the provider pool.
-        node.store()
-            .put_provider(&root, node.origin(), &BlobAd::complete(10))
-            .unwrap();
-        node.store()
-            .put_provider(
-                &root,
-                &OriginId::named("stranger", "x.example").unwrap(),
-                &BlobAd::complete(10),
-            )
-            .unwrap();
-
-        // The head of the object is claimed, so the provider is offered for
-        // it; the tail is not, so the provider is not offered for it at all.
-        let head = node.providers_for(&root, 0, 100).unwrap();
-        assert_eq!(head.len(), 1);
-        assert!(head[0].claims.contains(0));
-        assert!(node.providers_for(&root, 3 * g, 4 * g).unwrap().is_empty());
-        assert_eq!(
-            node.providers_for(&root, 0, 10).unwrap().len(),
-            1,
-            "only the bound, non-self provider remains"
-        );
-    }
-
-    /// A fetch with no providers reports the shape exactly and never invents
-    /// content: a locally complete object needs no fetch, an object nobody
-    /// can serve reports incomplete, and an empty object — one chunk group
-    /// nothing encodes for, every window served-nothing — needs no provider.
+    /// No providers, never invented content: a locally complete object needs
+    /// no fetch, nobody-serves reports incomplete, an empty object none at all.
     #[tokio::test]
     async fn a_fetch_with_no_providers_reports_the_shape_exactly() {
         let (_d, node) = node().await;
@@ -1645,9 +1585,8 @@ mod tests {
         assert!(!report.complete);
         assert_eq!(report.providers_tried, 0);
 
-        // An empty object published by a peer and never held here: no CAS
-        // row, no provider ad, and — being offline in this test — nobody to
-        // ask either.
+        // An empty object published by a peer and never held here: no CAS row,
+        // no provider ad, and — being offline — nobody to ask either.
         let (peer, _) = trust(&node, "nas");
         let empty = Hash::new(b"");
         node.store()
@@ -1656,8 +1595,7 @@ mod tests {
         let report = node.fetch_all(&empty, 0).await.unwrap();
         assert!(report.complete, "{report:?}");
         assert_eq!(report.providers_tried, 0, "nobody should have been asked");
-        // An entry claiming no bytes while naming some other object is not
-        // completed by inventing content for it.
+        // An entry claiming no bytes while naming some other object is not completed by invention.
         assert!(
             !node
                 .fetch_all(&Hash::new(b"not the empty object"), 0)
@@ -1667,60 +1605,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reading_a_locally_held_entry_returns_exact_bytes() {
-        let (_d, node) = node().await;
-        let payload: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();
-        let root = node.store().ingest_bytes(&payload, now_ns()).unwrap();
-        let origin = node.origin().clone();
-        node.store()
-            .put_entry(
-                &origin,
-                "s",
-                "big.bin",
-                &FileEntry::file(payload.len() as u64, 0, root, 1),
-            )
-            .unwrap();
-
-        assert_eq!(
-            node.read_range(
-                "s",
-                "big.bin",
-                &VersionPolicy::Origin(origin.clone()),
-                100,
-                Some(50)
-            )
-            .await
-            .unwrap(),
-            &payload[100..150]
-        );
-        // A range that runs past the end is clamped, not an error.
-        assert_eq!(
-            node.read_range(
-                "s",
-                "big.bin",
-                &VersionPolicy::Origin(origin.clone()),
-                49_990,
-                Some(1000)
-            )
-            .await
-            .unwrap(),
-            &payload[49_990..]
-        );
-        // A tombstoned entry is a clear error, not a mystery.
-        node.store()
-            .put_entry(&origin, "s", "gone", &FileEntry::tombstone(0, 4, None))
-            .unwrap();
-        assert!(node
-            .read_entry(&origin, "s", "gone")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("deleted at seq 4"));
-    }
-
-    /// Donors are the versions this node can actually supply bytes from, in
-    /// the order §3.2 of `docs/DELTA-SYNC.md` wants them tried.
+    /// Donors are the versions this node can supply bytes from, in the order
+    /// `docs/DELTA-SYNC.md` §3.2 wants them tried.
     #[tokio::test]
     async fn donors_are_the_lineage_this_node_can_still_read() {
         let (_d, node) = node().await;
@@ -1740,8 +1626,7 @@ mod tests {
         node.store()
             .put_entry(&peer, "s", "disk.img", &selected)
             .unwrap();
-        // A version nobody here has any bytes of: named in the tree, useless
-        // as a donor, and left out rather than tried.
+        // A version nobody has bytes of: named in the tree, useless as a donor, left out.
         let mut theirs = FileEntry::file(100_000, 4, rival_root, 1);
         theirs.prev = Some(Hash::new(b"a version this node never fetched"));
         node.store()
@@ -1767,27 +1652,17 @@ mod tests {
         );
     }
 
-    /// Round two looks inside the spans a donor can speak to, and nowhere
-    /// else (`docs/DELTA-SYNC.md` §3.3): a span past every donor's end has
-    /// nothing to compare against, so descending into it would buy a leaf
-    /// proof to learn what round one already said.
+    /// Round two looks inside spans a donor can speak to and nowhere else
+    /// (`docs/DELTA-SYNC.md` §3.3): a span past every donor's end has nothing
+    /// to compare against.
     #[tokio::test]
     async fn the_leaf_round_descends_only_where_a_donor_can_answer() {
         let (_d, node) = node().await;
         const GROUP: usize = 16 * 1024;
-        // A donor of eight groups; the new version is nineteen groups and a
-        // bit, so spans 0..4 and 4..8 are inside the donor, 8..12 and 12..16
-        // past its end, and the right edge is cut short by the end of the
-        // object and is not a whole subtree at all.
-        let donor = node
-            .store()
-            .ingest_bytes(
-                &(0..8 * GROUP)
-                    .map(|i| (i * 13 % 251) as u8)
-                    .collect::<Vec<u8>>(),
-                now_ns(),
-            )
-            .unwrap();
+        // A donor of eight groups; the new version is nineteen groups and a bit,
+        // so spans 8..16 are past its end and the right edge is no whole subtree.
+        let payload: Vec<u8> = (0..8 * GROUP).map(|i| (i * 13 % 251) as u8).collect();
+        let donor = node.store().ingest_bytes(&payload, now_ns()).unwrap();
         let span = |start: u64, groups: u64, whole: bool| ProvenSubtree {
             start,
             groups,
@@ -1813,14 +1688,12 @@ mod tests {
             ChunkRanges::from_ranges([GroupRange::new(0, 8), GroupRange::new(16, 20)]),
             "only the spans the donor reaches, plus the object's right edge"
         );
-        // With no donor at all, round two has nothing to look inside but that
-        // right edge.
+        // With no donor, round two has only the right edge to look inside.
         assert_eq!(
             node.unsettled_spans(&[], &round_one, &all).unwrap(),
             ChunkRanges::single(16, 20)
         );
-        // Spans are whole subtrees, so an overlap would otherwise be descended
-        // in full; the result is clipped to what was asked for.
+        // Spans are whole subtrees; the result is clipped to what was asked for.
         assert_eq!(
             node.unsettled_spans(&[Donor(donor)], &round_one, &ChunkRanges::single(5, 18))
                 .unwrap(),
@@ -1830,15 +1703,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_fetch_keeps_going_past_the_first_fanout_candidates() {
-        // §6.4: giving up after `fetch_fanout` candidates would strand a fetch
-        // whose fourth-ranked provider is the one that can actually serve it.
+        // §6.4: stopping after `fetch_fanout` candidates strands a fetch whose
+        // fourth-ranked provider is the one that can serve it.
         let (_d, node) = node().await;
         let payload = vec![9u8; 100_000];
         let root = Hash::new(&payload);
         let size = payload.len() as u64;
 
-        // Three providers that advertise the object and cannot be dialed, all
-        // ranked ahead of the fourth because they have measured latencies.
+        // Three undialable providers, all ranked ahead of the fourth by measured latency.
         for (i, name) in ["ghost-a", "ghost-b", "ghost-c"].iter().enumerate() {
             let (origin, key) = trust(&node, name);
             node.store()
@@ -1861,9 +1733,8 @@ mod tests {
         node.store()
             .put_provider(&root, &holder_origin, &BlobAd::complete(size))
             .unwrap();
-        // Measured, and slower than every ghost, so it deterministically ranks
-        // last — the ordering this test depends on has to be stated rather
-        // than inherited (§6.4's tiebreak is random).
+        // Measured, slower than every ghost, so it deterministically ranks
+        // last — stated rather than inherited (§6.4's tiebreak is random).
         node.store()
             .record_peer_sync(&holder.node_id(), 0, 100_000)
             .unwrap();
@@ -1884,31 +1755,27 @@ mod tests {
         assert_eq!(node.store().read_all(&root).unwrap(), payload);
     }
 
-    /// Two providers holding complementary halves between them can serve an
-    /// object: shares used to be zipped onto providers in *rank* order, which
-    /// is only an assignment if everybody claims everything.
+    /// Complementary halves between two providers can serve an object: shares
+    /// used to be zipped in *rank* order, only an assignment if all claim all.
     #[tokio::test]
     async fn complementary_holders_are_asked_for_what_they_hold() {
         let (_d, node) = node().await;
-        // Four ad spans, so each half is a whole number of spans and survives
-        // the inward rounding `coalesce_spans` applies.
+        // Four ad spans, so each half is a whole number, surviving `coalesce_spans`' rounding.
         let size = 4 * synch_core::AD_SPAN_GRANULARITY;
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let half = size / 2;
 
-        // A source of verified slices, so each holder can be given exactly its
-        // half rather than the whole object.
+        // A source of verified slices, so each holder gets exactly its half.
         let source_dir = tempfile::tempdir().unwrap();
         let source = synch_store::Store::open(source_dir.path()).unwrap();
         let root = source.ingest_bytes(&payload, now_ns()).unwrap();
 
-        // The tempdirs outlive the loop: dropping one deletes the store its
-        // node is still running on.
+        // The tempdirs outlive the loop: dropping one deletes a running store.
         let mut dirs = Vec::new();
         let mut holders = Vec::new();
         for (name, spans, latency) in [
-            // The fast one holds the *second* half, so the positional share
-            // it would have been handed is the one it cannot serve.
+            // The fast one holds the *second* half, the positional share it
+            // would have been handed is the one it cannot serve.
             ("tail", vec![(half, size)], 10i64),
             ("head", vec![(0, half)], 1_000i64),
         ] {
@@ -1954,5 +1821,39 @@ mod tests {
         let report = node.fetch_all(&root, size).await.unwrap();
         assert!(report.complete, "{report:?}");
         assert_eq!(node.store().read_all(&root).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn partial_ads_narrow_what_we_ask_for() {
+        let (_d, node) = node().await;
+        let g = synch_core::AD_SPAN_GRANULARITY;
+        let root = Hash::new(b"object");
+        let (origin, _) = trust(&node, "partial");
+        node.store()
+            .put_provider(&root, &origin, &BlobAd::partial(4 * g, [(0, g)]))
+            .unwrap();
+        // Self-ads and unbound origins are filtered out of the provider pool.
+        node.store()
+            .put_provider(&root, node.origin(), &BlobAd::complete(10))
+            .unwrap();
+        node.store()
+            .put_provider(
+                &root,
+                &OriginId::named("stranger", "x.example").unwrap(),
+                &BlobAd::complete(10),
+            )
+            .unwrap();
+
+        // The head of the object is claimed, so the provider is offered for
+        // it; the tail is not, so the provider is not offered for it at all.
+        let head = node.providers_for(&root, 0, 100).unwrap();
+        assert_eq!(head.len(), 1);
+        assert!(head[0].claims.contains(0));
+        assert!(node.providers_for(&root, 3 * g, 4 * g).unwrap().is_empty());
+        assert_eq!(
+            node.providers_for(&root, 0, 10).unwrap().len(),
+            1,
+            "only the bound, non-self provider remains"
+        );
     }
 }
