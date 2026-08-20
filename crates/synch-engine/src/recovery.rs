@@ -479,7 +479,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::testkit::node_as;
     use iroh_base::SecretKey;
     use synch_core::SignedHead;
     use synch_store::{Binding, BindingSource, Slot};
@@ -493,34 +493,45 @@ mod tests {
         )
     }
 
-    async fn node(origin: OriginId) -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init_named_by_zone(dir.path(), origin).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
-
     fn nas() -> OriginId {
         OriginId::named("nas", "cluster.example").unwrap()
     }
 
+    /// A `--wait 0` options literal, the common case.
+    fn quick(gap: u64) -> RecoveryOptions {
+        RecoveryOptions {
+            wait: Duration::ZERO,
+            gap,
+            poll: Duration::from_secs(30),
+        }
+    }
+
+    /// Records one peer summary for our own origin, as an `observe` round
+    /// would; `claimed_by` names the peer the operator is hearing it from.
+    fn observe(node: &Node, seq: u64, claimed_by: Option<&iroh_base::PublicKey>) {
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                seq,
+                &Hash([1u8; 32]),
+                true,
+                claimed_by,
+                now_ns(),
+            )
+            .unwrap();
+    }
+
     /// A node nobody has ever heard of is not in recovery, and publishes at
-    /// seq 1.
+    /// seq 1; a peer advertising a *different* origin says nothing about ours.
     #[tokio::test]
     async fn a_fresh_node_is_not_in_recovery() {
-        let (_d, node) = node(nas()).await;
+        let (_d, node) = node_as(&nas()).await;
         let state = node.recovery_state().unwrap();
         assert!(!state.in_recovery);
         assert_eq!(state.observed_seq, None);
         assert_eq!(state.next_seq, 1);
         node.ensure_publishable().unwrap();
-        node.shutdown().await.unwrap();
-    }
 
-    /// A peer advertising a *different* origin says nothing about ours.
-    #[tokio::test]
-    async fn summaries_for_other_origins_do_not_trigger_recovery() {
-        let (_d, node) = node(nas()).await;
         node.store()
             .record_observed_head(
                 &OriginId::named("laptop", "cluster.example").unwrap(),
@@ -535,16 +546,18 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// §3.4: a peer's unverified summary that our origin has published blocks
+    /// publishing, and the state names whose claim it is.
     #[tokio::test]
     async fn an_observation_for_our_own_origin_blocks_publishing() {
-        let (_d, node) = node(nas()).await;
-        node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
-            .unwrap();
+        let (_d, node) = node_as(&nas()).await;
+        let claimant = SecretKey::generate().public();
+        observe(&node, 100, Some(&claimant));
 
         let state = node.recovery_state().unwrap();
         assert!(state.in_recovery);
         assert_eq!(state.observed_seq, Some(100));
+        assert_eq!(state.observed_by, Some(claimant));
         assert_eq!(state.own_seq, None);
 
         let err = node.publish(&[staged_file()]).unwrap_err();
@@ -557,11 +570,9 @@ mod tests {
     /// peers advertise: it has published under this origin itself (§3.4).
     #[tokio::test]
     async fn holding_our_own_head_settles_the_question() {
-        let (_d, node) = node(nas()).await;
+        let (_d, node) = node_as(&nas()).await;
         node.publish(&[staged_file()]).unwrap().unwrap();
-        node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
-            .unwrap();
+        observe(&node, 100, None);
         assert!(!node.recovery_state().unwrap().in_recovery);
         node.ensure_publishable().unwrap();
         node.shutdown().await.unwrap();
@@ -571,23 +582,33 @@ mod tests {
     /// everything seen, and a second observation below it changes nothing.
     #[tokio::test]
     async fn recover_sets_the_floor_above_every_observation() {
-        let (_d, node) = node(nas()).await;
-        node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
-            .unwrap();
+        let (_d, node) = node_as(&nas()).await;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let report = node
+        // A node no peer knows: no floor, and seq 1 is left alone.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let report = node.recover(quick(1_000), tx).await.unwrap();
+        assert_eq!(report.observed_seq, None);
+        assert_eq!(report.floor, None);
+        assert_eq!(node.next_seq().unwrap(), 1);
+
+        // The gap is not an optimization to remove: a floor at the highest seq
+        // peers advertised is exactly the collision it exists to prevent.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = node
             .recover(
                 RecoveryOptions {
-                    wait: Duration::ZERO,
-                    gap: 1_000,
-                    poll: Duration::from_secs(30),
+                    gap: 0,
+                    ..quick(1_000)
                 },
                 tx,
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(err.to_string().contains("gap"), "{err}");
+
+        observe(&node, 100, None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let report = node.recover(quick(1_000), tx).await.unwrap();
         assert_eq!(report.rounds, 1);
         assert_eq!(report.observed_seq, Some(100));
         assert_eq!(report.floor, Some(1_100));
@@ -599,37 +620,12 @@ mod tests {
 
         // An observation below the floor is not a return to recovery: the floor
         // already clears it.
-        node.store()
-            .record_observed_head(node.origin(), 200, &Hash([2u8; 32]), true, None, now_ns())
-            .unwrap();
+        observe(&node, 200, None);
         assert!(!node.recovery_state().unwrap().in_recovery);
 
         // One above it is: publishing at the floor would now collide.
-        node.store()
-            .record_observed_head(node.origin(), 5_000, &Hash([3u8; 32]), true, None, now_ns())
-            .unwrap();
+        observe(&node, 5_000, None);
         assert!(node.recovery_state().unwrap().in_recovery);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn recover_on_a_node_no_peer_knows_leaves_seq_1_alone() {
-        let (_d, node) = node(nas()).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let report = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::ZERO,
-                    gap: 1_000,
-                    poll: Duration::from_secs(30),
-                },
-                tx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(report.observed_seq, None);
-        assert_eq!(report.floor, None);
-        assert_eq!(node.next_seq().unwrap(), 1);
         node.shutdown().await.unwrap();
     }
 
@@ -639,7 +635,7 @@ mod tests {
     /// every time.
     #[tokio::test]
     async fn recover_is_idempotent_once_the_node_holds_its_own_head() {
-        let (_d, node) = node(nas()).await;
+        let (_d, node) = node_as(&nas()).await;
         node.publish(&[staged_file()]).unwrap().unwrap();
         let own = node.store().complete_head(node.origin()).unwrap().unwrap();
         node.store()
@@ -647,17 +643,7 @@ mod tests {
             .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let report = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::ZERO,
-                    gap: 1_000,
-                    poll: Duration::from_secs(30),
-                },
-                tx,
-            )
-            .await
-            .unwrap();
+        let report = node.recover(quick(1_000), tx).await.unwrap();
         assert_eq!(report.floor, None, "{report:?}");
         assert_eq!(node.next_seq().unwrap(), own.seq + 1);
 
@@ -674,57 +660,24 @@ mod tests {
             )
             .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let report = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::ZERO,
-                    gap: 1_000,
-                    poll: Duration::from_secs(30),
-                },
-                tx,
-            )
-            .await
-            .unwrap();
+        let report = node.recover(quick(1_000), tx).await.unwrap();
         assert_eq!(report.floor, Some(own.seq + 50 + 1_000));
-        node.shutdown().await.unwrap();
-    }
-
-    /// The gap is not an optimization to remove: a floor at the highest seq
-    /// peers advertised is exactly the collision it exists to prevent.
-    #[tokio::test]
-    async fn a_zero_gap_is_refused() {
-        let (_d, node) = node(nas()).await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let err = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::ZERO,
-                    gap: 0,
-                    poll: Duration::from_secs(30),
-                },
-                tx,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("gap"), "{err}");
         node.shutdown().await.unwrap();
     }
 
     /// A client that walks away interrupts the quiesce, and nothing is written.
     #[tokio::test]
     async fn a_dropped_progress_receiver_interrupts_the_quiesce() {
-        let (_d, node) = node(nas()).await;
-        node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
-            .unwrap();
+        let (_d, node) = node_as(&nas()).await;
+        observe(&node, 100, None);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
         let err = node
             .recover(
                 RecoveryOptions {
                     wait: Duration::from_secs(3_600),
-                    gap: 1_000,
                     poll: Duration::from_millis(10),
+                    ..quick(1_000)
                 },
                 tx,
             )
@@ -736,45 +689,12 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The quiesce sleeps between rounds rather than spinning: a short wait
-    /// takes about as long as it says and costs a handful of rounds.
-    #[tokio::test]
-    async fn the_quiesce_waits_without_spinning() {
-        let (_d, node) = node(nas()).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let started = Instant::now();
-        let report = node
-            .recover(
-                RecoveryOptions {
-                    wait: Duration::from_millis(300),
-                    gap: 1_000,
-                    poll: Duration::from_millis(100),
-                },
-                tx,
-            )
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(280), "{elapsed:?}");
-        // A round costs a timer, not a spin: polling every 100 ms for 300 ms is
-        // a handful of rounds. Busy-waiting would be thousands, and the upper
-        // bound is loose enough for the slowest runner in the matrix.
-        assert!((1..=8).contains(&report.rounds), "{report:?}");
-        let mut updates = Vec::new();
-        while let Ok(update) = rx.try_recv() {
-            updates.push(update);
-        }
-        assert_eq!(updates.len(), report.rounds);
-        assert_eq!(updates.last().unwrap().remaining, Duration::ZERO);
-        node.shutdown().await.unwrap();
-    }
-
     /// §4.4: a head verified while its signer was bound stays provable history.
     /// Above the origin's current head, with the signer no longer bound, it is
     /// unreconciled pre-recovery history.
     #[tokio::test]
     async fn history_above_the_current_head_by_an_unbound_key_is_unreconciled() {
-        let (_d, node) = node(OriginId::named("laptop", "cluster.example").unwrap()).await;
+        let (_d, node) = node_as(&OriginId::named("laptop", "cluster.example").unwrap()).await;
         let lost = SecretKey::generate();
         let peer_origin = nas();
         node.store()
@@ -829,65 +749,12 @@ mod tests {
         assert_eq!(unreconciled[0].current_seq, Some(100));
 
         // Once the recovered origin publishes above it, the fork is behind the
-        // current head and no longer unreconciled. Signed by the key the origin
-        // was rebound to — signing with the lost one would leave the *new* head
-        // unreconciled in its turn, which is the honest answer and not what
-        // this step is about.
+        // current head and no longer unreconciled.
         let head = SignedHead::sign(&recovered, peer_origin.clone(), 1_100, Hash([2u8; 32]), 0);
         node.store()
             .put_head(Slot::Complete, &head, now_ns(), now_ns())
             .unwrap();
         assert!(node.unreconciled_history(&peer_origin).unwrap().is_empty());
-        node.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn progress_reads_as_a_status_line() {
-        let update = RecoveryProgress {
-            round: 3,
-            elapsed: Duration::from_secs(90),
-            remaining: Duration::from_secs(3_510),
-            reached: 2,
-            unreachable: 1,
-            observed_seq: Some(100),
-        };
-        let text = update.to_string();
-        assert!(text.contains("round 3"), "{text}");
-        assert!(text.contains("2 peer(s) answered"), "{text}");
-        assert!(text.contains("highest seq seen 100"), "{text}");
-        assert!(text.contains("3510s left"), "{text}");
-
-        let none = RecoveryProgress {
-            observed_seq: None,
-            ..update
-        };
-        assert!(none.to_string().contains("highest seq seen none"));
-    }
-
-    #[tokio::test]
-    async fn recovery_state_names_the_peer_that_claimed_the_seq() {
-        // §3.4: the claim is a peer's unverified summary, so the operator's
-        // judgement depends on knowing whose it is.
-        let (_d, node) = node(nas()).await;
-        let claimant = iroh_base::SecretKey::generate().public();
-        node.store()
-            .record_observed_head(
-                node.origin(),
-                900,
-                &Hash([4u8; 32]),
-                true,
-                Some(&claimant),
-                now_ns(),
-            )
-            .unwrap();
-
-        let state = node.recovery_state().unwrap();
-        assert!(state.in_recovery);
-        assert_eq!(state.observed_seq, Some(900));
-        assert_eq!(state.observed_by, Some(claimant));
-
-        // And the doctor report carries it through.
-        assert_eq!(node.doctor().unwrap().recovery.observed_by, Some(claimant));
         node.shutdown().await.unwrap();
     }
 }

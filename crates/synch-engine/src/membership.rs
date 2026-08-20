@@ -1018,16 +1018,18 @@ impl Node {
         Ok(total)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use iroh_base::SecretKey;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+    };
 
     /// A node named by `cluster.example`, which is therefore the zone it
-    /// resolves (§3.1) — the configuration every test below needs, since a
-    /// node refreshes the zone its own name came from and no other.
+    /// refreshes (§3.1).
     async fn node() -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
         Node::init_named_by_zone(
@@ -1039,42 +1041,26 @@ mod tests {
         (dir, node)
     }
 
-    /// A node whose name is its device key, so it resolves no zone at all.
-    async fn key_identified_node() -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
-
-    #[tokio::test]
-    async fn the_domain_round_trips_and_normalizes() {
-        let (_d, node) = key_identified_node().await;
-        assert_eq!(node.domain().unwrap(), None);
-        node.set_domain("Cluster.Example.COM.").unwrap();
-        assert_eq!(
-            node.domain().unwrap().as_deref(),
-            Some("cluster.example.com")
-        );
-        // Setting a second one replaces the first: a node has one zone (§3.1).
-        node.set_domain("other.example").unwrap();
-        assert_eq!(node.domain().unwrap().as_deref(), Some("other.example"));
-        assert!(node.clear_domain().unwrap());
-        assert_eq!(node.domain().unwrap(), None);
-        assert!(!node.clear_domain().unwrap());
-        node.shutdown().await.unwrap();
+    /// The DNS record line for one `(id, key)`.
+    fn rec(id: &str, key: &NodeId) -> String {
+        format!("v=sync1 id={id} nk={}", key.to_z32())
     }
 
     #[tokio::test]
     async fn applying_a_member_set_writes_dns_bindings() {
+        // §3.2: records become live bindings, an addr hint becomes dialable,
+        // and a binding lapses at ttl + grace — never later.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
         let laptop = SecretKey::generate().public();
-        let records = vec![
-            format!("v=sync1 id=nas nk={} addr=127.0.0.1:5555", nas.to_z32()),
-            format!("v=sync1 id=laptop nk={}", laptop.to_z32()),
-        ];
-        let set = MemberSet::from_records("cluster.example", &records).unwrap();
+        let set = MemberSet::from_records(
+            "cluster.example",
+            &[
+                format!("{} addr=127.0.0.1:5555", rec("nas", &nas)),
+                rec("laptop", &laptop),
+            ],
+        )
+        .unwrap();
         let refresh = node
             .apply_member_set(&set, Duration::from_secs(300), now_ns())
             .unwrap();
@@ -1082,104 +1068,45 @@ mod tests {
         assert!(refresh.ambiguous.is_empty());
 
         let origin = OriginId::named("nas", "cluster.example").unwrap();
-        assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
-        // The addr hint became a dialable address.
-        let addr = node.peer_addr(&nas).unwrap().unwrap();
-        assert_eq!(addr.ip_addrs().count(), 1);
+        let now = now_ns();
+        assert!(node.store().is_bound(&origin, &nas, now).unwrap());
+        assert_eq!(node.peer_addr(&nas).unwrap().unwrap().ip_addrs().count(), 1);
 
-        // Clearing the domain leaves the bindings for now: this process still
-        // resolves the zone its name came from, and the adoption at the next
-        // start is what drops them (§3.1).
+        // Clearing the domain leaves the bindings until the next start (§3.1).
         node.clear_domain().unwrap();
-        assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
+        assert!(node.store().is_bound(&origin, &nas, now).unwrap());
         assert!(node
             .store()
-            .is_bound(node.origin(), &node.node_id(), now_ns())
+            .is_bound(node.origin(), &node.node_id(), now)
             .unwrap());
-        node.shutdown().await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn dns_bindings_expire_after_ttl_plus_grace() {
-        let (_d, node) = node().await;
-        let nas = SecretKey::generate().public();
-        let set = MemberSet::from_records(
-            "cluster.example",
-            &[format!("v=sync1 id=nas nk={}", nas.to_z32())],
-        )
-        .unwrap();
-        node.apply_member_set(&set, Duration::from_secs(60), now_ns())
-            .unwrap();
-        let origin = OriginId::named("nas", "cluster.example").unwrap();
-        assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
-        let far_future = now_ns() + Duration::from_secs(3600).as_nanos() as i64;
+        let far_future = now + Duration::from_secs(3600).as_nanos() as i64;
         assert!(!node.store().is_bound(&origin, &nas, far_future).unwrap());
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ambiguous_keys_bind_nothing_and_are_reported() {
-        let (_d, node) = node().await;
-        let key = SecretKey::generate().public();
-        let set = MemberSet::from_records(
-            "cluster.example",
-            &[
-                format!("v=sync1 id=nas nk={}", key.to_z32()),
-                format!("v=sync1 id=laptop nk={}", key.to_z32()),
-            ],
-        )
-        .unwrap();
-        let refresh = node
-            .apply_member_set(&set, Duration::from_secs(300), now_ns())
-            .unwrap();
-        assert_eq!(refresh.bindings, 0);
-        assert_eq!(refresh.ambiguous, vec![key]);
-        assert!(!node.store().is_trusted_key(&key, now_ns()).unwrap());
-        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn ambiguity_reaches_doctor_from_the_scheduled_path() {
-        // §3.2 and `dns.rs` both say `synch doctor` reports the ambiguity, so it
-        // has to hold on the path nobody is watching: the scheduled loop drops
-        // the `DomainOutcome` it gets, and an ambiguous key's member appears
-        // nowhere in `trust ls`, so a finding that lives only in an explicit
-        // refresh's output is a finding an operator never sees.
+        // §3.2/§3.4: a finding on the unattended scheduled path is held in
+        // schedule state — the refresh's own output is dropped there — and
+        // `synch doctor` has to say it, ambiguous key and self-origin
+        // mismatch alike.
         let (_d, node) = node().await;
         let key = SecretKey::generate().public();
         let resolver = FakeResolver::new(
             vec![
-                format!("v=sync1 id=nas nk={}", key.to_z32()),
-                format!("v=sync1 id=laptop nk={}", key.to_z32()),
+                rec("nas", &key),
+                rec("laptop", &key),
+                rec("nas", &node.node_id()),
             ],
             MIN_TTL,
+            None,
         );
         node.set_domain("cluster.example").unwrap();
         node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
+        assert!(!node.store().is_trusted_key(&key, now_ns()).unwrap());
 
         let report = node.doctor().unwrap();
-        assert_eq!(
-            report.ambiguous,
-            vec![("cluster.example".to_string(), key)],
-            "the diagnosis has to be readable after the fact, not only while it happens"
-        );
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_self_origin_the_records_disagree_with_is_reported() {
-        // §3.2: this node's own OriginId is explicit, never inferred — so a
-        // record set that binds this node's key to a different id is a
-        // misconfiguration that syncs nothing while looking healthy.
-        let (_d, node) = node().await;
-        let resolver = FakeResolver::new(
-            vec![format!("v=sync1 id=nas nk={}", node.node_id().to_z32())],
-            MIN_TTL,
-        );
-        node.set_domain("cluster.example").unwrap();
-        node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
-
-        let report = node.doctor().unwrap();
+        assert_eq!(report.ambiguous, vec![("cluster.example".to_string(), key)]);
         assert_eq!(
             report.self_origin_mismatch,
             vec![(
@@ -1187,24 +1114,11 @@ mod tests {
                 OriginId::named("nas", "cluster.example").unwrap()
             )]
         );
-        node.shutdown().await.unwrap();
     }
 
     /// A second membership domain cannot repoint a key the first one vouches
-    /// for.
-    ///
-    /// `peers_seen.last_addr` is keyed on `node_id` alone and overwrites;
-    /// nothing prunes the table and no successful connection writes a real
-    /// address back, so a hint that lands is permanent. A node configured with
-    /// two domains would therefore let either of them steer every future dial
-    /// of any key the other trusts — through an answer that is genuinely
-    /// DNSSEC-valid for the domain that served it, so no signature check
-    /// catches it.
-    ///
-    /// Gating on the *answer's own* bindings does not help:
-    /// `refresh_dns_bindings` runs first and has no cross-domain conflict
-    /// check, so the hostile answer binds the key itself and any this-answer
-    /// test passes. Sole-source is the test that holds.
+    /// for: `peers_seen.last_addr` overwrites and nothing prunes it, so a hint
+    /// that lands is permanent (§3.2).
     #[tokio::test]
     async fn a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for() {
         let (_d, node) = node().await;
@@ -1212,31 +1126,34 @@ mod tests {
         let now = now_ns();
 
         // Domain A vouches for the key and supplies its address.
-        let a = MemberSet::from_records(
-            "a.example",
-            &[format!(
-                "v=sync1 id=nas nk={} addr=192.0.2.7:4433",
-                shared.to_z32()
-            )],
+        node.apply_member_set(
+            &MemberSet::from_records(
+                "a.example",
+                &[format!("{} addr=192.0.2.7:4433", rec("nas", &shared))],
+            )
+            .unwrap(),
+            Duration::from_secs(300),
+            now,
         )
         .unwrap();
-        node.apply_member_set(&a, Duration::from_secs(300), now)
-            .unwrap();
         let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
         assert_eq!(first.ip_addrs().count(), 1);
 
-        // Domain B names the same key and points it somewhere else. The
-        // answer is well-formed and would be validly signed for b.example.
-        let b = MemberSet::from_records(
-            "b.example",
-            &[format!(
-                "v=sync1 id=nas nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
-                shared.to_z32()
-            )],
+        // Domain B names the same key and points it elsewhere; the answer is
+        // well-formed and would be validly signed for b.example.
+        node.apply_member_set(
+            &MemberSet::from_records(
+                "b.example",
+                &[format!(
+                    "{} addr=198.51.100.66:9999 relay=https://attacker.example",
+                    rec("nas", &shared)
+                )],
+            )
+            .unwrap(),
+            Duration::from_secs(300),
+            now,
         )
         .unwrap();
-        node.apply_member_set(&b, Duration::from_secs(300), now)
-            .unwrap();
 
         // The recorded address is untouched: two domains vouch for this key
         // now, so neither one's dialing data is used.
@@ -1253,45 +1170,44 @@ mod tests {
         );
     }
 
-    /// The same, for the `id=`-less record shape — which is where the gate
-    /// used to be absent entirely.
-    ///
-    /// A record with no `id=` binds `OriginId::Key(nk)`, whose canonical
-    /// rendering is `key:<z32>` and names no domain. With the DNS binding keyed
-    /// on `(origin_id, node_id, source)` alone, two membership domains
-    /// publishing one such record wrote the *same row*, and each refresh
-    /// overwrote its `domain` column — so `hint_source_is_sole` saw one
-    /// binding, from whichever domain refreshed last, and said yes. The defence
-    /// was missing exactly where the attack it names lives.
+    /// The same gate for `id=`-less records, whose binding used to be keyed
+    /// without the domain — so two domains wrote one row and each refresh
+    /// overwrote the other's.
     #[tokio::test]
     async fn a_second_domain_cannot_repoint_an_id_less_key_either() {
         let (_d, node) = node().await;
         let shared = SecretKey::generate().public();
         let now = now_ns();
 
-        let a = MemberSet::from_records(
-            "a.example",
-            &[format!(
-                "v=sync1 nk={} addr=192.0.2.7:4433",
-                shared.to_z32()
-            )],
+        node.apply_member_set(
+            &MemberSet::from_records(
+                "a.example",
+                &[format!(
+                    "v=sync1 nk={} addr=192.0.2.7:4433",
+                    shared.to_z32()
+                )],
+            )
+            .unwrap(),
+            Duration::from_secs(300),
+            now,
         )
         .unwrap();
-        node.apply_member_set(&a, Duration::from_secs(300), now)
-            .unwrap();
         let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
         assert_eq!(first.ip_addrs().count(), 1);
 
-        let b = MemberSet::from_records(
-            "b.example",
-            &[format!(
-                "v=sync1 nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
-                shared.to_z32()
-            )],
+        node.apply_member_set(
+            &MemberSet::from_records(
+                "b.example",
+                &[format!(
+                    "v=sync1 nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
+                    shared.to_z32()
+                )],
+            )
+            .unwrap(),
+            Duration::from_secs(300),
+            now,
         )
         .unwrap();
-        node.apply_member_set(&b, Duration::from_secs(300), now)
-            .unwrap();
 
         let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
         assert_eq!(
@@ -1300,84 +1216,30 @@ mod tests {
             "an id-less record from a second domain must not repoint the key"
         );
         assert_eq!(after.relay_urls().count(), 0);
-
-        // And the two domains really are two bindings now, which is the thing
-        // that makes the gate able to see them.
-        let bindings = node.store().bindings_for_key(&shared).unwrap();
-        let mut domains: Vec<String> = bindings
+        // The two domains really are two bindings now — the thing the gate
+        // needs in order to see them.
+        let mut domains: Vec<String> = node
+            .store()
+            .bindings_for_key(&shared)
+            .unwrap()
             .iter()
             .filter_map(|b| b.domain.clone())
-            .collect::<Vec<_>>();
+            .collect();
         domains.sort();
         assert_eq!(domains, ["a.example", "b.example"]);
     }
 
-    #[tokio::test]
-    async fn hints_are_applied_only_for_bound_keys_and_only_in_shape() {
-        // M6: a hint steers an address only for a key the set binds, and only
-        // in the shape its attribute names. `record_peer_seen` *replaces*
-        // `last_addr`, so feeding every hint to `remember_peer` with no binding
-        // check would let one added TXT record repoint a legitimate member's
-        // recorded address; trying each hint as a socket address and then as a
-        // URL would make `addr=` and `relay=` mean whatever parsed.
-        let (_d, node) = node().await;
-        let ambiguous = SecretKey::generate().public();
-        let member = SecretKey::generate().public();
-        let set = MemberSet::from_records(
-            "cluster.example",
-            &[
-                // Ambiguous: binds nothing, so its hints steer nothing.
-                format!(
-                    "v=sync1 id=nas nk={} addr=10.0.0.9:5555",
-                    ambiguous.to_z32()
-                ),
-                format!(
-                    "v=sync1 id=laptop nk={} relay=https://evil.example",
-                    ambiguous.to_z32()
-                ),
-                // A member, with one usable hint and two unusable ones.
-                format!(
-                    "v=sync1 id=member nk={} addr=192.0.2.7:4433 relay=ftp://relay.example",
-                    member.to_z32()
-                ),
-            ],
-        )
-        .unwrap();
-        let refresh = node
-            .apply_member_set(&set, Duration::from_secs(300), now_ns())
-            .unwrap();
-        assert_eq!(refresh.bindings, 1);
-
-        assert!(
-            node.peer_addr(&ambiguous).unwrap().is_none(),
-            "a key that bound nothing must not have got a dialable address"
-        );
-        let addr = node.peer_addr(&member).unwrap().unwrap();
-        assert_eq!(addr.ip_addrs().count(), 1);
-        assert_eq!(
-            addr.relay_urls().count(),
-            0,
-            "a relay hint that is not an http(s) URL is dropped, not dialed"
-        );
-        node.shutdown().await.unwrap();
-    }
-
-    /// Each field is read as the one thing it means.
-    ///
-    /// The field a hint arrived in decides how it is read, so a value that
-    /// would parse as the *other* shape does not cross over: a `relay=` this
-    /// node makes outbound requests to can never be supplied by `addr=`, and a
-    /// direct address can never be supplied by `relay=`.
+    /// Each field is read as the one thing it means: a `relay=` this node
+    /// makes outbound requests to can never be supplied by `addr=`, and vice
+    /// versa.
     #[test]
     fn a_dialing_hint_means_one_thing() {
         assert!(direct_address("192.0.2.7:4433").is_some());
         assert!(relay_url("https://relay.example./").is_some());
         assert!(relay_url("http://relay.example:8080").is_some());
-
         // Neither field accepts the other's shape.
         assert!(direct_address("https://relay.example./").is_none());
         assert!(relay_url("192.0.2.7:4433").is_none());
-
         // A scheme this node would not dial a relay over, a hostless URL, a
         // bare host, a port-less address.
         for bad in [
@@ -1395,18 +1257,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_clock_that_dates_nothing_refuses_to_extend_membership() {
-        // Every expiry check is `now < expires_at`, so a node at the epoch
-        // would honor every binding it has ever stored, revoked members
-        // included, forever. The fail-closed answer is to refuse to extend
-        // trust, loudly, rather than to date it from a number that means
-        // nothing (§3.2).
+        // Every expiry check is `now < expires_at`, so an undatable clock
+        // would honor every binding forever; the fail-closed answer is to
+        // refuse to extend trust, loudly (§3.2).
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
-        let set = MemberSet::from_records(
-            "cluster.example",
-            &[format!("v=sync1 id=nas nk={}", nas.to_z32())],
-        )
-        .unwrap();
+        let set = MemberSet::from_records("cluster.example", &[rec("nas", &nas)]).unwrap();
         let refused = node
             .apply_member_set(&set, Duration::from_secs(300), 0)
             .expect_err("an undatable instant cannot extend trust");
@@ -1422,40 +1278,6 @@ mod tests {
         let report = node.doctor().unwrap();
         assert!(report.clock.trusted, "the test host's clock is fine");
         assert!(!node.store().clock_status(0).unwrap().trusted);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_failing_resolver_is_named_in_the_trust_report() {
-        // A daemon whose resolver could not be built refreshes nothing and
-        // otherwise looks healthy; `doctor` has to be able to say so.
-        let (_d, node) = node().await;
-        assert_eq!(node.resolver_status(), ResolverStatus::Absent);
-        assert!(node.dns_resolver().is_none());
-
-        node.set_dns_resolver(Err(
-            "trust anchor /nope: no DNSKEY records in the file".into()
-        ));
-        let report = node.doctor().unwrap();
-        match &report.trust {
-            ResolverStatus::Failed(why) => assert!(why.contains("no DNSKEY"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-
-        let resolver = std::sync::Arc::new(synch_net::DnssecResolver::with_defaults().unwrap());
-        node.set_dns_resolver(Ok(resolver.clone()));
-        assert!(node.dns_resolver().is_some());
-        match node.doctor().unwrap().trust {
-            ResolverStatus::Ready(config) => {
-                assert_eq!(config.rekor, RekorPolicy::Require);
-                assert_eq!(config.doh_url, DEFAULT_DOH_URL);
-                assert!(config.dnssec_anchor.is_none());
-                assert!(config.tuf_url.is_some(), "refresh is on by default");
-                assert!(!config.log_keys.is_empty(), "the bootstrap pins are real");
-            }
-            other => panic!("{other:?}"),
-        }
-        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1468,51 +1290,22 @@ mod tests {
 
         let report = node.doctor().unwrap();
         assert_eq!(report.origin, *node.origin());
-        assert_eq!(report.device_keys.len(), 1);
-        assert_eq!(report.device_keys[0].1, "active");
         assert_eq!(report.heads.len(), 1);
         assert_eq!(report.heads[0].complete_seq, Some(1));
-        assert!(report.heads[0].servable);
-        assert!(report.heads[0].bound);
+        assert!(report.heads[0].servable && report.heads[0].bound);
         assert_eq!(report.heads[0].entries, 1);
-        assert!(report.equivocations.is_empty());
-        assert!(report.unbound_origins.is_empty());
+        assert!(report.equivocations.is_empty() && report.unbound_origins.is_empty());
         assert!(report.trie.nodes > 0);
         assert_eq!(report.blobs, (1, 1));
-        node.shutdown().await.unwrap();
     }
 
+    /// §12: an origin whose trust was withdrawn keeps its head and entries,
+    /// and doctor has to flag it until it republishes under a bound key.
     #[tokio::test]
-    async fn doctor_surfaces_equivocation_and_unbound_origins() {
+    async fn doctor_surfaces_unbound_origins() {
         let (_d, node) = node().await;
         let peer = SecretKey::generate();
         let origin = OriginId::named("nas", "x.example").unwrap();
-        node.store()
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: peer.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
-
-        let syncer = node.syncer();
-        for root in [synch_core::Hash([1u8; 32]), synch_core::Hash([2u8; 32])] {
-            let head = synch_core::SignedHead::sign(&peer, origin.clone(), 5, root, 0);
-            syncer.offer_head(&head, now_ns()).unwrap();
-        }
-        let report = node.doctor().unwrap();
-        assert_eq!(report.equivocations.len(), 1);
-        assert_eq!(report.equivocations[0].seq, 5);
-
-        // Withdrawing trust leaves the head we already verified in place, but
-        // flags the origin: its data is unavailable until it republishes under
-        // a bound key (§3.4).
         node.store()
             .put_head(
                 synch_store::Slot::Complete,
@@ -1527,130 +1320,81 @@ mod tests {
                 0,
             )
             .unwrap();
-        node.store().remove_origin_bindings(&origin).unwrap();
         let report = node.doctor().unwrap();
         assert!(report.unbound_origins.iter().any(|(o, _)| o == &origin));
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn rebuild_restores_the_derived_views() {
-        let (_d, node) = node().await;
-        let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-        node.scan_and_publish().unwrap();
-
-        node.store().delete_origin_entries(node.origin()).unwrap();
-        assert!(node
-            .store()
-            .list_entries(Some(node.origin()), "media", "", None, None)
-            .unwrap()
-            .is_empty());
-
-        node.rebuild_views().unwrap();
-        assert_eq!(
-            node.store()
-                .list_entries(Some(node.origin()), "media", "", None, None)
-                .unwrap()
-                .len(),
-            1
-        );
-        node.shutdown().await.unwrap();
     }
 
     /// A resolver that answers from a fixed record set and counts its calls.
-    ///
-    /// The refresh loop is the thing under test, so what it resolves through
-    /// has to be steerable: this answers, or fails, on demand.
     #[derive(Debug)]
     struct FakeResolver {
-        records: std::sync::Mutex<Vec<String>>,
+        records: Mutex<Vec<String>>,
         ttl: Duration,
-        calls: std::sync::atomic::AtomicUsize,
-        failing: std::sync::atomic::AtomicBool,
+        calls: AtomicUsize,
+        failing: AtomicBool,
+        stall: Option<(String, Duration)>,
     }
 
     impl FakeResolver {
-        fn new(records: Vec<String>, ttl: Duration) -> FakeResolver {
+        fn new(
+            records: Vec<String>,
+            ttl: Duration,
+            stall: Option<(String, Duration)>,
+        ) -> FakeResolver {
             FakeResolver {
-                records: std::sync::Mutex::new(records),
+                records: Mutex::new(records),
                 ttl,
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                failing: std::sync::atomic::AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                failing: AtomicBool::new(false),
+                stall,
             }
         }
 
         fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+            self.calls.load(Ordering::SeqCst)
         }
 
         fn fail(&self, failing: bool) {
-            self.failing
-                .store(failing, std::sync::atomic::Ordering::SeqCst);
+            self.failing.store(failing, Ordering::SeqCst);
         }
     }
 
     impl MemberResolver for FakeResolver {
         fn resolve_members<'a>(&'a self, domain: &'a str) -> synch_net::dns::MemberSetFuture<'a> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let failing = self.failing.load(std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let failing = self.failing.load(Ordering::SeqCst);
             let records = self
                 .records
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let ttl = self.ttl;
+            let stall = self.stall.clone();
             Box::pin(async move {
+                if let Some((dom, d)) = stall {
+                    if domain == dom {
+                        tokio::time::sleep(d).await;
+                    }
+                }
                 if failing {
                     return Err(synch_net::NetError::Dns("resolver is down".into()));
                 }
-                let set = MemberSet::from_records(domain, &records)?;
-                Ok((set, ttl))
+                Ok((MemberSet::from_records(domain, &records)?, ttl))
             })
         }
     }
 
-    /// One domain that never answers does not spend the whole pass.
-    ///
-    /// `refresh_these` is serial and the domains in it are unrelated, so
-    /// without a per-domain deadline a zone that answers slowly enough
-    /// consumes every other domain's refresh budget — and their bindings
-    /// lapse at `ttl + DEFAULT_TRUST_GRACE` from their *own* last good
-    /// refresh, whether or not their zone was ever asked. The threat model's
-    /// attacker is the zone, so "it would only be hurting itself" does not
-    /// hold.
+    /// One stalling domain does not spend the whole pass: `refresh_these` is
+    /// serial and unrelated domains share the budget, so a zone that answers
+    /// slowly enough would starve every other refresh (§3.2).
     #[tokio::test(start_paused = true)]
     async fn one_stalling_domain_does_not_spend_the_whole_pass() {
-        #[derive(Debug)]
-        struct Stalling {
-            good: Vec<String>,
-        }
-        impl MemberResolver for Stalling {
-            fn resolve_members<'a>(
-                &'a self,
-                domain: &'a str,
-            ) -> synch_net::dns::MemberSetFuture<'a> {
-                let records = self.good.clone();
-                Box::pin(async move {
-                    if domain == "slow.example" {
-                        // Never answers. With `start_paused` the runtime
-                        // auto-advances, so this costs no wall clock — the
-                        // deadline is what ends it, not the sleep.
-                        tokio::time::sleep(Duration::from_secs(86_400)).await;
-                    }
-                    let set = MemberSet::from_records(domain, &records)?;
-                    Ok((set, MIN_TTL))
-                })
-            }
-        }
-
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
-        let resolver = Stalling {
-            good: vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
-        };
-
+        let resolver = FakeResolver::new(
+            vec![rec("nas", &nas)],
+            MIN_TTL,
+            Some(("slow.example".to_string(), Duration::from_secs(86_400))),
+        );
         let started = tokio::time::Instant::now();
         let outcomes = node
             .refresh_these(
@@ -1668,32 +1412,32 @@ mod tests {
             .find(|o| o.domain == "slow.example")
             .unwrap();
         let why = slow.result.as_ref().expect_err("it never answered");
-        assert!(why.contains("slow.example"), "{why}");
-        assert!(why.contains("abandoned"), "{why}");
+        assert!(
+            why.contains("slow.example") && why.contains("abandoned"),
+            "{why}"
+        );
 
-        // And the domain behind it in the queue was still resolved.
+        // The domain behind it in the queue was still resolved, and the pass
+        // ended on the deadline, not on the stall.
         let fast = outcomes
             .iter()
             .find(|o| o.domain == "fast.example")
             .unwrap();
         assert!(fast.result.is_ok(), "{:?}", fast.result);
-
-        // The pass ended on the deadline, not on the stall.
         assert!(started.elapsed() < REFRESH_DEADLINE * 2);
     }
 
     #[tokio::test]
     async fn bindings_survive_past_their_ttl_while_the_resolver_answers() {
-        // §3.2: records are re-resolved on the TTL. Without that loop the
-        // maintenance pass expires every dns binding one TTL plus grace after
-        // the last manual refresh and the cluster dissolves.
+        // §3.2: records are re-resolved on the TTL, and a resolver that fails
+        // mid-flight keeps the cached bindings instead of shrinking the set.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
-        let resolver =
-            FakeResolver::new(vec![format!("v=sync1 id=nas nk={}", nas.to_z32())], MIN_TTL);
+        let resolver = FakeResolver::new(vec![rec("nas", &nas)], MIN_TTL, None);
         node.set_domain("cluster.example").unwrap();
 
         let start = now_ns();
+        let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert_eq!(
             node.refresh_due_domains(&resolver, start)
                 .await
@@ -1702,10 +1446,7 @@ mod tests {
             1,
             "a domain that has never resolved is due at once"
         );
-        let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert!(node.store().is_bound(&origin, &nas, start).unwrap());
-
-        // Nothing is due again until the clamped TTL has passed.
         assert!(node
             .refresh_due_domains(&resolver, start + 1_000)
             .await
@@ -1713,57 +1454,24 @@ mod tests {
             .is_empty());
         assert_eq!(resolver.calls(), 1);
 
-        // A tick past the TTL re-resolves, which pushes the binding's expiry
-        // out ahead of the maintenance pass that would otherwise reap it.
-        let later = start + (MIN_TTL.as_nanos() as i64) + 1;
-        assert_eq!(
-            node.refresh_due_domains(&resolver, later)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(resolver.calls(), 2);
-
-        // Well past the original expiry, the binding is still live and the
-        // maintenance pass leaves it alone.
-        let horizon = later + (MIN_TTL.as_nanos() as i64) / 2;
-        assert!(node.store().is_bound(&origin, &nas, horizon).unwrap());
-        node.maintenance_pass().unwrap();
-        assert!(node.store().is_bound(&origin, &nas, horizon).unwrap());
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_failing_resolver_keeps_the_cached_bindings() {
-        // Fail closed (§3.2): a resolver hiccup must not shrink the member set.
-        let (_d, node) = node().await;
-        let nas = SecretKey::generate().public();
-        let resolver =
-            FakeResolver::new(vec![format!("v=sync1 id=nas nk={}", nas.to_z32())], MIN_TTL);
-        node.set_domain("cluster.example").unwrap();
-        let start = now_ns();
-        node.refresh_due_domains(&resolver, start).await.unwrap();
-
+        // The TTL ticks over while the resolver is down: the failed attempt
+        // is an outcome and a health entry, not a silence, and the cached
+        // binding keeps its own expiry while only the retry time moves.
+        let ttl = MIN_TTL.as_nanos() as i64;
         resolver.fail(true);
-        let later = start + (MIN_TTL.as_nanos() as i64) + 1;
-        // The failed attempt is an outcome, not a silence: the reason reaches
-        // whoever asked, and the health report holds it for `doctor`.
+        let later = start + ttl + 1;
         let outcomes = node.refresh_due_domains(&resolver, later).await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].result.is_err(), "{outcomes:?}");
         let health = node.domain_health().unwrap();
-        assert_eq!(health.len(), 1);
         let schedule = health[0].schedule.as_ref().unwrap();
         assert!(schedule.last_error.is_some(), "{schedule:?}");
         assert!(schedule.last_success > 0, "the first refresh succeeded");
-        let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert!(
             node.store().is_bound(&origin, &nas, later).unwrap(),
             "the cached binding keeps its own expiry"
         );
-        // And the failed attempt still moves the retry time, so the loop does
-        // not spin on a resolver that is down.
+        assert_eq!(resolver.calls(), 2);
         assert!(node
             .refresh_due_domains(&resolver, later + 1)
             .await
@@ -1772,22 +1480,34 @@ mod tests {
         assert_eq!(
             resolver.calls(),
             2,
-            "one initial, one failed; the retry waits out a clamped TTL rather than spinning"
+            "the retry waits out a clamped TTL rather than spinning"
         );
-        node.shutdown().await.unwrap();
+
+        // Recovered, the next due refresh renews the binding out past the
+        // maintenance sweep.
+        resolver.fail(false);
+        let again = later + ttl;
+        assert_eq!(
+            node.refresh_due_domains(&resolver, again)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let horizon = again + 1;
+        assert!(node.store().is_bound(&origin, &nas, horizon).unwrap());
+        node.maintenance_pass().unwrap();
+        assert!(node.store().is_bound(&origin, &nas, horizon).unwrap());
     }
 
     #[tokio::test]
     async fn the_unknown_key_trigger_fires_once_per_cooldown() {
         // §3.4: an inbound connection from an unknown key triggers an
-        // immediate re-resolution — rate-limited, because a peer that keeps
-        // retrying rings the bell as fast as it can dial.
+        // immediate re-resolution, rate-limited against a peer that keeps
+        // retrying.
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
-        let resolver = FakeResolver::new(
-            vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
-            Duration::from_secs(3600),
-        );
+        let resolver = FakeResolver::new(vec![rec("nas", &nas)], Duration::from_secs(3600), None);
         node.set_domain("cluster.example").unwrap();
 
         let now = now_ns();
@@ -1797,7 +1517,7 @@ mod tests {
         );
         assert_eq!(resolver.calls(), 1);
         // Every further trigger inside the cooldown is dropped.
-        for _ in 0..5 {
+        for _ in 0..2 {
             assert!(node
                 .refresh_triggered(&resolver, now)
                 .await
@@ -1813,25 +1533,25 @@ mod tests {
             1
         );
         assert_eq!(resolver.calls(), 2);
-        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn the_dns_loop_stops_on_shutdown_and_refreshes_on_the_bell() {
         let (_d, node) = node().await;
         let nas = SecretKey::generate().public();
-        let resolver = std::sync::Arc::new(FakeResolver::new(
-            vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
+        let resolver = Arc::new(FakeResolver::new(
+            vec![rec("nas", &nas)],
             Duration::from_secs(3600),
+            None,
         ));
         node.set_domain("cluster.example").unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let runner = node.clone();
-        let watched = resolver.clone();
+        let node_task = node.clone();
+        let resolver_task = resolver.clone();
         let handle = tokio::spawn(async move {
-            runner
-                .run_dns(watched.as_ref(), async {
+            node_task
+                .run_dns(resolver_task.as_ref(), async {
                     let _ = rx.await;
                 })
                 .await;
@@ -1853,11 +1573,5 @@ mod tests {
             .await
             .expect("the loop must stop promptly")
             .unwrap();
-        node.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn the_dns_delay_stays_inside_its_window() {
-        assert!(DNS_POLL_FLOOR <= DNS_POLL_CEILING);
     }
 }

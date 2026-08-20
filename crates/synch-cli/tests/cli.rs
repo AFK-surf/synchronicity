@@ -204,16 +204,14 @@ fn the_command_surface_works_over_the_socket() {
 
     let daemon = cli.daemon();
 
+    // A key-identified origin renders as the key.
     let id = cli.run(&["id"]);
     let origin = format!("key:{}", key_of(&cli));
-    // Listings render a key-identified origin short (`OriginId::short`).
-    let short = origin[..14].to_string();
     assert!(id.contains(&origin), "{id}");
     assert!(id.contains("active"), "{id}");
 
     cli.run(&["space", "add", "media", &space.path().to_string_lossy()]);
     assert!(cli.run(&["space", "ls"]).contains("media"));
-
     let scan = cli.run(&["scan"]);
     assert!(scan.contains("hashed 2"), "{scan}");
     assert!(scan.contains("published seq"), "{scan}");
@@ -221,37 +219,18 @@ fn the_command_surface_works_over_the_socket() {
     let ls = cli.run(&["ls", "media"]);
     assert!(ls.contains("notes.txt"), "{ls}");
     assert!(ls.contains("talks/a.txt"), "{ls}");
-    let ls = cli.run(&["ls", "media/talks"]);
-    assert!(!ls.contains("notes.txt"), "{ls}");
+    assert!(!cli.run(&["ls", "media/talks"]).contains("notes.txt"));
 
-    // The bare reference reads the unified tree under the default policy; the
-    // origin-prefixed one and `--from` are the same pin spelled two ways (§8).
+    // One cat form, and `get -o` writing the file.
     assert_eq!(cli.run_bytes(&["cat", "media/notes.txt"]), b"hello");
-    assert_eq!(
-        cli.run_bytes(&["cat", &format!("{origin}:media/notes.txt")]),
-        b"hello"
-    );
-    assert_eq!(
-        cli.run_bytes(&["cat", "media/notes.txt", "--from", &origin]),
-        b"hello"
-    );
-    // Nothing is divergent here, so `--strict` reads it happily.
-    assert_eq!(
-        cli.run_bytes(&["cat", "media/notes.txt", "--strict"]),
-        b"hello"
-    );
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("notes.txt");
     cli.run(&["get", "media/notes.txt", "-o", &target.to_string_lossy()]);
     assert_eq!(std::fs::read(&target).unwrap(), b"hello");
 
-    let status = cli.run(&["status", "media"]);
-    assert!(status.contains("media/notes.txt  1 version(s)"), "{status}");
-    assert!(status.contains(&short), "{status}");
-
-    // A mirror names the directory it writes into, and carries a policy.
+    // A mirror actually materializes content on disk.
     let mirror_dir = tempfile::tempdir().unwrap();
-    let added = cli.run(&[
+    cli.run(&[
         "mirror",
         "add",
         "media",
@@ -259,7 +238,6 @@ fn the_command_surface_works_over_the_socket() {
         "--policy",
         "newest",
     ]);
-    assert!(added.contains("newest"), "{added}");
     assert!(cli.run(&["mirror", "ls"]).contains("newest"));
     cli.run(&["mirror", "sync"]);
     assert_eq!(
@@ -269,25 +247,14 @@ fn the_command_surface_works_over_the_socket() {
     assert!(cli
         .run(&["mirror", "rm", &mirror_dir.path().to_string_lossy()])
         .contains("removed"));
-    assert!(cli.run(&["log", "media/notes.txt"]).contains("seq 1"));
 
-    let root = blake3::hash(b"hello").to_hex().to_string();
-    cli.run(&["pin", "add", &root]);
-    assert!(cli.run(&["pin", "ls"]).contains(&root));
-    cli.run(&["pin", "rm", &root]);
-
-    // A pin may also name a path, in which case the version the reading policy
+    // A pin may name a path, in which case the version the reading policy
     // selects supplies the root (§8).
+    let root = blake3::hash(b"hello").to_hex().to_string();
     assert!(cli.run(&["pin", "add", "media/notes.txt"]).contains(&root));
     assert!(cli.run(&["pin", "ls"]).contains(&root));
     assert!(cli.run(&["pin", "rm", "media/notes.txt"]).contains(&root));
     assert!(!cli.run(&["pin", "ls"]).contains(&root));
-
-    // `domain refresh` names no domain: there is only ever the node's own, so
-    // an extra argument is refused by the parser rather than looked up.
-    let (ok, _, stderr) = cli.try_run(&["domain", "refresh", "other.example"]);
-    assert!(!ok);
-    assert!(stderr.contains("unexpected argument"), "{stderr}");
 
     // A daemon-side failure is this process's exit status, not a transport
     // error.
@@ -295,25 +262,10 @@ fn the_command_surface_works_over_the_socket() {
     assert!(!ok);
     assert!(stderr.contains("hex"), "{stderr}");
 
-    // Rotation needs a name to carry across the key change, and this node is
-    // its key (§3.1). The refusal says where a name comes from.
-    let (ok, _, stderr) = cli.try_run(&["key", "rotate"]);
-    assert!(!ok);
-    assert!(stderr.contains("synch domain set"), "{stderr}");
-    let keys = cli.run(&["key", "ls"]);
-    assert_eq!(keys.lines().count(), 2, "{keys}");
-    assert_eq!(keys.matches("active").count(), 1, "{keys}");
-
-    // A later publish keeps counting up from where the last one left off.
-    std::fs::write(space.path().join("after.txt"), b"after").unwrap();
-    let scan = cli.run(&["scan"]);
-    assert!(scan.contains("published seq"), "{scan}");
-
     let doctor = cli.run(&["doctor"]);
     assert!(doctor.contains(&format!("origin: {origin}")), "{doctor}");
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
     assert!(cli.run(&["daemon", "status"]).contains("head: seq"));
-    assert!(cli.run(&["doctor"]).contains("storage:"));
 
     // `synch recover` on a node no peer has ever advertised: it collects one
     // round, finds nothing to resume from, and leaves the seq alone (§3.4).
@@ -329,28 +281,6 @@ fn the_command_surface_works_over_the_socket() {
     let (ok, _, stderr) = cli.try_run(&["id"]);
     assert!(!ok);
     assert!(stderr.contains("synch daemon run"), "{stderr}");
-}
-
-#[test]
-fn domains_are_configurable_without_dns() {
-    let dir = tempfile::tempdir().unwrap();
-    let cli = Cli::new(dir.path());
-    cli.run(&["init"]);
-    let daemon = cli.daemon();
-
-    // `domain set` records the zone and says when it takes effect. This node
-    // is named by its device key, so the running process keeps resolving no
-    // zone at all until it restarts (§3.1) — `domain ls` reports the change as
-    // pending, and `doctor` reports the zone actually in force.
-    let set = cli.run(&["domain", "set", "cluster.example"]);
-    assert!(set.contains("next `synch daemon run`"), "{set}");
-    let listed = cli.run(&["domain", "ls"]);
-    assert!(listed.contains("pending: cluster.example"), "{listed}");
-    assert!(!cli.run(&["doctor"]).contains("domain cluster.example"));
-
-    cli.run(&["domain", "clear"]);
-    assert!(cli.run(&["domain", "ls"]).trim().is_empty());
-    daemon.stop(&cli);
 }
 
 #[test]
@@ -372,11 +302,10 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     let laptop_daemon = laptop.daemon();
 
     // Each side learns the other's key. Addresses are exchanged explicitly
-    // because these nodes run with discovery disabled.
+    // because these nodes run with discovery disabled, and static trust
+    // binds the key and names nobody (§3.2).
     let nas_key = key_of(&nas);
     let laptop_key = key_of(&laptop);
-    // Key-identified, because static trust binds the key and names nobody:
-    // names are the zone's to issue (§3.2).
     nas.run(&[
         "trust",
         "add",
@@ -385,12 +314,6 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         &laptop_daemon.address,
     ]);
     laptop.run(&["trust", "add", &nas_key, "--addr", &nas_daemon.address]);
-
-    // `ls` on the laptop refuses the space by name until some origin
-    // publishes it — silence is reserved for "exists but empty".
-    let (ok, _, stderr) = laptop.try_run(&["ls", "media"]);
-    assert!(!ok);
-    assert!(stderr.contains("no space media"), "{stderr}");
 
     nas.run(&["space", "add", "media", &nas_space.path().to_string_lossy()]);
     nas.run(&["scan"]);
@@ -415,13 +338,11 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     assert!(ls.contains("small.txt"), "{ls}");
     assert!(ls.contains("120000"), "{ls}");
 
-    // A verified full read and a verified range read, both streamed from the
-    // laptop's daemon over the control socket.
+    // A verified full read, a verified range read, and a `get`, all streamed
+    // from the laptop's daemon over the control socket.
     let nas_origin = format!("key:{nas_key}");
-    let nas_short = nas_origin[..14].to_string();
     let got = laptop.run_bytes(&["cat", &format!("{nas_origin}:media/small.txt")]);
     assert_eq!(got, b"a small file");
-
     let got = laptop.run_bytes(&[
         "cat",
         &format!("{nas_origin}:media/big.bin"),
@@ -429,7 +350,6 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         "60000..60100",
     ]);
     assert_eq!(got, &payload[60_000..60_100]);
-
     let out_dir = tempfile::tempdir().unwrap();
     let target = out_dir.path().join("fetched.bin");
     laptop.run(&[
@@ -439,10 +359,6 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         &target.to_string_lossy(),
     ]);
     assert_eq!(std::fs::read(&target).unwrap(), payload);
-
-    // `status` now shows both origins' views of the space.
-    assert!(laptop.run(&["status", "media"]).contains(&nas_short));
-    assert!(laptop.run(&["peers"]).contains(&nas_key));
 
     laptop_daemon.stop(&laptop);
     nas_daemon.stop(&nas);

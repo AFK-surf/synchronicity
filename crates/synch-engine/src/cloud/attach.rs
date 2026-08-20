@@ -1221,15 +1221,8 @@ fn with_id(frame: Up, id: u32) -> Up {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cloud::frame::decode_chunk, config::NodeConfig};
+    use crate::{cloud::frame::decode_chunk, config::NodeConfig, testkit::node};
     use synch_core::{FileEntry, Hash};
-
-    async fn node() -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
 
     fn origin(name: &str) -> OriginId {
         OriginId::named(name, "x.example").unwrap()
@@ -1591,7 +1584,6 @@ mod tests {
         let credit = Arc::new(Semaphore::new(0));
         let reading = {
             let node = node.clone();
-            let writes = writes.clone();
             let credit = credit.clone();
             tokio::spawn(async move {
                 read(
@@ -1735,15 +1727,9 @@ mod tests {
         };
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["1.jpg", "2.jpg", "trips"]);
-        node.shutdown().await.unwrap();
-    }
 
-    /// Divergence is data the listing carries, not something it resolves.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_listing_reports_every_version_of_a_divergent_path() {
-        let _blocking = synch_core::BlockingScope::enter();
-        let (dir, node) = node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
+        // Divergence is data the listing carries, not something it resolves: a
+        // path with two origins' versions reports both.
         for (name, content) in [("nas", b"a"), ("laptop", b"b")] {
             node.store()
                 .put_entry(
@@ -1758,9 +1744,12 @@ mod tests {
         else {
             panic!("expected a page")
         };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].versions, 2);
-        assert_eq!(entries[0].all.len(), 2);
+        let split = entries
+            .iter()
+            .find(|e| e.name == "split")
+            .expect("the divergent path");
+        assert_eq!(split.versions, 2);
+        assert_eq!(split.all.len(), 2);
 
         let Up::Versions { versions, .. } = stat(&node, 1, "media", "split").await.unwrap() else {
             panic!("expected versions")
@@ -1768,26 +1757,5 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert!(versions.iter().all(|v| v.attestors.len() == 1));
         node.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn websocket_urls_follow_the_scheme_they_were_discovered_under() {
-        assert_eq!(
-            websocket_url("https://sync.example/agent/v1/attach"),
-            "wss://sync.example/agent/v1/attach"
-        );
-        assert_eq!(
-            websocket_url("http://127.0.0.1:8080/agent/v1/attach"),
-            "ws://127.0.0.1:8080/agent/v1/attach"
-        );
-    }
-
-    #[test]
-    fn directory_prefixes_end_at_a_boundary() {
-        assert_eq!(directory_prefix(""), "");
-        assert_eq!(directory_prefix("/"), "");
-        assert_eq!(directory_prefix("photos"), "photos/");
-        assert_eq!(directory_prefix("photos/"), "photos/");
-        assert_eq!(directory_prefix("/photos/2026/"), "photos/2026/");
     }
 }

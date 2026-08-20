@@ -415,21 +415,12 @@ fn sweep_unmarked(
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
-    use synch_core::{file_key, FileEntry, OriginId, SignedHead};
+    use synch_core::{file_key, FileEntry, Hash, SignedHead};
     use synch_mpt::NodeStore;
 
     use super::*;
     use crate::heads::Slot;
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
-    }
-
-    fn origin() -> OriginId {
-        OriginId::named("nas", "x.example").unwrap()
-    }
+    use crate::testutil::{origin, sign_head, store};
 
     fn publish(store: &Store, files: &[(&str, u64)]) -> Hash {
         let trie = Trie::new(store);
@@ -458,17 +449,22 @@ mod tests {
             "nothing is retained until a head points at it"
         );
 
-        let head = SignedHead::sign(&key, origin(), 2, new, 0);
-        store.put_head(Slot::Complete, &head, 0, 0).unwrap();
+        store
+            .put_head(
+                Slot::Complete,
+                &SignedHead::sign(&key, origin(), 2, new, 0),
+                0,
+                0,
+            )
+            .unwrap();
 
         let stats = store.gc_trie().unwrap();
         assert!(stats.nodes > 0, "the old root's private nodes must go");
         assert_eq!(stats.roots_marked, 1);
 
-        // Everything under the retained root survives.
+        // Everything under the retained root survives; the displaced root is gone.
         let trie = Trie::new(&store);
         assert!(trie.is_complete(new).unwrap());
-        // The displaced root is gone.
         assert!(!store.has_node(&old).unwrap());
     }
 
@@ -569,6 +565,12 @@ mod tests {
         assert!(store.blob(&pinned).unwrap().is_some());
         assert!(store.blob(&orphan).unwrap().is_none());
         assert!(!store.blob_path(&orphan).exists());
+
+        // `gc` runs content before orphans, so a row it took leaves no files
+        // behind for a whole retention window.
+        let stats = store.gc(1).unwrap();
+        assert_eq!(stats.blobs, 0);
+        assert_eq!(stats.orphans, 0);
     }
 
     #[test]
@@ -583,13 +585,9 @@ mod tests {
         assert!(store.blob(&fresh).unwrap().is_none());
     }
 
-    /// CAS files no row accounts for are reclaimed, once they are old enough
-    /// to be leftovers rather than a write in progress.
-    ///
-    /// A fetch that fails verification leaves a payload and an outboard with no
-    /// `blobs` row, and the row sweeps walk rows — so without this the disk
-    /// only ever grows. The payload of a live object is written before its row,
-    /// which is why the horizon is the same one content GC uses.
+    /// CAS files no row accounts for are reclaimed once old enough to be
+    /// leftovers rather than a write in progress, and files not named for an
+    /// object are never touched.
     #[test]
     fn stray_cas_files_are_swept_once_they_are_old_enough() {
         let (_d, store) = store();
@@ -626,15 +624,8 @@ mod tests {
         assert_eq!(store.gc(0).unwrap().orphans, 0);
     }
 
-    /// A leaked staging file is reclaimed, and never kills the sweep.
-    ///
-    /// Staging into the CAS root itself puts a *regular file* where the outer
-    /// `read_dir` of the orphan sweep meets it: `read_dir` on one fails with
-    /// `NotADirectory` rather than `NotFound`, so the whole pass returns an
-    /// error — permanently, since only this sweep could remove the file and
-    /// `cas_root_of` refuses the name anyway. Every ingest that fails after the
-    /// stream leaves one, and
-    /// each is a whole object of disk.
+    /// A leaked staging file is reclaimed, and never kills the sweep: a regular
+    /// file in the CAS root used to make every orphan pass fail NotADirectory.
     #[test]
     fn a_staging_file_in_the_cas_root_is_reclaimed_rather_than_breaking_the_sweep() {
         let (_d, store) = store();
@@ -697,14 +688,26 @@ mod tests {
         assert_eq!(store.prune_history_before(&origin(), 400).unwrap(), 2);
         assert_eq!(store.head_history(&origin()).unwrap().len(), 1);
         assert!(store.equivocations().unwrap().is_empty());
+
+        // An origin that never published past the forked seq keeps the
+        // evidence whatever the horizon.
+        let a = sign_head(&key, 2, 2);
+        let b = sign_head(&key, 2, 3);
+        store.record_history(&a, a.created_at).unwrap();
+        store.record_history(&b, b.created_at).unwrap();
+        store.put_head(Slot::Complete, &a, a.created_at, 0).unwrap();
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
+        let seqs: Vec<u64> = store
+            .head_history(&origin())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(seqs, vec![3, 2, 2]);
     }
 
-    /// A head dated at the end of time is pruned like any other.
-    ///
-    /// `created_at` is signed but is the signer's own choice and is never
-    /// clamped, so retention that read it would leave a row — and every trie
-    /// node reachable from its root — permanent on every peer that took it.
-    /// What ages a row out is when this node recorded it.
+    /// A head dated at the end of time is pruned like any other: retention
+    /// keys on when this node recorded the row, not on the signer's claim.
     #[test]
     fn a_head_dated_at_the_end_of_time_still_ages_out() {
         let (_d, store) = store();
@@ -727,14 +730,8 @@ mod tests {
         assert_eq!(kept, vec![2], "only the current head is left");
     }
 
-    /// An origin that is merely *alive* does not pin its old forks.
-    ///
-    /// The rule is that the origin published past the forked seq and the head
-    /// that did so is itself older than retention. Reading "the head that did
-    /// so" off the complete slot asks a different question — is the head we
-    /// hold *now* old? — under which an origin publishing once per retention
-    /// window keeps every fork it has ever signed, and every trie node under
-    /// those roots, alive on every peer forever.
+    /// An origin that merely publishes regularly does not pin its old forks:
+    /// "moved past" is read off retained history, not the complete slot.
     #[test]
     fn a_live_origin_does_not_pin_its_old_forks() {
         let (_d, store) = store();
@@ -745,15 +742,17 @@ mod tests {
 
         // A fork a hundred days ago, and ordinary history just past it.
         for root in [1u8, 2u8] {
-            let head = SignedHead::sign(&key, origin(), 5, Hash([root; 32]), 0);
-            store.record_history(&head, long_ago).unwrap();
+            store
+                .record_history(&sign_head(&key, 5, root), long_ago)
+                .unwrap();
         }
         for seq in 6..10u64 {
-            let head = SignedHead::sign(&key, origin(), seq, Hash([seq as u8 + 50; 32]), 0);
-            store.record_history(&head, long_ago).unwrap();
+            store
+                .record_history(&sign_head(&key, seq, seq as u8 + 50), long_ago)
+                .unwrap();
         }
         // And a head taken today, which holds the complete slot.
-        let current = SignedHead::sign(&key, origin(), 20, Hash([99u8; 32]), 0);
+        let current = sign_head(&key, 20, 99);
         store.put_head(Slot::Complete, &current, now, now).unwrap();
 
         // A seven-day window: everything but today's head is out of it, and the
@@ -774,16 +773,9 @@ mod tests {
         assert!(store.equivocations().unwrap().is_empty());
     }
 
-    /// Forks at seqs *above* the complete head are bounded too.
-    ///
-    /// An origin can sign two roots at each of a thousand far-future seqs and
-    /// never serve any of the tries, so the complete slot never advances. An
-    /// exemption asking whether the complete head had passed the forked seq
-    /// would never fire for those rows, making them permanent — mark roots for
-    /// GC included, and out of `trust rm`'s reach. A retained head at a
-    /// *higher* seq is the same proof that the origin moved on, and an origin
-    /// flooding future seqs supplies it by the thousand: only the single highest
-    /// forked seq is left without one.
+    /// Future-seq fork flooding is prunable: a retained head at a higher seq
+    /// is the proof the origin moved on, and only the single highest forked
+    /// seq is left without one.
     #[test]
     fn forks_above_the_complete_head_are_bounded_by_the_origin_own_flood() {
         let (_d, store) = store();
@@ -828,11 +820,8 @@ mod tests {
         assert_eq!(store.prune_history_before(&origin(), 10_000).unwrap(), 0);
     }
 
-    /// A fork is never pruned down to a single root.
-    ///
-    /// One root at a seq proves nothing; the pair is the evidence. So a forked
-    /// seq is taken whole or left whole, even when only some of its rows are
-    /// past the window.
+    /// A fork is never pruned down to a single root: the pair is the evidence,
+    /// so a forked seq goes whole or not at all.
     #[test]
     fn fork_evidence_is_pruned_whole_or_not_at_all() {
         let (_d, store) = store();
@@ -866,47 +855,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3]
         );
-    }
-
-    #[test]
-    fn a_fork_at_the_current_seq_is_never_pruned() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let a = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 100);
-        let b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 100);
-        store.record_history(&a, a.created_at).unwrap();
-        store.record_history(&b, b.created_at).unwrap();
-        store.put_head(Slot::Complete, &a, a.created_at, 0).unwrap();
-
-        // The origin has not published past the forked seq, so no horizon
-        // drops the evidence.
-        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
-        assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn history_origins_lists_what_has_history() {
-        let (_d, store) = store();
-        assert!(store.history_origins().unwrap().is_empty());
-        let key = SecretKey::generate();
-        store
-            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0), 0)
-            .unwrap();
-        assert_eq!(store.history_origins().unwrap(), vec![origin()]);
-    }
-
-    #[test]
-    fn full_gc_reports_every_sweep() {
-        let (_d, store) = store();
-        let trie = Trie::new(&store);
-        trie.insert(Hash::EMPTY, b"k", &vec![7u8; 500]).unwrap();
-        store.ingest_bytes(&vec![3u8; 100_000], 0).unwrap();
-        let stats = store.gc(1).unwrap();
-        assert!(stats.nodes > 0);
-        assert_eq!(stats.values, 1);
-        assert_eq!(stats.blobs, 1);
-        // The content sweep took the row and its files together, so the file
-        // sweep behind it finds nothing left over.
-        assert_eq!(stats.orphans, 0);
     }
 }

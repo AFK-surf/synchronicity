@@ -818,10 +818,17 @@ mod tests {
                 object_root: Hash::new(b"o"),
             },
             MptMessage::Providers {
-                ads: vec![(origin, BlobAd::complete(10))],
+                ads: vec![(origin.clone(), BlobAd::complete(10))],
             },
             MptMessage::Error {
                 reason: "nope".into(),
+            },
+            MptMessage::GetBindings {
+                origin: origin.clone(),
+            },
+            MptMessage::BindingsFor {
+                origin,
+                keys: vec![SecretKey::generate().public()],
             },
         ];
         for m in msgs {
@@ -937,8 +944,8 @@ mod bounded_decode_tests {
     /// fires on element `N + 1`.
     /// postcard collapses a visitor's custom message into its own opaque
     /// `Serde Deserialization Error`, so the assertion is that decoding fails
-    /// at all; `a_message_at_the_cap_still_decodes` is the control that says
-    /// the failure is the cap and not the encoding.
+    /// at all; the at-cap control below says the failure is the cap and not
+    /// the encoding.
     fn refuses_past(bytes: &[u8]) {
         assert!(
             postcard::from_bytes::<MptMessage>(bytes).is_err(),
@@ -948,58 +955,7 @@ mod bounded_decode_tests {
 
     #[test]
     fn a_heads_summary_list_past_the_cap_is_refused_while_decoding() {
-        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
-            .map(|i| HeadSummary {
-                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-                seq: i as u64,
-                root: Hash([0u8; 32]),
-                complete: false,
-            })
-            .collect();
-        let bytes = postcard::to_stdvec(&MptMessage::Hello {
-            proto: 1,
-            heads,
-            scope: None,
-        })
-        .unwrap();
-        refuses_past(&bytes);
-    }
-
-    #[test]
-    fn a_node_batch_past_the_cap_is_refused_while_decoding() {
-        let wants = |n: usize| -> Vec<(Vec<u8>, Hash)> {
-            (0..n)
-                .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
-                .collect()
-        };
-        let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
-            root: Hash([0u8; 32]),
-            wants: wants(MAX_BATCH + 1),
-        })
-        .unwrap();
-        refuses_past(&bytes);
-
-        let bytes = postcard::to_stdvec(&MptMessage::GetValues {
-            root: Hash([0u8; 32]),
-            wants: wants(MAX_BATCH + 1),
-        })
-        .unwrap();
-        refuses_past(&bytes);
-    }
-
-    #[test]
-    fn a_bindings_answer_past_the_cap_is_refused_while_decoding() {
-        let keys = vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1];
-        let bytes = postcard::to_stdvec(&MptMessage::BindingsFor {
-            origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-            keys,
-        })
-        .unwrap();
-        refuses_past(&bytes);
-    }
-
-    #[test]
-    fn a_message_at_the_cap_still_decodes() {
+        // The at-cap control: the failure above is the cap, not the encoding.
         let wants: Vec<(Vec<u8>, Hash)> = (0..MAX_BATCH)
             .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
             .collect();
@@ -1016,5 +972,59 @@ mod bounded_decode_tests {
                 wants
             }
         );
+
+        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
+            .map(|i| HeadSummary {
+                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
+                seq: i as u64,
+                root: Hash([0u8; 32]),
+                complete: false,
+            })
+            .collect();
+        refuses_past(
+            &postcard::to_stdvec(&MptMessage::Hello {
+                proto: 1,
+                heads,
+                scope: None,
+            })
+            .unwrap(),
+        );
+
+        // The same mechanism on the other capped batch fields.
+        let wants = |n: usize| -> Vec<(Vec<u8>, Hash)> {
+            (0..n)
+                .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
+                .collect()
+        };
+        refuses_past(
+            &postcard::to_stdvec(&MptMessage::GetNodes {
+                root: Hash([0u8; 32]),
+                wants: wants(MAX_BATCH + 1),
+            })
+            .unwrap(),
+        );
+        refuses_past(
+            &postcard::to_stdvec(&MptMessage::GetValues {
+                root: Hash([0u8; 32]),
+                wants: wants(MAX_BATCH + 1),
+            })
+            .unwrap(),
+        );
+
+        let keys = vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1];
+        refuses_past(
+            &postcard::to_stdvec(&MptMessage::BindingsFor {
+                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
+                keys,
+            })
+            .unwrap(),
+        );
+
+        // Provider hints are capped at MAX_PROVIDER_ADS the same way.
+        let origin = OriginId::Key(iroh_base::SecretKey::generate().public());
+        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
+            .map(|i| (origin.clone(), BlobAd::complete(i as u64)))
+            .collect();
+        refuses_past(&postcard::to_stdvec(&MptMessage::Providers { ads }).unwrap());
     }
 }

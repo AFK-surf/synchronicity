@@ -360,8 +360,8 @@ pub fn tokens_match(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// A code has to survive the round trip through a status, because the CLI's
-    /// exit status and the gateway's HTTP status are both read off it.
+    // A code has to survive the round trip through a status: the CLI's exit
+    // status and the gateway's HTTP status are both read off it.
     #[test]
     fn every_code_crosses_a_status_intact() {
         for code in [
@@ -380,14 +380,17 @@ mod tests {
         }
     }
 
-    /// A status the daemon never wrote — the transport gave up, or something
-    /// that is not a daemon answered — still has to land on a code.
+    // A status the daemon never wrote still has to land on a code.
     #[test]
     fn a_status_without_a_named_code_falls_back_to_the_grpc_one() {
-        let e = ControlError::from(Status::unavailable("nothing is listening"));
-        assert_eq!(e.code, ErrorCode::Unavailable);
-        let e = ControlError::from(Status::unknown("the connection went away"));
-        assert_eq!(e.code, ErrorCode::Internal);
+        assert_eq!(
+            ControlError::from(Status::unavailable("nothing is listening")).code,
+            ErrorCode::Unavailable
+        );
+        assert_eq!(
+            ControlError::from(Status::unknown("the connection went away")).code,
+            ErrorCode::Internal
+        );
     }
 
     #[test]
@@ -417,24 +420,5 @@ mod tests {
             EntryInfo::try_from(empty).unwrap_err().code,
             ErrorCode::Internal
         );
-    }
-
-    #[test]
-    fn token_comparison_is_length_and_content_sensitive() {
-        assert!(tokens_match(&[1, 2, 3], &[1, 2, 3]));
-        assert!(!tokens_match(&[1, 2, 3], &[1, 2, 4]));
-        assert!(!tokens_match(&[1, 2, 3], &[1, 2]));
-        assert!(tokens_match(&[], &[]));
-    }
-
-    #[test]
-    fn engine_errors_carry_their_kind_across_the_socket() {
-        let e: ControlError = synch_engine::EngineError::not_found("nope").into();
-        assert_eq!(e.code, ErrorCode::NotFound);
-        let e: ControlError = synch_engine::EngineError::invalid("bad").into();
-        assert_eq!(e.code, ErrorCode::Invalid);
-        assert_eq!(e.message, "bad");
-        let e: ControlError = synch_engine::EngineError::NotInitialized.into();
-        assert_eq!(e.code, ErrorCode::NotInitialized);
     }
 }

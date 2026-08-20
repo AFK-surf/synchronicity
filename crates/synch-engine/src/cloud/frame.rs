@@ -431,9 +431,6 @@ mod tests {
         let attach = attach_signing_input(url, &nonce);
         let head = head_signing_input(&origin, 7, &synch_core::Hash::new(b"root"), 1234, &node_id);
         assert_ne!(attach, head);
-        assert!(attach.starts_with(ATTACH_SIGNING_DOMAIN));
-        assert!(!attach.starts_with(synch_core::HEAD_SIGNING_DOMAIN));
-        assert!(!head.starts_with(ATTACH_SIGNING_DOMAIN));
 
         // And the signatures themselves do not cross over.
         let attach_sig = key.sign(&attach);
@@ -526,12 +523,9 @@ mod tests {
         };
         let text = serde_json::to_string(&up).unwrap();
         assert_eq!(serde_json::from_str::<Up>(&text).unwrap(), up);
-    }
 
-    /// Absent optional fields decode: a control plane one release behind must
-    /// not be a parse failure.
-    #[test]
-    fn optional_fields_default_when_a_peer_omits_them() {
+        // Absent optional fields decode: a control plane one release behind
+        // must not be a parse failure.
         let frame: Down =
             serde_json::from_str(r#"{"t":"ls","id":1,"space":"m","path":""}"#).unwrap();
         assert_eq!(

@@ -1271,39 +1271,83 @@ fn copy_run(donor: &File, payload: &mut DataFile, start: u64, end: u64) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil;
     use synch_core::group_cv;
 
     /// One chunk group, the unit everything here is counted in.
     const GROUP: usize = CHUNK_GROUP_SIZE as usize;
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
+    /// A provider holding `new` and a fetcher holding `old` as a donor:
+    /// (tempdirs, provider, fetcher, new_root, old_root, size). The tempdirs
+    /// must live as long as the stores, or the CAS files vanish.
+    fn pair_of_stores(
+        old: &[u8],
+        new: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        Store,
+        Hash,
+        Hash,
+        u64,
+    ) {
+        let (_d1, provider) = testutil::store();
+        let (_d2, fetcher) = testutil::store();
+        let old_root = fetcher.ingest_bytes(old, 0).unwrap();
+        let new_root = provider.ingest_bytes(new, 0).unwrap();
+        (
+            _d1,
+            _d2,
+            provider,
+            fetcher,
+            new_root,
+            old_root,
+            new.len() as u64,
+        )
     }
 
-    fn data(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i * 31 + 7) as u8).collect()
+    /// The fetcher's proof round over the whole object at `level`.
+    fn prove(
+        provider: &Store,
+        fetcher: &Store,
+        root: &Hash,
+        size: u64,
+        level: u8,
+    ) -> (Proven, ChunkRanges) {
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(root, &all, level, MAX_PROOF_NODES)
+            .unwrap();
+        let proven = fetcher
+            .write_proof(root, size, &served, level, &encoded, 0)
+            .unwrap();
+        (proven, all)
     }
 
-    /// A donor that is exactly as wide as the span being asked about still
-    /// vouches for it.
-    ///
-    /// The span a delta round asks about is a power of two, so a donor whose
-    /// group count is exactly that power is whole for precisely one span — its
-    /// own — and for no other. Answering `None` there would leave such a donor
-    /// vouching for nothing at all: every span of the new object fails, nothing
-    /// is promoted, and an object extended by one group re-fetches all of
-    /// itself.
+    /// Slices `missing` from the provider and asserts the object reads back as `expected` — the epilogue of every fetch path here.
+    fn finish_via_slice(
+        provider: &Store,
+        fetcher: &Store,
+        root: &Hash,
+        size: u64,
+        missing: &ChunkRanges,
+        expected: &[u8],
+    ) {
+        let (encoded, served) = provider.encode_slice(root, missing).unwrap();
+        fetcher
+            .write_slice(root, size, &served, &encoded, 0)
+            .unwrap();
+        assert!(fetcher.blob(root).unwrap().unwrap().complete);
+        assert_eq!(fetcher.read_all(root).unwrap(), expected);
+    }
+
+    /// A donor as wide as the span vouches for its whole tree as a subtree; single groups have no pair, so None (§3.3).
     #[test]
     fn a_donor_the_width_of_the_span_vouches_for_its_whole_tree() {
-        let (_dir, store) = store();
-        let bytes = data(16 * GROUP);
+        let (_d, store) = testutil::store();
+        let bytes = testutil::data(16 * GROUP);
         let donor = store.ingest_bytes(&bytes, 0).unwrap();
-
-        // Its whole tree, as a subtree of something larger: the unflagged join
-        // of the root pair, which is what those bytes hash to when they are not
-        // the whole object.
         let mut nodes = Vec::new();
         let expected = recompute(
             &bytes,
@@ -1312,26 +1356,549 @@ mod tests {
         );
         assert_eq!(
             store.subtree_cvs(&donor, &[(0, 16)]).unwrap(),
-            vec![Some(expected)],
-            "the donor's whole tree has a chaining value like any other subtree"
+            vec![Some(expected)]
         );
-
-        // And it is not the object's address, which carries the root flag.
-        assert_ne!(expected.0, donor.0);
-
-        // Narrower spans inside it keep answering as they did.
-        assert!(store.subtree_cvs(&donor, &[(0, 8)]).unwrap()[0].is_some());
-        assert!(store.subtree_cvs(&donor, &[(8, 8)]).unwrap()[0].is_some());
-
-        // A single-group object is the one case with no pair to join: its group
-        // is the tree, and the only hash the outboard holds is the address.
-        let tiny = store.ingest_bytes(&data(GROUP), 0).unwrap();
+        assert_ne!(expected.0, donor.0, "it is not the root-flagged address");
+        assert!(
+            store.subtree_cvs(&donor, &[(0, 8)]).unwrap()[0].is_some(),
+            "narrower spans still answer"
+        );
+        let tiny = store.ingest_bytes(&testutil::data(GROUP), 0).unwrap();
         assert_eq!(store.subtree_cvs(&tiny, &[(0, 1)]).unwrap(), vec![None]);
+        // A donor whose outboard the collector took answers None, not Err.
+        std::fs::remove_file(store.outboard_path(&donor)).unwrap();
+        assert_eq!(store.subtree_cvs(&donor, &[(0, 16)]).unwrap(), vec![None]);
     }
 
-    /// Recomputes a subtree's chaining value and every interior pair under it
-    /// straight from the bytes — the receiving side's arithmetic, with none of
-    /// the store's plumbing in the way.
+    /// Our idea of the tree — which groups pair, which outboard node holds the result, where the right edge collapses — is bao's, node for node.
+    #[test]
+    fn our_tree_math_agrees_with_the_outboard_bao_wrote() {
+        let (_d, store) = testutil::store();
+        for n in [
+            2 * GROUP,
+            3 * GROUP,
+            4 * GROUP,
+            5 * GROUP + 1,
+            8 * GROUP,
+            9 * GROUP - 5,
+            20 * GROUP,
+            33 * GROUP + 100,
+        ] {
+            let bytes = testutil::data(n);
+            let size = bytes.len() as u64;
+            let root = store.ingest_bytes(&bytes, 0).unwrap();
+            let outboard = outboard_of(&store, &root, size);
+            let mut nodes = Vec::new();
+            recompute(
+                &bytes,
+                Subtree::root_of(&Store::tree(size), group_count(size)),
+                &mut nodes,
+            );
+            assert_eq!(
+                nodes.len(),
+                group_count(size) as usize - 1,
+                "n groups, n-1 interior nodes ({size} bytes)"
+            );
+            for (node, pair) in &nodes {
+                assert_eq!(
+                    &load_from_outboard(&outboard, &root, node).unwrap(),
+                    pair,
+                    "node {node} of a {size}-byte object disagrees"
+                );
+            }
+        }
+    }
+
+    /// A leaf proof of a whole object is that object's whole tree: byte for byte the outboard bao wrote, held-nothing on the row.
+    #[test]
+    fn a_leaf_proof_round_trips_into_the_same_outboard() {
+        let (_d1, provider) = testutil::store();
+        let (_d2, fetcher) = testutil::store();
+        let bytes = testutil::data(9 * GROUP + 7);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let (proven, _) = prove(&provider, &fetcher, &root, size, 0);
+        assert_eq!(proven.subtrees.len(), group_count(size) as usize);
+        let last = proven.subtrees.last().unwrap();
+        let tail_start = (group_count(size) - 1) * GROUP as u64;
+        assert_eq!(last.cv, group_cv(tail_start, &bytes[tail_start as usize..]));
+        assert!(!last.whole, "the short tail is not whole");
+        assert_eq!(
+            std::fs::read(fetcher.outboard_path(&root)).unwrap(),
+            std::fs::read(provider.outboard_path(&root)).unwrap()
+        );
+        let row = fetcher.blob(&root).unwrap().unwrap();
+        assert!(!row.complete);
+        assert!(row.verified_groups().is_empty(), "a proof commits no bytes");
+    }
+
+    /// Objects of different sizes agree span for span wherever their bytes agree; a changed span is the only one that disagrees.
+    #[test]
+    fn equal_spans_are_proven_equal_across_unequal_sizes() {
+        let old = testutil::data(16 * GROUP);
+        let mut new = old.clone();
+        new.extend(testutil::data(4 * GROUP));
+        new[9 * GROUP + 100] ^= 0xff;
+        let (_d, store) = testutil::store();
+        let old_root = store.ingest_bytes(&old, 0).unwrap();
+        let (_d2, holder) = testutil::store();
+        let new_root = holder.ingest_bytes(&new, 0).unwrap();
+        let (proven, _) = prove(&holder, &store, &new_root, new.len() as u64, 2);
+        let spans: Vec<(u64, u64)> = proven
+            .subtrees
+            .iter()
+            .map(|s| (s.start, s.groups))
+            .collect();
+        let donor_cvs = store.subtree_cvs(&old_root, &spans).unwrap();
+        let equal: Vec<u64> = proven
+            .subtrees
+            .iter()
+            .zip(&donor_cvs)
+            .filter(|(s, cv)| **cv == Some(s.cv))
+            .map(|(s, _)| s.start)
+            .collect();
+        assert_eq!(
+            equal,
+            vec![0, 4, 12],
+            "every span but the edited one and the appended tail"
+        );
+        assert_eq!(
+            donor_cvs[4], None,
+            "the appended spans lie past the donor's end"
+        );
+    }
+
+    /// Neither delta-sync file is grown to a length no proof established: a 32 TiB claim must not buy sparse files nothing reclaims (§6).
+    #[test]
+    fn a_size_claim_cannot_grow_the_delta_sync_files_past_what_is_written() {
+        let (_d1, provider) = testutil::store();
+        let (_d2, victim) = testutil::store();
+        // A proof of one group writes a handful of pairs, not the whole tree.
+        let bytes = testutil::data(1024 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &ChunkRanges::single(0, 1), 0, MAX_PROOF_NODES)
+            .unwrap();
+        victim
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        let written = std::fs::metadata(victim.outboard_path(&root))
+            .unwrap()
+            .len();
+        assert_eq!(
+            written,
+            (encoded.len() / PROOF_NODE_LEN) as u64 * PROOF_NODE_LEN as u64
+        );
+        assert!(
+            written < Store::tree(size).outboard_size() / 4,
+            "nothing like the tree of the claimed length"
+        );
+
+        // A promotion writes the runs it matched and no more.
+        let old = testutil::data(16 * GROUP);
+        let mut new = old.clone();
+        new[15 * GROUP + 7] ^= 0xff;
+        let (_d3, _d4, provider, victim, new_root, old_root, new_size) = pair_of_stores(&old, &new);
+        let (proven, _) = prove(&provider, &victim, &new_root, new_size, 0);
+        let promoted = victim.promote(&Donor(old_root), &proven, 0).unwrap();
+        assert_eq!(promoted, ChunkRanges::single(0, 15));
+        let reach = promoted.ranges.last().unwrap().end * CHUNK_GROUP_SIZE;
+        assert_eq!(
+            std::fs::metadata(victim.blob_path(&new_root))
+                .unwrap()
+                .len(),
+            reach,
+            "the payload reaches the last promoted byte, not the claimed size"
+        );
+        assert!(reach < new_size);
+    }
+
+    /// A promoted span is servable to a third node, not merely held: the interior nodes land in the new outboard at bao's positions (§6.3).
+    #[test]
+    fn a_promoted_span_can_be_served_onward() {
+        let old = testutil::data(64 * GROUP);
+        let mut new = old.clone();
+        new[40 * GROUP + 7] ^= 0xff;
+        let (_d1, _d2, provider, fetcher, new_root, old_root, size) = pair_of_stores(&old, &new);
+        let (_d3, third) = testutil::store();
+        let (proven, _) = prove(&provider, &fetcher, &new_root, size, 4);
+        assert_eq!(proven.subtrees.len(), 4);
+        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
+        assert_eq!(promoted.count(), 48, "three whole spans: {promoted:?}");
+        // A third node fetches one promoted span and gets bytes that verify.
+        let span = ChunkRanges::single(16, 32);
+        let (encoded, served) = fetcher.encode_slice(&new_root, &span).unwrap();
+        assert_eq!(served, span);
+        third
+            .write_slice(&new_root, size, &served, &encoded, 0)
+            .unwrap();
+        assert_eq!(
+            third.read_range(&new_root, 16 * GROUP as u64, 100).unwrap(),
+            &new[16 * GROUP..16 * GROUP + 100]
+        );
+        assert_eq!(fetcher.read_range(&new_root, 0, 100).unwrap(), &new[..100]);
+    }
+
+    /// A matched run is copied across whole — aligned middle and short tail alike — and promoted groups are servable, not merely held.
+    #[test]
+    fn a_matched_run_is_copied_across_whole_including_the_tail_group() {
+        let old = testutil::data(20 * GROUP + 777);
+        let mut new = old.clone();
+        new[9 * GROUP..10 * GROUP].fill(0x5a);
+        let (_d1, _d2, provider, fetcher, new_root, old_root, size) = pair_of_stores(&old, &new);
+        let all = ChunkRanges::single(0, group_count(size));
+        // The descent as the fetcher runs it: spans first, then leaves.
+        let mut promoted = ChunkRanges::empty();
+        for level in [2u8, 0] {
+            let want = all.difference(&promoted);
+            let (encoded, served) = provider
+                .encode_proof(&new_root, &want, level, MAX_PROOF_NODES)
+                .unwrap();
+            let proven = fetcher
+                .write_proof(&new_root, size, &served, level, &encoded, 0)
+                .unwrap();
+            promoted = promoted.union(&fetcher.promote(&Donor(old_root), &proven, 0).unwrap());
+        }
+        assert_eq!(
+            promoted,
+            all.difference(&ChunkRanges::single(9, 10)),
+            "every group but the edited one, the short tail included"
+        );
+        assert!(promoted.contains(20), "the short tail came across");
+        assert_eq!(
+            fetcher.read_range(&new_root, 0, 8 * GROUP as u64).unwrap(),
+            &new[..8 * GROUP]
+        );
+        assert_eq!(
+            fetcher
+                .read_range(&new_root, 20 * GROUP as u64, 777)
+                .unwrap(),
+            &new[20 * GROUP..]
+        );
+        // Promoted groups are servable because the tree came with them.
+        let (slice, slice_served) = fetcher
+            .encode_slice(&new_root, &ChunkRanges::single(0, 4))
+            .unwrap();
+        assert_eq!(slice_served, ChunkRanges::single(0, 4));
+        assert!(!slice.is_empty());
+        finish_via_slice(
+            &provider,
+            &fetcher,
+            &new_root,
+            size,
+            &all.difference(&promoted),
+            &new,
+        );
+    }
+
+    /// A donor whose outboard rotted cannot poison the tree: copied nodes must recombine to the proven value, or the span falls back to the network.
+    #[test]
+    fn a_rotted_donor_tree_is_refused_and_left_to_the_fetch() {
+        let old = testutil::data(16 * GROUP);
+        let mut new = old.clone();
+        new[15 * GROUP..].fill(0x11);
+        let (_d1, _d2, provider, fetcher, new_root, old_root, size) = pair_of_stores(&old, &new);
+        let all = ChunkRanges::single(0, group_count(size));
+        let (proven, _) = prove(&provider, &fetcher, &new_root, size, 2);
+        let span = proven.subtrees.iter().find(|s| s.start == 4).unwrap();
+        // A bit flips in the donor's outboard under span 4..8, behind the
+        // store's back — a value the span's own comparison cannot see.
+        let inner = Subtree::locate(&Store::tree(size), 16, 4, 2).unwrap().node;
+        let offset = outboard_of(&fetcher, &old_root, size)
+            .tree
+            .pre_order_offset(inner)
+            .unwrap()
+            * PROOF_NODE_LEN as u64;
+        let mut raw = std::fs::read(fetcher.outboard_path(&old_root)).unwrap();
+        raw[offset as usize + 8 + 3] ^= 0xff;
+        std::fs::write(fetcher.outboard_path(&old_root), &raw).unwrap();
+
+        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
+        assert!(
+            !promoted.overlaps(span.start, span.end()),
+            "the span over the rotted tree is refused: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(0) && promoted.contains(8),
+            "the spans either side are not: {promoted:?}"
+        );
+        finish_via_slice(
+            &provider,
+            &fetcher,
+            &new_root,
+            size,
+            &all.difference(&promoted),
+            &new,
+        );
+    }
+
+    /// A proof of the right object at the wrong length is refused: a group-aligned understatement would promote subtrees the object does not end after, completing a row at 80% of its length (§6).
+    #[test]
+    fn a_proof_carries_the_length_it_was_taken_at() {
+        let bytes = testutil::data(20 * GROUP);
+        let size = bytes.len() as u64;
+        let mut donor_bytes = bytes.clone();
+        donor_bytes[19 * GROUP] ^= 0xff;
+        let (_d1, _d2, provider, fetcher, root, donor, _) = pair_of_stores(&donor_bytes, &bytes);
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        let short = 16 * GROUP as u64;
+        assert!(
+            fetcher
+                .write_proof(&root, short, &served, 0, &encoded, 0)
+                .is_err(),
+            "a proof must not verify under a length the tree does not have"
+        );
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(
+            proven.size, size,
+            "a proof carries the size it was taken at"
+        );
+        assert_eq!(
+            fetcher.promote(&Donor(donor), &proven, 0).unwrap().count(),
+            19,
+            "every group but the changed one"
+        );
+    }
+
+    /// A size claim short of the truth cannot promote a short tail: the run would be copied truncated, completing a row nothing supports (§6).
+    #[test]
+    fn an_understated_size_does_not_promote_a_short_tail() {
+        let bytes = testutil::data(8 * GROUP + 500);
+        let size = bytes.len() as u64;
+        let mut donor_bytes = bytes.clone();
+        donor_bytes[3 * GROUP + 9] ^= 0xff;
+        let (_d1, _d2, provider, victim, root, donor, _) = pair_of_stores(&donor_bytes, &bytes);
+        let all = ChunkRanges::single(0, group_count(size));
+        // One byte short of the truth: the same tree, so the proof verifies.
+        let short = size - 1;
+        assert_eq!(group_count(short), group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        let proven = victim
+            .write_proof(&root, short, &served, 0, &encoded, 0)
+            .expect("the proof verifies under the short size");
+        let promoted = victim.promote(&Donor(donor), &proven, 0).unwrap();
+        assert!(
+            !promoted.contains(8),
+            "the tail group's bytes reach further than the claim: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(0) && !promoted.contains(3),
+            "the whole groups either side still promote: {promoted:?}"
+        );
+        assert!(
+            !victim.blob(&root).unwrap().unwrap().complete,
+            "nothing completed the object under the claim"
+        );
+        // The honest writer of the real length is not refused by the residue.
+        finish_via_slice(&provider, &victim, &root, size, &all, &bytes);
+    }
+
+    /// A lying size claim racing a completing write never wins: settle_size decides inside the commit transaction. A bounded loop — rare to hit.
+    #[test]
+    fn a_size_claim_racing_a_completing_write_never_wins() {
+        let (_d1, provider) = testutil::store();
+        let (_d2, victim) = testutil::store();
+        for round in 0..64usize {
+            let bytes = testutil::data(4 * GROUP + 500 + round);
+            let size = bytes.len() as u64;
+            let root = provider.ingest_bytes(&bytes, 0).unwrap();
+            // A hundred bytes further on, inside the same chunk: same tree.
+            let lie = size + 100;
+            assert_eq!(group_count(lie), group_count(size));
+            let all = ChunkRanges::single(0, group_count(size));
+            let (slice, slice_served) = provider.encode_slice(&root, &all).unwrap();
+            let (proof, proof_served) = provider
+                .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+                .unwrap();
+            let (victim, root, slice, slice_served, proof, proof_served) =
+                (&victim, &root, &slice, &slice_served, &proof, &proof_served);
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    victim
+                        .write_slice(root, size, slice_served, slice, 0)
+                        .expect("the honest writer is never refused")
+                });
+                // Refused or absorbed, either is fine — never its size on a row.
+                scope.spawn(move || {
+                    let _ = victim.write_proof(root, lie, proof_served, 0, proof, 0);
+                });
+            });
+            let row = victim.blob(root).unwrap().unwrap();
+            assert_eq!(row.size, size, "round {round}: the claim won");
+            assert!(row.complete, "round {round}");
+            assert_eq!(victim.read_all(root).unwrap(), bytes, "round {round}");
+        }
+    }
+
+    /// A size a peer merely claimed does not brick a root: it yields to the next honest writer, and a completed row refuses a later lie.
+    #[test]
+    fn an_overstated_size_does_not_brick_a_root() {
+        let (_d1, provider) = testutil::store();
+        let (_d2, victim) = testutil::store();
+        let bytes = testutil::data(8 * GROUP + 500);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+        let lie = size + 100;
+        assert_eq!(group_count(lie), group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        victim
+            .write_proof(&root, lie, &served, 0, &encoded, 0)
+            .expect("the proof verifies: the lie is invisible in the tree");
+        assert_eq!(victim.blob(&root).unwrap().unwrap().size, lie);
+        // The honest fetch replaces the claim, and the object completes.
+        finish_via_slice(&provider, &victim, &root, size, &all, &bytes);
+        assert!(
+            matches!(
+                victim.write_slice(&root, lie, &served, &encoded, 0),
+                Err(StoreError::Verification { .. })
+            ),
+            "once the last group is held, the size is attested"
+        );
+    }
+
+    /// A tampered proof — flips, truncation, padding, a wrong root — is rejected whole with nothing committed; spent honestly it names its object and length.
+    #[test]
+    fn a_tampered_proof_is_rejected() {
+        let bytes = testutil::data(9 * GROUP);
+        let size = bytes.len() as u64;
+        let (_d1, provider) = testutil::store();
+        let (_d2, fetcher) = testutil::store();
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        for flip in [0usize, 63, 64, encoded.len() - 1] {
+            let mut tampered = encoded.clone();
+            tampered[flip] ^= 0xff;
+            assert!(
+                matches!(
+                    fetcher.write_proof(&root, size, &served, 0, &tampered, 0),
+                    Err(StoreError::Verification { .. })
+                ),
+                "a flip at byte {flip} was accepted"
+            );
+        }
+        assert!(
+            fetcher
+                .write_proof(&root, size, &served, 0, &encoded[..encoded.len() - 64], 0)
+                .is_err(),
+            "truncated"
+        );
+        let mut padded = encoded.clone();
+        padded.extend_from_slice(&[0u8; 64]);
+        assert!(
+            fetcher
+                .write_proof(&root, size, &served, 0, &padded, 0)
+                .is_err(),
+            "padded"
+        );
+        assert!(
+            fetcher
+                .write_proof(&Hash::new(b"elsewhere"), size, &served, 0, &encoded, 0)
+                .is_err(),
+            "a wrong root fails at the first node"
+        );
+        assert!(
+            fetcher.blob(&root).unwrap().is_none(),
+            "nothing was written"
+        );
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(proven.root, root);
+        assert_eq!(proven.size, size);
+    }
+
+    /// An over-budget proof request is refused rather than truncated; sized to the budget, the same request is served whole and verifies.
+    #[test]
+    fn an_over_budget_proof_is_refused_rather_than_truncated() {
+        let (_d, provider) = testutil::store();
+        let bytes = testutil::data(40 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+        let err = provider
+            .encode_proof(&root, &all, 0, 12)
+            .expect_err("an over-budget request must be refused");
+        assert!(err.to_string().contains("budget"), "{err}");
+        let window = ChunkRanges::single(0, 8);
+        assert!(synch_core::proof_nodes_upper_bound(&window, 0) <= 12 + 64);
+        let (encoded, served) = provider.encode_proof(&root, &window, 0, 128).unwrap();
+        assert_eq!(served, window, "a sized window is never short");
+        let (_d2, fetcher) = testutil::store();
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert!(!proven.is_empty());
+    }
+
+    /// A partial holder proves only the groups it holds, and what it serves still verifies against the root.
+    #[test]
+    fn a_partial_holder_proves_only_the_groups_it_holds() {
+        let (_d1, provider) = testutil::store();
+        let (_d2, partial) = testutil::store();
+        let bytes = testutil::data(16 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let half = ChunkRanges::single(0, 8);
+        let (encoded, served) = provider.encode_slice(&root, &half).unwrap();
+        partial
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = partial
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        assert_eq!(served, half);
+        let (_d3, fetcher) = testutil::store();
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(proven.subtrees.len(), 8);
+    }
+
+    /// Objects too small to have a tree have nothing to prove, and an inline donor promotes nothing: a single group has no chaining value (§2).
+    #[test]
+    fn tiny_objects_have_nothing_to_prove() {
+        let (_d, store) = testutil::store();
+        for size in [0usize, 1, 100, GROUP] {
+            let bytes = testutil::data(size);
+            let root = store.ingest_bytes(&bytes, 0).unwrap();
+            let all = ChunkRanges::single(0, group_count(bytes.len() as u64));
+            let (encoded, served) = store.encode_proof(&root, &all, 0, MAX_PROOF_NODES).unwrap();
+            assert!(encoded.is_empty(), "{size} bytes");
+            assert_eq!(served, all, "{size} bytes");
+            let promoted = store
+                .promote(&Donor(root), &Proven::none(root, bytes.len() as u64), 0)
+                .unwrap();
+            assert!(promoted.is_empty());
+        }
+        // An inline donor against a real proof promotes nothing.
+        let (_d1, provider) = testutil::store();
+        let (_d2, fetcher) = testutil::store();
+        let tiny = fetcher.ingest_bytes(&testutil::data(100), 0).unwrap();
+        let new = testutil::data(8 * GROUP);
+        let new_root = provider.ingest_bytes(&new, 0).unwrap();
+        let (proven, _) = prove(&provider, &fetcher, &new_root, new.len() as u64, 0);
+        assert!(fetcher
+            .promote(&Donor(tiny), &proven, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Recomputes a subtree's chaining value and every interior pair under it straight from the bytes — the receiving side's arithmetic, with none of the store's plumbing in the way.
     fn recompute(
         bytes: &[u8],
         node: Subtree,
@@ -1357,981 +1924,6 @@ mod tests {
             root: blake3::Hash::from_bytes(root.0),
             tree: Store::tree(size),
             data: DataFile(File::open(store.outboard_path(root)).unwrap()),
-        }
-    }
-
-    /// The foundation everything else here stands on: our idea of the tree —
-    /// which groups pair with which, which node of the outboard holds the
-    /// result, where the right edge collapses — is bao's idea of it, node for
-    /// node, for objects whose sizes land on every awkward boundary.
-    #[test]
-    fn our_tree_math_agrees_with_the_outboard_bao_wrote() {
-        let (_d, store) = store();
-        for groups_and_change in [
-            2 * GROUP,
-            3 * GROUP,
-            4 * GROUP,
-            5 * GROUP + 1,
-            8 * GROUP,
-            9 * GROUP - 5,
-            20 * GROUP,
-            33 * GROUP + 100,
-        ] {
-            let bytes = data(groups_and_change);
-            let size = bytes.len() as u64;
-            let root = store.ingest_bytes(&bytes, 0).unwrap();
-            let tree = Store::tree(size);
-            let outboard = outboard_of(&store, &root, size);
-
-            let mut nodes = Vec::new();
-            let top = Subtree::root_of(&tree, group_count(size));
-            recompute(&bytes, top, &mut nodes);
-            assert_eq!(
-                nodes.len(),
-                group_count(size) as usize - 1,
-                "a tree of n groups has n-1 interior nodes ({size} bytes)"
-            );
-            for (node, pair) in &nodes {
-                let theirs = load_from_outboard(&outboard, &root, node).unwrap();
-                assert_eq!(
-                    &theirs, pair,
-                    "node {node} of a {size}-byte object disagrees"
-                );
-            }
-            // And the top pair, root-finalized, is the address itself.
-            let (_, top_pair) = nodes.last().unwrap();
-            let left = Cv(top_pair[..32].try_into().unwrap());
-            let right = Cv(top_pair[32..].try_into().unwrap());
-            assert_eq!(join_root(&left, &right), root, "{size} bytes");
-        }
-    }
-
-    /// A leaf-level proof of a whole object is that object's whole tree: what
-    /// lands on the receiving side is byte for byte the outboard bao wrote.
-    #[test]
-    fn a_leaf_proof_round_trips_into_the_same_outboard() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(9 * GROUP + 7);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let all = ChunkRanges::single(0, group_count(size));
-
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        assert_eq!(served, all);
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-
-        assert_eq!(proven.subtrees.len(), group_count(size) as usize);
-        for subtree in &proven.subtrees {
-            assert_eq!(subtree.groups, 1);
-            let start = subtree.start as usize * GROUP;
-            let end = (start + GROUP).min(bytes.len());
-            assert_eq!(subtree.cv, group_cv(start as u64, &bytes[start..end]));
-            // The last group is short, so it is not a whole subtree.
-            assert_eq!(subtree.whole, end - start == GROUP);
-        }
-        assert_eq!(
-            std::fs::read(fetcher.outboard_path(&root)).unwrap(),
-            std::fs::read(provider.outboard_path(&root)).unwrap(),
-            "the proof carried the entire tree, so the two outboards are equal"
-        );
-        // A proof commits no bytes: the object is known, and held not at all.
-        let row = fetcher.blob(&root).unwrap().unwrap();
-        assert!(!row.complete);
-        assert!(row.verified_groups().is_empty());
-    }
-
-    /// A span-level proof costs a fraction of a leaf-level one and still ties
-    /// every span it names to the root.
-    #[test]
-    fn a_span_level_proof_names_one_subtree_per_span() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(20 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let all = ChunkRanges::single(0, group_count(size));
-
-        // Spans of four groups: five of them, and the tree above them.
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 2, MAX_PROOF_NODES)
-            .unwrap();
-        assert_eq!(served, all);
-        let (leaf_encoded, _) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        assert!(
-            encoded.len() * 3 < leaf_encoded.len(),
-            "a span proof is much cheaper than a leaf proof: {} vs {}",
-            encoded.len(),
-            leaf_encoded.len()
-        );
-
-        let proven = fetcher
-            .write_proof(&root, size, &served, 2, &encoded, 0)
-            .unwrap();
-        assert_eq!(proven.subtrees.len(), 5);
-        for (index, subtree) in proven.subtrees.iter().enumerate() {
-            assert_eq!(subtree.start, index as u64 * 4);
-            assert_eq!(subtree.groups, 4);
-            assert!(subtree.whole);
-        }
-    }
-
-    /// The property the whole design rests on, end to end: two objects of
-    /// different sizes agree, span for span, wherever their bytes agree — and a
-    /// span whose bytes changed is the only one that disagrees.
-    #[test]
-    fn equal_spans_are_proven_equal_across_unequal_sizes() {
-        let (_d, store) = store();
-        let old = data(16 * GROUP);
-        // The new version appends four groups and rewrites one in the middle.
-        let mut new = old.clone();
-        new.extend(data(4 * GROUP));
-        new[9 * GROUP + 100] ^= 0xff;
-
-        let old_root = store.ingest_bytes(&old, 0).unwrap();
-        let (_d2, holder) = self::store();
-        let new_root = holder.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = holder
-            .encode_proof(&new_root, &all, 2, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = store
-            .write_proof(&new_root, size, &served, 2, &encoded, 0)
-            .unwrap();
-
-        let spans: Vec<(u64, u64)> = proven
-            .subtrees
-            .iter()
-            .map(|s| (s.start, s.groups))
-            .collect();
-        let donor_cvs = store.subtree_cvs(&old_root, &spans).unwrap();
-        let equal: Vec<u64> = proven
-            .subtrees
-            .iter()
-            .zip(&donor_cvs)
-            .filter(|(subtree, cv)| **cv == Some(subtree.cv))
-            .map(|(subtree, _)| subtree.start)
-            .collect();
-        assert_eq!(
-            equal,
-            vec![0, 4, 12],
-            "every span but the edited one and the appended tail is reused"
-        );
-        // The appended spans lie past the donor's end, so it cannot speak to
-        // them at all rather than answering wrongly.
-        assert_eq!(donor_cvs[4], None);
-    }
-
-    /// Neither delta-sync file is grown to a length no proof established.
-    ///
-    /// `size` reaches these paths off a trie entry, and nothing has verified it:
-    /// `walk_proof` verifies the tree's shape, not its length, and `settle_size`
-    /// has no row to argue with the first time a root is met. An entry
-    /// claiming 32 TiB for any root would otherwise buy a 128 GiB sparse
-    /// outboard from `write_proof` and a 32 TiB sparse payload from `promote`
-    /// on every node that tried — and nothing reclaims either: `trim_to_size`
-    /// runs only on a commit that completes an object, `gc_orphans` skips
-    /// roots with a row, and `gc_content` skips referenced roots, the
-    /// attacker's own entry being the reference. `write_slice` refuses this
-    /// too; both files are bounded the same way, by what the operation in hand
-    /// actually reaches.
-    #[test]
-    fn a_size_claim_cannot_grow_the_delta_sync_files_past_what_is_written() {
-        let (_d1, provider) = store();
-        let (_d2, victim) = store();
-
-        // A proof of one group says nothing about the rest of the tree, so the
-        // outboard it writes is a handful of pairs — not the whole tree of an
-        // object this node holds nothing of.
-        let bytes = data(1024 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let one = ChunkRanges::single(0, 1);
-        let (encoded, served) = provider
-            .encode_proof(&root, &one, 0, MAX_PROOF_NODES)
-            .unwrap();
-        victim
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        let written = std::fs::metadata(victim.outboard_path(&root))
-            .unwrap()
-            .len();
-        let whole_tree = Store::tree(size).outboard_size();
-        assert_eq!(
-            written,
-            (encoded.len() / PROOF_NODE_LEN) as u64 * PROOF_NODE_LEN as u64,
-            "the outboard is exactly the nodes this proof carried"
-        );
-        assert!(
-            written < whole_tree / 4,
-            "and nothing like the tree of the claimed length: {written} vs {whole_tree}"
-        );
-
-        // A promotion writes the runs it matched and no more, so the payload
-        // ends where the last promoted byte does rather than at the claimed
-        // length.
-        let old = data(16 * GROUP);
-        let mut new = old.clone();
-        // Only the last group differs, so every group under it is promoted and
-        // the tail is left for the network.
-        new[15 * GROUP + 7] ^= 0xff;
-        let old_root = victim.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let new_size = new.len() as u64;
-        let all = ChunkRanges::single(0, group_count(new_size));
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = victim
-            .write_proof(&new_root, new_size, &served, 0, &encoded, 0)
-            .unwrap();
-        let promoted = victim.promote(&Donor(old_root), &proven, 0).unwrap();
-        assert_eq!(promoted, ChunkRanges::single(0, 15));
-
-        let reach = promoted.ranges.last().unwrap().end * CHUNK_GROUP_SIZE;
-        assert_eq!(
-            std::fs::metadata(victim.blob_path(&new_root))
-                .unwrap()
-                .len(),
-            reach,
-            "the payload reaches the last promoted byte, not the claimed size"
-        );
-        assert!(reach < new_size);
-    }
-
-    /// The whole flow at store level: prove, compare, promote, and fetch only
-    /// what is left.
-    #[test]
-    fn a_donor_supplies_every_group_that_did_not_change() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let old = data(12 * GROUP + 500);
-        let mut new = old.clone();
-        new[5 * GROUP + 3] ^= 0xff;
-        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-        let groups = group_count(size);
-
-        let all = ChunkRanges::single(0, groups);
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
-
-        assert_eq!(promoted, all.difference(&ChunkRanges::single(5, 6)));
-        assert_eq!(promoted.count(), groups - 1);
-        // Promoted groups are held like any others: readable, and servable,
-        // because the tree came with them.
-        assert_eq!(
-            fetcher.read_range(&new_root, 0, 100).unwrap(),
-            &new[..100],
-            "a promoted group reads back verified"
-        );
-        let (slice, slice_served) = fetcher
-            .encode_slice(&new_root, &ChunkRanges::single(0, 4))
-            .unwrap();
-        assert_eq!(slice_served, ChunkRanges::single(0, 4));
-        assert!(!slice.is_empty());
-
-        // What is left is exactly one group, and an ordinary slice finishes it.
-        let missing = all.difference(&promoted);
-        assert_eq!(missing, ChunkRanges::single(5, 6));
-        let (encoded, served) = provider.encode_slice(&new_root, &missing).unwrap();
-        fetcher
-            .write_slice(&new_root, size, &served, &encoded, 0)
-            .unwrap();
-        assert!(fetcher.blob(&new_root).unwrap().unwrap().complete);
-        assert_eq!(fetcher.read_all(&new_root).unwrap(), new);
-    }
-
-    /// A span promoted whole can be *served* whole, not merely held.
-    ///
-    /// The interior nodes under a promoted span have to land in the new
-    /// object's outboard at bao's positions for that to be true, and getting
-    /// those positions wrong is invisible until something asks this node for a
-    /// slice — which is the moment it has advertised itself as a source and
-    /// then cannot deliver (§3.4, §6.3).
-    #[test]
-    fn a_promoted_span_can_be_served_onward() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let (_d3, third) = store();
-        let old = data(64 * GROUP);
-        let mut new = old.clone();
-        new[40 * GROUP + 7] ^= 0xff;
-        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-        let all = ChunkRanges::single(0, group_count(size));
-
-        // Spans of sixteen groups, three of which are untouched.
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 4, MAX_PROOF_NODES)
-            .unwrap();
-        let spans = fetcher
-            .write_proof(&new_root, size, &served, 4, &encoded, 0)
-            .unwrap();
-        assert_eq!(spans.subtrees.len(), 4);
-        let promoted = fetcher.promote(&Donor(old_root), &spans, 0).unwrap();
-        assert_eq!(promoted.count(), 48, "three whole spans: {promoted:?}");
-
-        // A third node fetches one of those spans from the promoter and gets
-        // bytes that verify against the root.
-        let span = ChunkRanges::single(16, 32);
-        let (encoded, served) = fetcher.encode_slice(&new_root, &span).unwrap();
-        assert_eq!(served, span);
-        third
-            .write_slice(&new_root, size, &served, &encoded, 0)
-            .unwrap();
-        assert_eq!(
-            third.read_range(&new_root, 16 * GROUP as u64, 100).unwrap(),
-            &new[16 * GROUP..16 * GROUP + 100]
-        );
-        // And the promoter's own outboard is byte for byte the one bao wrote,
-        // wherever the promotion filled it in.
-        assert_eq!(fetcher.read_range(&new_root, 0, 100).unwrap(), &new[..100]);
-    }
-
-    /// The tail group is the one fixed-offset chunking is least kind to: it is
-    /// short, it is not a whole subtree, and it still has to be reusable when
-    /// it did not change.
-    #[test]
-    fn a_short_tail_group_is_promoted_when_it_did_not_change() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let old = data(6 * GROUP + 13);
-        let mut new = old.clone();
-        new[0] ^= 0xff;
-        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert!(
-            !proven.subtrees.last().unwrap().whole,
-            "the tail group is short"
-        );
-
-        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
-        assert!(
-            promoted.contains(6),
-            "the short tail is reusable: {promoted:?}"
-        );
-        assert!(!promoted.contains(0), "the changed group is not");
-    }
-
-    /// A matched run is copied across whole — the aligned middle of an object
-    /// and the short group on the end of it alike — and what comes out reads
-    /// back as the new version, byte for byte.
-    ///
-    /// The copy is `copy_file_range` where the kernel will take it, which on a
-    /// filesystem that shares extents moves no data at all. Nothing here asserts
-    /// which of those happened: the point of the fallback chain is that the
-    /// object is the same either way, so what is asserted is the object.
-    #[test]
-    fn a_matched_run_is_copied_across_whole_including_the_tail_group() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        // A size with a short last group, and more than one span's worth of
-        // whole ones in front of it.
-        let old = data(20 * GROUP + 777);
-        let mut new = old.clone();
-        new[9 * GROUP..10 * GROUP].fill(0x5a);
-        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-        let all = ChunkRanges::single(0, group_count(size));
-
-        // The descent as the fetcher runs it: spans first, then leaves in what
-        // the spans did not settle.
-        let mut promoted = ChunkRanges::empty();
-        for level in [2u8, 0] {
-            let want = all.difference(&promoted);
-            let (encoded, served) = provider
-                .encode_proof(&new_root, &want, level, MAX_PROOF_NODES)
-                .unwrap();
-            let proven = fetcher
-                .write_proof(&new_root, size, &served, level, &encoded, 0)
-                .unwrap();
-            let got = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
-            promoted = promoted.union(&got);
-        }
-        assert_eq!(
-            promoted,
-            all.difference(&ChunkRanges::single(9, 10)),
-            "every group but the edited one, the short tail included"
-        );
-        assert!(promoted.contains(20), "the short tail group came across");
-
-        // The bytes that came across are the new version's bytes, and they
-        // verify: a read is a bao decode against the root.
-        assert_eq!(
-            fetcher.read_range(&new_root, 0, 8 * GROUP as u64).unwrap(),
-            &new[..8 * GROUP]
-        );
-        assert_eq!(
-            fetcher
-                .read_range(&new_root, 20 * GROUP as u64, 777)
-                .unwrap(),
-            &new[20 * GROUP..]
-        );
-        // And the one group that changed finishes it off.
-        let missing = all.difference(&promoted);
-        let (encoded, served) = provider.encode_slice(&new_root, &missing).unwrap();
-        fetcher
-            .write_slice(&new_root, size, &served, &encoded, 0)
-            .unwrap();
-        assert!(fetcher.blob(&new_root).unwrap().unwrap().complete);
-        assert_eq!(fetcher.read_all(&new_root).unwrap(), new);
-    }
-
-    /// A donor whose *tree* rotted cannot poison the tree being built.
-    ///
-    /// Promotion believes a donor's bytes on the strength of its outboard, so
-    /// the outboard is the thing that has to be self-consistent: the nodes
-    /// copied out from under a matched span are recombined on the way up and
-    /// have to arrive at the chaining value the proof proved. A flipped bit
-    /// below the span survives the span's own comparison — that value is read
-    /// from the pair *above* it — and is caught here. The span is left to the
-    /// network, and the spans either side of it are unaffected.
-    #[test]
-    fn a_rotted_donor_tree_is_refused_and_left_to_the_fetch() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let old = data(16 * GROUP);
-        let mut new = old.clone();
-        new[15 * GROUP..].fill(0x11);
-        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-        let all = ChunkRanges::single(0, group_count(size));
-
-        // Spans of four groups. A bit flips inside the donor's outboard, under
-        // the span covering groups 4..8, behind the store's back.
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 2, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 2, &encoded, 0)
-            .unwrap();
-        let span = proven.subtrees.iter().find(|s| s.start == 4).unwrap();
-        // The node one level under that span, which its own comparison cannot
-        // see: the span's value comes out of the pair above it.
-        let inner = Subtree::locate(&Store::tree(size), 16, 4, 2).unwrap().node;
-        let outboard = outboard_of(&fetcher, &old_root, size);
-        let offset = outboard.tree.pre_order_offset(inner).unwrap() * PROOF_NODE_LEN as u64;
-        let mut raw = std::fs::read(fetcher.outboard_path(&old_root)).unwrap();
-        raw[offset as usize + 8 + 3] ^= 0xff;
-        std::fs::write(fetcher.outboard_path(&old_root), &raw).unwrap();
-
-        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
-        assert!(
-            !promoted.overlaps(span.start, span.end()),
-            "the span over the rotted tree is refused: {promoted:?}"
-        );
-        assert!(
-            promoted.contains(0) && promoted.contains(8),
-            "the spans either side of it are not: {promoted:?}"
-        );
-        // What was refused goes back to the network, and the object completes.
-        let missing = all.difference(&promoted);
-        let (encoded, served) = provider.encode_slice(&new_root, &missing).unwrap();
-        fetcher
-            .write_slice(&new_root, size, &served, &encoded, 0)
-            .unwrap();
-        assert_eq!(fetcher.read_all(&new_root).unwrap(), new);
-    }
-
-    /// A proof of one object cannot be spent on another.
-    ///
-    /// Two objects of a size have the same tree, so every positional check
-    /// promotion makes — does this subtree exist here, is it whole, does the
-    /// donor reach that far — passes for the wrong proof just as readily as for
-    /// the right one. What would come out is an object filled with a stranger's
-    /// bytes and marked complete: advertised, and unreadable by anyone who
-    /// asked for it. The root travelling with the subtrees is what makes the
-    /// refusal possible.
-    #[test]
-    fn a_proof_is_spent_on_the_object_it_was_taken_for() {
-        // `promote` reads the object and its length off the proof rather than
-        // taking them alongside it, so "spending a proof on the wrong object"
-        // is not a thing a caller can express. The guarantee that matters
-        // lives in `walk_proof`: a proof only
-        // verifies against the root it was taken for, so it can never be turned
-        // into bytes for a different object.
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let mine = data(8 * GROUP);
-        let mut theirs = mine.clone();
-        theirs[0] ^= 0xff;
-        let size = mine.len() as u64;
-        let my_root = provider.ingest_bytes(&mine, 0).unwrap();
-        let their_root = provider.ingest_bytes(&theirs, 0).unwrap();
-        let donor = fetcher.ingest_bytes(&mine, 0).unwrap();
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&my_root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-
-        // The forgery attempt: my object's proof bytes, offered as theirs.
-        assert!(
-            matches!(
-                fetcher.write_proof(&their_root, size, &served, 0, &encoded, 0),
-                Err(StoreError::Verification { .. })
-            ),
-            "a proof must not verify against another object's root"
-        );
-        assert!(
-            fetcher.blob(&their_root).unwrap().is_none(),
-            "nothing was written for the object the proof was not about"
-        );
-
-        // And spent honestly, it names the object it was taken for — the only
-        // object it can be spent on. (A promote that actually moves groups is
-        // covered by `a_proof_carries_the_length_it_was_taken_at`; here the
-        // donor *is* the object, so there is nothing left to fill.)
-        let proven = fetcher
-            .write_proof(&my_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert_eq!(proven.root, my_root);
-        assert_eq!(proven.size, size);
-        fetcher.promote(&Donor(donor), &proven, 0).unwrap();
-    }
-
-    /// A proof of the right object at the wrong length is refused.
-    ///
-    /// The root travelling with a proof settles *which* object it describes;
-    /// this settles how long that object is, and the two holes are the same
-    /// shape. "Whole" — the property that makes a subtree comparable across
-    /// objects at all — is a fact about where the object ends, so a proof spent
-    /// under a size shorter than the one it was taken at hands out whole-looking
-    /// subtrees that the object does not end after. A group-aligned
-    /// understatement of a twenty-group object by four groups would promote
-    /// sixteen of them and leave the row complete at eighty percent of its
-    /// length: unreadable, and refusing every honest writer of the rest for
-    /// good, exactly as an unattested size claim once did.
-    #[test]
-    fn a_proof_carries_the_length_it_was_taken_at() {
-        // The length is part of the proof rather than a parameter beside it, so
-        // a proof cannot be spent at a length it was not taken at. "Whole" —
-        // the property that makes a subtree comparable across objects — is a
-        // fact about where the object ends, and a proof taken under a short
-        // size would hand out whole-looking subtrees this object does not end
-        // after.
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(20 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        // A donor sharing every group but the last: a real reuse.
-        let mut donor_bytes = bytes.clone();
-        donor_bytes[19 * GROUP] ^= 0xff;
-        let donor = fetcher.ingest_bytes(&donor_bytes, 0).unwrap();
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-
-        // A proof cannot be *taken* at a length the object does not have.
-        let short = 16 * GROUP as u64;
-        assert!(
-            fetcher
-                .write_proof(&root, short, &served, 0, &encoded, 0)
-                .is_err(),
-            "a proof must not verify under a length the tree does not have"
-        );
-
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert_eq!(
-            proven.size, size,
-            "a proof carries the size it was taken at"
-        );
-
-        let promoted = fetcher.promote(&Donor(donor), &proven, 0).unwrap();
-        assert_eq!(promoted.count(), 19, "every group but the changed one");
-    }
-
-    /// An understated size cannot promote a short tail.
-    ///
-    /// A claim a few bytes below the object's real length leaves the tree the
-    /// same shape, so the proof verifies and the final group's chaining value
-    /// still attests every byte of it — while the run promotion would copy stops
-    /// at the claim. Committing that run marks the group verified and the row
-    /// complete at a length the bytes on disk do not reach: unreadable
-    /// afterwards, and refusing every honest writer of the real length.
-    #[test]
-    fn an_understated_size_does_not_promote_a_short_tail() {
-        let (_d1, provider) = store();
-        let (_d2, victim) = store();
-        let bytes = data(8 * GROUP + 500);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        // A donor that shares the tail and differs in one interior group, so
-        // the promotion has honest work to do either side of the attack.
-        let mut donor_bytes = bytes.clone();
-        donor_bytes[3 * GROUP + 9] ^= 0xff;
-        let donor = victim.ingest_bytes(&donor_bytes, 0).unwrap();
-
-        // One byte short of the truth, which leaves the group count — and so
-        // the tree the proof is checked against — untouched.
-        let short = size - 1;
-        assert_eq!(group_count(short), group_count(size));
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = victim
-            .write_proof(&root, short, &served, 0, &encoded, 0)
-            .expect("the proof verifies: the tree is the same under either size");
-        let promoted = victim.promote(&Donor(donor), &proven, 0).unwrap();
-
-        assert!(
-            !promoted.contains(8),
-            "the tail group's bytes reach further than the claim: {promoted:?}"
-        );
-        assert!(
-            promoted.contains(0) && !promoted.contains(3),
-            "the whole groups either side of the changed one still promote: \
-             {promoted:?}"
-        );
-        let row = victim.blob(&root).unwrap().unwrap();
-        assert!(
-            !row.complete,
-            "nothing completed the object under the claim"
-        );
-
-        // And the honest writer of the real length is not refused by what the
-        // claim left behind: the object completes and reads back whole.
-        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
-        victim
-            .write_slice(&root, size, &served, &encoded, 0)
-            .expect("an honest writer at the true size still succeeds");
-        let row = victim.blob(&root).unwrap().unwrap();
-        assert!(row.complete);
-        assert_eq!(row.size, size);
-        assert_eq!(victim.read_all(&root).unwrap(), bytes);
-    }
-
-    /// A size claim racing a write that completes the object cannot brick it.
-    ///
-    /// Deciding whether a claimed size can stand by reading the row *before*
-    /// doing the work loses the race: an honest `write_slice` finishing an
-    /// object and a `write_proof` carrying an entry's overstatement of it each
-    /// look, each see a row no group attested to yet, and each go ahead.
-    /// Whichever commits second writes its size over the other's, and when
-    /// that is the liar the row ends `complete` under a length no byte on the
-    /// disk supports — attested from then on, so every honest writer is
-    /// refused "size mismatch" for good, `read_all` fails, and the entry that
-    /// named the root keeps the collector off it. The decision happens inside
-    /// the same transaction as the bitmap union, so one of the two loses and it
-    /// is always the claim.
-    ///
-    /// A bounded loop rather than a stress test: the interleaving is rare enough
-    /// to take dozens of rounds to hit, and what is asserted is the invariant,
-    /// which has to hold on every one of them.
-    #[test]
-    fn a_size_claim_racing_a_completing_write_never_wins() {
-        let (_d1, provider) = store();
-        let (_d2, victim) = store();
-        for round in 0..64usize {
-            // A fresh object per round, so each race starts from no row at all.
-            let bytes = data(4 * GROUP + 500 + round);
-            let size = bytes.len() as u64;
-            let root = provider.ingest_bytes(&bytes, 0).unwrap();
-            // A hundred bytes further on, inside the same chunk group: the same
-            // tree, so the proof under the lie verifies against the same root.
-            let lie = size + 100;
-            assert_eq!(group_count(lie), group_count(size));
-
-            let all = ChunkRanges::single(0, group_count(size));
-            let (slice, slice_served) = provider.encode_slice(&root, &all).unwrap();
-            let (proof, proof_served) = provider
-                .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-                .unwrap();
-
-            std::thread::scope(|scope| {
-                let (victim, root) = (&victim, &root);
-                let (slice, slice_served) = (&slice, &slice_served);
-                let (proof, proof_served) = (&proof, &proof_served);
-                scope.spawn(move || {
-                    victim
-                        .write_slice(root, size, slice_served, slice, 0)
-                        .expect("the honest writer is never refused")
-                });
-                scope.spawn(move || {
-                    // Refused or absorbed, either is fine — what it must not do
-                    // is leave its size on a completed row.
-                    let _ = victim.write_proof(root, lie, proof_served, 0, proof, 0);
-                });
-            });
-
-            let row = victim.blob(&root).unwrap().unwrap();
-            assert_eq!(row.size, size, "round {round}: the claim won");
-            assert!(row.complete, "round {round}");
-            assert_eq!(victim.read_all(&root).unwrap(), bytes, "round {round}");
-        }
-    }
-
-    /// A size a peer merely claimed does not brick a root.
-    ///
-    /// An object's tree is the same shape for every size inside its last 16 KiB
-    /// chunk group, so an entry that overstates an honest root by a hundred bytes
-    /// yields a proof that verifies against that root perfectly well. If the
-    /// row it leaves behind recorded the lie, every honest writer of the same
-    /// root afterwards — from any origin, on any node that touched the path —
-    /// would be refused with "size mismatch" for good, with nothing to collect
-    /// the row because the honest entry still names it.
-    #[test]
-    fn an_overstated_size_does_not_brick_a_root() {
-        let (_d1, provider) = store();
-        let (_d2, victim) = store();
-        let bytes = data(8 * GROUP + 500);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        // A hundred bytes further on, inside the same chunk: the same tree.
-        let lie = size + 100;
-        assert_eq!(group_count(lie), group_count(size));
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        victim
-            .write_proof(&root, lie, &served, 0, &encoded, 0)
-            .expect("the proof verifies: the lie is invisible in the tree");
-        assert_eq!(victim.blob(&root).unwrap().unwrap().size, lie);
-
-        // The honest fetch that follows replaces the claim rather than being
-        // refused by it, and the object completes.
-        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
-        victim
-            .write_slice(&root, size, &served, &encoded, 0)
-            .unwrap();
-        let row = victim.blob(&root).unwrap().unwrap();
-        assert!(row.complete);
-        assert_eq!(row.size, size);
-        assert_eq!(victim.read_all(&root).unwrap(), bytes);
-
-        // And once the last group is held, the size *is* attested: a later
-        // claim of a different one is refused, as it always was.
-        assert!(matches!(
-            victim.write_slice(&root, lie, &served, &encoded, 0),
-            Err(StoreError::Verification { .. })
-        ));
-    }
-
-    /// An inline donor has nothing to say and is not consulted.
-    ///
-    /// A blob that fits in the index is one chunk group, and a single group's
-    /// only hash is its object's root — root-flagged, and so equal to no
-    /// chaining value anywhere (§2). Offering one is not an error; it simply
-    /// promotes nothing.
-    #[test]
-    fn an_inline_donor_promotes_nothing() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let new = data(8 * GROUP);
-        let tiny = fetcher.ingest_bytes(&data(100), 0).unwrap();
-        assert!(fetcher.blob(&tiny).unwrap().unwrap().inline.is_some());
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        let promoted = fetcher.promote(&Donor(tiny), &proven, 0).unwrap();
-        assert!(promoted.is_empty(), "{promoted:?}");
-    }
-
-    /// A tampered proof is rejected whole, and commits nothing.
-    #[test]
-    fn a_tampered_proof_is_rejected() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(9 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let all = ChunkRanges::single(0, group_count(size));
-
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        for flip in [0usize, 63, 64, encoded.len() - 1] {
-            let mut tampered = encoded.clone();
-            tampered[flip] ^= 0xff;
-            assert!(
-                matches!(
-                    fetcher.write_proof(&root, size, &served, 0, &tampered, 0),
-                    Err(StoreError::Verification { .. })
-                ),
-                "a flip at byte {flip} was accepted"
-            );
-        }
-        // Truncated and padded proofs are refused too: the walk and the bytes
-        // have to account for each other exactly.
-        assert!(fetcher
-            .write_proof(&root, size, &served, 0, &encoded[..encoded.len() - 64], 0)
-            .is_err());
-        let mut padded = encoded.clone();
-        padded.extend_from_slice(&[0u8; 64]);
-        assert!(fetcher
-            .write_proof(&root, size, &served, 0, &padded, 0)
-            .is_err());
-        // A proof for the wrong root fails at the very first node.
-        assert!(fetcher
-            .write_proof(&Hash::new(b"elsewhere"), size, &served, 0, &encoded, 0)
-            .is_err());
-        assert!(
-            fetcher.blob(&root).unwrap().is_none(),
-            "nothing was written"
-        );
-    }
-
-    /// A proof is clamped to one window like a slice, and `served` is where the
-    /// next request starts.
-    #[test]
-    fn an_over_budget_proof_is_refused_rather_than_truncated() {
-        // Serving a prefix and reporting where it stopped would mean making
-        // the two sides agree about the cut — by discarding the walk and
-        // repeating it over the ranges that fit. Instead the requester sizes
-        // its window from
-        // `proof_nodes_upper_bound` so a full holder still fits, this walk
-        // covers a subset of that and so cannot cost more, and an over-budget
-        // request means a non-conforming requester.
-        let (_d, provider) = store();
-        let bytes = data(40 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let all = ChunkRanges::single(0, group_count(size));
-
-        // A budget far below what a leaf-level proof of the whole object needs.
-        let err = provider
-            .encode_proof(&root, &all, 0, 12)
-            .expect_err("an over-budget request must be refused");
-        assert!(err.to_string().contains("budget"), "{err}");
-
-        // Sized to the budget, the same request is served whole — and what
-        // comes back verifies and covers exactly what was asked for.
-        let window = ChunkRanges::single(0, 8);
-        assert!(synch_core::proof_nodes_upper_bound(&window, 0) <= 12 + 64);
-        let (encoded, served) = provider.encode_proof(&root, &window, 0, 128).unwrap();
-        assert_eq!(served, window, "a sized window is never short");
-
-        let (_d2, fetcher) = store();
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert!(!proven.is_empty());
-
-        // And the next window picks up exactly where this one stopped.
-        let rest = all.difference(&served);
-        let (_, next) = provider.encode_proof(&root, &rest, 0, 4096).unwrap();
-        assert_eq!(next.ranges[0].start, served.ranges[0].end);
-    }
-
-    /// A partial holder can serve proofs for what it has, and says so.
-    #[test]
-    fn a_partial_holder_proves_only_the_groups_it_holds() {
-        let (_d1, provider) = store();
-        let (_d2, partial) = store();
-        let bytes = data(16 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-
-        let half = ChunkRanges::single(0, 8);
-        let (encoded, served) = provider.encode_slice(&root, &half).unwrap();
-        partial
-            .write_slice(&root, size, &served, &encoded, 0)
-            .unwrap();
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = partial
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        assert_eq!(served, half);
-        // What it served is a proof against the same root, from a node that
-        // holds half the object.
-        let (_d3, fetcher) = store();
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert_eq!(proven.subtrees.len(), 8);
-    }
-
-    /// A donor whose outboard has gone answers "nothing" rather than failing.
-    ///
-    /// The descent asks about donors it picked out of the index a moment ago,
-    /// and the collector may have taken one in between. Nothing in the descent
-    /// is allowed to fail a fetch — the worst a missing donor may cost is the
-    /// bytes it would have saved.
-    #[test]
-    fn a_donor_whose_outboard_is_gone_speaks_to_nothing() {
-        let (_d, store) = self::store();
-        let bytes = data(16 * GROUP);
-        let root = store.ingest_bytes(&bytes, 0).unwrap();
-        let spans = [(0u64, 4u64), (4, 4)];
-        assert!(
-            store
-                .subtree_cvs(&root, &spans)
-                .unwrap()
-                .iter()
-                .all(Option::is_some),
-            "the donor speaks to both spans while its tree is there"
-        );
-
-        std::fs::remove_file(store.outboard_path(&root)).unwrap();
-        assert_eq!(
-            store.subtree_cvs(&root, &spans).unwrap(),
-            vec![None, None],
-            "and to neither once it is gone"
-        );
-    }
-
-    /// Objects too small to have a tree have nothing to prove, and say so
-    /// without failing.
-    #[test]
-    fn tiny_objects_have_nothing_to_prove() {
-        let (_d, store) = store();
-        for size in [0usize, 1, 100, GROUP] {
-            let bytes = data(size);
-            let root = store.ingest_bytes(&bytes, 0).unwrap();
-            let all = ChunkRanges::single(0, group_count(bytes.len() as u64));
-            let (encoded, served) = store.encode_proof(&root, &all, 0, MAX_PROOF_NODES).unwrap();
-            assert!(encoded.is_empty(), "{size} bytes");
-            assert_eq!(served, all, "{size} bytes");
-            // And promoting into one is a no-op rather than an error: inline
-            // blobs never delta (§4).
-            let promoted = store
-                .promote(&Donor(root), &Proven::none(root, bytes.len() as u64), 0)
-                .unwrap();
-            assert!(promoted.is_empty());
         }
     }
 }

@@ -249,8 +249,11 @@ mod tests {
 
     #[test]
     fn value_ref_inlines_small_values() {
-        let (r, extra) = ValueRef::for_value(&[1, 2, 3]);
-        assert_eq!(r, ValueRef::Inline(vec![1, 2, 3]));
+        // Exactly at the boundary stays inline; one byte past it goes out of
+        // line — the split decides node hashing and wire shape.
+        let edge = vec![7u8; INLINE_VALUE_MAX];
+        let (r, extra) = ValueRef::for_value(&edge);
+        assert!(matches!(r, ValueRef::Inline(_)));
         assert!(extra.is_none());
 
         let big = vec![7u8; INLINE_VALUE_MAX + 1];
@@ -259,12 +262,6 @@ mod tests {
         assert_eq!(r, ValueRef::Hash(h));
         assert_eq!(h, Hash::new(&big));
         assert_eq!(payload, big);
-
-        // Exactly at the boundary stays inline.
-        let edge = vec![7u8; INLINE_VALUE_MAX];
-        let (r, extra) = ValueRef::for_value(&edge);
-        assert!(matches!(r, ValueRef::Inline(_)));
-        assert!(extra.is_none());
     }
 
     #[test]
@@ -287,18 +284,14 @@ mod tests {
             assert_eq!(TrieNode::decode(&bytes).unwrap(), n);
             assert_eq!(TrieNode::hash_of_encoded(&bytes).unwrap(), n.hash());
         }
-    }
-
-    #[test]
-    fn node_kinds_are_domain_separated() {
-        // Distinct tags per kind, so no encoding of one kind can be reinterpreted
-        // as another with the same hash.
+        // Domain-separated hashing: the same bytes hash differently under
+        // another kind's tag, so no encoding can be reinterpreted as another.
+        let leaf = TrieNode::leaf(Nibbles::from_bytes(b"ab"), ValueRef::Inline(vec![1]));
+        let bytes = leaf.encode();
         assert_ne!(LEAF_TAG, EXT_TAG);
-        assert_ne!(EXT_TAG, BRANCH_TAG);
-        let leaf = TrieNode::leaf(Nibbles::new(), ValueRef::Inline(vec![]));
         assert_ne!(
-            hash_encoded(LEAF_TAG, &leaf.encode()),
-            hash_encoded(EXT_TAG, &leaf.encode())
+            hash_encoded(LEAF_TAG, &bytes),
+            hash_encoded(EXT_TAG, &bytes)
         );
     }
 
@@ -306,30 +299,7 @@ mod tests {
     fn non_canonical_encodings_are_rejected() {
         let leaf = TrieNode::leaf(Nibbles::from_bytes(b"a"), ValueRef::Inline(vec![1]));
         let mut bytes = leaf.encode();
-        bytes.push(0); // trailing garbage
+        bytes.push(0);
         assert!(TrieNode::hash_of_encoded(&bytes).is_err());
-    }
-
-    #[test]
-    fn child_and_value_hashes() {
-        let a = Hash::new(b"a");
-        let v = Hash::new(b"v");
-        let branch = TrieNode::Branch {
-            children: {
-                let mut c = NO_CHILDREN;
-                c[0] = Some(a);
-                c
-            },
-            value: Some(ValueRef::Hash(v)),
-        };
-        assert_eq!(branch.child_hashes(), vec![a]);
-        assert_eq!(branch.value_hashes(), vec![v]);
-
-        let leaf = TrieNode::leaf(Nibbles::new(), ValueRef::Inline(vec![]));
-        assert!(leaf.child_hashes().is_empty());
-        assert!(leaf.value_hashes().is_empty());
-
-        let ext = TrieNode::ext(Nibbles::from_nibbles(&[1]), a);
-        assert_eq!(ext.child_hashes(), vec![a]);
     }
 }

@@ -25,6 +25,8 @@ pub mod recovery;
 pub mod reference;
 pub mod rotation;
 pub mod scanner;
+#[cfg(test)]
+mod testkit;
 pub mod tree;
 pub mod uploads;
 pub mod watcher;

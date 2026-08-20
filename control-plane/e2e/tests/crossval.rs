@@ -17,12 +17,32 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// What a shipped binary's `main` does on its first line.
-///
-/// `DnssecResolver` builds a reqwest `Client`, which panics outright when no
-/// rustls provider is installed. This crate is its own workspace with no
-/// `main` of ours and no `sim` feature, so neither of the two paths
-/// `synch_net::tls` describes reaches it — the tests install it themselves.
+/// Skips when the e2e environment is absent; run via e2e/run.sh.
+fn e2e_env() -> Option<(String, String, String)> {
+    Some((env("CP_DOH_URL")?, env("CP_ANCHOR_FILE")?, env("CP_DOMAIN")?))
+}
+
+/// A resolver against the control plane's zone, with or without the log gate.
+fn test_resolver(doh_url: String, anchor: String, rekor: Option<RekorPolicy>) -> DnssecResolver {
+    DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(doh_url),
+        trust_anchor: Some(anchor.into()),
+        rekor,
+        rekor_key: None,
+        rekor_state: None,
+        tuf_url: None,
+        // An e2e run never needs Sigstore's CDN: the refusal the second test
+        // asserts is about this zone's missing proof, and nothing about the
+        // pin set can change it.
+        no_tuf: true,
+        tuf_root: None,
+    })
+    .expect("resolver construction")
+}
+
+/// Installs the rustls provider: `DnssecResolver` builds a reqwest client
+/// that panics without one, and this crate has no `main` or `sim` feature
+/// to reach the install paths `synch_net::tls` describes.
 fn install_provider() {
     synch_net::tls::install_crypto_provider();
 }
@@ -30,36 +50,19 @@ fn install_provider() {
 #[tokio::test]
 async fn control_plane_zone_validates_and_parses() {
     install_provider();
-    let Some(doh_url) = env("CP_DOH_URL") else {
+    let Some((doh_url, anchor, domain)) = e2e_env() else {
         eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
         return;
     };
-    let anchor = env("CP_ANCHOR_FILE").expect("CP_ANCHOR_FILE");
-    let domain = env("CP_DOMAIN").expect("CP_DOMAIN");
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(doh_url),
-        trust_anchor: Some(anchor.into()),
-        // DNSSEC-only coverage here: the zone-key transparency path has its
-        // own suite, and this zone logs nothing — `rekor-publish` needs a
-        // real Rekor v2 endpoint, and an e2e that POSTed to the public log
-        // on every run would be publishing throwaway keys forever. The leg
-        // below asserts that this zone's silence is fail-closed rather than
-        // tolerated.
-        rekor: Some(RekorPolicy::Off),
-        rekor_key: None,
-        rekor_state: None,
-        tuf_url: None,
-        no_tuf: true,
-        tuf_root: None,
-    })
-    .expect("resolver construction");
+    // DNSSEC-only coverage here: the zone-key transparency path has its own
+    // suite, and this zone logs nothing — its silence is the next test's
+    // subject.
+    let resolver = test_resolver(doh_url, anchor, Some(RekorPolicy::Off));
 
     let (set, ttl) = resolver.member_set(&domain).await.expect(
         "DNSSEC-validated member set — validation failing here means \
-                 the control plane's signatures or negative proofs are wrong",
+         the control plane's signatures or negative proofs are wrong",
     );
-
     assert!(
         set.rejected.is_empty(),
         "no record may be rejected: {:?}",
@@ -95,24 +98,15 @@ async fn control_plane_zone_validates_and_parses() {
     assert_eq!(set.bindings.len(), 3);
 
     // Exact key membership, when the seeder's keys are handed to us.
-    let has_key = |z32: &str| ids.iter().any(|(_, k)| k == z32);
-    if let Some(nas_active) = env("CP_NAS_ACTIVE") {
-        assert!(has_key(&nas_active), "nas active key must be published");
-    }
-    if let Some(laptop_active) = env("CP_LAPTOP_ACTIVE") {
-        assert!(has_key(&laptop_active));
-    }
-    if let Some(laptop_retiring) = env("CP_LAPTOP_RETIRING") {
-        assert!(
-            has_key(&laptop_retiring),
-            "retiring key stays published through the rotation window"
-        );
-    }
-    if let Some(revoked) = env("CP_NAS_REVOKED") {
-        assert!(
-            !has_key(&revoked),
-            "revoked key must be gone from the RRset"
-        );
+    for (key, present) in [
+        (env("CP_NAS_ACTIVE"), true),
+        (env("CP_LAPTOP_ACTIVE"), true),
+        (env("CP_LAPTOP_RETIRING"), true),
+        (env("CP_NAS_REVOKED"), false),
+    ] {
+        if let Some(key) = key {
+            assert_eq!(ids.iter().any(|(_, k)| k == &key), present, "{key}: {ids:?}");
+        }
     }
 
     // TTL is the zone's 300s, inside the client clamp window.
@@ -134,28 +128,12 @@ async fn control_plane_zone_validates_and_parses() {
 #[tokio::test]
 async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
     install_provider();
-    let Some(doh_url) = env("CP_DOH_URL") else {
+    let Some((doh_url, anchor, domain)) = e2e_env() else {
         eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
         return;
     };
-    let anchor = env("CP_ANCHOR_FILE").expect("CP_ANCHOR_FILE");
-    let domain = env("CP_DOMAIN").expect("CP_DOMAIN");
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(doh_url),
-        trust_anchor: Some(anchor.into()),
-        // No `rekor` field at all: `require` is the default everywhere.
-        rekor: None,
-        rekor_key: None,
-        rekor_state: None,
-        tuf_url: None,
-        // The refusal below is about this zone's missing proof record, and
-        // nothing about the pin set can change it — so there is no reason
-        // for an e2e run to reach Sigstore's CDN.
-        no_tuf: true,
-        tuf_root: None,
-    })
-    .expect("resolver construction");
+    // No `rekor` field at all: `require` is the default everywhere.
+    let resolver = test_resolver(doh_url, anchor, None);
 
     let error = resolver
         .member_set(&domain)
@@ -164,10 +142,7 @@ async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
     eprintln!("ok: unlogged zone refused under the default policy: {error}");
 
     // And the ungated TXT lookup still works — it is the member-set path that
-    // gained a requirement, not every query the resolver makes. Nothing may
-    // decide anything from this answer, which is what the method's name says;
-    // here it only shows the refusal above came from the gate and not from the
-    // zone being unresolvable.
+    // gained a requirement, not every query the resolver makes.
     resolver
         .lookup_txt_ungated(&domain)
         .await

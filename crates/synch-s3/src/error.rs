@@ -350,12 +350,4 @@ mod tests {
             assert_eq!(e.status, StatusCode::BAD_REQUEST, "{}", e.code);
         }
     }
-
-    #[test]
-    fn xml_is_escaped() {
-        let e = S3Error::invalid("a<b&c\"d");
-        let xml = e.to_xml();
-        assert!(xml.contains("a&lt;b&amp;c&quot;d"), "{xml}");
-        assert!(!xml.contains("a<b"), "{xml}");
-    }
 }

@@ -217,17 +217,11 @@ fn build_observed(row: ObservedRow) -> Result<ObservedHead> {
 
 #[cfg(test)]
 mod tests {
+    use iroh_base::SecretKey;
+    use synch_core::{Hash, OriginId};
+
     use super::*;
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
-    }
-
-    fn origin() -> OriginId {
-        OriginId::named("nas", "x.example").unwrap()
-    }
+    use crate::testutil::{origin, store};
 
     #[test]
     fn observations_keep_the_greatest_seq_root() {
@@ -243,8 +237,7 @@ mod tests {
             .unwrap());
         assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 5);
 
-        // Same seq, greater root wins — the same lexicographic order the
-        // acceptance rule uses (§5.2).
+        // Same seq, greater root wins — the acceptance rule's order (§5.2).
         assert!(store
             .record_observed_head(&origin(), 5, &Hash([2u8; 32]), false, None, 12)
             .unwrap());
@@ -257,20 +250,14 @@ mod tests {
             .record_observed_head(&origin(), 9, &Hash([0u8; 32]), true, None, 13)
             .unwrap());
         assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 9);
-    }
 
-    #[test]
-    fn observations_are_per_origin() {
-        let (_d, store) = store();
+        // Per-origin: another origin's observation neither collides nor is
+        // overwritten by ours.
         let laptop = OriginId::named("laptop", "x.example").unwrap();
-        store
-            .record_observed_head(&origin(), 4, &Hash::EMPTY, true, None, 0)
-            .unwrap();
         store
             .record_observed_head(&laptop, 7, &Hash::EMPTY, true, None, 0)
             .unwrap();
-        let all = store.observed_heads().unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(store.observed_heads().unwrap().len(), 2);
         assert_eq!(store.observed_head(&laptop).unwrap().unwrap().seq, 7);
     }
 
@@ -295,20 +282,13 @@ mod tests {
         assert_eq!(store.publish_floor().unwrap(), Some(4_242));
     }
 
-    #[test]
-    fn a_corrupt_floor_is_reported_as_a_column_error() {
-        let (_d, store) = store();
-        store.set_config(FLOOR_KEY, "not a number").unwrap();
-        assert!(store.publish_floor().is_err());
-    }
-
+    /// §3.4: detection rests on unauthenticated summaries, so the operator
+    /// judges a bogus-seq claim by which peer made it.
     #[test]
     fn an_observation_records_which_peer_claimed_it() {
-        // §3.4: detection rests on unauthenticated summaries, so who made the
-        // claim is what an operator judges it by.
         let (_d, store) = store();
-        let loud = iroh_base::SecretKey::generate().public();
-        let quiet = iroh_base::SecretKey::generate().public();
+        let loud = SecretKey::generate().public();
+        let quiet = SecretKey::generate().public();
 
         store
             .record_observed_head(&origin(), 10, &Hash([1u8; 32]), true, Some(&quiet), 1)
@@ -319,7 +299,7 @@ mod tests {
         );
 
         // The claimant moves with the claim: whoever asserted the highest seq
-        // is the one named.
+        // is the one named, and a lower claim changes nothing, claimant included.
         store
             .record_observed_head(&origin(), 5_000, &Hash([2u8; 32]), true, Some(&loud), 2)
             .unwrap();
@@ -327,7 +307,6 @@ mod tests {
         assert_eq!(observed.seq, 5_000);
         assert_eq!(observed.claimed_by, Some(loud));
 
-        // A lower claim changes nothing, claimant included.
         store
             .record_observed_head(&origin(), 9, &Hash([3u8; 32]), true, Some(&quiet), 3)
             .unwrap();

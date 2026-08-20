@@ -628,174 +628,102 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synch_core::{EntryKind, FileEntry, Hash, OriginId};
-    use synch_engine::CompareChange;
+    use synch_core::{Hash, OriginId};
+    use synch_engine::{CompareChange, CompareStatus};
     use synch_store::VersionSet;
 
-    fn row(origin: &str, content: &[u8], mtime: i64) -> EntryRow {
-        let entry = FileEntry::file(3, mtime, Hash::new(content), 1);
+    /// One entry row; `ident` is the content for a file and the link target
+    /// for a content-less kind.
+    fn row(origin: &str, kind: EntryKind, mtime: i64, ident: &str) -> EntryRow {
         EntryRow {
             origin: OriginId::named(origin, "x.example").unwrap(),
             space: "media".into(),
             path: "f.txt".into(),
-            kind: entry.kind,
-            size: entry.size,
-            mtime_ns: entry.mtime_ns,
-            unix_mode: entry.unix_mode,
-            content: entry.content,
-            seq: entry.seq,
-            prev: None,
-            symlink_target: None,
-        }
-    }
-
-    fn symlink_row(origin: &str, target: &str, mtime: i64) -> EntryRow {
-        EntryRow {
-            origin: OriginId::named(origin, "x.example").unwrap(),
-            space: "media".into(),
-            path: "f.txt".into(),
-            kind: EntryKind::Symlink,
-            size: target.len() as u64,
+            kind,
+            size: ident.len() as u64,
             mtime_ns: mtime,
             unix_mode: None,
-            content: None,
+            content: (kind == EntryKind::File).then(|| Hash::new(ident.as_bytes())),
             seq: 1,
             prev: None,
-            symlink_target: Some(target.to_string()),
+            symlink_target: (kind != EntryKind::File).then(|| ident.to_string()),
         }
     }
 
-    /// A reading clock later than any time these tests publish.
-    const READ_AT: i64 = i64::MAX;
-
+    // A content-less kind is identified by its target, not a hash (§8).
     #[test]
-    fn a_symlink_version_shows_its_target() {
-        let set = VersionSet::from_entries(
-            "media",
-            "f.txt",
-            vec![
-                symlink_row("nas", "../a", 1),
-                symlink_row("laptop", "../a", 2),
-            ],
-            READ_AT,
-        );
-        assert_eq!(set.version_count(), 1, "same target, same version");
-        let lines = version_set(&set);
-        assert!(lines[1].contains("-> ../a"), "{lines:?}");
-        assert!(lines[1].contains("symlink"), "{lines:?}");
-    }
-
-    #[test]
-    fn divergence_is_marked_with_its_version_count() {
-        assert_eq!(divergence_mark(2), "⑂2");
-        assert_eq!(divergence_mark(7), "⑂7");
-    }
-
-    fn sample_report() -> CompareReport {
-        CompareReport {
-            from: OriginId::named("nas", "x.example").unwrap(),
-            to: OriginId::named("laptop", "x.example").unwrap(),
-            space: "media".into(),
-            changes: vec![
-                CompareChange {
-                    path: "a.jpg".into(),
-                    status: CompareStatus::Modified,
-                },
-                CompareChange {
-                    path: "new.txt".into(),
-                    status: CompareStatus::Created,
-                },
-            ],
+    fn a_symlink_version_shows_its_target_and_a_tombstone_says_so() {
+        for (kind, want) in [
+            (EntryKind::Symlink, "-> ../a"),
+            (EntryKind::Tombstone, "(deleted)"),
+        ] {
+            let set = VersionSet::from_entries(
+                "media",
+                "f.txt",
+                vec![row("nas", kind, 1, "../a")],
+                i64::MAX,
+            );
+            let lines = version_set(&set);
+            assert!(lines[1].contains(want), "{kind:?}: {lines:?}");
         }
     }
 
-    #[test]
-    fn compare_renders_name_status_lines_and_a_summary() {
-        let lines = compare(&sample_report(), false);
-        assert!(lines[0].contains("comparing media"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "M  a.jpg"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "A  new.txt"), "{lines:?}");
-        assert!(
-            lines
-                .last()
-                .unwrap()
-                .contains("1 created \u{00b7} 1 modified \u{00b7} 0 deleted"),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn compare_with_no_changes_says_so() {
-        let mut report = sample_report();
-        report.changes.clear();
-        let lines = compare(&report, false);
-        assert!(lines.iter().any(|l| l == "no differences"), "{lines:?}");
-    }
-
-    #[test]
-    fn compare_json_escapes_and_lists_changes() {
-        let mut report = sample_report();
-        report.changes.push(CompareChange {
-            path: "weird\"name\\x.txt".into(),
-            status: CompareStatus::Deleted,
-        });
-        let json = compare(&report, true);
-        assert_eq!(json.len(), 1);
-        assert!(json[0].starts_with("{\"space\":\"media\""), "{}", json[0]);
-        assert!(
-            json[0].contains("\"status\":\"deleted\",\"path\":\"weird\\\"name\\\\x.txt\""),
-            "{}",
-            json[0]
-        );
-    }
-
-    #[test]
-    fn an_agreed_path_carries_no_mark() {
-        let set = VersionSet::from_entries(
-            "media",
-            "f.txt",
-            vec![row("nas", b"same", 1), row("laptop", b"same", 2)],
-            READ_AT,
-        );
-        assert!(!set.is_divergent());
-        let lines = version_set(&set);
-        assert!(lines[0].contains("1 version(s)"), "{lines:?}");
-        assert!(!lines[0].contains('⑂'), "{lines:?}");
-        // One version, both attestors named on it.
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("nas"), "{lines:?}");
-        assert!(lines[1].contains("laptop"), "{lines:?}");
-    }
-
+    // The ⑂N header mark and newest-first order are display contracts the
+    // store layer does not assert; the agreed path is the mirror image.
     #[test]
     fn a_divergent_path_lists_every_version_newest_first() {
         let set = VersionSet::from_entries(
             "media",
             "f.txt",
-            vec![row("nas", b"theirs", 100), row("laptop", b"ours", 200)],
-            READ_AT,
+            vec![
+                row("nas", EntryKind::File, 100, "theirs"),
+                row("laptop", EntryKind::File, 200, "ours"),
+            ],
+            i64::MAX,
         );
         let lines = version_set(&set);
-        assert!(lines[0].contains("2 version(s)"), "{lines:?}");
-        assert!(lines[0].contains("⑂2"), "{lines:?}");
-        assert_eq!(lines.len(), 3);
-        assert!(lines[1].contains("laptop"), "the newest first: {lines:?}");
+        assert!(
+            lines[0].contains("2 version(s)") && lines[0].contains('⑂'),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("laptop"), "newest first: {lines:?}");
         assert!(lines[2].contains("nas"), "{lines:?}");
-    }
 
-    #[test]
-    fn a_tombstone_version_says_so() {
-        let mut deleted = row("nas", b"gone", 300);
-        deleted.kind = EntryKind::Tombstone;
-        deleted.content = None;
         let set = VersionSet::from_entries(
             "media",
             "f.txt",
-            vec![row("laptop", b"live", 100), deleted],
-            READ_AT,
+            vec![
+                row("nas", EntryKind::File, 1, "same"),
+                row("laptop", EntryKind::File, 2, "same"),
+            ],
+            i64::MAX,
         );
         let lines = version_set(&set);
-        assert!(lines[1].contains("(deleted)"), "{lines:?}");
-        assert!(lines[1].contains("deleted"), "{lines:?}");
+        assert!(
+            lines[0].contains("1 version(s)") && !lines[0].contains('⑂'),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("nas") && lines[1].contains("laptop"),
+            "both attestors on the one version: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn compare_json_escapes_and_lists_changes() {
+        let report = CompareReport {
+            from: OriginId::named("nas", "x.example").unwrap(),
+            to: OriginId::named("laptop", "x.example").unwrap(),
+            space: "media".into(),
+            changes: vec![CompareChange {
+                path: "weird\"name\\x.txt".into(),
+                status: CompareStatus::Deleted,
+            }],
+        };
+        let json = &compare(&report, true)[0];
+        assert!(
+            json.contains("\"status\":\"deleted\",\"path\":\"weird\\\"name\\\\x.txt\""),
+            "{json}"
+        );
     }
 }

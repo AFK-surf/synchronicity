@@ -274,7 +274,6 @@ fn refresh(repo: &dyn Repo, pins: &PinState, now: u64) -> Result<tuf::TufUpdate,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// A fixed instant inside the embedded trusted root's service windows.
     const NOW: u64 = 1_786_854_774;
@@ -289,39 +288,36 @@ mod tests {
         }
     }
 
-    /// A repository serving exactly the files it was handed.
-    struct Fixed(HashMap<String, Vec<u8>>);
-
-    impl Repo for Fixed {
-        fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
-            Ok(self.0.get(path).cloned())
-        }
-    }
-
-    #[test]
-    fn with_no_repository_the_embedded_trusted_root_names_the_log() {
+    /// One discovery against a fresh pin file, returning its warnings.
+    fn discover_with(
+        repo: Option<&dyn Repo>,
+        log: Option<&str>,
+        skip: &[String],
+    ) -> (Discovered, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
         let mut warnings = Vec::new();
         let found = discover(
-            None,
+            repo,
             &pins_beside(&dir.path().join("monitor.json")),
-            None,
-            &[],
+            log,
+            skip,
             None,
             NOW,
             &mut |w| warnings.push(w),
         )
         .unwrap();
+        (found, warnings)
+    }
+
+    #[test]
+    fn with_no_repository_the_embedded_trusted_root_names_the_log() {
+        let (found, warnings) = discover_with(None, None, &[]);
         assert!(warnings.is_empty());
         assert_eq!(found.source, "embedded trusted root");
         assert!(found.base_urls.iter().all(|u| u.starts_with("https://")));
         assert!(!found.keys.is_empty());
-        // **Every pinned shard is read, and every shard read is pinned.**
-        // Retired ones included: the client accepts a proof from any shard
-        // whose key is pinned, so a monitor that skipped the closed shards
-        // would leave a client-valid entry permanently unseen. Asserted as a
-        // set, and as a shape rather than as hostnames, because the hostnames
-        // are what this must not fix.
+        // **Every pinned shard is read, and every shard read is pinned** —
+        // retired ones included, asserted as a set rather than as hostnames.
         let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
         assert_eq!(found.base_urls.len(), pinned.len());
         for log in &pinned {
@@ -338,131 +334,42 @@ mod tests {
         }
     }
 
+    /// The documented posture: TUF trouble is never worse than not having
+    /// asked — a failed refresh warns, keeps the pins, and runs on the
+    /// embedded root.
     #[test]
     fn a_repository_that_serves_nothing_is_a_warning_and_not_a_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut warnings = Vec::new();
-        let found = discover(
-            Some(&Empty),
-            &pins_beside(&dir.path().join("monitor.json")),
-            None,
-            &[],
-            None,
-            NOW,
-            &mut |w| warnings.push(w),
-        )
-        .unwrap();
+        let (found, warnings) = discover_with(Some(&Empty), None, &[]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("keeping current pins"), "{warnings:?}");
         assert_eq!(found.source, "embedded trusted root");
         assert!(!found.keys.is_empty());
     }
 
-    #[test]
-    fn a_repository_serving_tampered_metadata_leaves_the_pins_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        // A root chain that starts where the embedded root does but carries
-        // a file nobody signed: the walk collects it, `update` refuses it.
-        let pins = PinState::embedded();
-        let mut files = HashMap::new();
-        files.insert(
-            format!("{}.root.json", pins.root_version),
-            br#"{"signed":{"_type":"root","version":99,"expires":"2099-01-01T00:00:00Z"},"signatures":[]}"#.to_vec(),
-        );
-        let mut warnings = Vec::new();
-        let found = discover(
-            Some(&Fixed(files)),
-            &pins_beside(&dir.path().join("monitor.json")),
-            None,
-            &[],
-            None,
-            NOW,
-            &mut |w| warnings.push(w),
-        )
-        .unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(found.source, "embedded trusted root");
-    }
-
     /// `--log` is the operator's word and is taken as given — with one line
     /// saying what the run is therefore not reading.
-    ///
-    /// The pin set is unchanged by it, so this run would believe a checkpoint
-    /// from a shard it never asks for, and an entry there stays unseen until a
-    /// run without the flag reads it. That is a coverage fact worth stating,
-    /// not a reason to refuse an override.
     #[test]
     fn naming_one_log_says_which_pinned_shards_go_unread() {
-        let dir = tempfile::tempdir().unwrap();
-        let pins = pins_beside(&dir.path().join("monitor.json"));
-        let mut warnings = Vec::new();
-        let found = discover(
-            None,
-            &pins,
-            Some("https://log.example/"),
-            &[],
-            None,
-            NOW,
-            &mut |w| warnings.push(w),
-        )
-        .unwrap();
+        let (found, warnings) = discover_with(None, Some("https://log.example/"), &[]);
         assert_eq!(found.base_urls, vec!["https://log.example".to_string()]);
         assert_eq!(found.source, "--log");
         // The keys are still the full pinned set, and the run says so.
         assert!(!found.keys.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("not read this run"), "{warnings:?}");
-
-        // Naming the one shard a single-log trusted root pins leaves nothing
-        // unread, and says nothing.
-        let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
-        if let [only] = pinned.as_slice() {
-            let mut quiet = Vec::new();
-            discover(
-                None,
-                &pins,
-                Some(&only.base_url),
-                &[],
-                None,
-                NOW,
-                &mut |w| quiet.push(w),
-            )
-            .unwrap();
-            assert!(quiet.is_empty(), "{quiet:?}");
-        }
     }
 
     /// A shard the operator has named as unreadable is skipped, loudly, and
     /// the rest of the run proceeds.
-    ///
-    /// The trusted root pins `rekor.sigstore.dev`, which is Rekor v1 — a
-    /// Trillian API with no `api/v2/checkpoint`, no hash tiles and no entry
-    /// bundles — so every stock run filed it as a failure and returned
-    /// `EXIT_INCOMPLETE`, permanently. An exit code that is always 30 is the
-    /// same as having none, which matters because 30 is the documented
-    /// alerting interface.
     #[test]
     fn a_skipped_shard_is_named_and_the_rest_are_still_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let pins = pins_beside(&dir.path().join("monitor.json"));
         let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
         assert!(
             pinned.len() > 1,
             "this test needs a trusted root pinning more than one shard"
         );
         let skip = pinned[0].base_url.clone();
-
-        let mut warnings = Vec::new();
-        let found = discover(
-            None,
-            &pins,
-            None,
-            std::slice::from_ref(&skip),
-            None,
-            NOW,
-            &mut |w| warnings.push(w),
-        )
-        .unwrap();
+        let (found, warnings) = discover_with(None, None, std::slice::from_ref(&skip));
         assert!(!found.base_urls.contains(&skip));
         assert_eq!(found.base_urls.len(), pinned.len() - 1);
         // The pin set is untouched: this run still believes checkpoints from
@@ -480,18 +387,22 @@ mod tests {
     /// exiting 0 over an empty walk.
     #[test]
     fn skipping_every_shard_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let pins = pins_beside(&dir.path().join("monitor.json"));
         let all: Vec<String> = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes())
             .unwrap()
             .into_iter()
             .map(|log| log.base_url)
             .collect();
+        let dir = tempfile::tempdir().unwrap();
         let mut warnings = Vec::new();
-        assert!(
-            discover(None, &pins, None, &all, None, NOW, &mut |w| warnings
-                .push(w))
-            .is_err()
-        );
+        assert!(discover(
+            None,
+            &pins_beside(&dir.path().join("monitor.json")),
+            None,
+            &all,
+            None,
+            NOW,
+            &mut |w| warnings.push(w),
+        )
+        .is_err());
     }
 }

@@ -43,6 +43,10 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+# `sim` marks a test build: it carries the pre-main TLS provider install
+# test binaries need since the aws-lc-rs move (crate::tls), and the
+# simulated zone/log harness.
+synch-net = { workspace = true, features = ["sim"] }
 synch-store.workspace = true
 tempfile.workspace = true
 

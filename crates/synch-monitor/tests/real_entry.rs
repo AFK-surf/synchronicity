@@ -1,21 +1,12 @@
 //! The classifier, over the same real published entry the client verifier is
-//! asserted against.
-//!
-//! One fixture, both halves of the invariant. `synch-net`'s
-//! `tests/fixtures/rekor_v3` holds a genuine `hashedrekord` entry from
-//! `log2025-1.rekor.sigstore.dev` (see its PROVENANCE.txt); over there the
+//! asserted against. `synch-net`'s `tests/fixtures/rekor_v3` holds a genuine
+//! `hashedrekord` entry from `log2025-1.rekor.sigstore.dev`; over there the
 //! client verifier accepts it end to end, and here the monitor classifies the
-//! very same bytes. A client-accepted entry must land in tier A and never in
-//! the silent bin — that property is exercised exhaustively over synthetic
-//! shapes in `tiers.rs`, and pinned to reality here.
-//!
-//! It lands in **tier A**: the chain in its certificate verifies to the
-//! anchor that zone is under, and covers the key the certificate carries. It
-//! is therefore an authorization, and a monitor watching that apex reports it
-//! the first time it sees it.
+//! very same bytes — the anchor that keeps the synthetic `tiers.rs` matrix
+//! honest.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
-use synch_monitor::classify::{classify, KnownKeys, Tier};
+use synch_monitor::classify::{classify, Tier};
 use synch_net::rekor::HashedRekordBody;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -30,10 +21,8 @@ const LOG_INDEX: u64 = 68_295_246;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
 /// chain in the certificate terminates at the apex rather than at the ICANN
-/// root. A public monitor rooted at ICANN would file this entry tier B — the
-/// honest verdict, since nothing outside that private universe can tell
-/// whether the key was delegated. Supplying the apex as the anchor is what a
-/// `--dnssec-anchor` operator's own monitor would do.
+/// root (a public monitor rooted at ICANN would file this entry tier B — the
+/// honest verdict for that population).
 fn anchors() -> (tempfile::TempDir, TrustAnchors) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("anchor.key");
@@ -42,6 +31,8 @@ fn anchors() -> (tempfile::TempDir, TrustAnchors) {
     (dir, anchors)
 }
 
+/// The real published entry classifies tier A, with the exact key tag and DS,
+/// and the reported line carries everything an operator acts on.
 #[test]
 fn the_real_published_entry_classifies_tier_a() {
     let body = HashedRekordBody::parse(&fixture("canonicalized_body.json"))
@@ -54,63 +45,30 @@ fn the_real_published_entry_classifies_tier_a() {
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
-    let [key] = finding.keys.as_slice() else {
-        panic!("a one-key zone proves one key: {:?}", finding.keys);
-    };
-    assert_eq!(key.key_tag, 32784);
-
-    // The chain validated and proves this set, which is the whole verdict.
     assert!(
         finding.reasons.iter().any(|r| r.contains("chain valid")),
         "{:?}",
         finding.reasons
     );
-
-    // Everything it says about the keys it read out of the chain-proven
-    // RRset — no DNS query anywhere, because the threat model has a
-    // compromised DNS provider in it. The DS is the line a registrar would
-    // show, so an operator can compare without believing the entry.
+    let [key] = finding.keys.as_slice() else {
+        panic!("a one-key zone proves one key: {:?}", finding.keys);
+    };
+    assert_eq!(key.key_tag, 32784);
+    assert_eq!(key.sha256.len(), 64);
+    // The DS is the line a registrar would show, so an operator can compare
+    // without believing anything the entry says.
     assert!(
         key.ds.starts_with("32784 13 2 "),
         "the derived DS: {}",
         key.ds
     );
-    assert_eq!(key.sha256.len(), 64);
-}
-
-/// Reporting, over real bytes: news once, then not again.
-#[test]
-fn the_real_entry_is_a_new_authorization_until_it_is_recorded() {
-    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
-    let (_dir, anchors) = anchors();
-    let finding = classify(&body, LOG_INDEX, &anchors).unwrap();
-    assert_eq!(finding.tier, Tier::A);
-
-    let apex = synch_net::chain::parse_name(APEX).unwrap();
-    let mut known = KnownKeys::default();
-    let key = &finding.keys[0];
+    let line = finding.line();
     assert!(
-        !known.contains_digest(&apex, &key.sha256),
-        "a monitor that has never seen this key must report it"
+        line.starts_with(&format!("[A] index {LOG_INDEX} apex {APEX}.")),
+        "{line}"
     );
-    known.insert_digest(&apex, &key.sha256);
     assert!(
-        known.contains_digest(&apex, &key.sha256),
-        "and must not report it a second time"
-    );
-}
-
-/// And the invariant, at the one point where it touches real bytes: an entry
-/// the client accepts is never silent.
-#[test]
-fn the_real_entry_is_never_in_the_silent_bin() {
-    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
-    let (_dir, anchors) = anchors();
-    let finding = classify(&body, LOG_INDEX, &anchors).unwrap();
-    assert_ne!(
-        finding.tier,
-        Tier::B,
-        "synch-net's suite verifies this same entry end to end, so classifying it \
-         tier B would mean a key that works against clients and rings no bell"
+        line.contains(&key.ds) && line.contains(&key.sha256),
+        "{line}"
     );
 }

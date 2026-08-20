@@ -36,23 +36,19 @@ fn extension_chain(store: &MemStore, depth: usize) -> Hash {
     hash
 }
 
+/// A 50 000-deep extension chain — the walk head promotion runs (§5.2).
+/// Recursing one frame per nibble here aborted the whole daemon on a chain a
+/// peer can serve in a few megabytes; both position-walking readers must fail
+/// safely instead.
 #[test]
-fn a_deep_extension_chain_does_not_overflow_the_diff() {
-    // The walk head promotion runs (§5.2). Recursing one frame per nibble here
-    // aborted the whole daemon on a chain a peer can serve in a few megabytes.
+fn a_deep_extension_chain_fails_safely() {
     let store = MemStore::new();
     let root = extension_chain(&store, 50_000);
-    let changes = Trie::new(&store).diff(Hash::EMPTY, root).unwrap();
-    // Every value in the chain sits below the depth any valid key can reach, so
-    // there is nothing to report — and, above all, the process is still here.
-    assert!(changes.is_empty());
-}
-
-#[test]
-fn a_deep_extension_chain_does_not_overflow_a_scan() {
-    let store = MemStore::new();
-    let root = extension_chain(&store, 50_000);
-    assert!(Trie::new(&store).iter(root).unwrap().is_empty());
+    let trie = Trie::new(&store);
+    // Every value in the chain sits below the depth any valid key can reach,
+    // so there is nothing to report — and, above all, the process is still here.
+    assert!(trie.diff(Hash::EMPTY, root).unwrap().is_empty());
+    assert!(trie.iter(root).unwrap().is_empty());
 }
 
 #[test]

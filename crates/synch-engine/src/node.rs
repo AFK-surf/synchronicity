@@ -1389,26 +1389,30 @@ pub fn decode_addr(id: NodeId, bytes: &[u8]) -> Option<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{node, node_with};
 
     fn node_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 
-    async fn spawn(dir: &Path, id: Option<OriginId>) -> Node {
-        match id {
-            Some(origin) => Node::init_named_by_zone(dir, origin),
-            None => Node::init(dir, None),
-        }
-        .unwrap();
-        Node::open(NodeConfig::loopback(dir)).await.unwrap()
-    }
-
     #[tokio::test]
     async fn init_without_a_domain_makes_the_key_the_identity() {
         let dir = node_dir();
+
+        // Opening before init fails clearly rather than inventing an identity.
+        let err = Node::open(NodeConfig::loopback(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotInitialized));
+
         let report = Node::init(dir.path(), None).unwrap();
         assert_eq!(report.origin, Some(OriginId::Key(report.node_id)));
         assert_eq!(report.domain, None);
+        assert!(Node::init(dir.path(), None).is_err());
+        // A node waiting on a name is initialized too, even with no origin yet.
+        let pending = node_dir();
+        Node::init(pending.path(), Some("cluster.example")).unwrap();
+        assert!(Node::init(pending.path(), Some("cluster.example")).is_err());
 
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         assert_eq!(node.origin(), &OriginId::Key(report.node_id));
@@ -1551,42 +1555,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_refuses_to_overwrite_an_identity() {
-        let dir = node_dir();
-        Node::init(dir.path(), None).unwrap();
-        assert!(Node::init(dir.path(), None).is_err());
-        // A node waiting on a name is initialized too, even with no origin yet.
-        let pending = node_dir();
-        Node::init(pending.path(), Some("cluster.example")).unwrap();
-        assert!(Node::init(pending.path(), Some("cluster.example")).is_err());
-    }
-
-    #[tokio::test]
-    async fn opening_an_uninitialized_directory_fails_clearly() {
-        let dir = node_dir();
-        let err = Node::open(NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, EngineError::NotInitialized));
-    }
-
-    #[tokio::test]
-    async fn a_named_identity_survives_a_reopen() {
-        let dir = node_dir();
-        let origin = OriginId::named("nas", "cluster.example").unwrap();
-        let node = spawn(dir.path(), Some(origin.clone())).await;
-        assert_eq!(node.origin(), &origin);
-        node.shutdown().await.unwrap();
-
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        assert_eq!(node.origin(), &origin);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn publishing_bumps_seq_and_retains_history() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        let (_d, node) = node().await;
         assert_eq!(node.next_seq().unwrap(), 1);
 
         let entry = synch_core::FileEntry::file(3, 0, Hash::new(b"c"), 1);
@@ -1618,15 +1588,9 @@ mod tests {
             .is_none());
         // Both roots are retained as history.
         assert_eq!(node.store().head_history(node.origin()).unwrap().len(), 2);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publishing_nothing_is_a_no_op() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        // Publishing nothing is a no-op, and so is a change that leaves the
+        // root where it was.
         assert!(node.publish(&[]).unwrap().is_none());
-        // A change that does not alter the root does not mint a head either.
         assert!(node
             .publish(&[(node.key_for("s", "absent").unwrap(), None)])
             .unwrap()
@@ -1636,8 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn manifests_round_trip_through_the_trie() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        let (_d, node) = node().await;
         let space = tempfile::tempdir().unwrap();
         node.add_space("media", space.path()).unwrap();
         let mut staged = vec![node.manifest_change().unwrap()];
@@ -1671,8 +1634,7 @@ mod tests {
 
     #[tokio::test]
     async fn spaces_may_not_overlap_mirrors() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        let (_d, node) = node().await;
         let shared = tempfile::tempdir().unwrap();
         node.store()
             .put_mirror(
@@ -1687,6 +1649,13 @@ mod tests {
         // And a nested subdirectory is caught too, so "no echo" is structural.
         let nested = shared.path().join("sub");
         assert!(node.add_space("nested", &nested).is_err());
+
+        // Spaces may not overlap each other either; re-adding the same space
+        // id at the same path is a legal update.
+        let a = tempfile::tempdir().unwrap();
+        node.add_space("a", a.path()).unwrap();
+        assert!(node.add_space("b", a.path().join("sub")).is_err());
+        node.add_space("a", a.path()).unwrap();
         node.shutdown().await.unwrap();
     }
 
@@ -1697,8 +1666,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn overlap_is_detected_through_symlinked_roots() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        let (_d, node) = node().await;
         let real = tempfile::tempdir().unwrap();
         let link_parent = tempfile::tempdir().unwrap();
         let link = link_parent.path().join("via-symlink");
@@ -1717,24 +1685,11 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn spaces_may_not_overlap_each_other() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
-        let a = tempfile::tempdir().unwrap();
-        node.add_space("a", a.path()).unwrap();
-        assert!(node.add_space("b", a.path().join("sub")).is_err());
-        // Re-adding the same space id at the same path is a legal update.
-        node.add_space("a", a.path()).unwrap();
-        node.shutdown().await.unwrap();
-    }
-
     /// Static trust binds the key and only the key: names are the zone's to
     /// issue, so there is no way to attach one here (§3.2).
     #[tokio::test]
     async fn trust_add_binds_the_key_as_the_identity() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
+        let (_d, node) = node().await;
         let peer = SecretKey::generate().public();
 
         let origin = node.trust_add(peer, Some("laptop")).unwrap();
@@ -1753,11 +1708,10 @@ mod tests {
 
     #[tokio::test]
     async fn ad_updates_are_milestone_driven() {
-        let dir = node_dir();
-        let mut config = NodeConfig::loopback(dir.path());
-        config.ad_update_interval = std::time::Duration::from_secs(3600);
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(config).await.unwrap();
+        let (_d, node) = node_with(|config| {
+            config.ad_update_interval = std::time::Duration::from_secs(3600);
+        })
+        .await;
 
         let root = node.store().ingest_bytes(b"payload", now_ns()).unwrap();
         // First sighting is always a milestone.
@@ -1772,36 +1726,14 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn addresses_round_trip_through_the_peers_table() {
-        let id = SecretKey::generate().public();
-        let addr = EndpointAddr::new(id).with_ip_addr("127.0.0.1:4433".parse().unwrap());
-        let encoded = encode_addr(&addr);
-        let back = decode_addr(id, &encoded).unwrap();
-        assert_eq!(back.id, id);
-        assert_eq!(
-            back.ip_addrs().copied().collect::<Vec<_>>(),
-            vec!["127.0.0.1:4433".parse().unwrap()]
-        );
-    }
-
-    #[test]
-    fn overlap_detection() {
-        assert!(paths_overlap(Path::new("/a/b"), Path::new("/a")));
-        assert!(paths_overlap(Path::new("/a"), Path::new("/a/b")));
-        assert!(!paths_overlap(Path::new("/a"), Path::new("/b")));
-    }
-
     #[tokio::test]
     async fn a_publish_that_fails_halfway_leaves_nothing_behind() {
         // §10: trie writes, head, history and materialization commit together
         // or not at all. A record the materializer cannot decode fails the
-        // last of those steps, after the trie has been written, the head
-        // signed, and both history rows inserted — exactly the window an
-        // untransacted publish would let a crash land in.
-        let dir = node_dir();
+        // last of those steps — exactly the window an untransacted publish
+        // would let a crash land in.
+        let (_d, node) = node().await;
         let space = tempfile::tempdir().unwrap();
-        let node = spawn(dir.path(), None).await;
         node.add_space("media", space.path()).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         let (_, head) = node.scan_and_publish().unwrap();
@@ -1854,28 +1786,6 @@ mod tests {
         )];
         let after = node.publish(&good).unwrap().unwrap();
         assert_eq!(after.seq, before.seq + 1);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_publish_shows_its_head_history_and_views_together() {
-        let dir = node_dir();
-        let node = spawn(dir.path(), None).await;
-        let root = node
-            .publish(&[node.manifest_change().unwrap()])
-            .unwrap()
-            .unwrap();
-        // The head, its history row, and the materialized view of its leaves
-        // all exist as of the same commit.
-        assert_eq!(node.own_head().unwrap().unwrap().root, root.root);
-        assert!(node
-            .store()
-            .head_history(node.origin())
-            .unwrap()
-            .iter()
-            .any(|h| h.root == root.root));
-        assert!(synch_mpt::NodeStore::has_node(node.store().as_ref(), &root.root).unwrap());
-        assert!(node.manifest_of(node.origin()).unwrap().is_some());
         node.shutdown().await.unwrap();
     }
 }

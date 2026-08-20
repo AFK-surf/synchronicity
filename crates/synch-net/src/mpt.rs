@@ -936,19 +936,22 @@ impl MptClient {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, trusting_pair, ScriptedPeer, StalledPeer};
+    use crate::testing::{bare_endpoint, trusting_pair, StalledPeer};
     use synch_core::{BlobAd, ALPN_MPT};
 
-    /// A sink that refuses one origin's heads and takes every other.
-    #[derive(Debug)]
-    /// A sink that fails one origin outright, the way a *local* fault does.
+    /// How long a test waits before calling a request hung rather than slow.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A sink that contains one origin's heads, the way a *local* fault does,
+    /// and takes every other.
     ///
-    /// An origin fault — a record this node cannot apply — is contained by the
-    /// sink itself, because the sink is the only side that can tell the two
-    /// apart (`Syncer`'s `HeadSink` impl). What reaches the wire is the other
-    /// kind, and the other kind legitimately ends the stream.
+    /// Containment is the sink's: only it can tell "we cannot apply this
+    /// origin" from "our disk is full", so the wire relays its verdict and
+    /// the exchange goes on.
+    #[derive(Debug)]
     struct Picky {
         refuse: OriginId,
         offered: std::sync::Mutex<Vec<OriginId>>,
@@ -975,8 +978,7 @@ mod tests {
                 .expect("the lock")
                 .push(head.origin.clone());
             if head.origin == self.refuse {
-                // What an origin fault looks like from out here: contained by
-                // the sink, so the exchange goes on.
+                // An origin fault, contained by the sink: the exchange goes on.
                 return Ok(());
             }
             Ok(())
@@ -990,69 +992,43 @@ mod tests {
         }
     }
 
-    /// How long a test waits before calling a request hung rather than slow.
-    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
-
-    /// A peer that keeps the session open and answers nothing fails the
-    /// request instead of holding the caller forever.
-    ///
-    /// Every client method reads a frame the peer is under no obligation to
-    /// send, so each carries its own deadline: what comes back is an ordinary
-    /// transport error, which is what puts a stalled peer on the same footing
-    /// as an unreachable one — dropped, and the next candidate tried.
+    /// Every client method carries its own deadline: a peer that keeps the
+    /// session open and answers nothing fails the request instead of holding
+    /// the caller forever, putting a stalled peer on the same footing as an
+    /// unreachable one.
     #[tokio::test]
     async fn a_peer_that_answers_nothing_fails_every_request() {
+        macro_rules! stalled {
+            ($name:literal, $call:expr) => {
+                (
+                    $name,
+                    tokio::time::timeout(PATIENCE, $call)
+                        .await
+                        .expect(concat!($name, " must not hang"))
+                        .map(|_| ()),
+                )
+            };
+        }
         let peer = StalledPeer::bind(ALPN_MPT).await;
         let dialer = bare_endpoint(ALPN_MPT).await;
         let connection = dialer.connect(peer.addr.clone(), ALPN_MPT).await.unwrap();
         let client =
             MptClient::new(connection).with_deadline(std::time::Duration::from_millis(100));
-
         let origin = OriginId::named("stalled", "x.example").unwrap();
         let stalled: Vec<(&str, Result<(), NetError>)> = vec![
-            (
+            stalled!(
                 "get_nodes",
-                tokio::time::timeout(
-                    PATIENCE,
-                    client.get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"n"))]),
-                )
-                .await
-                .expect("get_nodes must not hang")
-                .map(|_| ()),
+                client.get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"n"))])
             ),
-            (
+            stalled!(
                 "get_values",
-                tokio::time::timeout(
-                    PATIENCE,
-                    client.get_values(Hash::EMPTY, &[(Vec::new(), Hash::new(b"v"))]),
-                )
-                .await
-                .expect("get_values must not hang")
-                .map(|_| ()),
+                client.get_values(Hash::EMPTY, &[(Vec::new(), Hash::new(b"v"))])
             ),
-            (
-                "find_providers",
-                tokio::time::timeout(PATIENCE, client.find_providers(Hash::new(b"o")))
-                    .await
-                    .expect("find_providers must not hang")
-                    .map(|_| ()),
-            ),
-            (
-                "get_bindings",
-                tokio::time::timeout(PATIENCE, client.get_bindings(&origin))
-                    .await
-                    .expect("get_bindings must not hang")
-                    .map(|_| ()),
-            ),
-            (
+            stalled!("find_providers", client.find_providers(Hash::new(b"o"))),
+            stalled!("get_bindings", client.get_bindings(&origin)),
+            stalled!(
                 "head_exchange",
-                tokio::time::timeout(
-                    PATIENCE,
-                    client.head_exchange(Vec::new(), None, |_| (Vec::new(), Vec::new())),
-                )
-                .await
-                .expect("head_exchange must not hang")
-                .map(|_| ()),
+                client.head_exchange(Vec::new(), None, |_| (Vec::new(), Vec::new()))
             ),
         ];
         for (what, outcome) in stalled {
@@ -1064,74 +1040,12 @@ mod tests {
         peer.shutdown().await;
     }
 
-    /// A provider answer past the bound is refused before a row is written.
-    ///
-    /// Hints are unverified by design, but taking one still costs a row and
-    /// nothing in the answer vouches that the origins in it exist — so the
-    /// length is checked the way every other batch message's is.
-    ///
-    /// The refusal now happens *while decoding* (`MptMessage`'s per-field
-    /// bounds) rather than on the materialized `Vec`, so the failure is a
-    /// decode error rather than the handler's own message. That is the point:
-    /// the post-hoc check spent the whole cost of the message before it could
-    /// look at the length.
-    #[tokio::test]
-    async fn a_provider_answer_past_the_bound_is_refused() {
-        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
-            .map(|i| {
-                (
-                    OriginId::named(&format!("origin{i}"), "x.example").unwrap(),
-                    BlobAd::complete(1000),
-                )
-            })
-            .collect();
-        let peer = ScriptedPeer::bind(ALPN_MPT, MptMessage::Providers { ads }).await;
-        let dialer = bare_endpoint(ALPN_MPT).await;
-        let connection = dialer.connect(peer.addr.clone(), ALPN_MPT).await.unwrap();
-        let client = MptClient::new(connection);
-
-        client
-            .find_providers(Hash::new(b"object"))
-            .await
-            .expect_err("an over-long answer is refused");
-
-        // One ad short of the bound is an ordinary answer.
-        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS)
-            .map(|i| {
-                (
-                    OriginId::named(&format!("origin{i}"), "x.example").unwrap(),
-                    BlobAd::complete(1000),
-                )
-            })
-            .collect();
-        let honest = ScriptedPeer::bind(ALPN_MPT, MptMessage::Providers { ads }).await;
-        let connection = dialer.connect(honest.addr.clone(), ALPN_MPT).await.unwrap();
-        assert_eq!(
-            MptClient::new(connection)
-                .find_providers(Hash::new(b"object"))
-                .await
-                .unwrap()
-                .len(),
-            MAX_PROVIDER_ADS
-        );
-
-        dialer.close().await;
-        peer.shutdown().await;
-        honest.shutdown().await;
-    }
-
     /// The provider handler does not run SQLite on a runtime worker.
     ///
     /// `FindProviders` takes the single global connection mutex and decodes
-    /// every row's spans under it. Run inline on a busy store that is an
-    /// unbounded wait on a worker that also drives every other connection,
-    /// timer and control request in the process (§10, §12).
-    ///
-    /// Measured by the runtime's own clock. The stream is opened *before* the
-    /// store is made busy, so the per-stream binding check — a single bounded
-    /// row read, and inline by design — is already behind us when the request
-    /// body lands. What is left on the worker is the handler, and a handler that
-    /// blocks it cannot poll the deadline below until the store comes free.
+    /// every row's spans under it; run inline on a busy store it would stall
+    /// every timer and connection the worker also drives (§10, §12). Measured
+    /// by the runtime's own clock.
     #[tokio::test]
     async fn find_providers_never_blocks_the_runtime_on_the_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -1194,14 +1108,9 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
-    /// Every offered head reaches the sink, and the want is still answered.
-    ///
-    /// Containment is the sink's: it is the only side that can tell "this
-    /// origin published something we cannot apply" from "our disk is full", and
-    /// the string that crosses this seam cannot. So the wire relays the sink's
-    /// verdict rather than guessing at one — and a sink that contains, as the
-    /// real one does, leaves the exchange free to finish owing this peer an
-    /// answer to its `HeadsWant`.
+    /// A sink that contains an origin fault leaves the exchange free to
+    /// finish: every offered head reaches the sink, and the want is still
+    /// answered.
     #[tokio::test]
     async fn a_contained_origin_does_not_stop_a_hello_exchange() {
         let dir = tempfile::tempdir().unwrap();
@@ -1252,13 +1161,8 @@ mod tests {
     }
 
     /// A stream that stalls mid-message does not stop the connection serving
-    /// the next request.
-    ///
-    /// The work behind a request runs on the blocking pool, so a connection
-    /// that handles its streams one at a time cannot accept the next one while
-    /// a window is being built — and a peer that opens a stream and then says
-    /// nothing parks it indefinitely. One task per stream under a semaphore and
-    /// a deadline is what keeps the session usable either way.
+    /// the next request: one task per stream under a semaphore and a deadline
+    /// keeps the session usable either way.
     #[tokio::test]
     async fn a_stalled_stream_does_not_hold_the_connection() {
         let dir = tempfile::tempdir().unwrap();

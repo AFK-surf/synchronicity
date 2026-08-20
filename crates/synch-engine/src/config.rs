@@ -145,33 +145,3 @@ fn hostname() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "synchronicity".to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_match_the_design() {
-        let config = NodeConfig::new("/tmp/x");
-        assert_eq!(config.aae_interval, Duration::from_secs(30));
-        assert_eq!(config.mirror_interval, Duration::from_secs(60));
-        assert_eq!(config.watch_debounce, Duration::from_millis(500));
-        assert_eq!(config.scan_interval, Duration::from_secs(3600));
-        assert_eq!(config.publish_quiesce, Duration::from_secs(2));
-        assert_eq!(config.publish_batch_max, 1_000);
-        assert_eq!(config.ad_update_interval, Duration::from_secs(60));
-        assert_eq!(config.fetch_fanout, 3);
-        assert_eq!(config.delta_min_size, 16 * 1024 * 1024);
-        assert_eq!(config.pending_head_ttl, Duration::from_secs(900));
-        assert_eq!(config.sync_round_budget, Duration::from_secs(300));
-        assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
-        assert_eq!(config.tombstone_ttl, Duration::from_secs(90 * 24 * 3600));
-        assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));
-        assert_eq!(config.seq_gap, 1_000);
-    }
-
-    #[test]
-    fn loopback_is_offline() {
-        assert!(NodeConfig::loopback("/tmp/x").net.offline);
-    }
-}

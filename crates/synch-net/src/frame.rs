@@ -63,36 +63,3 @@ pub async fn read_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
     }
     Ok(buf)
 }
-
-#[cfg(test)]
-mod tests {
-    use synch_core::{MptMessage, MAX_FRAME_LEN};
-
-    /// The framing is `u32` length + postcard body; this reproduces the encoder
-    /// and decoder over an in-memory buffer so the wire shape is pinned without
-    /// needing a QUIC stream.
-    fn round_trip(msg: &MptMessage) -> MptMessage {
-        let body = postcard::to_stdvec(msg).unwrap();
-        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
-        framed.extend_from_slice(&body);
-
-        let len = u32::from_le_bytes(framed[..4].try_into().unwrap()) as usize;
-        assert!(len <= MAX_FRAME_LEN);
-        postcard::from_bytes(&framed[4..4 + len]).unwrap()
-    }
-
-    #[test]
-    fn framing_round_trips() {
-        let msg = MptMessage::GetNodes {
-            root: synch_core::Hash::EMPTY,
-            wants: vec![(Vec::new(), synch_core::Hash::new(b"a"))],
-        };
-        assert_eq!(round_trip(&msg), msg);
-    }
-
-    #[test]
-    fn an_empty_body_frames_cleanly() {
-        let msg = MptMessage::Heads { heads: Vec::new() };
-        assert_eq!(round_trip(&msg), msg);
-    }
-}

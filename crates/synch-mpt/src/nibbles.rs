@@ -116,46 +116,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bytes_round_trip() {
+    fn nibble_codec() {
+        // High nibble first, so nibble order agrees with byte order — the
+        // ordering canonical hashing and prefix scans rely on.
         let bytes = b"f:photos/a.jpg";
         let n = Nibbles::from_bytes(bytes);
         assert_eq!(n.len(), bytes.len() * 2);
         assert_eq!(n.to_bytes().unwrap(), bytes.to_vec());
-    }
+        assert_eq!(Nibbles::from_bytes(&[0xab]).as_slice(), &[0x0a, 0x0b]);
 
-    #[test]
-    fn nibble_order_is_high_first() {
-        let n = Nibbles::from_bytes(&[0xab]);
-        assert_eq!(n.as_slice(), &[0x0a, 0x0b]);
-    }
-
-    #[test]
-    fn odd_length_has_no_byte_form() {
+        // Odd lengths have no byte form; helpers used by collect.
         assert!(Nibbles::from_nibbles(&[1, 2, 3]).to_bytes().is_none());
-    }
-
-    #[test]
-    fn prepending() {
-        let n = Nibbles::from_nibbles(&[3, 4]);
-        assert_eq!(n.prepend(2).as_slice(), &[2, 3, 4]);
-        assert_eq!(n.prepend_all(&[0, 1]).as_slice(), &[0, 1, 3, 4]);
-    }
-
-    #[test]
-    fn common_prefixes() {
+        let m = Nibbles::from_nibbles(&[3, 4]);
+        assert_eq!(m.prepend(2).as_slice(), &[2, 3, 4]);
+        assert_eq!(m.prepend_all(&[0, 1]).as_slice(), &[0, 1, 3, 4]);
         assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1], &[2]), 0);
         assert_eq!(common_prefix_len(&[], &[1]), 0);
-    }
 
-    #[test]
-    fn nibble_order_matches_byte_order() {
-        // Lexicographic nibble order must agree with lexicographic byte order,
-        // which is what makes prefix range scans correct.
-        let a = Nibbles::from_bytes(b"abc");
-        let b = Nibbles::from_bytes(b"abd");
-        assert!(a < b);
-        let short = Nibbles::from_bytes(b"ab");
-        assert!(short < a);
+        // Lexicographic nibble order must agree with byte order.
+        assert!(Nibbles::from_bytes(b"ab") < Nibbles::from_bytes(b"abc"));
+        assert!(Nibbles::from_bytes(b"abc") < Nibbles::from_bytes(b"abd"));
     }
 }

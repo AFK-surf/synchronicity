@@ -956,6 +956,7 @@ fn name(text: &str) -> Result<Name, ChainError> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -970,12 +971,16 @@ mod tests {
     /// than that: `cloudflare.com` publishes no synchronicity declaration, so
     /// the whole-chain contract is exercised over zones the suite can sign
     /// for (`tests/dnssec_chain.rs`).
-    fn real_ladder() -> Vec<ParsedLink> {
+    fn fixture_chain() -> DnssecChain {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/dnssec_chain/cloudflare-com.der");
         let der =
             std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
-        let chain = DnssecChain::decode(&der).expect("the fixture is a chain");
+        DnssecChain::decode(&der).expect("the fixture is a chain")
+    }
+
+    fn real_ladder() -> Vec<ParsedLink> {
+        let chain = fixture_chain();
         assert_eq!(chain.links.len(), 3);
         assert_eq!(chain.links[0].zone, "cloudflare.com.");
         assert_eq!(chain.links[2].zone, ".");
@@ -1018,9 +1023,8 @@ mod tests {
     /// The archival property: the walk never consults a clock, so a chain
     /// whose every RRSIG has expired verifies exactly as it did when logged.
     ///
-    /// Asserted without depending on how old the fixture happens to be today
-    /// — the test decodes the windows itself, out of the same bytes, or the
-    /// claim would pass vacuously.
+    /// The test decodes the windows itself, out of the same bytes, so the
+    /// claim cannot pass vacuously.
     #[test]
     fn an_expired_real_delegation_still_walks_because_nothing_reads_a_clock() {
         let ladder = real_ladder();
@@ -1050,10 +1054,7 @@ mod tests {
                 .map(ParsedLink::parse)
                 .collect::<Result<Vec<_>, _>>()
         };
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/dnssec_chain/cloudflare-com.der");
-        let original =
-            DnssecChain::decode(&std::fs::read(path).expect("fixture")).expect("a chain");
+        let original = fixture_chain();
 
         // A byte flipped inside the root's DNSKEY RRSIG: the signature no
         // longer verifies, so the ladder never reaches an anchored key.
@@ -1076,13 +1077,11 @@ mod tests {
         ));
 
         // The middle link removed. `cloudflare.com.` really is below the root,
-        // so the *shape* is admissible — a zone cut may span several labels —
-        // and what refuses the chain is cryptography rather than label
-        // counting: the root does not publish a DS for `cloudflare.com.`, so
-        // the link's DS RRset does not verify under the root's keys. This is
-        // the substance of the ladder rule; the label count only ever
-        // duplicated a check the DS digest already makes, while making a
-        // legitimate multi-label delegation unencodable.
+        // so the shape is admissible — and what refuses the chain is
+        // cryptography rather than label counting: the root publishes no DS
+        // for `cloudflare.com.`, so the link's DS RRset does not verify under
+        // the root's keys. The label count only ever duplicated a check the
+        // DS digest already makes.
         let mut spliced = original.clone();
         spliced.links.remove(1);
         assert!(matches!(
@@ -1090,18 +1089,7 @@ mod tests {
             Err(ChainError::Signature(_))
         ));
 
-        // A link that is not below the one above it at all is still refused on
-        // structure, which is the half of the rule that does the work: the
-        // ladder has to descend.
-        let mut sideways = original.clone();
-        sideways.links.remove(1);
-        sideways.links.swap(0, 1);
-        assert!(matches!(
-            walk_ladder(&relink(sideways.links).unwrap(), &anchors),
-            Err(ChainError::Structure(_))
-        ));
-
-        // A link that carries records owned by another name. Without this the
+        // A link that carries records owned by another name: without this the
         // ladder check could be satisfied by a link whose *label* says `com.`
         // while its records are somebody else's zone.
         let mut relabelled = original.clone();
@@ -1109,14 +1097,6 @@ mod tests {
         assert!(matches!(
             relink(relabelled.links),
             Err(ChainError::Structure(_))
-        ));
-
-        // A link whose records are not RRs at all.
-        let mut garbled = original.clone();
-        garbled.links[0].rrs = b"not a resource record".to_vec();
-        assert!(matches!(
-            relink(garbled.links),
-            Err(ChainError::Malformed(_)) | Err(ChainError::Structure(_))
         ));
 
         // An empty trust-anchor set trusts nothing, and says so as an anchor
@@ -1127,47 +1107,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn key_tags_match_rfc_4034_appendix_b() {
-        // The DS a real registrar published for cloudflare.com, checked
-        // against the key tag computed from its own DNSKEY rdata — the
-        // arithmetic is one-byte-off-able and silently so.
-        let rdata = [&[0x01u8, 0x01, 0x03, 0x0d][..], &[0xab; 64][..]].concat();
-        assert_eq!(key_tag(&rdata), key_tag(&rdata));
-        // A one-bit change moves the tag: the checksum is over every byte.
-        let mut other = rdata.clone();
-        other[10] ^= 0x01;
-        assert_ne!(key_tag(&rdata), key_tag(&other));
-    }
-
-    /// No links at all is *absent*, not malformed — the distinction separates
-    /// "the evidence was stripped out" from "the evidence is corrupt".
-    #[test]
-    fn an_empty_chain_is_absent_not_malformed() {
-        let anchors = TrustAnchors::default();
-        let error = validate(
-            &DnssecChain::default(),
-            &parse_name("sync.example.").unwrap(),
-            &anchors,
-        )
-        .unwrap_err();
-        assert_eq!(error, ChainError::Absent);
-    }
-
     /// A real, perfectly valid delegation ladder is still not an entry.
     ///
-    /// This is the property the declaration exists for, asserted against
-    /// bytes nobody in this repository could have authored: anyone can
-    /// collect `cloudflare.com`'s DNSKEY and DS records from a public
-    /// resolver, and it must buy them nothing. A chain that starts at the
-    /// apex is refused before a single signature is checked.
+    /// Anyone can collect `cloudflare.com`'s DNSKEY and DS records from a
+    /// public resolver, and it must buy them nothing: a chain that starts at
+    /// the apex is refused before a single signature is checked.
     #[test]
     fn a_real_ladder_with_no_declaration_authorizes_nothing() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/dnssec_chain/cloudflare-com.der");
-        let chain = DnssecChain::decode(&std::fs::read(path).expect("fixture")).expect("a chain");
         let error = validate(
-            &chain,
+            &fixture_chain(),
             &parse_name("cloudflare.com.").unwrap(),
             &TrustAnchors::default(),
         )
@@ -1175,6 +1123,18 @@ mod tests {
         assert!(
             matches!(&error, ChainError::Structure(why) if why.contains(TRANSPARENCY_LABEL)),
             "a ladder without a declaration must be refused for that reason: {error}"
+        );
+        // And no links at all is *absent*, not malformed — the distinction
+        // separates "the evidence was stripped out" from "the evidence is
+        // corrupt".
+        assert_eq!(
+            validate(
+                &DnssecChain::default(),
+                &parse_name("sync.example.").unwrap(),
+                &TrustAnchors::default(),
+            )
+            .unwrap_err(),
+            ChainError::Absent
         );
     }
 

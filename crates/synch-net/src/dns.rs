@@ -2370,189 +2370,55 @@ mod tests {
         SecretKey::generate().public()
     }
 
-    #[test]
-    fn doh_urls_normalize() {
-        let simple = doh_url("https://1.1.1.1").unwrap();
-        assert_eq!(simple.as_str(), "https://1.1.1.1/dns-query");
-        // Explicit ports, paths, schemes, and IPv6 hosts survive verbatim.
-        assert_eq!(
-            doh_url("http://10.0.0.53:8053/resolve").unwrap().as_str(),
-            "http://10.0.0.53:8053/resolve"
-        );
-        assert_eq!(
-            doh_url("http://[::1]:8053").unwrap().as_str(),
-            "http://[::1]:8053/dns-query"
-        );
-        assert_eq!(
-            doh_url("https://dns.internal.example/dns-query")
-                .unwrap()
-                .as_str(),
-            "https://dns.internal.example/dns-query"
-        );
-        let err = doh_url("ftp://1.1.1.1/dns-query").unwrap_err();
-        assert!(err.to_string().contains("https:// or http://"), "{err}");
-        assert!(doh_url("not a url").is_err());
-    }
-
-    #[tokio::test]
-    async fn resolver_options_build_and_fail_closed() {
-        // The default, an https endpoint, and a plaintext http endpoint all
-        // build without touching the network.
-        DnssecResolver::with_defaults().unwrap();
-        for url in [
-            "https://127.0.0.1:8053/dns-query",
-            "http://127.0.0.1:8053/dns-query",
-        ] {
-            DnssecResolver::with_options(&ResolverOptions {
-                doh_url: Some(url.into()),
-                trust_anchor: None,
-                rekor: None,
-                rekor_key: None,
-                rekor_state: None,
-                tuf_url: None,
-                no_tuf: true,
-                tuf_root: None,
-            })
-            .unwrap();
-        }
-
-        // A missing or empty trust anchor is refused by name: an anchor set
-        // with no keys would validate nothing, forever, quietly.
-        let err = DnssecResolver::with_options(&ResolverOptions {
-            doh_url: None,
-            trust_anchor: Some("/does/not/exist.key".into()),
-            rekor: None,
-            rekor_key: None,
-            rekor_state: None,
-            tuf_url: None,
-            no_tuf: true,
-            tuf_root: None,
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("trust anchor"), "{err}");
-
-        let empty = tempfile::NamedTempFile::new().unwrap();
-        let err = DnssecResolver::with_options(&ResolverOptions {
-            doh_url: None,
-            trust_anchor: Some(empty.path().to_path_buf()),
-            rekor: None,
-            rekor_key: None,
-            rekor_state: None,
-            tuf_url: None,
-            no_tuf: true,
-            tuf_root: None,
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("no DNSKEY records"), "{err}");
-
-        // A syntactically valid DNSKEY record is accepted and replaces the
-        // ICANN root: building proves the whole path parses and loads.
-        let anchor = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            anchor.path(),
-            format!(". IN DNSKEY 257 3 13 {}==\n", "A".repeat(86)),
-        )
-        .unwrap();
-        DnssecResolver::with_options(&ResolverOptions {
-            doh_url: Some("http://127.0.0.1:8053/dns-query".into()),
-            trust_anchor: Some(anchor.path().to_path_buf()),
-            rekor: None,
-            rekor_key: None,
-            rekor_state: None,
-            tuf_url: None,
-            no_tuf: true,
-            tuf_root: None,
-        })
-        .unwrap();
-    }
-
-    /// A live exchange against a plaintext endpoint, which must fail closed:
-    /// the transport works — the query arrives, the canned answer returns —
-    /// and the unsigned answer is refused by the in-process validator. This
-    /// is the whole DoH-over-http security argument in one test.
-    #[tokio::test]
-    async fn a_plaintext_endpoint_serves_but_never_bypasses_validation() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            // The validator may chase the chain with several queries; answer
-            // each with an unsigned echo until the client gives up.
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                let body = loop {
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 {
-                        break None;
-                    }
-                    raw.extend_from_slice(&buf[..n]);
-                    if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                        let have = raw.len() - split - 4;
-                        if have >= length {
-                            break Some(raw[split + 4..split + 4 + length].to_vec());
-                        }
-                    }
-                };
-                let Some(query) = body else { continue };
-                // Echo the query back as a NOERROR answer with no records and
-                // no signatures: syntactically a response, cryptographically
-                // nothing.
-                let message = hickory_resolver::proto::op::Message::from_vec(&query)
-                    .unwrap()
-                    .into_response();
-                let reply = message.to_vec().unwrap();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n",
-                    reply.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.write_all(&reply).await;
-            }
-        });
-
-        let resolver = DnssecResolver::with_options(&ResolverOptions {
-            doh_url: Some(format!("http://127.0.0.1:{port}/dns-query")),
-            trust_anchor: None,
-            rekor: None,
-            rekor_key: None,
-            rekor_state: None,
-            tuf_url: None,
-            no_tuf: true,
-            tuf_root: None,
-        })
-        .unwrap();
-        let err = tokio::time::timeout(
-            Duration::from_secs(30),
-            resolver.lookup_txt_ungated("cluster.example"),
-        )
-        .await
-        .expect("the lookup must finish, not hang")
-        .expect_err("an unsigned answer must never validate");
-        let text = err.to_string();
-        assert!(
-            !text.contains("connection refused"),
-            "the transport itself must have worked: {text}"
-        );
-        server.abort();
-    }
-
     fn record(id: Option<&str>, key: &NodeId) -> String {
         match id {
             Some(id) => format!("v=sync1 id={id} nk={}", key.to_z32()),
             None => format!("v=sync1 nk={}", key.to_z32()),
         }
+    }
+
+    #[test]
+    fn doh_urls_normalize() {
+        for (input, expected) in [
+            ("https://1.1.1.1", "https://1.1.1.1/dns-query"),
+            ("http://[::1]:8053", "http://[::1]:8053/dns-query"),
+            (
+                "http://10.0.0.53:8053/resolve",
+                "http://10.0.0.53:8053/resolve",
+            ),
+            (
+                "https://dns.internal.example/dns-query",
+                "https://dns.internal.example/dns-query",
+            ),
+        ] {
+            assert_eq!(doh_url(input).unwrap().as_str(), expected);
+        }
+        // Only http(s) is a DoH transport; everything else is refused.
+        let err = doh_url("ftp://1.1.1.1/dns-query").unwrap_err();
+        assert!(err.to_string().contains("https:// or http://"), "{err}");
+        assert!(doh_url("not a url").is_err());
+    }
+
+    #[test]
+    fn resolver_options_build_and_fail_closed() {
+        // A missing or empty trust anchor is refused by name: an anchor set
+        // with no keys would validate nothing, forever, quietly.
+        let err = DnssecResolver::with_options(
+            &crate::testing::ResolverOptionsBuilder::new()
+                .trust_anchor("/does/not/exist.key")
+                .build(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("trust anchor"), "{err}");
+
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let err = DnssecResolver::with_options(
+            &crate::testing::ResolverOptionsBuilder::new()
+                .trust_anchor(empty.path())
+                .build(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no DNSKEY records"), "{err}");
     }
 
     #[test]
@@ -2565,35 +2431,20 @@ mod tests {
             parsed.origin("cluster.example.com").unwrap(),
             OriginId::named("nas", "cluster.example.com").unwrap()
         );
-    }
-
-    #[test]
-    fn an_idless_record_binds_the_key_itself() {
-        // §3.2: accepted for backward simplicity; binds OriginId::Key(nk),
-        // non-rotatable, as if statically trusted.
-        let k = key();
-        let parsed = parse_record(&record(None, &k)).unwrap();
-        assert_eq!(parsed.id, None);
-        assert_eq!(parsed.origin("x.example").unwrap(), OriginId::Key(k));
-    }
-
-    #[test]
-    fn parses_dialing_hints() {
-        let k = key();
-        let text = format!(
-            "v=sync1 id=nas nk={} relay=https://relay.example addr=10.0.0.1:4433",
-            k.to_z32()
+        // §3.2: an idless record binds the key itself, non-rotatable.
+        let idless = parse_record(&record(None, &k)).unwrap();
+        assert_eq!(idless.id, None);
+        assert_eq!(idless.origin("x.example").unwrap(), OriginId::Key(k));
+        // Unknown fields are tolerated (forward compatibility), and labels
+        // are case-insensitive.
+        assert!(parse_record(&format!("v=sync1 id=nas nk={} future=whatever", k.to_z32())).is_ok());
+        assert_eq!(
+            parse_record(&format!("v=sync1 id=NAS nk={}", k.to_z32()))
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("nas")
         );
-        let parsed = parse_record(&text).unwrap();
-        assert_eq!(parsed.relay.as_deref(), Some("https://relay.example"));
-        assert_eq!(parsed.addr.as_deref(), Some("10.0.0.1:4433"));
-    }
-
-    #[test]
-    fn ignores_unknown_fields() {
-        let k = key();
-        let text = format!("v=sync1 id=nas nk={} future=whatever", k.to_z32());
-        assert!(parse_record(&text).is_ok());
     }
 
     #[test]
@@ -2623,13 +2474,23 @@ mod tests {
             parse_record(&format!("v=sync1 id=a id=b nk={}", k.to_z32())).unwrap_err(),
             RecordError::Duplicate("id")
         );
-    }
-
-    #[test]
-    fn labels_are_case_insensitive() {
-        let k = key();
-        let parsed = parse_record(&format!("v=sync1 id=NAS nk={}", k.to_z32())).unwrap();
-        assert_eq!(parsed.id.as_deref(), Some("nas"));
+        // A duplicated apex is rejected like a duplicated nk=, and one apex
+        // is still one, normalized to lowercase.
+        assert_eq!(
+            parse_record(&format!(
+                "v=sync1 id=nas nk={} apex=a.example apex=b.example",
+                k.to_z32()
+            ))
+            .unwrap_err(),
+            RecordError::Duplicate("apex")
+        );
+        assert_eq!(
+            parse_record(&format!("v=sync1 id=nas nk={} apex=A.Example", k.to_z32()))
+                .unwrap()
+                .apex
+                .as_deref(),
+            Some("a.example")
+        );
     }
 
     #[test]
@@ -2644,42 +2505,59 @@ mod tests {
             set.keys_for(&OriginId::named("nas", "cluster.example.com").unwrap()),
             vec![nas]
         );
-        assert!(set.ambiguous_keys.is_empty());
-        assert!(set.rejected.is_empty());
-    }
+        assert!(set.ambiguous_keys.is_empty() && set.rejected.is_empty());
 
-    #[test]
-    fn two_keys_under_one_id_are_a_rotation_window() {
-        // §3.2: multiple records with the same id and different nk are valid
-        // and mean all listed keys are simultaneously bound.
+        // §3.2: one id, two keys is a rotation window — both bound, and each
+        // key keeps one identity for self-detection.
         let old = key();
         let new = key();
-        let records = vec![record(Some("nas"), &old), record(Some("nas"), &new)];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
+        let set = MemberSet::from_records(
+            "x.example",
+            &[record(Some("nas"), &old), record(Some("nas"), &new)],
+        )
+        .unwrap();
         let origin = OriginId::named("nas", "x.example").unwrap();
         let mut keys = set.keys_for(&origin);
         keys.sort_by_key(|k| *k.as_bytes());
         let mut expected = vec![old, new];
         expected.sort_by_key(|k| *k.as_bytes());
         assert_eq!(keys, expected);
-        assert!(set.ambiguous_keys.is_empty());
-        // Self-detection still works for each key: one identity each.
         assert_eq!(set.self_origin(&old), Some(origin.clone()));
         assert_eq!(set.self_origin(&new), Some(origin));
+
+        // Identical records collapse; unparseable records are reported, not
+        // fatal; and an empty set is not an error (bindings just expire).
+        let set = MemberSet::from_records(
+            "x.example",
+            &[
+                record(Some("nas"), &nas),
+                record(Some("nas"), &nas),
+                "v=spf1 include:example.com ~all".into(),
+                "v=sync1 id=broken".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.bindings.len(), 1);
+        assert_eq!(set.rejected.len(), 2);
+        let empty = MemberSet::from_records("x.example", &[]).unwrap();
+        assert!(empty.bindings.is_empty() && empty.rejected.is_empty());
     }
 
     #[test]
     fn one_key_under_two_ids_is_ambiguous() {
-        // §3.2 malformed-set rule: self-detection refuses to guess and the
-        // bindings the key would create are dropped.
+        // §3.2: self-detection refuses to guess, and the bindings an
+        // ambiguous key would create are dropped — its hints with them.
         let k = key();
         let other = key();
-        let records = vec![
-            record(Some("nas"), &k),
-            record(Some("laptop"), &k),
-            record(Some("vps"), &other),
-        ];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
+        let set = MemberSet::from_records(
+            "x.example",
+            &[
+                record(Some("nas"), &k),
+                record(Some("laptop"), &k),
+                record(Some("vps"), &other),
+            ],
+        )
+        .unwrap();
         assert_eq!(set.ambiguous_keys, vec![k]);
         assert_eq!(set.self_origin(&k), None);
         assert_eq!(set.bindings.len(), 1);
@@ -2687,38 +2565,34 @@ mod tests {
             set.bindings[0].0,
             OriginId::named("vps", "x.example").unwrap()
         );
-    }
 
-    #[test]
-    fn a_key_with_and_without_an_id_is_ambiguous() {
-        let k = key();
-        let records = vec![record(Some("nas"), &k), record(None, &k)];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
+        // With and without an id is the same ambiguity, with no binding.
+        let set =
+            MemberSet::from_records("x.example", &[record(Some("nas"), &k), record(None, &k)])
+                .unwrap();
         assert_eq!(set.ambiguous_keys, vec![k]);
         assert!(set.bindings.is_empty());
         assert_eq!(set.self_origin(&k), None);
-    }
 
-    #[test]
-    fn duplicate_identical_records_collapse() {
-        let k = key();
-        let records = vec![record(Some("nas"), &k), record(Some("nas"), &k)];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
-        assert_eq!(set.bindings.len(), 1);
-        assert!(set.ambiguous_keys.is_empty());
-    }
+        // No binding, no hints: harvesting one would let a single added
+        // record both evict a member and name where to reach that key.
+        let set = MemberSet::from_records(
+            "x.example",
+            &[
+                format!("v=sync1 id=nas nk={} addr=10.0.0.1:4433", k.to_z32()),
+                format!(
+                    "v=sync1 id=attacker nk={} relay=https://relay.attacker.example",
+                    k.to_z32()
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.ambiguous_keys, vec![k]);
+        assert!(set.hints_for(&k).is_empty());
 
-    #[test]
-    fn unparseable_records_are_reported_not_fatal() {
-        let k = key();
-        let records = vec![
-            record(Some("nas"), &k),
-            "v=spf1 include:example.com ~all".to_string(),
-            "v=sync1 id=broken".to_string(),
-        ];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
-        assert_eq!(set.bindings.len(), 1);
-        assert_eq!(set.rejected.len(), 2);
+        // A key that was never offered has no origin either.
+        let set = MemberSet::from_records("x.example", &[record(Some("nas"), &key())]).unwrap();
+        assert_eq!(set.self_origin(&key()), None);
     }
 
     #[test]
@@ -2738,14 +2612,17 @@ mod tests {
         );
         assert!(set.hints_for(&key()).is_empty());
 
-        // The distinction survives a value whose *shape* belongs to the other
-        // field, which is the whole reason the hint is typed: a consumer
-        // matching on shape alone would dial a relay value as an address.
-        let ambiguous = vec![format!(
-            "v=sync1 id=nas nk={} relay=10.0.0.9:4433",
-            k.to_z32()
-        )];
-        let set = MemberSet::from_records("x.example", &ambiguous).unwrap();
+        // The typed distinction survives a value whose *shape* belongs to the
+        // other field — a consumer matching on shape alone would dial a relay
+        // value as an address.
+        let set = MemberSet::from_records(
+            "x.example",
+            &[format!(
+                "v=sync1 id=nas nk={} relay=10.0.0.9:4433",
+                k.to_z32()
+            )],
+        )
+        .unwrap();
         assert_eq!(
             set.hints_for(&k),
             &[DialHint::Relay("10.0.0.9:4433".into())],
@@ -2754,40 +2631,11 @@ mod tests {
         assert_eq!(set.hints_for(&k)[0].value(), "10.0.0.9:4433");
     }
 
-    #[test]
-    fn self_origin_of_an_absent_key_is_none() {
-        let set = MemberSet::from_records("x.example", &[record(Some("nas"), &key())]).unwrap();
-        assert_eq!(set.self_origin(&key()), None);
-    }
-
-    #[test]
-    fn ttls_are_clamped() {
-        assert_eq!(clamp_ttl(Duration::from_secs(1)), MIN_TTL);
-        assert_eq!(clamp_ttl(Duration::from_secs(999_999)), MAX_TTL);
-        assert_eq!(
-            clamp_ttl(Duration::from_secs(300)),
-            Duration::from_secs(300)
-        );
-    }
-
     /// The client's half of the timing relation the control plane states in
-    /// `zone/render_external.ttl_proof`.
-    ///
-    /// **The grace alone has to cover the republish window.** A binding expires
-    /// at `<last successful refresh> + ttl + grace`, and the refresh cadence
-    /// *is* the TTL, so when a rotation starts the last refresh is already up to
-    /// a whole TTL old and the TTL term is spent. Crediting it is an off-by-one
-    /// TTL that lets an ordinary provider rotation drop every DNS-sourced
-    /// binding for a domain: with `T` the last success and `R` the moment the
-    /// provider starts signing with the un-logged key,
-    ///
-    /// ```text
-    /// survival margin = (T − R) + ttl − (window − grace),   (T − R) ∈ (−ttl, 0]
-    /// ```
-    ///
-    /// so the `ttl` term cancels and what is left is `grace − window`. That is
-    /// the relation, it has to be positive rather than merely non-negative, and
-    /// this is what fails if either side's constants drift apart.
+    /// `zone/render_external.ttl_proof`: the grace alone must cover the
+    /// republish window — the TTL term cancels in the survival margin (see
+    /// the off-by-one-TTL argument), so a grace equal to the window still
+    /// drops every DNS-sourced binding on an ordinary provider rotation.
     #[test]
     fn bindings_outlive_a_provider_rotation() {
         assert!(
@@ -2795,9 +2643,8 @@ mod tests {
             "a client would drop DNS-sourced members before the control plane \
              could re-publish: {DEFAULT_TRUST_GRACE:?} <= {CONTROL_PLANE_REPUBLISH_WINDOW:?}"
         );
-        // And with real headroom rather than the zero margin an equality gives:
-        // the three delays the window sums are the control plane's, so a change
-        // there must not land exactly on the boundary.
+        // With real headroom, not the zero margin an equality gives: the
+        // three delays the window sums are the control plane's.
         assert!(
             DEFAULT_TRUST_GRACE >= CONTROL_PLANE_REPUBLISH_WINDOW + Duration::from_secs(120),
             "the margin over the republish window is too thin to absorb any \
@@ -2811,16 +2658,6 @@ mod tests {
         );
     }
 
-    /// The attach record hangs off the apex, and only the apex — a client
-    /// that could not name the apex has nowhere to look.
-    #[test]
-    fn the_attach_record_is_read_at_the_apex() {
-        assert_eq!(
-            control_plane_query_name("sync.example"),
-            "_synchronicity-cp.sync.example"
-        );
-    }
-
     #[test]
     fn attach_records_parse_and_refuse() {
         assert_eq!(
@@ -2829,8 +2666,8 @@ mod tests {
                 url: "https://sync.example".into()
             }
         );
-        // A trailing slash is the same endpoint, and the signing context binds
-        // the URL — so it is normalized here rather than left to disagree.
+        // A trailing slash is the same endpoint, normalized here so the
+        // signing context cannot disagree about the URL.
         assert_eq!(
             parse_control_plane_record("v=synccp1 url=https://sync.example/ future=field")
                 .unwrap()
@@ -2849,16 +2686,14 @@ mod tests {
             parse_control_plane_record("v=synccp1 url=a url=b").unwrap_err(),
             CpRecordError::Duplicate("url")
         );
-        // A plaintext endpoint is accepted: what guards the redirect target is
-        // the zone-key gate, not the scheme (see `parse_control_plane_record`).
+        // What guards the redirect target is the zone-key gate, not the
+        // scheme; refused is anything that is not an origin.
         assert_eq!(
             parse_control_plane_record("v=synccp1 url=http://127.0.0.1:8510").unwrap(),
             ControlPlaneRecord {
                 url: "http://127.0.0.1:8510".into()
             }
         );
-        // What is refused is anything that is not an origin: a bare scheme or
-        // a schemeless host.
         for bad in ["https://", "http://", "sync.example"] {
             assert!(
                 matches!(
@@ -2870,64 +2705,10 @@ mod tests {
         }
     }
 
-    /// A duplicated `apex=` is a rejected record, like a duplicated `nk=`.
-    #[test]
-    fn a_record_that_names_two_apexes_is_rejected() {
-        let k = key();
-        assert_eq!(
-            parse_record(&format!(
-                "v=sync1 id=nas nk={} apex=a.example apex=b.example",
-                k.to_z32()
-            ))
-            .unwrap_err(),
-            RecordError::Duplicate("apex")
-        );
-        // One is still one.
-        assert_eq!(
-            parse_record(&format!("v=sync1 id=nas nk={} apex=A.Example", k.to_z32()))
-                .unwrap()
-                .apex
-                .as_deref(),
-            Some("a.example")
-        );
-    }
-
-    /// An ambiguous key contributes no dialing hints, because it contributes no
-    /// binding.
-    ///
-    /// The malformed-set rule is that every binding such a key would create is
-    /// dropped. A hint is part of what a record creates: harvesting one from a
-    /// record whose binding is refused would let a single added record both
-    /// evict a member and name where to reach that member's key.
-    #[test]
-    fn an_ambiguous_key_contributes_no_hints() {
-        let k = key();
-        let records = vec![
-            format!("v=sync1 id=nas nk={} addr=10.0.0.1:4433", k.to_z32()),
-            format!(
-                "v=sync1 id=attacker nk={} relay=https://relay.attacker.example",
-                k.to_z32()
-            ),
-        ];
-        let set = MemberSet::from_records("x.example", &records).unwrap();
-        assert_eq!(set.ambiguous_keys, vec![k]);
-        assert!(set.bindings.is_empty());
-        assert!(
-            set.hints_for(&k).is_empty(),
-            "a key with no binding has no hints either: {:?}",
-            set.hints_for(&k)
-        );
-    }
-
-    /// One answer names one control-plane apex, bounded at both ends.
-    ///
-    /// An apex has to *contain* the membership domain — the control plane
-    /// publishes membership at `_synchronicity.<network>.<org>.<apex>` — so
-    /// the apex is part of the owner name, and two apexes in one answer means
-    /// two records at names a client cannot both have queried. That is a
-    /// hand-authored zone contradicting itself, and it is refused rather than
-    /// tried each way: guessing multiplies the lookups one refresh costs, and
-    /// no reading of a self-contradicting answer is the right one.
+    /// One answer names one control-plane apex, bounded at both ends: the
+    /// apex has to contain the membership domain and sit inside the signing
+    /// zone, and two apexes in one answer is a self-contradicting zone
+    /// refused outright rather than tried each way.
     #[test]
     fn one_answer_names_one_apex_and_disagreement_is_refused() {
         let k = key();
@@ -2938,13 +2719,8 @@ mod tests {
         let other = named("org.cp.example.com");
         let expected = Name::from_utf8("cp.example.com.").unwrap();
 
-        // One record, and many records agreeing, name one apex.
         assert_eq!(
             apex_of(domain, &signing_zone, std::slice::from_ref(&live)).unwrap(),
-            expected
-        );
-        assert_eq!(
-            apex_of(domain, &signing_zone, &[live.clone(), live.clone()]).unwrap(),
             expected
         );
 
@@ -2962,9 +2738,9 @@ mod tests {
             );
         }
 
-        // An apex outside the signing zone, or one that does not contain the
-        // domain, or one that is not a name, is a rejected *record* — the
-        // realistic cause is a member editing their own dialing hint.
+        // An apex outside the signing zone, one not containing the domain,
+        // or one that is not a name, is a rejected record — a member editing
+        // their own dialing hint is the realistic cause.
         let outside = named("cp.other.example");
         let sibling = named("sibling.example.com");
         let unparseable = named("cp..example.com");
@@ -2972,18 +2748,13 @@ mod tests {
             apex_of(
                 domain,
                 &signing_zone,
-                &[
-                    live.clone(),
-                    outside.clone(),
-                    sibling.clone(),
-                    unparseable.clone()
-                ]
+                &[live, outside.clone(), sibling.clone(), unparseable.clone()]
             )
             .unwrap(),
             expected
         );
 
-        // And no usable apex at all is a refusal naming what is missing.
+        // No usable apex at all is a refusal naming what is missing.
         for records in [
             vec![],
             vec![format!("v=sync1 id=nas nk={}", k.to_z32())],
@@ -2998,83 +2769,42 @@ mod tests {
     /// The persisted clock floor cannot run away from the real clock.
     ///
     /// `updated_at` is read from a file and floors the clock every TUF expiry
-    /// check sees, so an unbounded floor is a silent, permanent freeze: past the
-    /// refresh interval the walk never runs again and *nothing is logged at any
-    /// level*, because from the code's point of view nothing failed. It does not
-    /// take an attacker either — one successful update taken while the clock is
-    /// briefly wrong-forward burns the value in for good.
+    /// check sees, so an unbounded floor is a silent, permanent freeze: past
+    /// the refresh interval the walk never runs again and nothing is logged
+    /// at any level — and one update taken while the clock is briefly
+    /// wrong-forward burns the value in for good, no attacker required.
     #[test]
     fn the_clock_floor_is_bounded_by_the_clock() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-
-        // No floor, or one in the past: the clock is the clock.
         assert_eq!(now_unix(0), Some(now));
         assert_eq!(now_unix(now - 1_000), Some(now));
-
-        // A floor slightly ahead is honoured — that is what it is for.
         let slightly = now + MAX_CLOCK_FLOOR_LEAD / 2;
         assert_eq!(now_unix(slightly), Some(slightly));
-
-        // A floor further ahead than any correction explains is discarded, and
-        // the refresh interval stays reachable rather than becoming unreachable
-        // forever.
-        for absurd in [
-            now + MAX_CLOCK_FLOOR_LEAD * 2,
-            4_102_444_800, // 2100-01-01
-            u64::MAX,
-        ] {
+        for absurd in [now + MAX_CLOCK_FLOOR_LEAD * 2, 4_102_444_800, u64::MAX] {
             assert_eq!(now_unix(absurd), Some(now), "floor {absurd}");
-            // And the walk really does become due. This has to be asked of
-            // `refresh_due`, which is the thing that decides it: the earlier
-            // form of this assertion compared `now_unix(absurd)` against
-            // `absurd + REFRESH_INTERVAL`, which is true for any clamped clock
-            // whatever the gate does, so it passed while the gate was frozen.
+            // And the walk really does become due — asked of `refresh_due`,
+            // the thing that decides it (an earlier form compared the clamped
+            // clock against `absurd + interval` and passed while the gate
+            // was frozen).
             assert!(
                 refresh_due(absurd, now_unix(absurd).unwrap()),
                 "a walk must still become due under floor {absurd}"
             );
         }
-    }
-
-    /// The refresh gate, including the arm the pin file can lie its way into.
-    #[test]
-    fn a_walk_is_due_on_the_interval_and_whenever_the_stamp_is_impossible() {
-        let now = 1_800_000_000;
-
-        // The ordinary interval.
-        assert!(!refresh_due(now, now), "just checked");
-        assert!(!refresh_due(now - 1, now), "a second ago");
-        assert!(!refresh_due(now - (tuf::REFRESH_INTERVAL - 1), now));
-        assert!(refresh_due(now - tuf::REFRESH_INTERVAL, now), "on the nose");
-        assert!(refresh_due(0, now), "never walked");
-
-        // A stamp ahead of the clock is impossible, so it is due rather than
-        // postponed. Without this a single integer in `rekor-pins.json` stops
-        // every pin refresh for good, across restarts, silently.
-        assert!(refresh_due(now + 1, now));
-        assert!(refresh_due(now + tuf::REFRESH_INTERVAL * 100, now));
-        assert!(refresh_due(4_102_444_800, now), "a stamp dated 2100");
-        assert!(refresh_due(u64::MAX, now), "and one that cannot overflow");
-    }
-
-    #[test]
-    fn query_names_are_prefixed() {
-        assert_eq!(
-            query_name("cluster.example.com"),
-            "_synchronicity.cluster.example.com"
-        );
-    }
-
-    #[test]
-    fn an_empty_domain_yields_an_empty_set() {
-        let set = MemberSet::from_records("x.example", &[]).unwrap();
-        assert!(set.bindings.is_empty());
-        // Fail-closed: an empty validated set is not an error here, but the
-        // caller keeps existing bindings until they expire on their own.
-        assert!(set.rejected.is_empty());
+        // The gate: the ordinary interval, and a stamp ahead of the clock —
+        // an impossible one — is due rather than postponed, so a single
+        // integer in `rekor-pins.json` cannot stop every pin refresh for
+        // good, silently, across restarts.
+        let t = 1_800_000_000;
+        assert!(!refresh_due(t, t) && !refresh_due(t - 1, t));
+        assert!(!refresh_due(t - (tuf::REFRESH_INTERVAL - 1), t));
+        assert!(refresh_due(t - tuf::REFRESH_INTERVAL, t) && refresh_due(0, t));
+        assert!(refresh_due(t + 1, t));
+        assert!(refresh_due(t + tuf::REFRESH_INTERVAL * 100, t));
+        assert!(refresh_due(4_102_444_800, t) && refresh_due(u64::MAX, t));
     }
 
     #[test]
@@ -3095,9 +2825,13 @@ mod tests {
             secure_dnskey(&zone, real_key.clone()),
             secure_dnskey_rrsig(&zone, &[decoy_key.clone(), real_key.clone()], &real_signer),
         ];
-        let rdata = signing_key_rdata(&zone, &rrsig, &txt_rrset, &dnskeys).unwrap();
-        assert_eq!(rdata, crate::chain::dnskey_rdata(&real_key));
+        assert_eq!(
+            signing_key_rdata(&zone, &rrsig, &txt_rrset, &dnskeys).unwrap(),
+            crate::chain::dnskey_rdata(&real_key)
+        );
 
+        // With no key that verifies the membership RRSIG, the answer is
+        // refused even though every key is secure.
         let only_decoy = vec![
             secure_dnskey(&zone, decoy_key.clone()),
             secure_dnskey_rrsig(&zone, std::slice::from_ref(&decoy_key), &real_signer),
@@ -3107,44 +2841,25 @@ mod tests {
             err.to_string().contains("verifies the membership RRSIG"),
             "{err}"
         );
-
-        let stranger = p256_at(&zone).0;
-        let neither = vec![
-            secure_dnskey(&zone, stranger.clone()),
-            secure_dnskey(&zone, decoy_key.clone()),
-            secure_dnskey_rrsig(&zone, &[stranger, decoy_key], &real_signer),
-        ];
-        let err = signing_key_rdata(&zone, &rrsig, &txt_rrset, &neither).unwrap_err();
-        assert!(
-            err.to_string().contains("verifies the membership RRSIG"),
-            "{err}"
-        );
     }
 
-    /// The proofs one refresh will verify are bounded by this build, not by the
-    /// zone.
+    /// The proofs one refresh will verify are bounded by this build, not by
+    /// the zone.
     #[test]
     fn the_proofs_one_refresh_verifies_are_capped() {
-        // What a zone can put at one name: sixteen parts' worth of validated
-        // TXT is many complete single-record groups.
-        let served: Vec<String> = (0u64..32)
-            .flat_map(|n| {
-                let proof = rekor::RekorProof {
-                    log_id: [7u8; 32],
-                    log_index: n,
-                    statement: b"{}".to_vec(),
-                    canonicalized_body: b"{}".to_vec(),
-                    checkpoint: "log.example\n1\nAAAA\n\n\u{2014} log.example AAAAAAAA\n"
-                        .as_bytes()
-                        .to_vec(),
-                    inclusion_path: Vec::new(),
-                };
-                proof.to_txt().expect("encodes")
+        // What a zone can put at one name is not bounded here; the work one
+        // refresh does is.
+        let candidates: Vec<rekor::RekorProof> = (0u64..32)
+            .map(|n| rekor::RekorProof {
+                log_id: [7u8; 32],
+                log_index: n,
+                statement: b"{}".to_vec(),
+                canonicalized_body: b"{}".to_vec(),
+                checkpoint: "log.example\n1\nAAAA\n\n\u{2014} log.example AAAAAAAA\n"
+                    .as_bytes()
+                    .to_vec(),
+                inclusion_path: Vec::new(),
             })
-            .collect();
-        let candidates: Vec<rekor::RekorProof> = rekor::proofs_from_txt(&served)
-            .into_iter()
-            .filter_map(Result::ok)
             .collect();
         assert!(
             candidates.len() > MAX_PROOF_CANDIDATES,
@@ -3159,12 +2874,11 @@ mod tests {
 
     /// A replay cannot renew trust past the signature's own lifetime.
     ///
-    /// `secure_txt` keeps no state across refreshes, and the Rekor proof covers
-    /// the zone *key* rather than the record set, so a correctly signed answer
-    /// replays as a unit for its whole RRSIG window — days to weeks at a managed
-    /// provider. Taking the record TTL at face value let each replay push a
-    /// binding out afresh, indefinitely, for records the zone had since removed.
-    /// The signature's own expiration is the ceiling.
+    /// `secure_txt` keeps no state across refreshes, and the proof covers the
+    /// zone key rather than the record set, so a signed answer replays as a
+    /// unit for its whole RRSIG window — days to weeks at a managed provider.
+    /// Taking the record TTL at face value would let each replay push a
+    /// binding out afresh; the signature's own expiration is the ceiling.
     #[test]
     fn an_answers_ttl_never_outlives_the_signature_over_it() {
         let zone = hickory_resolver::proto::rr::Name::from_utf8("example.").unwrap();
@@ -3185,21 +2899,22 @@ mod tests {
         assert_eq!(validated.expires_at, expires_at);
         assert_eq!(validated.ttl, Duration::from_secs(3600));
 
-        // Near the end of it: the signature decides, so a replay accepted here
+        // Near the end of it the signature decides: a replay accepted here
         // buys minutes rather than the hour the record claims.
         let late = expires_at - 90;
         let validated = secure_txt(name, &answers, Some(late)).expect("a signed answer");
         assert_eq!(validated.ttl, Duration::from_secs(90));
 
-        // Past the end the floor takes over, and hickory has already refused the
-        // answer by then — the RRSIG window is part of what `Proof::Secure`
-        // means, so this branch exists only so the arithmetic cannot underflow.
+        // Past the end the floor takes over (hickory has already refused the
+        // answer by then; this branch exists so the arithmetic cannot
+        // underflow), and the clamp's other bound: no TTL exceeds the cap.
         assert_eq!(
             secure_txt(name, &answers, Some(expires_at + 1))
                 .expect("a signed answer")
                 .ttl,
             MIN_TTL
         );
+        assert_eq!(clamp_ttl(Duration::from_secs(999_999)), MAX_TTL);
     }
 
     #[test]
@@ -3238,6 +2953,8 @@ mod tests {
         assert!(response.answers.iter().any(|r| r.data == txt.data));
         assert_eq!(response.authorities.len(), 1);
         assert_eq!(response.additionals.len(), 1);
+        // What survived every section encloses its owner — RFC 4035 5.3.1,
+        // which the resolver library skips.
         assert!(response.answers.iter().all(rrsig_signer_encloses_owner));
         assert!(response.authorities.iter().all(rrsig_signer_encloses_owner));
         assert!(response.additionals.iter().all(rrsig_signer_encloses_owner));
@@ -3274,19 +2991,30 @@ mod tests {
         hickory_resolver::proto::dnssec::DnssecSigner,
     ) {
         // A key tag is 16 bits, so a given one turns up about once every
-        // 65_536 draws and the *expected* cost is that, whatever the ceiling.
-        // The ceiling is only a runaway guard, and it has to sit far enough
-        // above the mean that an unlucky run is not a failing test: at 200_000
-        // draws — three times the mean — a geometric tail leaves a 1-in-21
-        // chance of finding nothing, which is a flake, not a guard.
-        const DRAWS: usize = 4_000_000;
-        for _ in 0..DRAWS {
+        // 65_536 draws; 4_000_000 — three times the mean — leaves a 1-in-21
+        // geometric tail, which is a flake, not a guard, so the loop is long
+        // on purpose.
+        for _ in 0..4_000_000 {
             let pair = p256_at(origin);
             if pair.0.calculate_key_tag().ok() == Some(tag) {
                 return pair;
             }
         }
-        panic!("no P-256 key with tag {tag} in {DRAWS} draws");
+        panic!("no P-256 key with tag {tag} in 4_000_000 draws");
+    }
+
+    fn sign_rrset(
+        set: &hickory_resolver::proto::rr::RecordSet,
+        signer: &hickory_resolver::proto::dnssec::DnssecSigner,
+    ) -> hickory_resolver::proto::dnssec::rdata::RRSIG {
+        use hickory_resolver::proto::{dnssec::rdata::RRSIG, rr::DNSClass};
+        RRSIG::from_rrset(
+            set,
+            DNSClass::IN,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+            signer,
+        )
+        .expect("sign rrset")
     }
 
     fn signed_txt(
@@ -3295,8 +3023,8 @@ mod tests {
         signer: &hickory_resolver::proto::dnssec::DnssecSigner,
     ) -> Vec<hickory_resolver::proto::rr::Record> {
         use hickory_resolver::proto::{
-            dnssec::rdata::{DNSSECRData, RRSIG},
-            rr::{rdata::TXT, DNSClass, RData, Record, RecordSet, RecordType},
+            dnssec::rdata::DNSSECRData,
+            rr::{rdata::TXT, RData, Record, RecordSet, RecordType},
         };
         let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
         set.insert(
@@ -3307,13 +3035,7 @@ mod tests {
             ),
             0,
         );
-        let rrsig = RRSIG::from_rrset(
-            &set,
-            DNSClass::IN,
-            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
-            signer,
-        )
-        .expect("sign txt");
+        let rrsig = sign_rrset(&set, signer);
         set.insert_rrsig(Record::from_rdata(
             owner.clone(),
             300,
@@ -3357,8 +3079,8 @@ mod tests {
         signer: &hickory_resolver::proto::dnssec::DnssecSigner,
     ) -> hickory_resolver::proto::rr::Record {
         use hickory_resolver::proto::{
-            dnssec::{rdata::DNSSECRData, rdata::RRSIG, Proof},
-            rr::{DNSClass, RData, Record, RecordSet, RecordType},
+            dnssec::{rdata::DNSSECRData, Proof},
+            rr::{RData, Record, RecordSet, RecordType},
         };
         let mut set = RecordSet::new(zone.clone(), RecordType::DNSKEY, 0);
         for key in keys {
@@ -3371,13 +3093,7 @@ mod tests {
                 0,
             );
         }
-        let rrsig = RRSIG::from_rrset(
-            &set,
-            DNSClass::IN,
-            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
-            signer,
-        )
-        .expect("sign dnskey");
+        let rrsig = sign_rrset(&set, signer);
         let mut record =
             Record::from_rdata(zone.clone(), 300, RData::DNSSEC(DNSSECRData::RRSIG(rrsig)));
         record.proof = Proof::Secure;

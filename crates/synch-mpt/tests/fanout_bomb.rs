@@ -11,20 +11,14 @@
 //! not breadth, so it is no defence.
 //!
 //! Note what such a structure *is*: a valid trie describing 16^k entries in
-//! k + 1 nodes. There is no local check that calls it malformed, because it is
-//! not — and, crucially, nothing about its *shape* distinguishes it from honest
-//! data. Give sixty thousand keys under dense structured paths one identical
-//! value and content addressing collapses the whole lower trie to about ten
-//! distinct nodes carrying sixty thousand positions: an ordinary
-//! `Trie::insert` corpus that is structurally a fan-out DAG. A guard that
-//! measured positions per *distinct node reached* refused that corpus, which is
-//! why the bound is now on work alone (`FanoutGuard`,
-//! `WALK_POSITION_CEILING`).
-//!
-//! Deduplicating positions by node hash is the other obvious defence and is
-//! also wrong: one leaf legitimately sits at as many positions as there are
-//! keys carrying its value, so pruning repeats silently drops keys.
-//! `scan_pagination` catches it.
+//! k + 1 nodes. Nothing about its *shape* distinguishes it from honest data —
+//! give sixty thousand keys under dense structured paths one identical value
+//! and content addressing collapses the whole lower trie to about ten distinct
+//! nodes carrying sixty thousand positions — which is why the bound is on work
+//! alone (`FanoutGuard`, `WALK_POSITION_CEILING`). Deduplicating positions by
+//! node hash is the other obvious defence and is also wrong: one leaf
+//! legitimately sits at as many positions as there are keys carrying its
+//! value, so pruning repeats silently drops keys.
 
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
@@ -72,10 +66,6 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
 /// `the_walk_guard_stops_at_the_ceiling` covers the guard's arithmetic in
 /// microseconds; this covers the wiring, and is worth running by hand
 /// (`cargo test -- --ignored`) whenever either changes.
-///
-/// The earlier per-node-arrival ratio made this cheap — it stopped the walk at
-/// ~65 k positions — but only because it fired on shapes honest data also
-/// produces, which is why it is gone.
 #[test]
 #[ignore = "walks to WALK_POSITION_CEILING; see the fast guard test in trie.rs"]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
@@ -106,41 +96,9 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
     assert!(err.to_string().contains("exceeded"), "{err}");
 }
 
-#[test]
-fn an_honest_trie_is_nowhere_near_the_bound() {
-    // The guard must not fire on real data, including the shape that most
-    // stresses it: many distinct keys all carrying one value, so a single leaf
-    // node is shared across every one of their positions.
-    //
-    // Sixty thousand, not two thousand. This corpus collapses to ~10 distinct
-    // nodes — structurally a fan-out DAG, built by ordinary inserts — and the
-    // previous per-node-arrival ratio refused it at ~65 k positions, while this
-    // test passed thirty times below the break and asserted the opposite.
-    let store = MemStore::new();
-    let trie = Trie::new(&store);
-    let mut root = Hash::EMPTY;
-    for i in 0..60_000u32 {
-        root = trie
-            .insert(
-                root,
-                format!("f:space/{i:08}/file").as_bytes(),
-                b"entry-value",
-            )
-            .unwrap();
-    }
-    // Reachable from the final root — not `node_count`, which also holds every
-    // intermediate root the 60 000 inserts passed through.
-    let reachable = trie.reachable(root).unwrap().nodes.len();
-    assert!(
-        reachable < 100,
-        "the corpus really is a DAG: {reachable} nodes"
-    );
-    assert_eq!(trie.iter(root).unwrap().len(), 60_000);
-    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 60_000);
-}
-
 /// First adoption of an origin diffs from `Hash::EMPTY`, and that must survive
-/// a corpus the size §7.1 names.
+/// a corpus the size §7.1 names — including the shape that most stresses the
+/// guard.
 ///
 /// The guard used to be charged once per *nibble slot* of every frame entered —
 /// all sixteen, before checking whether either side had anything there — so it
@@ -163,4 +121,30 @@ fn a_first_adoption_diff_survives_the_documented_corpus_size() {
         root = trie.insert(root, ad.as_bytes(), &[3u8; 40]).unwrap();
     }
     assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 120_000);
+
+    // Many distinct keys all carrying one value: content addressing collapses
+    // the lower trie to ~10 distinct nodes — structurally a fan-out DAG, built
+    // by ordinary inserts — and the previous per-node-arrival ratio refused it
+    // at ~65 k positions. The iter count is the shared-leaf regression the cut
+    // `scan_pagination` used to catch: deduping positions by hash would
+    // silently drop keys here.
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    let mut root = Hash::EMPTY;
+    for i in 0..60_000u32 {
+        root = trie
+            .insert(
+                root,
+                format!("f:space/{i:08}/file").as_bytes(),
+                b"entry-value",
+            )
+            .unwrap();
+    }
+    let reachable = trie.reachable(root).unwrap().nodes.len();
+    assert!(
+        reachable < 100,
+        "the corpus really is a DAG: {reachable} nodes"
+    );
+    assert_eq!(trie.iter(root).unwrap().len(), 60_000);
+    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 60_000);
 }

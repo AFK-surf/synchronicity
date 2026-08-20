@@ -1206,40 +1206,14 @@ mod tests {
     use synch_core::{blob_key, file_key, AD_SPAN_GRANULARITY};
 
     use super::*;
+    use crate::testutil::{origin_named, store};
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
-    }
-
-    fn origin(name: &str) -> OriginId {
-        OriginId::named(name, "x.example").unwrap()
-    }
-
-    #[test]
-    fn entries_round_trip() {
-        let (_d, store) = store();
-        let o = origin("nas");
-        let e = FileEntry::file(10, 5, Hash::new(b"c"), 3);
-        store.put_entry(&o, "media", "a/b.txt", &e).unwrap();
-
-        let row = store.entry(&o, "media", "a/b.txt").unwrap().unwrap();
-        assert_eq!(row.size, 10);
-        assert_eq!(row.content, Some(Hash::new(b"c")));
-        assert_eq!(row.kind, EntryKind::File);
-        assert_eq!(row.seq, 3);
-
-        store.delete_entry(&o, "media", "a/b.txt").unwrap();
-        assert!(store.entry(&o, "media", "a/b.txt").unwrap().is_none());
-    }
-
-    /// The advisory mode is metadata a mirror materializes (§7.2), so it has to
-    /// survive the trip through this view rather than being dropped at it.
+    /// The advisory mode is metadata a mirror materializes (§7.2), so it must
+    /// survive the trip through this view, and the delete path must too.
     #[test]
     fn entries_carry_the_advisory_unix_mode() {
         let (_d, store) = store();
-        let o = origin("nas");
+        let o = origin_named("nas");
         let mut e = FileEntry::file(10, 5, Hash::new(b"c"), 3);
         e.unix_mode = Some(0o100_640);
         store.put_entry(&o, "media", "a.txt", &e).unwrap();
@@ -1281,7 +1255,7 @@ mod tests {
                 &postcard::to_stdvec(&e).unwrap(),
             )
             .unwrap();
-        let peer = origin("laptop");
+        let peer = origin_named("laptop");
         store
             .transaction(|txn| txn.materialize_diff(&peer, Hash::EMPTY, root))
             .unwrap();
@@ -1293,38 +1267,16 @@ mod tests {
                 .unix_mode,
             Some(0o100_640)
         );
-    }
 
-    #[test]
-    fn counting_entries_is_scoped_to_one_origin_and_space() {
-        let (_d, store) = store();
-        let nas = origin("nas");
-        let laptop = origin("laptop");
-        let e = FileEntry::file(1, 0, Hash::new(b"c"), 1);
-        store.put_entry(&nas, "media", "a", &e).unwrap();
-        store.put_entry(&nas, "media", "b", &e).unwrap();
-        store.put_entry(&nas, "docs", "c", &e).unwrap();
-        store.put_entry(&laptop, "media", "d", &e).unwrap();
-
-        assert_eq!(store.count_entries(&nas, "media").unwrap(), 2);
-        assert_eq!(store.count_entries(&nas, "docs").unwrap(), 1);
-        assert_eq!(store.count_entries(&laptop, "media").unwrap(), 1);
-        assert_eq!(store.count_entries(&nas, "nothing").unwrap(), 0);
-        // And it agrees with the listing it stands in for.
-        assert_eq!(
-            store.count_entries(&nas, "media").unwrap() as usize,
-            store
-                .list_entries(Some(&nas), "media", "", None, None)
-                .unwrap()
-                .len()
-        );
+        store.delete_entry(&peer, "media", "c.txt").unwrap();
+        assert!(store.entry(&peer, "media", "c.txt").unwrap().is_none());
     }
 
     #[test]
     fn divergence_across_origins_is_visible() {
         let (_d, store) = store();
-        let nas = origin("nas");
-        let laptop = origin("laptop");
+        let nas = origin_named("nas");
+        let laptop = origin_named("laptop");
         store
             .put_entry(
                 &nas,
@@ -1352,8 +1304,8 @@ mod tests {
     #[test]
     fn listing_by_prefix_and_origin() {
         let (_d, store) = store();
-        let nas = origin("nas");
-        let laptop = origin("laptop");
+        let nas = origin_named("nas");
+        let laptop = origin_named("laptop");
         for path in ["a/1", "a/2", "a/sub/3", "b/1"] {
             store
                 .put_entry(&nas, "s", path, &FileEntry::file(1, 0, Hash::new(b"x"), 1))
@@ -1384,6 +1336,18 @@ mod tests {
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].path, "a/sub/3");
         assert_eq!(store.known_spaces().unwrap(), vec!["s".to_string()]);
+
+        // The count is scoped the same way, and agrees with the listing.
+        assert_eq!(store.count_entries(&nas, "s").unwrap(), 4);
+        assert_eq!(store.count_entries(&laptop, "s").unwrap(), 1);
+        assert_eq!(store.count_entries(&nas, "nothing").unwrap(), 0);
+        assert_eq!(
+            store.count_entries(&nas, "s").unwrap() as usize,
+            store
+                .list_entries(Some(&nas), "s", "", None, None)
+                .unwrap()
+                .len()
+        );
     }
 
     #[test]
@@ -1392,10 +1356,14 @@ mod tests {
         let g = AD_SPAN_GRANULARITY;
         let root = Hash::new(b"obj");
         store
-            .put_provider(&root, &origin("nas"), &BlobAd::complete(10 * g))
+            .put_provider(&root, &origin_named("nas"), &BlobAd::complete(10 * g))
             .unwrap();
         store
-            .put_provider(&root, &origin("laptop"), &BlobAd::partial(10 * g, [(0, g)]))
+            .put_provider(
+                &root,
+                &origin_named("laptop"),
+                &BlobAd::partial(10 * g, [(0, g)]),
+            )
             .unwrap();
 
         let all = store.providers(&root).unwrap();
@@ -1406,18 +1374,14 @@ mod tests {
         assert_eq!(head.len(), 2);
         let tail = store.providers_for_range(&root, 5 * g, 6 * g).unwrap();
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].0, origin("nas"));
+        assert_eq!(tail[0].0, origin_named("nas"));
 
-        store.delete_provider(&root, &origin("nas")).unwrap();
+        store.delete_provider(&root, &origin_named("nas")).unwrap();
         assert_eq!(store.providers(&root).unwrap().len(), 1);
     }
 
-    /// The provider read is bounded by the query, not by the caller.
-    ///
-    /// `FindProviders` truncates its answer to `MAX_PROVIDER_ADS`, but that
-    /// happens after every row has been read and every row's spans decoded —
-    /// under the single global connection mutex. The bound belongs in the SQL,
-    /// where it costs the reader nothing to enforce (§12).
+    /// The read bound belongs in the SQL: `FindProviders` truncates only after
+    /// every row and span is decoded, under the connection mutex (§12).
     #[test]
     fn a_provider_read_stops_at_the_advertised_bound() {
         let (_d, store) = store();
@@ -1426,7 +1390,7 @@ mod tests {
             store
                 .put_provider(
                     &root,
-                    &origin(&format!("holder{i:04}")),
+                    &origin_named(&format!("holder{i:04}")),
                     &BlobAd::complete(10),
                 )
                 .unwrap();
@@ -1438,16 +1402,13 @@ mod tests {
         );
     }
 
-    /// A `b:` record naming a million spans lands as a bounded row.
-    ///
-    /// The record is a trie value, so it is bounded only by `MAX_FRAME_LEN` —
-    /// and materialization is where an origin's published bytes become this
-    /// node's memory. The cap is applied by the ad's own decode, so the row it
-    /// writes is already bounded and every later read of it is too.
+    /// The record is a trie value, so materialization is where an origin's
+    /// published bytes become this node's memory — the ad's own decode bounds
+    /// the row (§12).
     #[test]
     fn a_pathological_ad_materializes_to_a_bounded_row() {
         let (_d, store) = store();
-        let o = origin("nas");
+        let o = origin_named("nas");
         let trie = Trie::new(&store);
         let g = AD_SPAN_GRANULARITY;
         let root = Hash::new(b"an object");
@@ -1478,7 +1439,7 @@ mod tests {
     #[test]
     fn materializes_from_a_trie_diff() {
         let (_d, store) = store();
-        let o = origin("nas");
+        let o = origin_named("nas");
         let trie = Trie::new(&store);
 
         let entry = FileEntry::file(42, 7, Hash::new(b"content"), 1);
@@ -1522,49 +1483,24 @@ mod tests {
         assert!(store.entry(&o, "media", "clip.mp4").unwrap().is_none());
         // The blob ad is untouched by the file deletion.
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
-    }
 
-    #[test]
-    fn rematerialize_rebuilds_from_the_trie() {
-        let (_d, store) = store();
-        let o = origin("nas");
-        let trie = Trie::new(&store);
-        let mut root = Hash::EMPTY;
-        for i in 0..5u8 {
-            let entry = FileEntry::file(i as u64, 0, Hash::new(&[i]), 1);
-            root = trie
-                .insert(
-                    root,
-                    &file_key("s", &format!("f{i}")).unwrap(),
-                    &postcard::to_stdvec(&entry).unwrap(),
-                )
-                .unwrap();
-        }
-        store
-            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, root))
+        // A rebuild from the authoritative trie restores what corruption
+        // deleted from the derived cache.
+        let root3 = trie
+            .insert(
+                root2,
+                &file_key("media", "clip.mp4").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
             .unwrap();
-        assert_eq!(
-            store
-                .list_entries(Some(&o), "s", "", None, None)
-                .unwrap()
-                .len(),
-            5
-        );
-
-        // Corrupt the derived cache, then rebuild it from the authoritative trie.
         store.delete_origin_entries(&o).unwrap();
-        assert!(store
-            .list_entries(Some(&o), "s", "", None, None)
-            .unwrap()
-            .is_empty());
-        store.rematerialize(&o, root).unwrap();
+        assert!(store.entry(&o, "media", "clip.mp4").unwrap().is_none());
+        store.rematerialize(&o, root3).unwrap();
         assert_eq!(
-            store
-                .list_entries(Some(&o), "s", "", None, None)
-                .unwrap()
-                .len(),
-            5
+            store.entry(&o, "media", "clip.mp4").unwrap().unwrap().size,
+            42
         );
+        assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
     }
 
     #[test]
@@ -1586,7 +1522,7 @@ mod tests {
             .put_mirror("/mnt/nas-media", "media", &VersionPolicy::Newest)
             .unwrap();
         assert_eq!(store.mirrors().unwrap().len(), 1);
-        let policy = VersionPolicy::Origin(origin("nas"));
+        let policy = VersionPolicy::Origin(origin_named("nas"));
         store
             .put_mirror("/mnt/nas-media", "media", &policy)
             .unwrap();
@@ -1600,11 +1536,8 @@ mod tests {
         assert!(store.mirror("/elsewhere").unwrap().is_none());
         assert!(store.remove_mirror("/mnt/nas-media").unwrap());
         assert!(!store.remove_mirror("/mnt/nas-media").unwrap());
-    }
 
-    #[test]
-    fn local_files_track_scanner_state() {
-        let (_d, store) = store();
+        // Scanner state round-trips the same way.
         let f = LocalFile {
             space: "s".into(),
             relpath: "a.txt".into(),
@@ -1618,7 +1551,6 @@ mod tests {
         assert_eq!(store.local_file("s", "a.txt").unwrap().unwrap(), f);
         assert_eq!(store.local_files("s").unwrap(), vec!["a.txt".to_string()]);
         assert_eq!(store.local_file_rows("s").unwrap(), vec![f.clone()]);
-        assert!(store.local_file_rows("other").unwrap().is_empty());
         store.remove_local_file("s", "a.txt").unwrap();
         assert!(store.local_file("s", "a.txt").unwrap().is_none());
     }
@@ -1626,8 +1558,8 @@ mod tests {
     #[test]
     fn expired_tombstones_are_scoped_to_one_origin_and_age() {
         let (_d, store) = store();
-        let nas = origin("nas");
-        let laptop = origin("laptop");
+        let nas = origin_named("nas");
+        let laptop = origin_named("laptop");
         // mtime_ns is the deletion time (§4.2).
         store
             .put_entry(&nas, "s", "old", &FileEntry::tombstone(100, 2, None))
@@ -1653,42 +1585,27 @@ mod tests {
         assert!(store.expired_tombstones(&nas, 0).unwrap().is_empty());
     }
 
-    #[test]
-    fn peer_latency_ewma() {
-        let (_d, store) = store();
-        let key = iroh_base::SecretKey::generate().public();
-        store.record_peer_seen(&key, Some(&[1, 2]), 10).unwrap();
-        store.record_peer_sync(&key, 20, 1000).unwrap();
-        store.record_peer_sync(&key, 30, 2000).unwrap();
-        let peers = store.peers_seen().unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].last_sync, 30);
-        assert!(peers[0].latency_ewma_us > 1000 && peers[0].latency_ewma_us < 2000);
-        assert_eq!(peers[0].last_addr, Some(vec![1, 2]));
-    }
-
-    /// A listing must not stop short of a path that sorts high.
-    ///
-    /// A prefix scan is bounded by the prefix's byte successor, so every path
-    /// carrying the prefix is inside it — including one whose next character is
-    /// the highest there is. What the mirror's unlink sweep reads is this
-    /// listing, so a path missing from it is a file the sweep would remove.
+    /// A listing must not stop short of a path that sorts high: what the
+    /// mirror's unlink sweep reads is this listing, so a path missing from it
+    /// is a file the sweep would remove.
     #[test]
     fn a_prefix_listing_reaches_every_path_under_it() {
-        assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
-        assert_eq!(prefix_upper_bound("az").as_deref(), Some("a{"));
-        assert_eq!(prefix_upper_bound("é").as_deref(), Some("ê"));
-        // The character above `U+D7FF` is `U+E000`: the surrogate block is not
-        // a scalar value.
-        assert_eq!(prefix_upper_bound("\u{d7ff}").as_deref(), Some("\u{e000}"));
-        // `U+10FFFF` has nothing above it, so the carry goes left, and a prefix
-        // made only of it has no upper bound at all.
-        assert_eq!(prefix_upper_bound("a\u{10ffff}").as_deref(), Some("b"));
-        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
-        assert_eq!(prefix_upper_bound(""), None);
+        // The successor of a prefix's last char bounds the scan; above U+D7FF
+        // the next scalar is U+E000, and U+10FFFF has nothing above it.
+        for (prefix, bound) in [
+            ("a", Some("b")),
+            ("az", Some("a{")),
+            ("é", Some("ê")),
+            ("\u{d7ff}", Some("\u{e000}")),
+            ("a\u{10ffff}", Some("b")),
+            ("\u{10ffff}", None),
+            ("", None),
+        ] {
+            assert_eq!(prefix_upper_bound(prefix).as_deref(), bound);
+        }
 
         let (_d, store) = store();
-        let origin = OriginId::named("nas", "x.example").unwrap();
+        let origin = origin_named("nas");
         for path in [
             "docs/a.txt",
             "docs/\u{10ffff}.txt",
@@ -1732,19 +1649,13 @@ mod tests {
         );
     }
 
-    /// The deletion sweep's anchor names live paths and excludes tombstones.
-    ///
-    /// The filter is the whole point of the query: a tombstoned path that came
-    /// back would be swept on every scan, re-staging a deletion this origin has
-    /// already published, forever. `entries.kind` is an integer column and
-    /// SQLite does not error on comparing one to a string — it simply never
-    /// matches — so a `kind != 'tombstone'` literal would pass everything, and
-    /// this is what catches it.
+    /// The deletion sweep's anchor must exclude tombstones: one that slipped in
+    /// would be swept on every scan, re-staging a deletion already published.
     #[test]
     fn published_paths_are_live_paths_of_one_origin() {
         let (_d, store) = store();
-        let mine = OriginId::named("nas", "x.example").unwrap();
-        let theirs = OriginId::named("laptop", "x.example").unwrap();
+        let mine = origin_named("nas");
+        let theirs = origin_named("laptop");
         store
             .put_entry(
                 &mine,

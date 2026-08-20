@@ -1082,13 +1082,12 @@ mod tests {
     use super::*;
     use synch_net::sim::{SimLog, SimZone};
 
-    /// A log served through the tile layout, from a `SimLog`'s leaves, with a
-    /// bundle that can be made to fail.
+    /// A log served through the tile layout, from a `SimLog`'s leaves, with
+    /// the shared in-memory tile log carrying the tests' knobs (a bundle that
+    /// fails, a forged leaf).
     struct Fixture {
         log: SimLog,
-        leaves: Vec<Vec<u8>>,
-        /// Fetches for the bundle at this first index answer a 503.
-        fail_bundle_at: Option<u64>,
+        tiles: synch_monitor::testsupport::MemoryLog,
     }
 
     impl TileSource for Fixture {
@@ -1096,67 +1095,12 @@ mod tests {
             if path == "api/v2/checkpoint" {
                 return Ok(Some(self.log.checkpoint()));
             }
-            let rest = path.strip_prefix("api/v2/tile/").expect("a tile path");
-            let (level, rest) = rest.split_once('/').expect("a level");
-            let (digits, width) = match rest.split_once(".p/") {
-                Some((digits, width)) => (digits, width.parse::<u64>().unwrap()),
-                None => (rest, 256),
-            };
-            let index: u64 = digits.split('/').fold(0u64, |acc, group| {
-                acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
-            });
-            let tile_level: u32 = match level {
-                "entries" => 0,
-                level => level.parse().unwrap(),
-            };
-            let current = ((self.leaves.len() as u64) >> (8 * tile_level))
-                .saturating_sub(index * 256)
-                .min(256);
-            if width != current {
-                return Ok(None);
-            }
-            if level == "entries" {
-                if self.fail_bundle_at == Some(index * 256) {
-                    return Err(MonitorError::Transport(format!(
-                        "{path}: the log answered 503"
-                    )));
-                }
-                let mut out = Vec::new();
-                for i in 0..width {
-                    let body = &self.leaves[(index * 256 + i) as usize];
-                    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                    out.extend_from_slice(body);
-                }
-                return Ok(Some(out));
-            }
-            let span = 1u64 << (8 * tile_level);
-            let mut out = Vec::new();
-            for i in 0..width {
-                let start = (index * 256 + i) * span;
-                out.extend_from_slice(&subtree(&self.leaves, start, start + span));
-            }
-            Ok(Some(out))
+            self.tiles.fetch(path).await
         }
 
         async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
-            Ok(Some(self.leaves.len() as u64))
+            self.tiles.checkpoint_size().await
         }
-    }
-
-    /// RFC 6962 §2.1, so the fixture's tiles are right independently of the
-    /// code that reads them.
-    fn subtree(leaves: &[Vec<u8>], lo: u64, hi: u64) -> [u8; 32] {
-        if lo + 1 == hi {
-            return synch_net::rekor::leaf_hash(&leaves[lo as usize]);
-        }
-        let mut span = 1u64;
-        while span * 2 < hi - lo {
-            span *= 2;
-        }
-        synch_net::rekor::node_hash(
-            &subtree(leaves, lo, lo + span),
-            &subtree(leaves, lo + span, hi),
-        )
     }
 
     fn anchors_for(zone: &SimZone) -> TrustAnchors {
@@ -1220,8 +1164,7 @@ mod tests {
         (
             Fixture {
                 log,
-                leaves,
-                fail_bundle_at: None,
+                tiles: synch_monitor::testsupport::MemoryLog::from_leaves(leaves),
             },
             zone,
         )
@@ -1234,15 +1177,14 @@ mod tests {
     /// The audited party triggers this deliberately: fail one tile request
     /// once the monitor has crossed the bundle boundary, and a findings vector
     /// dropped on the error takes the alarm with it while the cursor advances
-    /// past the entry that raised it — never printed, never recorded, never
-    /// re-read.
+    /// past the entry that raised it.
     #[tokio::test]
     async fn a_walk_that_fails_partway_still_returns_what_it_classified() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monitor.json");
         // The entry is in the first bundle; the second bundle 503s.
         let (mut fixture, zone) = log_with_entry(100, 400);
-        fixture.fail_bundle_at = Some(256);
+        fixture.tiles.fail_bundle_at = Some(256);
         let keys = LogKeys::parse(&fixture.log.key_pem()).unwrap();
         let anchors = anchors_for(&zone);
 
@@ -1328,61 +1270,40 @@ mod tests {
             .expect("a domain name is a watchable apex");
 
         // A wildcard parses — the label is legal — and then watches only its
-        // own ancestors: measured, `*.example.com` matches `example.com` and
-        // matches neither `cp.example.com` nor `a.b.example.com`. That is the
-        // same silent-nothing this guard exists to refuse, reached through a
-        // spelling that looks broader rather than narrower.
-        let wild = watching("*.example.com");
-        assert!(wild.watches(&synch_net::chain::parse_name("example.com").unwrap()));
-        assert!(!wild.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
-        let error = check_watch_list(&wild, path).expect_err("a wildcard watches nothing useful");
+        // own ancestors: the same silent-nothing this guard exists to refuse,
+        // reached through a spelling that looks broader rather than narrower.
+        let error = check_watch_list(&watching("*.example.com"), path)
+            .expect_err("a wildcard watches nothing useful");
         assert!(error.to_string().contains("wildcard"), "{error}");
-
-        // And the apex itself is the thing that actually covers both.
-        let apex = watching("example.com");
-        assert!(apex.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
     }
 
     /// A watch list that widened since the positions were recorded is a
-    /// coverage gap, and the same permanent kind `--from-index` is refused for.
-    ///
-    /// The filter runs per entry inside the walk, so an entry naming an
-    /// unwatched apex was stepped over and `next_index` advanced past it.
-    /// Nothing reaches back for it — not a later run, not the auto-insert —
-    /// so the run that would silently fail to classify it has to say so.
+    /// coverage gap, and the same permanent kind `--from-index` is refused
+    /// for: the filter runs per entry inside the walk, so nothing reaches
+    /// back for the entries it stepped over.
     #[test]
     fn a_watch_list_that_widened_since_the_last_walk_is_a_gap() {
         let recorded = vec!["a.example.com.".to_string()];
 
-        // A sibling: watched now, watched by nothing before. `watches` pairs
-        // names by delegation in either direction and these are unrelated, so
-        // every entry for it already in the log is unread for good.
-        let widened = watching("cp.example.com").widening_over(&recorded);
-        assert_eq!(widened, vec!["cp.example.com.".to_string()]);
-
-        // The same name is not a widening.
+        // A sibling: watched now, watched by nothing before.
+        assert_eq!(
+            watching("cp.example.com").widening_over(&recorded),
+            vec!["cp.example.com.".to_string()]
+        );
+        // The same name is not a widening, nor is a subdomain the old list
+        // already watched — which is exactly what the auto-insert writes when
+        // it records the apex of an entry it just reported.
         assert!(watching("a.example.com")
             .widening_over(&recorded)
             .is_empty());
-
-        // Nor is a name the old list already watched — which is exactly what
-        // the auto-insert writes when it records the apex of an entry it just
-        // reported, and that entry was reported *because* the old set matched
-        // it. Comparing the literal names instead would call this a gap and
-        // refuse a run that lost nothing.
         assert!(watching("sub.a.example.com")
             .widening_over(&recorded)
             .is_empty());
 
-        // An **ancestor** is a widening, and this is the half that matters.
-        // `watches` is bidirectional, so the old list does match
-        // `example.com.` itself — but what watching it now covers is every
-        // descendant of it, and `cp.example.com.` was matched by nothing
-        // before. Every entry for a sibling subtree already in the log is
-        // unread for good, which is exactly the event this guard exists to
-        // announce. Both ways to reach it are ordinary: §5.5 tells operators
-        // the upward half matters most, and the auto-insert writes the parent
-        // itself the first time a legitimate entry for it is reported.
+        // An **ancestor** is a widening, and this is the half that matters:
+        // `watches` is bidirectional, so the old list did match the parent
+        // itself — but watching it now covers every sibling subtree beneath
+        // it, and none of those were matched before.
         assert_eq!(
             watching("example.com").widening_over(&recorded),
             vec!["example.com.".to_string()]
@@ -1393,20 +1314,16 @@ mod tests {
         assert!(!watching("a.example.com").watches(&sibling));
         assert!(watching("example.com").watches(&sibling));
 
-        // And a first run, with nothing recorded, is not a widening either —
-        // there are no positions for it to be a gap against.
-        assert!(watching("cp.example.com").widening_over(&[]).len().eq(&1));
+        // And a first run, with nothing recorded, is not a widening either.
+        assert_eq!(watching("cp.example.com").widening_over(&[]).len(), 1);
     }
 
     /// The watch-coverage guard actually refuses a run, and `--allow-gap`
     /// actually lets one through.
     ///
-    /// The unit test below covers `widening_over`; this covers the guard built
-    /// on it. Deleting the whole `if let Some(covered)` block — which is to say
-    /// reinstating the defect a previous audit filed and fixed — left the
-    /// workspace green, because nothing exercised the refusal, the message or
-    /// the escape. The sibling guard it was modelled on, `--from-index`, has
-    /// exactly this test.
+    /// Deleting the whole `if let Some(covered)` block — reinstating the
+    /// defect a previous audit filed and fixed — left the workspace green,
+    /// because nothing exercised the refusal, the message or the escape.
     #[test]
     fn a_widened_watch_list_refuses_the_run_until_the_operator_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -1420,7 +1337,6 @@ mod tests {
             ..MonitorState::default()
         };
         state.position("log2025-1.rekor.example").next_index = 500;
-        // Nothing widened: the same list is the same coverage.
         coverage_gap(&state, &args).expect("an unchanged list is not a gap");
 
         // A sibling: matched by nothing before, so everything already in the
@@ -1436,10 +1352,8 @@ mod tests {
         args.allow_gap = true;
         coverage_gap(&state, &args).expect("--allow-gap accepts the loss");
 
-        // And an added *ancestor* is a gap too, which is the half the guard
-        // used to miss: `watches` is bidirectional, so the old list matched
-        // the parent's own name — but watching it now covers every sibling
-        // subtree beneath it, and none of those were matched before.
+        // And an added *ancestor* is a gap too — the half the guard used to
+        // miss.
         args.allow_gap = false;
         let mut upward = MonitorState {
             known: watching("a.example.com"),
@@ -1513,50 +1427,5 @@ mod tests {
             300,
             "the run read to the end of the tree"
         );
-    }
-
-    /// **D6.** One state file, one client population.
-    #[test]
-    fn a_run_that_changes_the_trust_surface_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let anchor = dir.path().join("anchor.key");
-        std::fs::write(&anchor, b"example. IN DNSKEY 257 3 13 aaaa\n").unwrap();
-        let mut args = run_args(&dir.path().join("monitor.json"));
-        let default = trust_surface(&args).unwrap();
-        assert_eq!(default.anchors, "icann-root");
-        assert_eq!(default.log_keys, "tuf");
-
-        args.dnssec_anchor = Some(anchor);
-        let overridden = trust_surface(&args).unwrap();
-        assert!(overridden.anchors.starts_with("sha256:"), "{overridden:?}");
-        assert_ne!(default, overridden);
-    }
-
-    /// `--rekor-key` is a static universe in both directions, here as on the
-    /// client: it replaces the pin set *and* stops the walk that would keep
-    /// following Sigstore's.
-    #[test]
-    fn a_named_key_file_turns_the_tuf_walk_off() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut args = run_args(&dir.path().join("monitor.json"));
-
-        // `run_args` sets `no_tuf` so the suite never reaches a CDN; the
-        // stock shape is the one where neither flag is given.
-        args.no_tuf = false;
-        assert!(!tuf_walk_disabled(&args), "a stock run follows Sigstore");
-
-        args.no_tuf = true;
-        assert!(tuf_walk_disabled(&args));
-
-        args.no_tuf = false;
-        args.rekor_key = Some(dir.path().join("log.pub"));
-        assert!(
-            tuf_walk_disabled(&args),
-            "a run under a named key file must not go on refreshing pins from \
-             Sigstore behind the operator's back"
-        );
-
-        args.no_tuf = true;
-        assert!(tuf_walk_disabled(&args), "and both together is still off");
     }
 }

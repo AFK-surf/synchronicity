@@ -6,8 +6,8 @@
 //! it that carries the weight of the rule itself — many randomized deliveries
 //! of one head set to N nodes, each in its own order and each seeing only some
 //! of it, then gossip until it settles — built directly on [`Syncer`] and
-//! [`Store`] so a case costs milliseconds and hundreds of them can run per test
-//! rather than a handful of scripted scenarios.
+//! [`Store`] so a case costs milliseconds and hundreds of them can run per
+//! test.
 //!
 //! What it pins is the join: `(seq, root)` under lexicographic order is a
 //! join-semilattice, so the head a node settles on is the *maximum* of what it
@@ -18,23 +18,18 @@
 //! case: applying the fork cap as an acceptance rule would leave a node that
 //! met the greatest root of a storm late never taking it.
 //!
-//! Two harnesses, because the rule and the decision are two things.
-//!
-//! `heads_converge_whatever_order_they_arrive_in` gossips a node's `head_floor`
-//! — the maximum over both slots — because that is the right stimulus for the
-//! property above: the join is about a node's current maximum. Every root there
-//! is fabricated, so everything sits in the pending slot and no promotion runs.
-//! That covers the *acceptance rule* and nothing else.
-//!
-//! `the_push_pull_decision_converges_over_real_slots` covers the part the wire
-//! actually runs, which is narrower in two ways: `heads_for` serves the
-//! **complete** slot only, and `sync_with` pushes off `complete_head` rather
-//! than off whichever summary was advertised. Every root there is a real trie,
-//! so promotion runs, the complete slot moves, and "converged" is checked as
-//! *servable* — the trie is here and the derived `entries` agree with the head —
-//! rather than merely known. That half used to be covered by nothing, and the
-//! decision is what a later audit found reading the store once per advertised
-//! origin on a runtime worker.
+//! Two harnesses, because the rule and the decision are two things:
+//! `heads_converge_whatever_order_they_arrive_in` gossips `head_floor` — the
+//! maximum over both slots — with fabricated roots, covering the acceptance
+//! rule and nothing else. `the_push_pull_decision_converges_over_real_slots`
+//! covers the part the wire actually runs, which is narrower in two ways:
+//! `heads_for` serves the **complete** slot only, and `sync_with` pushes off
+//! `complete_head` rather than off whichever summary was advertised. Every
+//! root there is a real trie, so promotion runs and "converged" is checked as
+//! *servable* — the trie is here and the derived `entries` agree with the
+//! head — rather than merely known. That half used to be covered by nothing,
+//! and the decision is what a later audit found reading the store once per
+//! advertised origin on a runtime worker.
 //!
 //! Still outstanding from §11: the live duplex transport, partitions and
 //! message loss as first-class events, and interleaved *publishes* (the heads
@@ -48,8 +43,7 @@ use synch_core::{Hash, OriginId, SignedHead};
 use synch_engine::reconcile::{Syncer, MAX_RETAINED_FORKS};
 use synch_store::{Binding, BindingSource, Store};
 
-/// xorshift64*, so a case is reproducible from its seed. Nothing here needs a
-/// real generator, and a seeded one is what makes a failure debuggable.
+/// xorshift64*, so a case is reproducible from its seed.
 struct Rng(u64);
 
 impl Rng {
@@ -260,10 +254,9 @@ fn one_case(seed: u64) {
     }
 }
 
-/// Every node settles on the same head, from every arrival order.
-///
-/// The property the whole of §5.2 rests on, and the one an acceptance rule that
-/// looks at anything but `(seq, root)` destroys.
+/// Every node settles on the same head, from every arrival order: the property
+/// the whole of §5.2 rests on, and the one an acceptance rule that looks at
+/// anything but `(seq, root)` destroys.
 #[test]
 fn heads_converge_whatever_order_they_arrive_in() {
     for seed in 0..10 {
@@ -271,26 +264,12 @@ fn heads_converge_whatever_order_they_arrive_in() {
     }
 }
 
-/// The same convergence property, gossiped the way the *protocol* gossips.
-///
-/// `one_case` above offers each node's `head_floor` — the maximum over both
-/// slots — which is the right stimulus for the acceptance rule and is not what
-/// the wire does. The wire is narrower in two ways that matter: `heads_for`
-/// serves the **complete** slot only, and `sync_with` pushes off `complete_head`
-/// rather than off whichever summary was advertised. So the push/pull *decision*
-/// — which origins each side asks for, and which heads it offers — was covered
-/// by nothing here, and the harness noted that as a scope boundary.
-///
-/// It is covered now, because the decision is the part that was quietly reading
-/// the store per advertised origin and had to be rewritten. Every root below is
-/// a real trie this node can serve, so promotion runs, the complete slot moves,
-/// and both narrowings are exercised: a node that has adopted a head but cannot
-/// serve it does not offer it, and a node that can serve an older root still
-/// advertises that.
-///
-/// What this still is not is a live duplex transport with partitions as
-/// first-class events (DESIGN §11). It is the decision over real slots and real
-/// tries, which is the half that was missing.
+/// The same convergence property, gossiped the way the *protocol* gossips:
+/// `heads_for` serves the complete slot only, and `sync_with` pushes off
+/// `complete_head` rather than off whichever summary was advertised. That
+/// decision was quietly reading the store per advertised origin and had to be
+/// rewritten; every root here is a real trie, so promotion runs and
+/// "converged" means servable, not merely known.
 #[test]
 fn the_push_pull_decision_converges_over_real_slots() {
     for seed in 0..8 {

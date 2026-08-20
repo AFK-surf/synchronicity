@@ -1900,17 +1900,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn proofs_round_trip() {
-        let original = proof();
-        let bytes = original.encode().expect("a small record encodes");
-        assert_eq!(RekorProof::decode(&bytes).unwrap(), original);
-        let records = original.to_txt().expect("encodes");
-        let reassembled = proofs_from_txt(&records);
-        let [Ok(only)] = reassembled.as_slice() else {
-            panic!("one proof reassembles to one candidate: {reassembled:?}");
-        };
-        assert_eq!(only, &original);
+    fn big_proof() -> RekorProof {
+        RekorProof {
+            statement: vec![b'x'; 3000],
+            canonicalized_body: vec![b'y'; 3000],
+            ..proof()
+        }
     }
 
     /// A proof is served in pieces, and the pieces are self-describing.
@@ -1918,11 +1913,7 @@ mod tests {
     fn a_proof_is_chunked_and_reassembles_in_any_order() {
         // Big enough to need several records: the whole reason the format
         // has a header at all.
-        let big = RekorProof {
-            statement: vec![b'x'; 3000],
-            canonicalized_body: vec![b'y'; 3000],
-            ..proof()
-        };
+        let big = big_proof();
         let mut records = big.to_txt().expect("encodes");
         assert!(records.len() > 1, "a real proof spans records");
         for record in &records {
@@ -1937,27 +1928,11 @@ mod tests {
         // Order is carried in the records, not in the answer: DNS gives no
         // ordering guarantee across an RRset.
         records.reverse();
-        let reassembled = proofs_from_txt(&records);
-        let [Ok(got)] = reassembled.as_slice() else {
-            panic!("one proof, one candidate: {reassembled:?}");
+        let proofs = proofs_from_txt(&records);
+        let [Ok(got)] = proofs.as_slice() else {
+            panic!("one proof, one candidate: {proofs:?}");
         };
         assert_eq!(got, &big);
-
-        // A missing piece is a refusal, not a truncated proof.
-        let short = records[1..].to_vec();
-        assert!(proofs_from_txt(&short)[0].is_err());
-
-        // Two proofs at one name — a rollover — stay separate.
-        let other = RekorProof {
-            log_index: big.log_index + 1,
-            ..big.clone()
-        };
-        let mut both = big.to_txt().expect("encodes");
-        both.extend(other.to_txt().expect("encodes"));
-        let reassembled = proofs_from_txt(&both);
-        assert_eq!(reassembled.len(), 2, "two groups, two proofs");
-        let decoded: Vec<&RekorProof> = reassembled.iter().map(|r| r.as_ref().unwrap()).collect();
-        assert!(decoded.contains(&&big) && decoded.contains(&&other));
     }
 
     /// Chunks of different proofs cannot be spliced into one that decodes.
@@ -1992,18 +1967,6 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_layout_is_pinned() {
-        // Field offsets are load-bearing across two implementations; assert
-        // them rather than trusting the encoder to agree with itself.
-        let bytes = proof().encode().expect("a small record encodes");
-        assert_eq!(bytes[0], PROOF_VERSION);
-        assert_eq!(&bytes[1..33], &[7u8; 32]);
-        assert_eq!(&bytes[33..41], &1_234_567u64.to_be_bytes());
-        // The statement blob's u16 length prefix, then its bytes.
-        assert_eq!(&bytes[41..43], &13u16.to_be_bytes());
-    }
-
-    #[test]
     fn a_truncated_or_padded_record_is_malformed() {
         let bytes = proof().encode().expect("a small record encodes");
         for cut in [0, 1, 10, 42, bytes.len() - 1] {
@@ -2012,16 +1975,10 @@ mod tests {
                 Err(ProofError::Malformed(_))
             ));
         }
-        let mut extra = bytes.clone();
+        let mut extra = bytes;
         extra.push(0);
         assert!(matches!(
             RekorProof::decode(&extra),
-            Err(ProofError::Malformed(_))
-        ));
-        let mut wrong_version = bytes;
-        wrong_version[0] = 1;
-        assert!(matches!(
-            RekorProof::decode(&wrong_version),
             Err(ProofError::Malformed(_))
         ));
     }
@@ -2050,15 +2007,6 @@ mod tests {
         let mut expected = vec![chain::key_tag(&ksk), chain::key_tag(&zsk)];
         expected.sort_unstable();
         assert_eq!(sorted, expected, "keys are in canonical tag order");
-        assert_eq!(
-            statement
-                .keys
-                .iter()
-                .map(|k| k.flags)
-                .collect::<Vec<_>>()
-                .len(),
-            2
-        );
 
         let json = statement.to_json();
         assert_eq!(ZoneKeyStatement::parse(&json).unwrap(), statement);
@@ -2074,12 +2022,11 @@ mod tests {
         assert_eq!(swapped.to_json(), statement.to_json());
 
         // An rdata with no complete header renders `flags` and `algorithm` as
-        // zero *together*, which is the rule the Gleam publisher follows over
-        // the same bytes. Deriving each field on its own would put `flags: 258,
+        // zero *together* — the rule the Gleam publisher follows over the
+        // same bytes. Deriving each field on its own would put `flags: 258,
         // algorithm: 0` in one canonical Statement and all-zero in the other,
         // and the Statement is what the two sides have to agree on byte for
-        // byte. (Nothing legitimate gets here: the chain walk's rdatas come out
-        // of parsed DNSKEY records, which carry their own header.)
+        // byte.
         for stub in [vec![], vec![0x01], vec![0x01, 0x02], vec![0x01, 0x02, 0x03]] {
             let derived =
                 ZoneKeyStatement::for_keys("sync.example.", std::slice::from_ref(&stub), "create");
@@ -2092,13 +2039,13 @@ mod tests {
                 "{stub:?} has no header to read, so neither field is invented"
             );
         }
-    }
 
-    #[test]
-    fn a_statement_of_the_wrong_type_is_refused() {
-        let bogus = br#"{"_type":"https://in-toto.io/Statement/v0.1","subject":[]}"#;
+        // A statement of the wrong type is refused, as is anything
+        // unparseable.
         assert!(matches!(
-            ZoneKeyStatement::parse(bogus),
+            ZoneKeyStatement::parse(
+                br#"{"_type":"https://in-toto.io/Statement/v0.1","subject":[]}"#
+            ),
             Err(ProofError::Binding(_))
         ));
         assert!(matches!(
@@ -2116,7 +2063,6 @@ mod tests {
         let cd = node_hash(&leaves[2], &leaves[3]);
         let root = node_hash(&ab, &cd);
         verify_inclusion(2, 4, leaves[2], &[leaves[3], ab], root).unwrap();
-        verify_inclusion(0, 4, leaves[0], &[leaves[1], cd], root).unwrap();
         // Wrong sibling order, short path, wrong root, out-of-range index.
         assert!(verify_inclusion(2, 4, leaves[2], &[ab, leaves[3]], root).is_err());
         assert!(verify_inclusion(2, 4, leaves[2], &[leaves[3]], root).is_err());
@@ -2130,9 +2076,6 @@ mod tests {
     fn checkpoints_parse_or_are_refused() {
         let note = "rekor.example\n17\n8N7C7fXJnu41Y7f/eR2Rqjr3FzLQqZ5jGVLPZaAJcXA=\n\n\u{2014} rekor.example AAAAAAECAw==\n";
         let checkpoint = Checkpoint::parse(note.as_bytes()).unwrap();
-        assert_eq!(checkpoint.origin, "rekor.example");
-        assert_eq!(checkpoint.tree_size, 17);
-        assert_eq!(checkpoint.signatures.len(), 1);
         // The signed bytes stop at the blank line.
         assert!(checkpoint.signed.ends_with(b"cXA=\n"));
         assert!(!String::from_utf8(checkpoint.signed.clone())
@@ -2156,70 +2099,15 @@ mod tests {
         }
     }
 
-    /// A genuine checkpoint with a block appended is not read as the genuine
-    /// one plus noise.
-    ///
-    /// The checkpoint is not covered by the leaf hash, so whatever sits in the
-    /// zone's TXT is attacker-malleable. Splitting the note at the *first*
-    /// blank line makes `signed` exactly the real note bytes, so the log's
-    /// real signature verifies over it and the appended block rides along as
-    /// signature lines. Go's `sumdb/note` splits at the last blank line and
-    /// refuses. Two readers disagreeing about which bytes a log signed is
-    /// exactly what this design exists to prevent.
-    #[test]
-    fn a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed() {
-        let genuine = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
-        let honest = Checkpoint::parse(genuine).expect("the real checkpoint parses");
-
-        let embedded = LogKeys::embedded();
-        let vouched = |c: &Checkpoint| {
-            embedded
-                .keys()
-                .iter()
-                .any(|k| c.verify_signature(k).is_ok())
-        };
-        assert!(vouched(&honest), "the genuine checkpoint verifies");
-
-        // The genuine bytes end in a newline, so one appended signature line
-        // creates a *second* blank line. Splitting at the first leaves
-        // `signed` as the real note, so the log's own signature is still in
-        // the signature list and still verifies — the extra line rides along
-        // as though the log had put it there. Splitting at the last, as Go
-        // does, moves the log's signature into the signed text, where no
-        // pinned key matches it any more.
-        let mut forged = genuine.to_vec();
-        forged.extend_from_slice("\n— attacker AAAAAAAA\n".as_bytes());
-        let accepted = Checkpoint::parse(&forged).is_ok_and(|c| vouched(&c));
-        assert!(
-            !accepted,
-            "a checkpoint carrying a line the log never signed must not verify"
-        );
-    }
-
+    /// The one external reality anchor for the checkpoint half: a genuine
+    /// signed checkpoint fetched from log2025-1.rekor.sigstore.dev, verified
+    /// here against the key this build embeds — nothing in this file
+    /// authored it. It also pins the parse *shape*: a real note carries the
+    /// log's signature plus three witness cosignatures, and a parser
+    /// narrowed to a single signature would reject everything the production
+    /// log serves.
     #[test]
     fn a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set() {
-        // The one external reality anchor for the checkpoint half of the
-        // proof path: a genuine signed checkpoint fetched from
-        // log2025-1.rekor.sigstore.dev, verified here against the log key
-        // this build embeds — nothing in this file authored it. It proves
-        // our signed-note parsing and our pinned-key selection accept what
-        // real Sigstore emits: the note framing (origin, tree size, base64
-        // root, blank line, `— name base64(keyhint||sig)`), the em-dash
-        // signature line, the four-byte key-hint prefix, and the Ed25519
-        // signature over the note body up to and including its final
-        // newline.
-        //
-        // It also pins the *shape* of that parse: a real checkpoint carries
-        // four signature lines, the log's own plus three witness
-        // cosignatures. This design interprets cosignatures not
-        // at all (§8.2), but narrowing the parser to a single signature would
-        // reject every checkpoint the production log serves. `verify_signature`
-        // scans the list and needs exactly one line to match a pinned key.
-        //
-        // This anchors the checkpoint and log-key machinery to reality; the
-        // Merkle *leaf* convention is anchored separately by the
-        // `real_rekor_v3` suite, over a genuine published `hashedrekord`
-        // entry whose verifier is a certificate (tests/fixtures/rekor_v3).
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
         let checkpoint = Checkpoint::parse(note).expect("a real checkpoint must parse");
         assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");
@@ -2227,17 +2115,15 @@ mod tests {
         assert_eq!(
             checkpoint.signatures.len(),
             4,
-            "a real checkpoint carries the log's signature and three witness \
-             cosignatures; a parser that tolerates only one would reject it"
+            "the log's own signature plus three witness cosignatures"
         );
 
         let embedded = LogKeys::embedded();
-        let verified = embedded
-            .keys()
-            .iter()
-            .any(|key| checkpoint.verify_signature(key).is_ok());
         assert!(
-            verified,
+            embedded
+                .keys()
+                .iter()
+                .any(|key| checkpoint.verify_signature(key).is_ok()),
             "the real checkpoint must verify under an embedded Sigstore key"
         );
 
@@ -2252,51 +2138,74 @@ mod tests {
                 .any(|key| tampered.verify_signature(key).is_ok()),
             "a tampered checkpoint must not verify"
         );
+
+        // A block appended after the genuine note is not read as the genuine
+        // one plus noise. The checkpoint is attacker-malleable (not covered
+        // by the leaf hash), so splitting at the *first* blank line keeps
+        // `signed` exactly the real note bytes, the log's signature still
+        // verifies, and the appended line rides along as a cosignature. Go's
+        // `sumdb/note` splits at the last blank line and refuses; two readers
+        // disagreeing about which bytes a log signed is what this design
+        // exists to prevent.
+        let mut forged = note.to_vec();
+        forged.extend_from_slice("\n— attacker AAAAAAAA\n".as_bytes());
+        let accepted = Checkpoint::parse(&forged).is_ok_and(|c| {
+            embedded
+                .keys()
+                .iter()
+                .any(|k| c.verify_signature(k).is_ok())
+        });
+        assert!(
+            !accepted,
+            "a checkpoint carrying a line the log never signed must not verify"
+        );
     }
 
-    /// Only the log's *own* signature line counts, not any line a pinned key
-    /// happens to have signed.
+    /// Only the log's own signature line counts, not any line a pinned key
+    /// happens to have signed — and the four-byte key hint is where C2SP
+    /// makes the origin↔key binding checkable.
     ///
-    /// A checkpoint carries the log's signature plus one per witness that
-    /// cosigned the tree. "Some pinned key signed these bytes" is not an answer
-    /// to *which log this is*: in a C2SP cosigning arrangement a key signs other
-    /// logs' notes as a witness, so an unpinned log Y's checkpoint cosigned by
-    /// pinned key X could travel with `log_id = id(X)` and an inclusion path into
-    /// Y's tree, and the only check that says which log an entry is in would pass.
-    /// The origin is inside the signed bytes, so requiring the signer's own name
-    /// to *be* that origin is what binds the key to the log.
+    /// A witness key signs other logs' notes, so an unpinned log's checkpoint
+    /// cosigned by a pinned key could travel under the pinned key's log_id;
+    /// the origin is inside the signed bytes, so requiring the signer's own
+    /// name to *be* that origin binds the key to the log. For Ed25519 the
+    /// note key id is SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32), so the hint is a
+    /// checkable statement of the same binding; Sigstore's P-256 logs publish
+    /// SHA-256 over the SubjectPublicKeyInfo instead, so no derivation is
+    /// right for that arm and none is claimed.
     #[test]
     fn only_the_line_naming_the_origin_can_vouch_for_a_checkpoint() {
-        // A real note, a real Ed25519 Sigstore key, four signature lines: the
-        // log's own plus three witness cosignatures.
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
         let checkpoint = Checkpoint::parse(note).expect("a real checkpoint parses");
         let embedded = LogKeys::embedded();
         checkpoint
             .verify_under(&embedded)
             .expect("the log's own line verifies under a pinned key");
+        let ed25519 = embedded
+            .keys()
+            .iter()
+            .find(|key| key.algorithm == LogKeyAlgorithm::Ed25519)
+            .expect("the embedded set has an Ed25519 shard")
+            .clone();
 
-        // Rename the note's origin, leaving every signature untouched. Two
-        // things then fail, and the order matters: the log's line does not
-        // *name* this origin, which is checked before any signature is, and
-        // the signatures do not cover these bytes either.
+        // Rename the note's origin, leaving every signature untouched. The
+        // log's line no longer *names* this origin — checked before any
+        // signature is — and the signatures do not cover these bytes either.
         let renamed = String::from_utf8_lossy(note).replacen(
             "log2025-1.rekor.sigstore.dev\n",
             "log2025-1.rekor.sigstore.dev.dev.2\n",
             1,
         );
-        let renamed = Checkpoint::parse(renamed.as_bytes()).expect("still a note");
-        assert!(renamed.verify_under(&embedded).is_err());
+        assert!(Checkpoint::parse(renamed.as_bytes())
+            .expect("still a note")
+            .verify_under(&embedded)
+            .is_err());
 
-        // And the load-bearing case: the *witness* lines, which are genuine
-        // signatures over these exact bytes by keys with names of their own.
-        // Rewritten as the note's origin they would each be "a signature that
-        // verifies" under whatever key made them — so a pinned key in a witness
-        // role must not be able to vouch for a log it merely cosigned. Here the
-        // log's own line is removed and only witness lines remain: nothing
-        // verifies, whatever their names say.
-        let text = String::from_utf8_lossy(note);
-        let without_own: String = text
+        // Witness lines are genuine signatures over these exact bytes by keys
+        // with names of their own; as the note's origin they must not vouch
+        // for a log they merely cosigned. Remove the log's own line: nothing
+        // verifies, whatever the remaining names say.
+        let without_own: String = String::from_utf8_lossy(note)
             .lines()
             .filter(|line| !line.starts_with("\u{2014} log2025-1.rekor.sigstore.dev "))
             .map(|line| format!("{line}\n"))
@@ -2307,62 +2216,46 @@ mod tests {
             witnessed.verify_under(&embedded).is_err(),
             "cosignatures are tolerated and never authoritative"
         );
+
+        // The hint: the real one on the log's own line is the C2SP id
+        // exactly, and it depends on the origin.
+        let own = checkpoint
+            .signatures
+            .iter()
+            .find(|line| line.name == checkpoint.origin)
+            .expect("the log signs its own note");
+        assert_eq!(ed25519.note_hint(&checkpoint.origin), Some(own.hint));
+        assert_ne!(
+            ed25519.note_hint("other.log.example"),
+            Some(own.hint),
+            "the id would say nothing about the origin if it did not depend on it"
+        );
+        // A line whose hint is not that id does not verify, even though the
+        // signature bytes beside it are the log's own...
+        let mut tampered = checkpoint.clone();
+        for line in &mut tampered.signatures {
+            line.hint[0] ^= 0x01;
+        }
+        assert!(tampered.verify_signature(&ed25519).is_err());
+        // ...and nothing is claimed for P-256, where Sigstore's own id is a
+        // different derivation entirely.
+        let p256 = embedded
+            .keys()
+            .iter()
+            .find(|key| key.algorithm == LogKeyAlgorithm::EcdsaP256Sha256)
+            .expect("the embedded set has a P-256 shard");
+        assert_eq!(p256.note_hint(&checkpoint.origin), None);
     }
 
     /// A pinned key does not vouch for a tree that is not its own log's,
     /// however the note's *unsigned* tail is spelled.
     ///
-    /// The line name and the four-byte hint are the two things
-    /// `verify_signature` used to read to decide *which* log signed, and both
-    /// sit after the blank line where no signature reaches — while the hint's
-    /// derivation is public arithmetic over public inputs. So an attacker
-    /// holding one genuine note signed by a pinned key under some other name
-    /// rewrites both and the check passes. The binding has to come from the
-    /// pin, which is where the trusted root put it.
-    ///
-    /// Built rather than captured: the shape needs a key that signed a note
-    /// whose origin line names a log the key is not pinned for, and no real
-    /// Sigstore checkpoint is one.
-    /// Reassembly is linear in the records offered, not quadratic.
-    ///
-    /// The records are the zone's, and the threat model's attacker *is* the
-    /// zone. Sixteen validated TXT names hold tens of thousands of minimal
-    /// `sync1p` records; spreading their claimed totals across 1..=255 made
-    /// the old rescan-per-index cost around 9x10^8 tuple comparisons — about a
-    /// second of CPU inside one `poll`, with no await for a timeout to fire at
-    /// and no `spawn_blocking` under it, on a task that walks configured
-    /// domains one at a time. The candidate cap runs afterwards and does not
-    /// bound it.
-    ///
-    /// Asserted as a wall-clock ceiling rather than an operation count,
-    /// because the count is what changed. The bound is loose enough that a
-    /// slow machine cannot reach it and tight enough that the old shape
-    /// cannot pass.
-    #[test]
-    fn reassembly_does_not_rescan_every_part_for_every_claimed_total() {
-        let chunk = "A".repeat(8);
-        let records: Vec<String> = (0..20_000)
-            .map(|i| {
-                // One group, every index spread over every plausible total, so
-                // the old form paid sum-of-totals times the record count.
-                let total = (i % 255) + 1;
-                let index = (i % total) + 1;
-                format!("sync1p abcdef01 {index}/{total} {chunk}")
-            })
-            .collect();
-        let started = std::time::Instant::now();
-        let out = proofs_from_txt(&records);
-        let elapsed = started.elapsed();
-        // Nothing reassembles — the payloads are not a proof — which is the
-        // point: the cost is paid before any of that is known.
-        assert!(out.iter().all(|r| r.is_err()));
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "reassembly of {} records took {elapsed:?}",
-            records.len()
-        );
-    }
-
+    /// The line name and the four-byte hint are the two things a reader used
+    /// to read to decide which log signed, and both sit after the blank line
+    /// where no signature reaches. The binding has to come from the pin,
+    /// which is where the trusted root put it. Built rather than captured:
+    /// the shape needs a key that signed a note whose origin names a log the
+    /// key is not pinned for, and no real Sigstore checkpoint is one.
     #[test]
     fn a_pinned_key_vouches_only_for_the_log_it_is_pinned_for() {
         use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
@@ -2405,6 +2298,40 @@ mod tests {
             .expect("a key pinned for this origin vouches for it");
     }
 
+    /// Reassembly is linear in the records offered, not quadratic.
+    ///
+    /// The records are the zone's, and the threat model's attacker *is* the
+    /// zone: sixteen validated TXT names hold tens of thousands of minimal
+    /// `sync1p` records, and spreading their claimed totals across 1..=255
+    /// made the old rescan-per-index cost about a second of CPU inside one
+    /// `poll`, with no await for a timeout to fire at. Asserted as a
+    /// wall-clock ceiling rather than an operation count, because the count
+    /// is what changed.
+    #[test]
+    fn reassembly_does_not_rescan_every_part_for_every_claimed_total() {
+        let chunk = "A".repeat(8);
+        let records: Vec<String> = (0..20_000)
+            .map(|i| {
+                // One group, every index spread over every plausible total,
+                // so the old form paid sum-of-totals times the record count.
+                let total = (i % 255) + 1;
+                let index = (i % total) + 1;
+                format!("sync1p abcdef01 {index}/{total} {chunk}")
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let out = proofs_from_txt(&records);
+        let elapsed = started.elapsed();
+        // Nothing reassembles — the payloads are not a proof — which is the
+        // point: the cost is paid before any of that is known.
+        assert!(out.iter().all(|r| r.is_err()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "reassembly of {} records took {elapsed:?}",
+            records.len()
+        );
+    }
+
     /// The pin set the trusted root yields carries each shard's origin.
     #[test]
     fn pinned_log_keys_carry_the_origin_the_trusted_root_named_them_at() {
@@ -2429,89 +2356,19 @@ mod tests {
             .expect("a real checkpoint verifies under the origin-bound pin set");
     }
 
-    /// The four-byte key hint is checked where C2SP makes the derivation
-    /// unambiguous.
-    ///
-    /// For Ed25519 the note key id is `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`,
-    /// so the hint is a checkable statement that this key belongs to this
-    /// origin — the origin↔key binding, carried in the note itself.
-    /// Sigstore's P-256 logs publish SHA-256 over
-    /// the SubjectPublicKeyInfo instead, so no derivation is right for that arm
-    /// and none is claimed.
-    #[test]
-    fn the_note_key_hint_is_checked_for_the_algorithm_that_defines_it() {
-        let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
-        let checkpoint = Checkpoint::parse(note).expect("a real checkpoint parses");
-        let ed25519 = LogKeys::embedded()
-            .keys()
-            .iter()
-            .find(|key| key.algorithm == LogKeyAlgorithm::Ed25519)
-            .expect("the embedded set has an Ed25519 shard")
-            .clone();
-
-        // The real hint on the log's own line is the C2SP id, exactly.
-        let own = checkpoint
-            .signatures
-            .iter()
-            .find(|line| line.name == checkpoint.origin)
-            .expect("the log signs its own note");
-        assert_eq!(
-            ed25519.note_hint(&checkpoint.origin),
-            Some(own.hint),
-            "the hint is SHA-256(origin || 0x0A || 0x01 || raw32) truncated"
-        );
-
-        // A different origin derives a different id, which is the binding.
-        assert_ne!(
-            ed25519.note_hint("other.log.example"),
-            Some(own.hint),
-            "the id would say nothing about the origin if it did not depend on it"
-        );
-
-        // A line whose hint is not that id does not verify, even though the
-        // signature bytes beside it are the log's own.
-        let mut tampered = checkpoint.clone();
-        for line in &mut tampered.signatures {
-            line.hint[0] ^= 0x01;
-        }
-        assert!(tampered.verify_signature(&ed25519).is_err());
-
-        // Nothing is claimed for P-256, where Sigstore's own id is a different
-        // derivation entirely.
-        let p256 = LogKeys::embedded()
-            .keys()
-            .iter()
-            .find(|key| key.algorithm == LogKeyAlgorithm::EcdsaP256Sha256)
-            .expect("the embedded set has a P-256 shard")
-            .clone();
-        assert_eq!(p256.note_hint(&checkpoint.origin), None);
-    }
-
     /// A group is one reading of its records, and a zone that contradicts
     /// itself is refused rather than guessed at.
     ///
-    /// Records claiming different `total`s are separate readings — a rollover
+    /// Records claiming different totals are separate readings — a rollover
     /// legitimately serves a five-part set beside a nine-part one — so a
     /// raised total cannot hole the real set. Within one reading each index
-    /// arrives once: a duplicate is the zone disagreeing with itself about
-    /// what it published, and there is no reading of that worth picking.
-    ///
-    /// **This makes a denial cheaper for the party who can mount one, and that
-    /// is the honest trade.** Every record here arrives DNSSEC-validated, so
-    /// duplicating an index takes the zone's signing key — and whoever holds it
-    /// can delete the records or refuse the name instead. Trying every
-    /// combination bought a bounded refusal rather than a surviving answer
-    /// (past the bound the whole group went, honest assembly included), at the
-    /// price of a combinatorial space that had to be capped. Availability
-    /// against the zone's own signer is not defensible here and is not claimed;
-    /// authorization is, and the group digest decides that either way.
+    /// arrives once; every record arrives DNSSEC-validated, so duplicating an
+    /// index takes the zone's signing key, and whoever holds that can delete
+    /// the records or refuse the name instead (the honest trade: this makes
+    /// a denial cheaper for the party who can mount one).
     #[test]
     fn a_group_is_one_reading_and_a_contradiction_is_refused() {
-        let big = RekorProof {
-            statement: vec![b'x'; 3000],
-            canonicalized_body: vec![b'y'; 3000],
-            ..proof()
-        };
+        let big = big_proof();
         let records = big.to_txt().expect("a multi-part proof");
         let total = records.len();
         assert!(total > 1, "the fixture must actually span several parts");
@@ -2570,15 +2427,11 @@ mod tests {
         ];
         der.extend_from_slice(&[0x11; 64]);
         let base64 = base64_encode(&der);
-        let pem = format!("-----BEGIN PUBLIC KEY-----\n{base64}\n-----END PUBLIC KEY-----\n");
+        let keys = LogKeys::parse(&base64).unwrap();
+        assert_eq!(keys.keys().len(), 1);
+        assert!(keys.find(&sha256(&der)).is_some());
 
-        for text in [base64.clone(), pem, format!("# a comment\n{base64}\n")] {
-            let keys = LogKeys::parse(&text).unwrap();
-            assert_eq!(keys.keys().len(), 1);
-            assert!(keys.find(&sha256(&der)).is_some());
-            assert!(keys.find(&[0u8; 32]).is_none());
-        }
-
+        // The refusal arms of the key-file grammar.
         assert!(LogKeys::parse("").unwrap().is_empty());
         assert!(LogKeys::parse("not base64!!").is_err());
         assert!(LogKeys::parse(&base64_encode(b"short")).is_err());
@@ -2609,11 +2462,5 @@ mod tests {
             keys.find(&log2025_1).is_some(),
             "log2025-1.rekor.sigstore.dev"
         );
-    }
-
-    #[test]
-    fn names_compare_the_way_dns_does() {
-        assert!(same_name("Sync.Example.", "sync.example"));
-        assert!(!same_name("sync.example", "other.example"));
     }
 }

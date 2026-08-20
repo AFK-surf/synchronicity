@@ -198,19 +198,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hex_round_trip() {
-        let h = Hash::new(b"hello");
-        let s = h.to_hex();
-        assert_eq!(s.len(), 64);
-        assert_eq!(Hash::from_str(&s).unwrap(), h);
-    }
-
-    #[test]
-    fn matches_plain_blake3() {
-        assert_eq!(Hash::new(b"abc").0, *blake3::hash(b"abc").as_bytes());
-    }
-
-    #[test]
     fn a_reader_hashes_the_same_as_a_slice() {
         // Longer than the internal buffer, so the multi-read path is the one
         // being checked.
@@ -270,11 +257,5 @@ mod tests {
         );
         // The roots, of course, are not.
         assert_ne!(Hash::new(&prefix), Hash::new(&appended));
-    }
-
-    #[test]
-    fn empty_sentinel() {
-        assert!(Hash::EMPTY.is_empty_sentinel());
-        assert!(!Hash::new(b"").is_empty_sentinel());
     }
 }

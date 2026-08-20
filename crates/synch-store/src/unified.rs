@@ -509,35 +509,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil;
     use synch_core::FileEntry;
 
-    /// A reading clock later than any time these tests publish, so the order
-    /// clamps nothing except where a test is about the clamp.
+    /// A reading clock later than any time these tests publish, so the order clamps nothing except where a test is about the clamp.
     const READ_AT: i64 = i64::MAX;
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
-    }
 
     fn origin(name: &str) -> OriginId {
         OriginId::named(name, "x.example").unwrap()
     }
 
+    fn put(store: &Store, space: &str, name: &str, path: &str, entry: &FileEntry) {
+        store.put_entry(&origin(name), space, path, entry).unwrap();
+    }
+
+    fn symlink(target: &str, mtime: i64, seq: u64) -> FileEntry {
+        let mut entry = FileEntry::tombstone(mtime, seq, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some(target.to_string());
+        entry.size = target.len() as u64;
+        entry
+    }
+
+    /// Config rows store the rendered policy; the round-trip plus the refusal of a malformed form is the wire-format guard.
     #[test]
     fn policies_round_trip_through_their_text() {
         for text in ["newest", "strict", "origin=nas@x.example", "origin=key:abc"] {
+            let parsed: std::result::Result<VersionPolicy, _> = text.parse();
             if text == "origin=key:abc" {
-                // Not a real key, so it must be refused rather than stored.
-                assert!(text.parse::<VersionPolicy>().is_err());
-                continue;
+                assert!(
+                    parsed.is_err(),
+                    "a key that is not a real key is refused rather than stored"
+                );
+            } else {
+                assert_eq!(parsed.unwrap().render(), text);
             }
-            let policy: VersionPolicy = text.parse().unwrap();
-            assert_eq!(policy.render(), text);
         }
         assert_eq!(VersionPolicy::default(), VersionPolicy::Newest);
-        assert!("origin".parse::<VersionPolicy>().is_err());
         assert!("".parse::<VersionPolicy>().is_err());
         assert_eq!(
             "origin=nas@x.example"
@@ -548,108 +556,99 @@ mod tests {
         );
     }
 
+    /// Three attestors publishing the same bytes collapse into one version; agreement renders as a plain file any policy reads the same.
     #[test]
     fn agreeing_origins_collapse_into_one_version() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         let content = Hash::new(b"same");
         for name in ["nas", "laptop", "vps"] {
-            store
-                .put_entry(
-                    &origin(name),
-                    "media",
-                    "a.txt",
-                    &FileEntry::file(4, 100, content, 1),
-                )
-                .unwrap();
+            put(
+                &store,
+                "media",
+                name,
+                "a.txt",
+                &FileEntry::file(4, 100, content, 1),
+            );
         }
         let set = store.versions_for("media", "a.txt").unwrap();
         assert_eq!(set.version_count(), 1);
         assert!(!set.is_divergent());
         assert!(set.exists());
         assert_eq!(set.versions[0].attestors.len(), 3);
-        // Agreement renders as a plain file: any policy reads the same bytes.
         for policy in [VersionPolicy::Newest, VersionPolicy::Strict] {
-            let selected = set.select(&policy, READ_AT).entry().unwrap().clone();
-            assert_eq!(selected.content, Some(content));
+            assert_eq!(
+                set.select(&policy, READ_AT).entry().unwrap().content,
+                Some(content),
+                "any policy reads the agreed bytes"
+            );
         }
     }
 
+    /// Divergence is visible to the caller, and selection is deterministic: newest takes the greater mtime, a pin reads its side, strict refuses.
     #[test]
     fn divergence_is_visible_and_selection_is_deterministic() {
-        let (_d, store) = store();
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::file(1, 500, Hash::new(b"theirs"), 9),
-            )
-            .unwrap();
-        store
-            .put_entry(
-                &origin("laptop"),
-                "media",
-                "f",
-                &FileEntry::file(1, 100, Hash::new(b"ours"), 2),
-            )
-            .unwrap();
-
+        let (_d, store) = testutil::store();
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::file(1, 500, Hash::new(b"theirs"), 9),
+        );
+        put(
+            &store,
+            "media",
+            "laptop",
+            "f",
+            &FileEntry::file(1, 100, Hash::new(b"ours"), 2),
+        );
         let set = store.versions_for("media", "f").unwrap();
         assert_eq!(set.version_count(), 2);
         assert!(set.is_divergent());
-
-        // `newest` takes the greater mtime, and says so identically every time.
         let selected = set
             .select(&VersionPolicy::Newest, READ_AT)
             .entry()
             .unwrap()
             .clone();
-        assert_eq!(selected.origin, origin("nas"));
-        for _ in 0..5 {
-            assert_eq!(
-                set.select(&VersionPolicy::Newest, READ_AT)
-                    .entry()
-                    .unwrap()
-                    .origin,
-                origin("nas")
-            );
-        }
-        // A pin reads the other side.
+        assert_eq!(
+            selected.origin,
+            origin("nas"),
+            "`newest` takes the greater mtime, identically every time"
+        );
         assert_eq!(
             set.select(&VersionPolicy::Origin(origin("laptop")), READ_AT)
                 .entry()
                 .unwrap()
                 .content,
-            Some(Hash::new(b"ours"))
+            Some(Hash::new(b"ours")),
+            "a pin reads the other side"
         );
-        // Strict refuses, and the version list is what the caller reports.
         assert_eq!(
             set.select(&VersionPolicy::Strict, READ_AT),
-            Selection::Divergent
+            Selection::Divergent,
+            "strict refuses"
         );
         assert_eq!(set.describe().len(), 2);
         assert!(set.describe()[0].contains("nas@x.example"));
-        // A pin on an origin that publishes nothing here selects nothing.
         assert_eq!(
             set.select(&VersionPolicy::Origin(origin("vps")), READ_AT),
-            Selection::Absent
+            Selection::Absent,
+            "a pin on an origin that publishes nothing selects nothing"
         );
     }
 
-    /// The order is total: equal mtimes fall through to the content root, and
-    /// equal roots to the origin — never to iteration order.
+    /// The order is total: equal mtimes fall through to the content root, and equal roots to the origin — never to iteration order.
     #[test]
     fn the_selection_order_is_total() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         for (name, content) in [("a", b"one"), ("b", b"two")] {
-            store
-                .put_entry(
-                    &origin(name),
-                    "s",
-                    "tied",
-                    &FileEntry::file(3, 42, Hash::new(content), 1),
-                )
-                .unwrap();
+            put(
+                &store,
+                "s",
+                name,
+                "tied",
+                &FileEntry::file(3, 42, Hash::new(content), 1),
+            );
         }
         let set = store.versions_for("s", "tied").unwrap();
         assert!(set.is_divergent());
@@ -658,15 +657,14 @@ mod tests {
             .entry()
             .unwrap()
             .clone();
-        // Whichever root sorts greater wins, and the answer does not depend on
-        // which origin happened to publish first.
+        // Whichever root sorts greater wins, and the answer does not depend
+        // on which origin happened to publish first.
         let expected = if Hash::new(b"one").as_bytes() > Hash::new(b"two").as_bytes() {
             origin("a")
         } else {
             origin("b")
         };
         assert_eq!(winner.origin, expected);
-        // The presented order agrees with the selection.
         assert_eq!(
             set.versions.last().unwrap().content,
             winner.content,
@@ -674,75 +672,123 @@ mod tests {
         );
     }
 
+    /// A tombstone is a content-less version that speaks only for the origin that published it: the path stays visible while any origin is still live, and once every publisher tombstones it — or as soon as a lone publisher deletes it — the path has left the tree (§8).
     #[test]
-    fn a_tombstone_is_a_content_less_version() {
-        let (_d, store) = store();
-        store
-            .put_entry(
-                &origin("nas"),
-                "s",
-                "f",
-                &FileEntry::file(1, 100, Hash::new(b"live"), 1),
-            )
-            .unwrap();
-        store
-            .put_entry(
-                &origin("laptop"),
-                "s",
-                "f",
-                &FileEntry::tombstone(200, 3, None),
-            )
-            .unwrap();
-
-        let set = store.versions_for("s", "f").unwrap();
+    fn a_tombstone_removes_only_its_own_origins_version() {
+        let (_d, store) = testutil::store();
+        let live = Hash::new(b"still here");
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::file(9, 100, live, 1),
+        );
+        // A deletion published later than the live version: what an attacker
+        // would send, and what an honest late deletion looks like too.
+        put(
+            &store,
+            "media",
+            "laptop",
+            "f",
+            &FileEntry::tombstone(9_000, 2, None),
+        );
+        let set = store.versions_for("media", "f").unwrap();
         assert_eq!(set.version_count(), 2, "live + tombstone is divergence");
-        assert!(set.exists(), "the path stays visible until it is resolved");
-        // The deletion speaks for the origin that published it, so `newest`
-        // reads the version that is still live (§8).
+        assert!(set.exists(), "one origin still publishes it");
         let selected = set
             .select(&VersionPolicy::Newest, READ_AT)
             .entry()
             .unwrap()
             .clone();
-        assert_eq!(selected.kind, EntryKind::File);
+        assert_eq!(selected.content, Some(live));
         assert_eq!(selected.origin, origin("nas"));
-
-        // Once every publisher tombstones it, the path has left the tree.
-        store
-            .put_entry(
-                &origin("nas"),
-                "s",
-                "f",
-                &FileEntry::tombstone(300, 4, None),
-            )
-            .unwrap();
-        let set = store.versions_for("s", "f").unwrap();
+        assert_eq!(
+            set.select(&VersionPolicy::Origin(origin("laptop")), READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone,
+            "pinned to the deleting origin, the deletion is the answer"
+        );
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::tombstone(9_000, 3, None),
+        );
+        let set = store.versions_for("media", "f").unwrap();
         assert_eq!(set.version_count(), 1, "tombstones collapse together");
         assert!(!set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT),
+            Selection::Absent
+        );
+        // A lone origin reads exactly as it always did: delete and it is gone.
+        let (_d2, store) = testutil::store();
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::file(9, 100, Hash::new(b"c"), 1),
+        );
+        assert!(store
+            .versions_for("media", "f")
+            .unwrap()
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .is_some());
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::tombstone(200, 2, None),
+        );
+        let set = store.versions_for("media", "f").unwrap();
+        assert!(!set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT),
+            Selection::Absent
+        );
+        assert_eq!(
+            set.select(&VersionPolicy::Strict, READ_AT),
+            Selection::Absent
+        );
+        assert_eq!(
+            set.select(&VersionPolicy::Origin(origin("nas")), READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone,
+            "the pinned view still sees the deletion itself"
+        );
     }
 
+    /// Prefix bounding, start_after pagination, limit, and one-row-per-path grouping of the unified listing.
     #[test]
     fn the_unified_listing_paginates_over_paths() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         for path in ["a/1", "a/2", "a/3", "b/1"] {
             for name in ["nas", "laptop"] {
-                store
-                    .put_entry(
-                        &origin(name),
-                        "s",
-                        path,
-                        &FileEntry::file(1, 0, Hash::new(name.as_bytes()), 1),
-                    )
-                    .unwrap();
+                put(
+                    &store,
+                    "s",
+                    name,
+                    path,
+                    &FileEntry::file(1, 0, Hash::new(name.as_bytes()), 1),
+                );
             }
         }
         let all = store.unified_listing("s", "", None, None).unwrap();
         assert_eq!(all.len(), 4, "one row per path, not per origin");
         assert!(all.iter().all(|s| s.is_divergent()));
-
-        let under_a = store.unified_listing("s", "a/", None, None).unwrap();
-        assert_eq!(under_a.len(), 3);
-
+        assert_eq!(
+            store.unified_listing("s", "a/", None, None).unwrap().len(),
+            3
+        );
         let page = store.unified_listing("s", "a/", None, Some(2)).unwrap();
         assert_eq!(
             page.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(),
@@ -757,47 +803,33 @@ mod tests {
             .is_empty());
     }
 
-    fn symlink(target: &str, mtime: i64, seq: u64) -> FileEntry {
-        let mut entry = FileEntry::tombstone(mtime, seq, None);
-        entry.kind = EntryKind::Symlink;
-        entry.symlink_target = Some(target.to_string());
-        entry.size = target.len() as u64;
-        entry
-    }
-
+    /// §8: a content-less kind's version identity is (kind, target): different targets diverge, the same target agrees.
     #[test]
     fn two_symlinks_with_different_targets_are_two_versions() {
-        // §8: a content-less kind's version identity is (kind, target).
-        let (_d, store) = store();
-        store
-            .put_entry(&origin("nas"), "media", "link", &symlink("../a", 100, 1))
-            .unwrap();
-        store
-            .put_entry(&origin("laptop"), "media", "link", &symlink("../b", 200, 1))
-            .unwrap();
-
+        let (_d, store) = testutil::store();
+        put(&store, "media", "nas", "link", &symlink("../a", 100, 1));
+        put(&store, "media", "laptop", "link", &symlink("../b", 200, 1));
         let set = store.versions_for("media", "link").unwrap();
         assert_eq!(set.version_count(), 2);
         assert!(set.is_divergent(), "different targets diverge");
         let described = set.describe().join(" | ");
-        assert!(described.contains("-> ../a"), "{described}");
-        assert!(described.contains("-> ../b"), "{described}");
-
-        // The newest mtime still selects deterministically.
-        let selected = set.select(&VersionPolicy::Newest, READ_AT);
-        assert_eq!(
-            selected.entry().unwrap().symlink_target.as_deref(),
-            Some("../b")
+        assert!(
+            described.contains("-> ../a") && described.contains("-> ../b"),
+            "{described}"
         );
-    }
-
-    #[test]
-    fn symlinks_with_the_same_target_agree() {
-        let (_d, store) = store();
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT)
+                .entry()
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("../b"),
+            "the newest mtime still selects deterministically"
+        );
+        // The same target agrees: one version, two attestors.
+        let (_d2, store) = testutil::store();
         for name in ["nas", "laptop"] {
-            store
-                .put_entry(&origin(name), "media", "link", &symlink("../a", 100, 1))
-                .unwrap();
+            put(&store, "media", name, "link", &symlink("../a", 100, 1));
         }
         let set = store.versions_for("media", "link").unwrap();
         assert_eq!(set.version_count(), 1);
@@ -806,262 +838,76 @@ mod tests {
         assert!(set.versions[0].is_symlink());
     }
 
+    /// Kind is part of the version key: a link and a file never collapse, and selection flips deterministically when the link overtakes.
     #[test]
     fn a_symlink_is_never_the_same_version_as_a_file() {
-        let (_d, store) = store();
-        store
-            .put_entry(&origin("nas"), "media", "x", &symlink("../a", 100, 1))
-            .unwrap();
-        store
-            .put_entry(
-                &origin("laptop"),
-                "media",
-                "x",
-                &FileEntry::file(3, 200, Hash::new(b"bytes"), 1),
-            )
-            .unwrap();
+        let (_d, store) = testutil::store();
+        put(&store, "media", "nas", "x", &symlink("../a", 100, 1));
+        put(
+            &store,
+            "media",
+            "laptop",
+            "x",
+            &FileEntry::file(3, 200, Hash::new(b"bytes"), 1),
+        );
         let set = store.versions_for("media", "x").unwrap();
         assert_eq!(set.version_count(), 2);
         assert!(set.is_divergent());
-
-        // Selection runs on the real mtimes both sides published, so every
-        // node picks the same side: the file here, which is newer.
-        let selected = set.select(&VersionPolicy::Newest, READ_AT);
-        assert_eq!(selected.entry().unwrap().kind, EntryKind::File);
-
-        // And with the link newer, the link wins — deterministically, and not
-        // because a scan happened to restate it.
-        store
-            .put_entry(&origin("nas"), "media", "x", &symlink("../a", 300, 2))
-            .unwrap();
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
+            EntryKind::File,
+            "the newer file wins"
+        );
+        put(&store, "media", "nas", "x", &symlink("../a", 300, 2));
         let set = store.versions_for("media", "x").unwrap();
         assert_eq!(
             set.select(&VersionPolicy::Newest, READ_AT)
                 .entry()
                 .unwrap()
                 .kind,
-            EntryKind::Symlink
+            EntryKind::Symlink,
+            "and with the link newer, the link wins"
         );
     }
 
-    /// A tombstone speaks for its own origin's copy, not for the path (§8).
-    ///
-    /// The unified tree merges assertions from every member by `(space, path)`,
-    /// so a deletion that removed the path outright would let any member delete
-    /// any file from every `newest` reader in the cluster. §8's rule is that a
-    /// path exists while at least one origin publishes a live entry for it, and
-    /// stays visible until every publisher tombstones it.
-    #[test]
-    fn a_tombstone_removes_only_its_own_origins_version() {
-        let (_d, store) = store();
-        let live = Hash::new(b"still here");
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::file(9, 100, live, 1),
-            )
-            .unwrap();
-        // A deletion published later than the live version, which is what an
-        // attacker would send and what an honest late deletion looks like too.
-        store
-            .put_entry(
-                &origin("laptop"),
-                "media",
-                "f",
-                &FileEntry::tombstone(9_000, 2, None),
-            )
-            .unwrap();
-
-        let set = store.versions_for("media", "f").unwrap();
-        assert!(set.exists(), "one origin still publishes it");
-        let selected = set
-            .select(&VersionPolicy::Newest, READ_AT)
-            .entry()
-            .unwrap()
-            .clone();
-        assert_eq!(selected.content, Some(live));
-        assert_eq!(selected.origin, origin("nas"));
-
-        // Pinned to the origin that deleted it, the deletion is the answer.
-        let pinned = set.select(&VersionPolicy::Origin(origin("laptop")), READ_AT);
-        assert_eq!(pinned.entry().unwrap().kind, EntryKind::Tombstone);
-
-        // Once every publisher has deleted it, the path is gone for everyone.
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::tombstone(9_000, 3, None),
-            )
-            .unwrap();
-        let set = store.versions_for("media", "f").unwrap();
-        assert!(!set.exists());
-        assert_eq!(
-            set.select(&VersionPolicy::Newest, READ_AT),
-            Selection::Absent
-        );
-    }
-
-    /// One origin publishing alone reads exactly as it always did.
-    #[test]
-    fn a_lone_origins_tombstone_still_empties_the_path() {
-        let (_d, store) = store();
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::file(9, 100, Hash::new(b"c"), 1),
-            )
-            .unwrap();
-        assert!(store
-            .versions_for("media", "f")
-            .unwrap()
-            .select(&VersionPolicy::Newest, READ_AT)
-            .entry()
-            .is_some());
-
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::tombstone(200, 2, None),
-            )
-            .unwrap();
-        let set = store.versions_for("media", "f").unwrap();
-        assert!(!set.exists());
-        assert_eq!(
-            set.select(&VersionPolicy::Newest, READ_AT),
-            Selection::Absent
-        );
-        assert_eq!(
-            set.select(&VersionPolicy::Strict, READ_AT),
-            Selection::Absent
-        );
-        // The pinned view still sees the deletion itself.
-        assert_eq!(
-            set.select(&VersionPolicy::Origin(origin("nas")), READ_AT)
-                .entry()
-                .unwrap()
-                .kind,
-            EntryKind::Tombstone
-        );
-    }
-
-    /// What a node materializes is the leaf, not the leaf plus its clock.
-    ///
-    /// Every component of the selection order has to be data every node holds
-    /// identically, or two nodes materializing the same trie at different times
-    /// select different versions — and `doctor --rebuild` changes the answer
-    /// again.
-    #[test]
-    fn a_leaf_materializes_to_the_same_row_whatever_the_clock_says() {
-        let (_d, store) = store();
-        let dated_ahead = FileEntry::file(9, i64::MAX, Hash::new(b"c"), 1);
-        store
-            .put_entry(&origin("nas"), "media", "f", &dated_ahead)
-            .unwrap();
-        let row = store.versions_for("media", "f").unwrap().entries[0].clone();
-        assert_eq!(row.mtime_ns, i64::MAX, "the leaf is stored as published");
-
-        // Materialized again — a rebuild, or another node — it is the same row.
-        store
-            .put_entry(&origin("nas"), "media", "f", &dated_ahead)
-            .unwrap();
-        assert_eq!(
-            store.versions_for("media", "f").unwrap().entries[0],
-            row,
-            "and the second materialization agrees with the first"
-        );
-    }
-
-    /// A version dated in the future orders as of now.
-    ///
-    /// `mtime_ns` is a member's own assertion and any member may publish for
-    /// any space, so an unbounded stamp would sit above every entry that will
-    /// ever be published, for every path, permanently. Read against the
-    /// reader's clock it claims the present instant and no more — the same
-    /// claim an honest publish at this instant makes, settled by the rest of
-    /// the order rather than by a number nothing can reach.
-    /// A reader whose clock lags the cluster still selects the newer edit.
-    ///
-    /// The clamp bounds an inflated stamp, but read against a raw local clock
-    /// it cuts the other way: every honest entry stamped above the reading
-    /// collapses to it, the primary component ties, and selection falls
-    /// through to ordering by content hash — so a node restored from a
-    /// snapshot picks the *older* edit, and a `newest` mirror on it writes
-    /// different bytes than every other node, unmarked.
-    ///
-    /// Driven through the trust floor, which is the persisted, monotonic
-    /// record of how far the cluster has got: a floor ahead of the local clock
-    /// is exactly the shape of a lagging reader.
-    #[test]
-    fn a_lagging_reader_still_selects_the_newer_edit() {
-        let (_d, store) = store();
-        let now = synch_core::now_ns();
-        // Twelve hours ahead of this machine's clock, and inside the step the
-        // floor will accept.
-        let ahead = now + 12 * 3_600 * 1_000_000_000;
-        store.advance_trust_floor(ahead).unwrap();
-
-        // The older edit gets the greater content hash, so the content-hash
-        // tiebreak the bug falls through to would pick it.
-        let (a, b) = (Hash::new(b"a"), Hash::new(b"b"));
-        let (older, newer) = if a > b { (a, b) } else { (b, a) };
-        store
-            .put_entry(
-                &origin("alpha"),
-                "media",
-                "f",
-                &FileEntry::file(9, ahead - 7_200_000_000_000, older, 1),
-            )
-            .unwrap();
-        store
-            .put_entry(
-                &origin("bravo"),
-                "media",
-                "f",
-                &FileEntry::file(9, ahead - 3_600_000_000_000, newer, 1),
-            )
-            .unwrap();
-
-        let set = store.versions_for("media", "f").unwrap();
-        let selected = set
-            .select(&VersionPolicy::Newest, store.read_instant().unwrap())
-            .entry()
-            .expect("a version is selected")
-            .clone();
-        assert_eq!(
-            selected.origin,
-            origin("bravo"),
-            "the older edit won: honest mtimes tied against a lagging clock"
-        );
-    }
-
+    /// A version dated in the future orders as of now: `mtime_ns` is a member's own assertion, so an unbounded stamp would sit above every entry ever published, permanently — clamped to the reader's clock it claims the present instant and no more (§8).
     #[test]
     fn a_version_dated_in_the_future_orders_as_of_now() {
-        let (_d, store) = store();
-        store
-            .put_entry(
-                &origin("liar"),
-                "media",
-                "f",
-                &FileEntry::file(9, i64::MAX, Hash::new(b"theirs"), 1),
-            )
-            .unwrap();
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::file(9, 1_000, Hash::new(b"ours"), 1),
-            )
-            .unwrap();
-
+        let (_d, store) = testutil::store();
+        let dated_ahead = FileEntry::file(9, i64::MAX, Hash::new(b"c"), 1);
+        put(&store, "media", "liar", "f", &dated_ahead);
+        put(
+            &store,
+            "media",
+            "nas",
+            "f",
+            &FileEntry::file(9, 1_000, Hash::new(b"ours"), 1),
+        );
+        // The leaf is stored as published, and re-materializes identically.
+        let row = store
+            .versions_for("media", "f")
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.origin == origin("liar"))
+            .unwrap()
+            .clone();
+        assert_eq!(row.mtime_ns, i64::MAX, "the leaf is stored as published");
+        put(&store, "media", "liar", "f", &dated_ahead);
+        assert_eq!(
+            store
+                .versions_for("media", "f")
+                .unwrap()
+                .entries
+                .iter()
+                .find(|e| e.origin == origin("liar"))
+                .unwrap(),
+            &row,
+            "the second materialization agrees with the first"
+        );
         let now = 2_000;
         let set = store.versions_for("media", "f").unwrap();
         let key_of = |name: &str| {
@@ -1074,26 +920,42 @@ mod tests {
         };
         assert_eq!(key_of("liar").0, now, "read as of now, never past it");
         assert_eq!(key_of("nas").0, 1_000, "an honest stamp is left alone");
+    }
 
-        // Republished at this instant, the honest entry is its equal: what the
-        // inflated stamp bought is nothing the publisher could not have had.
-        store
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "f",
-                &FileEntry::file(9, now, Hash::new(b"ours"), 2),
-            )
-            .unwrap();
+    /// A reader whose clock lags the cluster still selects the newer edit. The clamp bounds an inflated stamp, but a raw local clock cuts the other way: honest entries stamped above the reading collapse to it, the primary component ties, and selection falls through to the content hash — so a snapshot-restored node would pick the *older* edit. The trust floor is the persisted, monotonic record of how far the cluster has got: a floor ahead of the local clock is exactly that shape.
+    #[test]
+    fn a_lagging_reader_still_selects_the_newer_edit() {
+        let (_d, store) = testutil::store();
+        let now = synch_core::now_ns();
+        // Twelve hours ahead, inside the step the floor will accept.
+        let ahead = now + 12 * 3_600 * 1_000_000_000;
+        store.advance_trust_floor(ahead).unwrap();
+        let (a, b) = (Hash::new(b"a"), Hash::new(b"b"));
+        let (older, newer) = if a > b { (a, b) } else { (b, a) };
+        put(
+            &store,
+            "media",
+            "alpha",
+            "f",
+            &FileEntry::file(9, ahead - 7_200_000_000_000, older, 1),
+        );
+        put(
+            &store,
+            "media",
+            "bravo",
+            "f",
+            &FileEntry::file(9, ahead - 3_600_000_000_000, newer, 1),
+        );
         let set = store.versions_for("media", "f").unwrap();
-        let key_of = |name: &str| {
-            let entry = set
-                .entries
-                .iter()
-                .find(|e| e.origin == origin(name))
-                .expect("the entry");
-            entry_key(entry, now)
-        };
-        assert_eq!(key_of("liar").0, key_of("nas").0);
+        let selected = set
+            .select(&VersionPolicy::Newest, store.read_instant().unwrap())
+            .entry()
+            .expect("a version is selected")
+            .clone();
+        assert_eq!(
+            selected.origin,
+            origin("bravo"),
+            "the older edit won: honest mtimes tied against a lagging clock"
+        );
     }
 }

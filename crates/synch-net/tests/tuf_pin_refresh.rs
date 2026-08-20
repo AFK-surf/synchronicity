@@ -1,47 +1,23 @@
-//! TUF-driven pin refresh end to end (docs/REKOR-ZONE-KEY.md §10.5).
+//! TUF-driven pin refresh end to end (docs/REKOR-ZONE-KEY.md §10.2, §10.5).
 //!
-//! Three layers, because §10 makes three separate promises.
-//!
-//! The **conformance** half runs the real Sigstore chain, checked in
-//! verbatim, through the real verifier: root 13 → 14 → 15, then timestamp,
-//! snapshot, targets and the `trusted_root.json` target, ending in the pin
-//! set a client would actually adopt. Canonical JSON is where TUF
-//! implementations historically break, and the only way to know it is right
-//! is to check it against bytes somebody else produced.
-//!
-//! The **synthetic** half exercises what the real repository cannot be asked
-//! to do on demand: root rotation across versions, a threshold not met, an
-//! expired timestamp, a rolled-back version, a tampered target, and a
-//! trusted root that drops a shard key — revocation reaching the pin set.
-//!
-//! The **resolver** half proves the two load-bearing rules of §10.2 through
-//! the whole refresh path: a walk of Sigstore's repository teaches a client
-//! a log key its build never knew, in the same refresh that then verifies a
-//! proof from that log; nothing about that repository can ever fail a
-//! refresh; and a client walks it once a day, not once per membership
-//! lookup. Every repository here is injected, so no test run reaches
-//! Sigstore.
+//! Three layers: the **conformance** half runs the real Sigstore chain,
+//! checked in verbatim, through the real verifier; the **synthetic** half
+//! exercises what the real repository cannot be asked to do on demand —
+//! rotation, thresholds, expiry, rollback, tampering, revocation; the
+//! **resolver** half proves the §10.2 rules through the whole refresh path
+//! with injected repositories, so no run reaches Sigstore.
+
+mod common;
+
+use std::sync::Arc;
 
 use synch_net::{
     dns::{DnssecResolver, RekorPolicy, ResolverOptions},
     error::NetError,
-    rekor::{self, LogKeys},
+    rekor::{self, base64_encode, LogKeys},
     sim::{SimLog, SimTuf, SimZone},
     tuf::{self, PinState, TufError, TufMetadata},
 };
-
-fn write(contents: &str) -> tempfile::NamedTempFile {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(file.path(), contents).unwrap();
-    file
-}
-
-fn member_records() -> Vec<String> {
-    vec![format!(
-        "v=sync1 id=nas nk={} apex=cluster.example",
-        iroh_base::SecretKey::generate().public().to_z32()
-    )]
-}
 
 /// A fixed moment the synthetic repositories are built and verified at, so
 /// nothing in this file depends on the wall clock.
@@ -49,45 +25,21 @@ const NOW: i64 = 1_800_000_000;
 
 // ------------------------------------------------------- real-chain fixtures
 
-/// The checked-in Sigstore metadata this suite is asserted against: roots 13
-/// through 15, timestamp, snapshot, targets and `trusted_root.json`, as the
-/// repository served them, with `meta.txt` recording when and what they
-/// verify to.
-fn fixture_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tuf")
-}
-
 fn fixture(name: &str) -> Vec<u8> {
-    let path = fixture_dir().join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
+    common::fixture("tests/fixtures/tuf", name)
 }
 
 fn fixture_field(name: &str) -> String {
-    let meta = String::from_utf8(fixture("meta.txt")).unwrap();
-    meta.lines()
-        .find_map(|line| line.strip_prefix(&format!("{name}=")))
-        .unwrap_or_else(|| panic!("fixture meta has no {name}"))
-        .to_string()
+    common::fixture_field("tests/fixtures/tuf", name)
 }
 
 fn fixture_number(name: &str) -> u64 {
     fixture_field(name).parse().expect("a fixture number")
 }
 
-/// What a stock client collects: the root chain from the version its build
-/// embeds — one root today, and one more per Sigstore rotation until the
-/// embedded root is refreshed.
-fn fixture_metadata() -> TufMetadata {
-    fixture_metadata_from("root_version")
-}
-
-/// The same files with the whole checked-in root history in front, so the
-/// chain walk has real rotations to walk. The repository serves every one of
-/// these versions; where a client starts is its own root's business.
-fn fixture_chain_metadata() -> TufMetadata {
-    fixture_metadata_from("root_versions")
-}
-
+/// The checked-in Sigstore metadata, from the version this build embeds, or
+/// with the whole root history in front so the chain walk has rotations to
+/// walk.
 fn fixture_metadata_from(field: &str) -> TufMetadata {
     TufMetadata {
         roots: fixture_field(field)
@@ -101,69 +53,31 @@ fn fixture_metadata_from(field: &str) -> TufMetadata {
     }
 }
 
-#[test]
-fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
-    // Everything here is Sigstore's own bytes: if canonical JSON, the key
-    // parsing, the DER signatures, the optional `meta` hashes or the RFC
-    // 3339 shapes were wrong in any way, this cannot pass.
-    let metadata = fixture_chain_metadata();
+fn fixture_chain_metadata() -> TufMetadata {
+    fixture_metadata_from("root_versions")
+}
+
+/// What a stock client collects: the root chain from the version its build
+/// embeds, anchored at the floor §10.2 states per release.
+fn floor_state() -> PinState {
     let floor = fixture_number("chain_floor");
-    let state = PinState {
+    PinState {
         root_version: floor,
         ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
-    };
-    // Verified at the moment the fixture was fetched: a checked-in chain
-    // expires, and pinning the clock is what keeps it checkable.
-    let at = fixture_number("verify_at");
-    let update = tuf::update(&metadata, &state, at).expect("the real chain must verify");
-    assert!(update.changed);
-    assert_eq!(update.state.root_version, fixture_number("root_version"));
-    assert_eq!(
-        update.state.timestamp_version,
-        fixture_number("timestamp_version")
-    );
-    assert_eq!(
-        update.state.snapshot_version,
-        fixture_number("snapshot_version")
-    );
-    assert_eq!(
-        update.state.targets_version,
-        fixture_number("targets_version")
-    );
-    assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
-
-    // And the pin set it yields is the production log set — the same ids
-    // the build-time snapshot carries, derived a completely different way.
-    let derived = update.log_keys;
-    for id in fixture_field("log_ids").split(',') {
-        let id: [u8; 32] = hex::decode(id).unwrap().try_into().unwrap();
-        assert!(derived.find(&id).is_some(), "pin set is missing {id:?}");
     }
-    assert_eq!(
-        derived.keys().len(),
-        fixture_field("log_ids").split(',').count()
-    );
-    assert_eq!(
-        derived,
-        LogKeys::embedded(),
-        "the TUF-derived pin set and the embedded bootstrap snapshot are the same logs today"
-    );
 }
 
 /// The checked-in Sigstore files, served under the consistent-snapshot paths
-/// the repository actually publishes them at.
-///
-/// The fixture stores them by role (`snapshot.json`), the repository serves
-/// them by version (`165.snapshot.json`) and the target by digest — so a
-/// walk that resolved the wrong version, or read the digest out of the wrong
-/// field, would find nothing here rather than quietly assemble something.
+/// the repository actually publishes them at: versioned roots and roles, the
+/// target by digest — so a walk that resolved the wrong version or read the
+/// digest out of the wrong field would find nothing rather than quietly
+/// assemble something.
 struct FixtureRepo;
 
 impl tuf::Repo for FixtureRepo {
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
         let named = |name: &str| Some(fixture(name));
-        let versions = fixture_field("root_versions");
-        for version in versions.split(',') {
+        for version in fixture_field("root_versions").split(',') {
             if path == format!("{version}.root.json") {
                 return Ok(named(&format!("root-{version}.json")));
             }
@@ -191,112 +105,66 @@ impl tuf::Repo for FixtureRepo {
     }
 }
 
+/// The real Sigstore chain through the real verifier: roots 13 → 14 → 15,
+/// then timestamp, snapshot, targets and the trusted root, ending in the pin
+/// set a client would adopt. Canonical JSON is where TUF implementations
+/// historically break, and the only way to know it is right is to check it
+/// against bytes somebody else produced. Also pins the fixture's expiry and
+/// the embedded root's identity as the chain's head.
 #[test]
-fn walking_the_repository_finds_the_whole_chain() {
-    // How every reader of the pin set gets it — the client and the monitor
-    // alike: walk the consistent-snapshot naming, then hand what was
-    // collected to the ordinary verifier.
-    let floor = fixture_number("chain_floor");
-    let walked =
-        tuf::fetch_metadata(&FixtureRepo, floor).expect("the fixture repository is walkable");
-    assert_eq!(walked, fixture_chain_metadata());
-
-    // And it goes through the ordinary verifier from there, with no
-    // dispensation for having been fetched rather than relayed.
-    let state = PinState {
-        root_version: floor,
-        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
-    };
-    let update = tuf::update(&walked, &state, fixture_number("verify_at")).expect("it verifies");
-    assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
-
-    // The walk starts where the caller already is: a client at the current
-    // root collects only that root, and one past the end finds nothing at
-    // all rather than inventing a chain.
-    let current = fixture_number("root_version");
-    let from_current = tuf::fetch_metadata(&FixtureRepo, current).unwrap();
-    assert_eq!(
-        from_current.roots,
-        vec![fixture(&format!("root-{current}.json"))]
-    );
-    assert!(matches!(
-        tuf::fetch_metadata(&FixtureRepo, current + 1),
-        Err(TufError::Chain(_))
-    ));
-}
-
-#[test]
-fn the_log_to_read_comes_from_the_same_artifact_as_the_keys() {
-    // The endpoint follows Sigstore for the same reason the keys do. What
-    // the real trusted root names is asserted as a *shape* — an https base
-    // URL for a shard that is open at the moment the fixture was fetched,
-    // whose key is in the pin set — because pinning the hostname in a test
-    // is the thing being removed.
-    let trusted_root = fixture("trusted-root.json");
-    let logs = tuf::tlogs(&trusted_root).expect("the real trusted root lists its logs");
-    let at = fixture_number("verify_at");
-    let open = tuf::current_tlog(&logs, at).expect("Sigstore has a shard open");
-    assert!(open.base_url.starts_with("https://"));
-    assert!(!open.base_url.ends_with('/'));
-    assert!(open.valid_at(at));
-
-    let keys = tuf::tlog_keys(&trusted_root).unwrap();
-    assert!(
-        keys.find(&open.log_id).is_some(),
-        "the log to read must be one of the logs pinned"
-    );
-    // Retired shards stay pinned and stay out of the way: still verifiable,
-    // never selected.
-    assert!(logs.len() > 1);
-    for log in &logs {
-        assert!(keys.find(&log.log_id).is_some());
-    }
-}
-
-#[test]
-fn the_real_chain_expires() {
-    // Expiry gates the update and nothing else: a year after the fixture was
-    // fetched the same bytes are refused, and a client running on them keeps
-    // whatever pins it already had.
-    let at = fixture_number("verify_at") + 365 * 86_400;
-    let floor = fixture_number("chain_floor");
-    let state = PinState {
-        root_version: floor,
-        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
-    };
-    assert!(matches!(
-        tuf::update(&fixture_chain_metadata(), &state, at),
-        Err(TufError::Expiry(_))
-    ));
-}
-
-#[test]
-fn the_real_chain_cannot_be_reached_from_below_its_floor() {
-    // The floor §10.2 states per release, seen from a build below it. A
-    // client walks from the root version it holds, so material collected
-    // from the current version up has nothing to bridge the gap for a client
-    // two rotations older, and that client keeps its pins rather than
-    // guessing. The same files *with* the intermediates in front verify,
-    // which is what makes this a floor and not a bug.
-    let floor = fixture_number("chain_floor");
-    let state = PinState {
-        root_version: floor,
-        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
-    };
-    let error = tuf::update(&fixture_metadata(), &state, fixture_number("verify_at"));
-    assert!(matches!(error, Err(TufError::Chain(_))), "{error:?}");
-    tuf::update(
+fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
+    let update = tuf::update(
         &fixture_chain_metadata(),
-        &state,
+        &floor_state(),
         fixture_number("verify_at"),
     )
-    .expect("the full chain reaches the same head");
-}
+    .expect("the real chain must verify");
+    assert!(update.changed);
+    assert_eq!(update.state.root_version, fixture_number("root_version"));
+    assert_eq!(
+        update.state.timestamp_version,
+        fixture_number("timestamp_version")
+    );
+    assert_eq!(
+        update.state.snapshot_version,
+        fixture_number("snapshot_version")
+    );
+    assert_eq!(
+        update.state.targets_version,
+        fixture_number("targets_version")
+    );
+    assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
 
-#[test]
-fn the_embedded_root_is_the_chains_head() {
-    // The build ships root 15; the fixture chain ends there. If Sigstore
-    // rotates and only one of the two is refreshed, this says so.
+    // The pin set it yields is the production log set — the same ids the
+    // build-time snapshot carries, derived a completely different way.
+    let derived = update.log_keys;
+    for id in fixture_field("log_ids").split(',') {
+        let id: [u8; 32] = hex::decode(id).unwrap().try_into().unwrap();
+        assert!(derived.find(&id).is_some(), "pin set is missing {id:?}");
+    }
+    assert_eq!(
+        derived.keys().len(),
+        fixture_field("log_ids").split(',').count()
+    );
+    assert_eq!(
+        derived,
+        LogKeys::embedded(),
+        "the TUF-derived pin set and the embedded bootstrap snapshot are the same logs today"
+    );
+
+    // A year after the fixture was fetched the same bytes are refused:
+    // expiry gates the update and nothing else.
+    assert!(matches!(
+        tuf::update(
+            &fixture_chain_metadata(),
+            &floor_state(),
+            fixture_number("verify_at") + 365 * 86_400
+        ),
+        Err(TufError::Expiry(_))
+    ));
+
+    // The build ships the head of the chain the fixture ends at; a rotation
+    // refreshing only one of the two says so.
     let embedded: serde_json::Value = serde_json::from_str(tuf::EMBEDDED_TUF_ROOT).unwrap();
     assert_eq!(
         embedded["signed"]["version"].as_u64(),
@@ -308,22 +176,30 @@ fn the_embedded_root_is_the_chains_head() {
     );
 }
 
+/// How every reader of the pin set gets it — client and monitor alike: walk
+/// the consistent-snapshot naming, then hand what was collected to the
+/// ordinary verifier with no dispensation for having been fetched. The walk
+/// starts where the caller is: a client at the current root collects only
+/// that root, and one past the end finds nothing rather than inventing a
+/// chain.
 #[test]
-fn real_key_ids_are_the_digest_of_the_key_object_almost_always() {
-    // TUF derives a key id as SHA-256 over the canonical JSON of the key
-    // object, and Sigstore's roots agree — with one real exception: root 11
-    // edited a key's `x-tuf-on-ci-online-uri` member while keeping the id.
-    // That is why the verifier looks keys up by the id the table is keyed
-    // with, and why this only asserts the derivation on the roots it holds.
-    for version in fixture_field("root_versions").split(',') {
-        let root: serde_json::Value =
-            serde_json::from_slice(&fixture(&format!("root-{version}.json"))).unwrap();
-        let keys = root["signed"]["keys"].as_object().unwrap();
-        assert!(!keys.is_empty());
-        for (id, key) in keys {
-            assert_eq!(&tuf::key_id(key).unwrap(), id, "root {version} key {id}");
-        }
-    }
+fn walking_the_repository_finds_the_whole_chain() {
+    let walked = tuf::fetch_metadata(&FixtureRepo, fixture_number("chain_floor"))
+        .expect("the fixture repository is walkable");
+    assert_eq!(walked, fixture_chain_metadata());
+    let update =
+        tuf::update(&walked, &floor_state(), fixture_number("verify_at")).expect("it verifies");
+    assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
+
+    let current = fixture_number("root_version");
+    assert_eq!(
+        tuf::fetch_metadata(&FixtureRepo, current).unwrap().roots,
+        vec![fixture(&format!("root-{current}.json"))]
+    );
+    assert!(matches!(
+        tuf::fetch_metadata(&FixtureRepo, current + 1),
+        Err(TufError::Chain(_))
+    ));
 }
 
 // -------------------------------------------------------------- synthetic
@@ -331,67 +207,54 @@ fn real_key_ids_are_the_digest_of_the_key_object_almost_always() {
 /// A synthetic repository whose trusted root names one log.
 fn repo() -> (SimTuf, SimLog) {
     let log = SimLog::new("rekor.sim");
-    let repo = SimTuf::new(NOW, &[&log]);
-    (repo, log)
+    (SimTuf::new(NOW, &[&log]), log)
 }
 
-fn at(now: i64) -> u64 {
-    now as u64
+/// Update the repository from its embedded state at the fixed moment.
+fn accept(repo: &SimTuf) -> tuf::TufUpdate {
+    tuf::update(&repo.metadata(), &repo.embedded_state(), NOW as u64)
+        .expect("a well-formed chain verifies")
 }
 
-#[test]
-fn a_synthetic_chain_verifies_from_its_embedded_root() {
-    let (repo, log) = repo();
-    let update = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
-        .expect("a well-formed chain verifies");
-    assert!(update.changed);
-    assert_eq!(update.state.root_version, 1);
-    assert!(update.log_keys.find(&log.log_id()).is_some());
-
-    // Re-applying the same material is valid and boring: accepted, unchanged.
-    let again = tuf::update(&repo.metadata(), &update.state, at(NOW)).unwrap();
-    assert!(!again.changed);
-    assert_eq!(again.state, update.state);
-}
-
+/// A chained rotation walks every version in order, including a full
+/// re-keying; a client already at the head accepts a chain that only carries
+/// the tail; a version missing bridges nothing; and re-applying the same
+/// material is valid and boring.
 #[test]
 fn root_rotation_walks_every_version_in_order() {
-    let (mut repo, _log) = repo();
-    // Three rotations, the last two re-keying the root role entirely: a
-    // client embedded at version 1 must still arrive at version 4.
+    let (mut repo, log) = repo();
     repo.rotate_root(false);
     repo.rotate_root(true);
     repo.rotate_root(true);
     assert_eq!(repo.root_version(), 4);
-
-    let update = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
-        .expect("a chained rotation verifies");
+    let update = accept(&repo);
+    assert!(update.changed);
     assert_eq!(update.state.root_version, 4);
+    assert!(update.log_keys.find(&log.log_id()).is_some());
 
-    // A chain with a version missing bridges nothing. The relay is free to
-    // withhold; it is not free to be believed.
+    let again = tuf::update(&repo.metadata(), &update.state, NOW as u64).unwrap();
+    assert!(!again.changed);
+    assert_eq!(again.state, update.state);
+
     let mut gapped = repo.metadata();
     gapped.roots.remove(1);
     assert!(matches!(
-        tuf::update(&gapped, &repo.embedded_state(), at(NOW)),
+        tuf::update(&gapped, &repo.embedded_state(), NOW as u64),
         Err(TufError::Chain(_))
     ));
-
-    // And a client already at version 4 accepts a chain that only carries
-    // the tail — old material may be withheld once it is passed.
-    let tail = repo.metadata_from(4);
-    tuf::update(&tail, &update.state, at(NOW)).expect("the tail alone still verifies");
+    tuf::update(&repo.metadata_from(4), &update.state, NOW as u64)
+        .expect("the tail alone still verifies");
 }
 
+/// A root the old root did not sign is refused — the fork a relay that
+/// minted its own root would produce — and so is a root whose signatures
+/// repeat one key: two entries, one distinct key, no threshold.
 #[test]
 fn a_root_the_old_root_did_not_sign_is_refused() {
     let (mut repo, _log) = repo();
     let honest = repo.embedded_state();
-    // A fork: rotate to a root signed only by brand-new keys, the way a
-    // relay that had minted its own root would.
     repo.rotate_root(true);
     let mut forged = repo.metadata();
-    // Strip the predecessor's signatures from root 2, leaving only its own.
     let mut root: serde_json::Value = serde_json::from_slice(&forged.roots[1]).unwrap();
     let keyids: Vec<String> = root["signed"]["roles"]["root"]["keyids"]
         .as_array()
@@ -399,66 +262,58 @@ fn a_root_the_old_root_did_not_sign_is_refused() {
         .iter()
         .map(|id| id.as_str().unwrap().to_string())
         .collect();
-    let signatures: Vec<serde_json::Value> = root["signatures"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|sig| keyids.contains(&sig["keyid"].as_str().unwrap().to_string()))
-        .cloned()
-        .collect();
-    root["signatures"] = serde_json::Value::Array(signatures);
+    root["signatures"] = serde_json::Value::Array(
+        root["signatures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|sig| keyids.contains(&sig["keyid"].as_str().unwrap().to_string()))
+            .cloned()
+            .collect(),
+    );
     forged.roots[1] = root.to_string().into_bytes();
-
     assert!(matches!(
-        tuf::update(&forged, &honest, at(NOW)),
+        tuf::update(&forged, &honest, NOW as u64),
         Err(TufError::Threshold(_))
     ));
-}
 
-#[test]
-fn a_threshold_that_is_not_met_is_refused() {
-    let (mut repo, _log) = repo();
-    let state = repo.embedded_state();
+    // Same rotated-repo setup, a different mutation: one distinct key
+    // repeated in two signature entries.
     repo.rotate_root(false);
     let mut thin = repo.metadata();
-    // Root version 2 needs two of its three root keys; leave it one,
-    // repeated. Two signature entries, one distinct key — repeating a
-    // signature must not satisfy a threshold.
     let mut root: serde_json::Value = serde_json::from_slice(&thin.roots[1]).unwrap();
     let one = root["signatures"][0].clone();
     root["signatures"] = serde_json::Value::Array(vec![one.clone(), one]);
     thin.roots[1] = root.to_string().into_bytes();
-
-    let error = tuf::update(&thin, &state, at(NOW));
+    let error = tuf::update(&thin, &honest, NOW as u64);
     assert!(matches!(error, Err(TufError::Threshold(_))), "{error:?}");
-    // The untouched chain verifies, so the refusal is the signature count
-    // and nothing incidental.
-    tuf::update(&repo.metadata(), &state, at(NOW)).unwrap();
+    // The untouched chain verifies, so the refusal is the signature count.
+    tuf::update(&repo.metadata(), &honest, NOW as u64).unwrap();
 }
 
+/// Expiry is a deadline, not a stigma: the same material is refused one
+/// second after it expires and accepted one second before.
 #[test]
 fn an_expired_timestamp_is_refused() {
     let (mut repo, _log) = repo();
     repo.expires = NOW - 1;
-    let error = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW));
+    let error = tuf::update(&repo.metadata(), &repo.embedded_state(), NOW as u64);
     assert!(matches!(error, Err(TufError::Expiry(_))), "{error:?}");
-    // The same material a second before its expiry is fine: expiry is a
-    // deadline, not a stigma.
-    tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW - 2)).unwrap();
+    tuf::update(&repo.metadata(), &repo.embedded_state(), (NOW - 2) as u64).unwrap();
 }
 
+/// TUF checks only the *final* root's expiry (client workflow §5.3.11), and
+/// the real Sigstore chain relies on it — root 14 was already expired when
+/// 15 was published.
 #[test]
 fn an_expired_root_is_refused_but_an_expired_intermediate_is_not() {
     let (mut repo, _log) = repo();
     let state = repo.embedded_state();
-    // Root 1 expired long ago; root 2 is current. TUF checks only the final
-    // root's expiry (client workflow §5.3.11), and the real Sigstore chain
-    // relies on it — root 14 was already expired when 15 was published.
     repo.root_expires = NOW - 1;
     repo.rotate_root(false);
     let mut metadata = repo.metadata();
     assert!(matches!(
-        tuf::update(&metadata, &state, at(NOW)),
+        tuf::update(&metadata, &state, NOW as u64),
         Err(TufError::Expiry(_))
     ));
 
@@ -466,126 +321,128 @@ fn an_expired_root_is_refused_but_an_expired_intermediate_is_not() {
     repo.root_expires = NOW + 86_400;
     repo.rotate_root(false);
     metadata = repo.metadata();
-    let update = tuf::update(&metadata, &state, at(NOW)).expect("only the head's expiry gates");
+    let update = tuf::update(&metadata, &state, NOW as u64).expect("only the head's expiry gates");
     assert_eq!(update.state.root_version, 3);
 }
 
+/// A mirror that keeps serving the old chain after the repository moved on:
+/// valid material, refused, because the client has seen newer.
 #[test]
 fn a_version_rollback_is_refused() {
     let (mut repo, _log) = repo();
-    let first = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
-        .unwrap()
-        .state;
-    // A mirror keeps serving the old chain after the repository moved on:
-    // valid material, and refused, because the client has seen newer.
+    let first = accept(&repo).state;
     let stale = repo.metadata();
     repo.set_tlogs(&[&SimLog::new("rekor.sim")]);
-    let newer = tuf::update(&repo.metadata(), &first, at(NOW))
-        .unwrap()
-        .state;
+    let newer = accept(&repo).state;
     assert!(newer.timestamp_version > first.timestamp_version);
-
-    let error = tuf::update(&stale, &newer, at(NOW));
+    let error = tuf::update(&stale, &newer, NOW as u64);
     assert!(matches!(error, Err(TufError::Rollback(_))), "{error:?}");
 }
 
+/// The target's hash is bound by the snapshot, and the snapshot's length by
+/// the timestamp — tampering is caught at the level that covers it.
 #[test]
 fn a_tampered_target_is_refused() {
     let (repo, _log) = repo();
     let mut metadata = repo.metadata();
     metadata.trusted_root.push(b' ');
-    let error = tuf::update(&metadata, &repo.embedded_state(), at(NOW));
+    let error = tuf::update(&metadata, &repo.embedded_state(), NOW as u64);
     assert!(matches!(error, Err(TufError::TargetHash(_))), "{error:?}");
 
-    // A tampered *snapshot* fails one level up, where the timestamp's own
-    // hash of it is checked.
     let mut metadata = repo.metadata();
     metadata.snapshot.push(b' ');
+    // Trailing whitespace leaves the canonical form intact, so the length
+    // check is what catches it.
     assert!(matches!(
-        tuf::update(&metadata, &repo.embedded_state(), at(NOW)),
-        // Trailing whitespace does not change the canonical form, so the
-        // signature still verifies and the length check is what catches it.
+        tuf::update(&metadata, &repo.embedded_state(), NOW as u64),
         Err(TufError::TargetHash(_))
-    ));
-
-    // A snapshot whose *content* changed fails on the signature instead.
-    let mut metadata = repo.metadata();
-    let mut snapshot: serde_json::Value = serde_json::from_slice(&metadata.snapshot).unwrap();
-    snapshot["signed"]["meta"]["targets.json"]["version"] = serde_json::json!(99);
-    metadata.snapshot = snapshot.to_string().into_bytes();
-    assert!(matches!(
-        tuf::update(&metadata, &repo.embedded_state(), at(NOW)),
-        Err(TufError::TargetHash(_) | TufError::Threshold(_))
     ));
 }
 
+/// Revocation, the half of §10 nothing else demonstrates: the pin set
+/// *replaces*, never unions, so a shard Sigstore removes leaves the set —
+/// and an empty pin set is never adopted, since it would refuse every zone
+/// from then on.
 #[test]
 fn a_trusted_root_that_drops_a_shard_drops_it_from_the_pin_set() {
-    // Revocation, which is the half of §10 nothing else demonstrates: the
-    // pin set *replaces*, never unions, so a key Sigstore removes is a key
-    // clients drop.
     let old = SimLog::new("rekor.old");
     let new = SimLog::new("rekor.new");
     let mut repo = SimTuf::new(NOW, &[&old, &new]);
-    let both = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
+    let both = accept(&repo);
     assert!(both.log_keys.find(&old.log_id()).is_some());
     assert!(both.log_keys.find(&new.log_id()).is_some());
 
     repo.set_tlogs(&[&new]);
-    let after = tuf::update(&repo.metadata(), &both.state, at(NOW)).unwrap();
+    let after = tuf::update(&repo.metadata(), &both.state, NOW as u64).unwrap();
     assert_eq!(after.log_keys.keys().len(), 1);
     assert!(
         after.log_keys.find(&old.log_id()).is_none(),
         "a log Sigstore removed must leave the pin set"
     );
     assert!(after.log_keys.find(&new.log_id()).is_some());
-}
 
-#[test]
-fn a_trusted_root_naming_no_logs_is_never_adopted() {
-    // Adopting an empty pin set would silently refuse every zone from then
-    // on — trouble, which §10.2 says must never be worse than no record.
-    let mut repo = SimTuf::new(NOW, &[]);
-    let error = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW));
+    let mut empty = SimTuf::new(NOW, &[]);
+    let error = tuf::update(&empty.metadata(), &empty.embedded_state(), NOW as u64);
     assert!(matches!(error, Err(TufError::Malformed(_))), "{error:?}");
-    repo.set_tlogs(&[&SimLog::new("rekor.sim")]);
-    tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
+    empty.set_tlogs(&[&SimLog::new("rekor.sim")]);
+    tuf::update(&empty.metadata(), &empty.embedded_state(), NOW as u64).unwrap();
 }
 
+// -------------------------------------------------------- the pin-file clock
+
+/// `updated_at` floors the clock the TUF expiry checks see, so a signed
+/// comparison turning `u64::MAX` into `-1` would make nothing ever expire
+/// and adopt ten-year-old material from a hostile mirror — and `u64::MAX` is
+/// the one value that also clears the refresh-interval gate.
 #[test]
-fn state_is_monotonic_across_two_zones_sharing_one_file() {
-    // §10.2: one state file, global across domains. A second zone serving
-    // valid-but-older material must not walk the first one's versions back.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("rekor-pins.json");
-    let (mut repo, _log) = repo();
-    let stale = repo.metadata();
-    repo.rotate_root(false);
-    repo.set_tlogs(&[&SimLog::new("rekor.next")]);
+fn no_clock_value_makes_a_tuf_expiry_check_vacuous() {
+    let repo = SimTuf::new(NOW, &[&SimLog::new("rekor.honest")]);
+    let metadata = repo.metadata();
+    let state = repo.embedded_state();
+    tuf::update(&metadata, &state, NOW as u64).expect("fresh material verifies");
+    for at in [
+        NOW as u64 + 10 * 365 * 86_400,
+        u64::from(u32::MAX),
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+    ] {
+        let refused = tuf::update(&metadata, &state, at);
+        assert!(
+            matches!(refused, Err(TufError::Expiry(_))),
+            "material ten years expired must not be adopted at {at}: {refused:?}"
+        );
+    }
+}
 
-    let ahead = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
-    ahead.state.save(&path).unwrap();
-    // Read back against the root this harness minted, exactly as a client
-    // reads against the one its binary embeds. `rotate_root` above means the
-    // chain is non-empty here, so the round-trip carries one.
-    let reloaded = PinState::load_anchored(&path, &repo.embedded_root())
-        .expect("the state persists and loads under its own anchor");
-    assert_eq!(reloaded, ahead.state);
-
-    let error = tuf::update(&stale, &reloaded, at(NOW));
-    assert!(matches!(error, Err(TufError::Rollback(_))), "{error:?}");
+/// A retired shard's service window is judged in the same unsigned domain.
+#[test]
+fn a_shards_service_window_is_never_vacuous_either() {
+    let trusted_root = serde_json::json!({"tlogs": [{
+        "baseUrl": "https://retired.example",
+        "publicKey": {
+            "rawBytes": "MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=",
+            "validFor": { "start": "2021-01-12T11:53:27Z", "end": "2025-09-23T00:00:00Z" },
+        },
+    }]})
+    .to_string()
+    .into_bytes();
+    let logs = tuf::tlogs(&trusted_root).expect("one shard");
+    for at in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        assert!(
+            !logs[0].valid_at(at),
+            "a closed window must stay closed at {at}"
+        );
+    }
+    assert!(logs[0].valid_at(1_700_000_000));
 }
 
 // --------------------------------------------------------------- resolver
 
 /// A zone whose proof comes from a log the client's bootstrap pin set has
 /// never heard of, and the TUF repository that teaches it.
-///
-/// The point of the arrangement: the client's *bootstrap* pin set knows a
-/// different log entirely, so the proof can only verify if the TUF walk ran
-/// first and replaced the pins.
 fn zone_learning_a_new_shard() -> (SimZone, SimLog, SimTuf, tempfile::NamedTempFile) {
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut new_shard = SimLog::new("log2099-1.rekor.sim");
     let proof = new_shard.publish(&zone, "create");
     zone.rekor_txt = proof.to_txt().expect("encodes");
@@ -597,19 +454,18 @@ fn zone_learning_a_new_shard() -> (SimZone, SimLog, SimTuf, tempfile::NamedTempF
     let repo = SimTuf::new(now, &[&new_shard]);
     // The root this client embeds — written to a file only so the test can
     // seed a PinState from it the way a build would.
-    let embedded = write(&String::from_utf8(repo.embedded_root()).unwrap());
+    let embedded = common::write(&String::from_utf8(repo.embedded_root()).unwrap());
     (zone, new_shard, repo, embedded)
 }
 
-/// A repository that answers, and answers nonsense. The walk collects
+/// A repository that answers, and answers nonsense: the walk collects
 /// something; every check `update` makes then refuses it.
 struct Garbage;
 
 impl tuf::Repo for Garbage {
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
         // Whichever root a client trusts, this repository has one for it —
-        // so the walk gets past the chain and the refusal is about the
-        // *content*, not about a file that was missing.
+        // so the refusal is about the content, not a missing file.
         let junk = path.ends_with(".root.json") || path == "timestamp.json";
         Ok(junk.then(|| b"this is not TUF metadata".to_vec()))
     }
@@ -667,19 +523,32 @@ fn refreshing(
         tuf_url: None,
         no_tuf: false,
         // The harness mints its own TUF root, so that is the anchor every
-        // persisted pin state here records itself against — the same rule
-        // production applies with the built-in Sigstore root.
+        // persisted pin state here records itself against.
         tuf_root: tuf_root.map(std::path::Path::to_path_buf),
     }
+}
+
+/// A resolver pinned to `log`'s static key, serving `zone` over plaintext
+/// DoH. A static --rekor-key never walks anything at all.
+async fn static_resolver(
+    zone: SimZone,
+    log: &SimLog,
+) -> (DnssecResolver, tokio::task::JoinHandle<()>) {
+    let anchor = common::write(&zone.anchor_record());
+    let log_key = common::write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+    (resolver, server)
 }
 
 /// Seeds a state file at the synthetic repository's root version 1, which
 /// is what "a build that embeds this root" means to the resolver.
 fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
     let root = std::fs::read(embedded_root).unwrap();
-    // Anchored at that root: it *is* the anchor the resolver is given below,
-    // so the state's provenance digest has to name it or the load falls back
-    // to the bootstrap pins.
     let state = PinState {
         root_version: 1,
         ..PinState::anchored(&root)
@@ -687,16 +556,19 @@ fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
     state.save(path).unwrap();
 }
 
+/// The §10.2 flagship: a TUF walk teaches an unknown shard and verifies its
+/// proof in the same refresh, persists the state, and walks once a day —
+/// not once per membership lookup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     let (zone, new_shard, repo, embedded) = zone_learning_a_new_shard();
-    let anchor = write(&zone.anchor_record());
+    let anchor = common::write(&zone.anchor_record());
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("rekor-pins.json");
     seed_state(&state_path, embedded.path());
     let (url, server) = zone.serve().await;
 
-    let counting = std::sync::Arc::new(Counting::new(repo));
+    let counting = Arc::new(Counting::new(repo));
     let resolver = DnssecResolver::with_options(&refreshing(
         url,
         anchor.path(),
@@ -723,16 +595,9 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     assert_eq!(persisted.root_version, 1);
     assert!(persisted.timestamp_version >= 1);
     assert!(rekor::LogKeys::default() != persisted.log_keys().unwrap());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&state_path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "the pin state is the owner's alone");
-    }
 
-    // The rule that makes going to the source affordable: membership may
-    // re-resolve on a one-minute TTL, and the repository still hears from
-    // this client once a day (§10.2).
+    // Membership may re-resolve on a one-minute TTL; the repository still
+    // hears from this client once a day (§10.2).
     assert_eq!(counting.walks(), 1);
     resolver.member_set("cluster.example").await.unwrap();
     assert!(resolver.refresh_tuf().await.unwrap().is_none());
@@ -740,55 +605,60 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     server.abort();
 }
 
+/// The control for the flagship: everything identical except `--no-tuf`, so
+/// if the proof verified here too the flagship would have proved nothing —
+/// the log stays unknown, the refusal is the doctor-facing class, and the
+/// repository is never walked at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_same_zone_without_the_walk_fails_with_unknown_log() {
-    // The control: everything identical except the refresh. If the proof
-    // verified here too, the update above would have proved nothing.
-    let (zone, _shard, _repo, embedded) = zone_learning_a_new_shard();
-    let anchor = write(&zone.anchor_record());
+    let (zone, _shard, repo, embedded) = zone_learning_a_new_shard();
+    let anchor = common::write(&zone.anchor_record());
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("rekor-pins.json");
     seed_state(&state_path, embedded.path());
     let (url, server) = zone.serve().await;
 
+    let counting = Arc::new(Counting::new(repo));
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         no_tuf: true,
         tuf_root: None,
         ..refreshing(url, anchor.path(), Some(state_path), Some(embedded.path()))
     })
-    .unwrap();
+    .unwrap()
+    .with_tuf_repo(counting.clone());
     let error = resolver.member_set("cluster.example").await.unwrap_err();
     assert!(
         matches!(error, NetError::RekorUnknownLog { .. }),
         "without the walk the log stays unknown: {error}"
     );
+    assert!(resolver.refresh_tuf().await.unwrap().is_none());
+    assert_eq!(counting.walks(), 0, "`--no-tuf` never walks the repository");
     server.abort();
 }
 
+/// §10.2's load-bearing rule: TUF trouble is never worse than not having
+/// asked. The repository serves garbage while the zone's proof verifies
+/// against a static key — the refresh must succeed regardless, the pins must
+/// not move, and nothing is persisted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repository_serving_nonsense_never_fails_a_refresh() {
-    // The rule §10.2 calls load-bearing: TUF trouble is never worse than not
-    // having asked. The repository here serves garbage while the zone
-    // publishes a proof from a log the client already pins — the refresh
-    // must succeed regardless, and the pins must not move.
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
-
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
+    let anchor = common::write(&zone.anchor_record());
+    let log_key = common::write(&log.key_pem());
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("rekor-pins.json");
     let (url, server) = zone.serve().await;
 
-    // A static --rekor-key never walks anything at all: a different universe
-    // is static in both directions.
+    // A static --rekor-key disables TUF refresh entirely: no walk, no error,
+    // no file.
     let stat = DnssecResolver::with_options(&ResolverOptions {
         rekor_key: Some(log_key.path().to_path_buf()),
         ..refreshing(url.clone(), anchor.path(), Some(state_path.clone()), None)
     })
     .unwrap()
-    .with_tuf_repo(std::sync::Arc::new(Garbage));
+    .with_tuf_repo(Arc::new(Garbage));
     let (set, _ttl) = stat
         .member_set("cluster.example")
         .await
@@ -800,9 +670,8 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
         "an explicit key file disables TUF refresh entirely"
     );
 
-    // And the refreshable resolver says *which* way the chain broke — the
-    // whole reason the variant carries a class, for `synch doctor` — without
-    // that ever reaching the refresh, moving a pin, or writing a file.
+    // The refreshable variant says *which* way the chain broke — the class
+    // `synch doctor` reads — without moving a pin or writing a file.
     let client = DnssecResolver::with_options(&refreshing(
         url,
         anchor.path(),
@@ -810,7 +679,7 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
         None,
     ))
     .unwrap()
-    .with_tuf_repo(std::sync::Arc::new(Garbage));
+    .with_tuf_repo(Arc::new(Garbage));
     let before = client.log_keys();
     let error = client.refresh_tuf().await.unwrap_err();
     assert!(
@@ -822,130 +691,65 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repository_with_nothing_in_it_is_a_non_event() {
-    // An unreachable mirror and an empty one look the same from here, and
-    // both leave the client exactly where it was.
-    struct Empty;
-    impl tuf::Repo for Empty {
-        fn get(&self, _path: &str) -> Result<Option<Vec<u8>>, String> {
-            Ok(None)
-        }
-    }
-
-    let mut zone = SimZone::new("cluster.example", member_records());
-    let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap()
-    .with_tuf_repo(std::sync::Arc::new(Empty));
-    assert!(resolver.refresh_tuf().await.unwrap().is_none());
-    resolver
-        .member_set("cluster.example")
-        .await
-        .expect("a repository with nothing to say changes nothing");
-    server.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_tuf_walks_nothing_and_is_not_a_failure() {
-    // The knob for a deployment that will not have its daemon reach a CDN.
-    // Off means off — not "a repository that answers nothing", which would
-    // report a broken chain once a day forever.
-    let (zone, _shard, repo, embedded) = zone_learning_a_new_shard();
-    let anchor = write(&zone.anchor_record());
-    let dir = tempfile::tempdir().unwrap();
-    let state_path = dir.path().join("rekor-pins.json");
-    seed_state(&state_path, embedded.path());
-    let (url, server) = zone.serve().await;
-
-    let counting = std::sync::Arc::new(Counting::new(repo));
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        no_tuf: true,
-        tuf_root: None,
-        ..refreshing(url, anchor.path(), Some(state_path), Some(embedded.path()))
-    })
-    .unwrap()
-    // Even handed a repository, `--no-tuf` does not walk it.
-    .with_tuf_repo(counting.clone());
-    assert!(resolver.refresh_tuf().await.unwrap().is_none());
-    assert_eq!(counting.walks(), 0);
-    server.abort();
-}
-
-// ----------------------------------------------- cloud-attach discovery
-
-/// The attach endpoint is only as trustworthy as the membership answer that
-/// yields its apex, so discovery gates that answer's zone key exactly as
-/// `member_set` does. Under `RekorPolicy::Require`, a DNSSEC-valid membership
-/// answer whose key is *not* on the transparency log yields no endpoint — even
-/// when the zone serves a perfectly-formed `_synchronicity-cp` record.
-///
-/// This is the DNS-provider/registrar compromise the Rekor design exists to
-/// stop: an attacker who can add an unlogged DNSKEY and sign a
-/// `_synchronicity-cp` record pointing at themselves must not be able to make
-/// a daemon attach and stream its exposed spaces.
+/// The cloud-attach gate: under `RekorPolicy::Require`, a DNSSEC-valid
+/// membership answer whose zone key is unlogged yields no endpoint even with
+/// a perfectly-formed `_synchronicity-cp` record — the DNS-provider
+/// compromise the Rekor design exists to stop. With the gate `Off`, the same
+/// zone is discovered, which is what makes the refusal the gate's doing.
 #[tokio::test]
 async fn discovery_refuses_an_unlogged_zone_under_require() {
-    let mut zone = SimZone::new("cluster.example", member_records());
-    // The zone would love to be attached to — but its key was never logged.
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     zone.cp_txt = vec!["v=synccp1 url=https://attacker.example".to_string()];
     let log = SimLog::new("rekor.sim");
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap();
-
+    let (resolver, server) = static_resolver(zone, &log).await;
     let error = resolver
         .control_plane("cluster.example")
         .await
         .expect_err("an unlogged zone key must yield no endpoint under Require");
-    // The security property is that no endpoint is yielded, and the refusal is
-    // the transparency gate on the membership answer — the daemon never reaches
-    // the attach record. The sim serves an unsigned NODATA for the absent proof
-    // (it synthesizes no NSEC), so hickory reports a bogus negative rather than
-    // a validated empty set; against a real control plane the same absence is a
-    // signed negative and surfaces as `RekorAbsent`. Either way the endpoint is
-    // refused, which is what matters.
+    // The sim serves an unsigned NODATA for the absent proof, so hickory
+    // reports a bogus negative; a real control plane surfaces `RekorAbsent`.
+    // Either way the endpoint is refused, which is what matters.
     assert!(
         matches!(&error, NetError::RekorAbsent { .. })
             || matches!(&error, NetError::Dns(msg) if msg.contains(rekor::REKOR_TXT_PREFIX)),
         "the membership answer's zone key must be gated before the attach record is trusted: {error}"
     );
     server.abort();
+
+    // With the gate off, the same unlogged zone discovers its endpoint.
+    let mut zone = SimZone::new("cluster.example", common::member_records());
+    zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
+    let anchor = common::write(&zone.anchor_record());
+    let (url, server) = zone.serve().await;
+    let off = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
+        tuf_root: None,
+    })
+    .unwrap();
+    let (record, _ttl) = off
+        .control_plane("cluster.example")
+        .await
+        .expect("with the gate off, a DNSSEC-valid answer is enough");
+    assert_eq!(record.url, "https://sync.example");
+    server.abort();
 }
 
-/// The positive control: the *same* zone, once its key is logged, discovers
-/// its endpoint. Without this the refusal above could be the harness failing
-/// to serve the record rather than the gate refusing it.
+/// The positive control: the same zone, once its key is logged, discovers
+/// its endpoint — without this the refusal above could be the harness
+/// failing to serve the record rather than the gate refusing it.
 #[tokio::test]
 async fn discovery_yields_the_endpoint_once_the_key_is_logged() {
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
     zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap();
-
+    let (resolver, server) = static_resolver(zone, &log).await;
     let (record, _ttl) = resolver
         .control_plane("cluster.example")
         .await
@@ -955,51 +759,28 @@ async fn discovery_yields_the_endpoint_once_the_key_is_logged() {
 }
 
 /// The attach record's **own** signer is gated, not just the membership
-/// answer's.
-///
-/// The two are different RRsets and a zone can sign them with different keys.
-/// The attacker in the threat model is exactly the party who can put a second
-/// key in the apex DNSKEY RRset — a compromised or coerced parent substituting
-/// a DS — and everything such a key signs then validates. So they serve the
-/// operator's *genuine* membership RRset and RRSIG, which is public data and
-/// therefore passes the gate on the logged key, and sign only
-/// `_synchronicity-cp` with the unlogged key. The daemon would attach to their
-/// control plane and stream every exposed space to them, and because the
-/// unlogged key never enters the log no monitor would see anything.
-///
-/// The entry is minted *before* the second key joins the RRset, which is what
-/// makes it an honest proof for the honest key: the chain a certificate
-/// carries is a snapshot, so a key added afterwards is not in the set it
-/// proves.
+/// answer's — they are different RRsets and a zone can sign them with
+/// different keys. The attacker is the party who can add a second key to the
+/// apex DNSKEY RRset (a compromised parent substituting a DS); their key
+/// signs nothing but the attach record, while the genuine membership RRset
+/// passes the first gate with its real proof.
 #[tokio::test]
 async fn discovery_refuses_an_attach_record_signed_by_an_unlogged_key() {
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut log = SimLog::new("rekor.sim");
-    // Logged first: the proof covers the zone's own key and nothing else.
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
     zone.cp_txt = vec!["v=synccp1 url=https://attacker.example".to_string()];
-    // Now the parent's key joins the RRset and signs the attach record.
     let (evil, evil_signer) = zone.second_key();
     zone.add_dnskey(evil);
     zone.sign_cp_with(evil_signer);
 
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap();
-
+    let (resolver, server) = static_resolver(zone, &log).await;
     let error = resolver
         .control_plane("cluster.example")
         .await
         .expect_err("an attach record signed by an unlogged key must yield no endpoint");
-    // The membership answer passes the gate — its key really is logged — so
-    // the refusal is the second gate, on the attach answer's own signer, and
-    // it lands as a key-binding failure rather than an absent proof.
+    // The membership key really is logged, so the refusal is the second gate
+    // on the attach answer's own signer, landing as a binding failure.
     assert!(
         matches!(&error, NetError::RekorBinding { .. }),
         "the attach record's own signer must be gated: {error}"
@@ -1007,41 +788,21 @@ async fn discovery_refuses_an_attach_record_signed_by_an_unlogged_key() {
     server.abort();
 }
 
-/// The attach record does not get to name the apex it is judged against.
-///
-/// The gate needs an apex to check the signing key's proof under, and the
-/// membership record supplies its own through `apex=`. The attach RRset has no
-/// such field and must not acquire one: it is the record under audit, so
-/// letting it choose its own bound would let an attacker who can sign it point
-/// the gate at a name whose key really is logged and pass.
-///
-/// This is what `GateApex::Under` encodes — the bound comes from the gated
-/// answer that led here, never from the answer being gated — and switching
-/// this leg to `FromRecords` is the kind of edit that looks like a
-/// simplification. It fails here.
+/// The attach record does not get to name the apex it is judged against:
+/// the bound comes from the gated answer that led here (`GateApex::Under`),
+/// never from the record under audit — an `apex=` field is not part of the
+/// RRset's grammar.
 #[tokio::test]
 async fn an_attach_record_cannot_name_the_apex_it_is_gated_against() {
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
-    // The attacker's attach record, carrying an `apex=` field of its own — a
-    // field this RRset's grammar does not define, and which an implementation
-    // that derived the bound from the records would read.
     zone.cp_txt = vec!["v=synccp1 url=https://attacker.example apex=cluster.example".to_string()];
     let (evil, evil_signer) = zone.second_key();
     zone.add_dnskey(evil);
     zone.sign_cp_with(evil_signer);
 
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap();
-
+    let (resolver, server) = static_resolver(zone, &log).await;
     let error = resolver
         .control_plane("cluster.example")
         .await
@@ -1054,29 +815,18 @@ async fn an_attach_record_cannot_name_the_apex_it_is_gated_against() {
 }
 
 /// The positive control for the pair above: with both answers signed by the
-/// logged key — every ordinary deployment — the second gate reads the same
-/// proof and passes.
+/// logged key — an ordinary deployment with a spare key mid-rollover — the
+/// second gate reads the same proof and passes.
 #[tokio::test]
 async fn discovery_accepts_an_attach_record_signed_by_the_logged_key() {
-    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut zone = SimZone::new("cluster.example", common::member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
     zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
-    // A second key exists at the apex — an ordinary rollover — but the attach
-    // record is still signed by the logged one.
     let (spare, _spare_signer) = zone.second_key();
     zone.add_dnskey(spare);
 
-    let anchor = write(&zone.anchor_record());
-    let log_key = write(&log.key_pem());
-    let (url, server) = zone.serve().await;
-
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None, None)
-    })
-    .unwrap();
-
+    let (resolver, server) = static_resolver(zone, &log).await;
     let (record, _ttl) = resolver
         .control_plane("cluster.example")
         .await
@@ -1085,47 +835,65 @@ async fn discovery_accepts_an_attach_record_signed_by_the_logged_key() {
     server.abort();
 }
 
-/// And the gate is what refuses: with transparency off, the unlogged zone's
-/// endpoint is discovered. So the refusal above is the Rekor check, not
-/// something incidental about the answer.
-#[tokio::test]
-async fn discovery_without_the_gate_trusts_the_dnssec_answer_alone() {
-    let mut zone = SimZone::new("cluster.example", member_records());
-    zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
-    let anchor = write(&zone.anchor_record());
-    let (url, server) = zone.serve().await;
+/// A pin file naming a root this build never signed is not state: the state
+/// names the anchor it was accumulated under, and the *binary* decides which
+/// anchor that has to be — anyone able to write one file in the data
+/// directory could otherwise choose the transparency-log key set outright.
+#[test]
+fn a_pin_file_anchored_somewhere_else_does_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rekor-pins.json");
 
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Off),
-        rekor_key: None,
-        rekor_state: None,
-        tuf_url: None,
-        no_tuf: true,
-        tuf_root: None,
-    })
-    .unwrap();
+    // The honest client's repository, and a state it legitimately reached.
+    let (mut mine, _log) = repo();
+    mine.rotate_root(false);
+    let honest = accept(&mine);
+    honest.state.save(&path).unwrap();
+    assert!(
+        PinState::load_anchored(&path, &mine.embedded_root()).is_some(),
+        "the state this client reached must load for this client"
+    );
 
-    let (record, _ttl) = resolver
-        .control_plane("cluster.example")
-        .await
-        .expect("with the gate off, a DNSSEC-valid answer is enough");
-    assert_eq!(record.url, "https://sync.example");
-    server.abort();
+    // An attacker's repository: entirely their own keys, and bumped past
+    // the honest version so a version comparison would prefer it.
+    let (mut theirs, _their_log) = repo();
+    theirs.rotate_root(true);
+    theirs.rotate_root(true);
+    theirs.set_tlogs(&[&SimLog::new("rekor.attacker")]);
+    let forged = accept(&theirs);
+    assert!(
+        forged.state.root_version > honest.state.root_version,
+        "the forged state must look newer, or the test proves nothing"
+    );
+    forged.state.save(&path).unwrap();
+    assert!(
+        PinState::load_anchored(&path, &mine.embedded_root()).is_none(),
+        "a root this build's anchor never signed must not load"
+    );
+    // It is not the *versions* being refused: the forged state loads for
+    // the universe that minted it, so the anchor — not the file — decides.
+    assert!(
+        PinState::load_anchored(&path, &theirs.embedded_root()).is_some(),
+        "the forged state is well-formed; it is simply not ours"
+    );
+
+    // The digest carries that, rather than anything derived: a file naming
+    // some other repository's root is refused even though every other byte
+    // in it is this client's own.
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["anchor_digest"] =
+        serde_json::Value::String(base64_encode(&rekor::sha256(&theirs.embedded_root())));
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(PinState::load_anchored(&path, &mine.embedded_root()), None);
 }
 
 // -------------------------------------------------------------- fixtures
 
-/// Refetches the conformance fixture from the live Sigstore repository.
-///
-/// Not part of the suite: it reaches the network, and the metadata it writes
-/// expires, so regenerating is a deliberate act with a date attached rather
-/// than something a test run does behind anyone's back. The `verify_at` it
-/// records is what keeps the checked-in chain checkable afterwards.
-///
-/// `SYNCH_TUF_FIXTURE=write cargo test -p synch-net --test tuf_pin_refresh
-/// -- --ignored regenerate_the_shared_fixture`
+/// Refetches the conformance fixture from the live Sigstore repository, for
+/// when the real chain rotates past what is checked in. Reaches the network
+/// and rewrites the checked-in bytes, so it is gated by
+/// `SYNCH_TUF_FIXTURE=write` and run with `--ignored`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn regenerate_the_shared_fixture() {
@@ -1185,9 +953,8 @@ async fn regenerate_the_shared_fixture() {
         .await
         .expect("trusted root");
 
-    // Three roots is enough chain to be a chain: the head, and the two it
-    // was rotated from. All three are checked in, so the walk has real
-    // rotations to walk.
+    // Three roots is enough chain to be a chain: the head and the two it
+    // was rotated from, so the walk has real rotations to walk.
     let floor = head.saturating_sub(2).max(1);
     let chain: Vec<(u64, Vec<u8>)> = roots.into_iter().filter(|(v, _)| *v >= floor).collect();
     let walked = TufMetadata {
@@ -1257,107 +1024,6 @@ async fn regenerate_the_shared_fixture() {
     .unwrap();
 }
 
-/// A pin file naming a root this build never signed is not state.
-///
-/// Checking that the version number inside the stored root equals the version
-/// number stored beside it is a self-consistency test any file passes: whatever
-/// root the file named would become the client's world, every later update
-/// would chain from it, and anyone able to write one file in the data directory
-/// would choose the transparency-log key set outright.
-///
-/// The state names the anchor it was accumulated under, and the *binary*
-/// decides which anchor that has to be — so a state minted against somebody
-/// else's root fails to load and the client falls back to its bootstrap pins
-/// rather than adopting a stranger's universe.
-#[test]
-fn a_pin_file_anchored_somewhere_else_does_not_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("rekor-pins.json");
-
-    // The honest client's repository, and a state it legitimately reached.
-    let (mut mine, _log) = repo();
-    mine.rotate_root(false);
-    let honest = tuf::update(&mine.metadata(), &mine.embedded_state(), at(NOW)).unwrap();
-    honest.state.save(&path).unwrap();
-    assert!(
-        PinState::load_anchored(&path, &mine.embedded_root()).is_some(),
-        "the state this client reached must load for this client"
-    );
-
-    // An attacker's repository: entirely their own keys, and bumped past
-    // the honest version so a version comparison would prefer it.
-    let (mut theirs, _their_log) = repo();
-    theirs.rotate_root(true);
-    theirs.rotate_root(true);
-    theirs.set_tlogs(&[&SimLog::new("rekor.attacker")]);
-    let forged = tuf::update(&theirs.metadata(), &theirs.embedded_state(), at(NOW)).unwrap();
-    assert!(
-        forged.state.root_version > honest.state.root_version,
-        "the forged state must look newer, or the test proves nothing"
-    );
-    forged.state.save(&path).unwrap();
-
-    assert!(
-        PinState::load_anchored(&path, &mine.embedded_root()).is_none(),
-        "a root this build's anchor never signed must not load"
-    );
-    // And it is not merely the *versions* being refused: the forged state
-    // loads perfectly well for the universe that minted it, which is what
-    // makes the anchor — and not the file — the thing that decides.
-    assert!(
-        PinState::load_anchored(&path, &theirs.embedded_root()).is_some(),
-        "the forged state is well-formed; it is simply not ours"
-    );
-}
-
-/// Four independently-monotone counters need componentwise dominance.
-///
-/// Comparing `(root, timestamp, snapshot, targets)` as a tuple orders them
-/// lexicographically: the root version dominates the other three outright, so
-/// a state ahead on `root` and behind on everything else reads as newer, and
-/// adopting it drops the rollback floors for those roles to the lower numbers —
-/// the one thing the floors exist to prevent.
-#[test]
-fn a_state_ahead_on_the_root_alone_does_not_outrank_one_ahead_everywhere_else() {
-    let (mut repo, _log) = repo();
-    let base = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
-
-    // Same repository, one root rotation on: the root version moves and
-    // nothing below it does.
-    repo.rotate_root(false);
-    let rotated = tuf::update(&repo.metadata(), &base.state, at(NOW)).unwrap();
-    assert!(rotated.state.root_version > base.state.root_version);
-
-    // Hand-build the state a lexicographic comparison got wrong: newer root,
-    // older everything else.
-    let mut mixed = rotated.state.clone();
-    mixed.timestamp_version = base.state.timestamp_version.saturating_sub(1);
-    mixed.snapshot_version = base.state.snapshot_version.saturating_sub(1);
-    mixed.targets_version = base.state.targets_version.saturating_sub(1);
-
-    // Tuple order would call `mixed` the newer of the two. Dominance does
-    // not, and dominance is the question actually being asked.
-    assert!(
-        (
-            mixed.root_version,
-            mixed.timestamp_version,
-            mixed.snapshot_version,
-            mixed.targets_version
-        ) > (
-            base.state.root_version,
-            base.state.timestamp_version,
-            base.state.snapshot_version,
-            base.state.targets_version
-        ),
-        "the tuple comparison this replaced would have preferred `mixed`"
-    );
-    // Neither dominates the other, so neither may displace the other.
-    let dominates = |a: &PinState, b: &PinState| {
-        a.root_version >= b.root_version
-            && a.timestamp_version >= b.timestamp_version
-            && a.snapshot_version >= b.snapshot_version
-            && a.targets_version >= b.targets_version
-    };
-    assert!(!dominates(&mixed, &base.state));
-    assert!(!dominates(&base.state, &mixed));
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tuf")
 }

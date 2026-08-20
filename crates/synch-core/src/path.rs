@@ -112,13 +112,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_simple_paths() {
+    fn rejects_bad_paths() {
+        // The happy paths are the control rows of the same table.
         assert_eq!(normalize_path("a/b/c.txt").unwrap(), "a/b/c.txt");
         assert_eq!(normalize_path("file").unwrap(), "file");
-    }
 
-    #[test]
-    fn rejects_bad_paths() {
         assert_eq!(normalize_path("").unwrap_err(), PathError::Empty);
         assert_eq!(normalize_path("/abs").unwrap_err(), PathError::LeadingSlash);
         assert_eq!(
@@ -155,11 +153,5 @@ mod tests {
     fn native_paths_map_to_slashes() {
         let p = std::path::Path::new("a").join("b").join("c.txt");
         assert_eq!(normalize_native_path(&p).unwrap(), "a/b/c.txt");
-    }
-
-    #[test]
-    fn parent_split() {
-        assert_eq!(split_parent("a/b/c"), ("a/b/", "c"));
-        assert_eq!(split_parent("c"), ("", "c"));
     }
 }

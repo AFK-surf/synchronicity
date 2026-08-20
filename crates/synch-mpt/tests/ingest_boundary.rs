@@ -54,9 +54,8 @@ fn an_empty_ext_prefix_is_refused() {
 
 #[test]
 fn get_and_the_structural_walks_agree_even_if_one_slips_through() {
-    // Defence in depth: `get` does not treat an empty prefix as a transparent
-    // hop, so even a node planted directly into a store cannot put the two
-    // readers into disagreement.
+    // Defence in depth: `get` must not treat an empty prefix as a transparent
+    // hop even when one is planted directly into a store.
     let store = MemStore::new();
     let leaf = TrieNode::Leaf {
         key_rest: Nibbles::from_bytes(b"k"),
@@ -96,8 +95,8 @@ fn an_oversized_inline_value_is_refused() {
 
 #[test]
 fn a_nibble_outside_the_alphabet_is_refused() {
-    // Built by hand: the typed API masks, so this shape can only arrive from a
-    // peer. Reaching `insert`, it indexed a 16-element child array with 32.
+    // The typed API masks, so this shape can only arrive from a peer; reaching
+    // `insert`, it indexed a 16-element child array with 32.
     let honest = TrieNode::Leaf {
         key_rest: Nibbles::from_nibbles(&[2, 1]),
         value: ValueRef::Inline(vec![1]),
@@ -142,9 +141,8 @@ fn an_under_occupied_branch_is_refused() {
 
 #[test]
 fn an_odd_depth_value_still_fails_closed() {
-    // A value at odd nibble depth is not a per-node property, so the boundary
-    // cannot reject it. It must still fail rather than promote: the walk
-    // reports OddDepthValue and the completeness gate must not paper over it.
+    // Not a per-node property, so the boundary cannot reject it; the walks
+    // must still error rather than promote (F9 family).
     let store = MemStore::new();
     let leaf = TrieNode::Leaf {
         key_rest: Nibbles::from_nibbles(&[6]),
@@ -163,15 +161,9 @@ fn an_odd_depth_value_still_fails_closed() {
 }
 
 /// An extension above anything but a branch is refused where the structure is
-/// walked, which is what `check_invariants` says happens.
-///
-/// The invariant is documented on `TrieNode::Ext` and the doc on
-/// `check_invariants` promised it was "checked where the structure is walked".
-/// Nothing checked it. Such a node reads correctly through `get`, `iter` and
-/// `diff` — so it corrupts nothing — but it produces a different root for the
-/// same one-key map, which falsifies the canonical-root property the crate
-/// documents and silently disables both structural sharing across roots and
-/// the `reference == Some(hash)` pruning in `MissingWalk::since`.
+/// walked, as `check_invariants` promises: the shape reads correctly but gives
+/// one key/value map several distinct roots, silently disabling the
+/// `reference == Some(hash)` pruning in `MissingWalk::since`.
 #[test]
 fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
     use synch_mpt::MissingWalk;
@@ -224,10 +216,9 @@ fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
 /// A key at exactly the §12 ceiling is one thing to every reader.
 ///
 /// `get` counted node *loads* against `MAX_DEPTH_NIBBLES` while a key of `n`
-/// nibbles needs `n + 1` of them, so the longest legal key was yielded by
-/// `iter` and `diff` — and therefore materialized into `entries` and served
-/// through the unified tree — while `get` called it structurally invalid and
-/// `synch history` rendered the path as absent.
+/// nibbles needs `n + 1` of them, so `iter`/`diff` yielded the longest legal
+/// key while `get` called it structurally invalid and `synch history`
+/// rendered the path as absent.
 #[test]
 fn the_longest_legal_key_is_visible_to_every_reader() {
     let store = MemStore::new();
@@ -330,16 +321,10 @@ fn an_oversized_value_is_refused_by_the_write_path() {
 
 /// A node hung below the depth any valid key reaches is refused by the fetch.
 ///
-/// The node encoding bounds one node's nibble run, and DESIGN §12 read that as
-/// bounding ingest depth. It does not: a path is made of many nodes. Without a
-/// rule about the *path*, a chain reaching past that depth was pulled and
-/// committed, `is_complete` vouched for the root, no `entries` row reflected any
-/// of it, and every GC pass marked it from the retained head above.
-///
-/// A canonicality rule, not a quota: the walk deduplicates on hash, so a node is
-/// expanded at whichever depth it is reached first and sharing can make a deep
-/// chain shallow. What bounds storage is the deduplication itself — a member gets
-/// no leverage beyond what it uploads.
+/// The encoding bounds one node's nibble run; a path is made of many nodes, and
+/// without a rule about the *path* such a chain was pulled and committed,
+/// `is_complete` vouched for the root, no `entries` row reflected it, and every
+/// GC pass marked it from the retained head above.
 #[test]
 fn a_node_past_the_key_depth_is_refused_by_the_walk() {
     let store = MemStore::new();

@@ -209,15 +209,8 @@ fn deleted(path: &str) -> CompareChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::testkit::node;
     use synch_core::{now_ns, FileEntry, OriginId};
-
-    async fn node() -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
 
     fn a() -> OriginId {
         OriginId::named("nas", "x.example").unwrap()
@@ -225,6 +218,10 @@ mod tests {
 
     fn b() -> OriginId {
         OriginId::named("laptop", "x.example").unwrap()
+    }
+
+    fn c() -> OriginId {
+        OriginId::named("other", "x.example").unwrap()
     }
 
     fn put_file(node: &Node, origin: &OriginId, path: &str, content: &[u8], mtime: i64) {
@@ -250,9 +247,10 @@ mod tests {
     #[tokio::test]
     async fn reports_created_modified_and_deleted() {
         let (_d, node) = node().await;
-        // Shared, identical → not reported.
+        // Shared, identical content — with different mtimes, so content
+        // identity, not mtime, is what defines modified (§8).
         put_file(&node, &a(), "keep.txt", b"same", 1);
-        put_file(&node, &b(), "keep.txt", b"same", 1);
+        put_file(&node, &b(), "keep.txt", b"same", 999);
         // Only in the baseline → deleted in the target.
         put_file(&node, &a(), "only_a.txt", b"x", 1);
         // Only in the target → created.
@@ -260,63 +258,39 @@ mod tests {
         // In both, different bytes → modified.
         put_file(&node, &a(), "changed.txt", b"v1", 1);
         put_file(&node, &b(), "changed.txt", b"v2", 1);
+        // A tombstone in the target reads as deleted.
+        put_file(&node, &a(), "gone.txt", b"here", 1);
+        node.store()
+            .put_entry(&b(), "media", "gone.txt", &FileEntry::tombstone(2, 1, None))
+            .unwrap();
 
         let report = node.compare("media", "", &a(), &b()).unwrap();
         assert_eq!(
             statuses(&report),
             vec![
                 ("changed.txt", CompareStatus::Modified),
+                ("gone.txt", CompareStatus::Deleted),
                 ("only_a.txt", CompareStatus::Deleted),
                 ("only_b.txt", CompareStatus::Created),
             ]
         );
         assert_eq!(
             (report.created(), report.modified(), report.deleted()),
-            (1, 1, 1)
+            (1, 1, 2)
         );
-    }
 
-    #[tokio::test]
-    async fn identical_content_with_different_mtime_is_not_a_change() {
-        let (_d, node) = node().await;
-        put_file(&node, &a(), "f.txt", b"bytes", 100);
-        put_file(&node, &b(), "f.txt", b"bytes", 999); // same content, later mtime
-        let report = node.compare("media", "", &a(), &b()).unwrap();
-        assert!(report.changes.is_empty(), "{report:?}");
-    }
-
-    #[tokio::test]
-    async fn a_tombstone_in_the_target_reads_as_deleted() {
-        let (_d, node) = node().await;
-        put_file(&node, &a(), "gone.txt", b"here", 1);
-        node.store()
-            .put_entry(&b(), "media", "gone.txt", &FileEntry::tombstone(2, 1, None))
-            .unwrap();
-        let report = node.compare("media", "", &a(), &b()).unwrap();
-        assert_eq!(
-            statuses(&report),
-            vec![("gone.txt", CompareStatus::Deleted)]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_prefix_scopes_the_comparison() {
-        let (_d, node) = node().await;
+        // A prefix scopes the same comparison: only paths under it appear.
         put_file(&node, &a(), "photos/x.jpg", b"1", 1);
         put_file(&node, &b(), "photos/x.jpg", b"2", 1);
-        put_file(&node, &b(), "docs/y.txt", b"3", 1); // outside the prefix
+        put_file(&node, &b(), "docs/y.txt", b"3", 1);
         let report = node.compare("media", "photos/", &a(), &b()).unwrap();
         assert_eq!(
             statuses(&report),
             vec![("photos/x.jpg", CompareStatus::Modified)]
         );
-    }
 
-    #[tokio::test]
-    async fn an_unknown_target_origin_is_rejected() {
-        let (_d, node) = node().await;
-        put_file(&node, &a(), "f.txt", b"x", 1);
-        // b() never published, so it is not a synced origin.
-        assert!(node.compare("media", "", &a(), &b()).is_err());
+        // An origin this node has never synced is a typo, not an empty tree.
+        assert!(node.compare("media", "", &a(), &c()).is_err());
+        node.shutdown().await.unwrap();
     }
 }

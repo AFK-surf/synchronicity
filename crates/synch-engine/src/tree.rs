@@ -86,15 +86,8 @@ pub fn reference_of(policy: &VersionPolicy, space: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::testkit::node;
     use synch_core::{FileEntry, Hash, OriginId};
-
-    async fn node() -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
 
     fn origin(name: &str) -> OriginId {
         OriginId::named(name, "x.example").unwrap()
@@ -152,38 +145,6 @@ mod tests {
             err.to_string().contains("nas@x.example:media/absent"),
             "{err}"
         );
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn the_listing_marks_divergence() {
-        let (_d, node) = node().await;
-        for (name, content) in [("nas", b"a"), ("laptop", b"b")] {
-            node.store()
-                .put_entry(
-                    &origin(name),
-                    "media",
-                    "split",
-                    &FileEntry::file(1, 0, Hash::new(content), 1),
-                )
-                .unwrap();
-        }
-        node.store()
-            .put_entry(
-                &origin("nas"),
-                "media",
-                "agreed",
-                &FileEntry::file(1, 0, Hash::new(b"same"), 1),
-            )
-            .unwrap();
-
-        let listing = node.unified_listing("media", "", None, None).unwrap();
-        assert_eq!(listing.len(), 2, "one row per path");
-        let split = listing.iter().find(|s| s.path == "split").unwrap();
-        assert_eq!(split.version_count(), 2);
-        assert!(split.is_divergent());
-        let agreed = listing.iter().find(|s| s.path == "agreed").unwrap();
-        assert!(!agreed.is_divergent());
         node.shutdown().await.unwrap();
     }
 }

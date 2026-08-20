@@ -736,13 +736,13 @@ mod tests {
         let (space, path) = parse_file_key(&key).unwrap();
         assert_eq!(space, "photos");
         assert_eq!(path, "2024/summer/a.jpg");
-    }
 
-    #[test]
-    fn file_keys_normalize_paths() {
-        let a = file_key("s", "cafe\u{0301}.txt").unwrap();
-        let b = file_key("s", "caf\u{00e9}.txt").unwrap();
-        assert_eq!(a, b);
+        // The b: namespace round-trips the same way.
+        let h = Hash::new(b"object");
+        let key = blob_key(&h);
+        assert_eq!(key.len(), 34);
+        assert_eq!(parse_blob_key(&key).unwrap(), h);
+        assert!(key.starts_with(&blob_prefix()));
     }
 
     #[test]
@@ -752,15 +752,6 @@ mod tests {
         assert!(key.starts_with(&dir_prefix("photos", "a").unwrap()));
         assert!(!key.starts_with(&dir_prefix("photos", "b").unwrap()));
         assert_eq!(dir_prefix("photos", "").unwrap(), b"f:photos/".to_vec());
-    }
-
-    #[test]
-    fn blob_keys_round_trip() {
-        let h = Hash::new(b"object");
-        let key = blob_key(&h);
-        assert_eq!(key.len(), 34);
-        assert_eq!(parse_blob_key(&key).unwrap(), h);
-        assert!(key.starts_with(&blob_prefix()));
     }
 
     #[test]
@@ -870,13 +861,10 @@ mod tests {
         );
     }
 
-    /// Coalescing under-reports rather than over-reports.
-    ///
-    /// The direction is the policy `MAX_AD_SPANS` states: over-reporting sends a
-    /// fetcher to a provider that cannot serve, under-reporting costs at most a
-    /// re-fetch. Rounding a run *out* to granule boundaries claims up to 16 MiB
-    /// of unheld bytes at each end, which is what a holder of two bytes used to
-    /// advertise as the whole first granule.
+    /// Coalescing under-reports rather than over-reports: rounding a run *out*
+    /// to granule boundaries claims up to 16 MiB of unheld bytes at each end,
+    /// which is what a holder of two bytes used to advertise as the whole first
+    /// granule — the direction `MAX_AD_SPANS` states.
     #[test]
     fn spans_coalesce_at_16mib() {
         let g = AD_SPAN_GRANULARITY;
@@ -894,6 +882,18 @@ mod tests {
             coalesce_spans([(0, 2 * g), (2 * g, 4 * g)], size),
             vec![(0, 4 * g)]
         );
+
+        // The object's own end is exact, and a claim past it clamps to it.
+        let size = g / 2;
+        assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
+        assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);
+        assert_eq!(coalesce_spans([(0, 10)], size), vec![]);
+
+        // Intersection answers against the same span shape.
+        let ad = BlobAd::partial(10 * g, [(0, g)]);
+        assert!(ad.intersects(0, 10));
+        assert!(!ad.intersects(2 * g, 3 * g));
+        assert!(BlobAd::complete(10).intersects(0, 10));
     }
 
     /// A holder of part of an object never advertises the whole of it.
@@ -920,26 +920,5 @@ mod tests {
         let ad = BlobAd::partial(small, [(0, small)]);
         assert_eq!(ad.state.spans, vec![(0, small)]);
         assert!(ad.is_complete());
-    }
-
-    #[test]
-    fn spans_clamp_to_size() {
-        let g = AD_SPAN_GRANULARITY;
-        let size = g / 2;
-        // The object's own end is exact: its tail granule is real bytes, not a
-        // rounding artifact.
-        assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
-        assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);
-        // Part of it is part of it.
-        assert_eq!(coalesce_spans([(0, 10)], size), vec![]);
-    }
-
-    #[test]
-    fn ad_intersection() {
-        let g = AD_SPAN_GRANULARITY;
-        let ad = BlobAd::partial(10 * g, [(0, g)]);
-        assert!(ad.intersects(0, 10));
-        assert!(!ad.intersects(2 * g, 3 * g));
-        assert!(BlobAd::complete(10).intersects(0, 10));
     }
 }

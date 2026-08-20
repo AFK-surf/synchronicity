@@ -269,64 +269,37 @@ mod tests {
         lines.iter().map(|l| l.to_string()).collect()
     }
 
+    /// Every fold rule in one pass over the log: a later record replaces an
+    /// existing name, a single-field record removes it (and re-adding brings it
+    /// back, because nothing was rewritten), and a record nobody can read costs
+    /// only itself.
     #[test]
     fn the_last_record_naming_a_bucket_wins() {
         let buckets = fold(&records(&[
             "photos\tmedia\tnewest",
             "docs\tpapers\tstrict",
-            // A replacement for an existing name, appended rather than edited.
             "photos\tmedia\torigin=nas@cluster.example",
+            "garbage\tmedia\twhatever",
+            "\t\t",
+            "docs",
+            "docs\tother\tnewest",
         ]));
-        assert_eq!(buckets.len(), 2);
+        let names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "photos"]);
         let photos = buckets.iter().find(|b| b.name == "photos").unwrap();
         assert_eq!(
             photos.policy,
             Policy::Origin("nas@cluster.example".to_string())
         );
-    }
+        let docs = buckets.iter().find(|b| b.name == "docs").unwrap();
+        assert_eq!(docs.space, "other");
 
-    #[test]
-    fn a_single_field_record_removes_a_bucket() {
-        let buckets = fold(&records(&[
-            "photos\tmedia\tnewest",
-            "docs\tpapers\tstrict",
-            "photos",
-        ]));
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].name, "docs");
-        // And re-adding after a removal brings it back, because the log is
-        // read in order and nothing was rewritten.
-        let buckets = fold(&records(&[
-            "photos\tmedia\tnewest",
-            "photos",
-            "photos\tother\tstrict",
-        ]));
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].space, "other");
-    }
-
-    #[test]
-    fn an_unreadable_record_costs_only_itself() {
-        let buckets = fold(&records(&[
-            "photos\tmedia\tnewest",
-            "garbage\tmedia\twhatever",
-            "\t\t",
-            "docs\tpapers\tstrict",
-        ]));
-        let names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["docs", "photos"]);
-    }
-
-    /// Databases written before the unified tree stored the bucket map as
-    /// `<bucket>\t<space>\t<policy>` in one config row; migration v5 gave every
-    /// line its policy and v8 moved the row into the `s3.*` namespace, so what
-    /// the log reads back on an upgraded node is exactly a run of add records.
-    #[test]
-    fn a_migrated_bucket_map_reads_as_add_records() {
-        let buckets = fold(&records(&["photos\tmedia\torigin=nas@x.example"]));
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].space, "media");
-        assert_eq!(buckets[0].policy.pinned_origin(), Some("nas@x.example"));
+        // Databases written before the unified tree stored the bucket map as
+        // `<bucket>\t<space>\t<policy>`; what the log reads back on an
+        // upgraded node is exactly a run of add records.
+        let migrated = fold(&records(&["photos\tmedia\torigin=nas@x.example"]));
+        assert_eq!(migrated[0].space, "media");
+        assert_eq!(migrated[0].policy.pinned_origin(), Some("nas@x.example"));
     }
 
     #[test]
@@ -370,19 +343,15 @@ mod tests {
             .unwrap()
             .contains("read-only"));
 
-        let mine = Bucket {
-            policy: Policy::Origin(ours.into()),
-            ..bucket.clone()
-        };
-        assert!(!mine.pins_a_foreign_origin(ours));
-        assert!(mine.foreign_pin_warning(ours).is_none());
-
-        let unpinned = Bucket {
-            policy: Policy::Strict,
-            ..bucket
-        };
-        assert!(!unpinned.pins_a_foreign_origin(ours));
-        assert!(unpinned.foreign_pin_warning(ours).is_none());
+        for policy in [Policy::Origin(ours.into()), Policy::Strict] {
+            let bucket = Bucket {
+                name: "mine".into(),
+                space: "media".into(),
+                policy,
+            };
+            assert!(!bucket.pins_a_foreign_origin(ours));
+            assert!(bucket.foreign_pin_warning(ours).is_none());
+        }
     }
 
     #[test]

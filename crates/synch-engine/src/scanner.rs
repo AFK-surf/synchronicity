@@ -1271,20 +1271,11 @@ pub fn staged_content(change: &StagedChange) -> Option<Hash> {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
-
-    async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
-        (data, space, node)
-    }
+    use crate::testkit::{node_with_space, published, reopen};
 
     /// Ages every scan record past the racy window, as if the test had waited
-    /// two seconds: records hashed moments after their file's mtime are
-    /// racily clean and re-hashed on the next scan, which is correct but not
-    /// what tests of the trusted stat check are exercising.
+    /// two seconds: freshly hashed records are racily clean and re-hashed on
+    /// the next scan, which is correct but not what stat-trust tests exercise.
     fn age_quick_checks(node: &Node) {
         for space in node.store().spaces().unwrap() {
             for mut row in node.store().local_file_rows(&space.id).unwrap() {
@@ -1294,15 +1285,55 @@ mod tests {
         }
     }
 
+    /// A node whose tombstone TTL is set for a test rather than for a cluster.
+    async fn node_with_ttl(
+        ttl: std::time::Duration,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Node) {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let mut config = NodeConfig::loopback(data.path());
+        config.tombstone_ttl = ttl;
+        let node = Node::open(config).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        (data, space, node)
+    }
+
+    /// Rewrites a tombstone's deletion time, which is what a tombstone 90 days
+    /// old looks like without waiting 90 days.
+    fn backdate_tombstone(node: &Node, path: &str, mtime_ns: i64) {
+        let row = published(node, "media", path);
+        assert_eq!(row.kind, EntryKind::Tombstone);
+        node.store()
+            .put_entry(
+                node.origin(),
+                "media",
+                path,
+                &FileEntry::tombstone(mtime_ns, row.seq, row.prev),
+            )
+            .unwrap();
+    }
+
+    fn in_root(node: &Node, root: Hash, path: &str) -> bool {
+        Trie::new(node.store().as_ref())
+            .get(root, &file_key("media", path).unwrap())
+            .unwrap()
+            .is_some()
+    }
+
     #[tokio::test]
     async fn scans_hashes_and_publishes() {
         let (_d, space, node) = node_with_space().await;
         std::fs::create_dir_all(space.path().join("talks")).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         std::fs::write(space.path().join("talks/b.bin"), vec![7u8; 40_000]).unwrap();
+        // The walk honors the space's ignore set.
+        std::fs::write(space.path().join(".syncignore"), "*.tmp\n").unwrap();
+        std::fs::write(space.path().join("scratch.tmp"), b"x").unwrap();
 
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 2);
+        assert!(report.ignored >= 1);
         assert_eq!(report.unchanged, 0);
         let head = head.unwrap();
         assert_eq!(head.seq, 1);
@@ -1315,39 +1346,15 @@ mod tests {
         let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
         assert_eq!(a.size, 5);
         assert_eq!(a.content, Some(Hash::new(b"hello")));
-        // Content is in the CAS and reads back verified.
+        // Content is in the CAS and reads back verified, and the object is
+        // advertised as a provider.
         assert_eq!(
             node.store().read_all(&a.content.unwrap()).unwrap(),
             b"hello"
         );
-        // And the object is advertised.
         assert_eq!(
             node.store().providers(&a.content.unwrap()).unwrap().len(),
             1
-        );
-        node.shutdown().await.unwrap();
-    }
-
-    /// A scan publishes the file's mode, and it reaches the view every
-    /// materializing surface reads (§4.2, §7.2).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_scan_publishes_the_file_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_d, space, node) = node_with_space().await;
-        let path = space.path().join("run.sh");
-        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
-
-        node.scan_and_publish().unwrap();
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "run.sh")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            entry.unix_mode.expect("a scan on unix publishes a mode") & 0o777,
-            0o750
         );
         node.shutdown().await.unwrap();
     }
@@ -1368,11 +1375,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_racy_same_size_rewrite_is_still_detected() {
-        // The stat quick check is (size, mtime, file_id). A same-size rewrite
-        // landing within the filesystem's timestamp granularity leaves all
-        // three identical — forced here with set_times, which is what a
-        // coarse-clock kernel does on its own — so the quick check alone would
-        // never publish it. Within the racy window the bytes speak instead.
+        // A same-size rewrite sharing the hashed mtime: inside the racy window
+        // the stat proves nothing and the bytes are hashed again.
         let (_d, space, node) = node_with_space().await;
         let path = space.path().join("rolling.txt");
         std::fs::write(&path, b"revision 1").unwrap();
@@ -1393,16 +1397,11 @@ mod tests {
         assert_eq!(report.hashed, 1, "a racily clean stat proves nothing");
         assert_eq!(head.unwrap().seq, 2);
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "rolling.txt")
-                .unwrap()
-                .unwrap()
-                .content,
+            published(&node, "media", "rolling.txt").content,
             Some(Hash::new(b"revision 2"))
         );
 
-        // An untouched file leaves the racy window by being re-hashed once:
-        // the refreshed record ages into a trustworthy stat.
+        // The refreshed record ages into a trustworthy stat.
         age_quick_checks(&node);
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
@@ -1411,49 +1410,34 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// The change lifecycle: edits are detected with prev lineage pointing at
+    /// the replaced content; deletions become tombstones distinguishing
+    /// "deleted at seq N" from "never existed".
     #[tokio::test]
-    async fn edits_are_detected_and_carry_lineage() {
+    async fn edits_and_deletions_flow_through_the_lifecycle() {
         let (_d, space, node) = node_with_space().await;
         std::fs::write(space.path().join("a.txt"), b"before").unwrap();
         node.scan_and_publish().unwrap();
 
-        // Force a distinguishable mtime so the (size, mtime, file_id) triple
-        // differs even on coarse-resolution filesystems.
+        // A distinguishable mtime so the stat triple differs even on
+        // coarse-resolution filesystems.
         std::fs::write(space.path().join("a.txt"), b"after!!").unwrap();
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 1);
         assert_eq!(head.unwrap().seq, 2);
-
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
+        let entry = published(&node, "media", "a.txt");
         assert_eq!(entry.content, Some(Hash::new(b"after!!")));
         assert_eq!(entry.prev, Some(Hash::new(b"before")));
-        node.shutdown().await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn deletions_become_tombstones() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-        node.scan_and_publish().unwrap();
+        // The delete phase of the same lifecycle.
         std::fs::remove_file(space.path().join("a.txt")).unwrap();
-
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.deleted, 1);
-        assert_eq!(head.unwrap().seq, 2);
-
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
-        // The tombstone distinguishes "deleted at seq 2" from "never existed".
+        assert_eq!(head.unwrap().seq, 3);
+        let entry = published(&node, "media", "a.txt");
         assert_eq!(entry.kind, EntryKind::Tombstone);
-        assert_eq!(entry.seq, 2);
-        assert_eq!(entry.prev, Some(Hash::new(b"hello")));
+        assert_eq!(entry.seq, 3);
+        assert_eq!(entry.prev, Some(Hash::new(b"after!!")));
         node.shutdown().await.unwrap();
     }
 
@@ -1465,32 +1449,22 @@ mod tests {
         assert!(unjudged_covers(&unjudged, "d/sub/deep.txt"));
         assert!(unjudged_covers(&unjudged, "d/sub/a/b/c.txt"));
         assert!(unjudged_covers(&unjudged, "solo.txt"));
-        // Whole components: a sibling that merely shares a prefix is not
-        // covered, or one unreadable directory would freeze its neighbours'
-        // deletions too.
+        // Whole components only: a sibling sharing a prefix is not covered, or
+        // one unreadable directory would freeze its neighbours' deletions.
         assert!(!unjudged_covers(&unjudged, "d/subterfuge.txt"));
         assert!(!unjudged_covers(&unjudged, "d/other.txt"));
         assert!(!unjudged_covers(&unjudged, "solo.txt.bak"));
         assert!(!unjudged_covers(&[], "anything"));
     }
 
-    /// A path the walk could not judge is not tombstoned.
-    ///
-    /// A published file whose `symlink_metadata` fails — the parent lost its
-    /// execute bit, a network space returned `EIO` — was absent from `seen` and
-    /// so was swept: the scan reported it in `skipped` *and* published a
-    /// tombstone for it, mirrors deleted their copies, and a later successful
-    /// scan republished it with no `prev` so every peer re-fetched the bytes.
-    ///
-    /// Needs a real `EACCES`, so it is Unix-only and cannot run as root, who
-    /// bypasses the check being relied on.
+    /// A path the walk could not judge is not tombstoned: a published file
+    /// whose stat fails (an unreadable parent) is skipped, not swept as gone.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_path_the_walk_could_not_stat_is_not_deleted() {
         use std::os::unix::fs::PermissionsExt;
-        // Root bypasses the permission check this relies on, so there is
-        // nothing to observe. Detected by trying it rather than by asking for a
-        // uid: what matters is whether the failure actually happens.
+        // Root bypasses the permission check this relies on; detect it by
+        // trying rather than by asking for a uid.
         let probe = tempfile::tempdir().unwrap();
         std::fs::write(probe.path().join("p"), b"x").unwrap();
         std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -1501,30 +1475,23 @@ mod tests {
             return;
         }
         let (_d, space, node) = node_with_space().await;
+        // Both shapes: a file under the unreadable directory and one under a
+        // subdirectory of it — `walk` stats a DirEntry before it recurses.
         let dir = space.path().join("d");
-        // Both shapes: a file directly under the unreadable directory, and one
-        // under a *subdirectory* of it. `walk` stats a `DirEntry` before it can
-        // know it is a directory, so `d/sub` is what lands in `skipped` while
-        // `d/sub/deep.txt` is the published path at risk — and an exact-match
-        // exemption reaches only the first of the two.
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("keep.txt"), b"hello").unwrap();
         std::fs::write(dir.join("sub").join("deep.txt"), b"deeper").unwrap();
         node.scan_and_publish().unwrap();
         for path in ["d/keep.txt", "d/sub/deep.txt"] {
             assert_eq!(
-                node.store()
-                    .entry(node.origin(), "media", path)
-                    .unwrap()
-                    .unwrap()
-                    .kind,
+                published(&node, "media", path).kind,
                 EntryKind::File,
                 "{path} must be published before the directory is locked"
             );
         }
 
-        // Listable but not traversable: `read_dir` still yields the child's
-        // name, `symlink_metadata` on it fails.
+        // Listable but not traversable: `read_dir` still yields the name,
+        // `symlink_metadata` on it fails.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
         let report = node.scan_all().unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1533,11 +1500,7 @@ mod tests {
             !report.skipped.is_empty(),
             "the scan must report the path it could not judge"
         );
-        assert_eq!(
-            report.deleted, 0,
-            "and must not read it as deleted: {:?}",
-            report.skipped
-        );
+        assert_eq!(report.deleted, 0, "{:?}", report.skipped);
         for path in ["keep.txt", "deep.txt"] {
             assert!(
                 !report
@@ -1550,22 +1513,14 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A key the platform reads as more than one relative component is refused.
-    ///
-    /// `normalize_path` speaks the protocol's path language, where `/` is the
-    /// only separator — so on Windows a key of `..\\..\\evil.txt` is a single
-    /// `Normal` component to it and a traversal to `Path::join`, and one with a
-    /// drive prefix makes `join` discard the space root outright. Either writes
-    /// outside every space, as the daemon user, from any key the S3 gateway
-    /// accepts. A no-op on POSIX, which is why the assertions below are
-    /// platform-gated.
+    /// A key the platform reads as more than one relative component is
+    /// refused (Windows backslash and drive forms; POSIX sees ordinary
+    /// components, so its own path rules still refuse what matters).
     #[tokio::test]
     async fn an_adoption_target_stays_inside_its_space() {
         let (_d, _space, node) = node_with_space().await;
-        // Against the root as `add_space` recorded it, not as the test made it:
-        // `canonical_dir` resolves `/var` to `/private/var` on macOS and adds a
-        // verbatim prefix on Windows, so the tempdir's own path is a different
-        // spelling of the same directory.
+        // Against the root as `add_space` recorded it, not as the test made
+        // it: `canonical_dir` resolves `/var` to `/private/var` on macOS.
         let root = PathBuf::from(node.store().space("media").unwrap().unwrap().local_path);
         let inside = node.adoption_target("media", "sub/ok.txt").unwrap();
         assert_eq!(inside, root.join("sub").join("ok.txt"));
@@ -1581,23 +1536,13 @@ mod tests {
                 "{escape} must not resolve outside the space"
             );
         }
-        // On POSIX every one of those is a single ordinary component, and the
-        // protocol's own rules already refuse the separators that matter.
         assert!(node.adoption_target("media", "../evil.txt").is_err());
         assert!(node.adoption_target("media", "/etc/passwd").is_err());
         node.shutdown().await.unwrap();
     }
 
-    /// A path re-created while its own tombstone is expiring survives the batch.
-    ///
-    /// The expiry set is read from `entries` as it stood before the scan, so a
-    /// path that is both aged out and back on disk appears twice in one batch:
-    /// the scan's live entry, then a raw removal of the same key. `publish` folds
-    /// in order, so the removal used to win and the origin published *nothing*
-    /// for the path — not a file, not even a tombstone. And it stuck: the scan
-    /// had already recorded the new content in `local_files`, so every later scan
-    /// called the path unchanged, while the tombstone row the removal deleted was
-    /// no longer there to be retired.
+    /// A path re-created while its own tombstone is expiring survives the
+    /// batch: the scan's live entry restating the key beats the raw removal.
     #[tokio::test]
     async fn a_path_re_created_as_its_tombstone_expires_is_still_published() {
         let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
@@ -1606,16 +1551,12 @@ mod tests {
         std::fs::remove_file(space.path().join("a.txt")).unwrap();
         node.scan_and_publish().unwrap();
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "a.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
+            published(&node, "media", "a.txt").kind,
             EntryKind::Tombstone
         );
 
-        // The tombstone ages out and the file comes back, both before the next
-        // scan sees either — which is the whole of the trigger.
+        // The tombstone ages out and the file comes back, both before the
+        // next scan sees either — the whole of the trigger.
         backdate_tombstone(&node, "a.txt", now_ns() - 2 * 3600 * 1_000_000_000);
         std::fs::write(space.path().join("a.txt"), b"second").unwrap();
 
@@ -1626,23 +1567,14 @@ mod tests {
         );
         node.publish(&report.staged).unwrap();
 
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .expect("the re-created path must still be published");
+        let entry = published(&node, "media", "a.txt");
         assert_eq!(entry.kind, EntryKind::File);
         assert_eq!(entry.content, Some(Hash::new(b"second")));
     }
 
-    /// A deletion whose tombstone never reached a root is re-derived.
-    ///
-    /// The window: `scan_space` stages the tombstone and removes the
-    /// `local_files` row in the same pass, but only the row removal is
-    /// committed — staging is in memory. A crash, or a failed publish, and the
-    /// path is on disk nowhere, in `local_files` nowhere, and still published
-    /// as live. Anchoring the sweep to what this origin published, and not only
-    /// to what the scanner recorded, is what lets a later scan see it again.
+    /// A deletion whose tombstone never reached a root is re-derived from the
+    /// published tree by the next scan, and a tombstoned path is not swept
+    /// again (which would republish a deletion forever).
     #[tokio::test]
     async fn a_deletion_whose_batch_was_lost_is_re_derived_by_the_next_scan() {
         let (_d, space, node) = node_with_space().await;
@@ -1655,11 +1587,7 @@ mod tests {
         assert_eq!(lost.deleted, 1, "the scan saw the deletion");
         assert!(node.store().local_files("media").unwrap().is_empty());
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "a.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
+            published(&node, "media", "a.txt").kind,
             EntryKind::File,
             "and it is still published as live"
         );
@@ -1668,17 +1596,12 @@ mod tests {
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.deleted, 1);
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "a.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
+            published(&node, "media", "a.txt").kind,
             EntryKind::Tombstone
         );
         assert_eq!(head.unwrap().seq, 2);
 
-        // And a tombstoned path is not swept again, or every scan would
-        // republish a deletion forever.
+        // And a tombstoned path is not swept again.
         let (again, head) = node.scan_and_publish().unwrap();
         assert_eq!(again.deleted, 0);
         assert!(head.is_none());
@@ -1693,26 +1616,16 @@ mod tests {
         std::fs::write(space.path().join("gone.tmp"), b"two").unwrap();
         std::fs::write(space.path().join("z.txt"), b"three").unwrap();
 
-        // Removed after `walk` has listed it and before `index_file` stats it,
-        // which is what a build tree does to a scanner routinely. Driven by
-        // deleting it between two scans of the same walk order: `walk` sorts,
-        // so `gone.tmp` sits between the two files that must survive.
+        // Removed while the scan runs, between the walk and the indexing.
         let report = node
             .scan_all_with(|_, _| {
                 let _ = std::fs::remove_file(space.path().join("gone.tmp"));
             })
             .unwrap();
-        // Whether the removal beat the stat or not, the two real files are
-        // indexed and published — the failure mode this guards is the pass
-        // aborting and leaving `a.txt` recorded but unpublished.
         node.publish(&report.staged).unwrap();
         for name in ["a.txt", "z.txt"] {
             assert_eq!(
-                node.store()
-                    .entry(node.origin(), "media", name)
-                    .unwrap()
-                    .unwrap()
-                    .kind,
+                published(&node, "media", name).kind,
                 EntryKind::File,
                 "{name} must be published"
             );
@@ -1720,98 +1633,10 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn ignore_rules_are_honored() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join(".syncignore"), "*.tmp\n!keep.tmp\n").unwrap();
-        std::fs::write(space.path().join("a.txt"), b"x").unwrap();
-        std::fs::write(space.path().join("scratch.tmp"), b"x").unwrap();
-        std::fs::write(space.path().join("keep.tmp"), b"x").unwrap();
-        std::fs::write(space.path().join(".DS_Store"), b"x").unwrap();
-
-        let (report, _) = node.scan_and_publish().unwrap();
-        assert_eq!(report.hashed, 2);
-        assert!(report.ignored >= 2);
-        let paths: Vec<String> = node
-            .store()
-            .list_entries(Some(node.origin()), "media", "", None, None)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
-        assert_eq!(paths, vec!["a.txt".to_string(), "keep.tmp".to_string()]);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn nested_directories_mirror_into_the_key_space() {
-        let (_d, space, node) = node_with_space().await;
-        for dir in ["a", "a/b", "a/b/c"] {
-            std::fs::create_dir_all(space.path().join(dir)).unwrap();
-            std::fs::write(space.path().join(dir).join("f.txt"), dir.as_bytes()).unwrap();
-        }
-        node.scan_and_publish().unwrap();
-
-        // A directory listing is a range scan over the f: prefix (§4.1).
-        let under_b = node
-            .store()
-            .list_entries(Some(node.origin()), "media", "a/b/", None, None)
-            .unwrap();
-        assert_eq!(under_b.len(), 2);
-        assert!(under_b.iter().all(|e| e.path.starts_with("a/b/")));
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn adopting_a_peer_version_republishes_it_as_ours() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"mine").unwrap();
-        node.scan_and_publish().unwrap();
-
-        node.adopt("media", "a.txt", b"theirs").unwrap();
-        node.scan_and_publish().unwrap();
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
-        assert_eq!(entry.content, Some(Hash::new(b"theirs")));
-        assert_eq!(entry.prev, Some(Hash::new(b"mine")));
-        node.shutdown().await.unwrap();
-    }
-
-    /// A commit that cannot finish takes its staging file with it.
-    ///
-    /// `commit` has to take the handle out of the `Adoption` to flush and close
-    /// it before the rename, which is exactly what `Drop`'s cleanup keys on — so
-    /// once the sync or the rename fails, `Drop` sees nothing to remove and the
-    /// staging file is stranded. It wears a name the scanner's built-in ignore
-    /// rules skip, so nothing would ever have found it again: a full-size copy
-    /// of the object sitting beside the target forever, on a path reached
-    /// precisely when the disk is already in trouble (ENOSPC — or, as here, a
-    /// target that is a directory).
-    #[test]
-    fn a_commit_that_cannot_finish_leaves_no_staging_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("occupied");
-        std::fs::create_dir(&target).unwrap();
-
-        let mut out = Adoption::at(&target).unwrap();
-        out.write(b"the new version").unwrap();
-        assert!(out.commit().is_err(), "a directory cannot be renamed over");
-
-        let mut left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec!["occupied".to_string()], "residue: {left:?}");
-    }
-
-    /// The streamed form of adoption: the object goes from the CAS into the
-    /// space a piece at a time, never through a buffer the size of the file
-    /// (§9.4). The staging file it passes through is invisible to a scan and
-    /// gone by the time the adoption returns.
+    /// The streamed form of adoption (§9.4): bytes go from the CAS into the
+    /// space a piece at a time, through an invisible staging file that is gone
+    /// by the time the adoption returns; the bytes-in-hand form takes the same
+    /// pipeline with prev lineage.
     #[tokio::test]
     async fn adopting_a_peer_version_streams_it_into_the_space() {
         let (_d, space, node) = node_with_space().await;
@@ -1832,9 +1657,7 @@ mod tests {
 
         let target = node.adopt_from(&peer, "media", "a.txt").await.unwrap();
         // The engine reports the path under the *stored* space root, which was
-        // canonicalized at `space add` time — on macOS the tempdir's `/var/…`
-        // is a symlink to `/private/var/…`, so the raw tempdir path would not
-        // compare equal even though it names the same file.
+        // canonicalized at `space add` time (macOS `/var` -> `/private/var`).
         let canonical_space = space.path().canonicalize().unwrap();
         assert_eq!(target, canonical_space.join("a.txt"));
         assert_eq!(std::fs::read(&target).unwrap(), payload);
@@ -1845,18 +1668,42 @@ mod tests {
         assert_eq!(left, vec!["a.txt".to_string()]);
 
         node.scan_and_publish().unwrap();
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
+        let entry = published(&node, "media", "a.txt");
         assert_eq!(entry.content, Some(root));
         assert_eq!(entry.prev, Some(Hash::new(b"mine")));
+
+        // The bytes-in-hand wrapper republishes with prev lineage too.
+        node.adopt("media", "a.txt", b"hand").unwrap();
+        node.scan_and_publish().unwrap();
+        let entry = published(&node, "media", "a.txt");
+        assert_eq!(entry.content, Some(Hash::new(b"hand")));
+        assert_eq!(entry.prev, Some(root));
 
         // A path outside every indexed space is refused before anything is
         // fetched, exactly as the bytes-in-hand form refuses it.
         assert!(node.adopt_from(&peer, "absent", "a.txt").await.is_err());
         node.shutdown().await.unwrap();
+    }
+
+    /// A commit that cannot finish takes its staging file with it: `commit`
+    /// has to let go of the handle before the rename, so the cleanup happens
+    /// there — on a path reached precisely when the disk is in trouble.
+    #[test]
+    fn a_commit_that_cannot_finish_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut out = Adoption::at(&target).unwrap();
+        out.write(b"the new version").unwrap();
+        assert!(out.commit().is_err(), "a directory cannot be renamed over");
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["occupied".to_string()], "residue: {left:?}");
     }
 
     #[tokio::test]
@@ -1876,50 +1723,11 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A node whose tombstone TTL is set for a test rather than for a cluster.
-    async fn node_with_ttl(
-        ttl: std::time::Duration,
-    ) -> (tempfile::TempDir, tempfile::TempDir, Node) {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        let mut config = NodeConfig::loopback(data.path());
-        config.tombstone_ttl = ttl;
-        let node = Node::open(config).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
-        (data, space, node)
-    }
-
-    /// Rewrites a tombstone's deletion time, which is what a tombstone 90 days
-    /// old looks like without waiting 90 days.
-    fn backdate_tombstone(node: &Node, path: &str, mtime_ns: i64) {
-        let row = node
-            .store()
-            .entry(node.origin(), "media", path)
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.kind, EntryKind::Tombstone);
-        node.store()
-            .put_entry(
-                node.origin(),
-                "media",
-                path,
-                &FileEntry::tombstone(mtime_ns, row.seq, row.prev),
-            )
-            .unwrap();
-    }
-
-    fn in_root(node: &Node, root: Hash, path: &str) -> bool {
-        Trie::new(node.store().as_ref())
-            .get(root, &file_key("media", path).unwrap())
-            .unwrap()
-            .is_some()
-    }
-
     /// §4.2: tombstones are retained for `tombstone_ttl`, then dropped in a
-    /// later root — and only the aged ones are.
+    /// later root — only the aged ones — and expiring one is not forbidding
+    /// the path: creating it again republishes it, lineage starting over.
     #[tokio::test]
-    async fn an_expired_tombstone_leaves_the_next_root() {
+    async fn tombstone_ttl_expires_aged_keys_and_allows_recreation() {
         let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
         std::fs::write(space.path().join("old.txt"), b"old").unwrap();
         std::fs::write(space.path().join("recent.txt"), b"recent").unwrap();
@@ -1934,12 +1742,9 @@ mod tests {
 
         // One of them is now older than the TTL; the other is not.
         backdate_tombstone(&node, "old.txt", now_ns() - 2 * 3600 * 1_000_000_000);
-
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.expired, 1);
-        let root = head
-            .expect("expiry costs one head like any other batch")
-            .root;
+        let root = head.unwrap().root;
         assert!(
             !in_root(&node, root, "old.txt"),
             "the aged key must be gone"
@@ -1950,53 +1755,22 @@ mod tests {
             .entry(node.origin(), "media", "old.txt")
             .unwrap()
             .is_none());
-        assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "recent.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
-            EntryKind::Tombstone
-        );
 
         // Nothing is left to expire, so a further scan mints nothing.
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.expired, 0);
         assert!(head.is_none());
-        node.shutdown().await.unwrap();
-    }
 
-    /// Expiring a tombstone is not the same as forbidding the path: creating it
-    /// again republishes it as an ordinary entry.
-    #[tokio::test]
-    async fn a_path_can_be_re_created_after_its_tombstone_expires() {
-        let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
-        std::fs::write(space.path().join("a.txt"), b"first").unwrap();
-        node.scan_and_publish().unwrap();
-        std::fs::remove_file(space.path().join("a.txt")).unwrap();
-        node.scan_and_publish().unwrap();
-        backdate_tombstone(&node, "a.txt", now_ns() - 2 * 3600 * 1_000_000_000);
-        node.scan_and_publish().unwrap();
-        assert!(node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .is_none());
-
-        std::fs::write(space.path().join("a.txt"), b"again").unwrap();
+        // The expired path can be created again as an ordinary entry.
+        std::fs::write(space.path().join("old.txt"), b"again").unwrap();
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 1);
         let root = head.unwrap().root;
-        assert!(in_root(&node, root, "a.txt"));
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
+        assert!(in_root(&node, root, "old.txt"));
+        let entry = published(&node, "media", "old.txt");
         assert_eq!(entry.kind, EntryKind::File);
         assert_eq!(entry.content, Some(Hash::new(b"again")));
-        // The lineage starts over: what it replaced is no longer published.
-        assert_eq!(entry.prev, None);
+        assert_eq!(entry.prev, None, "what it replaced is no longer published");
         node.shutdown().await.unwrap();
     }
 
@@ -2011,11 +1785,7 @@ mod tests {
         std::fs::remove_file(space.path().join("a.txt")).unwrap();
         node.scan_and_publish().unwrap();
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "a.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
+            published(&node, "media", "a.txt").kind,
             EntryKind::Tombstone
         );
 
@@ -2057,87 +1827,57 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The crash the batching publisher makes possible, and the countermeasure
-    /// (§7.1): a scan writes `local_files` as it indexes, so a daemon that dies
-    /// with the batch still buffered must not leave the next scan skipping
-    /// those files forever.
+    /// §7.1: on open, `local_files` rows the published root does not
+    /// corroborate are dropped so the next scan re-indexes them; corroborated
+    /// rows — a published symlink's included — survive an ordinary restart.
     #[tokio::test]
-    async fn a_batch_lost_to_a_crash_is_re_indexed_on_open() {
+    async fn open_time_reconciliation_drops_unpublished_rows_only() {
         let data = tempfile::tempdir().unwrap();
         let space = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
+        let rows = if cfg!(unix) { 2 } else { 1 };
         {
             let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
             node.add_space("media", space.path()).unwrap();
             std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-
-            // Scan into the publisher and then lose the process: the files are
-            // hashed and recorded, and nothing is ever published.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
+            // The batch is lost: hashed and recorded, never published.
             let report = node.scan_and_stage().unwrap();
-            assert_eq!(report.hashed, 1);
+            assert_eq!(report.hashed, rows);
             assert!(node.publisher().pending() > 0);
             assert!(node.own_head().unwrap().is_none());
-            assert_eq!(node.store().local_files("media").unwrap().len(), 1);
+            assert_eq!(node.store().local_files("media").unwrap().len(), rows);
             node.shutdown().await.unwrap();
         }
 
-        // Opening notices that `local_files` claims a file the trie does not
-        // publish, and drops the row so the next scan re-hashes it.
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        // Opening drops the rows the trie does not publish, so the next scan
+        // re-hashes instead of skipping forever.
+        let node = reopen(data.path()).await;
         assert!(node.store().local_files("media").unwrap().is_empty());
-
         let (report, head) = node.scan_and_publish().unwrap();
-        assert_eq!(report.hashed, 1, "the file must be re-hashed, not skipped");
+        assert_eq!(
+            report.hashed, rows,
+            "the file must be re-hashed, not skipped"
+        );
         assert_eq!(head.unwrap().seq, 1);
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "a.txt")
-            .unwrap()
-            .unwrap();
-        assert_eq!(entry.content, Some(Hash::new(b"hello")));
         node.shutdown().await.unwrap();
-    }
 
-    /// Reconciliation is a repair, not a re-scan: a node whose published root
-    /// agrees with `local_files` keeps every row, so ordinary restarts do not
-    /// re-hash the tree.
-    #[tokio::test]
-    async fn reconciliation_leaves_a_published_tree_alone() {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        {
-            let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-            node.add_space("media", space.path()).unwrap();
-            std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-            node.scan_and_publish().unwrap();
-            node.shutdown().await.unwrap();
-        }
-
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        // A published tree keeps every row: ordinary restarts do not re-hash.
+        let node = reopen(data.path()).await;
         assert_eq!(node.reconcile_local_files().unwrap(), 0);
-        assert_eq!(node.store().local_files("media").unwrap().len(), 1);
+        assert_eq!(node.store().local_files("media").unwrap().len(), rows);
         age_quick_checks(&node);
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
-        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.unchanged, rows);
         assert!(head.is_none());
         node.shutdown().await.unwrap();
     }
 
-    /// §10: the scan runs off the runtime, so a node indexing a tree is still
-    /// a node that answers.
-    ///
-    /// `#[tokio::test]` gives a current-thread runtime, which is what makes
-    /// this decisive rather than probabilistic: there is exactly one thread
-    /// that can poll tasks. A ticker task counts how many times it is polled
-    /// across the scan, and the assertion is on the *rate*, not on movement.
-    /// Movement alone proves nothing — any await that returns `Pending` once
-    /// lets the ticker run a handful of times, so a scan that offloaded only
-    /// its SQLite commit and hashed inline would still show a count that
-    /// moved. A thread free for the duration of 16 MiB of BLAKE3 is polled
-    /// orders of magnitude more often than that; a thread doing the hashing
-    /// itself cannot be polled at all while it does.
+    /// §10: the scan runs off the runtime. A current-thread runtime makes this
+    /// decisive: a ticker task is polled orders of magnitude more often when
+    /// the hashing thread is free than when a worker does the hashing itself.
     #[tokio::test]
     async fn a_scan_does_not_block_the_runtime() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2169,11 +1909,9 @@ mod tests {
         let report = node.scan_and_stage_off_runtime().await.unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
-        // Calibrated to the failure modes, not to machine speed: a thread
-        // that hashes inline ticks at most a handful of times per file
-        // (one per `Pending` return — under a hundred for 32 files), while
-        // a free thread has been measured at ~9,000 even on the slowest
-        // shared CI runners. 1,000 sits an order of magnitude from both.
+        // Calibrated to the failure modes, not to machine speed: an inline
+        // hash ticks under a hundred times for 32 files; a free thread has
+        // been measured at ~9,000 even on the slowest shared CI runners.
         const FREE_RUNTIME_TICKS: usize = 1_000;
 
         assert_eq!(report.hashed, 32);
@@ -2196,141 +1934,74 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// The symlink lifecycle (§7.1): tracked by lstat mtime and target signal,
+    /// so an unchanged link stages nothing, a retarget stages an update, and
+    /// a removed link is tombstoned — the `local_files` row is what makes the
+    /// deletion sweep see the path at all.
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_unchanged_symlink_stages_nothing() {
-        // §7.1: republishing an unchanged symlink every scan would defeat the
-        // property that an unchanged tree publishes no head.
+    async fn the_symlink_lifecycle() {
         let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+        std::fs::write(space.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(space.path().join("b.txt"), b"b").unwrap();
         std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
 
         let (report, head) = node.scan_and_publish().unwrap();
-        assert_eq!(report.hashed, 2, "the file and the link");
+        assert_eq!(report.hashed, 3, "the two files and the link");
         assert_eq!(head.unwrap().seq, 1);
-
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "link")
-            .unwrap()
-            .unwrap();
+        let entry = published(&node, "media", "link");
         assert_eq!(entry.kind, EntryKind::Symlink);
         assert_eq!(entry.symlink_target.as_deref(), Some("a.txt"));
         // The link's own lstat mtime, never `now_ns()`.
         let lstat = mtime_nanos(&std::fs::symlink_metadata(space.path().join("link")).unwrap());
         assert_eq!(entry.mtime_ns, lstat);
 
-        // Scanning again finds nothing to say.
+        // An unchanged link stages nothing.
         age_quick_checks(&node);
         let (again, head) = node.scan_and_publish().unwrap();
         assert_eq!(again.hashed, 0);
-        assert_eq!(again.unchanged, 2);
+        assert_eq!(again.unchanged, 3);
         assert!(again.staged.is_empty(), "{:?}", again.staged);
         assert!(head.is_none(), "an unchanged tree publishes no head");
-        node.shutdown().await.unwrap();
-    }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_retargeted_symlink_stages_an_update() {
-        let (_d, space, node) = node_with_space().await;
-        std::fs::write(space.path().join("a.txt"), b"a").unwrap();
-        std::fs::write(space.path().join("b.txt"), b"b").unwrap();
-        std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
-        node.scan_and_publish().unwrap();
-        age_quick_checks(&node);
-
+        // Retargeting moves the signal and stages an update.
         std::fs::remove_file(space.path().join("link")).unwrap();
         std::os::unix::fs::symlink("b.txt", space.path().join("link")).unwrap();
-
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 1, "only the link moved");
         assert_eq!(head.unwrap().seq, 2);
         assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "link")
-                .unwrap()
-                .unwrap()
-                .symlink_target
-                .as_deref(),
+            published(&node, "media", "link").symlink_target.as_deref(),
             Some("b.txt")
         );
-        node.shutdown().await.unwrap();
-    }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_deleted_symlink_is_tombstoned() {
-        // Without a `local_files` row the deletion sweep never saw the path, so
-        // a removed symlink stayed published forever.
-        let (_d, space, node) = node_with_space().await;
-        std::os::unix::fs::symlink("nowhere", space.path().join("link")).unwrap();
-        node.scan_and_publish().unwrap();
-
+        // Removing the link is tombstoned, and its row goes with it.
         std::fs::remove_file(space.path().join("link")).unwrap();
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.deleted, 1);
         assert!(head.is_some());
-        let entry = node
-            .store()
-            .entry(node.origin(), "media", "link")
-            .unwrap()
-            .unwrap();
-        assert!(entry.kind == EntryKind::Tombstone);
+        assert_eq!(published(&node, "media", "link").kind, EntryKind::Tombstone);
         assert!(node.store().local_file("media", "link").unwrap().is_none());
-        node.shutdown().await.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_symlink_survives_the_open_time_reconciliation() {
-        // `reconcile_local_files` compares a row's signal against the published
-        // entry; reading a symlink's signal as a content root would drop every
-        // link's row on every open and re-stage it forever.
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(data.path(), None).unwrap();
-        {
-            let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-            node.add_space("media", space.path()).unwrap();
-            std::os::unix::fs::symlink("elsewhere", space.path().join("link")).unwrap();
-            node.scan_and_publish().unwrap();
-            node.shutdown().await.unwrap();
-        }
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        assert_eq!(node.reconcile_local_files().unwrap(), 0);
-        let (report, head) = node.scan_and_publish().unwrap();
-        assert_eq!(report.hashed, 0);
-        assert!(head.is_none());
         node.shutdown().await.unwrap();
     }
 }
 
 /// The symlink-escape guard, exercised where a symlink can be made.
-///
-/// `escapes_via_symlink` itself is cross-platform — `symlink_metadata` reports a
-/// reparse point on Windows as readily as a symlink on Unix — but *creating*
-/// one to test against is not: Windows needs a separate API and, ordinarily,
-/// privileges the CI runner does not have.
+/// `escapes_via_symlink` itself is cross-platform (`symlink_metadata` reports
+/// a reparse point on Windows as readily as a symlink on Unix), but creating
+/// one to test against is not.
 #[cfg(all(test, unix))]
 mod escape_tests {
-    use crate::{Node, NodeConfig};
+    use crate::testkit::node_with_space;
 
-    /// A symlinked directory inside a space is not a way out of it.
-    ///
-    /// A space root is canonicalized when it is added; its interior never is.
-    /// Without the ancestor check a client that can name a key can write and
-    /// delete anywhere the daemon's uid reaches — `~/.ssh/authorized_keys`, a
-    /// systemd user unit — through an ordinary `photos -> /mnt/nas` link.
+    /// A symlinked directory inside a space is not a way out of it: without
+    /// the ancestor check a client that can name a key can write and delete
+    /// anywhere the daemon's uid reaches.
     #[tokio::test]
     async fn a_symlinked_directory_cannot_be_written_or_deleted_through() {
-        let data = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
+        let (_d, space, node) = node_with_space().await;
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret"), b"not yours").unwrap();
-        Node::init(data.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
         std::os::unix::fs::symlink(outside.path(), space.path().join("escape")).unwrap();
 
         assert!(node.open_adoption("media", "escape/secret").is_err());

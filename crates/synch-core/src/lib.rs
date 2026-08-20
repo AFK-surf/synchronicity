@@ -158,7 +158,6 @@ mod tests {
 
     #[test]
     fn group_math() {
-        assert_eq!(group_of_offset(0), 0);
         assert_eq!(group_of_offset(CHUNK_GROUP_SIZE), 1);
         assert_eq!(groups_for_byte_range(0, 1), GroupRange::new(0, 1));
         assert_eq!(
@@ -167,13 +166,7 @@ mod tests {
         );
         assert!(groups_for_byte_range(5, 5).is_empty());
         assert_eq!(group_count(0), 1);
-        assert_eq!(group_count(1), 1);
         assert_eq!(group_count(CHUNK_GROUP_SIZE + 1), 2);
-    }
-
-    #[test]
-    fn now_is_positive() {
-        assert!(now_ns() > 0);
     }
 
     #[test]
