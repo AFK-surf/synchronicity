@@ -159,6 +159,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: control-plane/e2e
+      # The SPA, so `run.sh` has a real dashboard to stage into priv/web and
+      # ask a *replica* for. Without it the run still passes — the check
+      # degrades to comparing the two surfaces' routing — but the one
+      # end-to-end proof that a replica serves the actual dashboard is the
+      # point of building it here.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-plane/web/package-lock.json
+      - run: cd control-plane/web && npm ci && npx vite build
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev bind9-dnsutils
       - run: cd control-plane && make -C csqlite && gleam deps download
       - run: cd control-plane && ./e2e/run.sh

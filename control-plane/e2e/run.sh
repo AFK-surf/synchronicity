@@ -10,6 +10,16 @@ cd "$(dirname "$0")/.."
 make -C csqlite
 gleam build
 
+# The dashboard is served out of priv/web (src/api/static.gleam), and this
+# script is the only place that asks a *replica* for it. Staged here if a
+# build exists — CI builds it in the job — so the comparison below has teeth.
+# Without one, both nodes answer 404 and it degrades to a routing check, which
+# is the honest floor: whether the file is in the shipment at all is
+# `ops/image-smoke.sh`'s question, not this one.
+if [[ -d web/dist ]]; then
+  rm -rf priv/web && cp -r web/dist priv/web
+fi
+
 WORKDIR=$(mktemp -d)
 LOG="$WORKDIR/serve.log"
 cleanup() {
@@ -161,10 +171,28 @@ refused=$(curl -sS -o "$WORKDIR/refused.json" -w '%{http_code}' \
 [[ "$refused" == "409" ]] || { echo "FAIL: a write on a replica must be 409, got $refused"; exit 1; }
 grep -q 'read-only-replica' "$WORKDIR/refused.json" || {
   echo "FAIL: the refusal must name itself"; cat "$WORKDIR/refused.json"; exit 1; }
-# The dashboard itself, off the same read-only copy.
-spa=$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:8054/o/acme" || true)
-[[ "$spa" == "200" ]] || { echo "FAIL: the replica must serve the dashboard, got $spa"; exit 1; }
-echo "ok: replica serves the dashboard and the read API, and names the primary for writes"
+# The dashboard itself, off the same read-only copy. Compared against the
+# primary rather than against a hardcoded 200: what this change added is that
+# the *router* mounts the SPA fallback on a read-only node, and a regression
+# there is a replica that 404s a path the primary serves. Asserting 200
+# outright instead asserted that priv/web is populated, which is a packaging
+# fact this job does not establish — and it duly failed in CI while passing on
+# a working tree that happened to have a staged build.
+spa_primary=$(curl -sS -o "$WORKDIR/spa-primary.html" -w '%{http_code}' \
+  "http://127.0.0.1:$HTTP_PORT/o/acme")
+spa_replica=$(curl -sS -o "$WORKDIR/spa-replica.html" -w '%{http_code}' \
+  "http://127.0.0.1:8054/o/acme")
+[[ "$spa_replica" == "$spa_primary" ]] || {
+  echo "FAIL: /o/acme is $spa_replica on the replica and $spa_primary on the primary"; exit 1; }
+cmp -s "$WORKDIR/spa-primary.html" "$WORKDIR/spa-replica.html" || {
+  echo "FAIL: the replica serves a different body than the primary at /o/acme"; exit 1; }
+if [[ "$spa_replica" == "200" ]]; then
+  grep -q "<div id=\"root\"" "$WORKDIR/spa-replica.html" \
+    || { head -5 "$WORKDIR/spa-replica.html"; echo "FAIL: that is not the dashboard"; exit 1; }
+  echo "ok: replica serves the built dashboard and the read API, and names the primary for writes"
+else
+  echo "ok: replica routes the dashboard as the primary does (no built SPA staged), serves the read API, and names the primary for writes"
+fi
 
 # The actual synchronicity client resolver, over DoH.
 export CP_DOH_URL="http://127.0.0.1:$HTTP_PORT/dns-query"
