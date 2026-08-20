@@ -27,9 +27,45 @@ Two rules explain most of the surface:
 
 ## Getting a binary
 
+Download a release archive from GitHub. Do not build from source — the
+source tree is not expected to be present. Each release ships one archive per
+platform, named `synchronicity-<version>-<target>.<ext>`, and each unpacks to
+a directory holding `synch`, `synch-s3`, `synch-monitor` and the docs:
+
+| Platform | `<target>` | Archive |
+| --- | --- | --- |
+| Linux, x86-64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
+| Linux, arm64 | `aarch64-unknown-linux-musl` | `.tar.gz` |
+| macOS, Intel | `x86_64-apple-darwin` | `.tar.gz` |
+| macOS, Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
+| Windows, x86-64 | `x86_64-pc-windows-msvc` | `.zip` |
+
+The musl builds are fully static, so they run on any Linux whatever its libc.
+Resolve the latest tag from the API rather than hardcoding a version:
+
 ```sh
-cargo build --release          # target/release/synch and target/release/synch-s3
+tag=$(curl -fsSL https://api.github.com/repos/AFK-surf/synchronicity/releases/latest \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)  target=x86_64-unknown-linux-musl ;;
+  Linux-aarch64) target=aarch64-unknown-linux-musl ;;
+  Darwin-x86_64) target=x86_64-apple-darwin ;;
+  Darwin-arm64)  target=aarch64-apple-darwin ;;
+esac
+
+base="https://github.com/AFK-surf/synchronicity/releases/download/$tag"
+name="synchronicity-$tag-$target"
+curl -fsSLO "$base/$name.tar.gz"
+curl -fsSL "$base/SHA256SUMS" | grep -F "$name.tar.gz" | sha256sum -c -
+tar xzf "$name.tar.gz"
+sudo install -m 0755 "$name/synch" "$name/synch-s3" /usr/local/bin
 ```
+
+(On macOS, where `sha256sum` does not exist, `shasum -a 256 -c -` reads the
+same format.) On Windows, download the `.zip`, check its hash against
+`SHA256SUMS` (`certutil -hashfile <zip> SHA256`), and expand it — `synch.exe`
+and `synch-s3.exe` run from wherever they land.
 
 SQLite is compiled in and TLS is rustls, so there is no system library to
 install.
@@ -539,4 +575,6 @@ Amazon S3.
 - `synch <command> --help` — every flag, with the reasoning attached.
 - `synch doctor` — the state of this node, in full.
 - `DESIGN.md` — the architecture; the `§` numbers in CLI help point into it.
-- `docs/REKOR-ZONE-KEY.md` — zone-key transparency, end to end.
+  It ships in every release archive, next to the binaries.
+- `docs/REKOR-ZONE-KEY.md` — zone-key transparency, end to end. It lives in
+  the repo (github.com/AFK-surf/synchronicity), not in the archives.
