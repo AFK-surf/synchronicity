@@ -535,6 +535,31 @@ impl Store {
         if live.is_empty() {
             return Ok((PublishScope::Untrusted, origins));
         }
+        // A delegation outranks a local `trust add`, and the order matters.
+        //
+        // A `d:` record is the cluster's statement about a key, replicated to
+        // every member and read identically by all of them; a rooted binding is
+        // one operator's local configuration. Letting the local one win made
+        // two members of the same cluster answer this question differently for
+        // the same key, and since this is what a responder declares in its
+        // `Hello`, the delegate reading those declarations flipped between them
+        // once per anti-entropy round.
+        //
+        // Deciding it from the record every member holds makes the answer agree
+        // cluster-wide, and it fails closed. Promoting a delegate is therefore
+        // revoking its delegation, not rooting its key beside a record that
+        // still confines it.
+        let delegated: Vec<String> = live
+            .iter()
+            .filter(|b| b.source == BindingSource::Delegated)
+            .flat_map(|b| b.spaces.clone())
+            .collect();
+        if !delegated.is_empty() {
+            let mut spaces = delegated;
+            spaces.sort();
+            spaces.dedup();
+            return Ok((PublishScope::Confined(spaces), origins));
+        }
         if live.iter().any(|b| b.is_rooted()) {
             return Ok((PublishScope::Unrestricted, origins));
         }
@@ -576,46 +601,162 @@ impl Store {
     /// held here because the fetch walk, promotion and the head summaries all
     /// have to agree about it.
     ///
-    /// Adopting a peer's word costs nothing: every responder enforces the same
-    /// scope on every request independently, so a wrong value can only make
-    /// this node ask for less than it is entitled to.
+    /// Read-only. [`Store::set_read_scope`] is the one thing that moves it,
+    /// because moving it discards everything derived under the old value — and
+    /// the claim that used to stand here, that "adopting a peer's word costs
+    /// nothing … a wrong value can only make this node ask for less than it is
+    /// entitled to", is exactly what that discarding disproves. Asking for less
+    /// is free only while nothing durable is derived from it.
     pub fn local_scope(&self) -> Result<Option<Vec<String>>> {
         Ok(self.config("local_scope")?.map(|text| decode_spaces(&text)))
     }
 
-    /// Records the scope a peer declared, when it differs from what is held.
+    /// The origins that have delegated to *this* node (§3.5); empty if it is
+    /// not a delegate.
     ///
-    /// Returns true if the value changed. A completeness memo needs nothing
-    /// from the caller — [`Scope::memo_key`] folds the scope in, so a widened
-    /// scope re-derives — but the redaction memo is keyed by node hash alone,
-    /// and that one is cleared here.
+    /// A delegation names a device key, so this matches every key that is this
+    /// node's — its origin's, and every `device_keys` row, because a record
+    /// naming a key mid-rotation still confines the node holding it.
+    pub fn own_issuers(&self, now: i64) -> Result<Vec<OriginId>> {
+        let own: Vec<NodeId> = self
+            .self_origin()?
+            .as_ref()
+            .and_then(|o| o.as_key().copied())
+            .into_iter()
+            .chain(self.device_keys()?.into_iter().map(|k| k.node_id))
+            .collect();
+        Ok(self
+            .live_bindings(now)?
+            .into_iter()
+            .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+            .filter_map(|b| b.issuer)
+            .collect())
+    }
+
+    /// Why this node must not pull metadata from `peer`, or `None` if it may
+    /// (§5.5).
     ///
-    /// It has to be. A redaction records *where the walk stopped*, which is a
-    /// fact about a scope rather than about a node: widen the grant and the
-    /// same node stands at the same position, still marked as a boundary, so
-    /// the walk skips a subtree this node is now entitled to and
-    /// `is_complete_scoped` answers complete for a trie it does not hold —
-    /// silently, permanently, with no misbehaving peer anywhere. The memo is a
-    /// cache of an answer that just changed, so it is dropped whole rather
-    /// than re-keyed: a boundary that still stands is re-learned on the next
-    /// walk, at the cost of one round.
-    pub fn set_local_scope(&self, scope: Option<&[String]>) -> Result<bool> {
+    /// A delegate holds every foreign trie in part, so only a node holding one
+    /// whole can serve it: pulling from another delegate yields a trie short in
+    /// exactly the spaces that peer was not granted, which nothing downstream
+    /// can tell from a trie still arriving. A delegate therefore syncs only
+    /// with full members of its own issuer's cluster — which is also what keeps
+    /// the read scope a single node-wide value, since every peer it can reach
+    /// reads the same `d:` record and declares the same answer.
+    ///
+    /// A node that is not a delegate is unrestricted. Content is unaffected:
+    /// it is content-addressed and hash-verified, so bytes come from anyone
+    /// (§6).
+    pub fn refuse_metadata_sync(&self, peer: &NodeId, now: i64) -> Result<Option<String>> {
+        let live = self.live_bindings(now)?;
+        // The clusters this node is a delegate of. Empty means it is not a
+        // delegate at all, and none of this applies to it.
+        let issuers = self.own_issuers(now)?;
+        if issuers.is_empty() {
+            return Ok(None);
+        }
+        // A peer is a full member exactly where this node holds a *rooted*
+        // binding for it: a delegate's binding is `Delegated` by construction,
+        // so this one test is the whole of the delegate-to-delegate rule.
+        let member_origins: Vec<&OriginId> = live
+            .iter()
+            .filter(|b| &b.node_id == peer && b.is_rooted())
+            .map(|b| &b.origin)
+            .collect();
+        if member_origins.is_empty() {
+            return Ok(Some(
+                "this node is a delegate and that peer is not a full member of its cluster".into(),
+            ));
+        }
+        let same_cluster = member_origins.iter().any(|origin| {
+            issuers.iter().any(|issuer| {
+                *origin == issuer
+                    || (origin.domain().is_some() && origin.domain() == issuer.domain())
+            })
+        });
+        match same_cluster {
+            true => Ok(None),
+            false => Ok(Some(
+                "this node is a delegate and that peer belongs to a different cluster".into(),
+            )),
+        }
+    }
+
+    /// Sets the read scope and, if it moved, discards everything derived under
+    /// the old one (§5.5). Returns whether it moved.
+    ///
+    /// The scope decides what a fetch asks for, what `is_complete_scoped`
+    /// counts as whole, and what `materialize_diff` walks. Nothing reconciles
+    /// rows built under one scope with a walk under another: the promotion diff
+    /// prunes at equal node hashes, so it can neither reach what a narrower
+    /// walk skipped nor remove what a wider one covered — and where the newly
+    /// admitted subtree also changed, it descends into an old root with no node
+    /// there and raises `MissingNode`, which reads as the origin's fault.
+    ///
+    /// So nothing is reconciled. `entries`, `blob_providers` and the delegated
+    /// bindings are derived state, and derived state whose premise changed is
+    /// thrown away: the rows go, the boundaries go, and every foreign complete
+    /// head drops back to pending. The promotion that follows finds no complete
+    /// head, so its diff runs from `Hash::EMPTY` — a full materialization that
+    /// touches the stale root not at all.
+    ///
+    /// An unchanged scope costs one comparison; a changed one costs a
+    /// re-materialization of every foreign origin. Trie nodes are
+    /// content-addressed and are not discarded, so the only bytes refetched are
+    /// what the new scope adds. This node's own origin is never touched: it
+    /// built that trie and there is nobody to refetch it from.
+    pub fn set_read_scope(&self, spaces: Option<&[String]>) -> Result<bool> {
         let current = self.local_scope()?;
-        let next = scope.map(|s| s.to_vec());
+        let next = spaces.map(|s| s.to_vec());
         if current == next {
             return Ok(false);
         }
-        // One transaction, so a crash cannot leave the new scope beside the
-        // old scope's boundaries.
-        self.transaction(|txn| -> Result<()> {
+        // All of it in one transaction, so a crash cannot leave the new scope
+        // beside the old scope's rows, its boundaries, or its heads.
+        self.transaction(|txn| {
             match &next {
                 None => txn.clear_config("local_scope")?,
                 Some(spaces) => txn.set_config("local_scope", &encode_spaces(spaces))?,
             }
+            // A boundary records where a walk *stopped*, which is a fact about
+            // a scope and not about a node: widen the grant and the same node
+            // stands at the same position, still marked as a boundary, so the
+            // walk skips a subtree this node is now entitled to and
+            // `is_complete_scoped` answers complete for a trie it does not
+            // hold. Dropped whole rather than re-keyed; one round re-learns any
+            // that still stand.
             txn.clear_redacted()?;
-            Ok(())
-        })?;
-        Ok(true)
+            let own: Option<String> = txn
+                .conn()
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'self_origin_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            for stored in txn.all_heads(crate::heads::Slot::Complete)? {
+                let origin = &stored.head.origin;
+                if own.as_deref() == Some(origin.canonical().as_str()) {
+                    continue;
+                }
+                txn.delete_origin_entries(origin)?;
+                txn.delete_origin_providers(origin)?;
+                txn.delete_origin_delegations(origin)?;
+                // Back to pending rather than deleted: the head is still a
+                // signed statement this node verified, and demoting it is
+                // exactly the claim that changed — this node no longer holds
+                // the trie under it, because "holds it whole" is a question
+                // about a scope and the scope just moved.
+                txn.put_head(
+                    crate::heads::Slot::Pending,
+                    &stored.head,
+                    stored.received_at,
+                    stored.verified_at,
+                )?;
+                txn.clear_head(origin, crate::heads::Slot::Complete)?;
+            }
+            Ok(true)
+        })
     }
 
     /// The scope one origin's leaves may be materialized under.
@@ -704,6 +845,18 @@ impl Store {
         })
     }
 
+    /// Drops every binding one zone vouched for, now rather than at expiry.
+    ///
+    /// For leaving a zone: those bindings are trusted *because* that zone said
+    /// so, and waiting out `dns_trust_grace` would leave its members dialable
+    /// for hours after the operator said otherwise.
+    pub fn drop_dns_bindings(&self, domain: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM bindings WHERE source = 'dns' AND domain = ?1",
+            params![domain],
+        )?)
+    }
+
     /// Deletes DNS bindings whose expiry has passed, returning how many went.
     ///
     /// Nothing is deleted at an instant no expiry can be compared against (see
@@ -752,16 +905,12 @@ mod tests {
 
         let (_dir, store) = store();
         let withheld = synch_core::Hash::new(b"a subtree the narrow grant withheld");
-        store
-            .set_local_scope(Some(&["photos".to_string()]))
-            .unwrap();
+        store.set_read_scope(Some(&["photos".to_string()])).unwrap();
         store.note_redacted(&withheld).unwrap();
         assert!(store.is_redacted(&withheld).unwrap());
 
         // Re-declaring the same scope changes nothing, so the boundary stands.
-        assert!(!store
-            .set_local_scope(Some(&["photos".to_string()]))
-            .unwrap());
+        assert!(!store.set_read_scope(Some(&["photos".to_string()])).unwrap());
         assert!(store.is_redacted(&withheld).unwrap());
 
         // Widening it does. The same node now sits at a position this node is
@@ -769,7 +918,7 @@ mod tests {
         // make the walk skip it forever — reporting a trie complete that it
         // does not hold, with nothing to notice.
         assert!(store
-            .set_local_scope(Some(&["photos".to_string(), "finance".to_string()]))
+            .set_read_scope(Some(&["photos".to_string(), "finance".to_string()]))
             .unwrap());
         assert!(
             !store.is_redacted(&withheld).unwrap(),
@@ -1101,19 +1250,15 @@ mod tests {
         assert_eq!(store.local_scope().unwrap(), None);
         assert!(store.local_trie_scope().unwrap().is_full());
 
-        assert!(store
-            .set_local_scope(Some(&["photos".to_string()]))
-            .unwrap());
-        assert!(!store
-            .set_local_scope(Some(&["photos".to_string()]))
-            .unwrap());
+        assert!(store.set_read_scope(Some(&["photos".to_string()])).unwrap());
+        assert!(!store.set_read_scope(Some(&["photos".to_string()])).unwrap());
         assert_eq!(
             store.local_scope().unwrap(),
             Some(vec!["photos".to_string()])
         );
         assert!(!store.local_trie_scope().unwrap().is_full());
 
-        assert!(store.set_local_scope(None).unwrap());
+        assert!(store.set_read_scope(None).unwrap());
         assert!(store.local_trie_scope().unwrap().is_full());
     }
 }

@@ -386,10 +386,11 @@ pub enum DaemonCommand {
 /// `synch trust ...`
 #[derive(Debug, Subcommand)]
 pub enum TrustCommand {
-    /// Trust a device key. The key is the identity: names come from zones
+    /// Trust a device key, or a zone whose members are resolved from DNS
     /// (§3.2).
     Add {
-        /// The peer's z-base-32 device key.
+        /// A peer's z-base-32 device key, or a domain such as
+        /// `cluster.example` whose member records this node should resolve.
         key: String,
         /// A note for `synch trust ls`.
         #[arg(long)]
@@ -397,17 +398,10 @@ pub enum TrustCommand {
         /// A direct address to remember for dialing.
         #[arg(long)]
         addr: Option<String>,
-        /// Bind the key under this named origin, e.g. `nas@cluster.example`.
-        ///
-        /// For a member that publishes under a name this node has no
-        /// membership zone to learn from. The binding never expires, so it
-        /// shadows the zone record it names — prefer a zone where there is one.
-        #[arg(long = "as", value_name = "ORIGIN")]
-        as_origin: Option<String>,
     },
     /// Remove trust.
     Rm {
-        /// The origin to stop trusting.
+        /// The origin to stop trusting, or a trusted zone.
         origin: String,
         /// Drop only this z-base-32 key's binding, keeping the origin's other
         /// keys — the cleanup step after a peer's rotation window closes.
