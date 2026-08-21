@@ -828,7 +828,7 @@ fn decide(
             // would land in.
             Some(winner) if winner != &set.path => {
                 let dir = target.parent().unwrap_or(root_dir).to_path_buf();
-                if folds_case(&dir, &mut folds) {
+                if folds_case(&dir, root_dir, &mut folds) {
                     report.skipped.push((
                         set.path.clone(),
                         format!("collides with {winner} under filesystem name folding"),
@@ -1013,7 +1013,24 @@ fn indexed_content(
 /// scan would pick up. Anything unwritable answers "folds", which is the
 /// conservative direction: it keeps the collision guard rather than dropping
 /// it.
-fn folds_case(dir: &Path, memo: &mut HashMap<PathBuf, bool>) -> bool {
+fn folds_case(dir: &Path, root: &Path, memo: &mut HashMap<PathBuf, bool>) -> bool {
+    // Folding is a property of the mount, and `decide` runs to completion
+    // before `write_fill` creates a single directory — so on a first fill the
+    // directory a colliding path lands in usually does not exist yet. Probing
+    // it directly would fail `ENOENT`, answer "folds" conservatively, and
+    // refuse one of two names that are two perfectly good files: the very
+    // report this function exists to stop. Walk up to the nearest ancestor that
+    // does exist, which is on the mount the new directory will be created in,
+    // and never above the space root — the plan has already established that
+    // one is a directory.
+    let mut probe = dir;
+    while probe != root && !probe.is_dir() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break,
+        }
+    }
+    let dir = probe;
     if let Some(known) = memo.get(dir) {
         return *known;
     }
@@ -2178,6 +2195,86 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("recover"), "{refused}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// The fold probe asks the mount, and a directory this fill has not created
+    /// yet is on the mount its nearest existing ancestor is on. Probing the
+    /// missing directory itself would fail and answer "folds", refusing one of
+    /// two names that are two perfectly good files here — on the first fill
+    /// into an emptied checkout, which is the case fill exists for.
+    #[tokio::test]
+    async fn a_collision_below_a_directory_that_does_not_exist_yet_asks_the_mount() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "sub/Fold.txt", b"upper", STAMP);
+        publish(&node, &peer(), "sub/fold.txt", b"lower", STAMP);
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+
+        // Ask the filesystem the same question, at the root — which is where
+        // the probe has to ask, since `sub/` did not exist when it was asked.
+        let probe = space.path().join("CaseProbe");
+        std::fs::write(&probe, b"").unwrap();
+        let folds = space.path().join("caseprobe").symlink_metadata().is_ok();
+        std::fs::remove_file(&probe).unwrap();
+
+        if folds {
+            assert_eq!(report.filled, 1, "{report:?}");
+            assert_eq!(report.skipped.len(), 1, "{report:?}");
+        } else {
+            assert_eq!(
+                report.filled, 2,
+                "both are real files on this filesystem, and a missing parent \
+                 must not be read as one that folds: {report:?}"
+            );
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(
+                std::fs::read(space.path().join("sub/fold.txt")).unwrap(),
+                b"lower"
+            );
+        }
+        node.shutdown().await.unwrap();
+    }
+
+    /// A streamed write holds an open `Adoption` for as long as its client
+    /// takes, and `commit` renames over whatever is there. The gate the header
+    /// exchange took says nothing about the moment of the rename.
+    #[tokio::test]
+    async fn a_write_opened_before_recovery_is_refused_at_its_commit() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("f.txt");
+        std::fs::write(&target, b"mine, unpublished").unwrap();
+
+        // What the `put` handler does before it spawns.
+        node.ensure_adoptable("media", "f.txt").unwrap();
+        let mut adoption = node.open_adoption("media", "f.txt").unwrap();
+        adoption.write(b"theirs").unwrap();
+
+        // An inbound `Hello` floors the node while the body is still arriving.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        // The gate the handler re-takes immediately before the rename.
+        let refused = node.ensure_adoptable("media", "f.txt").unwrap_err();
+        assert!(refused.to_string().contains("recover"), "{refused}");
+        drop(adoption);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"mine, unpublished",
+            "a commit past that gate would have destroyed a file nothing could \
+             then publish a replacement for"
+        );
         node.shutdown().await.unwrap();
     }
 

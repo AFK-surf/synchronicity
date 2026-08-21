@@ -957,7 +957,7 @@ impl Node {
     /// publish, which is after the file is gone.
     ///
     /// Then the space's own ignore rules.
-    pub(crate) fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
+    pub fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
         self.ensure_publishable()?;
         self.refuse_if_ignored(space_id, path)
     }
