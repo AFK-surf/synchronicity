@@ -1877,12 +1877,33 @@ CREATE TABLE blobs (
   complete    INTEGER NOT NULL,
   bitmap      BLOB,                      -- verified 16 KiB-group bitmap when partial
   inline      BLOB,                      -- payload for small blobs, else NULL (fs store)
-  pinned      INTEGER NOT NULL DEFAULT 0,
   last_access INTEGER NOT NULL,
   durable     INTEGER NOT NULL DEFAULT 0  -- backend stable-storage promise (docs/SERVERLESS.md §5)
 );
+CREATE TABLE pins (                       -- who holds an object (docs/REPLICATION.md §3.1)
+  root          BLOB NOT NULL,
+  holder        TEXT NOT NULL,            -- 'operator' | 'replica:<space>'
+  created_at    INTEGER NOT NULL,
+  release_after INTEGER,                  -- NULL = held; set = due to go then
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE TABLE replica_want (               -- content a replicated space lacks (§3.3)
+  root         BLOB NOT NULL,
+  holder       TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  prev         BLOB,                      -- delta donor: the root this version replaced
+  first_wanted INTEGER NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_error   TEXT,
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX replica_want_by_attempt ON replica_want (last_attempt);
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT); -- NULL = detached
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,  -- NULL = detached
+                            replicate TEXT,      -- NULL | 'tree' | 'archive'
+                            grace INTEGER, budget INTEGER);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));

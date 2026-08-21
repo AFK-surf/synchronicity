@@ -1929,9 +1929,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             range,
             from,
             strict,
+            root,
         }) => {
-            let reference = parse_reference(&reference)?;
-            let policy = policy_for(&reference, from.as_deref(), strict)?;
             let range = match &range {
                 Some(text) => crate::cli::ByteRange::parse(text)
                     .map_err(|e| ControlError::invalid(e.to_string()))?,
@@ -1940,15 +1939,24 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     end: None,
                 },
             };
-            let prepared = node
-                .prepare_range(
-                    &reference.space,
-                    &reference.path,
-                    &policy,
-                    range.start,
-                    range.length(),
-                )
-                .await?;
+            let prepared = match &root {
+                Some(root) => {
+                    node.prepare_root_range(&parse_root(root)?, range.start, range.length())
+                        .await?
+                }
+                None => {
+                    let reference = parse_reference(&reference)?;
+                    let policy = policy_for(&reference, from.as_deref(), strict)?;
+                    node.prepare_range(
+                        &reference.space,
+                        &reference.path,
+                        &policy,
+                        range.start,
+                        range.length(),
+                    )
+                    .await?
+                }
+            };
             stream_range(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
@@ -1956,12 +1964,17 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             reference,
             from,
             strict,
+            root,
         }) => {
-            let reference = parse_reference(&reference)?;
-            let policy = policy_for(&reference, from.as_deref(), strict)?;
-            let prepared = node
-                .prepare_range(&reference.space, &reference.path, &policy, 0, None)
-                .await?;
+            let prepared = match &root {
+                Some(root) => node.prepare_root_range(&parse_root(root)?, 0, None).await?,
+                None => {
+                    let reference = parse_reference(&reference)?;
+                    let policy = policy_for(&reference, from.as_deref(), strict)?;
+                    node.prepare_range(&reference.space, &reference.path, &policy, 0, None)
+                        .await?
+                }
+            };
             stream_range(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
@@ -2169,10 +2182,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             if !node.unpin_object(&root).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
-                    format!("no object {root} in the local store"),
+                    format!("no operator pin on {root}"),
                 ));
             }
-            out.line(format!("unpinned {root}")).await?;
+            // What remains decides whether anything actually leaves, and the
+            // operator asked about the bytes rather than about the row. A
+            // command that answered "unpinned" flat, while a replica went on
+            // holding the object for another month, would be describing its own
+            // bookkeeping instead of the outcome.
+            let remaining = read(node, move |n| Ok(n.store().pins_for(&root)?)).await?;
+            out.line(match remaining.as_slice() {
+                [] => format!("unpinned {root}"),
+                held => format!("unpinned {root} (still held by {})", render_holders(held)),
+            })
+            .await?;
         }
 
         Command::PinLs(pb::PinLs {}) => {
@@ -2182,19 +2205,24 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             for root in pinned {
                 // A bare hash answers "what is pinned" without answering
-                // "what is it": the size and the paths currently naming the
-                // object are what make the list reviewable.
-                let (size, paths) = read(node, move |n| {
+                // "what is it": the size, who holds it, and the paths currently
+                // naming the object are what make the list reviewable.
+                let (size, holders, paths) = read(node, move |n| {
                     let size = n
                         .store()
                         .blob(&root)?
                         .map(|b| format!("{} B", b.size))
                         .unwrap_or_else(|| "(bytes not held)".into());
-                    Ok((size, n.store().paths_naming(&root)?))
+                    Ok((
+                        size,
+                        n.store().pins_for(&root)?,
+                        n.store().paths_naming(&root)?,
+                    ))
                 })
                 .await?;
                 out.line(format!(
-                    "{root}  {size}  {}",
+                    "{root}  {size}  {}  {}",
+                    render_holders(&holders),
                     if paths.is_empty() {
                         "(no current entry names it)".to_string()
                     } else {
@@ -2926,6 +2954,35 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
+/// Reads a `--root` argument.
+///
+/// Its own function because the error an operator gets for a typo'd hash should
+/// say what the argument wanted, not what `Hash::from_str` happened to dislike.
+fn parse_root(text: &str) -> Result<Hash, ControlError> {
+    Hash::from_str(text)
+        .map_err(|_| ControlError::invalid(format!("{text} is not a 64-character hex object root")))
+}
+
+/// Renders who holds an object, and which of those claims are on their way out.
+///
+/// A scheduled release is the interesting half: "held by replica:media" and
+/// "held by replica:media, leaving in 3d" are different answers to "can I
+/// delete the original yet".
+fn render_holders(pins: &[synch_store::PinRow]) -> String {
+    let now = synch_core::now_ns();
+    pins.iter()
+        .map(|pin| match pin.release_after {
+            None => pin.holder.render(),
+            Some(at) => format!(
+                "{} (leaving in {})",
+                pin.holder,
+                crate::render::remaining(at, now)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
         return Ok((root, None));

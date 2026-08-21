@@ -307,7 +307,11 @@ impl Node {
                 // conservatively; pinning a stale ad leaks bytes, while failing
                 // to pin can delete an acknowledged durability promise.
                 if !node.store().content_is_referenced(&root)? {
-                    node.store().set_pinned(&root, true)?;
+                    node.store().pin(
+                        &root,
+                        &synch_store::PinHolder::Operator,
+                        synch_core::now_ns(),
+                    )?;
                 }
                 Ok(())
             })

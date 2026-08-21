@@ -20,7 +20,7 @@ pub mod uploads;
 pub mod views;
 
 pub use bindings::{Binding, BindingSource, PublishScope};
-pub use cas::{BlobRow, BlobSummary, BLOCK_SIZE};
+pub use cas::{BlobRow, BlobSummary, PinHolder, PinRow, BLOCK_SIZE};
 pub use clock::ClockStatus;
 pub use db::{DeviceKey, IdentityAdoption, KeyState, Store, Txn, CAS_DIR, DB_FILE, STAGING_DIR};
 pub use error::{Result, StoreError};

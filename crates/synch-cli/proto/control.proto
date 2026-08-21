@@ -324,7 +324,7 @@ message Status {
 }
 
 message Cat {
-  // The entry reference.
+  // The entry reference. Empty when `root` names the object instead.
   string reference = 1;
   // A byte range, as `START..END`, `START..`, or `..END`.
   optional string range = 2;
@@ -332,15 +332,19 @@ message Cat {
   optional string from = 3;
   // `--strict`: refuse a divergent path.
   bool strict = 4;
+  // `--root <hex>`: read an object by content root, with no path involved.
+  optional string root = 5;
 }
 
 message Get {
-  // The entry reference.
+  // The entry reference. Empty when `root` names the object instead.
   string reference = 1;
   // `--from <origin>`: fetch that origin's version.
   optional string from = 2;
   // `--strict`: refuse a divergent path.
   bool strict = 3;
+  // `--root <hex>`: fetch an object by content root, with no path involved.
+  optional string root = 4;
 }
 
 message Take {

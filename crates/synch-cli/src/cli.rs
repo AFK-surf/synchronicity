@@ -354,7 +354,8 @@ pub enum Command {
     Cat {
         /// `[<origin>:]<space>/<path>`. The bare form reads the version the
         /// policy selects; the origin-prefixed form pins one origin.
-        reference: String,
+        #[arg(required_unless_present = "root", conflicts_with = "root")]
+        reference: Option<String>,
         /// A byte range, as `START..END`, `START..`, or `..END`.
         #[arg(long)]
         range: Option<String>,
@@ -365,12 +366,19 @@ pub enum Command {
         /// Refuse to read a divergent path, and list its versions instead.
         #[arg(long, conflicts_with = "from")]
         strict: bool,
+        /// Read an object by its content root, with no path involved — what
+        /// `synch log` prints, and the only way to read a superseded version
+        /// (§8).
+        #[arg(long, value_name = "HEX", conflicts_with_all = ["from", "strict"])]
+        root: Option<String>,
     },
     /// Fetch to a file.
     Get {
         /// `[<origin>:]<space>/<path>`.
-        reference: String,
-        /// Where to write. Defaults to the entry's file name.
+        #[arg(required_unless_present = "root", conflicts_with = "root")]
+        reference: Option<String>,
+        /// Where to write. Defaults to the entry's file name, or to the root
+        /// itself when `--root` names the object.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Fetch this origin's version.
@@ -379,6 +387,9 @@ pub enum Command {
         /// Refuse to fetch a divergent path, and list its versions instead.
         #[arg(long, conflicts_with = "from")]
         strict: bool,
+        /// Fetch an object by its content root, with no path involved.
+        #[arg(long, value_name = "HEX", conflicts_with_all = ["from", "strict"])]
+        root: Option<String>,
     },
     /// Adopt a peer's version as this node's own.
     Take {
