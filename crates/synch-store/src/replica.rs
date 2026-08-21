@@ -660,7 +660,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{origin, store};
+    use crate::testutil::{origin, origin_named, store};
     use crate::ReplicaPolicy;
 
     fn media() -> PinHolder {
@@ -884,6 +884,55 @@ mod tests {
         assert_eq!(store.stage_space_wants("media", &media(), 5).unwrap(), 0);
         assert!(store.wants_of(&media()).unwrap().is_empty());
         assert_eq!(store.pins_for(&held).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_replication_floor_does_not_count_this_node_as_a_peer() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"the last copy", 0).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+        store
+            .set_config("self_origin_id", &origin().canonical())
+            .unwrap();
+
+        // This node advertises what it holds like any other origin. A provider
+        // count that included itself would answer "does anyone else have this?"
+        // with "I do", and a replica asked not to be the last holder would
+        // always find one holder left — itself.
+        store
+            .put_provider(&root, &origin(), &synch_core::BlobAd::complete(13))
+            .unwrap();
+        assert_eq!(
+            store
+                .schedule_stale_releases_above(&media(), 500, 1)
+                .unwrap(),
+            0,
+            "its own advertisement must not satisfy the floor"
+        );
+        assert_eq!(
+            store.held_back_by_replication_floor(&media(), 1).unwrap(),
+            1,
+            "and the status report must say the object is being held back"
+        );
+
+        // A second, foreign holder is what the floor is actually asking for.
+        store
+            .put_provider(
+                &root,
+                &origin_named("elsewhere"),
+                &synch_core::BlobAd::complete(13),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .schedule_stale_releases_above(&media(), 500, 1)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.held_back_by_replication_floor(&media(), 1).unwrap(),
+            0
+        );
     }
 
     #[test]
