@@ -278,6 +278,11 @@ synch fill media --dry-run                                 # decide everything, 
 synch fill media --force                                   # replace local files that differ
 ```
 
+`synch space sync` is the other half of the same wish and a different thing:
+replication holds the *bytes* of every version in the store and materializes
+nothing, while a fill writes *files*, one selected version per path. On a
+replicated space the two compose — everything the fill wants is already local.
+
 A fill does not publish. The files land where the scanner will find them, and
 the next scan publishes them as this node's own view — which is why a filled
 file carries the mtime and mode the origin published rather than this machine's

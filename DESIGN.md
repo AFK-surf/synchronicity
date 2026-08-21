@@ -1289,7 +1289,15 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   stdout with verified random access; this is where hash-tree reads shine (e.g.
   seeking in a large video).
 - `synch fill [<origin>:]<space>[/<dir>] [--from <origin>|--strict] [--force]
-  [--dry-run]` —
+  [--dry-run]` — not to be confused with `synch space sync`, which is the other
+  half of the same wish. Replication (`--replicate`, docs/REPLICATION.md) holds
+  the *bytes* of every version in the CAS and materializes nothing; a fill
+  writes *files*, one selected version per path, and holds nothing beyond what
+  the store already keeps. They compose: on a replicated space every object a
+  fill wants is already local, so the fill is materialization with no network
+  in it at all.
+
+  A fill is
   one-shot materialization into the *space's own* directory, the one `synch space
   add` named. Where a mirror owns the directory it writes into, a fill writes into
   the directory this node indexes and publishes from, so it may only ever add: a
