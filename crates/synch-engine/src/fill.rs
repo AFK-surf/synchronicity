@@ -2102,45 +2102,6 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A streamed write holds an open `Adoption` for as long as its client
-    /// takes, and `commit` renames over whatever is there. The gate the header
-    /// exchange took says nothing about the moment of the rename.
-    #[tokio::test]
-    async fn a_write_opened_before_recovery_is_refused_at_its_commit() {
-        let (_data, space, node) = node_with_space().await;
-        let target = space.path().join("f.txt");
-        std::fs::write(&target, b"mine, unpublished").unwrap();
-
-        // What the `put` handler does before it spawns.
-        node.ensure_adoptable("media", "f.txt").unwrap();
-        let mut adoption = node.open_adoption("media", "f.txt").unwrap();
-        adoption.write(b"theirs").unwrap();
-
-        // An inbound `Hello` floors the node while the body is still arriving.
-        node.store()
-            .record_observed_head(
-                node.origin(),
-                100,
-                &synch_core::Hash([7u8; 32]),
-                true,
-                None,
-                now_ns(),
-            )
-            .unwrap();
-
-        // The gate the handler re-takes immediately before the rename.
-        let refused = node.ensure_adoptable("media", "f.txt").unwrap_err();
-        assert!(refused.to_string().contains("recover"), "{refused}");
-        drop(adoption);
-        assert_eq!(
-            std::fs::read(&target).unwrap(),
-            b"mine, unpublished",
-            "a commit past that gate would have destroyed a file nothing could \
-             then publish a replacement for"
-        );
-        node.shutdown().await.unwrap();
-    }
-
     /// A recovering node cannot publish, so a fill would write a tree nothing
     /// would ever announce — and `--force`'s own-origin guard, which needs this
     /// node to publish something, would be inert while it did.

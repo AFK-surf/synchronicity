@@ -944,6 +944,47 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
     daemon.shutdown().await;
 }
 
+/// A streamed write is gated when it opens and again when it commits. The
+/// window between is the client's to take, and a node floored by an inbound
+/// `Hello` in the middle of it must not let the commit rename over a file it
+/// can then publish no replacement for (§3.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_floored_mid_stream_does_not_commit() {
+    // Deliberately not `daemon_with_space`: that scans, and a node holding a
+    // complete head of its own is not in key-loss recovery however far ahead a
+    // peer claims to be (§3.4).
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    let space = space_with(&[("kept.txt", b"kept")]);
+    lines(
+        data_dir,
+        space_add("media", &space.path().to_string_lossy()),
+    )
+    .await;
+
+    // Opened while the node is healthy: the header exchange takes its gates
+    // and hands back a stream.
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let mut put = client.put("media", "kept.txt").await.unwrap();
+    put.chunk(b"theirs".to_vec()).await.unwrap();
+
+    // A peer advertises a head for our own origin that we have no history for
+    // — key-loss recovery, arriving while the body is still on the wire.
+    observed_head(&daemon.node, 100).await;
+
+    let error = put.finish().await.expect_err("the commit must be refused");
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(error.message.contains("recover"), "{error}");
+    assert_eq!(
+        std::fs::read(space.path().join("kept.txt")).unwrap(),
+        b"kept",
+        "the file must survive a commit the node could never have published"
+    );
+
+    daemon.shutdown().await;
+}
+
 /// `synch recover` over the socket: the quiesce reports each round and the
 /// node publishes again (§3.4, §9.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
