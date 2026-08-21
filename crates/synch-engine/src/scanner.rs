@@ -872,6 +872,19 @@ impl Node {
             source.to_path_buf(),
         );
         let (normalized, size) = crate::blocking::offload(move || {
+            // The detached half of `ensure_adoptable`, and the last adoption
+            // entry point that trusted its caller for it. Both callers do check
+            // — the `put` handler and `complete_upload` — but both then do the
+            // work in a spawned task, so an inbound `Hello` can floor this node
+            // in between, and an embedder calling this `pub fn` has no check at
+            // all. What follows is a durable-tier promotion (a billable write
+            // on a cloud CAS) and an `f:`/`b:` pair staged for a publish that
+            // would be refused, re-failing on every quiesce tick and orphaning
+            // the blob if the daemon restarts first.
+            //
+            // `refuse_if_ignored` is the other half and is a no-op here: a
+            // detached space has no directory to hold a `.syncignore`.
+            node.ensure_publishable()?;
             if !node.is_detached_space(&checked_space)? {
                 return Err(EngineError::invalid(format!(
                     "space {checked_space} has a local checkout"

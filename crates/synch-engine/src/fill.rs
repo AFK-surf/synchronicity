@@ -45,7 +45,10 @@
 //! target is identical, so every node still converges on the same link — but
 //! the "restates rather than mints" rule above is a rule about files.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use synch_core::{EntryKind, Hash};
 use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
@@ -69,6 +72,13 @@ pub struct FillOptions {
     pub force: bool,
     /// Decide everything and write nothing: the report says what a real run
     /// would do, down to which files it would replace.
+    ///
+    /// "Nothing" is about the tree: no path is created, replaced or removed. A
+    /// fill whose candidates include two names that fold together still asks
+    /// the filesystem whether it folds them, which is a create and an unlink of
+    /// an ignored probe name in the directory concerned — the alternative being
+    /// a dry run that reports a collision the real run will not make, or misses
+    /// one it will.
     pub dry_run: bool,
 }
 
@@ -696,8 +706,10 @@ fn decide(
     // Detected before anything is written, the way a mirror pass does it: the
     // first claimant of a folded name wins and the rest are reported — but only
     // where this space's filesystem actually folds them.
-    let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let folds = folds_case(root_dir);
+    let mut claimed: HashMap<String, String> = HashMap::new();
+    // Answered per directory, and only for a directory that turns out to hold a
+    // folded pair.
+    let mut folds: HashMap<PathBuf, bool> = HashMap::new();
 
     for set in listing {
         // A mirror refuses these names on every platform, so that one mirror of
@@ -809,19 +821,23 @@ fn decide(
         // does it: without the claim, `--force` would write one over the other
         // and call both of them filled. Where the filesystem does *not* fold,
         // there is no collision to report and both are written.
-        if folds {
-            let folded = fold(&set.path);
-            match claimed.get(&folded) {
-                Some(winner) if winner != &set.path => {
+        let folded = fold(&set.path);
+        match claimed.get(&folded) {
+            // Two candidates fold together. Only now is it worth asking the
+            // filesystem whether it folds them, and only of the directory they
+            // would land in.
+            Some(winner) if winner != &set.path => {
+                let dir = target.parent().unwrap_or(root_dir).to_path_buf();
+                if folds_case(&dir, &mut folds) {
                     report.skipped.push((
                         set.path.clone(),
                         format!("collides with {winner} under filesystem name folding"),
                     ));
                     continue;
                 }
-                _ => {
-                    claimed.insert(folded, set.path.clone());
-                }
+            }
+            _ => {
+                claimed.insert(folded, set.path.clone());
             }
         }
 
@@ -971,8 +987,8 @@ fn indexed_content(
     fresh.then_some(known.content).flatten()
 }
 
-/// Whether this space's filesystem folds two names that differ only in case
-/// onto one file.
+/// Whether the directory a path lands in folds two names that differ only in
+/// case onto one file.
 ///
 /// A mirror applies the fold rule everywhere, so that one tree is one directory
 /// on every OS. A fill has the opposite obligation — it writes into *this*
@@ -982,31 +998,41 @@ fn indexed_content(
 /// report a permanent collision about two files that are both sitting there,
 /// and would leave the loser unrestorable after a lost checkout.
 ///
-/// Compile-time is the wrong answer: macOS is unix and folds, Linux does not,
-/// and a single machine can mount both kinds. So it is asked of the root
-/// itself, once per fill — one create, one stat, one unlink.
+/// Compile-time is the wrong axis: macOS is unix and folds, Linux does not, and
+/// one machine can mount both — a case-insensitive card under a case-sensitive
+/// root is an ordinary thing to have, and a single answer for the whole tree
+/// would silently clobber inside it. So the question is asked of the directory
+/// the colliding paths actually land in, and memoized per directory.
+///
+/// Asked lazily, only when two candidate paths really do fold onto one name,
+/// which on almost every tree is never: a fill that has no such pair writes
+/// nothing here at all, `--dry-run` included.
 ///
 /// The probe wears a `.synch-part` suffix, which the built-in ignore rules
-/// already cover, so a crash between the create and the unlink leaves nothing
-/// a scan would pick up. Anything unreadable answers "folds", which is the
+/// already cover, so a crash between the create and the unlink leaves nothing a
+/// scan would pick up. Anything unwritable answers "folds", which is the
 /// conservative direction: it keeps the collision guard rather than dropping
 /// it.
-fn folds_case(root: &Path) -> bool {
-    let upper = root.join(format!(
-        ".synch-case-A{}{}",
-        std::process::id(),
-        crate::scanner::PART_SUFFIX
-    ));
-    let lower = root.join(format!(
-        ".synch-case-a{}{}",
-        std::process::id(),
-        crate::scanner::PART_SUFFIX
-    ));
-    if std::fs::write(&upper, b"").is_err() {
-        return true;
+fn folds_case(dir: &Path, memo: &mut HashMap<PathBuf, bool>) -> bool {
+    if let Some(known) = memo.get(dir) {
+        return *known;
     }
-    let folds = lower.symlink_metadata().is_ok();
-    let _ = std::fs::remove_file(&upper);
+    let name = |case: char| {
+        dir.join(format!(
+            ".synch-case-{case}{}{}",
+            std::process::id(),
+            crate::scanner::PART_SUFFIX
+        ))
+    };
+    let (upper, lower) = (name('A'), name('a'));
+    let folds = if std::fs::write(&upper, b"").is_err() {
+        true
+    } else {
+        let folds = lower.symlink_metadata().is_ok();
+        let _ = std::fs::remove_file(&upper);
+        folds
+    };
+    memo.insert(dir.to_path_buf(), folds);
     folds
 }
 
@@ -2097,6 +2123,64 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A dry run over a tree with no folded pair touches the filesystem not at
+    /// all: the probe is asked only when two candidates really do collide.
+    #[tokio::test]
+    async fn a_dry_run_without_a_collision_leaves_no_trace() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "a.txt", b"one", STAMP);
+        publish(&node, &peer(), "sub/b.txt", b"two", STAMP);
+
+        let report = node
+            .fill_space(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: false,
+                    dry_run: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.filled, 2, "{report:?}");
+        assert_eq!(
+            std::fs::read_dir(space.path()).unwrap().count(),
+            0,
+            "a dry run with nothing to disambiguate creates nothing at all"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// The last adoption entry point, and the one every gate had missed: a
+    /// detached commit promotes an object to the durable tier and stages a
+    /// reference, neither of which a node in recovery can publish.
+    #[tokio::test]
+    async fn a_recovering_node_commits_no_detached_file() {
+        let (_data, _space, node) = node_with_space().await;
+        node.store().put_detached_space("cloud").unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"payload").unwrap();
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        let refused = node
+            .commit_detached_file("cloud", "f.txt", source.path(), now_ns())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        node.shutdown().await.unwrap();
+    }
+
     /// A recovering node cannot publish, so a fill would write a tree nothing
     /// would ever announce — and `--force`'s own-origin guard, which needs this
     /// node to publish something, would be inert while it did.
@@ -2173,10 +2257,18 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The scanner's own record answers the currency check without a read: a
-    /// chmod 000 proves the second fill never opened the file, because hashing
-    /// it would have failed and reported the path as differing.
-    #[cfg(unix)]
+    /// The scanner's own record answers the currency check without a read.
+    ///
+    /// Proven by making the record and the bytes *disagree*, which is the case
+    /// the record's own rule is about: the file is scanned, then rewritten in
+    /// place at the same length with its mtime restored, so `(size, mtime,
+    /// file_id)` still match and the record still vouches for content the disk
+    /// no longer holds. A fill that consults the record calls the path current;
+    /// one that hashes the file finds different bytes and wants to write.
+    ///
+    /// A `chmod 000` was the earlier proof and was no proof at all: every
+    /// container running as root reads straight through it, so the test passed
+    /// whether or not the record was ever consulted.
     #[tokio::test]
     async fn an_indexed_file_is_believed_without_a_read() {
         let (_data, space, node) = node_with_space().await;
@@ -2184,26 +2276,45 @@ mod tests {
         std::fs::write(&target, b"agreed").unwrap();
         // Backdated past the racy window, so the record the scan leaves is one
         // a later stat is allowed to be trusted against.
-        std::fs::File::options()
-            .write(true)
-            .open(&target)
-            .unwrap()
-            .set_times(
-                std::fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::now() - std::time::Duration::from_secs(10),
-                ),
-            )
-            .unwrap();
+        let stamp = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let backdate = || {
+            std::fs::File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stamp))
+                .unwrap();
+        };
+        backdate();
         node.scan_publish_push().await.unwrap();
+
+        // Rewritten in place, same length, mtime put back: the stat is
+        // unchanged and the record now vouches for bytes that are gone.
+        std::fs::write(&target, b"REVISE").unwrap();
+        backdate();
+        // The peer publishes what the record still claims is here.
         publish(&node, &peer(), "f.txt", b"agreed", STAMP);
 
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .fill_space(
+                "media",
+                "",
+                &VersionPolicy::Origin(peer()),
+                FillOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.current, 1, "{report:?}");
+        assert_eq!(
+            report.current, 1,
+            "the record answered. A fill that hashed the file would have found \
+             `REVISE` against a published `agreed` and wanted to write: {report:?}"
+        );
         assert!(report.differing.is_empty(), "{report:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"REVISE",
+            "and nothing was written over it"
+        );
         node.shutdown().await.unwrap();
     }
 }
