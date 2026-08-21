@@ -1321,6 +1321,20 @@ impl Store {
         Ok(touched > 0)
     }
 
+    /// Drops one holder's claims whose scheduled release has arrived.
+    ///
+    /// Per holder so that a sweep can report what *this* space let go of. The
+    /// node-wide [`Store::expire_pins`] stays as the catch-all for holders no
+    /// sweep visits any more: a space removed with its pins kept still has
+    /// claims that were scheduled before it went.
+    pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM pins
+              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2",
+            params![holder.render(), now],
+        )?)
+    }
+
     /// Drops claims whose scheduled release has arrived, so that every other
     /// predicate over `pins` can stay free of the clock. Returns how many went.
     pub fn expire_pins(&self, now: i64) -> Result<usize> {

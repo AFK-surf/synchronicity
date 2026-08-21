@@ -1108,8 +1108,7 @@ impl Node {
         // here that can publish a mass deletion: it takes the publishing gate,
         // and a node that cannot publish must not be stopped from giving up a
         // space it never published into (`docs/REPLICATION.md` §3.2).
-        let publishes_here =
-            space.local_path.is_some() || self.store().count_entries(self.origin(), id)? > 0;
+        let publishes_here = publishes_into(&space, self.store().count_entries(self.origin(), id)?);
         if publishes_here {
             self.ensure_publishable()?;
         }
@@ -1347,6 +1346,16 @@ impl Node {
         let mut out = Vec::new();
         for space in self.store().spaces()? {
             let entry_count = self.store().count_entries(self.origin(), &space.id)?;
+            // A space this node only replicates is not a space it publishes.
+            // The record says "here is my view of this space, and here is how
+            // much of it I have", and a replica's answer to the second half is
+            // permanently zero — advertising that would claim a space this node
+            // publishes nothing into (`docs/REPLICATION.md` §3.2). The
+            // predicate is shared with `remove_space`, so what is advertised
+            // and what is withdrawn cannot drift apart.
+            if !publishes_into(&space, entry_count) {
+                continue;
+            }
             let info = SpaceInfo {
                 v: synch_core::RECORD_VERSION,
                 // Local paths are host-private implementation details and are
@@ -1578,6 +1587,16 @@ impl Node {
     pub fn key_for(&self, space: &str, path: &str) -> Result<Vec<u8>> {
         Ok(file_key(space, path)?)
     }
+}
+
+/// Whether this node publishes into a space, as opposed to only replicating it.
+///
+/// A checkout means it does — that is what the scanner walks — and so does
+/// having published an entry, which is how a detached space serves gateway
+/// writes without one. A space with neither is one this node holds copies of
+/// and asserts nothing about.
+fn publishes_into(space: &synch_store::SpaceRow, own_entries: u64) -> bool {
+    space.local_path.is_some() || own_entries > 0
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf> {

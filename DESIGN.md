@@ -1455,8 +1455,10 @@ synch domain set|clear|ls|refresh            the DNSSEC zone this node belongs t
                                              (§3.1) and clear drops the zone's bindings
 synch peers                                  live peers, addresses, last sync, lag
 
-synch space add <id> <path>                  index a local directory as a space
-synch space ls|rm
+synch space add <id> <path> [--replicate[=tree|archive]] [--grace <dur>] [--budget <n>]
+synch space add <id> --detached [--replicate…]  index a directory as a space, hold every
+synch space set <id> [--replicate…|--no-replicate [--release]]   version of it, or both
+synch space ls [<id>] | rm <id> [--release] | sync [<id>]   (§4.1, docs/REPLICATION.md)
 synch scan                                   walk every space now: hash changes, publish
 
 synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent paths
@@ -1467,6 +1469,8 @@ synch status [<space>[/<path>]]              the version inspector: every versio
                                              a path, its attestors, side by side
 synch cat  [<origin>:]<space>/<path>         verified streaming read of the selected
            [--range] [--from <o>|--strict]   version (§8 policy; default newest)
+synch cat|get --root <hex>                   read an object by content root, no path
+                                             involved — how a superseded version is read
 synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
            [--from <o>|--strict]
 synch take <origin>:<space>/<path>           adopt a version as my own (ends divergence)
@@ -1478,7 +1482,9 @@ synch mirror add <space> <dir> [--policy …]  continuous materialization of the
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
-                                             (a path pins its selected version's root)
+                                             (a path pins its selected version's root;
+                                             `ls` and `rm` name every holder, since a
+                                             replicated space may hold it too)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by

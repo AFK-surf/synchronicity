@@ -1,8 +1,11 @@
 # Replication
 
-Status: **proposed**. Nothing below is built. Section 11 is the order it should
-land in; each phase is useful on its own, and the first one is worth doing even
-if the rest is never built.
+Status: **implemented** through §11 phase 6 — pin holders and leases, read by
+root, the `spaces` columns and their commands, the sweep, the fetch loop, the
+live path, and release with the discipline. Phases 7 to 9 (budget reporting,
+published claims, the under-replication brake and cooperative *k*-replication)
+are not built. Where the built thing differs from what was proposed, this
+document has been corrected to describe the built thing.
 
 Checked against `09d89a3` (OpenDAL CAS backends, `docs/SERVERLESS.md`). That
 work moved three things this design leaned on — `spaces.local_path` is already
@@ -262,13 +265,16 @@ merged code rather than the older tree:
 - **`m:space/<id>` no longer publishes the local path.** `space_info_changes`
   now sends `description: String::new()` for every space — "local paths are
   host-private implementation details" — so half the argument for suppressing
-  the record on a replicate-only space is gone, fixed upstream and more
-  broadly. What survives is thinner: the record still carries this origin's
-  `entry_count` for the space, which is permanently zero where the row exists
-  only to replicate, and a zero record says "I publish this space" to anything
-  reading space info. Suppressing it there is a small improvement, not the
-  correctness point it was drafted as; the `r:` claim (§4.1) is what carries the
-  real information either way.
+  the record on a replicate-only space was gone before this was built, fixed
+  upstream and more broadly. The other half is implemented: the record still
+  carries this origin's `entry_count`, which is permanently zero where the row
+  exists only to replicate, so a zero record would claim a space this node
+  publishes nothing into. `publishes_into` — a checkout, or an entry of our own,
+  which is how a detached write target qualifies without one — gates both the
+  advertisement and its withdrawal, so what is advertised and what `space rm`
+  takes back cannot drift apart. That shared predicate is not decoration: had
+  only the tombstone scan been skipped, a replicate-only space would have
+  advertised an `m:space` record that `space rm` then stranded in the trie.
 
 One decision does survive intact, and it is the sharp one:
 
@@ -576,7 +582,7 @@ count them.
 | `spaces.budget` | none | per space byte ceiling; stops fetching, never releases |
 | `replica_interval` | 300 s | reconciling sweep backstop; the promotion bell rings it early |
 | `replica_concurrency` | 4 | concurrent object fetches for replica work |
-| `replica_backoff` | 60 s … 6 h | per-want retry schedule, exponential in `attempts` |
+| backoff | 60 s … 6 h | per-want retry schedule; the first retry waits the minimum and each failure after that doubles it, computed per row inside `wants_to_attempt` rather than applied as one threshold |
 | `root_retention` | 7 d | unchanged; head history depth, now independent of content |
 | `cas.cloud.upload` | `own+pinned` | not new and not changed: the default already covers a replica's holdings, since a replica pins what it holds (§3.1) |
 

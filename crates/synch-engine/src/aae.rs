@@ -323,6 +323,18 @@ impl Node {
             }
         }
         contained("expiring tombstones", self.expire_tombstones());
+        // The catch-all for claims a replication sweep will not visit again:
+        // a space removed with its pins kept still has releases that were
+        // scheduled before it went, and nothing else would ever run them
+        // (`docs/REPLICATION.md` §3.1).
+        if let Some(expired) = contained(
+            "expiring pins",
+            self.store().expire_pins(now).map_err(EngineError::from),
+        ) {
+            if expired > 0 {
+                tracing::info!(expired, "scheduled releases fell due");
+            }
+        }
         self.sweep_pending_heads(now);
         // Ads for objects content GC has since dropped. Staged before the
         // content sweep below rather than after, so a root that goes this pass

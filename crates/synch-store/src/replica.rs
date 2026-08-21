@@ -167,9 +167,11 @@ impl Store {
     /// The backoff is computed per row rather than applied as one threshold,
     /// because the rows differ in how often they have failed: a want on its
     /// first retry and one that has failed all day should not come back at the
-    /// same rate. It doubles from `min_backoff` per attempt and stops at
-    /// `max_backoff`, both in nanoseconds, and the shift is capped so that a
-    /// row that somehow accumulated thousands of attempts cannot overflow it.
+    /// same rate. The first retry waits `min_backoff`, each failure after that
+    /// doubles the wait, and it stops at `max_backoff` — both in nanoseconds.
+    /// The shift is taken off `attempts - 1` so the first wait is the minimum
+    /// rather than twice it, and capped so that a row which somehow
+    /// accumulated thousands of attempts cannot overflow it.
     pub fn wants_to_attempt(
         &self,
         now: i64,
@@ -184,7 +186,7 @@ impl Store {
                FROM replica_want w
               WHERE w.last_attempt IS NULL
                  OR w.last_attempt
-                    + MIN(?2 * (1 << MIN(w.attempts, 12)), ?3) <= ?1
+                    + MIN(?2 * (1 << MIN(MAX(w.attempts - 1, 0), 12)), ?3) <= ?1
               ORDER BY (SELECT COUNT(*) FROM blob_providers p
                          WHERE p.object_root = w.root AND p.complete != 0) ASC,
                        w.first_wanted ASC

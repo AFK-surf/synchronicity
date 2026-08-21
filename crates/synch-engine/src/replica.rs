@@ -188,24 +188,20 @@ impl Node {
                 } else {
                     0
                 };
+            // Expiry runs even when the view is incomplete. These releases were
+            // decided when it was complete — by the live path, or by an earlier
+            // sweep — and holding them back would mean one unreachable peer
+            // froze every space's grace window indefinitely.
+            let released = self.store().expire_pins_of(&holder, now)?;
             out.push((
                 space.id.clone(),
                 SweepReport {
                     wanted,
                     reprieved,
                     scheduled,
-                    released: 0,
+                    released,
                 },
             ));
-        }
-        // Expiry is node-wide rather than per space: a claim past its release
-        // is past it whoever made it, and one statement is cheaper than one per
-        // space. Runs even when the view is incomplete — these releases were
-        // decided when it was not, and holding them back would mean a single
-        // unreachable peer froze every space's grace window.
-        let expired = self.store().expire_pins(now)?;
-        if let Some((_, first)) = out.first_mut() {
-            first.released = expired;
         }
         Ok(out)
     }
@@ -329,15 +325,25 @@ impl Node {
         prev: Option<&Hash>,
         holder: &PinHolder,
     ) -> Result<(u64, u64)> {
-        let donors: Vec<synch_store::Donor> = prev
-            .filter(|prev| {
-                // A donor with no bytes here is a wasted pass over the proof
-                // list, which is what `donors_for` filters for on the read path.
-                self.holds_any_of(prev).unwrap_or(false)
-            })
-            .map(|prev| synch_store::Donor(*prev))
-            .into_iter()
-            .collect();
+        // A donor with no bytes here is a wasted pass over the proof list,
+        // which is what `donors_for` filters for on the read path. The check
+        // reads the blob row, so it goes over the blocking pool rather than
+        // running on the worker polling this future (§10) — the guard aborts
+        // the process for it, and a test that has entered a `BlockingScope`
+        // will not notice.
+        let donors: Vec<synch_store::Donor> = match prev.copied() {
+            None => Vec::new(),
+            Some(prev) => {
+                let node = self.clone();
+                crate::blocking::offload(move || {
+                    Ok(match node.holds_any_of(&prev)? {
+                        true => vec![synch_store::Donor(prev)],
+                        false => Vec::new(),
+                    })
+                })
+                .await?
+            }
+        };
         let fetched = self.fetch_all_from(root, size, &donors).await?;
         if !fetched.complete {
             return Err(EngineError::not_found(format!(

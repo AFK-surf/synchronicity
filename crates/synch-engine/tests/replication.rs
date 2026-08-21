@@ -443,6 +443,57 @@ async fn removing_a_replicated_space_publishes_nothing() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
+/// A space this node only replicates is not one it publishes: it advertises no
+/// `m:space` record, so `space rm` has none to strand (§3.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replicated_space_advertises_nothing_of_its_own() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn("replica").await;
+    introduce(&[&publisher, &replica]);
+
+    publisher
+        .node
+        .add_space("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("a.bin"), b"content").unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+
+    // The replica has its own space too, so this is not testing a node that
+    // publishes nothing at all — it is testing that the two are told apart.
+    replica
+        .node
+        .add_space("mine", replica.space.path())
+        .unwrap();
+    let replicating = replica.node.clone();
+    off_runtime(move || {
+        replicating.add_detached_space("media").unwrap();
+        replicating
+            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .unwrap();
+    })
+    .await;
+    std::fs::write(replica.space.path().join("b.bin"), b"mine").unwrap();
+    replica.node.scan_publish_push().await.unwrap();
+    converge(&replica.node, &publisher.node).await;
+
+    let node = replica.node.clone();
+    let (own, replicated) = off_runtime(move || {
+        (
+            node.space_info_of(node.origin(), "mine").unwrap(),
+            node.space_info_of(node.origin(), "media").unwrap(),
+        )
+    })
+    .await;
+    assert!(own.is_some(), "a space this node indexes is advertised");
+    assert!(
+        replicated.is_none(),
+        "a space it only replicates is not, so `space rm` strands no record"
+    );
+
+    shutdown(&[&publisher.node, &replica.node]).await;
+}
+
 /// A replica of a space it also indexes is two independent halves of one row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_space_can_be_indexed_and_replicated_at_once() {
