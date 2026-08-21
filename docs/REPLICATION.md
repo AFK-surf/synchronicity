@@ -339,12 +339,31 @@ reaches it is dropped from the queue rather than fetched and then released —
 which is both the cheaper order and the one that stops a churning path from
 generating permanent false entries in the `unreachable` count.
 
-**Priority is rarest-first.** Order by the number of distinct origins
-advertising a complete `BlobAd` for the root (`blob_providers`), ascending, then
-by `first_wanted`. A replica exists to raise the floor on the number of copies,
-so the object with one advertised holder is worth more than the object with
-nine — and it is the one about to be lost when that holder leaves. Ties go to
-the oldest want, so nothing starves.
+**Priority is rarest-first *within a space*, and a turn each between them.**
+Rarity orders by the number of *other* origins advertising a complete `BlobAd`
+for the root (`blob_providers`), ascending, then by `first_wanted`. A replica
+exists to raise the floor on the number of copies, so the object with one
+advertised holder is worth more than the object with nine — and it is the one
+about to be lost when that holder leaves. Ties go to the oldest want. The count
+excludes this node's own advertisement: a node advertises its `b:` records like
+any other origin, so counting itself answers "does anyone else have this?" with
+"I do", and the §3.6 release floor would never engage.
+
+Ranking the *pooled* candidates globally is what this section first specified,
+and it starves. A space bootstrapping four million equally rare objects sorts
+ahead of every newer want in every other space, so a space added afterwards
+fetches nothing until the first one drains. Rarity is the right order within a
+space; between spaces the only defensible order is a turn each. So each
+replicated space contributes its own rarest-first window, the windows are
+interleaved one row at a time, and — because the fetch loop admits only the
+first `replica_concurrency` rows of that interleave, and spaces are listed by
+id — which space leads advances by one per pass. Every space gets the lead
+within one turn of the list.
+
+Rarity is ranked over a bounded window rather than the queue: the oldest ready
+rows per space, `RARITY_WINDOW` per concurrency slot. That is enough for a rare
+object in a batch to win without a pass costing one provider count per queued
+row, which on a four-million-row queue is the whole feature's cost model.
 
 ### 3.4 Two sources of work, and only one may release
 
@@ -389,8 +408,12 @@ from absence is not, and that asymmetry is the next section.
 A third standing task, separate from both, because it is the only one that
 touches the network and the only one that should be rate-limited:
 
-1. Take up to `replica_concurrency` want rows in priority order, skipping rows
-   inside a backoff derived from `attempts`.
+1. Take up to `replica_concurrency` want rows in §3.3's order — rarest-first
+   within each replicated space, interleaved between them, with the lead
+   rotating one space per pass — skipping rows inside a backoff derived from
+   `attempts`. The backoff is per row, not one threshold for the batch: the
+   first retry waits `min_backoff` and each failure after it doubles the wait,
+   up to `max_backoff`.
 2. `fetch_all_from(root, size, donors)` — the ordinary §6.4 path, so delta
    descent, provider fanout and resumption apply unchanged. This is the best
    case for the descent and a replica hits it constantly: it is fetching
@@ -461,8 +484,10 @@ should be visible in the code as plainly as it is here.
 Two further brakes, both strictly conservative:
 
 - **Under-replication delays a release.** A replica that is about to let a root
-  go may check how many distinct origins advertise a complete `BlobAd` for it
-  and hold on if the answer is too few. This uses peers' claims only to *keep*
+  go may check how many *other* origins advertise a complete `BlobAd` for it
+  and hold on if the answer is too few — other, because a count that includes
+  this node's own advertisement always finds one holder left, itself, and the
+  brake would never engage. This uses peers' claims only to *keep*
   bytes, never to drop them, which is the safe half of §4.2's invariant.
 - **A release is never a delete.** Setting `release_after` schedules the pin's
   removal; the object then faces the ordinary GC rule like anything else. If a

@@ -1220,12 +1220,23 @@ impl ReplicaTargets {
         let rows = stmt.query_map([], space_row)?;
         for space in rows {
             let space = space?;
+            // The SQL filters on the column and `space_row` parses it, and the
+            // two can disagree: a `replicate` value no `ReplicaPolicy` renders
+            // is non-NULL to the query and `None` to the parse. Deciding on the
+            // parsed value here is what keeps this predicate the same one
+            // `replicated_spaces` uses — otherwise the live path would stage
+            // wants for a space the sweep and the fetch loop do not consider
+            // replicated, and the rows would sit in the queue for ever. Nothing
+            // writes such a value today; the point is that nothing has to.
+            let Some(policy) = space.replicate else {
+                continue;
+            };
             by_space.insert(
                 space.id.clone(),
                 ReplicaTarget {
                     holder: space.holder().render(),
                     grace_ns: space.grace_secs().saturating_mul(1_000_000_000),
-                    releases: space.replicate.is_some_and(ReplicaPolicy::releases),
+                    releases: policy.releases(),
                     release_floor,
                 },
             );

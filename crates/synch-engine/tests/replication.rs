@@ -641,6 +641,15 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
 /// property of an unrelated clock — `last_access` is stamped by the write, and
 /// `gc_content` skips anything newer than its horizon. A change to either
 /// would open it with every other test still green.
+///
+/// Reaching that state takes more than fetching and not pinning. A replica
+/// stages a want in the same transaction that materializes the entry, so a
+/// wanted root is a referenced root, and a pass over one is decided by
+/// `referenced_content` without the retention clock ever being consulted — the
+/// test would then pass with both age checks deleted. So the reference is taken
+/// away: the publisher removes the file, the replica syncs, its entry goes and
+/// its want self-cleans, and what is left is precisely the window's state —
+/// complete, unreferenced, unpinned, and spared by nothing but its age.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -682,13 +691,38 @@ async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
         .unwrap();
     assert!(fetched.complete);
 
+    // Take the reference away, which is what puts the root into the window's
+    // state rather than merely near it.
+    std::fs::remove_file(publisher.space.path().join("a.bin")).unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+    replica
+        .node
+        .sync_with_peer(&publisher.node.node_id())
+        .await
+        .unwrap();
+
     // Nothing references it — no entry of this node's own names it, and no pin
-    // stands for it yet. A maintenance pass here is entitled to collect it on
-    // every rule except its age.
+    // stands for it. A maintenance pass here is entitled to collect it on every
+    // rule except its age. Asserted, not assumed: if a later change leaves the
+    // entry or the want standing, this says so instead of quietly going back to
+    // testing nothing.
+    let root = want[0].root;
+    let store = replica.node.store().clone();
+    let (referenced, pins, wants) = off_runtime(move || {
+        (
+            store.content_is_referenced(&root).unwrap(),
+            store.pins_for(&root).unwrap().len(),
+            store.wants_of(&holder()).unwrap().len(),
+        )
+    })
+    .await;
+    assert!(!referenced, "the entry that named the root should be gone");
+    assert_eq!(pins, 0, "and the fetch took no possession");
+    assert_eq!(wants, 0, "and the want self-cleaned with the tree");
+
     let sweeping = replica.node.clone();
     off_runtime(move || sweeping.maintenance_pass().unwrap()).await;
 
-    let root = want[0].root;
     let store = replica.node.store().clone();
     let survived = off_runtime(move || store.blob(&root).unwrap()).await;
     assert!(
@@ -697,8 +731,11 @@ async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
          replica has just paid for"
     );
 
-    // And the pass that follows can still take possession of them.
-    replica.node.fetch_replica_wants().await.unwrap();
+    // And the bytes that survived are usable: the file comes back, and the
+    // replica takes possession without paying for the transfer twice.
+    std::fs::write(publisher.space.path().join("a.bin"), b"paid for once").unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+    converge(&replica.node, &publisher.node).await;
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     shutdown(&[&publisher.node, &replica.node]).await;
