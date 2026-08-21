@@ -663,6 +663,7 @@ impl Node {
         let pending_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone())
             .on_change(Some(mirror_wake.clone()))
+            .on_replica(Some(replica_wake.clone()))
             .on_pending(Some(pending_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
         let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {

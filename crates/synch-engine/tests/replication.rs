@@ -178,6 +178,63 @@ async fn a_promotion_stages_and_schedules_without_any_sweep() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
+/// The standing loop converges on its own, without anyone calling the sweep.
+///
+/// Every other test here drives `sweep_replicas` and `fetch_replica_wants` by
+/// hand, which is precisely how a missing wake goes unnoticed: the loop was
+/// rung only by a configuration change, so a replica lagged a whole interval
+/// behind every publish and an operator saw a claim of zero while the node held
+/// terabytes. This test only publishes and waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_standing_loop_converges_without_being_driven() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let peer = spawn("peer").await;
+
+    let node = peer.node.clone();
+    let path = peer.space.path().to_path_buf();
+    off_runtime(move || {
+        node.add_space("media", &path).unwrap();
+        node.set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .unwrap();
+    })
+    .await;
+
+    let (stop, mut rx) = tokio::sync::broadcast::channel::<()>(1);
+    let running = peer.node.clone();
+    let loop_handle = tokio::spawn(async move {
+        running
+            .run_replicas(async move {
+                let _ = rx.recv().await;
+            })
+            .await
+    });
+
+    std::fs::write(peer.space.path().join("published.bin"), b"by the scanner").unwrap();
+    peer.node.scan_publish_push().await.unwrap();
+
+    // The publish rings the replication bell, so the loop should hold the
+    // content without anything else asking it to.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if coverage(&peer.node).await.held > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the standing loop never held the published content"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(10), loop_handle)
+        .await
+        .expect("the loop must observe shutdown promptly")
+        .unwrap();
+
+    shutdown(&[&peer.node]).await;
+}
+
 /// The grace window is what makes a deletion recoverable, and expiry is what
 /// finally ends a claim — so that every other predicate over `pins` can stay
 /// free of the clock (§3.1).

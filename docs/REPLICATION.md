@@ -1,11 +1,14 @@
 # Replication
 
-Status: **implemented** through §11 phase 6 — pin holders and leases, read by
+Status: **implemented** through §11 phase 9, except cooperative
+*k*-replication, which §4.3 deliberately defers until single-node replication
+has run somewhere for a while — the hazard that makes it worth waiting for is
+written down there. Everything else is built: pin holders and leases, read by
 root, the `spaces` columns and their commands, the sweep, the fetch loop, the
-live path, and release with the discipline. Phases 7 to 9 (budget reporting,
-published claims, the under-replication brake and cooperative *k*-replication)
-are not built. Where the built thing differs from what was proposed, this
-document has been corrected to describe the built thing.
+live path, release with the discipline, budget and reporting, published
+coverage claims, and the under-replication brake. Where the built thing differs
+from what was proposed, this document has been corrected to describe the built
+thing.
 
 Checked against `09d89a3` (OpenDAL CAS backends, `docs/SERVERLESS.md`). That
 work moved three things this design leaned on — `spaces.local_path` is already

@@ -270,12 +270,13 @@ pub fn replica_status(status: &ReplicaStatus) -> Lines {
     // check another's disk (§4.2).
     for (origin, claim) in &status.claims {
         out.push(format!(
-            "  claim   {origin} says {} of {} objects held ({}{})",
-            match claim.complete {
-                true => "all".to_string(),
-                false => "some".to_string(),
-            },
+            "  claim   {origin} says it holds {} objects ({} B{}, {}{})",
             claim.objects,
+            claim.bytes,
+            match claim.complete {
+                true => ", nothing outstanding",
+                false => ", still fetching",
+            },
             claim.policy,
             match claim.grace_secs {
                 0 => String::new(),

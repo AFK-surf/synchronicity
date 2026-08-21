@@ -1859,6 +1859,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 fetched.held, fetched.failed, fetched.fetched_bytes, fetched.reused_bytes
             ))
             .await?;
+            // What this node says it holds should not be left behind by a sync
+            // the operator ran deliberately: the standing loop publishes its
+            // claims at the end of a pass, and this is the same pass by hand.
+            node.publish_material_claims().await;
         }
 
         Command::SpaceRm(pb::SpaceRm { id, release }) => {

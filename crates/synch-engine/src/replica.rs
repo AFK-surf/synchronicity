@@ -62,6 +62,18 @@ pub struct SweepReport {
     pub released: usize,
 }
 
+/// Whether a count has moved far enough to be worth a publish: a doubling in
+/// either direction, or any move off zero.
+fn doubled(published: u64, current: u64) -> bool {
+    match (published, current) {
+        (0, 0) => false,
+        (0, _) | (_, 0) => true,
+        (published, current) => {
+            current >= published.saturating_mul(2) || current.saturating_mul(2) <= published
+        }
+    }
+}
+
 /// One admitted want, with the space that wants it.
 struct WantPlan {
     want: synch_store::WantRow,
@@ -543,14 +555,20 @@ impl Node {
     ///
     /// Counts move on every object a bootstrap holds, and a head per fetched
     /// object would drown the cluster in publishes to say "still going". So the
-    /// standing loop publishes only when something *material* changed — the
-    /// policy, the grace window, whether the space is covered at all, or a
-    /// claim appearing or disappearing — and the counts ride along with
-    /// whatever the node publishes next for its own reasons
-    /// ([`Node::replica_claim_changes`], staged beside `m:space` by the
-    /// scanner). A claim's counts are therefore a floor rather than a live
-    /// gauge, which is all a claim can honestly be: it describes another node's
-    /// disk at a moment it chose (§4.2).
+    /// standing loop publishes only when something *material* changed: the
+    /// policy, the grace window, whether the space is covered, a claim
+    /// appearing or disappearing — or the object count doubling or halving.
+    ///
+    /// That last one is what keeps the number usable without making it chatty.
+    /// Leaving counts to ride along with whatever the node publishes next reads
+    /// as thrift and is a bad trade: a dedicated replica publishes nothing of
+    /// its own, so its claim would sit at the zero it was created with while it
+    /// held terabytes, and an operator reading "all of 0 objects held" would
+    /// reasonably conclude the thing was broken. Doubling bounds the publishes
+    /// to a logarithmic number per convergence and keeps the claim within a
+    /// factor of two, which is what a coverage claim is for: it describes
+    /// another node's disk at a moment that node chose (§4.2), and no reader
+    /// may act on it beyond ordering its own work.
     pub fn material_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
         let mut out = Vec::new();
         for change in self.replica_claim_changes()? {
@@ -566,6 +584,7 @@ impl Node {
                     claim.policy != published.policy
                         || claim.grace_secs != published.grace_secs
                         || claim.complete != published.complete
+                        || doubled(published.objects, claim.objects)
                 }
             };
             if material {
@@ -707,7 +726,7 @@ impl Node {
     }
 
     /// Publishes a coverage claim when one materially changed (§4.1).
-    async fn publish_material_claims(&self) {
+    pub async fn publish_material_claims(&self) {
         let node = self.clone();
         let changes = match crate::blocking::offload(move || node.material_claim_changes()).await {
             Ok(changes) if !changes.is_empty() => changes,
@@ -720,9 +739,22 @@ impl Node {
         // A node that cannot publish still replicates; it simply says nothing
         // about it. Refusing the whole pass over an unpublishable claim would
         // stop it holding content over a record nobody needs.
-        if let Err(e) = self.ensure_publishable() {
-            tracing::debug!(error = %e, "not publishing replication claims");
-            return;
+        //
+        // Off the runtime worker: the check reads this origin's heads, and §10
+        // aborts the process for a store read on a worker thread.
+        let node = self.clone();
+        let publishable =
+            crate::blocking::offload(move || Ok(node.ensure_publishable().is_ok())).await;
+        match publishable {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!("not publishing replication claims: this node cannot publish");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not check whether claims may be published");
+                return;
+            }
         }
         self.stage(changes);
         if let Err(e) = self.flush_staged().await {
