@@ -26,6 +26,13 @@
 //! clock would make this node win the selection for every path it touched,
 //! cluster-wide.
 //!
+//! Filesystems coarsen the stamp — NTFS to 100 ns, HFS+ to whole seconds — and
+//! only ever downward, so what the next scan publishes can sit a tick below the
+//! version that was filled. That direction is harmless: an mtime is not part of
+//! a version's identity (`Version`, synch-store), so the two origins still
+//! collapse to one version with two attestors, and being fractionally *older*
+//! is the safe way to be wrong about a `newest` order.
+//!
 //! A symbolic link is the exception, and cannot help being one: stamping a
 //! link's own times needs a facility the standard library does not expose
 //! (§7.2), so a filled link does publish as newer than the version it came
@@ -83,6 +90,11 @@ pub struct FillReport {
     /// Paths a fill could not write, with the reason — including every path a
     /// `strict` fill refused to guess at.
     pub skipped: Vec<(String, String)>,
+    /// Paths that *were* written but whose write was not everything it should
+    /// have been: the metadata the filesystem refused, the scanner record that
+    /// could not be dropped. Kept out of `skipped`, which means "not written",
+    /// so that `filled + skipped` never counts one path twice.
+    pub warnings: Vec<(String, String)>,
     /// Bytes that crossed the network for what this fill wrote.
     pub fetched_bytes: u64,
     /// Bytes that did not, because a local donor already held them
@@ -441,7 +453,7 @@ impl Node {
                         report.replaced.push(path.clone());
                     }
                     if let Some(why) = stale {
-                        report.skipped.push((
+                        report.warnings.push((
                             path.clone(),
                             format!(
                                 "written, but the scanner's record of the old file could not be \
@@ -450,7 +462,7 @@ impl Node {
                         ));
                     }
                     if let Written::WithoutMetadata(_, why) = outcome {
-                        report.skipped.push((
+                        report.warnings.push((
                             path,
                             format!(
                                 "content written, but its metadata could not be reproduced, so \
@@ -1190,9 +1202,19 @@ mod tests {
 
         let ours = published(&node, "media", "f.txt");
         assert_eq!(ours.content, theirs.content, "the same object");
-        assert_eq!(
-            ours.mtime_ns, theirs.mtime_ns,
-            "the origin's mtime, so `newest` does not flip to this node"
+        // Not equality: filesystems coarsen. NTFS keeps 100 ns, HFS+ whole
+        // seconds, and a stamp is only ever coarsened *downward* — so what the
+        // scan republishes can sit just below the version that was filled. What
+        // must never happen is the other direction, which is the half that
+        // matters: `newest` orders on the mtime, so a filled path publishing a
+        // *newer* one would flip the selection to this node, cluster-wide.
+        let drift = theirs.mtime_ns - ours.mtime_ns;
+        assert!(
+            (0..crate::mirror::MTIME_GRANULARITY_NS).contains(&drift),
+            "republished {} against the origin's {}: a filled path must never publish an mtime \
+             newer than the version it came from, nor more than one filesystem tick below it",
+            ours.mtime_ns,
+            theirs.mtime_ns
         );
         #[cfg(unix)]
         assert_eq!(ours.unix_mode.map(|m| m & 0o777), Some(0o640));
@@ -1848,6 +1870,31 @@ mod tests {
             "{report:?}"
         );
         assert!(!root.exists(), "the root must not be recreated mid-fill");
+        node.shutdown().await.unwrap();
+    }
+
+    /// Every writer into a space directory is bound by its ignore rules, not
+    /// just the multipart one: a plain `PutObject` takes `open_adoption`, and
+    /// `synch take` takes `adopt`/`adopt_from`. A write the scanner will never
+    /// look at is worse than a refused write — the bytes land in the operator's
+    /// own directory, unpublished and unswept, and the client that sent them
+    /// gets an error anyway when the publish finds nothing.
+    #[tokio::test]
+    async fn every_space_writer_refuses_an_ignored_path() {
+        let (_data, space, node) = node_with_space().await;
+        std::fs::write(space.path().join(".syncignore"), "raw/\n").unwrap();
+
+        for refused in [
+            node.open_adoption("media", "raw/photo.raw").err(),
+            node.adopt("media", "raw/photo.raw", b"bytes").err(),
+            node.refuse_if_ignored("media", "raw/nested/deep.raw").err(),
+        ] {
+            let refused = refused.expect("an ignored path must be refused");
+            assert!(refused.to_string().contains("ignore rule"), "{refused}");
+        }
+        assert!(!space.path().join("raw/photo.raw").exists());
+        // And a path the rules do not cover is unaffected.
+        assert!(node.open_adoption("media", "keep.txt").is_ok());
         node.shutdown().await.unwrap();
     }
 

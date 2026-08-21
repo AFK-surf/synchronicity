@@ -127,21 +127,7 @@ impl Node {
         // A key the scanner would skip can never become an object, and finding
         // that out at completion — after the client has streamed gigabytes and
         // the parts have been consumed — is the worst possible moment for it.
-        let space_row = self
-            .store()
-            .space(space)?
-            .ok_or_else(|| EngineError::not_found(format!("space {space}")))?;
-        let normalized =
-            synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        if let Some(local_path) = space_row.local_path.as_deref() {
-            if crate::ignore::IgnoreSet::for_space(Path::new(local_path))?
-                .excludes_path(&normalized)
-            {
-                return Err(EngineError::invalid(format!(
-                    "{space}/{path} matches an ignore rule, so it could never be published"
-                )));
-            }
-        }
+        self.refuse_if_ignored(space, path)?;
         self.check_upload_capacity(principal)?;
         let id = new_upload_id()?;
         let dir = self.store().upload_dir(&id);

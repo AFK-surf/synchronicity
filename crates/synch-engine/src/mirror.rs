@@ -824,7 +824,7 @@ const MODE_MASK: u32 = 0o777;
 /// "repair" every file it had itself just stamped, forever. A stamp is only
 /// ever coarsened downward, so a stored value inside this window below the
 /// published one is the published one.
-const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
+pub(crate) const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
 
 /// True if `target` already carries the metadata `meta` describes.
 ///

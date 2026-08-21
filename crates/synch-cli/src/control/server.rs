@@ -2297,6 +2297,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(format!("skipped {}/{path}: {reason}", reference.space))
                     .await?;
             }
+            // Written, but not wholly: kept out of the skipped count so that
+            // `filled` and `skipped` never describe the same path.
+            for (path, reason) in &report.warnings {
+                out.line(format!("filled {}/{path}, but {reason}", reference.space))
+                    .await?;
+            }
             // A prefix that names nothing is almost always a typo, and it
             // reports exactly what an already-full directory reports. `status`
             // refuses to let a named path that matches nothing pass as silence;

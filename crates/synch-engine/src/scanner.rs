@@ -710,6 +710,7 @@ impl Node {
     /// indexing pipeline republishes them as this node's entry, with `prev`
     /// pointing at the content we replaced.
     pub fn adopt(&self, space_id: &str, path: &str, content: &[u8]) -> Result<PathBuf> {
+        self.refuse_if_ignored(space_id, path)?;
         let target = self.adoption_target(space_id, path)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -759,7 +760,11 @@ impl Node {
         // path (§10).
         let target = {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
+            crate::blocking::offload(move || {
+                node.refuse_if_ignored(&space_id, &path)?;
+                node.adoption_target(&space_id, &path)
+            })
+            .await?
         };
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
         self.materialize_blob(&range.root, range.size, target.clone())
@@ -821,6 +826,7 @@ impl Node {
     /// the control socket — where holding the object in memory to call the
     /// other one is exactly what must not happen.
     pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
+        self.refuse_if_ignored(space_id, path)?;
         if self.is_detached_space(space_id)? {
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
@@ -911,6 +917,37 @@ impl Node {
             (file_key(space_id, &normalized)?, Some(entry)),
             (blob_key(&root), Some(ad)),
         ]);
+        Ok(())
+    }
+
+    /// Refuses a write at a path the space's own ignore rules exclude.
+    ///
+    /// Taken by every writer into a space directory — `synch take` in both its
+    /// forms, and the streamed write an S3 `PutObject` becomes — because a file
+    /// written where the scanner will never look is worse than a refused write:
+    /// it is never published, never swept (it is in neither `local_files` nor
+    /// the published tree), and it sits in the operator's own directory
+    /// indefinitely. `create_upload` takes the same check at *initiate* as
+    /// well, so a multipart client learns before it streams gigabytes rather
+    /// than after.
+    ///
+    /// Deliberately not on the deletion path: a delete of an excluded key is
+    /// how a stray file like that gets cleaned up, and S3 `DELETE` is
+    /// idempotent besides.
+    pub(crate) fn refuse_if_ignored(&self, space_id: &str, path: &str) -> Result<()> {
+        let Some(space) = self.store().space(space_id)? else {
+            return Ok(());
+        };
+        let Some(local_path) = space.local_path.as_deref() else {
+            return Ok(());
+        };
+        let normalized =
+            synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
+        if IgnoreSet::for_space(Path::new(local_path))?.excludes_path(&normalized) {
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{path} matches an ignore rule, so it could never be published"
+            )));
+        }
         Ok(())
     }
 
