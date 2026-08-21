@@ -572,9 +572,17 @@ partial spans). The hazard is specific and worth writing down before anyone
 implements it: *k* as a **floor on fetching** is safe, and *k* as a **licence to
 release** is how a pool of replicas converges on zero copies — every member
 observing that "the others have it" at the same moment the others observe the
-same thing, and all of them wrong together during a partition. Deployments that
-want a hard floor run replicas on every machine they are willing to pay for and
-count them.
+same thing, and all of them wrong together during a partition.
+
+Half of it is built, and it is the conservative half. `replica_release_floor`
+holds a stale root while fewer than *k* **other** origins advertise a complete
+copy: peers' assertions make this node keep bytes and never drop them, which is
+the only direction §4.2 permits. What is not built is declining to *fetch*
+because others have it — that is the direction with the hazard, and the brake
+creates no pressure to add it.
+
+Deployments that want a hard floor run replicas on every machine they are
+willing to pay for and count them.
 
 ## 5. Configuration
 
@@ -637,21 +645,35 @@ for this feature and should read like an answer:
 
 ```
 $ synch space ls media
-media   indexed /srv/media   replicate tree   grace 30d   since 2026-03-04
-  held          412,880 objects   6.02 TiB   (covers every version in the tree)
-  releasing       1,204 objects  31.7 GiB   (oldest leaves in 3d)
-  wanted            412 objects  10.4 GiB   (oldest 4m ago)
-  unreachable        14 objects   2.1 GiB   ← no provider for 6d
+media   indexed /srv/media   replicate tree   grace 30d
+  held            412,880 objects    6614661799936 B
+  releasing         1,204 objects      34036482048 B   (soonest leaves in 3d)
+  wanted              412 objects      11166914560 B   (oldest 4m ago)
+  unreachable          14 objects       2254857830 B   <- no provider has answered for these
+  held back            31 objects                      too few peers advertise these to let them go
+  budget        8000000000000 B, 6614661799936 B of it used
   view          complete — releases are running
-  claims        nas@cluster.example.com (complete), vps@… (99.4%, claimed)
+  from nas@cluster.example.com               6510000000000 B
+  from vps@cluster.example.com                104661799936 B
+  claim   nas@cluster.example.com says it holds 412880 objects (6614661799936 B, nothing outstanding, tree, grace 30d)
 ```
 
-Three of those lines exist to be read on a bad day. `unreachable` must never be
+Four of those lines exist to be read on a bad day. `unreachable` must never be
 folded into `wanted`: fourteen objects with no provider for six days is not a
 backlog, it is fourteen versions that are probably already gone. `releasing` is
-what an operator checks before deleting something they may want back. And
-`view` says whether §3.6's preconditions hold, because "releases are paused" is
-the difference between a replica that is behaving and one that is broken.
+what an operator checks before deleting something they may want back. `view`
+says whether §3.6's preconditions hold, because "releases are paused" is the
+difference between a replica that is behaving and one that is broken — and it
+is a different reason from `held back`, which is the §4.3 floor, so the two are
+counted and printed separately rather than one being read as the other.
+
+The `from` lines answer the question a budget raises and cannot: *whose* content
+grew. Any member can publish, and every replica of the space fetches what they
+publish — the membership trust model working as designed (§8), and a thing an
+operator should be able to watch happening. The `claim` lines are other nodes'
+assertions about their own disks, rendered as claims because that is what they
+are (§4.2); nothing here has checked them, and nothing may act on them beyond
+ordering its own work.
 
 ## 7. What this deliberately does not do
 
