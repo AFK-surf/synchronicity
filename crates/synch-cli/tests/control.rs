@@ -443,6 +443,29 @@ fn cloud_disable() -> Command {
 fn cloud_enable() -> Command {
     Command::CloudEnable(pb::CloudEnable {})
 }
+fn replicating_space_add(id: &str, path: &str, policy: &str, grace: i64) -> Command {
+    Command::SpaceAdd(pb::SpaceAdd {
+        id: id.into(),
+        path: path.into(),
+        detached: false,
+        replicate: Some(policy.into()),
+        grace: Some(grace),
+        budget: None,
+    })
+}
+fn space_set(id: &str, grace: Option<i64>, budget: Option<u64>) -> Command {
+    Command::SpaceSet(pb::SpaceSet {
+        id: id.into(),
+        replicate: None,
+        no_replicate: false,
+        release: false,
+        grace,
+        budget,
+    })
+}
+fn space_ls_one(id: &str) -> Command {
+    Command::SpaceLs(pb::SpaceLs { id: id.into() })
+}
 fn space_add(id: &str, path: &str) -> Command {
     Command::SpaceAdd(pb::SpaceAdd {
         id: id.into(),
@@ -985,6 +1008,56 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
 /// answering in entry metadata, naming space, path, and policy as fields —
 /// an S3 key may contain a colon, which the text reference form reads as an
 /// origin.
+/// The replication half of `space` over the socket: what `add` says, what `ls`
+/// reports, and that tuning one knob leaves the other alone.
+///
+/// The last of those is the one worth a test. `space set --budget` writing every
+/// replication column would reset the grace window to its default — the whole
+/// recovery story for a deletion under `tree` — and say nothing about having
+/// done it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replication_is_configured_and_reported_over_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let space = space_with(&[("notes.txt", b"hello")]);
+    let data_dir = dir.path();
+
+    let added = lines(
+        data_dir,
+        replicating_space_add("media", &space.path().to_string_lossy(), "tree", 7 * 86400),
+    )
+    .await;
+    assert!(added.contains("replicating media (tree)"), "{added}");
+    assert!(
+        added.contains("recoverable here for 7d"),
+        "the reply must state the recovery window it just committed to: {added}"
+    );
+
+    let listed = lines(data_dir, space_ls_one("media")).await;
+    assert!(listed.contains("replicate tree"), "{listed}");
+    assert!(listed.contains("grace 7d"), "{listed}");
+
+    // Tuning the budget must not touch the grace window.
+    lines(data_dir, space_set("media", None, Some(4096))).await;
+    let listed = lines(data_dir, space_ls_one("media")).await;
+    assert!(
+        listed.contains("grace 7d"),
+        "setting a budget cleared the grace window: {listed}"
+    );
+    assert!(listed.contains("budget        4096 B"), "{listed}");
+
+    // And the reverse.
+    lines(data_dir, space_set("media", Some(3600), None)).await;
+    let listed = lines(data_dir, space_ls_one("media")).await;
+    assert!(listed.contains("grace 1h"), "{listed}");
+    assert!(
+        listed.contains("budget        4096 B"),
+        "setting a grace window cleared the budget: {listed}"
+    );
+
+    daemon.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tree_can_be_listed_and_resolved_structurally() {
     // A colon is fine in a key but not in a Windows file name (alternate
