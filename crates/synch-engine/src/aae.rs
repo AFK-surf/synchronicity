@@ -268,15 +268,10 @@ impl Node {
                     match node.cas_backend().maintain(now_ns()).await {
                         Ok(report)
                             if report.local_orphans > 0
-                                || report.remote_deleted > 0
-                                || report.remote_deletes_completed > 0
                                 || report.cache_entries_evicted > 0 =>
                         {
                             tracing::info!(
                                 local_orphans = report.local_orphans,
-                                remote_inspected = report.remote_inspected,
-                                remote_deleted = report.remote_deleted,
-                                remote_deletes_completed = report.remote_deletes_completed,
                                 cache_entries_evicted = report.cache_entries_evicted,
                                 cache_bytes_evicted = report.cache_bytes_evicted,
                                 "CAS backend maintenance completed"

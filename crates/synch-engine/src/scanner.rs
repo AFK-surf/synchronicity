@@ -1520,24 +1520,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_retires_an_existing_availability_ad() {
-        let (_data, node) = crate::testkit::node().await;
-        let root = node
-            .store()
-            .ingest_bytes(&vec![0x23; 100_000], now_ns())
-            .unwrap();
-        let ad = node.store().local_ad(&root).unwrap().unwrap();
-        node.publish(&[(blob_key(&root), Some(postcard::to_stdvec(&ad).unwrap()))])
-            .unwrap();
-        node.store().quarantine_blob(&root).unwrap();
-        assert_eq!(
-            node.retired_ad_changes().unwrap(),
-            vec![(blob_key(&root), None)]
-        );
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn detached_cloud_ingest_is_remote_before_its_row_and_publish() {
         let data = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
@@ -1615,11 +1597,10 @@ mod tests {
         node.reconstruct_recovered_cloud_rows().await.unwrap();
         let recovered_pin = node.store().blob(&pinned.root).unwrap().unwrap();
         assert!(recovered_pin.durable && recovered_pin.pinned);
-        assert!(node.store().pending_backend_deletes().unwrap().is_empty());
         assert!(node.retired_ad_changes().unwrap().is_empty());
 
         // Simulate a replacement container: only the database and remote
-        // object survive. The first read refills and verifies the cache.
+        // object survive. The first read refills the cache.
         node.store().reconcile_scratch_generation("fresh").unwrap();
         assert!(!node.store().blob(&root).unwrap().unwrap().complete);
         assert_eq!(

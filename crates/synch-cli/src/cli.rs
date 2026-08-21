@@ -459,7 +459,7 @@ pub enum Command {
 /// `synch cas ...`
 #[derive(Debug, Subcommand)]
 pub enum CasCommand {
-    /// Copy and verify every durable object into another backend, then switch.
+    /// Copy every durable object into another backend, then switch.
     /// The daemon must be stopped; rerunning after interruption is safe.
     Migrate {
         /// Destination backend.

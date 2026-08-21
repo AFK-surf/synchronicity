@@ -1,9 +1,9 @@
 //! The content-addressed blob store (§6.1, §6.2).
 //!
 //! Every object is hashed with BLAKE3 over 16 KiB chunk groups and kept
-//! alongside its bao outboard, so any byte range can be served — and read — as
-//! a verified slice without touching the rest of the object. Partial objects
-//! are first class: a verified-group bitmap records exactly which groups are
+//! alongside its bao outboard, so any byte range can be served as a bao slice
+//! without touching the rest of the object. Partial objects are first class: a
+//! verified-group bitmap records exactly which peer-supplied groups are
 //! present, which is what lets a node holding the first half of a video
 //! usefully advertise and serve it.
 
@@ -16,8 +16,7 @@ use std::{
 use bao_tree::{
     io::{
         outboard::PreOrderOutboard,
-        sync::{decode_ranges, encode_ranges_validated, DecodeResponseIter},
-        BaoContentItem,
+        sync::{decode_ranges, encode_ranges, ReadAt, WriteAt},
     },
     BaoTree, BlockSize, ChunkNum,
 };
@@ -104,9 +103,8 @@ pub(crate) fn replace_file(
 /// explicit re-`put` — and for a large object the window between the truncate
 /// and the last byte is the length of the whole write. A power loss inside it
 /// left the object with its `complete = 1` row intact and a truncated outboard
-/// behind it: still advertised by `local_ad`, still `has_complete_blob`, but
-/// every `encode_slice` and `read_range` failing verification, with GC unable
-/// to reclaim a row an entry references and nothing anywhere re-verifying. The
+/// behind it: still advertised by `local_ad`, still `has_complete_blob`, but no
+/// longer satisfying the stable-storage promise represented by that row. The
 /// payload beside it already staged and renamed ([`Store::ingest_file`]); this
 /// is the same rule applied to the file that describes it.
 ///
@@ -158,8 +156,6 @@ pub struct BlobSummary {
     pub complete: bool,
     /// True when the backend has committed the complete object to its durable tier.
     pub durable: bool,
-    /// True when verification found corruption in a durable backend object.
-    pub quarantined: bool,
     /// True if the blob is pinned against GC.
     pub pinned: bool,
     /// When the blob was last written to, in unix nanoseconds.
@@ -177,8 +173,6 @@ pub struct BlobRow {
     pub complete: bool,
     /// True when the backend has committed the complete object to stable storage.
     pub durable: bool,
-    /// True when a durable copy failed verification and must not be advertised.
-    pub quarantined: bool,
     /// The verified-group bitmap, when partial.
     pub bitmap: Option<Vec<u8>>,
     /// The payload, for blobs small enough to inline (§6.2).
@@ -445,24 +439,16 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
         durable,
     } = row;
     conn.execute(
-        "DELETE FROM backend_deletes WHERE root = ?1",
-        params![root.as_bytes().to_vec()],
-    )?;
-    conn.execute(
         "INSERT INTO blobs
-           (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, 0)
+           (root, size, complete, bitmap, inline, pinned, last_access, durable)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
          ON CONFLICT(root) DO UPDATE SET
            size = excluded.size,
            complete = excluded.complete,
            bitmap = excluded.bitmap,
            inline = COALESCE(excluded.inline, blobs.inline),
            last_access = excluded.last_access,
-           durable = max(blobs.durable, excluded.durable),
-           quarantined = CASE
-             WHEN excluded.durable != 0 THEN 0
-             ELSE blobs.quarantined
-           END",
+           durable = max(blobs.durable, excluded.durable)",
         params![
             root.as_bytes().to_vec(),
             size as i64,
@@ -692,17 +678,12 @@ impl Store {
     pub fn record_remote_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
         self.with_immediate_tx(|tx| {
             tx.execute(
-                "DELETE FROM backend_deletes WHERE root = ?1",
-                params![root.as_bytes().to_vec()],
-            )?;
-            tx.execute(
                 "INSERT INTO blobs
-               (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
-             VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1, 0)
+               (root, size, complete, bitmap, inline, pinned, last_access, durable)
+             VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1)
              ON CONFLICT(root) DO UPDATE SET
                size = excluded.size,
                durable = 1,
-               quarantined = 0,
                last_access = excluded.last_access",
                 params![root.as_bytes().to_vec(), size as i64, now],
             )?;
@@ -820,7 +801,7 @@ impl Store {
         let row = conn
             .query_row(
                 "SELECT root, size, complete, bitmap, inline, pinned, last_access,
-                        durable, quarantined
+                        durable
                  FROM blobs WHERE root = ?1",
                 params![root.as_bytes().to_vec()],
                 |row| {
@@ -833,14 +814,11 @@ impl Store {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)) =
-            row
-        else {
+        let Some((root, size, complete, bitmap, inline, pinned, last_access, durable)) = row else {
             return Ok(None);
         };
         Ok(Some(BlobRow {
@@ -848,7 +826,6 @@ impl Store {
             size: size as u64,
             complete: complete != 0,
             durable: durable != 0,
-            quarantined: quarantined != 0,
             bitmap,
             inline,
             pinned: pinned != 0,
@@ -867,7 +844,7 @@ impl Store {
     pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT root, size, complete, durable, quarantined, pinned, last_access FROM blobs
+            "SELECT root, size, complete, durable, pinned, last_access FROM blobs
              ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -878,18 +855,16 @@ impl Store {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (root, size, complete, durable, quarantined, pinned, last_access) = row?;
+            let (root, size, complete, durable, pinned, last_access) = row?;
             out.push(BlobSummary {
                 root: hash_column(root, "blobs.root")?,
                 size: size as u64,
                 complete: complete != 0,
                 durable: durable != 0,
-                quarantined: quarantined != 0,
                 pinned: pinned != 0,
                 last_access,
             });
@@ -902,7 +877,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT root, size, complete, bitmap, inline, pinned, last_access,
-                    durable, quarantined FROM blobs
+                    durable FROM blobs
              ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -915,19 +890,16 @@ impl Store {
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined) =
-                row?;
+            let (root, size, complete, bitmap, inline, pinned, last_access, durable) = row?;
             out.push(BlobRow {
                 root: hash_column(root, "blobs.root")?,
                 size: size as u64,
                 complete: complete != 0,
                 durable: durable != 0,
-                quarantined: quarantined != 0,
                 bitmap,
                 inline,
                 pinned: pinned != 0,
@@ -939,31 +911,26 @@ impl Store {
 
     /// True if the whole object is present and verified locally.
     pub fn has_complete_blob(&self, root: &Hash) -> Result<bool> {
-        Ok(self
-            .blob(root)?
-            .is_some_and(|b| !b.quarantined && (b.complete || b.durable)))
+        Ok(self.blob(root)?.is_some_and(|b| b.complete || b.durable))
     }
 
     /// The advertisement this node should publish for an object (§6.3).
     pub fn local_ad(&self, root: &Hash) -> Result<Option<BlobAd>> {
-        Ok(self
-            .blob(root)?
-            .filter(|blob| !blob.quarantined)
-            .map(|blob| blob.to_ad()))
+        Ok(self.blob(root)?.map(|blob| blob.to_ad()))
     }
 
     /// Records that the configured backend has promoted a complete object to
     /// stable storage. Call only after the backend's durability promise.
     pub fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+            "UPDATE blobs SET durable = 1 WHERE root = ?1",
             params![root.as_bytes().to_vec()],
         )?;
         Ok(changed > 0)
     }
 
     /// Reconstructs a cold durable row after metadata restore, once the remote
-    /// backend has verified that the final payload/outboard pair exists.
+    /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
         self.with_immediate_tx(|tx| {
             let existing: Option<i64> = tx
@@ -975,38 +942,24 @@ impl Store {
                 .optional()?;
             if let Some(existing) = existing {
                 if existing as u64 != size {
-                    return Err(StoreError::Verification {
-                        root: *root,
-                        reason: format!("size mismatch: have {existing}, offered {size}"),
-                    });
+                    return Err(StoreError::invalid(format!(
+                        "size mismatch for {root}: have {existing}, offered {size}"
+                    )));
                 }
                 tx.execute(
-                    "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+                    "UPDATE blobs SET durable = 1 WHERE root = ?1",
                     params![root.as_bytes().to_vec()],
                 )?;
             } else {
                 tx.execute(
                     "INSERT INTO blobs
-                       (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
-                     VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1, 0)",
+                       (root, size, complete, bitmap, inline, pinned, last_access, durable)
+                     VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1)",
                     params![root.as_bytes().to_vec(), size as i64, now],
                 )?;
             }
-            tx.execute(
-                "DELETE FROM backend_deletes WHERE root = ?1",
-                params![root.as_bytes().to_vec()],
-            )?;
             Ok(())
         })
-    }
-
-    /// Quarantines a durable object whose bytes failed verification.
-    pub fn quarantine_blob(&self, root: &Hash) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE blobs SET quarantined = 1 WHERE root = ?1 AND durable != 0",
-            params![root.as_bytes().to_vec()],
-        )?;
-        Ok(changed > 0)
     }
 
     /// Applies the authoritative S3 `NoSuchKey` heal rule.
@@ -1016,7 +969,7 @@ impl Store {
     pub fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
         self.with_immediate_tx(|tx| {
             let changed = tx.execute(
-                "UPDATE blobs SET durable = 0, quarantined = 0 WHERE root = ?1 AND durable != 0",
+                "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
                 params![root.as_bytes().to_vec()],
             )?;
             tx.execute(
@@ -1065,36 +1018,18 @@ impl Store {
         })
     }
 
-    /// Whether both files behind a complete out-of-line cache claim exist at
-    /// their exact expected lengths.
-    pub fn cached_blob_files_present(&self, root: &Hash, size: u64) -> bool {
-        std::fs::metadata(self.blob_path(root)).is_ok_and(|metadata| metadata.len() == size)
-            && std::fs::metadata(self.outboard_path(root))
-                .is_ok_and(|metadata| metadata.len() == Self::tree(size).outboard_size())
+    /// Whether both files behind a complete out-of-line cache claim exist.
+    pub fn cached_blob_files_present(&self, root: &Hash, _size: u64) -> bool {
+        self.blob_path(root).is_file() && self.outboard_path(root).is_file()
     }
 
-    /// Reads the whole cached outboard only when its exact tree length is
-    /// present; a short/torn copy is treated as a cache miss.
-    pub(crate) fn cached_outboard(&self, root: &Hash, size: u64) -> Option<Vec<u8>> {
-        let path = self.outboard_path(root);
-        std::fs::metadata(&path)
-            .ok()
-            .filter(|metadata| metadata.len() == Self::tree(size).outboard_size())?;
-        std::fs::read(path).ok()
+    /// Reads the whole cached outboard when present.
+    pub(crate) fn cached_outboard(&self, root: &Hash) -> Option<Vec<u8>> {
+        std::fs::read(self.outboard_path(root)).ok()
     }
 
     /// Caches a complete remote outboard without claiming any payload groups.
-    pub(crate) fn cache_outboard(&self, root: &Hash, size: u64, bytes: &[u8]) -> Result<()> {
-        let expected = Self::tree(size).outboard_size();
-        if bytes.len() as u64 != expected {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!(
-                    "cloud outboard is {} bytes, expected {expected}",
-                    bytes.len()
-                ),
-            });
-        }
+    pub(crate) fn cache_outboard(&self, root: &Hash, bytes: &[u8]) -> Result<()> {
         let _lease = self.lease_write(root);
         write_and_sync(&self.staging_dir(), &self.outboard_path(root), bytes)
     }
@@ -1134,7 +1069,7 @@ impl Store {
         let discarded = self.with_immediate_tx(|tx| {
             for root in migrated {
                 tx.execute(
-                    "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+                    "UPDATE blobs SET durable = 1 WHERE root = ?1",
                     params![root.as_bytes().to_vec()],
                 )?;
             }
@@ -1286,7 +1221,7 @@ impl Store {
     /// moments later — and
     /// the fetch case is worse, because `commit_groups` then re-inserts a row
     /// whose bitmap claims groups whose bytes went to an unlinked inode, which
-    /// the node advertises and nothing ever re-verifies.
+    /// the node would then advertise without any reachable payload.
     ///
     /// The unlinks cannot join the transaction — SQLite rolls back, `unlink`
     /// does not — so they stay after the commit, in the order
@@ -1318,19 +1253,6 @@ impl Store {
             return Ok(false);
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if self.has_remote_cas() {
-            tx.execute(
-                "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
-                   SELECT root, ?3 FROM blobs
-                    WHERE root = ?1
-                      AND pinned = 0
-                      AND last_access < ?2
-                      AND NOT EXISTS (
-                        SELECT 1 FROM entries WHERE entries.content = blobs.root
-                      )",
-                params![root.as_bytes().to_vec(), before, synch_core::now_ns()],
-            )?;
-        }
         let rows = tx.execute(
             "DELETE FROM blobs
                WHERE root = ?1
@@ -1381,13 +1303,6 @@ impl Store {
         // whose bytes are gone.
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if self.has_remote_cas() {
-            tx.execute(
-                "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
-                   SELECT root, ?2 FROM blobs WHERE root = ?1",
-                params![root.as_bytes().to_vec(), synch_core::now_ns()],
-            )?;
-        }
         tx.execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
@@ -1399,39 +1314,9 @@ impl Store {
         Ok(())
     }
 
-    /// Remote objects whose row-first deletion has committed and still needs
-    /// its idempotent backend half.
-    pub fn pending_backend_deletes(&self) -> Result<Vec<Hash>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root FROM backend_deletes
-              WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.root = backend_deletes.root)
-              ORDER BY queued_at, root",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(hash_column(row?, "backend_deletes.root")?);
-        }
-        Ok(out)
-    }
+    // ---- reads ------------------------------------------------------------
 
-    /// Clears one remote-delete intent after the backend confirms deletion.
-    pub fn finish_backend_delete(&self, root: &Hash) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM backend_deletes WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
-        Ok(())
-    }
-
-    // ---- verified reads ---------------------------------------------------
-
-    /// Reads a byte range, verified against the object root (§6.1).
-    ///
-    /// Cost is `O(range + log(size))`: only the chunk groups covering the range
-    /// and the sibling hashes on their paths to the root are touched. A flipped
-    /// bit anywhere fails at the exact 16 KiB group it occurs in.
+    /// Reads a byte range from the trusted storage backend.
     pub fn read_range(&self, root: &Hash, offset: u64, len: u64) -> Result<Vec<u8>> {
         let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
         let end = offset.saturating_add(len).min(blob.size);
@@ -1454,38 +1339,15 @@ impl Store {
             });
         }
 
-        let encoded = self.encode_slice_inner(&blob, &wanted)?;
-        let tree = Self::tree(blob.size);
-        let bao_ranges = to_bao_ranges(&wanted);
-        let iter = DecodeResponseIter::new(
-            blake3::Hash::from_bytes(root.0),
-            tree,
-            std::io::Cursor::new(&encoded),
-            &bao_ranges,
-        );
         let mut out = vec![0u8; (end - offset) as usize];
-        for item in iter {
-            let item = item.map_err(|e| StoreError::Verification {
-                root: *root,
-                reason: e.to_string(),
-            })?;
-            if let BaoContentItem::Leaf(leaf) = item {
-                let leaf_start = leaf.offset;
-                let leaf_end = leaf_start + leaf.data.len() as u64;
-                let copy_start = leaf_start.max(offset);
-                let copy_end = leaf_end.min(end);
-                if copy_start < copy_end {
-                    let src = (copy_start - leaf_start) as usize;
-                    let dst = (copy_start - offset) as usize;
-                    let n = (copy_end - copy_start) as usize;
-                    out[dst..dst + n].copy_from_slice(&leaf.data[src..src + n]);
-                }
-            }
+        match &blob.inline {
+            Some(data) => out.copy_from_slice(&data[offset as usize..end as usize]),
+            None => File::open(self.blob_path(root))?.read_exact_at(offset, &mut out)?,
         }
         Ok(out)
     }
 
-    /// Reads a whole object, verified.
+    /// Reads a whole object from the trusted storage backend.
     pub fn read_all(&self, root: &Hash) -> Result<Vec<u8>> {
         let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
         self.read_range(root, 0, blob.size)
@@ -1535,7 +1397,7 @@ impl Store {
                     tree,
                     data: Vec::<u8>::new(),
                 };
-                encode_ranges_validated(data.as_slice(), outboard, &bao_ranges, &mut encoded)
+                encode_ranges(data.as_slice(), outboard, &bao_ranges, &mut encoded)
             }
             None => {
                 // Both files are read positionally, never slurped. An outboard
@@ -1551,44 +1413,92 @@ impl Store {
                     tree,
                     data: DataFile(File::open(self.outboard_path(&blob.root))?),
                 };
-                encode_ranges_validated(DataFile(data), outboard, &bao_ranges, &mut encoded)
+                encode_ranges(DataFile(data), outboard, &bao_ranges, &mut encoded)
             }
         }
-        .map_err(|e| StoreError::Verification {
-            root: blob.root,
-            reason: e.to_string(),
-        })?;
+        .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;
         Ok(encoded)
     }
 
-    /// Encodes and verifies ranges from backend-private sparse files without
-    /// creating a public filesystem-path API.
-    pub(crate) fn encode_slice_files(
-        root: Hash,
+    /// Caches one group-aligned range returned by the trusted remote backend.
+    ///
+    /// This deliberately does not run the bytes back through bao. OpenDAL's
+    /// successful write/read contract is the storage-integrity boundary; bao
+    /// verification remains for slices received from peers in [`Store::write_slice`].
+    pub(crate) fn cache_trusted_range(
+        &self,
+        root: &Hash,
         size: u64,
-        ranges: &ChunkRanges,
-        payload: &std::path::Path,
-        outboard: &std::path::Path,
-    ) -> Result<Vec<u8>> {
-        let tree = Self::tree(size);
-        let bao_ranges = to_bao_ranges(ranges);
-        let mut encoded = Vec::new();
-        let outboard = PreOrderOutboard {
-            root: blake3::Hash::from_bytes(root.0),
-            tree,
-            data: DataFile(File::open(outboard)?),
+        offset: u64,
+        bytes: &[u8],
+        now: i64,
+    ) -> Result<ChunkRanges> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| StoreError::invalid("trusted cache range overflowed"))?;
+        if offset > size || end > size {
+            return Err(StoreError::RangeOutOfBounds {
+                start: offset,
+                end,
+                size,
+            });
+        }
+        if !offset.is_multiple_of(CHUNK_GROUP_SIZE)
+            || (end != size && !end.is_multiple_of(CHUNK_GROUP_SIZE))
+        {
+            return Err(StoreError::invalid(
+                "trusted cache writes must cover whole chunk groups",
+            ));
+        }
+        let served = if size == 0 {
+            ChunkRanges::single(0, 1)
+        } else {
+            ChunkRanges::from_ranges([groups_for_byte_range(offset, end)])
+                .intersect(&ChunkRanges::single(0, group_count(size)))
         };
-        encode_ranges_validated(
-            DataFile(File::open(payload)?),
-            outboard,
-            &bao_ranges,
-            &mut encoded,
-        )
-        .map_err(|error| StoreError::Verification {
-            root,
-            reason: error.to_string(),
-        })?;
-        Ok(encoded)
+        if served.is_empty() {
+            return Ok(served);
+        }
+
+        let _lease = self.lease_write(root);
+        if let Some(row) = self.blob(root)? {
+            let held = row.verified_groups();
+            settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
+            if row.complete {
+                return Ok(ChunkRanges::empty());
+            }
+        }
+
+        if size <= INLINE_BLOB_MAX {
+            if offset != 0 || end != size {
+                return Err(StoreError::invalid(
+                    "an inline cache fill must contain the whole object",
+                ));
+            }
+            self.commit_groups(root, size, &served, Some(bytes.to_vec()), now)?;
+            return Ok(served);
+        }
+
+        let payload_path = self.blob_path(root);
+        if let Some(parent) = payload_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut payload = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&payload_path)?;
+        payload.write_all_at(offset, bytes)?;
+        fsync_file(&payload)?;
+        fsync_parent(&payload_path);
+        let commit = self.commit_groups(root, size, &served, None, now)?;
+        self.trim_to_size(root, commit);
+        Ok(served)
     }
 
     /// Decodes a received bao slice into the CAS, verifying every group against
@@ -1847,7 +1757,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durable_rows_survive_cold_scratch_and_heal_or_quarantine_loudly() {
+    fn durable_rows_survive_cold_scratch_and_heal_missing_objects() {
         let (_dir, store) = crate::testutil::store();
         let root = store.ingest_bytes(&vec![7u8; 100_000], 1).unwrap();
 
@@ -1858,10 +1768,6 @@ mod tests {
         assert!(store.has_complete_blob(&root).unwrap());
         assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
         assert!(!store.reconcile_scratch_generation("first").unwrap());
-
-        assert!(store.quarantine_blob(&root).unwrap());
-        assert!(!store.has_complete_blob(&root).unwrap());
-        assert!(store.local_ad(&root).unwrap().is_none());
 
         assert!(store.heal_missing_durable_blob(&root).unwrap());
         assert!(store.blob(&root).unwrap().is_none());
@@ -1892,31 +1798,6 @@ mod tests {
         assert!(!cache.blob(&inline).unwrap().unwrap().durable);
     }
 
-    #[test]
-    fn remote_deletes_are_queued_row_first_and_reingest_cancels_them() {
-        let (_dir, store) = crate::testutil::store();
-        store.set_remote_cas(true);
-        let payload = crate::testutil::data(100_000);
-        let root = store.ingest_bytes(&payload, 1).unwrap();
-        store.mark_blob_durable(&root).unwrap();
-
-        store.delete_blob(&root).unwrap();
-        assert!(store.blob(&root).unwrap().is_none());
-        assert_eq!(store.pending_backend_deletes().unwrap(), vec![root]);
-
-        // A retry that recreates the same content address wins over the old
-        // delete intent before maintenance can remove its new remote object.
-        assert_eq!(store.ingest_bytes(&payload, 2).unwrap(), root);
-        assert!(store.pending_backend_deletes().unwrap().is_empty());
-
-        store.delete_blob(&root).unwrap();
-        store.finish_backend_delete(&root).unwrap();
-        assert!(store.pending_backend_deletes().unwrap().is_empty());
-
-        let inline = store.ingest_bytes(b"inline", 3).unwrap();
-        store.delete_blob(&inline).unwrap();
-        assert_eq!(store.pending_backend_deletes().unwrap(), vec![inline]);
-    }
     use crate::testutil::{data, store};
 
     #[test]
@@ -1952,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_range_reads() {
+    fn range_reads() {
         let (_d, store) = store();
         let bytes = data(200_000);
         let root = store.ingest_bytes(&bytes, 0).unwrap();
@@ -1962,25 +1843,6 @@ mod tests {
             assert_eq!(got, &bytes[offset as usize..end as usize], "{offset}+{len}");
         }
         assert!(store.read_range(&root, 0, 0).unwrap().is_empty());
-    }
-
-    #[test]
-    fn corrupted_payload_fails_verification() {
-        let (_d, store) = store();
-        let bytes = data(200_000);
-        let root = store.ingest_bytes(&bytes, 0).unwrap();
-        // Flip a bit in the middle of the payload behind the store's back.
-        let mut raw = std::fs::read(store.blob_path(&root)).unwrap();
-        raw[100_000] ^= 0xff;
-        std::fs::write(store.blob_path(&root), &raw).unwrap();
-
-        assert!(matches!(
-            store.read_range(&root, 100_000, 16),
-            Err(StoreError::Verification { .. })
-        ));
-        // A read of an untouched group still succeeds: verification is
-        // per-16 KiB-group, not whole-file.
-        assert_eq!(store.read_range(&root, 0, 16).unwrap(), &bytes[..16]);
     }
 
     #[test]

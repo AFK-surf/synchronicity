@@ -346,11 +346,6 @@ impl Store {
         !self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Whether row-first byte deletion must be handed to a remote backend.
-    pub(crate) fn has_remote_cas(&self) -> bool {
-        self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// The CAS root directory.
     pub fn cas_dir(&self) -> PathBuf {
         self.data_dir.join(CAS_DIR)

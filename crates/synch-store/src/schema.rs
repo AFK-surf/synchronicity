@@ -84,16 +84,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V18_REDACTED_NODES),
     Migration::Sql(V19_S3_MULTIPART_UPLOADS),
     Migration::Sql(V20_SERVERLESS_FOUNDATION),
-    Migration::Sql(V21_BACKEND_DELETES),
 ];
-
-/// v21 — row-first remote deletes survive crashes and process replacement.
-const V21_BACKEND_DELETES: &str = r#"
-CREATE TABLE backend_deletes (
-  root      BLOB PRIMARY KEY,
-  queued_at INTEGER NOT NULL
-);
-"#;
 
 /// v20 — state shared by filesystem and serverless CAS backends.
 ///
@@ -107,7 +98,6 @@ CREATE TABLE backend_deletes (
 /// scanner or watcher root, but remains a space this origin can publish into.
 const V20_SERVERLESS_FOUNDATION: &str = r#"
 ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE blobs ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;
 UPDATE blobs SET durable = complete;
 
 ALTER TABLE spaces RENAME TO spaces_v19;
@@ -683,12 +673,7 @@ CREATE TABLE blobs (
   inline      BLOB,
   pinned      INTEGER NOT NULL DEFAULT 0,
   last_access INTEGER NOT NULL,
-  durable     INTEGER NOT NULL DEFAULT 0,
-  quarantined INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE backend_deletes (
-  root      BLOB PRIMARY KEY,
-  queued_at INTEGER NOT NULL
+  durable     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,

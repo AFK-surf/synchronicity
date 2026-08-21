@@ -407,30 +407,14 @@ impl Node {
             for part in &chosen {
                 let key = cloud_part_key(upload, &part.file);
                 let mut offset = 0u64;
-                let mut hasher = blake3::Hasher::new();
                 while offset < part.size {
                     let end = (offset + 8 * 1024 * 1024).min(part.size);
                     let bytes = self
                         .cas_backend()
                         .read_upload_part(key.clone(), offset..end)
                         .await?;
-                    if bytes.len() as u64 != end - offset {
-                        return Err(EngineError::invalid(format!(
-                            "cloud part {} returned {} byte(s) for {offset}..{end}",
-                            part.number,
-                            bytes.len()
-                        )));
-                    }
-                    hasher.update(&bytes);
                     output.write_all(&bytes).await?;
                     offset = end;
-                }
-                let actual = Hash(*hasher.finalize().as_bytes());
-                if actual != part.root {
-                    return Err(EngineError::invalid(format!(
-                        "multipart part {} changed after it was acknowledged: expected {}, got {actual}",
-                        part.number, part.root
-                    )));
                 }
             }
             output.sync_all().await?;
@@ -441,23 +425,11 @@ impl Node {
             let _ = tokio::fs::remove_file(&target).await;
             committed?
         } else {
-            let sources: Vec<(u32, Hash, PathBuf)> = chosen
-                .iter()
-                .map(|part| (part.number, part.root, dir.join(&part.file)))
-                .collect();
+            let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
             let assembled_target = target.clone();
             let assembled = crate::blocking::offload(move || {
                 let mut adoption = Adoption::at(&assembled_target)?;
-                for (number, expected, source) in &sources {
-                    let actual = synch_core::hash_reader(std::io::BufReader::new(
-                        std::fs::File::open(source)?,
-                    ))?;
-                    if actual != *expected {
-                        return Err(EngineError::invalid(format!(
-                            "multipart part {} changed after it was acknowledged: expected {}, got {actual}",
-                            number, expected
-                        )));
-                    }
+                for source in &sources {
                     adoption.append_file(source)?;
                 }
                 let written = adoption.written();
@@ -1037,32 +1009,6 @@ mod tests {
             keys.push(key);
         }
 
-        let corrupt = data.path().join("corrupt-cloud-part");
-        std::fs::write(&corrupt, vec![8u8; head.len()]).unwrap();
-        node.cas_backend()
-            .put_upload_part(keys[0].clone(), corrupt)
-            .await
-            .unwrap();
-        let error = node
-            .complete_upload(
-                &upload,
-                "media",
-                "joined.bin",
-                None,
-                &[(1, None), (2, None)],
-            )
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("changed after it was acknowledged"));
-        let restored = data.path().join("restored-cloud-part");
-        std::fs::write(&restored, &head).unwrap();
-        node.cas_backend()
-            .put_upload_part(keys[0].clone(), restored)
-            .await
-            .unwrap();
-
         let completed = node
             .complete_upload(
                 &upload,
@@ -1195,20 +1141,6 @@ mod sweeper_tests {
             adoption.write(bytes).unwrap();
             node.commit_part(staging, adoption).unwrap();
         }
-        let first = node.store().upload_parts(&id).unwrap()[0].clone();
-        std::fs::write(
-            node.store().upload_dir(&id).join(&first.file),
-            vec![8u8; head.len()],
-        )
-        .unwrap();
-        let error = node
-            .complete_upload(&id, "media", "joined.bin", None, &[(1, None), (2, None)])
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("changed after it was acknowledged"));
-        std::fs::write(node.store().upload_dir(&id).join(&first.file), &head).unwrap();
         let done = node
             .complete_upload(&id, "media", "joined.bin", None, &[(1, None), (2, None)])
             .await

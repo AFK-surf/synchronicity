@@ -2,7 +2,7 @@
 //!
 //! This module is the migration boundary around the legacy synchronous
 //! `Store` CAS. `LocalFs` centralizes its blocking handoff; `Cloud` adds the
-//! remote durability promise while retaining the same verified cache codec.
+//! remote durability promise while retaining the same cache codec.
 
 use std::{
     io::Write,
@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use synch_core::{group_count, groups_for_byte_range, ChunkRanges, Hash};
+use synch_core::{group_count, groups_for_byte_range, ChunkRanges, Hash, CHUNK_GROUP_SIZE};
 
 use crate::{
     cloud::{CloudStore, CloudUploadPolicy},
@@ -64,12 +64,6 @@ pub enum Materialization {
 pub struct MaintenanceReport {
     /// Stale local staging/cache files removed.
     pub local_orphans: usize,
-    /// Remote CAS objects inspected by an eligible provider sweep.
-    pub remote_inspected: usize,
-    /// Remote CAS objects deleted as old orphans.
-    pub remote_deleted: usize,
-    /// Row-first delete intents completed against the remote backend.
-    pub remote_deletes_completed: usize,
     /// Durable local cache entries evicted by capacity policy.
     pub cache_entries_evicted: usize,
     /// Payload/outboard bytes released by cache eviction.
@@ -83,11 +77,11 @@ pub trait CasBackend: std::fmt::Debug + Send + Sync + 'static {
     async fn ingest_bytes(&self, data: Vec<u8>, now: i64) -> Result<Ingested>;
     /// Ingests a file and returns only after its durable tier is safe.
     async fn ingest_file(&self, path: PathBuf, now: i64) -> Result<Ingested>;
-    /// Makes a durable cold object readable from verified local cache.
+    /// Makes a durable cold object readable from local cache.
     async fn ensure_cached(&self, root: Hash, size: u64) -> Result<()>;
-    /// Makes selected durable groups readable from verified local cache.
+    /// Makes selected durable groups readable from local cache.
     async fn ensure_ranges(&self, root: Hash, size: u64, ranges: ChunkRanges) -> Result<()>;
-    /// Encodes a verified bao slice and the ranges actually served.
+    /// Encodes a bao slice and the ranges actually served.
     async fn encode_slice(
         &self,
         root: Hash,
@@ -102,7 +96,7 @@ pub trait CasBackend: std::fmt::Debug + Send + Sync + 'static {
         encoded: Vec<u8>,
         now: i64,
     ) -> Result<GroupsWritten>;
-    /// Reads and verifies one byte range.
+    /// Reads one byte range.
     async fn read_range(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>>;
     /// Encodes a delta proof.
     async fn encode_proof(
@@ -126,9 +120,10 @@ pub trait CasBackend: std::fmt::Debug + Send + Sync + 'static {
     async fn promote(&self, donor: Donor, proven: Proven, now: i64) -> Result<ChunkRanges>;
     /// Promotes a complete staged object to the durable tier.
     async fn finalize(&self, root: Hash, size: u64) -> Result<()>;
-    /// Writes a complete verified object to a local target atomically.
+    /// Writes a complete object to a local target atomically.
     async fn materialize(&self, root: Hash, size: u64, target: PathBuf) -> Result<Materialization>;
-    /// Deletes metadata first and backend bytes second; idempotent.
+    /// Deletes the local claim/cache; LocalFs also removes its private bytes,
+    /// while Cloud keeps globally addressed final objects append-only.
     async fn delete(&self, root: Hash) -> Result<()>;
     /// Whether multipart parts must be persisted through backend object APIs.
     fn remote_upload_parts(&self) -> bool {
@@ -180,7 +175,7 @@ impl LocalFs {
     }
 }
 
-/// OpenDAL durable CAS plus the shared verified local cache codec.
+/// OpenDAL durable CAS plus the shared local cache codec.
 #[derive(Debug, Clone)]
 pub struct Cloud {
     store: Arc<Store>,
@@ -188,9 +183,6 @@ pub struct Cloud {
     upload_policy: CloudUploadPolicy,
     cache_bytes: Option<u64>,
     accessed: Arc<std::sync::Mutex<std::collections::HashMap<Hash, i64>>>,
-    /// Striped per-root locks serialize final-object upload and deletion. A
-    /// fixed stripe table avoids an unbounded lock registry.
-    mutations: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
 impl Cloud {
@@ -229,56 +221,7 @@ impl Cloud {
             upload_policy,
             cache_bytes,
             accessed: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            mutations: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
         }
-    }
-
-    fn mutation_lock(&self, root: Hash) -> &tokio::sync::Mutex<()> {
-        &self.mutations[root.as_bytes()[0] as usize]
-    }
-
-    async fn drain_pending_delete(&self, root: Hash) -> Result<bool> {
-        let _mutation = self.mutation_lock(root).lock().await;
-        let store = self.store.clone();
-        let (claimed, advertised) = blocking(move || {
-            Ok((
-                store.blob(&root)?.is_some() || store.content_is_referenced(&root)?,
-                store.is_self_provider(&root)?,
-            ))
-        })
-        .await?;
-        if claimed {
-            let store = self.store.clone();
-            blocking(move || store.finish_backend_delete(&root)).await?;
-            return Ok(false);
-        }
-        if advertised {
-            return Ok(false);
-        }
-        self.objects.delete(&root).await?;
-        let store = self.store.clone();
-        blocking(move || store.finish_backend_delete(&root)).await?;
-        Ok(true)
-    }
-
-    async fn delete_orphan_paths(&self, root: Hash, paths: Vec<String>) -> Result<usize> {
-        let _mutation = self.mutation_lock(root).lock().await;
-        let store = self.store.clone();
-        if blocking(move || {
-            Ok(store.blob(&root)?.is_some()
-                || store.content_is_referenced(&root)?
-                || store.is_self_provider(&root)?)
-        })
-        .await?
-        {
-            return Ok(0);
-        }
-        let mut deleted = 0;
-        for path in paths {
-            self.objects.delete_object(&path).await?;
-            deleted += 1;
-        }
-        Ok(deleted)
     }
 
     async fn durability(&self, root: Hash) -> Result<Durability> {
@@ -293,7 +236,6 @@ impl Cloud {
     }
 
     async fn adopt_remote_if_present(&self, root: Hash, size: u64) -> Result<bool> {
-        let _mutation = self.mutation_lock(root).lock().await;
         let store = self.store.clone();
         let mut replace_claim = false;
         if let Some(row) = blocking(move || store.blob(&root)).await? {
@@ -304,10 +246,10 @@ impl Cloud {
                         .verified_groups()
                         .contains(group_count(row.size).saturating_sub(1));
                 if attested {
-                    return Err(StoreError::Verification {
-                        root,
-                        reason: format!("size mismatch: have {}, offered {size}", row.size),
-                    });
+                    return Err(StoreError::invalid(format!(
+                        "size mismatch for {root}: have {}, offered {size}",
+                        row.size
+                    )));
                 }
                 replace_claim = true;
             }
@@ -315,8 +257,13 @@ impl Cloud {
                 return Ok(true);
             }
         }
-        match self.objects.verify_pair(&root, size).await {
-            Ok(()) => {
+        match self.objects.require_pair(&root).await {
+            Ok(stored_size) => {
+                if stored_size != size {
+                    return Err(StoreError::invalid(format!(
+                        "size mismatch for {root}: storage has {stored_size}, offered {size}"
+                    )));
+                }
                 if replace_claim {
                     let store = self.store.clone();
                     if !blocking(move || store.clear_blob_cache(&root)).await? {
@@ -345,7 +292,6 @@ impl Cloud {
         {
             return Ok(size);
         }
-        let _mutation = self.mutation_lock(root).lock().await;
         let store = self.store.clone();
         if let Some(size) =
             blocking(move || store.blob(&root).map(|row| row.map(|row| row.size))).await?
@@ -365,7 +311,12 @@ impl Cloud {
         })
         .await?
         .ok_or(StoreError::MissingBlob(root))?;
-        self.objects.verify_pair(&root, size).await?;
+        let stored_size = self.objects.require_pair(&root).await?;
+        if stored_size != size {
+            return Err(StoreError::invalid(format!(
+                "size mismatch for {root}: storage has {stored_size}, advertised {size}"
+            )));
+        }
         let store = self.store.clone();
         blocking(move || store.adopt_durable_blob(&root, size, synch_core::now_ns())).await?;
         Ok(size)
@@ -400,65 +351,58 @@ impl Cloud {
         if ranges.is_empty() {
             return Ok(());
         }
-        let (outboard, cached_outboard) = self.outboard_bytes(root, size).await?;
-        let first = self
-            .objects
-            .read_verified_slice(&root, size, &ranges, &outboard)
-            .await;
-        let encoded = match first {
-            Ok(encoded) => encoded,
-            Err(StoreError::Verification { .. }) if cached_outboard => {
-                let store = self.store.clone();
-                let cleared = blocking(move || store.clear_blob_cache(&root)).await?;
-                if !cleared {
-                    return Err(StoreError::invalid(
-                        "cached outboard changed while the object was being written",
-                    ));
-                }
-                let outboard = self.remote_outboard_bytes(root, size).await?;
-                match self
-                    .objects
-                    .read_verified_slice(&root, size, &ranges, &outboard)
-                    .await
-                {
-                    Ok(encoded) => encoded,
-                    Err(error @ StoreError::Verification { .. }) => {
+        // Keep maintenance from evicting an earlier window or the cached
+        // outboard while this hydration is still assembling the requested
+        // ranges. The lease holds no SQLite connection across these awaits.
+        let _hydrating = self.store.lease_write(&root);
+        self.outboard_bytes(root).await?;
+        if size == 0 {
+            let store = self.store.clone();
+            blocking(move || {
+                store.cache_trusted_range(&root, size, 0, &[], synch_core::now_ns())?;
+                Ok(())
+            })
+            .await?;
+            return Ok(());
+        }
+        const WINDOW: u64 = 8 * 1024 * 1024;
+        for range in &ranges.ranges {
+            let mut offset = range.start.saturating_mul(CHUNK_GROUP_SIZE);
+            let end = range.end.saturating_mul(CHUNK_GROUP_SIZE).min(size);
+            while offset < end {
+                let window_end = offset.saturating_add(WINDOW).min(end);
+                let bytes = match self.objects.read_range(&root, offset..window_end).await {
+                    Ok(bytes) => bytes,
+                    Err(error @ StoreError::CloudNotFound { .. }) => {
                         let store = self.store.clone();
-                        blocking(move || store.quarantine_blob(&root).map(|_| ())).await?;
+                        blocking(move || store.heal_missing_durable_blob(&root).map(|_| ()))
+                            .await?;
                         return Err(error);
                     }
                     Err(error) => return Err(error),
-                }
-            }
-            Err(error @ StoreError::CloudNotFound { .. }) => {
+                };
                 let store = self.store.clone();
-                blocking(move || store.heal_missing_durable_blob(&root).map(|_| ())).await?;
-                return Err(error);
+                let bytes = bytes.to_vec();
+                blocking(move || {
+                    store.cache_trusted_range(&root, size, offset, &bytes, synch_core::now_ns())?;
+                    Ok(())
+                })
+                .await?;
+                offset = window_end;
             }
-            Err(error @ StoreError::Verification { .. }) => {
-                let store = self.store.clone();
-                blocking(move || store.quarantine_blob(&root).map(|_| ())).await?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        let store = self.store.clone();
-        blocking(move || {
-            store.write_slice(&root, size, &ranges, &encoded, synch_core::now_ns())?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn outboard_bytes(&self, root: Hash, size: u64) -> Result<(Vec<u8>, bool)> {
-        let store = self.store.clone();
-        if let Some(cached) = blocking(move || Ok(store.cached_outboard(&root, size))).await? {
-            return Ok((cached, true));
         }
-        Ok((self.remote_outboard_bytes(root, size).await?, false))
+        Ok(())
     }
 
-    async fn remote_outboard_bytes(&self, root: Hash, size: u64) -> Result<Vec<u8>> {
+    async fn outboard_bytes(&self, root: Hash) -> Result<Vec<u8>> {
+        let store = self.store.clone();
+        if let Some(cached) = blocking(move || Ok(store.cached_outboard(&root))).await? {
+            return Ok(cached);
+        }
+        self.remote_outboard_bytes(root).await
+    }
+
+    async fn remote_outboard_bytes(&self, root: Hash) -> Result<Vec<u8>> {
         let outboard = match self.objects.read_outboard(&root).await {
             Ok(outboard) => outboard.to_vec(),
             Err(error @ StoreError::CloudNotFound { .. }) => {
@@ -470,49 +414,8 @@ impl Cloud {
         };
         let store = self.store.clone();
         let cached = outboard.clone();
-        match blocking(move || store.cache_outboard(&root, size, &cached)).await {
-            Ok(()) => {}
-            Err(error @ StoreError::Verification { .. }) => {
-                let store = self.store.clone();
-                blocking(move || store.quarantine_blob(&root).map(|_| ())).await?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        }
+        blocking(move || store.cache_outboard(&root, &cached)).await?;
         Ok(outboard)
-    }
-
-    /// Replaces a faulty reconstructible cache copy from the durable tier.
-    /// Returns false when the error is not cache-shaped or no remote promise
-    /// exists, in which case the original error belongs to the caller.
-    async fn recover_cache_fault(&self, root: Hash, size: u64, error: &StoreError) -> Result<bool> {
-        let cache_shaped = match error {
-            StoreError::Verification { .. } => true,
-            StoreError::Io(error) => matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
-            ),
-            _ => false,
-        };
-        if !cache_shaped {
-            return Ok(false);
-        }
-        let store = self.store.clone();
-        let durable = blocking(move || {
-            Ok(store
-                .blob(&root)?
-                .is_some_and(|row| row.durable && !row.quarantined))
-        })
-        .await?;
-        if !durable {
-            return Ok(false);
-        }
-        let store = self.store.clone();
-        if !blocking(move || store.clear_blob_cache(&root)).await? {
-            return Ok(false);
-        }
-        self.ensure_cached(root, size).await?;
-        Ok(true)
     }
 }
 
@@ -702,14 +605,11 @@ impl CasBackend for Cloud {
             }
             None => return Err(StoreError::MissingBlob(root)),
         };
-        if row.quarantined {
-            return Err(StoreError::MissingBlob(root));
-        }
         if row.durable && row.size != size {
-            return Err(StoreError::Verification {
-                root,
-                reason: format!("size mismatch: have {}, offered {size}", row.size),
-            });
+            return Err(StoreError::invalid(format!(
+                "size mismatch for {root}: have {}, offered {size}",
+                row.size
+            )));
         }
         if row.inline.is_some() {
             return Ok(());
@@ -722,7 +622,11 @@ impl CasBackend for Cloud {
                 return Ok(());
             }
             let store = self.store.clone();
-            blocking(move || store.clear_blob_cache(&root)).await?;
+            if !blocking(move || store.clear_blob_cache(&root)).await? {
+                return Err(StoreError::invalid(
+                    "the cloud cache is currently being filled by another operation",
+                ));
+            }
             if !row.durable {
                 return Err(StoreError::MissingBlob(root));
             }
@@ -749,14 +653,11 @@ impl CasBackend for Cloud {
             }
             None => return Ok(()),
         };
-        if row.quarantined {
-            return Err(StoreError::MissingBlob(root));
-        }
         if row.durable && row.size != size {
-            return Err(StoreError::Verification {
-                root,
-                reason: format!("size mismatch: have {}, offered {size}", row.size),
-            });
+            return Err(StoreError::invalid(format!(
+                "size mismatch for {root}: have {}, offered {size}",
+                row.size
+            )));
         }
         if !row.durable && !self.adopt_remote_if_present(root, size).await? {
             return Ok(());
@@ -793,16 +694,7 @@ impl CasBackend for Cloud {
                 .await?;
         }
         let store = self.store.clone();
-        let first_requested = requested.clone();
-        let first = blocking(move || store.encode_slice(&root, &first_requested)).await;
-        let result = match first {
-            Ok(value) => Ok(value),
-            Err(error) if self.recover_cache_fault(root, size, &error).await? => {
-                let store = self.store.clone();
-                blocking(move || store.encode_slice(&root, &requested)).await
-            }
-            Err(error) => Err(error),
-        };
+        let result = blocking(move || store.encode_slice(&root, &requested)).await;
         if result.is_ok() {
             self.touch(root).await?;
         }
@@ -857,15 +749,7 @@ impl CasBackend for Cloud {
             }
         }
         let store = self.store.clone();
-        let first = blocking(move || store.read_range(&root, offset, len)).await;
-        let result = match first {
-            Ok(value) => Ok(value),
-            Err(error) if self.recover_cache_fault(root, size, &error).await? => {
-                let store = self.store.clone();
-                blocking(move || store.read_range(&root, offset, len)).await
-            }
-            Err(error) => Err(error),
-        };
+        let result = blocking(move || store.read_range(&root, offset, len)).await;
         if result.is_ok() {
             self.touch(root).await?;
         }
@@ -902,35 +786,13 @@ impl CasBackend for Cloud {
             }
             return first;
         }
-        let (outboard, cached_outboard) = self.outboard_bytes(root, size).await?;
-        let mut encoded = {
+        let outboard = self.outboard_bytes(root).await?;
+        let result = {
             let requested = requested.clone();
             blocking(move || {
                 Store::encode_complete_proof(root, size, &requested, level, budget, outboard)
             })
             .await
-        };
-        if matches!(encoded, Err(StoreError::Verification { .. })) && cached_outboard {
-            let store = self.store.clone();
-            if !blocking(move || store.clear_blob_cache(&root)).await? {
-                return Err(StoreError::invalid(
-                    "cached outboard changed while the object was being written",
-                ));
-            }
-            let outboard = self.remote_outboard_bytes(root, size).await?;
-            let requested = requested.clone();
-            encoded = blocking(move || {
-                Store::encode_complete_proof(root, size, &requested, level, budget, outboard)
-            })
-            .await;
-        }
-        let result = match encoded {
-            Err(error @ StoreError::Verification { .. }) => {
-                let store = self.store.clone();
-                blocking(move || store.quarantine_blob(&root).map(|_| ())).await?;
-                Err(error)
-            }
-            other => other,
         };
         if result.is_ok() {
             self.touch(root).await?;
@@ -980,20 +842,24 @@ impl CasBackend for Cloud {
     }
 
     async fn finalize(&self, root: Hash, size: u64) -> Result<()> {
-        let _mutation = self.mutation_lock(root).lock().await;
         let store = self.store.clone();
         let mut row = blocking(move || store.blob(&root))
             .await?
             .ok_or(StoreError::MissingBlob(root))?;
         if row.size != size {
-            return Err(StoreError::Verification {
-                root,
-                reason: format!("size mismatch: have {}, offered {size}", row.size),
-            });
+            return Err(StoreError::invalid(format!(
+                "size mismatch for {root}: have {}, offered {size}",
+                row.size
+            )));
         }
-        if row.durable && !row.quarantined {
-            match self.objects.verify_pair(&root, size).await {
-                Ok(()) => return Ok(()),
+        if row.durable {
+            match self.objects.require_pair(&root).await {
+                Ok(stored_size) if stored_size == size => return Ok(()),
+                Ok(stored_size) => {
+                    return Err(StoreError::invalid(format!(
+                        "size mismatch for {root}: storage has {stored_size}, row has {size}"
+                    )))
+                }
                 Err(error @ StoreError::CloudNotFound { .. }) => {
                     let store = self.store.clone();
                     blocking(move || store.heal_missing_durable_blob(&root).map(|_| ())).await?;
@@ -1002,41 +868,28 @@ impl CasBackend for Cloud {
                     }
                     row.durable = false;
                 }
-                Err(error @ StoreError::Verification { .. }) => {
-                    if !row.complete && row.inline.is_none() {
-                        let store = self.store.clone();
-                        blocking(move || store.quarantine_blob(&root).map(|_| ())).await?;
-                        return Err(error);
-                    }
-                    row.durable = false;
-                }
                 Err(error) => return Err(error),
             }
         }
         if !row.complete && row.inline.is_none() {
-            return if row.quarantined || row.durable {
+            return if row.durable {
                 Err(StoreError::MissingBlob(root))
             } else {
                 Ok(())
             };
         }
-        let uploaded = match row.inline.as_deref() {
-            Some(bytes) => self.objects.ingest_bytes(bytes).await?,
+        match row.inline.as_deref() {
+            Some(bytes) => self.objects.put_pair_bytes(&root, bytes, &[]).await?,
             None => {
                 self.objects
-                    .ingest_file(&self.store.blob_path(&root))
+                    .put_pair_files(
+                        &root,
+                        &self.store.blob_path(&root),
+                        &self.store.outboard_path(&root),
+                    )
                     .await?
             }
         };
-        if (uploaded.root, uploaded.size) != (root, size) {
-            return Err(StoreError::Verification {
-                root,
-                reason: format!(
-                    "cloud finalize produced {} ({} bytes)",
-                    uploaded.root, uploaded.size
-                ),
-            });
-        }
         let store = self.store.clone();
         blocking(move || {
             if store.mark_blob_durable(&root)? {
@@ -1051,16 +904,7 @@ impl CasBackend for Cloud {
     async fn materialize(&self, root: Hash, size: u64, target: PathBuf) -> Result<Materialization> {
         self.ensure_cached(root, size).await?;
         let store = self.store.clone();
-        let first_target = target.clone();
-        let first = blocking(move || materialize_cached(&store, root, size, &first_target)).await;
-        let result = match first {
-            Ok(value) => Ok(value),
-            Err(error) if self.recover_cache_fault(root, size, &error).await? => {
-                let store = self.store.clone();
-                blocking(move || materialize_cached(&store, root, size, &target)).await
-            }
-            Err(error) => Err(error),
-        };
+        let result = blocking(move || materialize_cached(&store, root, size, &target)).await;
         if result.is_ok() {
             self.touch(root).await?;
         }
@@ -1068,12 +912,8 @@ impl CasBackend for Cloud {
     }
 
     async fn delete(&self, root: Hash) -> Result<()> {
-        let _mutation = self.mutation_lock(root).lock().await;
         let store = self.store.clone();
-        blocking(move || store.delete_blob(&root)).await?;
-        self.objects.delete(&root).await?;
-        let store = self.store.clone();
-        blocking(move || store.finish_backend_delete(&root)).await
+        blocking(move || store.delete_blob(&root)).await
     }
 
     fn remote_upload_parts(&self) -> bool {
@@ -1099,7 +939,6 @@ impl CasBackend for Cloud {
     async fn maintain(&self, now: i64) -> Result<MaintenanceReport> {
         const DAY_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
         const HORIZON_SECONDS: i64 = 7 * 24 * 60 * 60;
-        const LAST_SWEEP_KEY: &str = "cas.cloud.last_sweep_ns";
 
         let store = self.store.clone();
         let cache_bytes = self.cache_bytes;
@@ -1114,70 +953,11 @@ impl CasBackend for Cloud {
             .checked_sub(std::time::Duration::from_secs(HORIZON_SECONDS as u64))
             .unwrap_or(std::time::UNIX_EPOCH);
         local_orphans += self.objects.sweep_scratch(scratch_cutoff).await?;
-
-        let store = self.store.clone();
-        let due = blocking(move || {
-            let last = match store.config(LAST_SWEEP_KEY)? {
-                Some(value) => value.parse::<i64>().map_err(|_| {
-                    StoreError::invalid(format!(
-                        "invalid {LAST_SWEEP_KEY} timestamp in config: {value}"
-                    ))
-                })?,
-                None => i64::MIN,
-            };
-            Ok(now.saturating_sub(last) >= DAY_NS)
-        })
-        .await?;
-
-        let mut report = MaintenanceReport {
+        Ok(MaintenanceReport {
             local_orphans,
             cache_entries_evicted,
             cache_bytes_evicted,
-            ..MaintenanceReport::default()
-        };
-        let store = self.store.clone();
-        let pending = blocking(move || store.pending_backend_deletes()).await?;
-        for root in pending {
-            report.remote_deletes_completed += self.drain_pending_delete(root).await? as usize;
-        }
-        if due {
-            let store = self.store.clone();
-            let live = blocking(move || {
-                let mut live: std::collections::HashSet<Hash> = store
-                    .blob_candidates()?
-                    .into_iter()
-                    .filter(|blob| blob.durable)
-                    .map(|blob| blob.root)
-                    .collect();
-                live.extend(store.referenced_content()?);
-                live.extend(store.self_provider_roots()?);
-                Ok(live)
-            })
-            .await?;
-            let (inspected, candidates) = self
-                .objects
-                .orphan_candidates(
-                    &live,
-                    now.saturating_div(1_000_000_000)
-                        .saturating_sub(HORIZON_SECONDS),
-                )
-                .await?;
-            report.remote_inspected = inspected;
-            let mut by_root: std::collections::HashMap<Hash, Vec<String>> =
-                std::collections::HashMap::new();
-            for candidate in candidates {
-                by_root
-                    .entry(candidate.root)
-                    .or_default()
-                    .push(candidate.path);
-            }
-            for (root, paths) in by_root {
-                report.remote_deleted += self.delete_orphan_paths(root, paths).await?;
-            }
-            let store = self.store.clone();
-            blocking(move || store.set_config(LAST_SWEEP_KEY, &now.to_string())).await?;
-        }
-        Ok(report)
+        })
     }
 }
 
@@ -1236,14 +1016,6 @@ fn materialize_cached(
         } else {
             clone_or_copy(&store.blob_path(&root), &temporary)?
         };
-        let materialized_root =
-            synch_core::hash_reader(std::io::BufReader::new(std::fs::File::open(&temporary)?))?;
-        if materialized_root != root {
-            return Err(StoreError::Verification {
-                root,
-                reason: format!("materialized cache bytes hashed to {materialized_root}"),
-            });
-        }
         crate::cas::replace_file(&temporary, target)?;
         if let Some(parent) = target.parent() {
             if let Ok(directory) = std::fs::File::open(parent) {
@@ -1271,12 +1043,7 @@ fn clone_or_copy(source: &std::path::Path, target: &std::path::Path) -> Result<M
     }
     drop(target_file);
     std::fs::remove_file(target)?;
-    let copied = std::fs::copy(source, target)?;
-    if copied != source_file.metadata()?.len() {
-        return Err(StoreError::invalid(
-            "short copy while materializing CAS object",
-        ));
-    }
+    std::fs::copy(source, target)?;
     std::fs::OpenOptions::new()
         .write(true)
         .open(target)?
@@ -1320,7 +1087,7 @@ async fn blocking<T: Send + 'static>(
 mod tests {
     use super::*;
     use opendal::{services::Memory, Operator};
-    use synch_core::{group_count, FileEntry};
+    use synch_core::group_count;
 
     async fn contract(
         backend: Arc<dyn CasBackend>,
@@ -1510,19 +1277,6 @@ mod tests {
         assert_eq!(proved, all);
         assert!(!proof.is_empty());
 
-        store.delete_blob(&restored.root).unwrap();
-        let truncated = scratch.path().join("truncated-rowless-payload");
-        std::fs::write(&truncated, &restored_payload[..restored_payload.len() - 1]).unwrap();
-        objects
-            .write_object_file(&CloudStore::payload_key(&restored.root), &truncated)
-            .await
-            .unwrap();
-        assert!(matches!(
-            backend.read_range(restored.root, 0, 1).await,
-            Err(StoreError::Verification { .. })
-        ));
-        assert!(store.blob(&restored.root).unwrap().is_none());
-
         let claimed_payload = vec![0x61; 120_000];
         let claimed = objects.ingest_bytes(&claimed_payload).await.unwrap();
         store
@@ -1541,116 +1295,70 @@ mod tests {
         let corrected = store.blob(&claimed.root).unwrap().unwrap();
         assert_eq!(corrected.size, claimed.size);
         assert!(corrected.durable);
+
+        // Storage metadata, not a peer's entry, is authoritative when a cold
+        // final pair has no SQLite row after restore.
+        let rowless = objects.ingest_bytes(&vec![0x72; 100_000]).await.unwrap();
+        assert!(matches!(
+            backend
+                .ensure_ranges(rowless.root, rowless.size + 1, ChunkRanges::empty())
+                .await,
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(store.blob(&rowless.root).unwrap().is_none());
+        backend
+            .ensure_ranges(rowless.root, rowless.size, ChunkRanges::empty())
+            .await
+            .unwrap();
+        let adopted = store.blob(&rowless.root).unwrap().unwrap();
+        assert_eq!(adopted.size, rowless.size);
+        assert!(adopted.durable);
     }
 
     #[tokio::test]
-    async fn stale_remote_delete_and_orphan_snapshots_cannot_delete_reingested_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
-        let origin = crate::testutil::origin();
-        store.set_self_origin(&origin).unwrap();
-        let objects = CloudStore::from_operator(
-            Operator::new(Memory::default()).unwrap(),
-            scratch.path().to_path_buf(),
-        )
-        .unwrap();
-        let backend = Cloud::new(
-            store.clone(),
-            objects.clone(),
+    async fn cloud_final_objects_are_append_only_across_shared_nodes() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a_scratch = tempfile::tempdir().unwrap();
+        let b_scratch = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_dir.path()).unwrap());
+        let b_store = Arc::new(Store::open(b_dir.path()).unwrap());
+        let operator = Operator::new(Memory::default()).unwrap();
+        let a_objects =
+            CloudStore::from_operator(operator.clone(), a_scratch.path().to_path_buf()).unwrap();
+        let b_objects =
+            CloudStore::from_operator(operator, b_scratch.path().to_path_buf()).unwrap();
+        let a = Cloud::new(
+            a_store.clone(),
+            a_objects,
             CloudUploadPolicy::OwnPinned,
-            None,
+            Some(0),
+        );
+        let b = Cloud::new(
+            b_store.clone(),
+            b_objects,
+            CloudUploadPolicy::OwnPinned,
+            Some(0),
         );
         let payload = vec![0x41; 100_000];
+        let a_object = a.ingest_bytes(payload.clone(), 1).await.unwrap();
+        let b_object = b.ingest_bytes(payload.clone(), 1).await.unwrap();
+        assert_eq!(a_object, b_object);
 
-        let ingested = backend.ingest_bytes(payload.clone(), 1).await.unwrap();
-        store.delete_blob(&ingested.root).unwrap();
-        let stale_delete = store.pending_backend_deletes().unwrap()[0];
-        backend.ingest_bytes(payload.clone(), 2).await.unwrap();
-        assert!(!backend.drain_pending_delete(stale_delete).await.unwrap());
+        b.maintain(10 * 24 * 60 * 60 * 1_000_000_000).await.unwrap();
+        assert!(!b_store.blob(&b_object.root).unwrap().unwrap().complete);
+        a.delete(a_object.root).await.unwrap();
+        a.maintain(10 * 24 * 60 * 60 * 1_000_000_000).await.unwrap();
+        assert!(a_store.blob(&a_object.root).unwrap().is_none());
         assert_eq!(
-            objects
-                .read_range(&ingested.root, 0..1)
-                .await
-                .unwrap()
-                .as_ref(),
-            &[0x41]
+            b.read_range(b_object.root, 0, b_object.size).await.unwrap(),
+            payload
         );
-
-        let advertised = backend.ingest_bytes(vec![0x52; 100_000], 3).await.unwrap();
-        store
-            .put_provider(
-                &advertised.root,
-                &origin,
-                &synch_core::BlobAd::complete(advertised.size),
-            )
-            .unwrap();
-        store.delete_blob(&advertised.root).unwrap();
-        assert!(!backend.drain_pending_delete(advertised.root).await.unwrap());
-        assert_eq!(
-            store.pending_backend_deletes().unwrap(),
-            vec![advertised.root]
-        );
-        assert!(objects.read_range(&advertised.root, 0..1).await.is_ok());
-        store.delete_provider(&advertised.root, &origin).unwrap();
-        assert!(backend.drain_pending_delete(advertised.root).await.unwrap());
-        assert!(matches!(
-            objects.read_range(&advertised.root, 0..1).await,
-            Err(StoreError::CloudNotFound { .. })
-        ));
-
-        backend.delete(ingested.root).await.unwrap();
-        let orphan = objects.ingest_bytes(&payload).await.unwrap();
-        store
-            .adopt_durable_blob(&orphan.root, orphan.size, 3)
-            .unwrap();
-        store.delete_blob(&orphan.root).unwrap();
-        store
-            .put_entry(
-                &crate::testutil::origin(),
-                "restored",
-                "live.bin",
-                &FileEntry::file(orphan.size, 3, orphan.root, 1),
-            )
-            .unwrap();
-        let (_, candidates) = objects
-            .orphan_candidates(&std::collections::HashSet::new(), i64::MAX)
-            .await
-            .unwrap();
-        let paths: Vec<String> = candidates
-            .into_iter()
-            .filter(|candidate| candidate.root == orphan.root)
-            .map(|candidate| candidate.path)
-            .collect();
-        assert!(!backend.drain_pending_delete(orphan.root).await.unwrap());
-        assert!(store.pending_backend_deletes().unwrap().is_empty());
-        assert_eq!(
-            backend
-                .delete_orphan_paths(orphan.root, paths.clone())
-                .await
-                .unwrap(),
-            0
-        );
-        backend
-            .ensure_ranges(
-                orphan.root,
-                orphan.size,
-                ChunkRanges::single(0, group_count(orphan.size)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            backend
-                .delete_orphan_paths(orphan.root, paths)
-                .await
-                .unwrap(),
-            0
-        );
-        assert!(objects.read_range(&orphan.root, 0..1).await.is_ok());
+        assert!(b_store.blob(&b_object.root).unwrap().unwrap().durable);
     }
 
     #[tokio::test]
-    async fn cloud_cache_eviction_refill_not_found_and_quarantine_follow_the_contract() {
+    async fn cloud_cache_eviction_refill_and_not_found_follow_the_contract() {
         let dir = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
@@ -1677,11 +1385,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.cache_entries_evicted, 1);
-        assert_eq!(report.remote_deletes_completed, 1);
-        assert!(matches!(
-            objects.read_range(&deleted.root, 0..1).await,
-            Err(StoreError::CloudNotFound { .. })
-        ));
+        assert!(objects.read_range(&deleted.root, 0..1).await.is_ok());
         let cold = store.blob(&ingested.root).unwrap().unwrap();
         assert!(cold.durable);
         assert!(!cold.complete);
@@ -1707,17 +1411,12 @@ mod tests {
             backend
                 .ensure_ranges(ingested.root, wrong_size, ChunkRanges::single(0, 1))
                 .await,
-            Err(StoreError::Verification { .. })
+            Err(StoreError::Invalid(_))
         ));
         let unchanged = store.blob(&ingested.root).unwrap().unwrap();
         assert_eq!(unchanged.size, ingested.size);
-        assert!(unchanged.durable && !unchanged.quarantined);
+        assert!(unchanged.durable);
 
-        // A same-length corruption of only the reconstructible local outboard
-        // is retried from OpenDAL and never quarantines healthy remote bytes.
-        let mut cached_outboard = std::fs::read(store.outboard_path(&ingested.root)).unwrap();
-        cached_outboard[0] ^= 0xff;
-        std::fs::write(store.outboard_path(&ingested.root), cached_outboard).unwrap();
         assert_eq!(
             backend.read_range(ingested.root, 37, 91_000).await.unwrap(),
             payload[37..91_037]
@@ -1728,18 +1427,6 @@ mod tests {
             "a range read must not hydrate the whole object"
         );
         assert!(warmed.verified_groups().count() < group_count(ingested.size));
-
-        let mut cached_outboard = std::fs::read(store.outboard_path(&ingested.root)).unwrap();
-        cached_outboard[0] ^= 0xff;
-        std::fs::write(store.outboard_path(&ingested.root), cached_outboard).unwrap();
-        let lease = store.lease_write(&ingested.root);
-        let error = backend
-            .encode_proof(ingested.root, all.clone(), 0, synch_core::MAX_PROOF_NODES)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("being written"), "{error}");
-        drop(lease);
-        assert!(!store.blob(&ingested.root).unwrap().unwrap().quarantined);
         backend
             .encode_proof(ingested.root, all.clone(), 0, synch_core::MAX_PROOF_NODES)
             .await
@@ -1748,17 +1435,6 @@ mod tests {
             backend.read_range(ingested.root, 37, 91_000).await.unwrap(),
             payload[37..91_037]
         );
-
-        // Scratch corruption is not durable corruption: discard it, refill
-        // from the remote object, and serve the verified answer.
-        let mut cached = std::fs::read(store.blob_path(&ingested.root)).unwrap();
-        cached[40] ^= 0xff;
-        std::fs::write(store.blob_path(&ingested.root), cached).unwrap();
-        assert_eq!(
-            backend.read_range(ingested.root, 37, 91_000).await.unwrap(),
-            payload[37..91_037]
-        );
-        assert!(!store.blob(&ingested.root).unwrap().unwrap().quarantined);
 
         // A strongly consistent NotFound withdraws the remote durability
         // claim after local cache is removed.
@@ -1772,49 +1448,5 @@ mod tests {
             Err(StoreError::CloudNotFound { .. })
         ));
         assert!(store.blob(&ingested.root).unwrap().is_none());
-
-        // A present object whose bytes no longer hash to its key is retained
-        // remotely for diagnosis but retired from advertisements.
-        let second = backend.ingest_bytes(payload.clone(), 2).await.unwrap();
-        backend
-            .maintain(10 * 24 * 60 * 60 * 1_000_000_000 + 2)
-            .await
-            .unwrap();
-        let corrupt = scratch.path().join("corrupt");
-        std::fs::write(&corrupt, vec![0x55; payload.len()]).unwrap();
-        objects
-            .write_object_file(&CloudStore::payload_key(&second.root), &corrupt)
-            .await
-            .unwrap();
-        assert!(matches!(
-            backend.read_range(second.root, 0, 1).await,
-            Err(StoreError::Verification { .. })
-        ));
-        let row = store.blob(&second.root).unwrap().unwrap();
-        assert!(row.durable && row.quarantined);
-        assert!(store.local_ad(&second.root).unwrap().is_none());
-
-        let third_payload: Vec<u8> = payload.iter().map(|byte| byte ^ 0x3c).collect();
-        let third = backend.ingest_bytes(third_payload, 3).await.unwrap();
-        backend
-            .maintain(10 * 24 * 60 * 60 * 1_000_000_000 + 3)
-            .await
-            .unwrap();
-        let mut bad_outboard = objects.read_outboard(&third.root).await.unwrap().to_vec();
-        bad_outboard[0] ^= 0xff;
-        let corrupt_outboard = scratch.path().join("corrupt-outboard");
-        std::fs::write(&corrupt_outboard, bad_outboard).unwrap();
-        objects
-            .write_object_file(&CloudStore::outboard_key(&third.root), &corrupt_outboard)
-            .await
-            .unwrap();
-        let third_all = ChunkRanges::single(0, group_count(third.size));
-        assert!(matches!(
-            backend
-                .encode_proof(third.root, third_all, 0, synch_core::MAX_PROOF_NODES,)
-                .await,
-            Err(StoreError::Verification { .. })
-        ));
-        assert!(store.blob(&third.root).unwrap().unwrap().quarantined);
     }
 }

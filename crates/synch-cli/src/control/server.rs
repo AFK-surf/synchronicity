@@ -2587,9 +2587,8 @@ async fn stream_range(
     let mut offset = range.start;
     while offset < range.end {
         let take = (CHUNK_SIZE as u64).min(range.end - offset);
-        // Every piece is a verified read out of the CAS — payload and outboard
-        // off disk — so it runs on the blocking pool rather than on the worker
-        // polling this connection.
+        // Every piece is a trusted backend read, so local filesystem work runs
+        // on the blocking pool rather than on the worker polling this connection.
         let root = range.root;
         let bytes = node.cas_backend().read_range(root, offset, take).await?;
         if bytes.is_empty() {

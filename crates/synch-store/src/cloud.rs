@@ -4,7 +4,7 @@
 //! payload/outboard keys, normalized NotFound, and completed writes.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -17,9 +17,9 @@ use opendal::{
     services::{AzblobConfig, GcsConfig, MemoryConfig, S3Config},
     Configurator, ErrorKind, Operator,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
-use synch_core::{ChunkRanges, Hash, CHUNK_GROUP_LOG2, CHUNK_GROUP_SIZE};
+use synch_core::{Hash, CHUNK_GROUP_LOG2};
 
 use crate::{
     cas::{compute_outboard, fsync_file, TeeReader},
@@ -140,13 +140,6 @@ pub struct CloudIngested {
     pub size: u64,
 }
 
-/// One old unclaimed CAS object returned by a provider listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CloudOrphan {
-    pub(crate) root: Hash,
-    pub(crate) path: String,
-}
-
 impl CloudStore {
     /// Builds and capability-checks the configured OpenDAL operator.
     pub fn open(config: &CloudConfig) -> Result<Self> {
@@ -264,32 +257,48 @@ impl CloudStore {
         Ok(CloudIngested { root, size })
     }
 
-    /// Confirms both durable objects exist at their exact expected lengths.
-    pub async fn verify_pair(&self, root: &Hash, size: u64) -> Result<()> {
-        for (key, expected) in [
-            (Self::payload_key(root), size),
-            (
-                Self::outboard_key(root),
-                BaoTree::new(size, bao_tree::BlockSize::from_chunk_log(CHUNK_GROUP_LOG2))
-                    .outboard_size(),
-            ),
-        ] {
-            let metadata = self
-                .operator
-                .stat(&key)
-                .await
-                .map_err(|source| cloud("stat", &key, source))?;
-            if metadata.content_length() != expected {
-                return Err(StoreError::Verification {
-                    root: *root,
-                    reason: format!(
-                        "cloud object {key} is {} bytes, expected {expected}",
-                        metadata.content_length()
-                    ),
-                });
-            }
-        }
+    /// Stores a payload/outboard pair under an already assigned content
+    /// address. The caller produced the address when it accepted the object;
+    /// storage is trusted after that boundary and is not re-hashed here.
+    pub async fn put_pair_files(&self, root: &Hash, payload: &Path, outboard: &Path) -> Result<()> {
+        self.write_object_file(&Self::payload_key(root), payload)
+            .await?;
+        self.write_object_file(&Self::outboard_key(root), outboard)
+            .await
+    }
+
+    /// Stores an in-memory payload/outboard pair under an assigned address.
+    pub async fn put_pair_bytes(&self, root: &Hash, payload: &[u8], outboard: &[u8]) -> Result<()> {
+        let payload_key = Self::payload_key(root);
+        self.operator
+            .write(&payload_key, Bytes::copy_from_slice(payload))
+            .await
+            .map_err(|source| cloud("write", &payload_key, source))?;
+        let outboard_key = Self::outboard_key(root);
+        self.operator
+            .write(&outboard_key, Bytes::copy_from_slice(outboard))
+            .await
+            .map_err(|source| cloud("write", &outboard_key, source))?;
         Ok(())
+    }
+
+    /// Confirms both durable objects exist and returns the payload length from
+    /// authoritative storage metadata. Contents are trusted once acknowledged;
+    /// the length binds an untrusted peer's size claim without re-hashing data.
+    pub async fn require_pair(&self, root: &Hash) -> Result<u64> {
+        let payload = Self::payload_key(root);
+        let size = self
+            .operator
+            .stat(&payload)
+            .await
+            .map_err(|source| cloud("stat", &payload, source))?
+            .content_length();
+        let outboard = Self::outboard_key(root);
+        self.operator
+            .stat(&outboard)
+            .await
+            .map_err(|source| cloud("stat", &outboard, source))?;
+        Ok(size)
     }
 
     /// Reads one byte range from an immutable payload.
@@ -309,74 +318,10 @@ impl CloudStore {
         Ok(buffer.to_bytes())
     }
 
-    /// Reads selected groups in bounded windows and returns a root-verified bao
-    /// slice ready for the shared local cache codec.
-    pub async fn read_verified_slice(
-        &self,
-        root: &Hash,
-        size: u64,
-        ranges: &ChunkRanges,
-        remote_outboard: &[u8],
-    ) -> Result<Vec<u8>> {
-        tokio::fs::create_dir_all(&self.scratch_dir).await?;
-        let sequence = INGEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let payload = self
-            .scratch_dir
-            .join(format!("slice-{}-{sequence}.payload", std::process::id()));
-        let outboard = self
-            .scratch_dir
-            .join(format!("slice-{}-{sequence}.obao", std::process::id()));
-        let result = async {
-            let mut local_payload = tokio::fs::File::create(&payload).await?;
-            local_payload.set_len(size).await?;
-            for range in &ranges.ranges {
-                let mut offset = range.start.saturating_mul(CHUNK_GROUP_SIZE);
-                let end = range.end.saturating_mul(CHUNK_GROUP_SIZE).min(size);
-                while offset < end {
-                    let window_end = offset.saturating_add(UPLOAD_CHUNK as u64).min(end);
-                    let bytes = self.read_range(root, offset..window_end).await?;
-                    if bytes.len() as u64 != window_end - offset {
-                        return Err(StoreError::Verification {
-                            root: *root,
-                            reason: format!(
-                                "cloud range {offset}..{window_end} returned {} byte(s)",
-                                bytes.len()
-                            ),
-                        });
-                    }
-                    local_payload.seek(std::io::SeekFrom::Start(offset)).await?;
-                    local_payload.write_all(&bytes).await?;
-                    offset = window_end;
-                }
-            }
-            local_payload.sync_all().await?;
-            tokio::fs::write(&outboard, remote_outboard).await?;
-            let payload_for_encode = payload.clone();
-            let outboard_for_encode = outboard.clone();
-            let ranges = ranges.clone();
-            let root = *root;
-            tokio::task::spawn_blocking(move || {
-                crate::Store::encode_slice_files(
-                    root,
-                    size,
-                    &ranges,
-                    &payload_for_encode,
-                    &outboard_for_encode,
-                )
-            })
-            .await
-            .map_err(|error| {
-                StoreError::invalid(format!("cloud slice verification worker failed: {error}"))
-            })?
-        }
-        .await;
-        let _ = tokio::fs::remove_file(&payload).await;
-        let _ = tokio::fs::remove_file(&outboard).await;
-        result
-    }
-
-    /// Deletes payload and outboard idempotently.
-    pub async fn delete(&self, root: &Hash) -> Result<()> {
+    /// Deletes a final pair idempotently for NotFound-path tests. Production
+    /// final CAS keys are append-only.
+    #[cfg(test)]
+    pub(crate) async fn delete(&self, root: &Hash) -> Result<()> {
         for key in [Self::payload_key(root), Self::outboard_key(root)] {
             match self.operator.delete(&key).await {
                 Ok(()) => {}
@@ -450,66 +395,6 @@ impl CloudStore {
             deleted += 1;
         }
         Ok(deleted)
-    }
-
-    /// Lists old cloud CAS objects no live SQLite row claimed in the snapshot.
-    /// The backend rechecks each root under its remote mutation lock before
-    /// deleting it.
-    pub(crate) async fn orphan_candidates(
-        &self,
-        live: &HashSet<Hash>,
-        cutoff_unix_seconds: i64,
-    ) -> Result<(usize, Vec<CloudOrphan>)> {
-        let entries = self
-            .operator
-            .list_with("cas/")
-            .recursive(true)
-            .await
-            .map_err(|source| cloud("list", "cas/", source))?;
-        let mut inspected = 0;
-        let mut candidates = Vec::new();
-        for entry in entries {
-            if !entry.metadata().is_file() {
-                continue;
-            }
-            inspected += 1;
-            let path = entry.path();
-            let Some(root) = cloud_key_root(path) else {
-                continue;
-            };
-            let claimed = live.contains(&root);
-            if claimed {
-                continue;
-            }
-            let modified_seconds = match entry.metadata().last_modified() {
-                Some(modified) => modified.into_inner().as_second(),
-                None => self
-                    .operator
-                    .stat(path)
-                    .await
-                    .map_err(|source| cloud("stat", path, source))?
-                    .last_modified()
-                    .map(|modified| modified.into_inner().as_second())
-                    // Memory exists only for the contract suite and exposes no
-                    // timestamps. A fabricated maximal cutoff deliberately
-                    // treats its unclaimed objects as old.
-                    .or_else(|| (self.operator.info().scheme() == "memory").then_some(i64::MIN))
-                    .ok_or_else(|| {
-                        StoreError::invalid(format!(
-                            "OpenDAL service {} supplies no last-modified time for {path}",
-                            self.operator.info().scheme()
-                        ))
-                    })?,
-            };
-            if modified_seconds >= cutoff_unix_seconds {
-                continue;
-            }
-            candidates.push(CloudOrphan {
-                root,
-                path: path.to_string(),
-            });
-        }
-        Ok((inspected, candidates))
     }
 
     /// Removes abandoned local cloud-operation temporaries older than `cutoff`.
@@ -602,19 +487,6 @@ fn cloud(operation: &'static str, path: &str, source: opendal::Error) -> StoreEr
     }
 }
 
-fn cloud_key_root(path: &str) -> Option<Hash> {
-    let name = path
-        .rsplit('/')
-        .next()?
-        .strip_suffix(".obao")
-        .unwrap_or_else(|| {
-            path.rsplit('/')
-                .next()
-                .expect("the path has a final segment")
-        });
-    (name.len() == 64).then(|| name.parse().ok()).flatten()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,38 +521,6 @@ mod tests {
         cloud.delete(&ingested.root).await.unwrap();
         assert!(matches!(
             cloud.read_range(&ingested.root, 0..1).await,
-            Err(StoreError::CloudNotFound { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn orphan_sweep_keeps_both_objects_of_a_live_root() {
-        let scratch = tempfile::tempdir().unwrap();
-        let sources = tempfile::tempdir().unwrap();
-        let cloud = CloudStore::from_operator(
-            Operator::new(Memory::default()).unwrap(),
-            scratch.path().to_path_buf(),
-        )
-        .unwrap();
-        let live_source = sources.path().join("live");
-        let orphan_source = sources.path().join("orphan");
-        std::fs::write(&live_source, vec![1u8; 100_000]).unwrap();
-        std::fs::write(&orphan_source, vec![2u8; 100_000]).unwrap();
-        let live = cloud.ingest_file(&live_source).await.unwrap();
-        let orphan = cloud.ingest_file(&orphan_source).await.unwrap();
-
-        let (inspected, candidates) = cloud
-            .orphan_candidates(&HashSet::from([live.root]), i64::MAX)
-            .await
-            .unwrap();
-        assert_eq!(inspected, 4);
-        assert_eq!(candidates.len(), 2);
-        for candidate in candidates {
-            cloud.delete_object(&candidate.path).await.unwrap();
-        }
-        assert!(cloud.read_range(&live.root, 0..1).await.is_ok());
-        assert!(matches!(
-            cloud.read_range(&orphan.root, 0..1).await,
             Err(StoreError::CloudNotFound { .. })
         ));
     }

@@ -387,28 +387,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Provider-view roots still advertised by this node's current signed head.
-    pub(crate) fn self_provider_roots(&self) -> Result<Vec<Hash>> {
-        match self.self_origin()? {
-            Some(origin) => self.provider_roots_for_origin(&origin),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Whether the current own head still advertises this object.
-    pub(crate) fn is_self_provider(&self, root: &Hash) -> Result<bool> {
-        let Some(origin) = self.self_origin()? else {
-            return Ok(false);
-        };
-        Ok(self.conn().query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM blob_providers WHERE object_root = ?1 AND origin_id = ?2
-             )",
-            params![root.as_bytes().to_vec(), origin.canonical()],
-            |row| row.get(0),
-        )?)
-    }
-
     /// Deletes every provider row for an origin.
     pub fn delete_origin_providers(&self, origin: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(

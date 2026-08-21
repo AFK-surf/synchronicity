@@ -1168,7 +1168,6 @@ impl Node {
         Ok(self
             .store()
             .blob(root)?
-            .filter(|blob| !blob.quarantined)
             .map(|blob| blob.verified_groups())
             .unwrap_or_else(ChunkRanges::empty))
     }

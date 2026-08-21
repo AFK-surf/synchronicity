@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use synch_store::{
     backend::{CasBackend, Cloud},
     cloud::{CloudConfig, CloudService, CloudStore, CloudUploadPolicy},
-    Donor, Store, StoreError,
+    Donor, Store,
 };
 
 fn configured(service: CloudService) -> Option<HashMap<String, String>> {
@@ -159,10 +159,11 @@ async fn provider_contract(service: CloudService) {
         .unwrap();
     assert_eq!(std::fs::read(target).unwrap(), payload);
     backend.delete(ingested.root).await.unwrap();
-    assert!(matches!(
-        objects.read_range(&ingested.root, 0..1).await,
-        Err(StoreError::CloudNotFound { .. })
-    ));
+    assert!(store.blob(&ingested.root).unwrap().is_none());
+    assert_eq!(
+        objects.read_range(&ingested.root, 0..1).await.unwrap(),
+        payload[..1]
+    );
 
     let provider_dir = tempfile::tempdir().unwrap();
     let provider = Store::open(provider_dir.path()).unwrap();
@@ -242,22 +243,24 @@ async fn provider_contract(service: CloudService) {
         backend.delete(root).await.unwrap();
     }
     backend.delete(inline.root).await.unwrap();
+    assert!(objects.read_range(&target_root, 0..1).await.is_ok());
+    assert!(objects.read_range(&inline.root, 0..1).await.is_ok());
 
     // Crash shape: provider acknowledgement happened, but no SQLite row did.
-    // A fabricated future horizon must identify and remove the leaked pair.
+    // The append-only pair remains reusable instead of being deleted from a
+    // namespace another node may share.
     let leaked = objects
         .ingest_bytes(b"acked before row commit")
         .await
         .unwrap();
     assert!(store.blob(&leaked.root).unwrap().is_none());
     let future = synch_core::now_ns() + 8 * 24 * 60 * 60 * 1_000_000_000;
-    let report = backend.maintain(future).await.unwrap();
-    assert!(report.remote_inspected >= 2);
-    assert!(report.remote_deleted >= 2);
-    assert!(matches!(
-        objects.read_range(&leaked.root, 0..1).await,
-        Err(StoreError::CloudNotFound { .. })
-    ));
+    backend.maintain(future).await.unwrap();
+    assert_eq!(
+        objects.require_pair(&leaked.root).await.unwrap(),
+        leaked.size
+    );
+    assert!(objects.read_range(&leaked.root, 0..1).await.is_ok());
 }
 
 #[tokio::test]

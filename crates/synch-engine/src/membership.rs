@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use synch_core::{clock_is_trusted, now_ns, Hash, NodeId, OriginId};
+use synch_core::{clock_is_trusted, now_ns, NodeId, OriginId};
 use synch_net::dns::{
     clamp_ttl, DialHint, MemberResolver, MemberSet, RekorPolicy, ResolverOptions, DEFAULT_DOH_URL,
     DEFAULT_TRUST_GRACE, MIN_TTL,
@@ -288,8 +288,6 @@ pub struct DoctorReport {
     pub trie: synch_store::TrieStats,
     /// How many objects are held locally, and how many are complete.
     pub blobs: (usize, usize),
-    /// Durable object roots quarantined after verification failure.
-    pub quarantined_blobs: Vec<Hash>,
 }
 
 /// One origin's head state.
@@ -998,13 +996,6 @@ impl Node {
         // projection rather than every inline payload in the store.
         let blobs = self.store().blob_candidates()?;
         let complete_blobs = blobs.iter().filter(|b| b.complete).count();
-        let mut quarantined_blobs: Vec<Hash> = blobs
-            .iter()
-            .filter(|blob| blob.quarantined)
-            .map(|blob| blob.root)
-            .collect();
-        quarantined_blobs.sort_unstable_by_key(Hash::to_hex);
-
         Ok(DoctorReport {
             origin: self.origin().clone(),
             device_keys: self
@@ -1028,7 +1019,6 @@ impl Node {
             trust: self.resolver_status(),
             trie: self.store().trie_stats()?,
             blobs: (blobs.len(), complete_blobs),
-            quarantined_blobs,
         })
     }
 
@@ -1365,18 +1355,6 @@ mod tests {
             report.heads[0].servable,
             "this node's own head is held whole whatever it was granted to read"
         );
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn doctor_names_every_quarantined_durable_object() {
-        let (_d, node) = node().await;
-        let root = node
-            .store()
-            .ingest_bytes(&vec![0x42; 100_000], now_ns())
-            .unwrap();
-        node.store().quarantine_blob(&root).unwrap();
-        assert_eq!(node.doctor().unwrap().quarantined_blobs, vec![root]);
         node.shutdown().await.unwrap();
     }
 

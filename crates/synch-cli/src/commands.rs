@@ -366,12 +366,9 @@ async fn copy_and_switch_backends(
                 }
                 match probes.get(&root) {
                     Some((known, _)) if *known != size => {
-                        return Err(synch_store::StoreError::Verification {
-                            root,
-                            reason: format!(
-                                "recovered metadata gives both {known} and {size} bytes"
-                            ),
-                        });
+                        return Err(synch_store::StoreError::invalid(format!(
+                            "recovered metadata for {root} gives both {known} and {size} bytes"
+                        )));
                     }
                     Some(_) => {}
                     None => {
@@ -392,7 +389,7 @@ async fn copy_and_switch_backends(
             source_backend
                 .ensure_ranges(root, size, synch_core::ChunkRanges::empty())
                 .await
-                .with_context(|| format!("could not verify advertised source object {root}"))?;
+                .with_context(|| format!("could not locate advertised source object {root}"))?;
             let checked = source_store.clone();
             let (durable, complete_cache) = tokio::task::spawn_blocking(move || {
                 let _scope = synch_core::BlockingScope::enter();
@@ -450,42 +447,22 @@ async fn copy_and_switch_backends(
             .await
             .with_context(|| format!("could not read source object {}", blob.root))?;
         let copied: Result<()> = async {
-            let ingested = target_backend
+            target_backend
                 .ingest_file(materialized.clone(), synch_core::now_ns())
                 .await
                 .with_context(|| format!("could not write destination object {}", blob.root))?;
-            if (ingested.root, ingested.size) != (blob.root, blob.size) {
-                anyhow::bail!(
-                    "destination verification changed {} ({} bytes) into {} ({} bytes)",
-                    blob.root,
-                    blob.size,
-                    ingested.root,
-                    ingested.size
-                );
-            }
             if target_name == "local" {
                 // Install through the real future-local Store, not merely the
-                // isolated validation index. This rebuilds and fsyncs both the
-                // payload and outboard, so same-length cache corruption cannot
-                // survive the backend flip.
+                // isolated target index. This rebuilds and fsyncs both the
+                // payload and outboard before the backend flip.
                 let installed = source_store.clone();
                 let path = materialized.clone();
-                let expected = (blob.root, blob.size);
-                let actual = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     let _scope = synch_core::BlockingScope::enter();
                     installed.ingest_file(&path, synch_core::now_ns())
                 })
                 .await
                 .context("the local CAS install task did not complete")??;
-                if actual != expected {
-                    anyhow::bail!(
-                        "local CAS install changed {} ({} bytes) into {} ({} bytes)",
-                        expected.0,
-                        expected.1,
-                        actual.0,
-                        actual.1
-                    );
-                }
             }
             Ok(())
         }
@@ -519,7 +496,7 @@ async fn copy_and_switch_backends(
             Ok::<_, synch_store::StoreError>(())
         })
         .await
-        .context("the local destination CAS verification task did not complete")??;
+        .context("the local destination CAS presence check did not complete")??;
     }
 
     let switched = source_store;
@@ -957,7 +934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_migration_switches_only_after_every_object_verifies() {
+    async fn cas_migration_switches_only_after_every_object_copies() {
         let _blocking = synch_core::BlockingScope::enter();
         let data = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
@@ -1215,15 +1192,6 @@ mod tests {
         outboard_path.set_extension("obao");
         let _ = std::fs::remove_file(payload_path);
         let _ = std::fs::remove_file(outboard_path);
-        let cached_hex = cached.to_hex();
-        let mut cached_outboard = reverse_source_store
-            .data_dir()
-            .join(synch_store::CAS_DIR)
-            .join(format!("{}/{cached_hex}", &cached_hex[..2]));
-        cached_outboard.set_extension("obao");
-        let mut corrupt_outboard = std::fs::read(&cached_outboard).unwrap();
-        corrupt_outboard[0] ^= 0xff;
-        std::fs::write(&cached_outboard, corrupt_outboard).unwrap();
         let reverse_source: Arc<dyn synch_store::backend::CasBackend> =
             Arc::new(synch_store::backend::Cloud::new(
                 reverse_source_store.clone(),
@@ -1270,7 +1238,7 @@ mod tests {
 
         // A complete own durability promise must not disappear merely because
         // an older staged row masks it. With neither source final pair nor
-        // verified cache, migration fails before the backend flip.
+        // complete cache, migration fails before the backend flip.
         let unavailable_data = tempfile::tempdir().unwrap();
         let unavailable_scratch = tempfile::tempdir().unwrap();
         let unavailable_store =
@@ -1348,7 +1316,7 @@ mod tests {
             Some("s3")
         );
 
-        // A source verification/read failure returns before the final config
+        // A source read failure returns before the final config
         // transaction, leaving the stored backend untouched for a retry.
         let broken_data = tempfile::tempdir().unwrap();
         let broken_source = Arc::new(synch_store::Store::open(broken_data.path()).unwrap());

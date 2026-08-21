@@ -74,9 +74,8 @@ is an ephemeral, orchestrator-managed, scale-to-one container — not FaaS.
    │  ├ store/incoming/ staging        ├ staging/<uuid> keys       │
    │  ├ fsync + rename discipline      ├ scratch spill + cache     │
    │  ├ sparse files, reflinks         │   (ephemeral, internal)   │
-   │  └ mtime orphan walk              └ LIST orphan sweep,        │
-   │                                     provider lifecycle        │
-   │                                     backstops                 │
+   │  └ mtime orphan walk              └ append-only final CAS     │
+   │                                     upload lifecycle cleanup  │
    └───────────────────────────────────────────────────────────────┘
                     │                       │
                     └───────────┬───────────┘
@@ -88,14 +87,14 @@ is an ephemeral, orchestrator-managed, scale-to-one container — not FaaS.
 **Where the trait is cut.** The boundary is the *semantics* of a
 content-addressed blob store — ingest an object, commit verified groups of a
 partially held one, finalize, read verified ranges, materialize to a file,
-delete, sweep — never file operations. A file-level trait (open, write-at,
+delete local claims, maintain — never file operations. A file-level trait (open, write-at,
 rename, fsync) was considered and rejected: it is the local backend's
 implementation vocabulary, and object stores can express almost none of it —
 no partial writes, no rename, no sparse files, no reflinks. Cutting at semantics lets
 each backend keep its native mechanics: the local backend keeps every line of
 today's discipline (staging-and-rename, sparse `write_at`, `copy_file_range`
-reflinks, mtime-driven sweeps), and the cloud backend gets immutable objects,
-OpenDAL operations, capability-gated copies, and LIST-driven sweeps.
+reflinks, mtime-driven sweeps), and the cloud backend gets immutable,
+append-only final objects plus OpenDAL operations.
 
 The backend is deliberately a **CAS coordinator**, not merely a byte driver.
 Each implementation receives the node's `Arc<Store>` and owns the small set of
@@ -137,6 +136,17 @@ it reports `Durable`. Litestream is asynchronous, so an inline SQLite row alone
 cannot satisfy the serverless durability promise. LocalFs retains the original
 inline-only behavior.
 
+**Storage is a trusted boundary.** Once LocalFs has fsynced a write, or
+OpenDAL has acknowledged it, this design trusts that backend to preserve and
+return those bytes. The application does not re-hash stored payloads, compare
+them with their content address on reads or migrations, quarantine objects, or
+retry through another copy because stored bytes appear different. Hashing is
+still required to assign a content address at ingest, and bao verification is
+still required for slices and proofs received from untrusted peers; neither is
+an at-rest storage integrity check. OpenDAL `Content-Length` remains
+authoritative metadata: a peer-supplied size must match it before a rowless
+cloud object can be adopted.
+
 ---
 
 ## 3. The backend contract
@@ -156,7 +166,7 @@ pub trait CasBackend: Send + Sync + 'static {
     async fn ingest_bytes(&self, bytes: Vec<u8>, now: i64) -> Result<Ingested>;
     async fn ingest_file(&self, path: PathBuf, now: i64) -> Result<Ingested>;
 
-    /// Hydrate a durable cold object into verified scratch/cache. A staged
+    /// Hydrate a durable cold object into backend-managed scratch/cache. A staged
     /// peer fetch is already readable and is left alone.
     async fn ensure_cached(&self, root: Hash, size: u64) -> Result<()>;
     /// Hydrate only the named groups for a range read or slice request. Cloud
@@ -174,8 +184,8 @@ pub trait CasBackend: Send + Sync + 'static {
                          served: ChunkRanges, encoded: Vec<u8>, now: i64)
         -> Result<GroupsWritten>;
 
-    /// Read a verified byte range. Durable cold Cloud objects hydrate
-    /// transparently; a verified local cache is an implementation detail.
+    /// Read one byte range. Durable cold Cloud objects hydrate transparently;
+    /// a local cache is an implementation detail.
     async fn read_range(&self, root: Hash, offset: u64, len: u64)
         -> Result<Vec<u8>>;
 
@@ -195,12 +205,12 @@ pub trait CasBackend: Send + Sync + 'static {
 
     /// Write the object's bytes to a local file (mirror / `synch get`
     /// materialization), atomically replacing the target. LocalFs reflinks
-    /// where possible; Cloud downloads through its verified cache.
+    /// where possible; Cloud downloads through its cache.
     async fn materialize(&self, root: Hash, size: u64,
                          target: PathBuf) -> Result<Materialization>;
 
-    /// Delete the SQLite claim first and backend bytes second. Idempotent;
-    /// failure after the row deletion is repaired by orphan sweeping.
+    /// Delete the local claim/cache. LocalFs also removes its private bytes;
+    /// Cloud leaves globally addressed final objects append-only.
     async fn delete(&self, root: Hash) -> Result<()>;
 
     /// Gateway multipart parts use the selected backend too. LocalFs reports
@@ -214,9 +224,8 @@ pub trait CasBackend: Send + Sync + 'static {
     async fn delete_upload_part(&self, key: String) -> Result<()>;
     async fn delete_upload_prefix(&self, prefix: String) -> Result<usize>;
 
-    /// Perform backend-specific maintenance: orphan removal, abandoned
-    /// staging cleanup, and cache eviction. It derives a consistent live set
-    /// from Store rather than accepting a caller-assembled manifest.
+    /// Perform backend-specific maintenance: abandoned staging cleanup and
+    /// cache eviction.
     async fn maintain(&self, now: i64) -> Result<MaintenanceReport>;
 }
 ```
@@ -230,15 +239,15 @@ Notes on the contract:
   LocalFs collapses the distinction (everything it acks is Durable), which
   is exactly why the distinction must live in the contract and not in
   call-site knowledge of which backend is configured.
-- **Verification is enforced at the backend boundary.** `write_slice` and
+- **Verification stops at the storage boundary.** `write_slice` and
   `write_proof` accept untrusted wire bytes and do not update the bitmap until
-  bao verification succeeds. `read_range`/`encode_slice` verify what the
-  backend returns against the outboard before serving it, so a
-  corrupt cloud object or a bit-flipped local file is caught at the same
-  16 KiB granularity as a hostile peer, whichever backend is under it.
+  bao verification succeeds. Whole-object ingest hashes its input because the
+  hash is the object's name. After either backend acknowledges storage,
+  `read_range`, `encode_slice`, materialization, and migration trust the bytes
+  it returns; they do not perform a second integrity policy in the application.
 - **The SQLite index stays in `Store`, but CAS transitions are encapsulated.**
-  The `blobs` table (bitmap, complete, pinned, inline, and `durable`/
-  `quarantined` flags — §5) remains the single index. The backend calls its
+  The `blobs` table (bitmap, complete, pinned, inline, and `durable` flag — §5)
+  remains the single index. The backend calls its
   narrow Store APIs only after I/O awaits have completed; it never holds a
   SQLite connection or transaction across an await.
 - **Dispatch** is `Arc<dyn CasBackend>` via the `async_trait` crate
@@ -249,14 +258,14 @@ Notes on the contract:
   where a backend with different CAS mechanics plugs in. A closed enum over the
   two implementations was considered and rejected only for that reason.
 - **One contract test suite, run against both backends.** The cloud suite runs
-  first against OpenDAL's memory service with fault injection, then as service
+  first against OpenDAL's memory service with failure injection, then as service
   integration tests against MinIO (S3), `fake-gcs-server` (GCS), and Azurite
   (Azure Blob): ingest/read/slice round-trips, partial
-  commit and finalize, proof promotion, materialize, delete idempotence,
-  maintenance/sweep behavior
+  commit and finalize, proof promotion, materialize, delete idempotence, and
+  maintenance behavior
   with a fabricated horizon, and the durability ordering itself
-  (crash-shaped: kill between backend ack and row commit, assert the
-  orphan is swept and never resurrected). The suite is the definition of
+  (crash-shaped: kill between backend ack and row commit, assert the durable
+  residue can be adopted or overwritten idempotently). The suite is the definition of
   backend correctness; a third backend is done when it passes.
 
 Node configuration selects the backend: `--cas-backend local|s3|gcs|azblob`
@@ -278,39 +287,28 @@ and extends it through the publish:
 backend object ack  →  backend commits blobs row (durable=1)  →  f:/b: records publish  →  client ack
 ```
 
-and for deletion, the existing row-first order:
-
-```
-backend_deletes intent + blobs row deletion (one transaction)
-    → backend.delete() → intent cleared
-```
-
-`backend_deletes(root, queued_at)` is a crash-recoverable handoff, not a second
-manifest. It exists only for remote backends because SQLite cannot hold a
-transaction across an object-store await: content GC commits the intent and row
-deletion together, then cloud maintenance performs the idempotent payload/
-outboard delete and clears the intent. A crash at any point retries safely; a
-lost intent still leaves an orphan for the seven-day LIST sweep.
+Cloud deletion stops at the SQLite claim and reconstructible cache. Final
+`cas/` keys are append-only: a content address may be shared by multiple nodes
+using the same bucket/root, and one node cannot know that every other node has
+released it without distributed reference counting. The storage residue is the
+deliberate price of avoiding that machinery.
 
 Consequences, given that Litestream replication is asynchronous:
 
 - A restored database can only be **behind** the cloud backend, never ahead: no
   row can claim a durable object that was never uploaded, because the upload
   completed before the row existed. The converse — objects no restored row
-  claims — is an orphan, collected by the sweep (§6.5).
-- One exception exists: a restore can **roll back a deletion**, resurrecting
-  a row whose object is already deleted. This is the one path to the "row
-  claims bytes that do not exist" state — documented in `cas.rs` as never
-  self-healing on the local backend — and on a supported cloud backend it becomes
-  *cheaply detectable*, because the admitted services have strong object
-  consistency and are authoritatively answerable: OpenDAL `NotFound` on an object the row claims durable is
-  proof, not a maybe-unmounted disk. §6.4 makes that a self-healing rule.
+  claims — is durable residue, reusable by retry or readoption (§6.5).
+- A restore can **roll back a deletion**, resurrecting its local row. The final
+  cloud object normally remains because deletion is local-only. If an operator
+  or provider lifecycle rule removed it, OpenDAL `NotFound` is authoritative and
+  §6.4 withdraws the stale claim.
 
 The ack at the end of the chain deserves its own statement. A gateway `PUT`
 is acknowledged after the publish transaction commits *locally*; Litestream
 ships that WAL segment asynchronously (default ~1 s). A crash inside that
 window loses the **metadata** of an acknowledged write while its **bytes**
-survive remotely as an orphan. §8.3 closes this window using the cluster itself
+survive remotely as unclaimed residue. §8.3 closes this window using the cluster itself
 where peers exist, and quantifies the residue where they do not.
 
 ---
@@ -329,11 +327,6 @@ Schema addition (shared by both backends):
 
 ```sql
 ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE blobs ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;
-CREATE TABLE backend_deletes (
-  root BLOB PRIMARY KEY,
-  queued_at INTEGER NOT NULL
-);
 ```
 
 On the local backend `durable` tracks `complete` trivially (backfilled by
@@ -350,13 +343,14 @@ the service builder (`S3`, `Gcs`, or `Azblob` initially); no provider type
 escapes the constructor. OpenDAL supplies authentication, request signing,
 credential refresh, retries, streaming readers/writers, range reads, listing,
 and normalized error kinds. It does **not** supply CAS semantics, bao
-verification, durability ordering, scratch generations, orphan policy, or
-quarantine — those remain this backend's code and are tested once against the
-trait contract.
+protocol verification, durability ordering, or scratch generations — those
+remain this backend's code and are tested once against the trait
+contract. Integrity of bytes already accepted by the service belongs to the
+service, not to a second application-level checker.
 
 At open the backend inspects `Operator::info()` and refuses a service without
 the semantic minimum: stat, whole/range read, streaming or multipart write,
-delete, recursive list, content length, and last-modified metadata. Copy is an
+delete, recursive list, and content length. Copy is an
 optional acceleration, never a correctness dependency. The service must also
 provide strongly consistent reads and listings after successful writes and
 deletes. S3, GCS, and Azure Blob meet that requirement; merely having an
@@ -404,7 +398,7 @@ backend's ephemeral scratch instead of depending on a provider's copy API:
 
 The final keys are immutable. A crash during step 1 loses only unacknowledged
 scratch. A crash during step 2 can leave one completed final object without its
-mate; until the row commits it is an orphan, and a retry completes or replaces
+mate; until the row commits it is unclaimed residue, and a retry completes or replaces
 the pair idempotently. OpenDAL may choose multipart/resumable upload internally;
 abandoned provider upload sessions are covered by provider lifecycle rules
 where available. A future copy fast path may upload `staging/<uuid>` while
@@ -441,7 +435,7 @@ operator reports copy support; it cannot change the baseline semantics.
 - **Reads** (`read_range`/`encode_slice`) serve from the cache when the
   groups are present, else use an OpenDAL range read in ≤ 8 MiB windows,
   fetch the outboard whole on first touch (it is 1/256 of the payload),
-  verify every group against it, commit to the cache, serve. To the engine
+  commit the trusted backend bytes to the cache, and serve. To the engine
   this is invisible: an object the store shows `durable` is never fetched
   from peers; a cold cache is the backend's private problem. Peers remain
   the source for objects this node does not hold at all — the fetch planner
@@ -457,14 +451,6 @@ operator reports copy support; it cannot change the baseline semantics.
   ad, and cloud objects untouched. Pinned blobs are evictable like any
   durable blob: on this backend the pin's promise is kept remotely, not by
   the cache.
-- **Verification failure** against a freshly read durable object is
-  **corruption of a durable copy** — possibly the only one — and is handled loudly: the
-  object is quarantined (row marked, ad retired, `synch doctor` reports
-  it) and the read falls back to peer donors if any exist. It is never
-  deleted. A failure involving a cached outboard first discards that
-  reconstructible cache state and retries the outboard from the durable tier;
-  only a fresh remote failure quarantines the object.
-
 ### 6.4 The NotFound heal rule
 
 OpenDAL `ErrorKind::NotFound` on an object a row claims `durable` is
@@ -479,29 +465,18 @@ permission, rate-limit, and generic transport errors are never translated into
 NotFound; they leave the durable claim intact and make the read degrade to cache
 and peers.
 
-### 6.5 Deletion, sweep, lifecycle
+### 6.5 Deletion and lifecycle
 
-Content GC's *decision* logic (pins, retention, references) is unchanged;
-`delete` removes cache files, then payload and outboard objects. A delete
-that fails or is lost to a crash leaves an orphan for the sweep.
+Content GC's *decision* logic (pins, retention, references) is unchanged, but
+on Cloud it deletes only the SQLite claim and reconstructible cache. Final
+payload/outboard keys under `cas/` are never deleted by the daemon. This makes a
+shared bucket/root safe: identical content has identical keys, and no node can
+delete another node's durable copy.
 
-**`sweep_orphans`** (a maintenance-loop pass, default daily): recursively list
-`cas/` through OpenDAL, delete any object whose hash is not in the live set and whose
-`LastModified` is older than the horizon — default **7 days**, doing double
-duty: it must exceed both the longest plausible ingest (an object uploaded
-before its row commits looks like an orphan until step 2 of §6.2 lands)
-and the deepest plausible **database rollback** (a Litestream restore that
-lost the row of an uploaded object must not race the sweep before the heal
-rules or a re-publish restore it). The cost is one provider request per listing
-page, daily.
-
-**Provider lifecycle rules** back the sweep so leaks have a floor even if the
-daemon never runs again: abort incomplete/resumable uploads after 7 days where
-the service exposes that policy; expire `staging/` after 7 days; expire
-`uploads/` (§9) after 7 days, matching the existing multipart-upload TTL.
-Lifecycle configuration is deployment work — OpenDAL intentionally does not
-manage bucket/container policy — and the daemon sweep remains the portable
-correctness path.
+Provider lifecycle rules may abort incomplete/resumable provider uploads and
+expire `uploads/` (§9) after the multipart TTL. They must not expire `cas/`
+final keys. Unclaimed final objects are accepted storage residue; re-ingest and
+self-readoption reuse them by deterministic address.
 
 ---
 
@@ -516,9 +491,12 @@ uploads/<upload-id>/<n>     §9
 
 One bucket/container, distinct prefixes. The two-hex shard stays for symmetry
 with the local layout and for services that partition request load by prefix.
+Multiple nodes may share the same CAS root because final keys are append-only;
+their SQLite claims and caches remain private.
 Objects are immutable and content-addressed, so object versioning is off;
-integrity does not come from provider ETags but from the address itself plus
-outboard verification on every read. Server-side encryption and key selection
+at-rest integrity is delegated to the configured storage service. The content
+address names writes and peer protocol verification still rejects hostile wire
+data, but backend reads are not re-hashed by the application. Server-side encryption and key selection
 are provider/deployment policy.
 
 Litestream configuration is separate. It may use a `db/` prefix in the same
@@ -558,11 +536,10 @@ credentials, not only static keys.
 | --- | --- | --- |
 | Scratch disk lost (container replaced) | Cache cold; Staged rows stale | Generation marker mismatch clears claims in one UPDATE (§6.1); refill on demand |
 | Crash mid-ingest | Scratch spill and possibly an incomplete provider upload; no durable row; client unacked | Backend scratch/provider lifecycle sweeps; client retries |
-| Crash between finalize and row | Durable object, no row | Orphan sweep after horizon; a retried ingest overwrites the same deterministic keys |
+| Crash between finalize and row | Durable object, no row | Retained append-only; a retried ingest or readoption reuses the deterministic keys |
 | Crash between row and publish | Window does not exist — row and staged records commit in one transaction, so the publish batch either carried the entry or the ingest never acked |  |
 | Crash between publish and Litestream ship | Acked write's metadata rolled back; bytes durable remotely | §8.3 |
-| DB restore rolls back a deletion | Row resurrected, object gone | OpenDAL NotFound heal on first read (§6.4); sweep horizon prevents the mirror-image race |
-| Cloud object corrupt | Read verification fails | Quarantine + doctor + peer fallback; never silent |
+| DB restore rolls back a deletion | Row resurrected; final object normally remains | Read succeeds; an operator-caused NotFound heals on first read (§6.4) |
 | Cloud service unavailable | Durable tier unreachable | Reads degrade to cache + peers; ingests and pinned fetches fail closed (nothing acks without durability); operation and maintenance errors are logged |
 
 ### 8.2 Litestream and the database
@@ -600,7 +577,8 @@ unlike the general recovery case these heads are self-signed and fully
 verifiable. Delegations, ads, entries — everything in the lost window
 comes back. Before maintenance starts, every recovered complete own `b:` ad
 (including a b-only pin) supplies its signed size to the backend; the backend
-verifies the final cloud pair and reconstructs any missing cold `durable` row.
+locates the final cloud pair, binds that size to the payload's OpenDAL
+`Content-Length`, and reconstructs any missing cold `durable` row.
 Provider reads repeat that safe adoption on demand, using the signed ad size
 rather than mutable object metadata. The mechanism reuses the recovery machinery's observation path
 and the ordinary trie fetch; what is new is the willingness to adopt an
@@ -610,7 +588,7 @@ key.
 **The residue.** A cluster where the serverless node has no peers — or
 none that heard the push — has an RPO of the Litestream sync interval
 (default 1 s) for *metadata only*. Bytes are never lost (they precede the
-ack remotely); the orphan sweep's horizon means they linger a week for manual
+ack remotely); append-only final keys remain available for manual
 salvage (`synch pin add <root>` re-publishes an ad; a re-`PUT` of the same
 content is a no-op upload). This residue is documented, not designed away:
 closing it would mean a synchronous redo log in cloud storage per publish batch,
@@ -642,9 +620,11 @@ parts cannot stage on scratch. Parts become cloud objects through OpenDAL:
   instead of a directory, with the lifecycle rule as its backstop.
 
 Local-backend nodes keep the `s3-uploads/` directory exactly as today; the
-part store is selected by the same backend switch. Completion re-verifies every
-part against the root acknowledged by `UploadPart`, then removes the whole
-remote upload prefix so superseded attempts cannot leak.
+part store is selected by the same backend switch. A successful part write and
+its immutable backend key are authoritative; completion does not re-hash each
+part. It still hashes the concatenated assembly once to determine the final CAS
+root, then removes the whole remote upload prefix so superseded attempts cannot
+leak.
 
 ---
 
@@ -717,8 +697,8 @@ mirror materialization) restructure so their CAS steps are awaited by the
 async orchestration that already wraps them. The standing rule "no
 `Store::conn` inside a transaction" gains a sibling: no backend await while
 holding a connection. LocalFs retains its short row-delete/unlink critical
-section and `WriteLease` race guard; Cloud commits `backend_deletes` and drains
-it asynchronously (§4), so no object-store await holds the SQLite mutex.
+section and `WriteLease` race guard; Cloud removes only local claims/cache, so
+final-CAS deletion needs no object-store await.
 
 **The refactor surface, honestly.** The implementation wraps the CAS half of
 `cas.rs`, `proof.rs`, and `gc.rs` in `LocalFs` and flips every semantic CAS call site in
@@ -754,7 +734,7 @@ cross-platform lifecycle lock a daemon takes before opening its Store or iroh
 endpoint, so a daemon cannot start and acknowledge a source-only write
 mid-migration. It probes rowless own ads and referenced entry roots against a
 cloud source, then walks every durable object plus every complete cache object
-whose verified bytes are still present (including inline content). Preserving
+whose bytes are still present (including inline content). Preserving
 complete cache objects keeps their published availability ads truthful; stale
 or partial nondurable filesystem rows are discarded at the switch. Every
 destination uses an isolated temporary SQLite index, so target retries or
@@ -762,7 +742,7 @@ failures cannot rewrite source durability before the final transaction,
 `ingest`s each into the new backend (content-addressed, so restartable and
 idempotent), then flips the stored backend setting at the end; `--to
 local` is the same walk in reverse, and cloud-to-cloud migration uses the same
-verified read/ingest path. Source and destination coexist only inside the
+read/ingest path. Source and destination coexist only inside the
 migration command; normal mixed operation is not supported — a
 node has one backend — which is the simplicity "backends" buys over
 "tiers", paid for by the migration being explicit.
@@ -777,9 +757,9 @@ gate below has executable evidence:
 2. OpenDAL integration and service factory; the Litestream/SIGTERM/
    busy-timeout/pin-state fixes (§8.2). Independently worthwhile.
 3. The cloud backend: portable scratch ingest, spill + finalize + upload policy,
-   read cache + maintenance target and eviction, generation marker, orphan
-   sweep, NotFound heal, quarantine/ad retirement/doctor reporting. The contract
-   suite runs against memory fault injection, MinIO, fake-gcs-server, and
+   read cache + maintenance target and eviction, generation marker,
+   append-only final keys, and NotFound heal. The contract suite runs against memory failure
+   injection, MinIO, fake-gcs-server, and
    Azurite in CI; those required emulator jobs cover every admitted builder's
    endpoint/auth configuration. Expiring workload credentials remain a
    deployment smoke test because CI cannot faithfully emulate their issuers.
@@ -788,7 +768,7 @@ gate below has executable evidence:
 6. Self-readoption at boot (§8.3), tested with a restored database behind an
    own-origin head retained by a peer.
 7. `synch cas migrate` in both directions and cloud-to-cloud, including restart
-   idempotence and refusal to flip the stored backend until verification ends.
+   idempotence and refusal to flip the stored backend until every copy ends.
 8. Workspace unit/integration tests, lint/format gates, and serverless fault
    tests pass without requiring durable local CAS state.
 
@@ -801,7 +781,7 @@ gate below has executable evidence:
   upload inline before the ack — that is the point.
 - **Requests and bytes**: the portable ingest baseline writes one payload and
   one outboard object after a local scratch/hash pass; cold reads use range
-  operations and the daily sweep recursively lists the CAS prefix. Gateway
+  operations. Gateway
   multipart completion pays one full remote read of the parts and one full
   remote write of the final payload. A capability-gated remote-copy path may
   reduce transferred bytes, but is not assumed by the contract.

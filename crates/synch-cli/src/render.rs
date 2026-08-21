@@ -513,18 +513,6 @@ pub fn doctor(node: &Node) -> Lines {
         "storage: {} trie nodes, {} trie values, {} objects ({} complete)",
         report.trie.nodes, report.trie.values, report.blobs.0, report.blobs.1
     ));
-    if !report.quarantined_blobs.is_empty() {
-        out.push(format!(
-            "  QUARANTINED: {} durable object(s) failed content verification",
-            report.quarantined_blobs.len()
-        ));
-        for root in &report.quarantined_blobs {
-            out.push(format!("    {root}"));
-        }
-        out.push(
-            "  their availability ads are retired; remote bytes are retained for diagnosis".into(),
-        );
-    }
     Ok(out)
 }
 

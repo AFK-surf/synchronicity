@@ -51,8 +51,8 @@ pub enum StoreError {
     /// A blob was not in the local content store.
     #[error("blob {0} is not in the local store")]
     MissingBlob(Hash),
-    /// A verified read or slice decode failed against the object root.
-    #[error("content verification failed for {root}: {reason}")]
+    /// Untrusted wire data or a metadata claim failed validation.
+    #[error("object validation failed for {root}: {reason}")]
     Verification {
         /// The object root the content failed against.
         root: Hash,
