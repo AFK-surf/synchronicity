@@ -1303,6 +1303,14 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   not publish either: the files land where the scanner will find them and the next
   scan (§7.1) publishes them as this node's own view.
 
+  A node in recovery refuses to fill (§3.4), like every other command that does
+  irreversible work before publishing. A scan refuses there too, so a fill would
+  write a tree nothing would ever announce — and `--force`'s own-origin guard,
+  which needs this node to publish something, would be inert while it did: a
+  recovering node publishes nothing under its own origin, so every path selects
+  a peer's version and every local file that differs is overwritten. `synch
+  recover`, then fill, then scan.
+
   A fill does not exclude the scanner: the two share no lock, and the fill's own
   writes are what wake the watcher (§7.1), so a scan running during a fill is
   the normal case rather than the exotic one. That is what the write-time guards

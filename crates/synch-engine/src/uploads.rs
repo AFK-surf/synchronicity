@@ -124,9 +124,16 @@ impl Node {
         principal: Option<&str>,
         _target: &Path,
     ) -> Result<String> {
+        // A space that does not exist cannot hold an upload; `refuse_if_ignored`
+        // passes over one rather than inventing an error, so it is named here.
+        if self.store().space(space)?.is_none() {
+            return Err(EngineError::not_found(format!("space {space}")));
+        }
         // A key the scanner would skip can never become an object, and finding
         // that out at completion — after the client has streamed gigabytes and
         // the parts have been consumed — is the worst possible moment for it.
+        // It is checked again there all the same: an upload outlives the rules
+        // it opened under.
         self.refuse_if_ignored(space, path)?;
         self.check_upload_capacity(principal)?;
         let id = new_upload_id()?;
@@ -383,8 +390,18 @@ impl Node {
         } else {
             let (node, space_owned, path_owned) =
                 (self.clone(), space.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_owned, &path_owned))
-                .await?
+            // Re-taken here and not only at initiate. An upload may have been
+            // open for days, and the rules can have changed under it — the same
+            // reason the recovery gate is re-taken at completion rather than
+            // trusted from when the upload opened. Without it, the one write
+            // path into a space that `refuse_if_ignored` did not reach would
+            // assemble the object into the indexed directory, publish nothing
+            // (the scan skips it), and answer the client `Ok`.
+            crate::blocking::offload(move || {
+                node.refuse_if_ignored(&space_owned, &path_owned)?;
+                node.adoption_target(&space_owned, &path_owned)
+            })
+            .await?
         };
 
         let (root, size) = if remote_parts {

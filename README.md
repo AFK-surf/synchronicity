@@ -279,7 +279,9 @@ synch fill media --force                                   # replace local files
 ```
 
 A fill does not publish. The files land where the scanner will find them, and
-the next scan publishes them as this node's own view — which is why a filled
+the next scan publishes them as this node's own view. A node in recovery (§3.4)
+therefore refuses to fill at all — a scan would refuse too, so the tree would
+sit there unannounced: run `synch recover` first, then fill, then scan — which is why a filled
 file carries the mtime and mode the origin published rather than this machine's
 clock: the version that gets republished is the one that was filled, not a
 newer one that would win every `newest` selection in the cluster. `--force` is

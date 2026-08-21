@@ -2288,7 +2288,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // so `--force` neither caused this nor resolves it.
             for path in &report.appeared {
                 out.line(format!(
-                    "appeared {}/{path} (written here while the fill ran; left alone)",
+                    "appeared {}/{path} (not the file this fill was shown; left alone)",
                     reference.space
                 ))
                 .await?;

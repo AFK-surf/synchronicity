@@ -136,6 +136,27 @@ impl Node {
         // state. Mirrors take the same lock; their roots cannot overlap a
         // space's, so sharing it costs nothing but the wait.
         let _pass = self.lock_materialization().await;
+        // Refused in recovery, before anything is written, for the reason every
+        // other command that does irreversible work before publishing takes
+        // this gate — and for one more that is specific to a fill.
+        //
+        // A recovering node holds no complete head of its own (§3.4), which is
+        // exactly the state an operator reaches for a fill in: the checkout is
+        // gone and the cluster has the content. But a scan refuses in recovery
+        // too, so everything filled would sit unpublished and the closing line
+        // of the command — "the next scan publishes what was filled" — would be
+        // false. Worse, `--force`'s own-origin guard is *inert* here: it fires
+        // when the selected version is this node's own, and a recovering node
+        // publishes nothing under its own origin, so every path selects a
+        // peer's version and every local file that differs is overwritten with
+        // no version, no `prev` and no trace. The guard against silent loss is
+        // missing precisely where the danger is greatest.
+        //
+        // `synch recover` first, then fill, then scan. The error names it.
+        {
+            let node = self.clone();
+            crate::blocking::offload(move || node.ensure_publishable()).await?;
+        }
         let plan = self.plan_fill(space_id, prefix, policy, options).await?;
         self.write_fill(plan).await
     }
@@ -269,6 +290,7 @@ impl Node {
                 target,
                 link_target,
                 replacing,
+                was,
             } = link;
             // The same three guards the object loop takes below, and for the
             // same reasons: `materialize_symlink` unlinks whatever stands at the
@@ -282,10 +304,14 @@ impl Node {
                 if escapes_via_symlink(&root, &guarded) {
                     return Ok(Err(ESCAPED.to_string()));
                 }
-                let over = target.symlink_metadata().is_ok();
-                if over && !replacing {
-                    return Ok(Err(APPEARED.to_string()));
-                }
+                // Identity, not just existence: `--force` answers for the
+                // file the operator was shown, and a path that has become
+                // something else since is not it.
+                let over = match target.symlink_metadata() {
+                    Ok(stat) if replacing && was.as_ref() == Some(&signature(&stat)) => true,
+                    Ok(_) => return Ok(Err(APPEARED.to_string())),
+                    Err(_) => false,
+                };
                 Ok(materialize_symlink(&target, Some(&link_target)).map(|_| over))
             })
             .await?;
@@ -619,6 +645,11 @@ struct PendingLink {
     link_target: String,
     /// Whether something is being replaced, which only `--force` reaches.
     replacing: bool,
+    /// What the plan saw at the target, as [`signature`]. The write compares
+    /// against it for the same reason the object path does: `materialize_symlink`
+    /// unlinks whatever stands there, so a link destroys a file rewritten since
+    /// the plan exactly as a rename does.
+    was: Option<(u64, i64, Option<Vec<u8>>)>,
 }
 
 /// Decides, and performs, everything a fill can settle without the network.
@@ -809,6 +840,7 @@ fn decide(
                     target,
                     link_target: wanted_target.unwrap_or_default().to_string(),
                     replacing: on_disk.is_some(),
+                    was: on_disk.as_ref().map(signature),
                 });
             }
             continue;
@@ -1954,6 +1986,74 @@ mod tests {
         );
         assert_eq!(report.appeared, vec!["f.txt".to_string()], "{report:?}");
         assert!(report.replaced.is_empty(), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// The identity check covers links as well as objects: `--force` answers
+    /// for the file the operator was shown, and a link that unlinks whatever
+    /// stands there loses it as completely as a rename does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_does_not_unlink_a_file_edited_during_the_plan() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("latest");
+        std::fs::write(&target, b"what the plan saw").unwrap();
+        publish_link(&node, &peer(), "latest", "v1");
+
+        let plan = node
+            .fill_plan_with_options_for_test(
+                "media",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: true,
+                    dry_run: false,
+                },
+            )
+            .await;
+        std::fs::write(&target, b"edited since the plan looked").unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"edited since the plan looked",
+            "a link must not unlink a file the operator was never shown"
+        );
+        assert_eq!(report.appeared, vec!["latest".to_string()], "{report:?}");
+        assert!(report.replaced.is_empty(), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A recovering node cannot publish, so a fill would write a tree nothing
+    /// would ever announce — and `--force`'s own-origin guard, which needs this
+    /// node to publish something, would be inert while it did.
+    #[tokio::test]
+    async fn a_recovering_node_refuses_to_fill() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "f.txt", b"theirs", STAMP);
+        // The observation that puts a node into key-loss recovery (§3.4): a
+        // peer advertising a head for our own origin that we have no history
+        // for.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        let refused = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert!(
+            !space.path().join("f.txt").exists(),
+            "nothing is written before the gate"
+        );
         node.shutdown().await.unwrap();
     }
 
