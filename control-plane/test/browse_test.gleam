@@ -454,6 +454,97 @@ pub fn a_request_may_name_its_node_test() {
     == Error("no attached daemon holds media")
 }
 
+fn replicates(spaces: List(String)) -> List(agent.ReplicaSpace) {
+  list.map(spaces, fn(space) {
+    agent.ReplicaSpace(
+      space: space,
+      policy: "tree",
+      grace_secs: 2_592_000,
+      budget: 0,
+      held: 1,
+      held_bytes: 10,
+      releasing: 0,
+      releasing_bytes: 0,
+      wanted: 0,
+      wanted_bytes: 0,
+      unreachable: 0,
+      unreachable_bytes: 0,
+      held_back: 0,
+      oldest_want: 0,
+      next_release: 0,
+      view_complete: True,
+      view_reason: "",
+    )
+  })
+}
+
+/// How many nodes hold a space is the one fact reading each node on its own
+/// cannot show: a space one node replicates keeps every superseded version in
+/// exactly one place, and looks identical, node by node, to one that three
+/// nodes hold.
+pub fn a_space_is_counted_once_per_node_that_replicates_it_test() {
+  let nas =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media", "docs"]),
+      "",
+      "",
+    )
+  let laptop =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  // First-seen order, so the listing does not reshuffle between polls.
+  assert browse_api.replica_counts([nas, laptop])
+    == [#("media", 2), #("docs", 1)]
+}
+
+/// A daemon that could not be asked contributes nothing — not a zero.
+///
+/// Silence is not evidence that a node does not replicate a space. Counting it
+/// as though it were would report the fleet as thinner than it is, which is
+/// the direction that has somebody acting on a number nobody measured.
+pub fn a_node_that_refused_is_not_counted_as_replicating_nothing_test() {
+  let answered =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  let silent =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      [],
+      "unavailable",
+      "the attached daemon did not answer in time",
+    )
+  assert browse_api.replica_counts([answered, silent]) == [#("media", 1)]
+  // And a fleet where nobody answered reports no coverage at all rather than
+  // a row saying zero.
+  assert browse_api.replica_counts([silent]) == []
+}
+
+/// Asking every daemon must not cost a full timeout per daemon: the questions
+/// go out together, so the budget is shared rather than laid end to end.
+pub fn asking_a_fleet_does_not_multiply_the_wait_test() {
+  let one = agent.per_node_timeout(1)
+  // One daemon keeps the window it always had.
+  assert agent.per_node_timeout(0) == one
+  assert agent.per_node_timeout(4) == one / 4
+  // With a floor, so a large fleet still gives each node a wait worth having
+  // — bounded total beats an unbounded one, but not at the cost of a budget
+  // too short for any daemon to answer within.
+  assert agent.per_node_timeout(1000) == 1000
+}
+
 /// Reads are same-origin GETs with cookies and no CSRF token, so a hostile
 /// page can start one with an `img` tag. The cap is what bounds how many.
 pub fn one_user_may_not_open_unbounded_downloads_test() {

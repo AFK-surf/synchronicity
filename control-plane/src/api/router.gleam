@@ -289,6 +289,11 @@ fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
         use who <- with_principal(req, reads)
         browse_api.delegations(reads, browse, who, slug, net)
       })
+    ["api", "orgs", slug, "networks", net, "replication"], Get ->
+      Some({
+        use who <- with_principal(req, reads)
+        browse_api.replication(reads, browse, who, slug, net)
+      })
     ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
       Some({
         use who <- with_principal(req, reads)

@@ -13,8 +13,9 @@
 //// trail.
 ////
 //// Nothing in this module writes to a cluster. The frames it can encode ask
-//// for a listing, a version set, a resolution or a byte range; there is no
-//// opcode for anything else, which is where the read-only property lives.
+//// for a listing, a version set, a resolution, a byte range, who the cluster
+//// admits, or what a node replicates; there is no opcode for anything else,
+//// which is where the read-only property lives.
 
 import api/middleware.{now_unix}
 import gleam/bit_array
@@ -47,7 +48,11 @@ fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 /// A mismatch is a refusal naming both versions, not a negotiation: protobuf
 /// keeps a field addition readable, but nothing makes a control plane that has
 /// not learnt a frame out of one that has.
-pub const protocol_version = 2
+///
+/// v3 added the replication query. Both ends are deployed together or the
+/// attach is refused by a sentence naming both numbers, which is the point of
+/// checking rather than hoping.
+pub const protocol_version = 3
 
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
@@ -144,6 +149,12 @@ pub type Question {
   /// argument: delegations reach every member, so whichever node answers
   /// speaks for the whole network.
   Delegations
+  /// What the answering node replicates, and how far behind it is
+  /// (`docs/REPLICATION.md` §8). Takes no argument either, but for the
+  /// opposite reason to `Delegations`: replication is a per-node decision, so
+  /// this speaks for the node asked and no other — which is why the handler
+  /// asks every attached daemon and labels each answer.
+  Replication
 }
 
 /// What a question is answered with.
@@ -158,6 +169,49 @@ pub type Answer {
     holders: List(String),
   )
   Delegated(delegations: List(Delegation))
+  Replicating(spaces: List(ReplicaSpace))
+}
+
+/// One replicated space, as the node reports it (`docs/REPLICATION.md` §8).
+///
+/// The counts are the node's own and are carried through unfolded. `wanted`
+/// includes `unreachable`, because that is what the node means by it: objects
+/// no provider has answered for are not a backlog that is draining, they are
+/// versions that are probably already gone, and the difference is the whole
+/// reason to watch a replica. A field that added them together would hide the
+/// one number this panel exists to show.
+///
+/// `budget`, `oldest_want` and `next_release` read as `0` when the node sends
+/// null, the same way a delegation with no expiry does.
+pub type ReplicaSpace {
+  ReplicaSpace(
+    space: String,
+    /// `tree` or `archive`.
+    policy: String,
+    grace_secs: Int,
+    /// The ceiling on held bytes, or 0 for none.
+    budget: Int,
+    held: Int,
+    held_bytes: Int,
+    releasing: Int,
+    releasing_bytes: Int,
+    wanted: Int,
+    wanted_bytes: Int,
+    unreachable: Int,
+    unreachable_bytes: Int,
+    /// Objects the tree has stopped naming that the node holds anyway,
+    /// because too few other origins advertise them.
+    held_back: Int,
+    /// When the oldest outstanding want was first wanted, unix nanoseconds,
+    /// or 0 for none.
+    oldest_want: Int,
+    /// When the soonest scheduled release falls due, unix nanoseconds, or 0.
+    next_release: Int,
+    /// Whether releases are running at all. Paused is the difference between
+    /// a replica that is behaving and one that is stuck.
+    view_complete: Bool,
+    view_reason: String,
+  )
 }
 
 /// One delegated key, as the node reports it.
@@ -437,6 +491,58 @@ pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
   }
 }
 
+/// Asks every attached daemon the same question and collects what came back.
+///
+/// Every question goes out before any answer is waited for, so the daemons
+/// work in parallel and the waits overlap. Asking them one at a time with
+/// `ask` would lay a full `query_timeout` end to end per wedged daemon, and
+/// a fleet with a few of those turns one dashboard panel into a request
+/// measured in minutes.
+///
+/// A daemon that refuses or falls silent comes back as its own `Error` rather
+/// than failing the call: the answer to "what does the fleet replicate" is
+/// per node, so one node that cannot say is a fact about that node and not a
+/// reason to withhold the others.
+pub fn ask_all(
+  sessions: List(Session),
+  question: Question,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  let budget = per_node_timeout(list.length(sessions))
+  let pending =
+    list.map(sessions, fn(session) {
+      let reply = process.new_subject()
+      process.send(session.inbox, Query(question, reply))
+      #(session, reply)
+    })
+  list.map(pending, fn(entry) {
+    let #(session, reply) = entry
+    let answer = case process.receive(reply, budget) {
+      Ok(answer) -> answer
+      Error(Nil) ->
+        Error(Refusal(
+          "unavailable",
+          "the attached daemon did not answer in time",
+        ))
+    }
+    #(session, answer)
+  })
+}
+
+/// How long each daemon gets when several are asked together.
+///
+/// One daemon keeps the whole window it has always had. Several share it, with
+/// a floor so a large fleet does not give each node a wait too short to be
+/// one. The sharing costs less than it looks: the questions went out first, so
+/// by the time the last session is waited on, its answer has usually been
+/// sitting in the mailbox for most of the budget already — and a receive on a
+/// message that has arrived returns at once.
+pub fn per_node_timeout(nodes: Int) -> Int {
+  case nodes <= 1 {
+    True -> query_timeout
+    False -> int.max(query_timeout / nodes, 1000)
+  }
+}
+
 // -- the attach endpoint -----------------------------------------------------
 
 /// What the attach endpoint needs to do its work.
@@ -557,6 +663,7 @@ fn incoming(
     Ok("versions"), Live(_) -> answered(state, body, versions_decoder())
     Ok("resolved"), Live(_) -> answered(state, body, resolved_decoder())
     Ok("delegations"), Live(_) -> answered(state, body, delegations_decoder())
+    Ok("replication"), Live(_) -> answered(state, body, replication_decoder())
     Ok("meta"), Live(_) -> streamed(state, body, meta_decoder())
     Ok("done"), Live(_) -> streamed(state, body, done_decoder())
     Ok("err"), Live(_) -> streamed(state, body, error_decoder())
@@ -1025,6 +1132,11 @@ fn question_json(id: Int, question: Question) -> Json {
         #("t", json.string("delegations")),
         #("id", json.int(id)),
       ])
+    Replication ->
+      json.object([
+        #("t", json.string("replication")),
+        #("id", json.int(id)),
+      ])
   }
 }
 
@@ -1136,6 +1248,51 @@ fn delegations_decoder() -> Decoder(#(Int, Answer)) {
     decode.list(delegation_decoder()),
   )
   decode.success(#(id, Delegated(delegations)))
+}
+
+fn replica_space_decoder() -> Decoder(ReplicaSpace) {
+  use space <- decode.field("space", decode.string)
+  use policy <- decode.field("policy", decode.string)
+  use grace_secs <- decode.optional_field("grace_secs", 0, nullable_int())
+  use budget <- decode.optional_field("budget", 0, nullable_int())
+  use held <- decode.field("held", decode.int)
+  use held_bytes <- decode.field("held_bytes", decode.int)
+  use releasing <- decode.field("releasing", decode.int)
+  use releasing_bytes <- decode.field("releasing_bytes", decode.int)
+  use wanted <- decode.field("wanted", decode.int)
+  use wanted_bytes <- decode.field("wanted_bytes", decode.int)
+  use unreachable <- decode.field("unreachable", decode.int)
+  use unreachable_bytes <- decode.field("unreachable_bytes", decode.int)
+  use held_back <- decode.field("held_back", decode.int)
+  use oldest_want <- decode.optional_field("oldest_want", 0, nullable_int())
+  use next_release <- decode.optional_field("next_release", 0, nullable_int())
+  use view_complete <- decode.field("view_complete", decode.bool)
+  use view_reason <- decode.optional_field("view_reason", "", nullable_string())
+  decode.success(ReplicaSpace(
+    space,
+    policy,
+    grace_secs,
+    budget,
+    held,
+    held_bytes,
+    releasing,
+    releasing_bytes,
+    wanted,
+    wanted_bytes,
+    unreachable,
+    unreachable_bytes,
+    held_back,
+    oldest_want,
+    next_release,
+    view_complete,
+    view_reason,
+  ))
+}
+
+fn replication_decoder() -> Decoder(#(Int, Answer)) {
+  use id <- decode.field("id", decode.int)
+  use spaces <- decode.field("spaces", decode.list(replica_space_decoder()))
+  decode.success(#(id, Replicating(spaces)))
 }
 
 fn meta_decoder() -> Decoder(#(Int, Event)) {
