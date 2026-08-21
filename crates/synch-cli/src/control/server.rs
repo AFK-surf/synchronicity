@@ -2284,8 +2284,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             // Kept apart from `differing` because the advice is the opposite:
-            // these are paths nothing had looked at when the fill planned them,
-            // so `--force` neither caused this nor resolves it.
+            // these are paths that are no longer what the fill was shown, so
+            // `--force` — which answers for the file it was pointed at —
+            // neither caused this nor resolves it.
             for path in &report.appeared {
                 out.line(format!(
                     "appeared {}/{path} (not the file this fill was shown; left alone)",

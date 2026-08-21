@@ -710,7 +710,7 @@ impl Node {
     /// indexing pipeline republishes them as this node's entry, with `prev`
     /// pointing at the content we replaced.
     pub fn adopt(&self, space_id: &str, path: &str, content: &[u8]) -> Result<PathBuf> {
-        self.refuse_if_ignored(space_id, path)?;
+        self.ensure_adoptable(space_id, path)?;
         let target = self.adoption_target(space_id, path)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -761,7 +761,7 @@ impl Node {
         let target = {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
             crate::blocking::offload(move || {
-                node.refuse_if_ignored(&space_id, &path)?;
+                node.ensure_adoptable(&space_id, &path)?;
                 node.adoption_target(&space_id, &path)
             })
             .await?
@@ -784,6 +784,9 @@ impl Node {
     /// here to remove — which is not an error: the assertion being adopted is
     /// "this path is gone", and it already is.
     pub fn adopt_deletion(&self, space_id: &str, path: &str) -> Result<Option<PathBuf>> {
+        // The publishability half only: an excluded path is exactly the stray
+        // file a deletion is here to clear up (`refuse_if_ignored`).
+        self.ensure_publishable()?;
         if self.is_detached_space(space_id)? {
             let normalized = normalized_adoption_path(path)?;
             let previous = self
@@ -826,7 +829,7 @@ impl Node {
     /// the control socket — where holding the object in memory to call the
     /// other one is exactly what must not happen.
     pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
-        self.refuse_if_ignored(space_id, path)?;
+        self.ensure_adoptable(space_id, path)?;
         if self.is_detached_space(space_id)? {
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
@@ -918,6 +921,22 @@ impl Node {
             (blob_key(&root), Some(ad)),
         ]);
         Ok(())
+    }
+
+    /// The gates every adoption into a space directory takes, before it
+    /// touches anything.
+    ///
+    /// Publishability first. A node in key-loss recovery cannot publish (§3.4),
+    /// and an adoption that writes before finding that out has destroyed the
+    /// local copy and can tell nobody — no version, no `prev`, no trace. That
+    /// is the reasoning `Node::delete_object` already states over the very same
+    /// `adopt_deletion` this guards; `synch take` reached the gate only at its
+    /// publish, which is after the file is gone.
+    ///
+    /// Then the space's own ignore rules.
+    pub(crate) fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
+        self.ensure_publishable()?;
+        self.refuse_if_ignored(space_id, path)
     }
 
     /// Refuses a write at a path the space's own ignore rules exclude.

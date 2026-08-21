@@ -13,6 +13,11 @@
 //! - a local file whose bytes already differ is reported and left alone.
 //!   `--force` replaces it, which is the bulk form of `synch take`.
 //!
+//! Nothing here publishes, and a node that *cannot* publish does not fill at
+//! all: a scan would refuse there too, so the tree would sit unannounced — and
+//! `--force`'s own-origin guard, which needs this node to publish something,
+//! would be inert while it wrote. `synch recover` first (§3.4).
+//!
 //! Nothing here publishes. The files land in an indexed directory, so the next
 //! scan — the watcher's, or an explicit `synch scan` — stages and publishes
 //! them as this node's own view (§7.1), exactly as it would files copied in by
@@ -82,10 +87,12 @@ pub struct FillReport {
     /// Paths whose local copy differs from the selected version and was left
     /// alone. `--force`, or `synch take` per path, is what ends the standoff.
     pub differing: Vec<String>,
-    /// Paths that were empty when this fill planned them and were not by the
-    /// time it came to write. Refused whatever the flags say — `--force` means
-    /// "replace what I have looked at", and nobody has looked at these — so
-    /// they are kept apart from `differing`, which `--force` does resolve.
+    /// Paths that are no longer the thing this fill was shown: a path the plan
+    /// found empty that something now stands at, and equally one whose file has
+    /// been rewritten since the plan stat'd it. Refused whatever the flags say
+    /// — `--force` answers for the file it was pointed at, not for whatever the
+    /// path became while an object was being fetched — so they are kept apart
+    /// from `differing`, which `--force` does resolve.
     pub appeared: Vec<String>,
     /// Paths a fill could not write, with the reason — including every path a
     /// `strict` fill refused to guess at.
@@ -362,10 +369,13 @@ impl Node {
                 continue;
             }
 
-            // Both guards are re-taken here, in the same blocking step as the
-            // write they protect, because a fetch stands between the plan and
-            // this point and each of them describes something that can have
-            // moved in the meantime.
+            // Both guards are re-taken here because a fetch stands between the
+            // plan and this point and each of them describes something that can
+            // have moved in the meantime. Not in the same step as the write:
+            // `materialize_blob` is its own await below, and a clone-or-copy
+            // cannot be held under a stat. The window this closes is the fetch;
+            // what is left is the materialization, which the link loop — where
+            // stat and write really are one step — does not have.
             //
             // The escape guard is the mirror's, and describes the *directory*
             // the write lands in — `escapes_via_symlink` pops the last
@@ -594,8 +604,9 @@ enum Ready {
     RootGone(String),
     /// An ancestor is a symlink: the write would land outside the space.
     Escaped,
-    /// Nothing was here when this path was planned and something is here now.
-    /// A file that arrives mid-fill belongs to whoever wrote it.
+    /// What is at the path now is not what the plan looked at — nothing was
+    /// here and something is, or the file has been rewritten since. Either way
+    /// it belongs to whoever wrote it.
     Appeared,
 }
 
@@ -608,7 +619,7 @@ enum Written {
     WithoutMetadata(crate::CloneKind, String),
     /// Refused by the symlink-escape guard: nothing was written.
     Escaped,
-    /// Refused because the path stopped being empty while the fill ran.
+    /// Refused because the path is no longer the thing the plan looked at.
     Appeared,
     /// The object could not be materialized. The target is as it was.
     Failed(String),
@@ -816,13 +827,15 @@ fn decide(
                 .is_some_and(|link| Some(link.to_string_lossy().as_ref()) == wanted_target);
             if current {
                 report.current += 1;
+            } else if let Some(reason) = symlink_refusal(wanted_target) {
+                // Asked in the plan rather than at the write, so a dry run
+                // cannot promise a link this platform will refuse — on every
+                // non-unix one, that is all of them. And before the `differing`
+                // arm, so a path there is never told "--force replaces it" by a
+                // platform that will answer `--force` with this same refusal.
+                report.skipped.push((set.path.clone(), reason));
             } else if on_disk.is_some() && !options.force {
                 report.differing.push(set.path.clone());
-            } else if let Some(reason) = symlink_refusal(wanted_target) {
-                // Asked here rather than at the write, so a dry run cannot
-                // promise a link this platform will refuse — on every non-unix
-                // one, that is all of them.
-                report.skipped.push((set.path.clone(), reason));
             } else if on_disk.is_some() && selected.origin == *node.origin() {
                 // The same refusal the regular-file branch makes, for the same
                 // reason: `--force` adopts a peer's version, and this version is
@@ -975,8 +988,8 @@ fn root_is_gone(root: &Path) -> Option<String> {
 /// The refusal reported for a path whose ancestors include a symlink.
 const ESCAPED: &str = "path resolves through a symlink; refusing to write outside the space";
 
-/// The marker the write guards use for a path that stopped being empty while
-/// the fill ran. Never shown to anyone: the caller turns it into a
+/// The marker the write guards use for a path that is no longer the thing the
+/// plan looked at. Never shown to anyone: the caller turns it into a
 /// [`FillReport::appeared`] entry, which the CLI describes in its own words.
 const APPEARED: &str = "a file appeared here while the fill ran";
 
@@ -2054,6 +2067,48 @@ mod tests {
             !space.path().join("f.txt").exists(),
             "nothing is written before the gate"
         );
+        node.shutdown().await.unwrap();
+    }
+
+    /// `synch take` adopts by writing into the space and publishing after. On a
+    /// node that cannot publish, doing the write first destroys the local copy
+    /// and can tell nobody — so the gate is taken before anything is touched,
+    /// for content and for a deletion alike.
+    #[tokio::test]
+    async fn a_recovering_node_adopts_nothing() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("f.txt");
+        std::fs::write(&target, b"mine, unscanned").unwrap();
+        publish(&node, &peer(), "f.txt", b"theirs", STAMP);
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        let refused = node
+            .adopt_from(&peer(), "media", "f.txt")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"mine, unscanned",
+            "the local copy must survive an adoption that could never be published"
+        );
+
+        let refused = node
+            .adopt_deletion("media", "f.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert!(target.exists(), "and a deletion must not unlink it either");
         node.shutdown().await.unwrap();
     }
 
