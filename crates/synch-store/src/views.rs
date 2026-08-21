@@ -1319,9 +1319,17 @@ fn apply_change(
         // overwritten still names. Skipped entirely when nothing replicates
         // this space, which is the ordinary node and must not pay for this.
         let target = replicas.get(&space);
-        let superseded = match target {
-            None => None,
-            Some(_) => current_content(tx, origin, &space, &path)?,
+        let superseded = match (target, change.kind) {
+            // Nothing replicates this space, so none of this applies — the
+            // ordinary node must not pay a lookup per leaf for a feature it
+            // does not use.
+            (None, _) => None,
+            // `Added` means the key was not under the old root, and `entries`
+            // is derived from the trie, so there is no row to supersede. Worth
+            // the special case: a first sync of a replicated space is millions
+            // of `Added` leaves and this is a query on each of them.
+            (Some(_), ChangeKind::Added) => None,
+            (Some(_), _) => current_content(tx, origin, &space, &path)?,
         };
         match change.kind {
             ChangeKind::Deleted => {
