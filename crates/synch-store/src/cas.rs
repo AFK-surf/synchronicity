@@ -1040,52 +1040,65 @@ impl Store {
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
         self.with_immediate_tx(|tx| {
+            let key = root.as_bytes().to_vec();
+            // Read before anything is written: this row is the most
+            // authoritative record of the object's size, and it is about to be
+            // withdrawn or deleted.
+            let size: Option<i64> = tx
+                .query_row(
+                    "SELECT size FROM blobs WHERE root = ?1",
+                    params![key.clone()],
+                    |row| row.get(0),
+                )
+                .optional()?;
             let changed = tx.execute(
                 "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
-                params![root.as_bytes().to_vec()],
+                params![key.clone()],
             )?;
-            let dropped = tx.execute(
+            tx.execute(
                 "DELETE FROM blobs
                    WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
-                params![root.as_bytes().to_vec()],
+                params![key.clone()],
             )?;
             // A replica's claim must not outlive the bytes it was a promise
             // about (`docs/REPLICATION.md` §8). This is the one place where
             // absence of bytes *is* evidence: the backend answered `NotFound`
-            // about a content address, which is a statement, unlike `entries`
+            // about a content address, which is a statement — unlike `entries`
             // merely not naming a root.
             //
-            // Turning the claim back into a want rather than dropping it
-            // outright is what closes the hole. Both staging paths skip a root
-            // this holder already pins, so a pin left standing over a deleted
-            // row is one no sweep can ever re-want: the node would go on
-            // counting the object as held, advertising coverage it does not
-            // have, for ever. The operator's own pins are left alone — those
-            // are a person's promise, not this node's bookkeeping, and a
-            // vanished object is something they should be told about rather
-            // than have quietly rewritten.
-            if dropped > 0 {
-                // Re-wanted only where an entry still names the root, because
-                // the entry is where the size comes from and a want without one
-                // cannot be fetched — the design refuses a bare root nobody
-                // holds for exactly that reason. A root no entry names is a
-                // superseded version being held out its grace window: its bytes
-                // are gone, nothing can restore them, and a want that could
-                // only ever fail would dress that up as a backlog.
+            // Gated on the *withdrawal*, not on the row disappearing. A cloud
+            // replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
+            // ordinary course of things — the cache LRU clears a durable row
+            // and any later ranged read writes a partial bitmap back — and for
+            // such a row the delete above matches nothing. Gating on it left
+            // the pin standing over bytes that are neither complete nor
+            // durable, which is the same permanent hole this exists to close:
+            // both staging paths skip a root the holder already pins, so no
+            // sweep could ever re-want it.
+            if changed > 0 {
+                // `blobs.size` is `NOT NULL` and `changed > 0` means the row
+                // was there to withdraw, so the size is always in hand — which
+                // is the point: a root no entry names is still re-fetchable
+                // from any provider that has it, and `blob_providers` survives
+                // independently of `entries`. Dropping such a claim silently
+                // would lose exactly the objects an `archive` replica is bought
+                // to keep, since nothing else names a superseded version.
                 tx.execute(
                     "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
-                     SELECT p.root, p.holder, e.size, NULL, ?2
+                     SELECT p.root, p.holder, ?2, NULL, ?3
                        FROM pins p
-                       JOIN (SELECT content, MIN(size) AS size FROM entries
-                              WHERE content IS NOT NULL GROUP BY content) e
-                         ON e.content = p.root
                       WHERE p.root = ?1 AND p.holder LIKE 'replica:%'
                      ON CONFLICT(root, holder) DO NOTHING",
-                    params![root.as_bytes().to_vec(), synch_core::now_ns()],
+                    params![key.clone(), size.unwrap_or(0), synch_core::now_ns()],
                 )?;
+                // The claim goes either way: it was a promise about bytes this
+                // node no longer holds. The operator's own pins are left alone
+                // — those are a person's promise, not this node's bookkeeping,
+                // and a vanished object is something they should be told about
+                // rather than have quietly rewritten.
                 tx.execute(
                     "DELETE FROM pins WHERE root = ?1 AND holder LIKE 'replica:%'",
-                    params![root.as_bytes().to_vec()],
+                    params![key],
                 )?;
             }
             Ok(changed > 0)

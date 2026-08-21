@@ -250,13 +250,24 @@ impl Store {
         // larger than a space's remaining budget, say — so it is handed a
         // ranked window rather than exactly `limit` rows.
         let mut out = Vec::new();
-        while per_space.iter_mut().any(|space| match space.next() {
-            Some(want) => {
-                out.push(want);
-                true
+        loop {
+            // Every space advances on every round. `any` will not do here: it
+            // short-circuits on the first space that still has a want, so the
+            // loop restarts at that space each time and emits its whole window
+            // before touching the next — a concatenation wearing a
+            // round-robin's shape, which is exactly the starvation this exists
+            // to prevent.
+            let mut progressed = false;
+            for space in per_space.iter_mut() {
+                if let Some(want) = space.next() {
+                    out.push(want);
+                    progressed = true;
+                }
             }
-            None => false,
-        }) {}
+            if !progressed {
+                break;
+            }
+        }
         Ok(out)
     }
 
@@ -993,18 +1004,64 @@ mod tests {
     }
 
     #[test]
-    fn a_withdrawn_claim_over_content_nothing_names_is_simply_dropped() {
+    fn a_withdrawn_claim_is_re_wanted_even_when_cache_residue_survives() {
         let (_dir, store) = store();
-        let root = synch_core::Hash::new(b"a superseded version, held out its grace");
+        let payload = crate::testutil::data(120_000);
+        let root = synch_core::Hash::new(&payload);
+        store
+            .record_remote_durable_blob(&root, payload.len() as u64, 1)
+            .unwrap();
+        store
+            .put_entry(
+                &origin(),
+                "media",
+                "big.bin",
+                &synch_core::FileEntry::file(payload.len() as u64, 1, root, 1),
+            )
+            .unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+
+        // A cloud replica reaches this state routinely: the cache LRU clears a
+        // durable row, and any later ranged read writes a partial bitmap back.
+        // The row therefore survives the heal's delete — which is what made
+        // gating the pin conversion on that delete leave the claim standing
+        // over bytes that are neither complete nor durable.
+        store
+            .conn()
+            .execute(
+                "UPDATE blobs SET complete = 0, bitmap = X'01' WHERE root = ?1",
+                params![root.as_bytes().to_vec()],
+            )
+            .unwrap();
+
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+        assert!(
+            store.pins_for(&root).unwrap().is_empty(),
+            "the claim must not outlive the durable promise it was made about"
+        );
+        let wants = store.wants_of(&media()).unwrap();
+        assert_eq!(wants.len(), 1, "and the replica must want it again");
+        assert_eq!(wants[0].size, payload.len() as u64);
+    }
+
+    #[test]
+    fn a_withdrawn_claim_is_re_wanted_even_when_no_entry_names_the_root() {
+        let (_dir, store) = store();
+        let root = synch_core::Hash::new(b"a superseded version an archive still holds");
         store.record_remote_durable_blob(&root, 4096, 1).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
-        // No entry names it, so there is no size to fetch by and nothing to
-        // restore. A want here could only ever fail, and would dress a
-        // permanent loss up as a backlog.
+        // No entry names it — an `archive` replica's pins over superseded roots
+        // stand for ever by design, and nothing else in the tree points at
+        // them. The size is still known from this node's own row, and
+        // `blob_providers` survives independently of `entries`, so the object
+        // may well still be fetchable. Dropping the claim quietly here would
+        // lose precisely the objects that policy is bought to keep.
         assert!(store.heal_missing_durable_blob(&root).unwrap());
         assert!(store.pins_for(&root).unwrap().is_empty());
-        assert!(store.wants_of(&media()).unwrap().is_empty());
+        let wants = store.wants_of(&media()).unwrap();
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].size, 4096);
     }
 
     #[test]
@@ -1037,11 +1094,18 @@ mod tests {
             .stage_want(&synch_core::Hash::new(b"docs one"), &docs, 10, None, 9_000)
             .unwrap();
 
-        let batch = store.wants_to_attempt(1_000_000, 60, 3600, 4).unwrap();
+        // The caller admits the first `limit` rows and no more, so membership in
+        // the whole window proves nothing: under a concatenation `docs` sits at
+        // the end of a 33-row window and is never reached. Assert on the prefix
+        // the fetch loop actually takes.
+        let limit = 4;
+        let batch = store.wants_to_attempt(1_000_000, 60, 3600, limit).unwrap();
+        let admitted: Vec<&PinHolder> = batch.iter().take(limit).map(|w| &w.holder).collect();
         assert!(
-            batch.iter().any(|want| want.holder == docs),
-            "a space added after a large backlog must still get a turn, or it \
-             fetches nothing until the backlog drains — months, at four a pass"
+            admitted.contains(&&docs),
+            "a space added after a large backlog must get a turn inside the first \
+             {limit} wants, or it fetches nothing until the backlog drains — \
+             months, at four a pass. Admitted: {admitted:?}"
         );
     }
 

@@ -479,20 +479,6 @@ impl Store {
             .optional()?)
     }
 
-    /// How many *other* origins must advertise a complete copy before this node
-    /// releases a stale root of its own (`docs/REPLICATION.md` §4.3).
-    ///
-    /// Kept in `config` rather than passed in because the live release path
-    /// runs inside the head-flip transaction, where there is no engine to ask.
-    /// Absent means the built-in default, so a store opened by anything that
-    /// does not set it still gets the brake.
-    pub fn replica_release_floor(&self) -> Result<i64> {
-        Ok(self
-            .config("replica.release_floor")?
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(crate::views::DEFAULT_REPLICA_RELEASE_FLOOR))
-    }
-
     /// Writes a config value.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         self.conn().execute(
