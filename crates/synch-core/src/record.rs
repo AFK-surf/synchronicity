@@ -655,6 +655,12 @@ pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
         if let Ok(key) = space_info_key(space) {
             out.exact.push(key);
         }
+        // A delegate must be able to *read* the coverage claims on its granted
+        // spaces as well as publish its own, or it can say what it holds and
+        // never learn what anyone else does (`docs/REPLICATION.md` §4.1).
+        if let Ok(key) = replica_claim_key(space) {
+            out.exact.push(key);
+        }
     }
     out
 }

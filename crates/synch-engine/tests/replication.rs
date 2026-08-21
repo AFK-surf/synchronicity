@@ -500,6 +500,70 @@ async fn removing_a_replicated_space_publishes_nothing() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
+/// A batch that mixes a success with a failure attributes each to itself.
+///
+/// `futures_join` returns outputs in completion order, so pairing them with the
+/// input order credits whichever want finished in another's place. The failure
+/// then lands on the object that succeeded — whose want row is already gone, so
+/// nothing records it — and the object that failed is counted as held, keeping
+/// no attempt, no backoff, and no path to the `unreachable` count that exists
+/// to say a version is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_batch_records_each_outcome_against_its_own_want() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn("replica").await;
+    introduce(&[&publisher, &replica]);
+
+    publisher
+        .node
+        .add_space("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("real.bin"), b"fetchable").unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+
+    let replicating = replica.node.clone();
+    let unreachable = synch_core::Hash::new(b"no provider will ever serve this");
+    off_runtime(move || {
+        replicating.add_detached_space("media").unwrap();
+        replicating
+            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .unwrap();
+    })
+    .await;
+    replica
+        .node
+        .sync_with_peer(&publisher.node.node_id())
+        .await
+        .unwrap();
+
+    // A second want in the same batch that nobody can serve.
+    let staging = replica.node.clone();
+    off_runtime(move || {
+        staging
+            .store()
+            .stage_want(&unreachable, &holder(), 4096, None, 1)
+            .unwrap();
+    })
+    .await;
+
+    let report = replica.node.fetch_replica_wants().await.unwrap();
+    assert_eq!(report.held, 1, "exactly the fetchable object was held");
+    assert_eq!(report.failed, 1, "exactly the unreachable one failed");
+
+    let store = replica.node.store().clone();
+    let wants = off_runtime(move || store.wants_of(&holder()).unwrap()).await;
+    assert_eq!(wants.len(), 1, "the failed want survives");
+    assert_eq!(wants[0].root, unreachable, "and it is the one that failed");
+    assert_eq!(
+        wants[0].attempts, 1,
+        "with its own failure recorded against it, so it can back off and \
+         eventually be reported as unreachable"
+    );
+
+    shutdown(&[&publisher.node, &replica.node]).await;
+}
+
 /// A space this node only replicates is not one it publishes: it advertises no
 /// `m:space` record, so `space rm` has none to strand (§3.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

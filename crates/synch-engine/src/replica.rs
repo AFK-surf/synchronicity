@@ -309,6 +309,12 @@ impl Node {
     pub async fn fetch_replica_wants(&self) -> Result<FetchReport> {
         let mut report = FetchReport::default();
         let limit = self.config().replica_concurrency.max(1);
+        // Candidates are drawn per space and then ranked together. One global
+        // queue ordered by age would let a space with a large old backlog
+        // starve every other replicated space outright, and would leave the
+        // `(holder, first_wanted)` index unusable — a global `ORDER BY` over a
+        // holder-leading index is a scan and a temp sort of the whole queue,
+        // on the one write connection, on every pass.
         let wants = {
             let store = self.store().clone();
             crate::blocking::offload(move || {
@@ -345,32 +351,51 @@ impl Node {
                     crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
                 }
                 Some((held, budget)) if *budget > 0 && *held + want.size > *budget => {
+                    // Skipped, not stopped: a smaller want further down still
+                    // fits, and rejecting one must not end the pass. Nothing is
+                    // recorded against the row either — a budget is not the
+                    // want's fault, and charging it an attempt would push it
+                    // into the backoff and eventually into `unreachable`.
                     report.over_budget += 1;
                 }
-                Some((held, _)) => {
+                Some((held, _)) if admitted.len() < limit => {
                     // Counted as though it lands, so one batch cannot overshoot
                     // a budget by the size of the whole batch.
                     *held = held.saturating_add(want.size);
                     admitted.push(WantPlan { want, space });
                 }
+                Some(_) => break,
             }
         }
 
         // Concurrent, because this is the only network-bound step and the knob
         // is named for it: one object at a time would leave a replica on a fat
         // link converging at the latency of a single provider.
-        let outcomes = crate::join::futures_join(admitted.iter().map(|plan| async move {
-            self.hold_object(
-                &plan.want.root,
-                plan.want.size,
-                plan.want.prev.as_ref(),
-                &plan.want.holder,
-            )
-            .await
-        }))
-        .await;
+        let outcomes =
+            crate::join::futures_join(admitted.iter().enumerate().map(|(i, plan)| async move {
+                let held = self
+                    .hold_object(
+                        &plan.want.root,
+                        plan.want.size,
+                        plan.want.prev.as_ref(),
+                        &plan.want.holder,
+                    )
+                    .await;
+                // The index travels with the outcome because `futures_join`
+                // returns them in *completion* order: zipping against the input
+                // order pairs each want with whichever other want happened to
+                // finish in its place. A slow success beside a fast failure
+                // then records the failure against the object that succeeded —
+                // whose want row is already gone, so the update matches nothing
+                // — and credits the failed one as held, leaving it with no
+                // attempt recorded, no backoff, and no path to the
+                // `unreachable` count that exists to say a version is gone.
+                (i, held)
+            }))
+            .await;
 
-        for (plan, outcome) in admitted.iter().zip(outcomes) {
+        for (i, outcome) in outcomes {
+            let plan = &admitted[i];
             match outcome {
                 Ok((fetched, reused)) => {
                     report.held += 1;
@@ -382,11 +407,20 @@ impl Node {
                     let store = self.store().clone();
                     let (root, holder, reason) =
                         (plan.want.root, plan.want.holder.clone(), e.to_string());
-                    let now = now_ns();
-                    crate::blocking::offload(move || {
+                    let now = {
+                        let store = self.store().clone();
+                        crate::blocking::offload(move || Ok(store.read_instant()?)).await?
+                    };
+                    // Logged rather than propagated: one row that could not
+                    // record its failure must not discard the accounting of
+                    // every outcome after it.
+                    let recorded = crate::blocking::offload(move || {
                         Ok(store.record_want_failure(&root, &holder, now, &reason)?)
                     })
-                    .await?;
+                    .await;
+                    if let Err(e) = recorded {
+                        tracing::warn!(error = %e, "could not record a replica fetch failure");
+                    }
                     tracing::debug!(
                         root = %plan.want.root,
                         space = %plan.space,
@@ -533,7 +567,11 @@ impl Node {
                 },
                 objects: coverage.held,
                 bytes: coverage.held_bytes,
-                complete: coverage.wanted == 0,
+                // Holding nothing and wanting nothing is what a space looks
+                // like before its first sweep, and claiming full coverage there
+                // says the opposite of the truth to the one report an operator
+                // reads to find out whether coverage exists.
+                complete: coverage.wanted == 0 && coverage.held > 0,
             };
             let bytes =
                 postcard::to_stdvec(&claim).map_err(|e| EngineError::Record(e.to_string()))?;
@@ -647,8 +685,12 @@ impl Node {
         &self,
         space: &str,
     ) -> Result<Vec<(synch_core::OriginId, synch_core::ReplicaClaim)>> {
+        // Every origin whose trie this node holds, not every origin with an
+        // entry: a dedicated replica publishes no entries anywhere, so an
+        // `entries`-derived candidate list cannot see the one node shape this
+        // report exists for.
         let mut out = Vec::new();
-        for origin in self.store().entry_origins()? {
+        for origin in self.store().origins_with_complete_heads()? {
             if let Some(claim) = self.replica_claim_of(&origin, space)? {
                 out.push((origin, claim));
             }

@@ -27,6 +27,16 @@ const RARITY_WINDOW: usize = 8;
 /// mean this node has never materialized what that member publishes. Either
 /// makes "no entry names this root" mean "I do not know", and a release decided
 /// from that is a release decided from ignorance.
+/// "Some origin other than this one", for counting *other* holders.
+///
+/// A node advertises its own `b:` records like any other origin, so a provider
+/// count that includes itself answers "does anyone have this?" with "I do" —
+/// and a replica deciding whether it may be the last holder to let go would
+/// always find one holder left, itself. The brake would then never engage at
+/// its default.
+const NOT_SELF: &str = "origin_id != COALESCE(
+        (SELECT value FROM config WHERE key = 'self_origin_id'), '')";
+
 const VIEW_IS_COMPLETE: &str = "NOT EXISTS (SELECT 1 FROM heads WHERE slot = 'pending')
      AND NOT EXISTS (
            SELECT 1 FROM bindings b
@@ -184,7 +194,10 @@ impl Store {
         Ok(())
     }
 
-    /// The wants worth attempting now, rarest first.
+    /// The wants worth attempting now, rarest first, drawn per space.
+    ///
+    /// Returns a ranked *window* rather than exactly `limit` rows: `limit` is
+    /// how many the caller means to start, and it may decline some of them.
     ///
     /// Rarity is the count of origins advertising the object, ascending, so the
     /// object with one advertised holder outranks the object with nine: a
@@ -208,21 +221,35 @@ impl Store {
         max_backoff: i64,
         limit: usize,
     ) -> Result<Vec<WantRow>> {
-        let candidates = self.wants_ready(now, min_backoff, max_backoff, limit * RARITY_WINDOW)?;
-        self.rarest_first(candidates, limit)
+        let mut candidates = Vec::new();
+        for space in self.replicated_spaces()? {
+            candidates.extend(self.wants_ready_of(
+                &space.holder(),
+                now,
+                min_backoff,
+                max_backoff,
+                limit * RARITY_WINDOW,
+            )?);
+        }
+        // Ranked, not truncated: the caller may skip some — a want larger than
+        // a space's remaining budget, say — and truncating here would leave it
+        // nothing to fall back on, so a space near its ceiling would stop
+        // fetching entirely rather than take the smaller wants that still fit.
+        self.rank_rarest_first(candidates)
     }
 
-    /// The oldest ready wants, in `first_wanted` order.
+    /// One holder's oldest ready wants, in `first_wanted` order.
     ///
-    /// Ordered by the index rather than by rarity, so SQLite walks
-    /// `replica_want_by_holder` and stops as soon as it has enough. Ranking by
-    /// provider count in the statement instead reads like the obvious thing and
-    /// is quadratic: the count is a correlated subquery, so leading the
-    /// `ORDER BY` with it forces a full scan of the queue and a temp-B-tree
-    /// sort of every row in it to return four — on every pass, on the one write
-    /// connection that publishes and GC also want.
-    fn wants_ready(
+    /// Filtered by holder, which is what lets SQLite walk
+    /// `replica_want_by_holder` and stop as soon as it has enough. A global
+    /// `ORDER BY first_wanted` over a holder-leading index cannot be served by
+    /// it: the plan is a scan of the whole queue plus a temp-B-tree sort, on
+    /// every pass, on the one write connection that publishes and GC also want.
+    /// Per holder is also what keeps a space with a large old backlog from
+    /// starving every other replicated space.
+    pub fn wants_ready_of(
         &self,
+        holder: &PinHolder,
         now: i64,
         min_backoff: i64,
         max_backoff: i64,
@@ -232,45 +259,43 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT root, holder, size, prev, first_wanted, attempts, last_attempt, last_error
                FROM replica_want
-              WHERE last_attempt IS NULL
-                 OR last_attempt + MIN(?2 * (1 << MIN(MAX(attempts - 1, 0), 12)), ?3) <= ?1
+              WHERE holder = ?1
+                AND (last_attempt IS NULL
+                     OR last_attempt
+                        + MIN(?3 * (1 << MIN(MAX(attempts - 1, 0), 12)), ?4) <= ?2)
               ORDER BY first_wanted ASC
-              LIMIT ?4",
+              LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![now, min_backoff, max_backoff, limit as i64],
+            params![holder.render(), now, min_backoff, max_backoff, limit as i64],
             want_row,
         )?;
         collect_wants(rows)
     }
 
-    /// Ranks a bounded candidate set rarest-first and keeps the best `limit`.
+    /// Ranks a bounded candidate set rarest-first.
     ///
     /// One indexed count per candidate — tens of seeks, not a scan of the whole
-    /// queue. Rarity is the count of origins advertising a complete copy, so
+    /// queue. Rarity counts the *other* origins advertising a complete copy, so
     /// the object with one advertised holder outranks the object with nine: a
     /// replica exists to raise the floor on how many copies exist, and the
     /// object with one holder is the one about to be lost when that holder
-    /// leaves.
-    fn rarest_first(&self, mut candidates: Vec<WantRow>, limit: usize) -> Result<Vec<WantRow>> {
+    /// leaves. Ties go to the oldest want, so nothing starves behind a stream
+    /// of equally rare newcomers.
+    pub fn rank_rarest_first(&self, mut candidates: Vec<WantRow>) -> Result<Vec<WantRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM blob_providers WHERE object_root = ?1 AND complete != 0",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COUNT(*) FROM blob_providers
+              WHERE object_root = ?1 AND complete != 0 AND {NOT_SELF}"
+        ))?;
         let mut ranked = Vec::with_capacity(candidates.len());
         for want in candidates.drain(..) {
             let holders: i64 =
                 stmt.query_row(params![want.root.as_bytes().to_vec()], |row| row.get(0))?;
             ranked.push((holders, want));
         }
-        // Ties go to the oldest want, so nothing starves behind a stream of
-        // equally rare newcomers.
         ranked.sort_by_key(|(holders, want)| (*holders, want.first_wanted));
-        Ok(ranked
-            .into_iter()
-            .take(limit)
-            .map(|(_, want)| want)
-            .collect())
+        Ok(ranked.into_iter().map(|(_, want)| want).collect())
     }
 
     /// Every want one holder has, oldest first.
@@ -316,6 +341,17 @@ impl Store {
                   WHERE e.space = ?1 AND e.content IS NOT NULL AND b.durable != 0
                  ON CONFLICT(root, holder) DO NOTHING",
                 params![space, holder.render(), now],
+            )?;
+            // Whatever was just pinned stops being wanted. Without this the two
+            // rows coexist — held and wanted at once, which this module's
+            // header says cannot happen — and `replica_coverage` counts the
+            // object in both totals while `complete` stays false for ever.
+            tx.execute(
+                "DELETE FROM replica_want
+                  WHERE holder = ?1
+                    AND EXISTS (SELECT 1 FROM pins p
+                                 WHERE p.root = replica_want.root AND p.holder = ?1)",
+                params![holder.render()],
             )?;
             Ok(tx.execute(
                 "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
@@ -406,7 +442,8 @@ impl Store {
                     AND release_after IS NULL
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND (SELECT COUNT(*) FROM blob_providers p
-                          WHERE p.object_root = pins.root AND p.complete != 0) >= ?3
+                          WHERE p.object_root = pins.root AND p.complete != 0
+                            AND p.{NOT_SELF}) >= ?3
                     AND {VIEW_IS_COMPLETE}"
             ),
             params![holder.render(), at, floor],
@@ -419,13 +456,20 @@ impl Store {
         if floor <= 0 {
             return Ok(0);
         }
+        // The view predicate is here too, so a paused view is never reported as
+        // the replication floor holding things back: they are different reasons
+        // and `space ls` prints them on different lines.
         Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM pins
-              WHERE holder = ?1
-                AND release_after IS NULL
-                AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
-                AND (SELECT COUNT(*) FROM blob_providers p
-                      WHERE p.object_root = pins.root AND p.complete != 0) < ?2",
+            &format!(
+                "SELECT COUNT(*) FROM pins
+                  WHERE holder = ?1
+                    AND release_after IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
+                    AND (SELECT COUNT(*) FROM blob_providers p
+                          WHERE p.object_root = pins.root AND p.complete != 0
+                            AND p.{NOT_SELF}) < ?2
+                    AND {VIEW_IS_COMPLETE}"
+            ),
             params![holder.render(), floor],
             |row| row.get::<_, i64>(0),
         )? as u64)
@@ -735,18 +779,21 @@ mod tests {
         store.stage_want(&root, &holder, 10, None, 0).unwrap();
         let (min, max) = (60_000_000_000, 6 * 3600 * 1_000_000_000);
         // Never attempted: ready immediately.
-        assert_eq!(store.wants_to_attempt(0, min, max, 8).unwrap().len(), 1);
+        assert_eq!(
+            store.wants_ready_of(&holder, 0, min, max, 8).unwrap().len(),
+            1
+        );
 
         store
             .record_want_failure(&root, &holder, 1_000, "no provider")
             .unwrap();
         assert!(store
-            .wants_to_attempt(1_000, min, max, 8)
+            .wants_ready_of(&holder, 1_000, min, max, 8)
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .wants_to_attempt(1_000 + min, min, max, 8)
+                .wants_ready_of(&holder, 1_000 + min, min, max, 8)
                 .unwrap()
                 .len(),
             1
@@ -757,12 +804,12 @@ mod tests {
             .record_want_failure(&root, &holder, 2_000, "no provider")
             .unwrap();
         assert!(store
-            .wants_to_attempt(2_000 + min, min, max, 8)
+            .wants_ready_of(&holder, 2_000 + min, min, max, 8)
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .wants_to_attempt(2_000 + 2 * min, min, max, 8)
+                .wants_ready_of(&holder, 2_000 + 2 * min, min, max, 8)
                 .unwrap()
                 .len(),
             1

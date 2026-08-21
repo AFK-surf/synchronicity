@@ -1256,6 +1256,18 @@ fn replica_wants(
         "UPDATE pins SET release_after = NULL WHERE root = ?1 AND holder = ?2",
         params![root.as_bytes().to_vec(), target.holder],
     )?;
+    // Content this node already holds durably needs a claim, not a fetch. The
+    // diff runs for this node's *own* origin on every publish, so without this
+    // a space that is both indexed and replicated queues a want for every file
+    // it scans — bytes that are already in the CAS — and sends each one round
+    // the fetch loop to discover that.
+    tx.execute(
+        "INSERT INTO pins (root, holder, created_at, release_after)
+         SELECT ?1, ?2, ?3, NULL
+          WHERE EXISTS (SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)
+         ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+        params![root.as_bytes().to_vec(), target.holder, now],
+    )?;
     tx.execute(
         "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
          SELECT ?1, ?2, ?3, ?4, ?5

@@ -382,6 +382,21 @@ impl Node {
         }
     }
 
+    /// [`Node::resolving_domains`], read off the runtime worker.
+    ///
+    /// For a key-identified node the answer comes from `config`, so this is a
+    /// store read — and every async caller of it is on a runtime worker, which
+    /// §10 aborts the process for. `run_dns` already offloads the sibling call
+    /// that works out the next delay, with the same reasoning in its comment;
+    /// the refreshes it then awaits did not, so any node without a membership
+    /// domain in its origin died on the loop's first tick.
+    pub(crate) async fn resolving_domains_off_runtime(&self) -> Vec<String> {
+        let node = self.clone();
+        crate::blocking::offload(move || Ok(node.resolving_domains()))
+            .await
+            .unwrap_or_default()
+    }
+
     /// The resolving domain as the refresh machinery wants it: none or one.
     ///
     /// Everything below schedules, refreshes and reports per domain, which is
@@ -576,7 +591,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
     ) -> Result<Vec<DomainOutcome>> {
-        let domains = self.resolving_domains();
+        let domains = self.resolving_domains_off_runtime().await;
         self.refresh_these(resolver, &domains, now_ns()).await
     }
 
@@ -605,7 +620,7 @@ impl Node {
         // The resolving domain is the origin's, held in memory, so neither
         // branch touches the store.
         let domains = match domain {
-            None => self.resolving_domains(),
+            None => self.resolving_domains_off_runtime().await,
             Some(name) => vec![self.configured_domain(name)?],
         };
         self.refresh_these(resolver, &domains, now_ns()).await
@@ -621,7 +636,7 @@ impl Node {
         resolver: &dyn MemberResolver,
         now: i64,
     ) -> Result<Vec<DomainOutcome>> {
-        let configured = self.resolving_domains();
+        let configured = self.resolving_domains_off_runtime().await;
         let due: Vec<String> = {
             let schedule = self.dns_schedule();
             configured
@@ -644,9 +659,12 @@ impl Node {
         resolver: &dyn MemberResolver,
         now: i64,
     ) -> Result<Vec<DomainOutcome>> {
+        // Read before the guard is taken: the schedule lock is not `Send`, so
+        // awaiting while it is held would make this future unspawnable.
+        let configured = self.resolving_domains_off_runtime().await;
         let ready: Vec<String> = {
             let schedule = self.dns_schedule();
-            self.resolving_domains()
+            configured
                 .into_iter()
                 .filter(|d| {
                     schedule
