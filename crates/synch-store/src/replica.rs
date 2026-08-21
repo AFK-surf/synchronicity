@@ -12,6 +12,29 @@
 //! statement per entry would hold the single write connection for the length of
 //! the sweep, and the sweep is a background pass competing with publishes.
 
+/// How many candidates to consider per fetch slot when ranking by rarity.
+///
+/// Rarity has to be ranked over *something*, and ranking over the whole queue
+/// is what makes it quadratic. Eight oldest-ready candidates per slot is enough
+/// for the rare object in a batch to win without the pass reading the queue.
+const RARITY_WINDOW: usize = 8;
+
+/// The §3.6 precondition, as a SQL predicate.
+///
+/// True when this node's picture of what the cluster publishes is a faithful
+/// one: no head is sitting pending — its origin's entries are absent or stale
+/// while it does — and no bound origin is missing a complete head, which would
+/// mean this node has never materialized what that member publishes. Either
+/// makes "no entry names this root" mean "I do not know", and a release decided
+/// from that is a release decided from ignorance.
+const VIEW_IS_COMPLETE: &str = "NOT EXISTS (SELECT 1 FROM heads WHERE slot = 'pending')
+     AND NOT EXISTS (
+           SELECT 1 FROM bindings b
+            WHERE b.origin_id != COALESCE(
+                    (SELECT value FROM config WHERE key = 'self_origin_id'), '')
+              AND NOT EXISTS (SELECT 1 FROM heads h
+                               WHERE h.origin_id = b.origin_id AND h.slot = 'complete'))";
+
 use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
 
@@ -116,12 +139,18 @@ impl Store {
     /// window is entitled to take it.
     pub fn take_possession(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
         self.with_immediate_tx(|tx| {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1)",
+            // Held, not merely known. A `blobs` row exists for a partial fetch
+            // too, so a row alone would let a claim stand over a 0%-complete
+            // object — exactly what this function's own doc says cannot happen.
+            // The predicate is `pin_object`'s, and it belongs in the store
+            // rather than in the discipline of every caller.
+            let held: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs
+                                WHERE root = ?1 AND (complete != 0 OR durable != 0))",
                 params![root.as_bytes().to_vec()],
                 |row| row.get(0),
             )?;
-            if !exists {
+            if !held {
                 return Ok(false);
             }
             tx.execute(
@@ -179,17 +208,33 @@ impl Store {
         max_backoff: i64,
         limit: usize,
     ) -> Result<Vec<WantRow>> {
+        let candidates = self.wants_ready(now, min_backoff, max_backoff, limit * RARITY_WINDOW)?;
+        self.rarest_first(candidates, limit)
+    }
+
+    /// The oldest ready wants, in `first_wanted` order.
+    ///
+    /// Ordered by the index rather than by rarity, so SQLite walks
+    /// `replica_want_by_holder` and stops as soon as it has enough. Ranking by
+    /// provider count in the statement instead reads like the obvious thing and
+    /// is quadratic: the count is a correlated subquery, so leading the
+    /// `ORDER BY` with it forces a full scan of the queue and a temp-B-tree
+    /// sort of every row in it to return four — on every pass, on the one write
+    /// connection that publishes and GC also want.
+    fn wants_ready(
+        &self,
+        now: i64,
+        min_backoff: i64,
+        max_backoff: i64,
+        limit: usize,
+    ) -> Result<Vec<WantRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT w.root, w.holder, w.size, w.prev, w.first_wanted,
-                    w.attempts, w.last_attempt, w.last_error
-               FROM replica_want w
-              WHERE w.last_attempt IS NULL
-                 OR w.last_attempt
-                    + MIN(?2 * (1 << MIN(MAX(w.attempts - 1, 0), 12)), ?3) <= ?1
-              ORDER BY (SELECT COUNT(*) FROM blob_providers p
-                         WHERE p.object_root = w.root AND p.complete != 0) ASC,
-                       w.first_wanted ASC
+            "SELECT root, holder, size, prev, first_wanted, attempts, last_attempt, last_error
+               FROM replica_want
+              WHERE last_attempt IS NULL
+                 OR last_attempt + MIN(?2 * (1 << MIN(MAX(attempts - 1, 0), 12)), ?3) <= ?1
+              ORDER BY first_wanted ASC
               LIMIT ?4",
         )?;
         let rows = stmt.query_map(
@@ -197,6 +242,35 @@ impl Store {
             want_row,
         )?;
         collect_wants(rows)
+    }
+
+    /// Ranks a bounded candidate set rarest-first and keeps the best `limit`.
+    ///
+    /// One indexed count per candidate — tens of seeks, not a scan of the whole
+    /// queue. Rarity is the count of origins advertising a complete copy, so
+    /// the object with one advertised holder outranks the object with nine: a
+    /// replica exists to raise the floor on how many copies exist, and the
+    /// object with one holder is the one about to be lost when that holder
+    /// leaves.
+    fn rarest_first(&self, mut candidates: Vec<WantRow>, limit: usize) -> Result<Vec<WantRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM blob_providers WHERE object_root = ?1 AND complete != 0",
+        )?;
+        let mut ranked = Vec::with_capacity(candidates.len());
+        for want in candidates.drain(..) {
+            let holders: i64 =
+                stmt.query_row(params![want.root.as_bytes().to_vec()], |row| row.get(0))?;
+            ranked.push((holders, want));
+        }
+        // Ties go to the oldest want, so nothing starves behind a stream of
+        // equally rare newcomers.
+        ranked.sort_by_key(|(holders, want)| (*holders, want.first_wanted));
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, want)| want)
+            .collect())
     }
 
     /// Every want one holder has, oldest first.
@@ -219,20 +293,42 @@ impl Store {
     /// groups and the second as its delta donor, and neither survives the entry
     /// being superseded.
     ///
-    /// `DISTINCT` over content rather than over entries: two origins publishing
-    /// identical bytes are one object and one want.
+    /// `DISTINCT` reduces the common case — several origins publishing the same
+    /// bytes at the same size and lineage collapse to one row — but it is over
+    /// the projected tuple, so two origins whose entries disagree about `prev`
+    /// still produce two. What makes that harmless is the conflict clause: one
+    /// want per `(root, holder)` survives either way, and which donor hint it
+    /// keeps is not worth a second statement to make deterministic.
     pub fn stage_space_wants(&self, space: &str, holder: &PinHolder, now: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
-             SELECT DISTINCT e.content, ?2, e.size, e.prev, ?3
-               FROM entries e
-              WHERE e.space = ?1
-                AND e.content IS NOT NULL
-                AND NOT EXISTS (SELECT 1 FROM pins p
-                                 WHERE p.root = e.content AND p.holder = ?2)
-             ON CONFLICT(root, holder) DO NOTHING",
-            params![space, holder.render(), now],
-        )?)
+        self.with_immediate_tx(|tx| {
+            // Content already held durably needs a claim, not a fetch. A
+            // replicated space that also has a checkout would otherwise queue a
+            // want for every file it publishes itself — bytes it just ingested
+            // — and send each one round the fetch loop to discover that. Gated
+            // on `durable` rather than `complete`, because on a cloud backend a
+            // pin is a promise about the durable tier and a cache entry is not
+            // one (`docs/SERVERLESS.md` §6.3).
+            tx.execute(
+                "INSERT INTO pins (root, holder, created_at, release_after)
+                 SELECT DISTINCT e.content, ?2, ?3, NULL
+                   FROM entries e
+                   JOIN blobs b ON b.root = e.content
+                  WHERE e.space = ?1 AND e.content IS NOT NULL AND b.durable != 0
+                 ON CONFLICT(root, holder) DO NOTHING",
+                params![space, holder.render(), now],
+            )?;
+            Ok(tx.execute(
+                "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+                 SELECT DISTINCT e.content, ?2, e.size, e.prev, ?3
+                   FROM entries e
+                  WHERE e.space = ?1
+                    AND e.content IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM pins p
+                                     WHERE p.root = e.content AND p.holder = ?2)
+                 ON CONFLICT(root, holder) DO NOTHING",
+                params![space, holder.render(), now],
+            )?)
+        })
     }
 
     /// Clears the scheduled release of anything this holder pins that some
@@ -262,18 +358,106 @@ impl Store {
     /// space deciding for another. Holding more than strictly necessary is the
     /// safe direction and the only one available without per-space refcounting.
     ///
-    /// Callers must satisfy the completeness precondition first
-    /// (`docs/REPLICATION.md` §3.6). This statement cannot tell "no entry names
-    /// it" from "no entry is materialized right now", and the difference is the
-    /// whole store.
+    /// The completeness precondition (`docs/REPLICATION.md` §3.6) is part of the
+    /// statement rather than a check the caller makes first, because a check
+    /// the caller makes first is a check that can go stale: an operator's
+    /// `scope set` landing between it and this update commits `set_read_scope`'s
+    /// wholesale delete of every foreign origin's entries, after which this
+    /// would schedule a release for every root only those entries named. As one
+    /// statement the two cannot separate. [`Node::view_state`] answers the same
+    /// question for reporting, and says *why* when the answer is no.
     pub fn schedule_stale_releases(&self, holder: &PinHolder, at: i64) -> Result<usize> {
         Ok(self.conn().execute(
-            "UPDATE pins SET release_after = ?2
-              WHERE holder = ?1
-                AND release_after IS NULL
-                AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)",
+            &format!(
+                "UPDATE pins SET release_after = ?2
+                  WHERE holder = ?1
+                    AND release_after IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
+                    AND {VIEW_IS_COMPLETE}"
+            ),
             params![holder.render(), at],
         )?)
+    }
+
+    /// Schedules a stale root's release only where enough other origins
+    /// advertise a complete copy of it (`docs/REPLICATION.md` §3.6, §4.3).
+    ///
+    /// The conservative half of what peers' assertions may be used for. A claim
+    /// or an ad may make this node *keep* bytes and may never make it drop
+    /// them, so this can only ever hold more than the unguarded form would —
+    /// which is why it is safe to build on data a peer supplies and the
+    /// releasing form of the same idea is not.
+    ///
+    /// `floor` is how many distinct origins must advertise the whole object
+    /// before this node will let its own copy go. Zero disables the brake.
+    pub fn schedule_stale_releases_above(
+        &self,
+        holder: &PinHolder,
+        at: i64,
+        floor: i64,
+    ) -> Result<usize> {
+        if floor <= 0 {
+            return self.schedule_stale_releases(holder, at);
+        }
+        Ok(self.conn().execute(
+            &format!(
+                "UPDATE pins SET release_after = ?2
+                  WHERE holder = ?1
+                    AND release_after IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
+                    AND (SELECT COUNT(*) FROM blob_providers p
+                          WHERE p.object_root = pins.root AND p.complete != 0) >= ?3
+                    AND {VIEW_IS_COMPLETE}"
+            ),
+            params![holder.render(), at, floor],
+        )?)
+    }
+
+    /// Held objects this holder would release but for the brake, so a status
+    /// report can say the number out loud rather than let it look like nothing.
+    pub fn held_back_by_replication_floor(&self, holder: &PinHolder, floor: i64) -> Result<u64> {
+        if floor <= 0 {
+            return Ok(0);
+        }
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM pins
+              WHERE holder = ?1
+                AND release_after IS NULL
+                AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
+                AND (SELECT COUNT(*) FROM blob_providers p
+                      WHERE p.object_root = pins.root AND p.complete != 0) < ?2",
+            params![holder.render(), floor],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Bytes held for one holder, by the origin whose entry names the content.
+    ///
+    /// For the operator question a budget raises but does not answer: *whose*
+    /// content grew. A member can publish anything and every replica of that
+    /// space fetches it, which is the membership trust model working as
+    /// designed — and a reason to be able to see it happening.
+    pub fn held_bytes_by_origin(&self, holder: &PinHolder) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.origin_id, SUM(b.size)
+               FROM pins p
+               JOIN blobs b ON b.root = p.root
+               JOIN (SELECT DISTINCT origin_id, content FROM entries WHERE content IS NOT NULL) e
+                 ON e.content = p.root
+              WHERE p.holder = ?1
+              GROUP BY e.origin_id
+              ORDER BY SUM(b.size) DESC",
+        )?;
+        let rows = stmt.query_map(params![holder.render()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (origin, bytes) = row?;
+            out.push((origin, bytes));
+        }
+        Ok(out)
     }
 
     /// What one space holds and wants, for `space ls <id>`.
@@ -345,6 +529,20 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT MIN(first_wanted) FROM replica_want WHERE holder = ?1",
+                params![holder.render()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// When this holder's oldest claim was made — how long it has been holding
+    /// the space, without a second timestamp to keep in agreement with it.
+    pub fn oldest_pin(&self, holder: &PinHolder) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT MIN(created_at) FROM pins WHERE holder = ?1",
                 params![holder.render()],
                 |row| row.get::<_, Option<i64>>(0),
             )
@@ -572,6 +770,76 @@ mod tests {
     }
 
     #[test]
+    fn a_release_is_refused_while_a_head_sits_pending() {
+        let (_dir, store) = store();
+        let first = store.ingest_bytes(b"payload", 0).unwrap();
+        store.pin(&first, &media(), 1).unwrap();
+
+        // With a complete view, an unreferenced root is scheduled.
+        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 1);
+
+        // A pending head means that origin's entries are absent or stale, so
+        // "nothing names this root" becomes ignorance rather than evidence.
+        // The check is part of the statement, not a precondition a caller can
+        // read and then act on after it has gone stale.
+        let key = iroh_base::SecretKey::generate();
+        let head = crate::testutil::sign_head(&key, 1, 7);
+        store
+            .put_head(crate::heads::Slot::Pending, &head, 1, 1)
+            .unwrap();
+        let second = store.ingest_bytes(b"another payload", 0).unwrap();
+        store.pin(&second, &media(), 1).unwrap();
+        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 0);
+        assert_eq!(store.pins_for(&second).unwrap()[0].release_after, None);
+    }
+
+    #[test]
+    fn a_release_is_refused_while_a_bound_origin_has_published_nothing_here() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+
+        // A member this node admits but has never synced: its entries are
+        // missing, not deleted.
+        let key = iroh_base::SecretKey::generate().public();
+        store
+            .put_binding(&crate::Binding {
+                origin: origin(),
+                node_id: key,
+                source: crate::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 0);
+    }
+
+    #[test]
+    fn content_already_held_is_pinned_rather_than_queued() {
+        let (_dir, store) = store();
+        let held = store.ingest_bytes(b"already here", 0).unwrap();
+        store
+            .put_entry(
+                &origin(),
+                "media",
+                "mine.bin",
+                &synch_core::FileEntry::file(12, 1, held, 1),
+            )
+            .unwrap();
+
+        // A replicated space that also has a checkout publishes its own files;
+        // the bytes are in the CAS the moment the entry is. Sending them round
+        // the fetch loop to discover that is work nobody needs.
+        assert_eq!(store.stage_space_wants("media", &media(), 5).unwrap(), 0);
+        assert!(store.wants_of(&media()).unwrap().is_empty());
+        assert_eq!(store.pins_for(&held).unwrap().len(), 1);
+    }
+
+    #[test]
     fn coverage_separates_a_backlog_from_a_loss() {
         let (_dir, store) = store();
         let held = store.ingest_bytes(b"held", 0).unwrap();
@@ -599,8 +867,9 @@ mod tests {
         let (_dir, store) = store();
         store.put_space("media", Some("/srv/media")).unwrap();
         store
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), Some(60), None)
+            .set_space_policy("media", Some(ReplicaPolicy::Tree))
             .unwrap();
+        store.set_space_grace("media", 60).unwrap();
         let space = store.space("media").unwrap().unwrap();
         assert_eq!(space.local_path.as_deref(), Some("/srv/media"));
         assert_eq!(space.replicate, Some(ReplicaPolicy::Tree));
@@ -612,12 +881,13 @@ mod tests {
         assert_eq!(space.replicate, Some(ReplicaPolicy::Tree));
 
         // And turning replication off leaves the checkout alone.
-        store
-            .set_space_replication("media", None, None, None)
-            .unwrap();
+        store.set_space_policy("media", None).unwrap();
         let space = store.space("media").unwrap().unwrap();
         assert_eq!(space.local_path.as_deref(), Some("/srv/media2"));
         assert!(space.replicate.is_none());
-        assert_eq!(space.grace_secs(), crate::DEFAULT_REPLICA_GRACE_SECS);
+        // The grace window survives the policy being cleared, because the two
+        // are set separately: turning replication back on must not silently
+        // hand the space a different recovery window from the one configured.
+        assert_eq!(space.grace_secs(), 60);
     }
 }

@@ -630,26 +630,37 @@ impl Store {
             .collect())
     }
 
-    /// Sets or clears a space's replication policy and its two tunables.
-    ///
-    /// Writes only the replication half, so turning replication on for a space
-    /// that already has a checkout leaves the checkout alone — and the reverse.
-    /// Returns whether there was a space to configure.
-    pub fn set_space_replication(
-        &self,
-        id: &str,
-        policy: Option<ReplicaPolicy>,
-        grace: Option<i64>,
-        budget: Option<u64>,
-    ) -> Result<bool> {
+    /// Sets or clears a space's replication policy, leaving its tunables and
+    /// its checkout alone.
+    pub fn set_space_policy(&self, id: &str, policy: Option<ReplicaPolicy>) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE spaces SET replicate = ?2, grace = ?3, budget = ?4 WHERE id = ?1",
-            params![
-                id,
-                policy.map(|p| p.render()),
-                grace,
-                budget.map(|b| b as i64)
-            ],
+            "UPDATE spaces SET replicate = ?2 WHERE id = ?1",
+            params![id, policy.map(|p| p.render())],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Sets a space's grace window, leaving everything else alone.
+    ///
+    /// One column per call, because the alternative — one statement writing
+    /// every replication column from whatever flags an invocation happened to
+    /// carry — silently clears the ones it was not told about. `space set
+    /// --budget` would then reset a 90-day grace window to the default, which
+    /// is the whole recovery story for a deletion under the `tree` policy, and
+    /// say nothing about having done it.
+    pub fn set_space_grace(&self, id: &str, grace: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE spaces SET grace = ?2 WHERE id = ?1",
+            params![id, grace],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Sets a space's byte ceiling, leaving everything else alone.
+    pub fn set_space_budget(&self, id: &str, budget: u64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE spaces SET budget = ?2 WHERE id = ?1",
+            params![id, budget as i64],
         )?;
         Ok(changed > 0)
     }
@@ -1067,13 +1078,21 @@ impl Txn<'_> {
         // One read for the whole diff. An ordinary node gets an empty set and
         // every per-leaf replication step below short-circuits on it.
         let replicas = ReplicaTargets::of(self.conn())?;
+        // Releases are scheduled against the store's reading rather than the
+        // bare clock, because that is what expires them: `sweep_replicas` calls
+        // `expire_pins_of` with `read_instant`, which never goes backwards. A
+        // node whose clock steps back — a snapshot restore, a dead RTC, a
+        // container that starts before NTP — would otherwise schedule releases
+        // in the past and have the very next sweep run them, collapsing the
+        // grace window to nothing without saying so.
+        let release_now = Store::read_instant_on(self.conn())?;
         // Streamed, not collected. The walk's position ceiling bounds how many
         // changes there can be and says nothing about how large each one is, so
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
         // in ([`Trie::for_each_resolved_change`]).
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
-            apply_change(self.conn(), origin, &change, now, &replicas)
+            apply_change(self.conn(), origin, &change, now, release_now, &replicas)
         })
     }
 
@@ -1304,6 +1323,7 @@ fn apply_change(
     origin: &OriginId,
     change: &ChangeView<'_>,
     now: i64,
+    release_now: i64,
     replicas: &ReplicaTargets,
 ) -> Result<()> {
     let key = change.key;
@@ -1338,7 +1358,7 @@ fn apply_change(
                     params![origin.canonical(), space, path],
                 )?;
                 if let (Some(target), Some(root)) = (target, superseded) {
-                    replica_releases(tx, target, &root, now)?;
+                    replica_releases(tx, target, &root, release_now)?;
                 }
             }
             _ => {
@@ -1371,7 +1391,7 @@ fn apply_change(
                     // scheduled against itself.
                     match superseded {
                         Some(root) if Some(root) != entry.content => {
-                            replica_releases(tx, target, &root, now)?;
+                            replica_releases(tx, target, &root, release_now)?;
                         }
                         _ => {}
                     }

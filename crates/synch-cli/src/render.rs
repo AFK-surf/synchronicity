@@ -239,10 +239,50 @@ pub fn replica_status(status: &ReplicaStatus) -> Lines {
             coverage.unreachable, coverage.unreachable_bytes
         ));
     }
+    if status.held_back > 0 {
+        out.push(format!(
+            "  held back     {:>9} objects                     \
+             too few peers advertise these to let them go",
+            status.held_back
+        ));
+    }
+    if let Some(budget) = space.budget {
+        let held = coverage.held_bytes;
+        out.push(match held >= budget {
+            true => format!(
+                "  budget        {budget} B — reached, so nothing new is being fetched; \
+                 no release was shortened for it"
+            ),
+            false => format!("  budget        {budget} B, {} B of it used", held),
+        });
+    }
     out.push(match status.view.reason() {
         None => "  view          complete — releases are running".to_string(),
         Some(why) => format!("  view          incomplete, releases paused: {why}"),
     });
+    // Whose content this is, because a budget raises the question and cannot
+    // answer it: any member can publish, and every replica of the space fetches
+    // what they publish.
+    for (origin, bytes) in status.by_origin.iter().take(8) {
+        out.push(format!("  from {origin:<32} {bytes:>14} B"));
+    }
+    // Rendered as claims, never as verified coverage: this node has no way to
+    // check another's disk (§4.2).
+    for (origin, claim) in &status.claims {
+        out.push(format!(
+            "  claim   {origin} says {} of {} objects held ({}{})",
+            match claim.complete {
+                true => "all".to_string(),
+                false => "some".to_string(),
+            },
+            claim.objects,
+            claim.policy,
+            match claim.grace_secs {
+                0 => String::new(),
+                secs => format!(", grace {}", duration(secs)),
+            }
+        ));
+    }
     Ok(out)
 }
 
@@ -622,6 +662,33 @@ pub fn doctor(node: &Node) -> Lines {
         "storage: {} trie nodes, {} trie values, {} objects ({} complete)",
         report.trie.nodes, report.trie.values, report.blobs.0, report.blobs.1
     ));
+
+    // Replication belongs in the examination rather than only in `space ls`,
+    // because the two lines that matter here are ones nobody thinks to look
+    // for: content no provider will serve, and releases that have stopped
+    // running. Both mean a replica is not doing what it was asked to.
+    for space in node.store().replicated_spaces()? {
+        let status = node.replica_status(&space.id)?;
+        out.push(format!(
+            "replicating {}: {} objects held, {} wanted{}",
+            space.id,
+            status.coverage.held,
+            status.coverage.wanted,
+            match status.coverage.unreachable {
+                0 => String::new(),
+                n => format!(
+                    ", {n} UNREACHABLE — no provider has answered for these, so they are \
+                     most likely gone from the cluster"
+                ),
+            }
+        ));
+        if let Some(why) = status.view.reason() {
+            out.push(format!(
+                "  releases are paused: {why} — this node is holding more than its \
+                 policy asks, which is the safe direction"
+            ));
+        }
+    }
     Ok(out)
 }
 

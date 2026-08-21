@@ -1894,6 +1894,7 @@ CREATE TABLE pins (                       -- who holds an object (docs/REPLICATI
   PRIMARY KEY (root, holder)
 );
 CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
 CREATE TABLE replica_want (               -- content a replicated space lacks (ยง3.3)
   root         BLOB NOT NULL,
   holder       TEXT NOT NULL,
@@ -1905,7 +1906,7 @@ CREATE TABLE replica_want (               -- content a replicated space lacks (ย
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX replica_want_by_attempt ON replica_want (last_attempt);
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
 -- indexing / engine state
 CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,  -- NULL = detached
                             replicate TEXT,      -- NULL | 'tree' | 'archive'

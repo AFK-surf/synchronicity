@@ -1348,7 +1348,8 @@ impl Node {
         }
         .ok_or_else(|| {
             EngineError::not_found(format!(
-                "nothing here knows the size of {root}: no local object, no entry naming it,                  and no peer advertising it"
+                "nothing here knows the size of {root}: no local object, no entry naming \
+                 it, and no peer advertising it"
             ))
         })?;
         if start > size {

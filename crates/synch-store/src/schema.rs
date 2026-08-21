@@ -97,6 +97,16 @@ pub const MIGRATIONS: &[Migration] = &[
 ///
 /// A nullable space path is the representation of a detached space. It has no
 /// scanner or watcher root, but remains a space this origin can publish into.
+const V20_SERVERLESS_FOUNDATION: &str = r#"
+ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
+UPDATE blobs SET durable = complete;
+
+ALTER TABLE spaces RENAME TO spaces_v19;
+CREATE TABLE spaces (id TEXT PRIMARY KEY, local_path TEXT);
+INSERT INTO spaces (id, local_path) SELECT id, local_path FROM spaces_v19;
+DROP TABLE spaces_v19;
+"#;
+
 /// v21 — replication: pins gain a holder, spaces gain a policy (`docs/REPLICATION.md`).
 ///
 /// `blobs.pinned` was a boolean with no provenance, which cannot answer the one
@@ -119,6 +129,14 @@ pub const MIGRATIONS: &[Migration] = &[
 /// fabricated "now" would make every pre-existing pin look newer than the
 /// content it holds.
 ///
+/// The two indexes are the ones the queries actually use. `pins` is filtered by
+/// `holder` on every status read and every release sweep, and its primary key
+/// leads with `root`, so without `pins_by_holder` each of those scans the whole
+/// table. `replica_want` is walked oldest-first per holder, which is what
+/// `replica_want_by_holder` answers — an index on `last_attempt` alone would
+/// look plausible and serve no statement, since the backoff is computed from
+/// `attempts` and cannot seek on it.
+///
 /// `spaces` gains the replication policy in the same step, because v20 already
 /// made a row mean "this node's participation in this space" — a nullable
 /// `local_path` for detached spaces — and holding every version of a space is
@@ -133,6 +151,7 @@ CREATE TABLE pins (
   PRIMARY KEY (root, holder)
 );
 CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
 INSERT INTO pins (root, holder, created_at, release_after)
   SELECT root, 'operator', last_access, NULL FROM blobs WHERE pinned != 0;
 ALTER TABLE blobs DROP COLUMN pinned;
@@ -152,17 +171,7 @@ CREATE TABLE replica_want (
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX replica_want_by_attempt ON replica_want (last_attempt);
-"#;
-
-const V20_SERVERLESS_FOUNDATION: &str = r#"
-ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
-UPDATE blobs SET durable = complete;
-
-ALTER TABLE spaces RENAME TO spaces_v19;
-CREATE TABLE spaces (id TEXT PRIMARY KEY, local_path TEXT);
-INSERT INTO spaces (id, local_path) SELECT id, local_path FROM spaces_v19;
-DROP TABLE spaces_v19;
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
 "#;
 
 /// v19 — the multipart uploads an S3 client has open (§9.4).
@@ -741,6 +750,7 @@ CREATE TABLE pins (                       -- who holds an object, and until when
   PRIMARY KEY (root, holder)
 );
 CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
 CREATE TABLE replica_want (               -- content a replicated space wants (§3.3)
   root         BLOB NOT NULL,
   holder       TEXT NOT NULL,
@@ -752,7 +762,7 @@ CREATE TABLE replica_want (               -- content a replicated space wants (�
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX replica_want_by_attempt ON replica_want (last_attempt);
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
 CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,
                             replicate TEXT, grace INTEGER, budget INTEGER);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,

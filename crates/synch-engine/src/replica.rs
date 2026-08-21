@@ -13,9 +13,9 @@
 //!   that decides anything from a *listing*;
 //! - the **fetch loop** ([`Node::fetch_replica_wants`]) is the only one that
 //!   touches the network, and so the only one that needs rate limiting;
-//! - the **live path** (`Store::apply_change`, via
-//!   [`Node::note_replicated_change`]) reacts to one promotion at a time and is
-//!   the only one that ever has positive evidence that a root left the tree.
+//! - the **live path** (`Store::apply_change`, inside the transaction that
+//!   flips a head) reacts to one promotion at a time and is the only one that
+//!   ever has positive evidence that a root left the tree.
 //!
 //! The asymmetry between the last two is the load-bearing rule of the whole
 //! design, and §3.6 is where it is argued: **a release is driven by an observed
@@ -60,6 +60,12 @@ pub struct SweepReport {
     pub scheduled: usize,
     /// Claims that reached their scheduled release and were dropped.
     pub released: usize,
+}
+
+/// One admitted want, with the space that wants it.
+struct WantPlan {
+    want: synch_store::WantRow,
+    space: String,
 }
 
 /// What one pass of the fetch loop did.
@@ -115,6 +121,13 @@ pub struct ReplicaStatus {
     pub next_release: Option<i64>,
     /// Whether releases are running.
     pub view: ViewState,
+    /// Objects the tree has stopped naming that this node is holding anyway,
+    /// because too few other origins advertise them (§4.3).
+    pub held_back: u64,
+    /// Bytes held, by the origin that published the content.
+    pub by_origin: Vec<(String, u64)>,
+    /// What every origin — this one included — says it holds of the space.
+    pub claims: Vec<(synch_core::OriginId, synch_core::ReplicaClaim)>,
 }
 
 impl Node {
@@ -147,14 +160,44 @@ impl Node {
                 }
             }
         }
-        self.store()
-            .set_space_replication(id, policy, grace, budget)?;
+        if let Some(grace) = grace {
+            self.store().set_space_grace(id, grace)?;
+        }
+        if let Some(budget) = budget {
+            self.store().set_space_budget(id, budget)?;
+        }
+        self.store().set_space_policy(id, policy)?;
         if policy.is_none() {
             let holder = space.holder();
             self.store().drop_wants(&holder)?;
             if release {
                 self.store().unpin_all(&holder)?;
             }
+        }
+        self.replica_wake().notify_one();
+        Ok(())
+    }
+
+    /// Adjusts a replicated space's grace window or budget, and nothing else.
+    ///
+    /// Separate from [`Node::set_space_replication`] because the policy is not
+    /// a value a tuning command should have an opinion about — not even the
+    /// opinion "put back what was there", which is wrong the moment the stored
+    /// value is one this build cannot read.
+    pub fn set_space_tunables(
+        &self,
+        id: &str,
+        grace: Option<i64>,
+        budget: Option<u64>,
+    ) -> Result<()> {
+        if self.store().space(id)?.is_none() {
+            return Err(EngineError::not_found(format!("no space {id}")));
+        }
+        if let Some(grace) = grace {
+            self.store().set_space_grace(id, grace)?;
+        }
+        if let Some(budget) = budget {
+            self.store().set_space_budget(id, budget)?;
         }
         self.replica_wake().notify_one();
         Ok(())
@@ -184,7 +227,11 @@ impl Node {
             let scheduled =
                 if space.replicate.is_some_and(ReplicaPolicy::releases) && view.is_complete() {
                     let at = now.saturating_add(space.grace_secs().saturating_mul(1_000_000_000));
-                    self.store().schedule_stale_releases(&holder, at)?
+                    self.store().schedule_stale_releases_above(
+                        &holder,
+                        at,
+                        self.config().replica_release_floor,
+                    )?
                 } else {
                     0
                 };
@@ -263,6 +310,11 @@ impl Node {
             })
             .await?
         };
+        // The space rows and their budgets are read once for the batch, not
+        // once per object (see `budget_state`).
+        let mut admitted: Vec<WantPlan> = Vec::new();
+        let mut budgets: std::collections::HashMap<String, Option<(u64, u64)>> =
+            std::collections::HashMap::new();
         for want in wants {
             let Some(space) = want.holder.space().map(str::to_string) else {
                 // A want whose holder is not a replica's belongs to nothing
@@ -270,41 +322,65 @@ impl Node {
                 // another version's row, and §3.1 keeps those.
                 continue;
             };
-            let configured = {
-                let store = self.store().clone();
-                let space = space.clone();
-                crate::blocking::offload(move || Ok(store.space(&space)?)).await?
-            };
-            let Some(configured) = configured.filter(|row| row.replicate.is_some()) else {
-                // The space stopped being replicated between the sweep and now.
-                let store = self.store().clone();
-                let (root, holder) = (want.root, want.holder.clone());
-                crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
-                continue;
-            };
-            if self.over_budget(&configured, want.size).await? {
-                report.over_budget += 1;
-                continue;
+            if !budgets.contains_key(&space) {
+                budgets.insert(space.clone(), self.budget_state(&space).await?);
             }
-            match self
-                .hold_object(&want.root, want.size, want.prev.as_ref(), &want.holder)
-                .await
-            {
-                Ok(fetched) => {
+            match budgets.get_mut(&space).expect("just inserted") {
+                // The space stopped being replicated between the sweep and now.
+                None => {
+                    let store = self.store().clone();
+                    let (root, holder) = (want.root, want.holder.clone());
+                    crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
+                }
+                Some((held, budget)) if *budget > 0 && *held + want.size > *budget => {
+                    report.over_budget += 1;
+                }
+                Some((held, _)) => {
+                    // Counted as though it lands, so one batch cannot overshoot
+                    // a budget by the size of the whole batch.
+                    *held = held.saturating_add(want.size);
+                    admitted.push(WantPlan { want, space });
+                }
+            }
+        }
+
+        // Concurrent, because this is the only network-bound step and the knob
+        // is named for it: one object at a time would leave a replica on a fat
+        // link converging at the latency of a single provider.
+        let outcomes = crate::join::futures_join(admitted.iter().map(|plan| async move {
+            self.hold_object(
+                &plan.want.root,
+                plan.want.size,
+                plan.want.prev.as_ref(),
+                &plan.want.holder,
+            )
+            .await
+        }))
+        .await;
+
+        for (plan, outcome) in admitted.iter().zip(outcomes) {
+            match outcome {
+                Ok((fetched, reused)) => {
                     report.held += 1;
-                    report.fetched_bytes += fetched.0;
-                    report.reused_bytes += fetched.1;
+                    report.fetched_bytes += fetched;
+                    report.reused_bytes += reused;
                 }
                 Err(e) => {
                     report.failed += 1;
                     let store = self.store().clone();
-                    let (root, holder, reason) = (want.root, want.holder.clone(), e.to_string());
+                    let (root, holder, reason) =
+                        (plan.want.root, plan.want.holder.clone(), e.to_string());
                     let now = now_ns();
                     crate::blocking::offload(move || {
                         Ok(store.record_want_failure(&root, &holder, now, &reason)?)
                     })
                     .await?;
-                    tracing::debug!(root = %want.root, space = %space, error = %e, "replica fetch failed");
+                    tracing::debug!(
+                        root = %plan.want.root,
+                        space = %plan.space,
+                        error = %e,
+                        "replica fetch failed"
+                    );
                 }
             }
         }
@@ -368,22 +444,31 @@ impl Node {
         ))
     }
 
-    /// Whether taking one more object would put a space past its budget.
+    /// A space's `(bytes held, ceiling)`, or `None` when it is not replicated.
     ///
-    /// Reaching the budget stops fetching and never shortens a release: a
-    /// replica that let go of its grace window because a disk filled up would
-    /// drop the recovery story exactly when nobody was watching (§3.8).
-    async fn over_budget(&self, space: &SpaceRow, incoming: u64) -> Result<bool> {
-        let Some(budget) = space.budget else {
-            return Ok(false);
-        };
+    /// A ceiling of zero means no ceiling. Reaching one stops fetching and
+    /// never shortens a release: a replica that let go of its grace window
+    /// because a disk filled up would drop the recovery story exactly when
+    /// nobody was watching (§3.8).
+    ///
+    /// Read once per space per pass, not once per object: `replica_coverage`
+    /// aggregates over every pin the holder has, so asking it per candidate
+    /// turns a budgeted replica — the large ones, which are what budgets are
+    /// for — into a scan of its own pins for every object it fetches.
+    async fn budget_state(&self, space: &str) -> Result<Option<(u64, u64)>> {
         let store = self.store().clone();
-        let holder = space.holder();
-        let coverage = crate::blocking::offload(move || {
-            Ok(store.replica_coverage(&holder, UNREACHABLE_ATTEMPTS)?)
+        let space = space.to_string();
+        crate::blocking::offload(move || {
+            let Some(row) = store.space(&space)?.filter(|row| row.replicate.is_some()) else {
+                return Ok(None);
+            };
+            let Some(budget) = row.budget else {
+                return Ok(Some((0, 0)));
+            };
+            let coverage = store.replica_coverage(&row.holder(), UNREACHABLE_ATTEMPTS)?;
+            Ok(Some((coverage.held_bytes, budget)))
         })
-        .await?;
-        Ok(coverage.held_bytes.saturating_add(incoming) > budget)
+        .await
     }
 
     /// What `space ls <id>` reports.
@@ -399,8 +484,157 @@ impl Node {
             oldest_want: self.store().oldest_want(&holder)?,
             next_release: self.store().next_release(&holder)?,
             view: self.view_state()?,
+            held_back: self
+                .store()
+                .held_back_by_replication_floor(&holder, self.config().replica_release_floor)?,
+            by_origin: self.store().held_bytes_by_origin(&holder)?,
+            claims: self.replica_claims_on(id)?,
             space,
         })
+    }
+
+    /// The `r:<space>` records this node should be publishing (§4.1).
+    ///
+    /// Staged like `m:space/<id>` and the manifest, through the ordinary
+    /// publisher, so a claim costs no head of its own. A space that stopped
+    /// being replicated yields a removal, because a claim left standing over a
+    /// space this node no longer holds is the one kind of lie this record can
+    /// tell that nobody could check.
+    pub fn replica_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
+        let mut out = Vec::new();
+        let mut claimed = std::collections::HashSet::new();
+        for space in self.store().replicated_spaces()? {
+            let policy = space.replicate.expect("replicated_spaces filters on it");
+            let coverage = self
+                .store()
+                .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)?;
+            let claim = synch_core::ReplicaClaim {
+                v: synch_core::RECORD_VERSION,
+                // The oldest claim this node holds for the space is when it
+                // started holding it. Better than a stored timestamp, which
+                // would be one more thing to keep in agreement with the pins.
+                since_ns: self.store().oldest_pin(&space.holder())?.unwrap_or(0),
+                policy: policy.render().to_string(),
+                grace_secs: match policy.releases() {
+                    true => space.grace_secs(),
+                    false => 0,
+                },
+                objects: coverage.held,
+                bytes: coverage.held_bytes,
+                complete: coverage.wanted == 0,
+            };
+            let bytes =
+                postcard::to_stdvec(&claim).map_err(|e| EngineError::Record(e.to_string()))?;
+            out.push((synch_core::replica_claim_key(&space.id)?, Some(bytes)));
+            claimed.insert(space.id.clone());
+        }
+        // Withdraw a claim over a space this node has stopped replicating. The
+        // published set is the authority on what to withdraw, since the
+        // configuration no longer remembers the space at all.
+        for space in self.published_claim_spaces()? {
+            if !claimed.contains(&space) {
+                out.push((synch_core::replica_claim_key(&space)?, None));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The claim changes worth a publish of their own.
+    ///
+    /// Counts move on every object a bootstrap holds, and a head per fetched
+    /// object would drown the cluster in publishes to say "still going". So the
+    /// standing loop publishes only when something *material* changed — the
+    /// policy, the grace window, whether the space is covered at all, or a
+    /// claim appearing or disappearing — and the counts ride along with
+    /// whatever the node publishes next for its own reasons
+    /// ([`Node::replica_claim_changes`], staged beside `m:space` by the
+    /// scanner). A claim's counts are therefore a floor rather than a live
+    /// gauge, which is all a claim can honestly be: it describes another node's
+    /// disk at a moment it chose (§4.2).
+    pub fn material_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
+        let mut out = Vec::new();
+        for change in self.replica_claim_changes()? {
+            let space = synch_core::parse_replica_claim_key(&change.0)?;
+            let published = self.replica_claim_of(self.origin(), &space)?;
+            let material = match (&change.1, &published) {
+                // A claim appearing, or being withdrawn: always material.
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+                (Some(bytes), Some(published)) => {
+                    let claim: synch_core::ReplicaClaim = postcard::from_bytes(bytes)
+                        .map_err(|e| EngineError::Record(e.to_string()))?;
+                    claim.policy != published.policy
+                        || claim.grace_secs != published.grace_secs
+                        || claim.complete != published.complete
+                }
+            };
+            if material {
+                out.push(change);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The spaces this node's own published trie carries a claim for.
+    fn published_claim_spaces(&self) -> Result<Vec<String>> {
+        let Some(head) = self.store().complete_head(self.origin())? else {
+            return Ok(Vec::new());
+        };
+        let trie = synch_mpt::Trie::new(self.store().as_ref());
+        let mut out = Vec::new();
+        for (key, _) in trie.scan(
+            head.root,
+            &[synch_core::record::PREFIX_REPLICA, b':'],
+            None,
+            None,
+        )? {
+            if let Ok(space) = synch_core::parse_replica_claim_key(&key) {
+                out.push(space);
+            }
+        }
+        Ok(out)
+    }
+
+    /// What one origin says it holds of a space, if it says anything.
+    ///
+    /// Rendered as a claim wherever it is shown. It is a member's assertion
+    /// about its own disk, and this node has no way to check it — §4.2.
+    pub fn replica_claim_of(
+        &self,
+        origin: &synch_core::OriginId,
+        space: &str,
+    ) -> Result<Option<synch_core::ReplicaClaim>> {
+        let Some(head) = self.store().complete_head(origin)? else {
+            return Ok(None);
+        };
+        let trie = synch_mpt::Trie::new(self.store().as_ref());
+        let Some(bytes) = trie.get(head.root, &synch_core::replica_claim_key(space)?)? else {
+            return Ok(None);
+        };
+        let claim: synch_core::ReplicaClaim =
+            postcard::from_bytes(&bytes).map_err(|e| EngineError::Record(e.to_string()))?;
+        // A record from a future schema is refused rather than half-read, for
+        // the reason `f:` and `b:` refuse one: postcard ignores trailing bytes,
+        // so a v2 claim decodes as a v1 claim with the new field silently
+        // missing.
+        match synch_core::record::is_supported_version(claim.v) {
+            true => Ok(Some(claim)),
+            false => Ok(None),
+        }
+    }
+
+    /// Every origin's claim on a space, for `space ls <id>`.
+    pub fn replica_claims_on(
+        &self,
+        space: &str,
+    ) -> Result<Vec<(synch_core::OriginId, synch_core::ReplicaClaim)>> {
+        let mut out = Vec::new();
+        for origin in self.store().entry_origins()? {
+            if let Some(claim) = self.replica_claim_of(&origin, space)? {
+                out.push((origin, claim));
+            }
+        }
+        Ok(out)
     }
 
     /// Runs the standing replication loop until `shutdown` resolves.
@@ -462,12 +696,37 @@ impl Node {
                         "replica fetch pass"
                     );
                 }
-                Ok(_) => return,
+                Ok(_) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "replica fetch pass failed");
-                    return;
+                    break;
                 }
             }
+        }
+        self.publish_material_claims().await;
+    }
+
+    /// Publishes a coverage claim when one materially changed (§4.1).
+    async fn publish_material_claims(&self) {
+        let node = self.clone();
+        let changes = match crate::blocking::offload(move || node.material_claim_changes()).await {
+            Ok(changes) if !changes.is_empty() => changes,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not compute replication claims");
+                return;
+            }
+        };
+        // A node that cannot publish still replicates; it simply says nothing
+        // about it. Refusing the whole pass over an unpublishable claim would
+        // stop it holding content over a record nobody needs.
+        if let Err(e) = self.ensure_publishable() {
+            tracing::debug!(error = %e, "not publishing replication claims");
+            return;
+        }
+        self.stage(changes);
+        if let Err(e) = self.flush_staged().await {
+            tracing::warn!(error = %e, "could not publish replication claims");
         }
     }
 }

@@ -1824,7 +1824,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             if replicate.is_none() && grace.is_none() && budget.is_none() {
                 return Err(ControlError::invalid(
-                    "space set needs something to set: --replicate, --no-replicate,                      --grace or --budget",
+                    "space set needs something to set: --replicate, --no-replicate, \
+                     --grace or --budget",
                 ));
             }
             apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
@@ -1835,8 +1836,13 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let only = (!id.is_empty()).then(|| id.clone());
             let reports = offload(move || Ok(sweeping.sweep_replicas(only.as_deref())?)).await?;
             if reports.is_empty() {
-                out.progress("(no replicated spaces; add one with `synch space set --replicate`)")
-                    .await?;
+                out.progress(match id.is_empty() {
+                    true => "(no replicated spaces; add one with `synch space set --replicate`)"
+                        .to_string(),
+                    false => format!("({id} is not replicated here)"),
+                })
+                .await?;
+                return Ok(());
             }
             for (space, report) in reports {
                 out.line(format!(
@@ -3037,13 +3043,6 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
     }
 }
 
-/// What `synch pin add|rm` names: a hex object root, or a path whose selected
-/// version supplies one (§8).
-///
-/// A pin is about bytes, and the bytes a path stands for are whichever version
-/// the reading policy picks — the same selection every other read goes
-/// through, so a pin and a `synch cat` of the same reference always mean the
-/// same object. An `<origin>:` prefix pins that origin's version.
 /// Applies the replication half of `space add` and `space set`.
 ///
 /// Shared because the two commands mean the same thing by the same flags, and
@@ -3060,11 +3059,16 @@ async fn apply_replication(
     out: &mut Frames,
 ) -> Result<(), ControlError> {
     let Some(policy) = policy else {
-        // `--grace`/`--budget` alone tune a space that is already replicating.
+        // `--grace`/`--budget` alone tune a space that is already replicating,
+        // and must not go near its policy. Reading the policy and writing it
+        // back would look equivalent and is not: a value this build cannot
+        // parse reads as "not replicated", so tuning the grace window on a
+        // space configured by a newer build would silently turn replication
+        // off.
         if grace.is_some() || budget.is_some() {
-            let (space, existing) = (id.to_string(), current_policy(node, id).await?);
+            let space = id.to_string();
             read(node, move |n| {
-                Ok(n.set_space_replication(&space, existing, grace, budget, false)?)
+                Ok(n.set_space_tunables(&space, grace, budget)?)
             })
             .await?;
         }
@@ -3118,13 +3122,6 @@ async fn apply_replication(
     Ok(())
 }
 
-/// The policy a space already has, so tuning one knob does not clear it.
-async fn current_policy(node: &Node, id: &str) -> Result<Option<ReplicaPolicy>, ControlError> {
-    let space = id.to_string();
-    let row = read(node, move |n| Ok(n.store().space(&space)?)).await?;
-    Ok(row.and_then(|row| row.replicate))
-}
-
 /// Reads a `--root` argument.
 ///
 /// Its own function because the error an operator gets for a typo'd hash should
@@ -3154,6 +3151,13 @@ fn render_holders(pins: &[synch_store::PinRow]) -> String {
         .join(", ")
 }
 
+/// What `synch pin add|rm` names: a hex object root, or a path whose selected
+/// version supplies one (§8).
+///
+/// A pin is about bytes, and the bytes a path stands for are whichever version
+/// the reading policy picks — the same selection every other read goes
+/// through, so a pin and a `synch cat` of the same reference always mean the
+/// same object. An `<origin>:` prefix pins that origin's version.
 async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
         return Ok((root, None));
