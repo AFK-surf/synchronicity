@@ -417,7 +417,7 @@ async fn an_unfetchable_want_persists_and_backs_off() {
         // Ready immediately, before any attempt has been made.
         let ready = node
             .store()
-            .wants_to_attempt(0, 60_000_000_000, 3_600_000_000_000, 8)
+            .wants_to_attempt(0, 60_000_000_000, 3_600_000_000_000, 8, 0)
             .unwrap();
         (wanted, ready.len())
     })
@@ -436,7 +436,7 @@ async fn an_unfetchable_want_persists_and_backs_off() {
         let wants = store.wants_of(&holder()).unwrap();
         let now = synch_core::now_ns();
         let ready = store
-            .wants_to_attempt(now, 60_000_000_000, 3_600_000_000_000, 8)
+            .wants_to_attempt(now, 60_000_000_000, 3_600_000_000_000, 8, 0)
             .unwrap();
         (wants[0].attempts, ready.len())
     })
@@ -625,6 +625,79 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
             .unwrap();
     })
     .await;
+    replica.node.fetch_replica_wants().await.unwrap();
+    assert_eq!(coverage(&replica.node).await.held, 1);
+
+    shutdown(&[&publisher.node, &replica.node]).await;
+}
+
+/// A GC pass between the fetch and the pin does not take the bytes.
+///
+/// §3.5 asks for this by name: "Between the fetch's last commit and the pin
+/// insert the object is complete, possibly unreferenced, and unpinned … that
+/// deserves a test that runs a GC pass inside the window rather than a
+/// paragraph asserting it." It is the one window in which a replica can lose
+/// bytes it has just paid to fetch, and what protects it is an incidental
+/// property of an unrelated clock — `last_access` is stamped by the write, and
+/// `gc_content` skips anything newer than its horizon. A change to either
+/// would open it with every other test still green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn("replica").await;
+    introduce(&[&publisher, &replica]);
+
+    publisher
+        .node
+        .add_space("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("a.bin"), b"paid for once").unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+
+    let replicating = replica.node.clone();
+    off_runtime(move || {
+        replicating.add_detached_space("media").unwrap();
+        replicating
+            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .unwrap();
+    })
+    .await;
+    replica
+        .node
+        .sync_with_peer(&publisher.node.node_id())
+        .await
+        .unwrap();
+
+    // Fetch the bytes without taking possession, which is the window.
+    let want = {
+        let store = replica.node.store().clone();
+        off_runtime(move || store.wants_of(&holder()).unwrap()).await
+    };
+    assert_eq!(want.len(), 1, "the promotion should have staged the want");
+    let fetched = replica
+        .node
+        .fetch_all(&want[0].root, want[0].size)
+        .await
+        .unwrap();
+    assert!(fetched.complete);
+
+    // Nothing references it — no entry of this node's own names it, and no pin
+    // stands for it yet. A maintenance pass here is entitled to collect it on
+    // every rule except its age.
+    let sweeping = replica.node.clone();
+    off_runtime(move || sweeping.maintenance_pass().unwrap()).await;
+
+    let root = want[0].root;
+    let store = replica.node.store().clone();
+    let survived = off_runtime(move || store.blob(&root).unwrap()).await;
+    assert!(
+        survived.is_some_and(|blob| blob.complete),
+        "a GC pass inside the fetch-to-pin window must not take bytes the \
+         replica has just paid for"
+    );
+
+    // And the pass that follows can still take possession of them.
     replica.node.fetch_replica_wants().await.unwrap();
     assert_eq!(coverage(&replica.node).await.held, 1);
 

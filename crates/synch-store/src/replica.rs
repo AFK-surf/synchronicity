@@ -219,12 +219,19 @@ impl Store {
     /// The shift is taken off `attempts - 1` so the first wait is the minimum
     /// rather than twice it, and capped so that a row which somehow
     /// accumulated thousands of attempts cannot overflow it.
+    /// `rotate` is which space leads this round. The interleave is fair over
+    /// the whole window, but the caller admits only the first `limit` rows, and
+    /// `replicated_spaces` is ordered by id — so with more spaces than
+    /// `replica_concurrency` the same leading few would be served for ever and
+    /// the rest would wait out the first's backlog. Advancing it by one per
+    /// pass gives every space the lead within one turn of the list.
     pub fn wants_to_attempt(
         &self,
         now: i64,
         min_backoff: i64,
         max_backoff: i64,
         limit: usize,
+        rotate: usize,
     ) -> Result<Vec<WantRow>> {
         // Ranked within a space, then interleaved across them. Ranking the
         // pooled candidates globally is what §3.3 first specified and it
@@ -245,6 +252,10 @@ impl Store {
             if !ready.is_empty() {
                 per_space.push(self.rank_rarest_first(ready)?.into_iter());
             }
+        }
+        let spaces = per_space.len();
+        if spaces > 0 {
+            per_space.rotate_left(rotate % spaces);
         }
         // Interleaved, not truncated: the caller may decline some — a want
         // larger than a space's remaining budget, say — so it is handed a
@@ -1099,13 +1110,57 @@ mod tests {
         // the end of a 33-row window and is never reached. Assert on the prefix
         // the fetch loop actually takes.
         let limit = 4;
-        let batch = store.wants_to_attempt(1_000_000, 60, 3600, limit).unwrap();
+        let batch = store
+            .wants_to_attempt(1_000_000, 60, 3600, limit, 0)
+            .unwrap();
         let admitted: Vec<&PinHolder> = batch.iter().take(limit).map(|w| &w.holder).collect();
         assert!(
             admitted.contains(&&docs),
             "a space added after a large backlog must get a turn inside the first \
              {limit} wants, or it fetches nothing until the backlog drains — \
              months, at four a pass. Admitted: {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn more_spaces_than_slots_still_all_get_served() {
+        let (_dir, store) = store();
+        // Six spaces, four slots: with no rotation the first four in id order
+        // take every slot for ever and the last two wait out their backlogs.
+        // The two-space test cannot see this, because with spaces <= slots the
+        // property holds trivially.
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        for (n, id) in ids.iter().enumerate() {
+            store.put_detached_space(id).unwrap();
+            store
+                .set_space_policy(id, Some(ReplicaPolicy::Tree))
+                .unwrap();
+            store
+                .stage_want(
+                    &synch_core::Hash::new(id.as_bytes()),
+                    &PinHolder::Replica(id.to_string()),
+                    10,
+                    None,
+                    n as i64,
+                )
+                .unwrap();
+        }
+
+        let limit = 4;
+        let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pass in 0..ids.len() {
+            let batch = store
+                .wants_to_attempt(1_000_000, 60, 3600, limit, pass)
+                .unwrap();
+            for want in batch.iter().take(limit) {
+                served.insert(want.holder.space().unwrap().to_string());
+            }
+        }
+        assert_eq!(
+            served.len(),
+            ids.len(),
+            "every space must lead the interleave within one turn of the list; \
+             served: {served:?}"
         );
     }
 

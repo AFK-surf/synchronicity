@@ -331,6 +331,12 @@ impl Node {
         // `(holder, first_wanted)` index unusable — a global `ORDER BY` over a
         // holder-leading index is a scan and a temp sort of the whole queue,
         // on the one write connection, on every pass.
+        // Advanced once per pass, so which space leads the interleave moves on.
+        // Without it the first `replica_concurrency` spaces in id order take
+        // every slot for ever and the rest wait out their backlogs.
+        let rotate = self
+            .replica_rotation()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let wants = {
             let store = self.store().clone();
             crate::blocking::offload(move || {
@@ -340,6 +346,7 @@ impl Node {
                     MIN_BACKOFF.as_nanos() as i64,
                     MAX_BACKOFF.as_nanos() as i64,
                     limit,
+                    rotate,
                 )?)
             })
             .await?

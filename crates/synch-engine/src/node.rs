@@ -111,6 +111,7 @@ struct NodeInner {
     /// mirror loop materializes it without waiting out its interval (§7.2).
     mirror_wake: Arc<tokio::sync::Notify>,
     replica_wake: Arc<tokio::sync::Notify>,
+    replica_rotation: Arc<std::sync::atomic::AtomicUsize>,
     /// Rung when a head lands in the pending slot: its trie has to be fetched
     /// and only an anti-entropy round does that.
     pending_wake: Arc<tokio::sync::Notify>,
@@ -700,6 +701,7 @@ impl Node {
                 dns_wake,
                 mirror_wake,
                 replica_wake,
+                replica_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
@@ -1174,6 +1176,12 @@ impl Node {
     /// must not drag a sweep of four million entries along with it.
     pub(crate) fn replica_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.replica_wake.clone()
+    }
+
+    /// Which replicated space leads the next fetch batch (`docs/REPLICATION.md`
+    /// §3.3). In memory only: fairness across a restart is not worth a write.
+    pub(crate) fn replica_rotation(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.inner.replica_rotation.clone()
     }
 
     /// The bell a head landing in the pending slot rings (§5.3).
