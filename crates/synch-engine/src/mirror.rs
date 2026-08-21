@@ -830,7 +830,7 @@ const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
 ///
 /// An unreadable target answers "no" and the pass tries to stamp it, which
 /// reports the real error rather than this guess.
-pub(crate) fn metadata_matches(target: &Path, meta: Metadata) -> bool {
+fn metadata_matches(target: &Path, meta: Metadata) -> bool {
     let Ok(on_disk) = std::fs::metadata(target) else {
         return false;
     };
@@ -911,7 +911,7 @@ fn system_time(ns: i64) -> SystemTime {
 /// The root rather than a bare "current?": naming the object that is on the
 /// disk is also what tells the pass whether the file is a version the descent
 /// wanted and could not find (`docs/DELTA-SYNC.md` §3.2).
-pub(crate) fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
+fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
     let metadata = std::fs::metadata(target).ok().filter(|m| m.is_file())?;
     if metadata.len() != wanted_size {
         return None;

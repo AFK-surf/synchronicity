@@ -1303,6 +1303,17 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   not publish either: the files land where the scanner will find them and the next
   scan (§7.1) publishes them as this node's own view.
 
+  Two refusals follow from writing into a directory somebody works in. A file
+  that *appears* while the fill is fetching is never overwritten, `--force` or
+  not: the plan's "nothing was here" has a shelf life, and materialization ends
+  in a rename. And a file this node cannot *read* is never called differing and
+  never replaced — "differs" would be a claim the failed read did not establish,
+  and a rename needs no read permission to act on it. `--force` also declines
+  the one case where there is nothing to adopt: when the selected version is
+  this node's own and the file differs from it, the disk holds an edit no scan
+  has published yet, and overwriting it would lose that edit leaving no version,
+  no `prev`, and no trace in the cluster.
+
   Which is why the metadata rule below is load-bearing here rather than cosmetic.
   The mtime a filled path is stamped with is the one the next scan publishes, so a
   fill restates the version it filled instead of minting a newer one — and `newest`

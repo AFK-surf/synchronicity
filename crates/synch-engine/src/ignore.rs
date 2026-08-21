@@ -25,6 +25,15 @@ pub const BUILTIN_DEFAULTS: &[&str] = &[
     // still arriving (§9.4). A scan that ran mid-upload would otherwise hash a
     // fragment and publish it as this node's own assertion.
     "*.synch-part",
+    // The same hazard from the other write path: `materialize_blob` stages the
+    // object beside its target and renames, so while a `synch take` or a
+    // `synch fill` is materializing into a space there is a growing file next
+    // to the real one (`Store::materialize`, synch-store/src/backend.rs). A
+    // scan racing it would hash whatever length it had reached and publish
+    // *that* — a truncated file under a plausible name, replicated to every
+    // peer, then tombstoned by the scan after. `fill` makes the race a bulk
+    // one: thousands of such files, for as long as the fill runs.
+    "*.synch-materialize",
 ];
 
 /// One ignore rule.

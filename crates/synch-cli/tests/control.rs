@@ -902,6 +902,45 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
         b"not mine"
     );
 
+    // A strict fill's whole answer is the paths it refused, so those reach
+    // stdout with everything else: `lines()` drops progress frames, so this
+    // assertion fails if they are ever demoted to progress.
+    daemon
+        .peer_file(&peer, "media", "split.txt", b"theirs", 2_000_000_000, 2)
+        .await;
+    daemon
+        .peer_file(
+            &OriginId::named("desktop", "cluster.example").unwrap(),
+            "media",
+            "split.txt",
+            b"others",
+            2_100_000_000,
+            1,
+        )
+        .await;
+    let strict = says(
+        data_dir,
+        Command::Fill(pb::Fill {
+            reference: "media".into(),
+            from: None,
+            strict: true,
+            force: false,
+            dry_run: false,
+        }),
+        "skipped media/split.txt",
+    )
+    .await;
+    assert!(strict.contains("strict"), "{strict}");
+
+    // A prefix that names nothing is a typo, not an empty directory.
+    let typo = says(
+        data_dir,
+        fill("media/nosuchdir", None, false, false),
+        "note: no path in media starts with nosuchdir/",
+    )
+    .await;
+    assert!(typo.contains("filled 0"), "{typo}");
+
     daemon.shutdown().await;
 }
 

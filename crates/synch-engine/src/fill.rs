@@ -29,17 +29,17 @@
 use std::path::{Path, PathBuf};
 
 use synch_core::{EntryKind, Hash};
-use synch_store::{Donor, VersionPolicy, VersionSet};
+use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
-    mirror::{
-        apply_metadata, escapes_via_symlink, fold, materialize_symlink, same_size_root,
-        unsafe_name, Metadata,
-    },
+    mirror::{apply_metadata, escapes_via_symlink, fold, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
 };
+
+#[cfg(windows)]
+use crate::mirror::unsafe_name;
 
 /// How a fill treats what is already on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,7 +101,23 @@ impl Node {
         // state. Mirrors take the same lock; their roots cannot overlap a
         // space's, so sharing it costs nothing but the wait.
         let _pass = self.lock_materialization().await;
+        let plan = self.plan_fill(space_id, prefix, policy, options).await?;
+        self.write_fill(plan, options).await
+    }
 
+    /// Everything a fill can settle before the network: which paths need
+    /// writing, and every decision that needs no bytes.
+    ///
+    /// Split from [`Node::write_fill`] because the two halves are what a fill
+    /// *is* — and because the gap between them is where the interesting
+    /// failures live, so a test has to be able to stand in it.
+    async fn plan_fill(
+        &self,
+        space_id: &str,
+        prefix: &str,
+        policy: &VersionPolicy,
+        options: FillOptions,
+    ) -> Result<FillPlan> {
         // The space row is read once and its root carried through the pass:
         // the write guard needs the root per path, and re-reading the row for
         // each would be one store acquisition per file in the space.
@@ -128,21 +144,34 @@ impl Node {
             .await?
         };
 
-        // Phase 1, blocking end to end for the reasons mirror.rs lays out: the
-        // listing is a range scan over every path in the space plus a version
-        // set each, and deciding what a path needs is a stat and — where the
-        // scanner's own record cannot answer — a whole-file hash.
-        let plan = {
-            let node = self.clone();
-            let (space_id, prefix) = (space_id.to_string(), prefix.to_string());
-            let (root_dir, policy) = (root_dir.clone(), policy.clone());
-            crate::blocking::offload(move || {
-                let listing = node.unified_listing(&space_id, &prefix, None, None)?;
-                plan_fill(&node, &space_id, &root_dir, &listing, &policy, options)
+        // Blocking end to end for the reasons mirror.rs lays out: the listing
+        // is a range scan over every path in the space plus a version set each,
+        // and deciding what a path needs is a stat and — where the scanner's
+        // own record cannot answer — a whole-file hash.
+        let node = self.clone();
+        let (space, prefix) = (space_id.to_string(), prefix.to_string());
+        let policy = policy.clone();
+        crate::blocking::offload(move || {
+            let listing = node.unified_listing(&space, &prefix, None, None)?;
+            let (report, wanted) = decide(&node, &space, &root_dir, &listing, &policy, options)?;
+            Ok(FillPlan {
+                space,
+                root_dir,
+                report,
+                wanted,
             })
-            .await?
-        };
-        let FillPlan { mut report, wanted } = plan;
+        })
+        .await
+    }
+
+    /// Fetches and writes what the plan decided it must, and reports.
+    async fn write_fill(&self, plan: FillPlan, options: FillOptions) -> Result<FillReport> {
+        let FillPlan {
+            space: space_id,
+            root_dir,
+            mut report,
+            wanted,
+        } = plan;
         if options.dry_run {
             // The plan *is* the answer: everything it decided is already in the
             // report, and `wanted` is what a real run would go and fetch.
@@ -153,6 +182,7 @@ impl Node {
         // Phase 2: fetch what phase 1 could not satisfy locally — building each
         // object out of a donor where the descent can — and write it as it
         // lands.
+        let mut reindex: Vec<String> = Vec::new();
         for want in wanted {
             let Wanted {
                 path,
@@ -163,7 +193,20 @@ impl Node {
                 donors,
                 replacing,
             } = want;
-            let fetched = self.fetch_all_from(&content, size, &donors).await?;
+            // A failure here is this path's, not the run's. A one-shot fill has
+            // no second pass to repair what an early `?` would abandon, and by
+            // now some of these files are already on disk — so the run finishes
+            // and the report names what went wrong, rather than the operator
+            // getting an error and no account of what was written.
+            let fetched = match self.fetch_all_from(&content, size, &donors).await {
+                Ok(fetched) => fetched,
+                Err(e) => {
+                    report
+                        .skipped
+                        .push((path, format!("content could not be fetched: {e}")));
+                    continue;
+                }
+            };
             if !fetched.complete {
                 report
                     .skipped
@@ -173,14 +216,41 @@ impl Node {
             report.fetched_bytes += crate::mirror::bytes_of(&fetched.fetched, size);
             report.reused_bytes += crate::mirror::bytes_of(&fetched.promoted, size);
 
-            // Taken again immediately before the write it guards: phase 1
-            // checked this path too, but a fetch stands between the two, and
-            // the gap must stay one write wide rather than one pass wide.
+            // Both guards are re-taken here, in the same blocking step as the
+            // write they protect, because a fetch stands between the plan and
+            // this point and each of them describes something that can have
+            // moved in the meantime.
+            //
+            // The escape guard is the mirror's, and describes the *directory*
+            // the write lands in — `escapes_via_symlink` pops the last
+            // component, so it says nothing about the target itself.
+            //
+            // The second guard is the one a fill needs and a mirror does not.
+            // A mirror owns its root; a fill writes into the directory the user
+            // works in, with the watcher running, so "nothing was here when we
+            // planned" is a statement with a shelf life. Materialization ends
+            // in a rename, which destroys whatever it lands on — so a file that
+            // appeared during the fetch would be silently overwritten by a run
+            // that was never given `--force`. Re-stat, and refuse.
             let (root, guarded) = (root_dir.clone(), path.clone());
-            let clear =
-                crate::blocking::offload(move || Ok(!escapes_via_symlink(&root, &guarded))).await?;
-            let outcome = if !clear {
+            let stat_target = target.clone();
+            let ready = crate::blocking::offload(move || {
+                if escapes_via_symlink(&root, &guarded) {
+                    return Ok(Ready::Escaped);
+                }
+                Ok(match std::fs::symlink_metadata(&stat_target) {
+                    // Planned as a replacement, and something is still there:
+                    // `--force` was given for exactly this.
+                    Ok(_) if replacing => Ready::Write,
+                    Ok(_) => Ready::Appeared,
+                    Err(_) => Ready::Write,
+                })
+            })
+            .await?;
+            let outcome = if let Ready::Escaped = ready {
                 Written::Escaped
+            } else if let Ready::Appeared = ready {
+                Written::Appeared
             } else {
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched.
@@ -209,6 +279,10 @@ impl Node {
                     if replacing {
                         report.replaced.push(path.clone());
                     }
+                    // The scanner's record for this path describes the file
+                    // that *was* here, and a fill just replaced it. The rows go
+                    // below, in one step.
+                    reindex.push(path.clone());
                     if let Written::WithoutMetadata(_, why) = outcome {
                         report.skipped.push((
                             path,
@@ -223,12 +297,60 @@ impl Node {
                     path,
                     "path resolves through a symlink; refusing to write outside the space".into(),
                 )),
+                Written::Appeared => report.differing.push(path),
                 Written::Failed(why) => report
                     .skipped
                     .push((path, format!("content could not be written: {why}"))),
             }
         }
+
+        // The scanner skips a file whose `(size, mtime_ns, file_id)` still
+        // matches its `local_files` row, and a fill has just written bytes
+        // those rows do not describe. Dropping them makes the next scan re-hash
+        // every path this fill wrote.
+        //
+        // It matters most where `file_identity` is `None` — every non-unix
+        // platform — because there the comparison is only `(size, mtime)`, and
+        // a fill stamps the *selected version's* mtime. A selected version that
+        // ties this node's own published one on size and mtime (the tie
+        // `newest` breaks on content root) would leave the scan calling the
+        // filled path unchanged and never publishing it: the disk would hold
+        // the peer's bytes while this node went on publishing its own. §7.2
+        // rests on that publish happening.
+        //
+        // One blocking step for all of them rather than one acquisition of the
+        // store's connection per file (§10).
+        if !reindex.is_empty() {
+            let (node, space) = (self.clone(), space_id.to_string());
+            crate::blocking::offload(move || {
+                for path in reindex {
+                    node.store().remove_local_file(&space, &path)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+impl Node {
+    /// The plan half alone, so a test can let the world move between the plan
+    /// and the write the way a slow fetch does.
+    pub(crate) async fn fill_plan_for_test(
+        &self,
+        space_id: &str,
+        policy: &VersionPolicy,
+    ) -> FillPlan {
+        self.plan_fill(space_id, "", policy, FillOptions::default())
+            .await
+            .expect("the plan half should succeed")
+    }
+
+    /// The write half alone, against a plan taken earlier.
+    pub(crate) async fn finish_fill_for_test(&self, plan: FillPlan) -> Result<FillReport> {
+        self.write_fill(plan, FillOptions::default()).await
     }
 }
 
@@ -252,6 +374,18 @@ struct Wanted {
     replacing: bool,
 }
 
+/// What the guards taken immediately before a write decided.
+#[derive(Debug)]
+enum Ready {
+    /// Write it.
+    Write,
+    /// An ancestor is a symlink: the write would land outside the space.
+    Escaped,
+    /// Nothing was here when this path was planned and something is here now.
+    /// A file that arrives mid-fill belongs to whoever wrote it.
+    Appeared,
+}
+
 /// How one write ended.
 #[derive(Debug)]
 enum Written {
@@ -261,28 +395,36 @@ enum Written {
     WithoutMetadata(crate::CloneKind, String),
     /// Refused by the symlink-escape guard: nothing was written.
     Escaped,
+    /// Refused because the path stopped being empty while the fill ran.
+    Appeared,
     /// The object could not be materialized. The target is as it was.
     Failed(String),
 }
 
 /// What one fill settled before any content was fetched.
-#[derive(Debug, Default)]
-struct FillPlan {
+#[derive(Debug)]
+pub(crate) struct FillPlan {
+    /// The space being filled, for the `local_files` rows the write half drops.
+    space: String,
+    /// Its configured directory.
+    root_dir: PathBuf,
+    /// Everything already decided.
     report: FillReport,
+    /// What is left for the network half to fetch.
     wanted: Vec<Wanted>,
 }
 
 /// Decides, and performs, everything a fill can settle without the network.
 ///
-/// Blocking from end to end: [`Node::fill_space`] runs it on the blocking pool.
-fn plan_fill(
+/// Blocking from end to end: [`Node::plan_fill`] runs it on the blocking pool.
+fn decide(
     node: &Node,
     space_id: &str,
     root_dir: &Path,
     listing: &[VersionSet],
     policy: &VersionPolicy,
     options: FillOptions,
-) -> Result<FillPlan> {
+) -> Result<(FillReport, Vec<Wanted>)> {
     // One clock reading for the pass, and the store's rather than the bare
     // clock, so every path selects against the same instant (`plan_pass`,
     // mirror.rs).
@@ -297,9 +439,19 @@ fn plan_fill(
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for set in listing {
-        // The name is judged before the target is built, because building it
-        // is already the damage on a platform that reads more out of a path
-        // than the protocol puts in (`plan_pass`, mirror.rs).
+        // A mirror refuses these names on every platform, so that one mirror of
+        // one tree is the same directory everywhere. A fill has the opposite
+        // obligation: it writes into *this* machine's directory, where this
+        // machine's own scanner is the thing that published half these paths.
+        // `2026-08-21T10:00:00.log` and `aux.txt` are ordinary names here, and
+        // refusing them would report a file as skipped on every fill while it
+        // sat on disk already current — and would make a peer's copy of such a
+        // path unfillable on the very platform that can hold it.
+        //
+        // So the check is the platform's own. Safety does not rest on it in
+        // either case: `target_within` below is what refuses a path that would
+        // leave the space, and it applies the platform's rules on every one.
+        #[cfg(windows)]
         if let Some(reason) = unsafe_name(&set.path) {
             report.skipped.push((set.path.clone(), reason));
             continue;
@@ -383,6 +535,12 @@ fn plan_fill(
                 report.current += 1;
             } else if on_disk.is_some() && !options.force {
                 report.differing.push(set.path.clone());
+            } else if let Some(reason) = symlink_refusal(wanted_target) {
+                // Asked before the dry-run branch, not after: a dry run that
+                // counted a link this platform cannot create — every non-unix
+                // one — would promise a fill the real run then reports as a
+                // skip, which is the one thing a dry run must not do.
+                report.skipped.push((set.path.clone(), reason));
             } else if options.dry_run {
                 report.filled += 1;
                 if on_disk.is_some() {
@@ -410,43 +568,77 @@ fn plan_fill(
         };
 
         if let Some(stat) = &on_disk {
-            // Is the file here already the selected version? The scanner's own
-            // `local_files` record answers with a stat wherever it can, which
-            // is what keeps a second fill of a large space from re-hashing it;
-            // a file the record cannot vouch for is hashed, but only when its
-            // length leaves it able to be the version at all.
-            //
-            // A regular file or nothing: a *symlink* standing where the tree
-            // publishes a file is a different kind of thing, whatever it
-            // happens to point at, and `same_size_root` would follow it and
-            // call a link to an identical file current.
-            let here = stat
-                .is_file()
-                .then(|| {
-                    indexed_content(node, space_id, &set.path, stat)
-                        .or_else(|| same_size_root(&target, selected.size))
-                })
-                .flatten();
-            if here == Some(content) {
-                // Right bytes. The metadata is left alone deliberately: what a
-                // file here carries is this node's own assertion, and a fill
-                // that restamped it would republish every path it looked at.
-                report.current += 1;
-                continue;
-            }
-            if !options.force {
-                report.differing.push(set.path.clone());
-                continue;
+            match content_here(node, space_id, &set.path, &target, stat, &selected) {
+                LocalContent::Is(here) if here == content => {
+                    // Right bytes. The metadata is left alone deliberately:
+                    // what a file here carries is this node's own assertion,
+                    // and a fill that restamped it would republish every path
+                    // it looked at.
+                    report.current += 1;
+                    continue;
+                }
+                // The bytes are readable and are not the selected version's.
+                LocalContent::Is(_) | LocalContent::WrongSize => {
+                    if !options.force {
+                        report.differing.push(set.path.clone());
+                        continue;
+                    }
+                    // Our *own* published version, and the file here does not
+                    // match it: the disk is a local edit this node has not
+                    // scanned yet, and the entry is what it published last
+                    // time. Filling would overwrite the newer statement of our
+                    // view with the older one, and — because the old content
+                    // root is the one we already publish — the next scan would
+                    // stage nothing, so the edit would vanish leaving no
+                    // version, no `prev`, and no trace anywhere in the cluster.
+                    // `--force` means "take theirs"; there is no theirs here.
+                    if selected.origin == *node.origin() {
+                        report.skipped.push((
+                            set.path.clone(),
+                            "the selected version is this node's own, and the file here differs \
+                             from it: that is an edit no scan has published yet, not a version to \
+                             adopt. Run `synch scan` to publish it"
+                                .into(),
+                        ));
+                        continue;
+                    }
+                }
+                // Something is here, it is the right length to be the version,
+                // and it could not be read. "Differs" would be a claim nothing
+                // established, and `--force` acts on that claim by renaming
+                // over the file — which needs no read permission at all. So a
+                // file this node cannot read is never replaced and never
+                // called differing.
+                LocalContent::Unreadable(why) => {
+                    report.skipped.push((
+                        set.path.clone(),
+                        format!("a file is here and could not be read to compare it: {why}"),
+                    ));
+                    continue;
+                }
             }
         }
 
+        // Per-path, like every other failure in this loop: a donor lookup that
+        // fails is a path that cannot be planned, not a run that cannot finish
+        // — and by this point the loop has already written symlinks.
+        let donors = match node.donors_for(&selected, set) {
+            Ok(donors) => donors,
+            Err(e) => {
+                report.skipped.push((
+                    set.path.clone(),
+                    format!("could not look up what could serve the content: {e}"),
+                ));
+                continue;
+            }
+        };
         wanted.push(Wanted {
             path: set.path.clone(),
             target,
             content,
             size: selected.size,
             meta: Metadata::of(&selected),
-            donors: node.donors_for(&selected, set)?,
+            donors,
             replacing: on_disk.is_some(),
         });
     }
@@ -461,7 +653,7 @@ fn plan_fill(
                 .map(|w| w.path.clone()),
         );
     }
-    Ok(FillPlan { report, wanted })
+    Ok((report, wanted))
 }
 
 /// The content root the scanner recorded for a path, when the stat on disk
@@ -488,6 +680,80 @@ fn indexed_content(
     fresh.then_some(known.content).flatten()
 }
 
+/// What is on disk where the selected version belongs.
+#[derive(Debug)]
+enum LocalContent {
+    /// The bytes here, named by their content root.
+    Is(Hash),
+    /// Not the right length to be the selected version, so nothing was read:
+    /// no hash of it could have matched.
+    WrongSize,
+    /// Something is here that could not be read — a mode this daemon does not
+    /// satisfy, an I/O error, a file another process holds. Deliberately not
+    /// folded into "differs": see the caller.
+    Unreadable(String),
+}
+
+/// Reads what is at `target` well enough to compare it with the version being
+/// filled, without ever reading more than it must.
+///
+/// The scanner's own `local_files` record answers first wherever its stat still
+/// vouches for the file, which is what keeps a second fill of a large space
+/// from re-hashing it. Failing that, length settles almost every case for the
+/// price of a `stat`, and only a file that *could* be the version is hashed.
+///
+/// A regular file or nothing: a symlink standing where the tree publishes a
+/// file is a different kind of thing whatever it points at, and following it
+/// would let a link to an identical file read as current.
+fn content_here(
+    node: &Node,
+    space_id: &str,
+    relpath: &str,
+    target: &Path,
+    stat: &std::fs::Metadata,
+    selected: &EntryRow,
+) -> LocalContent {
+    if !stat.is_file() {
+        return LocalContent::WrongSize;
+    }
+    if let Some(known) = indexed_content(node, space_id, relpath, stat) {
+        return LocalContent::Is(known);
+    }
+    if stat.len() != selected.size {
+        return LocalContent::WrongSize;
+    }
+    match std::fs::File::open(target)
+        .and_then(|file| synch_core::hash_reader(std::io::BufReader::new(file)))
+    {
+        Ok(root) => LocalContent::Is(root),
+        Err(e) => LocalContent::Unreadable(e.to_string()),
+    }
+}
+
+/// Why this platform cannot write the symbolic link an entry describes, or
+/// `None` if it can.
+///
+/// The refusals [`materialize_symlink`] makes before it touches the disk, asked
+/// separately so a dry run can report exactly what a real run would do rather
+/// than promising a link that could never be created.
+fn symlink_refusal(link_target: Option<&str>) -> Option<String> {
+    if link_target.is_none() {
+        return Some("symlink entry carries no target".into());
+    }
+    #[cfg(unix)]
+    {
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        Some(format!(
+            "symlink to {}: creating symbolic links is not available to the daemon on this \
+             platform, so the path is skipped rather than written as a plain file",
+            link_target.unwrap_or_default()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +778,20 @@ mod tests {
     /// CAS so the fetch has a local provider.
     fn publish(node: &Node, origin: &OriginId, path: &str, content: &[u8], mtime: i64) {
         publish_with_mode(node, origin, path, content, mtime, None);
+    }
+
+    /// The same, in a named space rather than `media`.
+    fn publish_in(
+        node: &Node,
+        origin: &OriginId,
+        space: &str,
+        path: &str,
+        content: &[u8],
+        mtime: i64,
+    ) {
+        let root = node.store().ingest_bytes(content, now_ns()).unwrap();
+        let entry = FileEntry::file(content.len() as u64, mtime, root, 1);
+        node.store().put_entry(origin, space, path, &entry).unwrap();
     }
 
     /// Publishes `origin`'s version of a path as a symbolic link.
@@ -850,6 +1130,252 @@ mod tests {
             "one of the folded pair is refused: {report:?}"
         );
         assert!(report.skipped[0].1.contains("folding"), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// The guard that keeps a fill inside its space, at both the moments it is
+    /// taken: when the path is planned, and again immediately before the write
+    /// the plan led to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_ancestor_is_refused() {
+        let (_data, space, node) = node_with_space().await;
+        let outside = tempfile::tempdir().unwrap();
+        // The shape a hostile peer plants: a link the fill would resolve
+        // through, and a path beneath it.
+        std::os::unix::fs::symlink(outside.path(), space.path().join("sub")).unwrap();
+        publish(&node, &peer(), "sub/escaped.txt", b"not yours", STAMP);
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(
+            report.skipped[0].1.contains("symlink"),
+            "{:?}",
+            report.skipped
+        );
+        assert!(
+            !outside.path().join("escaped.txt").exists(),
+            "a fill must never write outside the space root"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A file that appears while the fill is fetching belongs to whoever wrote
+    /// it. Without `--force` the plan's "nothing was here" has a shelf life,
+    /// and materialization ends in a rename that would destroy it silently.
+    #[tokio::test]
+    async fn a_file_that_appears_mid_fill_is_not_overwritten() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "late.txt", b"theirs", STAMP);
+
+        // Planned as absent, then created behind the plan's back: the same
+        // interleaving a slow fetch gives any editor working in the space.
+        let plan = node
+            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .await;
+        std::fs::write(space.path().join("late.txt"), b"mine, just now").unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(space.path().join("late.txt")).unwrap(),
+            b"mine, just now",
+            "the file written during the fill must survive it"
+        );
+        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.differing, vec!["late.txt".to_string()], "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A current file is left completely alone — its mtime included. Restamping
+    /// it would republish every path a fill looked at, and `newest` orders on
+    /// the mtime, so it would win the selection cluster-wide.
+    #[tokio::test]
+    async fn a_current_file_is_not_restamped_and_publishes_nothing() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("f.txt");
+        std::fs::write(&target, b"agreed").unwrap();
+        node.scan_publish_push().await.unwrap();
+        let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+        // The peer publishes the same bytes under a different stamp.
+        publish(&node, &peer(), "f.txt", b"agreed", STAMP);
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
+        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            before,
+            "a fill must not restamp a file whose bytes are already right"
+        );
+        // And so the scan after it has nothing to say.
+        assert!(
+            node.scan_publish_push().await.unwrap().is_none(),
+            "restamping would have republished a path nothing changed at"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A file the daemon cannot read is never called differing and never
+    /// replaced: "differs" would be a claim the failed read did not establish,
+    /// and a rename needs no read permission to destroy it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_file_is_reported_rather_than_replaced() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("secret.txt");
+        // The same length as the version being filled, so length cannot settle
+        // it and the compare has to read.
+        std::fs::write(&target, b"mine!!").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        publish(&node, &peer(), "secret.txt", b"theirs", STAMP);
+
+        // A mode is not a wall for every uid: run as root — in a container, in
+        // a sandbox — and `0o000` reads fine, so there is no unreadable file to
+        // test with. Say so and stop rather than assert something the platform
+        // is not doing.
+        if std::fs::File::open(&target).is_ok() {
+            eprintln!(
+                "skipped: this uid reads through a 0o000 mode, so nothing here is unreadable"
+            );
+            node.shutdown().await.unwrap();
+            return;
+        }
+
+        for force in [false, true] {
+            let report = node
+                .fill_space(
+                    "media",
+                    "",
+                    &VersionPolicy::Newest,
+                    FillOptions {
+                        force,
+                        dry_run: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.differing.is_empty(), "force={force}: {report:?}");
+            assert!(report.replaced.is_empty(), "force={force}: {report:?}");
+            assert_eq!(report.skipped.len(), 1, "force={force}: {report:?}");
+            assert!(
+                report.skipped[0].1.contains("could not be read"),
+                "force={force}: {report:?}"
+            );
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine!!");
+        node.shutdown().await.unwrap();
+    }
+
+    /// `--force` adopts a peer's version. Where the selected version is this
+    /// node's *own*, there is nothing to adopt: the file on disk is an edit no
+    /// scan has published yet, and overwriting it would leave no version, no
+    /// `prev`, and no trace anywhere.
+    #[tokio::test]
+    async fn force_will_not_revert_an_unscanned_local_edit() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("mine.txt");
+        std::fs::write(&target, b"published").unwrap();
+        node.scan_publish_push().await.unwrap();
+        std::fs::write(&target, b"edited since the scan").unwrap();
+
+        let report = node
+            .fill_space(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: true,
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"edited since the scan",
+            "the edit must survive: nothing in the cluster would record its loss"
+        );
+        assert!(report.replaced.is_empty(), "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].1.contains("synch scan"), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// Content nobody can serve is one skipped path, not a failed run — and the
+    /// report of what did land survives it.
+    #[tokio::test]
+    async fn an_unservable_object_costs_its_own_path_only() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "here.txt", b"fetchable", STAMP);
+        // An entry naming content this node does not hold, with no peer to ask.
+        let mut absent = FileEntry::file(9, STAMP, synch_core::Hash([9u8; 32]), 1);
+        absent.unix_mode = None;
+        node.store()
+            .put_entry(&peer(), "media", "absent.txt", &absent)
+            .unwrap();
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.filled, 1,
+            "the servable path still landed: {report:?}"
+        );
+        assert!(space.path().join("here.txt").exists());
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.skipped[0].0, "absent.txt");
+        assert!(!space.path().join("absent.txt").exists());
+        node.shutdown().await.unwrap();
+    }
+
+    /// The fold-collision rule, named both ways: which path wins, and that the
+    /// winner's bytes are what is on disk.
+    #[tokio::test]
+    async fn the_first_claimant_of_a_folded_name_wins() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "Fold.txt", b"upper", STAMP);
+        publish(&node, &peer(), "fold.txt", b"lower", STAMP);
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        // The listing is ordered, so the first claimant is the lexicographically
+        // first path — the same winner a mirror picks (§7.2).
+        assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
+        assert!(report.skipped[0].1.contains("collides with Fold.txt"));
+        assert_eq!(
+            std::fs::read(space.path().join("Fold.txt")).unwrap(),
+            b"upper"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A detached space has no checkout to fill, and says which command does
+    /// materialize one.
+    #[tokio::test]
+    async fn a_detached_space_is_refused_with_the_command_that_fits() {
+        let (_data, _space, node) = node_with_space().await;
+        node.store().put_detached_space("cloud").unwrap();
+        publish_in(&node, &peer(), "cloud", "f.txt", b"theirs", STAMP);
+        let refused = node
+            .fill_space("cloud", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("detached"), "{refused}");
+        assert!(refused.contains("synch mirror add cloud"), "{refused}");
         node.shutdown().await.unwrap();
     }
 

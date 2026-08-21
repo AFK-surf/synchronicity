@@ -2192,9 +2192,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }) => {
             let reference = parse_reference(&reference)?;
             let policy = policy_for(&reference, from.as_deref(), strict)?;
-            if let Some(origin) = &reference.origin {
-                ensure_known_origin(node, origin).await?;
-            }
+            // Space first and origin second, the order `ls` states its reason
+            // for: one typo should be reported as the same mistake whichever
+            // command met it.
+            //
             // A space nobody publishes and a space nobody indexes fail for
             // different reasons, and the second is the one `fill` is picky
             // about: it writes into the directory `synch space add` named, so
@@ -2202,6 +2203,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // says so; this is the other half, so a typo'd id does not report
             // "no local space" when the real answer is "no such space at all".
             ensure_known_space(node, &reference.space).await?;
+            if let Some(origin) = &reference.origin {
+                ensure_known_origin(node, origin).await?;
+            }
             let options = synch_engine::FillOptions { force, dry_run };
             let report = node
                 .fill_space(&reference.space, &reference.dir_prefix(), &policy, options)
@@ -2237,10 +2241,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ))
                 .await?;
             }
-            // On stdout rather than as progress, unlike the per-path lines of
-            // `scan` and `mirror sync`: these are the paths the operator has
-            // to decide about, and under `--dry-run` the list *is* the
-            // command's answer.
+            // Every per-path line here goes to stdout, unlike the per-path
+            // lines of `scan` and `mirror sync`. Those report how a pass went,
+            // path by path; these are the paths the operator has to decide
+            // about — under `--dry-run` the list *is* the command's answer, and
+            // under `--strict` the skipped paths are the entire reason the
+            // command was run. Splitting one decision list across two streams
+            // so that `synch fill media --strict > plan` wrote the count and
+            // dropped the paths would be the worst of both.
             for path in &report.replaced {
                 out.line(format!(
                     "{} {}/{path}",
@@ -2261,7 +2269,24 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             for (path, reason) in &report.skipped {
-                out.progress(format!("skipped {path}: {reason}")).await?;
+                out.line(format!("skipped {}/{path}: {reason}", reference.space))
+                    .await?;
+            }
+            // A prefix that names nothing is almost always a typo, and it
+            // reports exactly what an already-full directory reports. `status`
+            // refuses to let a named path that matches nothing pass as silence;
+            // a fill that writes nothing because of a typo is the same trap.
+            if !reference.is_space_root()
+                && report.filled + report.current == 0
+                && report.differing.is_empty()
+                && report.skipped.is_empty()
+            {
+                out.line(format!(
+                    "note: no path in {} starts with {}",
+                    reference.space,
+                    reference.dir_prefix()
+                ))
+                .await?;
             }
             if report.filled > 0 && !report.dry_run {
                 out.line("the next scan publishes what was filled as this node's own view")
