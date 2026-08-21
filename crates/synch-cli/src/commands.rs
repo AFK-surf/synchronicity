@@ -736,6 +736,20 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             }),
         },
 
+        Command::Fill {
+            reference,
+            from,
+            strict,
+            force,
+            dry_run,
+        } => Cmd::Fill(pb::Fill {
+            reference: reference.clone(),
+            from: from.clone(),
+            strict: *strict,
+            force: *force,
+            dry_run: *dry_run,
+        }),
+
         Command::Mirror { command } => match command {
             MirrorCommand::Add {
                 space,

@@ -387,6 +387,15 @@ fn domain_refresh() -> Command {
 fn domain_clear() -> Command {
     Command::DomainClear(pb::DomainClear {})
 }
+fn fill(reference: &str, from: Option<&str>, force: bool, dry_run: bool) -> Command {
+    Command::Fill(pb::Fill {
+        reference: reference.into(),
+        from: from.map(String::from),
+        strict: false,
+        force,
+        dry_run,
+    })
+}
 fn mirror_add(space: &str, path: &str, policy: Option<&str>) -> Command {
     Command::MirrorAdd(pb::MirrorAdd {
         space: space.into(),
@@ -790,6 +799,7 @@ async fn errors_cross_the_socket_with_their_code() {
         (status(Some("media/gone.txt")), ErrorCode::NotFound),
         (space_rm("ghost"), ErrorCode::NotFound),
         (mirror_rm("/no/such/mirror"), ErrorCode::NotFound),
+        (fill("nospace", None, false, false), ErrorCode::NotFound),
         (
             key_activate(&SecretKey::generate().public().to_z32()),
             ErrorCode::NotFound,
@@ -813,6 +823,84 @@ async fn errors_cross_the_socket_with_their_code() {
     for (command, code) in cases {
         assert_eq!(failure(data_dir, command.clone()).await, *code);
     }
+
+    daemon.shutdown().await;
+}
+
+/// `synch fill` over the socket (§7.2): a peer's content lands in the space
+/// this node publishes from, a local file that differs is reported rather than
+/// overwritten, and the scan afterwards publishes what was filled as ours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    let space = space_with(&[("mine.txt", b"mine")]);
+    // Backdated, so the peer's competing version below is unambiguously the
+    // newer one: `newest` orders on the published mtime, and a file written
+    // just now would win against any stamp a test can name.
+    let ours = space.path().join("mine.txt");
+    std::fs::File::options()
+        .write(true)
+        .open(&ours)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+    lines(
+        data_dir,
+        space_add("media", &space.path().to_string_lossy()),
+    )
+    .await;
+    says(data_dir, scan(), "published seq").await;
+
+    let peer = OriginId::named("laptop", "cluster.example").unwrap();
+    daemon
+        .peer_file(&peer, "media", "theirs.txt", b"theirs", 1_700_000_000, 1)
+        .await;
+    // The same path, published with newer bytes: the local copy is this node's
+    // own assertion and a fill leaves it standing.
+    daemon
+        .peer_file(&peer, "media", "mine.txt", b"not mine", 2_000_000_000, 1)
+        .await;
+
+    // The dry run decides everything and writes nothing.
+    let planned = says(data_dir, fill("media", None, false, true), "would fill 1").await;
+    assert!(planned.contains("differing media/mine.txt"), "{planned}");
+    assert!(!space.path().join("theirs.txt").exists(), "{planned}");
+
+    let filled = says(data_dir, fill("media", None, false, false), "filled 1").await;
+    assert!(filled.contains("differing media/mine.txt"), "{filled}");
+    assert!(filled.contains("the next scan publishes"), "{filled}");
+    assert_eq!(
+        std::fs::read(space.path().join("theirs.txt")).unwrap(),
+        b"theirs"
+    );
+    assert_eq!(
+        std::fs::read(space.path().join("mine.txt")).unwrap(),
+        b"mine",
+        "a fill never overwrites what is here without --force"
+    );
+
+    // And now it is ours as well: one version, two attestors.
+    says(data_dir, scan(), "published seq").await;
+    says(
+        data_dir,
+        status(Some("media/theirs.txt")),
+        "media/theirs.txt  1 version(s)",
+    )
+    .await;
+
+    // Nothing left to do, and `--force` is what ends the standoff.
+    says(data_dir, fill("media", None, false, false), "filled 0").await;
+    let forced = says(data_dir, fill("media", None, true, false), "filled 1").await;
+    assert!(forced.contains("replaced media/mine.txt"), "{forced}");
+    assert_eq!(
+        std::fs::read(space.path().join("mine.txt")).unwrap(),
+        b"not mine"
+    );
 
     daemon.shutdown().await;
 }

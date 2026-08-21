@@ -305,6 +305,12 @@ fn the_command_surface_works_over_the_socket() {
         .run(&["mirror", "rm", &mirror_dir.path().to_string_lossy()])
         .contains("removed"));
 
+    // A fill of a space whose every path this node already holds has nothing
+    // to do, and says so without writing anything.
+    let fill = cli.run(&["fill", "media", "--dry-run"]);
+    assert!(fill.contains("would fill 0"), "{fill}");
+    assert!(fill.contains("current 2"), "{fill}");
+
     // A pin may name a path; the reading policy's version supplies the root (§8).
     let root = blake3::hash(b"hello").to_hex().to_string();
     assert!(cli.run(&["pin", "add", "media/notes.txt"]).contains(&root));

@@ -931,41 +931,51 @@ impl Node {
                 "space {space_id} is detached and has no filesystem adoption target"
             ))
         })?;
-        let normalized = normalized_adoption_path(path)?;
-        // And the platform has to agree the result is purely relative before it
-        // is joined onto the space root.
-        //
-        // `normalize_path` works in the protocol's own path language, where `/`
-        // is the only separator — deliberately, so a trie key means the same
-        // thing on every node. On Windows the *platform* reads more than that: a
-        // key of `..\..\evil.txt` is one `Normal` component to the protocol and
-        // a traversal to `Path::join`, and one of `C:/Windows/Temp/evil.txt`
-        // carries a drive prefix, which makes `join` discard the space root
-        // entirely. Either writes outside every space, as the daemon user, from
-        // any key the S3 gateway accepts.
-        //
-        // A no-op on POSIX, where none of those parse as anything but `Normal`.
-        // The mirror's `unsafe_name` already refuses these on the way out; this
-        // is the way in.
-        // Lexical safety is still not enough. A space root is canonicalized when
-        // it is added but its *interior* never is, so a symlinked directory
-        // inside the space resolves through to wherever it points, and the write
-        // or the delete lands outside every space as whatever uid the daemon
-        // runs as. The mirror loop has always checked this; every other writer
-        // needs the same check, and a deletion needs it as much as a write does.
-        if crate::mirror::escapes_via_symlink(Path::new(local_path), &normalized) {
-            return Err(EngineError::invalid(format!(
-                "{space_id}/{path} resolves through a symlinked directory and would leave the space"
-            )));
-        }
-        Ok(PathBuf::from(local_path).join(&normalized))
+        target_within(Path::new(local_path), space_id, path)
     }
+}
+
+/// The guard itself, over a space root already in hand.
+///
+/// [`Node::adoption_target`] is the form that reads the space row first; this
+/// is the form for a caller holding the root already and asking it of many
+/// paths in a row (`synch fill`, fill.rs), where re-reading that row per path
+/// would be one store acquisition per file in the space.
+pub(crate) fn target_within(root: &Path, space_id: &str, path: &str) -> Result<PathBuf> {
+    let normalized = normalized_adoption_path(path)?;
+    // Lexical safety is still not enough. A space root is canonicalized when
+    // it is added but its *interior* never is, so a symlinked directory
+    // inside the space resolves through to wherever it points, and the write
+    // or the delete lands outside every space as whatever uid the daemon
+    // runs as. The mirror loop has always checked this; every other writer
+    // needs the same check, and a deletion needs it as much as a write does.
+    if crate::mirror::escapes_via_symlink(root, &normalized) {
+        return Err(EngineError::invalid(format!(
+            "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+        )));
+    }
+    Ok(root.join(&normalized))
 }
 
 /// Normalizes a write path and applies the host platform's relative-path rules.
 fn normalized_adoption_path(path: &str) -> Result<String> {
     let normalized =
         synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
+    // And the platform has to agree the result is purely relative before it
+    // is joined onto the space root.
+    //
+    // `normalize_path` works in the protocol's own path language, where `/`
+    // is the only separator — deliberately, so a trie key means the same
+    // thing on every node. On Windows the *platform* reads more than that: a
+    // key of `..\..\evil.txt` is one `Normal` component to the protocol and
+    // a traversal to `Path::join`, and one of `C:/Windows/Temp/evil.txt`
+    // carries a drive prefix, which makes `join` discard the space root
+    // entirely. Either writes outside every space, as the daemon user, from
+    // any key the S3 gateway accepts.
+    //
+    // A no-op on POSIX, where none of those parse as anything but `Normal`.
+    // The mirror's `unsafe_name` already refuses these on the way out; this
+    // is the way in.
     if Path::new(&normalized)
         .components()
         .any(|part| !matches!(part, std::path::Component::Normal(_)))

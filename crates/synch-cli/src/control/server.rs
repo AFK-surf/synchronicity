@@ -2183,6 +2183,92 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::Fill(pb::Fill {
+            reference,
+            from,
+            strict,
+            force,
+            dry_run,
+        }) => {
+            let reference = parse_reference(&reference)?;
+            let policy = policy_for(&reference, from.as_deref(), strict)?;
+            if let Some(origin) = &reference.origin {
+                ensure_known_origin(node, origin).await?;
+            }
+            // A space nobody publishes and a space nobody indexes fail for
+            // different reasons, and the second is the one `fill` is picky
+            // about: it writes into the directory `synch space add` named, so
+            // an unindexed space has nowhere to put anything. `fill_space`
+            // says so; this is the other half, so a typo'd id does not report
+            // "no local space" when the real answer is "no such space at all".
+            ensure_known_space(node, &reference.space).await?;
+            let options = synch_engine::FillOptions { force, dry_run };
+            let report = node
+                .fill_space(&reference.space, &reference.dir_prefix(), &policy, options)
+                .await?;
+            let mut summary = format!(
+                "{} {} · current {} · differing {} · skipped {}",
+                if report.dry_run {
+                    "would fill"
+                } else {
+                    "filled"
+                },
+                report.filled,
+                report.current,
+                report.differing.len(),
+                report.skipped.len()
+            );
+            if !report.replaced.is_empty() {
+                summary.push_str(&format!(
+                    " · {} {}",
+                    if report.dry_run {
+                        "would replace"
+                    } else {
+                        "replaced"
+                    },
+                    report.replaced.len()
+                ));
+            }
+            out.line(summary).await?;
+            if report.reused_bytes > 0 || report.reflinked > 0 {
+                out.line(format!(
+                    "reused {} B · fetched {} B · reflinked {}",
+                    report.reused_bytes, report.fetched_bytes, report.reflinked
+                ))
+                .await?;
+            }
+            // On stdout rather than as progress, unlike the per-path lines of
+            // `scan` and `mirror sync`: these are the paths the operator has
+            // to decide about, and under `--dry-run` the list *is* the
+            // command's answer.
+            for path in &report.replaced {
+                out.line(format!(
+                    "{} {}/{path}",
+                    if report.dry_run {
+                        "would replace"
+                    } else {
+                        "replaced"
+                    },
+                    reference.space
+                ))
+                .await?;
+            }
+            for path in &report.differing {
+                out.line(format!(
+                    "differing {}/{path} (local content differs; --force replaces it)",
+                    reference.space
+                ))
+                .await?;
+            }
+            for (path, reason) in &report.skipped {
+                out.progress(format!("skipped {path}: {reason}")).await?;
+            }
+            if report.filled > 0 && !report.dry_run {
+                out.line("the next scan publishes what was filled as this node's own view")
+                    .await?;
+            }
+        }
+
         Command::MirrorAdd(pb::MirrorAdd {
             space,
             path,

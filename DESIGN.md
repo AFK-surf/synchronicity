@@ -1288,6 +1288,23 @@ Materialization reads the unified tree (§8), so every materializing surface nam
 - `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to
   stdout with verified random access; this is where hash-tree reads shine (e.g.
   seeking in a large video).
+- `synch fill <space>[/<dir>] [--from <origin>|--strict] [--force] [--dry-run]` —
+  one-shot materialization into the *space's own* directory, the one `synch space
+  add` named. Where a mirror owns the directory it writes into, a fill writes into
+  the directory this node indexes and publishes from, so it may only ever add: a
+  missing path is written, a path whose bytes already match is left alone, and a
+  path whose bytes differ is reported rather than overwritten (`--force` replaces
+  it, which is the bulk form of `synch take`). **Nothing is ever removed** — not a
+  tombstoned version, not a local file no origin publishes; adopting a deletion
+  stays the deliberate, one-path act `synch take` of a tombstone is. A fill does
+  not publish either: the files land where the scanner will find them and the next
+  scan (§7.1) publishes them as this node's own view.
+
+  Which is why the metadata rule below is load-bearing here rather than cosmetic.
+  The mtime a filled path is stamped with is the one the next scan publishes, so a
+  fill restates the version it filled instead of minting a newer one — and `newest`
+  orders on `(mtime, content root, origin)`, so a fill stamped with the wall clock
+  would make this node win the selection for every path it touched, cluster-wide.
 
 Materialized files carry the metadata their selected version published, not the
 metadata of the copy: the origin's `mtime_ns`, and the permission bits of its
@@ -1481,6 +1498,9 @@ synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/
                                              content fetched, --from defaults to self
 synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
+synch fill [<origin>:]<space>[/<dir>]        one-shot materialization into the space's
+           [--from <o>|--strict]             own directory: adds what is missing, never
+           [--force] [--dry-run]             removes, reports what differs (§7.2)
 
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
                                              (a path pins its selected version's root;
