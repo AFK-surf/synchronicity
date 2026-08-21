@@ -506,9 +506,13 @@ remember that `db/` contains the node's **device secret key** (it lives in the
 shape, CAS credentials need only the CAS/staging/uploads prefixes and namespace
 policy is part of the node's security boundary.
 
-Common configuration is `--cas-backend`, `--cloud-root` (prefix),
-`--cloud-cache-bytes`, and `--cloud-upload`. Provider configuration is explicit
-and also has `SYNCH_…` environment fallbacks:
+Common configuration is `--cas-backend`, `--cas-root` (prefix),
+`--cas-cache-bytes`, and `--cas-upload`. Their environment forms are
+`SYNCH_CAS_BACKEND`, `SYNCH_CAS_ROOT`, `SYNCH_CAS_CACHE_BYTES`, and
+`SYNCH_CAS_UPLOAD`: CAS storage deliberately does not use the
+`SYNCH_CLOUD_…` namespace, which belongs to the separately named control-plane
+connection. Provider configuration is explicit and also has `SYNCH_…`
+environment fallbacks:
 
 - `s3`: bucket, region, optional endpoint, access-key/secret/session-token or
   OpenDAL's AWS role/web-identity/instance credential chain; path-style mode is

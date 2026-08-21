@@ -83,7 +83,7 @@ fn cloud_config_with_fallback(
         false => explicit.or_else(|| fallback.get(name).cloned()),
     };
     let mut options = std::collections::HashMap::new();
-    let explicit_root = (cli.cloud_root != "/").then(|| cli.cloud_root.clone());
+    let explicit_root = (cli.cas_root != "/").then(|| cli.cas_root.clone());
     let root = select(explicit_root, "root").unwrap_or_else(|| "/".into());
     options.insert("root".to_string(), root);
     let service = match backend {
@@ -148,8 +148,8 @@ fn cloud_config_with_fallback(
         options,
         scratch_dir,
         io_timeout: std::time::Duration::from_secs(60),
-        upload_policy: cli.cloud_upload.into(),
-        cache_bytes: cli.cloud_cache_bytes,
+        upload_policy: cli.cas_upload.into(),
+        cache_bytes: cli.cas_cache_bytes,
     }))
 }
 
@@ -886,8 +886,12 @@ mod tests {
             "durable-cas",
             "--s3-region",
             "us-west-2",
-            "--cloud-root",
+            "--cas-root",
             "nodes/a",
+            "--cas-upload",
+            "all",
+            "--cas-cache-bytes",
+            "1024",
             "daemon",
             "run",
         ]);
@@ -896,6 +900,11 @@ mod tests {
         assert_eq!(cloud.options["bucket"], "durable-cas");
         assert_eq!(cloud.options["region"], "us-west-2");
         assert_eq!(cloud.options["root"], "nodes/a");
+        assert_eq!(
+            cloud.upload_policy,
+            synch_store::cloud::CloudUploadPolicy::All
+        );
+        assert_eq!(cloud.cache_bytes, Some(1024));
 
         let missing = Cli::parse_from(["synch", "--cas-backend", "gcs", "daemon", "run"]);
         assert!(node_config(&missing)

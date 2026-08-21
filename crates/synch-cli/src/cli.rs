@@ -27,22 +27,22 @@ pub struct Cli {
     pub cas_backend: CasBackendArg,
 
     /// Prefix/root below the selected cloud bucket or container.
-    #[arg(long, global = true, env = "SYNCH_CLOUD_ROOT", default_value = "/")]
-    pub cloud_root: String,
+    #[arg(long, global = true, env = "SYNCH_CAS_ROOT", default_value = "/")]
+    pub cas_root: String,
 
     /// Which fetched objects are uploaded to the cloud CAS.
     #[arg(
         long,
         global = true,
-        env = "SYNCH_CLOUD_UPLOAD",
+        env = "SYNCH_CAS_UPLOAD",
         default_value = "own+pinned"
     )]
-    pub cloud_upload: CloudUploadArg,
+    pub cas_upload: CloudUploadArg,
 
     /// Maintenance target for the reconstructible cloud read cache. Without a
     /// value on Unix, maintenance targets 20% free space.
-    #[arg(long, global = true, env = "SYNCH_CLOUD_CACHE_BYTES")]
-    pub cloud_cache_bytes: Option<u64>,
+    #[arg(long, global = true, env = "SYNCH_CAS_CACHE_BYTES")]
+    pub cas_cache_bytes: Option<u64>,
 
     /// S3 bucket (also used by compatible endpoints such as MinIO).
     #[arg(long, global = true, env = "SYNCH_S3_BUCKET")]
