@@ -1,11 +1,11 @@
 //! The `synch` daemon, its control socket, and the CLI that drives it (§9.1).
 //!
-//! **The daemon owns the node; the CLI is only a client of it.** Every command
-//! except the two that bootstrap or *are* the daemon — `synch init`, which
-//! creates the datadir before any daemon can exist, and `synch daemon run` —
-//! is a request over the local control socket (§9.3). There is no in-process
-//! fallback: with no daemon running, a command fails with a message naming the
-//! socket path and the command to start one.
+//! **The daemon owns the node; the CLI is only a client of it.** Three commands
+//! do not use the local control socket: `synch init` creates the datadir,
+//! `synch daemon run` *is* the daemon, and `synch daemon start` launches that
+//! daemon in the background. Every other command is a request over the socket
+//! (§9.3). There is no in-process fallback: with no daemon running, a command
+//! fails with a message naming the socket path and both ways to start one.
 //!
 //! The crate is a library so the control protocol, the server, and the client
 //! can be exercised in process; `src/main.rs` is the argument-parsing shell

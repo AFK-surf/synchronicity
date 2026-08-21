@@ -519,6 +519,9 @@ pub enum KeyCommand {
 /// `synch daemon ...`
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
+    /// Start the daemon in the background and return once its control socket
+    /// is ready.
+    Start,
     /// Own the node: serve the control socket and run the anti-entropy,
     /// scanner, watcher, and maintenance loops.
     Run,
@@ -766,6 +769,17 @@ mod tests {
     #[test]
     fn the_command_surface_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn daemon_start_is_a_command() {
+        let cli = Cli::parse_from(["synch", "daemon", "start"]);
+        assert!(matches!(
+            cli.command,
+            Command::Daemon {
+                command: DaemonCommand::Start
+            }
+        ));
     }
 
     #[test]

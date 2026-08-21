@@ -19,13 +19,16 @@ round that needs no browser: see **The control-plane API** below.
 
 Two rules explain most of the surface:
 
-1. **The daemon owns the node.** `synch init` is the only command that runs
-   without one. Everything else is a gRPC call over a unix socket at
+1. **The daemon owns the node.** `synch init` bootstraps it, `synch daemon
+   start` launches it in the background and returns only when its socket is
+   ready, and `synch daemon run` keeps it in the foreground for a supervisor.
+   Every operational command is a gRPC call over a unix socket at
    `<data-dir>/control.sock`. With no daemon running you get, verbatim:
 
    ```
    synch: no daemon is running for /var/lib/synch: nothing is listening on
-   /var/lib/synch/control.sock. Start one with `synch daemon run`
+   /var/lib/synch/control.sock. Start one with `synch daemon start` (or keep
+   `synch daemon run` in the foreground)
    ```
 
 2. **Nobody writes anybody else's view.** A publish always says "*this* origin
@@ -81,7 +84,7 @@ install.
 
 ```sh
 synch init --domain cluster.acme.example.com  # the zone the network's page names
-synch daemon run &                      # required from here on
+synch daemon start                      # background; returns when the socket is ready
 synch space add media /srv/media        # index a local directory
 synch scan                              # hash it and publish a signed root
 synch ls media                          # read it back
@@ -95,7 +98,7 @@ record a zone run by hand would need:
 device key: qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo
 data dir:   /var/lib/synch
 domain:     cluster.acme.example.com
-next:       publish this record, then `synch daemon run`:
+next:       publish this record, then `synch daemon start`:
   _synchronicity.cluster.acme.example.com. IN TXT "v=sync1 id=<name> nk=<device key> apex=<apex>"
 ```
 
@@ -104,8 +107,8 @@ in the control plane — a label and the device key — and the record is
 signed and served in the same moment; **The control-plane API** below is the
 same act as one `POST` to the network — which is the form to reach for from
 this node itself, and the only one a join key can make. Until it is done,
-`daemon run` waits rather than serves: the zone does not name this key yet, so
-the node has no name to publish under.
+the daemon exposes only its reduced control service and waits: the zone does
+not name this key yet, so the node has no name to publish under.
 
 `scan` reports what it did and what it published:
 
@@ -373,6 +376,7 @@ remove the pin by its root.
 
 ```sh
 synch daemon run                # owns the node: control socket + every standing loop
+synch daemon start              # launch it in the background; wait for the socket
 synch daemon status             # one screen
 synch daemon stop               # ask it to shut down (Ctrl-C does the same)
 synch peers                     # live peers, addresses, last sync, rtt
@@ -381,7 +385,10 @@ synch doctor                    # the full examination
 synch doctor --rebuild          # rebuild derived views from the authoritative trie
 ```
 
-`daemon run` prints where it is and what socket it bound, then keeps the
+`daemon start` runs the same daemon in the background, appends its stdout and
+stderr to `<data-dir>/daemon.log`, and exits once the control socket accepts a
+connection. Use `daemon run` when a service manager should own the foreground
+process. `daemon run` prints where it is and what socket it bound, then keeps the
 anti-entropy scheduler, scanner, watcher, publisher, mirror loop, DNS refresh,
 maintenance/GC and the control-plane tunnel running:
 
@@ -782,7 +789,8 @@ Notes that bite:
 - `--offline` **conflicts with** every network flag rather than quietly
   ignoring it; `--dht-bootstrap` and `--dht-publish-addrs` require `--dht`.
 - The network flags take effect **where the endpoint is bound**, which is
-  `synch daemon run`. Passing them to a client command changes nothing.
+  `synch daemon run` (directly or through `daemon start`). Passing them to a
+  client command changes nothing.
 - `--strict` conflicts with `--from` on `cat` and `get` — one refuses to
   choose, the other chooses.
 
@@ -795,7 +803,7 @@ Failures worth recognizing:
 
 | Message | Means |
 | --- | --- |
-| `no daemon is running for <dir>: nothing is listening on <sock>` | start `synch daemon run` |
+| `no daemon is running for <dir>: nothing is listening on <sock>` | start `synch daemon start`, or use `synch daemon run` under a supervisor |
 | `no space <id>: not a local space, and no origin publishes one` | the space id is wrong, or nothing has published it yet |
 | `not found: <space>/<path>` | no version of that path in the unified tree |
 | `<path> has N versions and the policy is strict` | divergence, under `--strict`; the versions follow |
@@ -807,8 +815,9 @@ Failures worth recognizing:
 
 A fresh `<data-dir>` holds `synchronicity.db` (the metadata database, device
 secret included), the blob store under `store/`, `control.sock`, and
-`control.token`. Two more appear with use: `rekor-pins.json`, the TUF-verified
-transparency-log pin set, and `s3-uploads/`, where multipart parts are staged.
+`control.token`. More appear with use: `daemon.log` when `daemon start` is
+used, `rekor-pins.json`, the TUF-verified transparency-log pin set, and
+`s3-uploads/`, where multipart parts are staged.
 
 ```
 $ ls -a ~/.local/share/synchronicity

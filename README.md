@@ -22,13 +22,13 @@ so neither needs a system library.
 
 ## Usage
 
-Set up a node. `synch init` is the one command that runs without a daemon — it
-creates the datadir; everything after it is a gRPC call to the running daemon over a
-local control socket:
+Set up a node. `synch init` creates the datadir, `synch daemon start` launches
+the owner process in the background, and operational commands are gRPC calls to
+that daemon over a local control socket:
 
 ```sh
 synch init --domain cluster.example.com   # or plain `synch init` for a key identity
-synch daemon run &                         # required: the daemon owns the node
+synch daemon start                         # returns when the control socket is ready
 synch space add media /srv/media
 synch scan                                 # hash, publish a signed root
 synch id                                   # print the origin, device key, and address
@@ -40,7 +40,7 @@ The socket is `<data-dir>/control.sock` (a `\\.\pipe\synchronicity-…` named pi
 on Windows), `0600` inside a `0700` data directory, authenticated by a token
 regenerated on every daemon start and sent as a header on every call. The service
 schema is `crates/synch-cli/proto/control.proto`. With no daemon running, every
-command except `synch init` fails with a message naming that socket.
+operational/client command fails with a message naming that socket.
 
 ## Serverless mode
 
@@ -62,7 +62,7 @@ export SYNCH_CAS_ROOT=nodes/production
 export SYNCH_CAS_CACHE_BYTES=10737418240     # 10 GiB maintenance target
 
 synch init --domain cluster.example.com     # once, only if restore found no database
-synch daemon run &
+synch daemon start
 synch space add media --detached
 ```
 

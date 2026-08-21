@@ -1415,11 +1415,11 @@ Both are dependency-free static binaries:
 - `rustls` everywhere (no OpenSSL),
 - musl static builds for Linux releases; standard static-ish builds for macOS/Windows.
 
-**The daemon owns the node; the CLI is only a client of it.** Every command except the
-two that bootstrap or *are* the daemon — `synch init`, which creates the datadir before
-any daemon can exist, and `synch daemon run` itself — is a request over the control
-socket (§9.3). There is no in-process fallback: with no daemon running, a command
-fails with a message naming the socket path and the command to start one.
+**The daemon owns the node; the CLI is only a client of it.** `synch init` creates the
+datadir, `synch daemon run` is the daemon, and `synch daemon start` launches it in the
+background; every other command is a request over the control socket (§9.3). There is
+no in-process fallback: with no daemon running, a command fails with a message naming
+the socket path and both ways to start one.
 
 This is a deliberate narrowing. A CLI that could also open the database directly meant
 two code paths to the same state, two processes contending on one SQLite file, and —
@@ -1432,14 +1432,15 @@ files.
 
 ### 9.2 Command surface (v1)
 
-`synch init` and `synch daemon run` act on the datadir directly; every other command
-is a control-service call to a running daemon (§9.3).
+`synch init` and `synch daemon run` act on the datadir directly, while `synch
+daemon start` launches the latter in the background and waits for its socket;
+every other command is a control-service call to a running daemon (§9.3).
 
 ```
 synch init [--domain <d>]                    create device key + database (no daemon);
                                              --domain joins the zone that will name
                                              this node (§3.1)
-synch daemon run|status|stop
+synch daemon run|start|status|stop
 synch id                                     print OriginId + current device key(s),
                                              where the name came from, and adoptions
 synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)

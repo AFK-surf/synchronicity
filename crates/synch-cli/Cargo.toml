@@ -51,5 +51,8 @@ synch-net = { workspace = true, features = ["sim"] }
 synch-store.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+
 [lints]
 workspace = true
