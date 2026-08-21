@@ -1321,8 +1321,11 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   every file was deleted).
 
   Two refusals follow from writing into a directory somebody works in. A file
-  that *appears* while the fill is fetching is never overwritten, `--force` or
-  not: the plan's "nothing was here" has a shelf life, and materialization ends
+  the operator was not shown is never overwritten, `--force` or not — one that
+  *appeared* at a path the plan found empty, and equally one whose bytes were
+  *rewritten* since the plan stat'd them, because `--force` answers for the file
+  it was pointed at rather than for whatever the path became while an object was
+  being fetched: the plan's "nothing was here" has a shelf life, and materialization ends
   in a rename. And a file this node cannot *read* is never called differing and
   never replaced — "differs" would be a claim the failed read did not establish,
   and a rename needs no read permission to act on it. `--force` also declines

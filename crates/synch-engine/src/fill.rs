@@ -313,6 +313,7 @@ impl Node {
                 meta,
                 donors,
                 replacing,
+                was,
             } = want;
             // A failure here is this path's, not the run's. A one-shot fill has
             // no second pass to repair what an early `?` would abandon, and by
@@ -361,9 +362,17 @@ impl Node {
                     return Ok(Ready::Escaped);
                 }
                 Ok(match std::fs::symlink_metadata(&stat_target) {
-                    // Planned as a replacement, and something is still there:
-                    // `--force` was given for exactly this.
-                    Ok(_) if replacing => Ready::Write { over: true },
+                    // Planned as a replacement, and still the very file the
+                    // plan looked at: `--force` was given for exactly this.
+                    Ok(stat) if replacing && was.as_ref() == Some(&signature(&stat)) => {
+                        Ready::Write { over: true }
+                    }
+                    // Something is here that the operator was not shown — a
+                    // path that was empty and is not, or one whose file has
+                    // been rewritten since. `--force` answers for the file it
+                    // was pointed at, not for whatever the path became while
+                    // an object was being fetched, which on a large space is
+                    // minutes of somebody else's work.
                     Ok(_) => Ready::Appeared,
                     // Nothing here now — including the case where this path was
                     // planned as a replacement and the file has since been
@@ -533,6 +542,20 @@ struct Wanted {
     /// Whether a local file with different bytes is being overwritten, which
     /// only `--force` reaches.
     replacing: bool,
+    /// What the plan saw at the target: `(len, mtime_ns, file_id)`, or `None`
+    /// where there was nothing. The write compares against it, so `--force`
+    /// overwrites the file the operator was shown and not whatever the path
+    /// became while the object was being fetched.
+    was: Option<(u64, i64, Option<Vec<u8>>)>,
+}
+
+/// The stat signature the plan records for a target, and the write re-checks.
+fn signature(stat: &std::fs::Metadata) -> (u64, i64, Option<Vec<u8>>) {
+    (
+        stat.len(),
+        crate::scanner::mtime_nanos(stat),
+        crate::scanner::file_identity(stat),
+    )
 }
 
 /// What the guards taken immediately before a write decided.
@@ -867,6 +890,7 @@ fn decide(
             meta: Metadata::of(&selected),
             donors,
             replacing: on_disk.is_some(),
+            was: on_disk.as_ref().map(signature),
         });
     }
 
@@ -1895,6 +1919,41 @@ mod tests {
         assert!(!space.path().join("raw/photo.raw").exists());
         // And a path the rules do not cover is unaffected.
         assert!(node.open_adoption("media", "keep.txt").is_ok());
+        node.shutdown().await.unwrap();
+    }
+
+    /// `--force` answers for the file the operator was shown. A file *edited*
+    /// during the fetch window is as much somebody else's work as one created
+    /// there, and gets the same refusal.
+    #[tokio::test]
+    async fn force_does_not_overwrite_a_file_edited_during_the_fetch() {
+        let (_data, space, node) = node_with_space().await;
+        let target = space.path().join("f.txt");
+        std::fs::write(&target, b"what the plan saw").unwrap();
+        publish(&node, &peer(), "f.txt", b"theirs", STAMP);
+
+        let plan = node
+            .fill_plan_with_options_for_test(
+                "media",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: true,
+                    dry_run: false,
+                },
+            )
+            .await;
+        // Rewritten behind the plan's back, the way an editor saving into a
+        // space does while a large object is still being fetched.
+        std::fs::write(&target, b"edited since the plan looked").unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"edited since the plan looked",
+            "--force answers for the file it was pointed at, not for what the path became"
+        );
+        assert_eq!(report.appeared, vec!["f.txt".to_string()], "{report:?}");
+        assert!(report.replaced.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
