@@ -564,6 +564,73 @@ async fn a_mixed_batch_records_each_outcome_against_its_own_want() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
+/// A budget stops fetching and never shortens a release (§3.8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_stops_fetching_and_releases_nothing() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn("replica").await;
+    introduce(&[&publisher, &replica]);
+
+    publisher
+        .node
+        .add_space("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("big.bin"), vec![7u8; 4096]).unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+
+    // A ceiling far below the object: nothing can be admitted.
+    let replicating = replica.node.clone();
+    off_runtime(move || {
+        replicating.add_detached_space("media").unwrap();
+        replicating
+            .set_space_replication(
+                "media",
+                Some(ReplicaPolicy::Tree),
+                Some(3600),
+                Some(16),
+                false,
+            )
+            .unwrap();
+    })
+    .await;
+    converge(&replica.node, &publisher.node).await;
+
+    let after = coverage(&replica.node).await;
+    assert_eq!(after.held, 0, "the object does not fit under the ceiling");
+    assert_eq!(
+        after.wanted, 1,
+        "and stays wanted: a budget is a storage problem, and dropping the want \
+         would turn it into a silent data-loss one"
+    );
+    let store = replica.node.store().clone();
+    let attempts = off_runtime(move || store.wants_of(&holder()).unwrap()[0].attempts).await;
+    assert_eq!(
+        attempts, 0,
+        "a budget is not the want's fault, so it must not be charged an attempt \
+         and pushed toward being reported unreachable"
+    );
+
+    // Raising the ceiling lets the same want through, untouched.
+    let raising = replica.node.clone();
+    off_runtime(move || {
+        raising
+            .set_space_replication(
+                "media",
+                Some(ReplicaPolicy::Tree),
+                None,
+                Some(1 << 20),
+                false,
+            )
+            .unwrap();
+    })
+    .await;
+    replica.node.fetch_replica_wants().await.unwrap();
+    assert_eq!(coverage(&replica.node).await.held, 1);
+
+    shutdown(&[&publisher.node, &replica.node]).await;
+}
+
 /// A space this node only replicates is not one it publishes: it advertises no
 /// `m:space` record, so `space rm` has none to strand (§3.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
