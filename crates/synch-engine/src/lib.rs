@@ -14,6 +14,7 @@ pub mod compare;
 pub mod config;
 pub mod error;
 pub mod fetcher;
+pub mod fill;
 pub mod ignore;
 mod join;
 pub mod membership;
@@ -38,6 +39,7 @@ pub use compare::{CompareChange, CompareReport, CompareStatus};
 pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};
 pub use fetcher::{FetchReport, PreparedRange, Provider};
+pub use fill::{FillOptions, FillReport};
 pub use ignore::IgnoreSet;
 pub use membership::{
     DoctorReport, DomainHealth, DomainOutcome, DomainRefresh, HeadStatus, ResolverStatus,

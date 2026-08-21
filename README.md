@@ -264,6 +264,39 @@ divergence. Deletions are adoptable the same way: taking a tombstone version
 removes the local copy and publishes our own tombstone, and once every
 publisher has done so the path leaves the tree.
 
+Fill a space's own directory — the writable one `synch space add` named — with
+the content of the unified tree. One pass, and additive: a path missing here is
+written, a path whose bytes already match is left alone, and a path whose bytes
+differ is reported rather than overwritten. Nothing is ever removed.
+
+```sh
+synch fill media                                           # newest, by default
+synch fill media/talks                                     # one directory of it
+synch fill media --from nas@cluster.example.com            # that origin's versions
+synch fill media --strict                                  # report divergent paths, skip them
+synch fill media --dry-run                                 # decide everything, write nothing
+synch fill media --force                                   # replace local files that differ
+```
+
+`synch space sync` is the other half of the same wish and a different thing:
+replication holds the *bytes* of every version in the store and materializes
+nothing, while a fill writes *files*, one selected version per path. On a
+replicated space the two compose — everything the fill wants is already local.
+
+A fill does not publish. The files land where the scanner will find them, and
+the next scan publishes them as this node's own view — which is why a filled
+file carries the mtime and mode the origin published rather than this machine's
+clock: the version that gets republished is the one that was filled, not a
+newer one that would win every `newest` selection in the cluster. `--force` is
+`synch take`'s adoption in bulk, though not its publish, and it names every
+file it overwrote.
+
+A node in key-loss recovery refuses to fill. A scan would refuse there too, so
+everything filled would sit unannounced — and `--force`'s guard against
+overwriting a local edit no scan has published needs this node to be publishing
+something, so it would be inert while the fill wrote. Run `synch recover`
+first, then fill, then scan.
+
 Mirror a space into a directory, continuously, under a policy of its own:
 
 ```sh

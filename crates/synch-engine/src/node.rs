@@ -1189,8 +1189,9 @@ impl Node {
         self.inner.pending_wake.clone()
     }
 
-    /// Serializes a mirror pass against every other pass on this node.
-    pub(crate) async fn lock_mirrors(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    /// Serializes one materialization pass against every other on this node:
+    /// a mirror pass (§7.2) and a `synch fill` of a space (fill.rs) alike.
+    pub(crate) async fn lock_materialization(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.mirror_lock.lock().await
     }
 

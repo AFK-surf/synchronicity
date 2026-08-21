@@ -1,6 +1,6 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key or a network-scoped join key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
+description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, fill, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key or a network-scoped join key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
 ---
 
 # synch
@@ -354,6 +354,37 @@ synch mirror rm /mnt/safe
 ```
 /mnt/media  written 0 · current 2 · retouched 0 · removed 0 · skipped 0
 ```
+
+A **fill** is the one-shot form, and it writes into the space's *own* directory
+— the one `synch space add` named, which this node indexes and publishes from.
+So it only ever adds: a missing path is written, a path whose bytes already
+match is left alone, a path whose bytes differ is reported rather than
+overwritten, and nothing is ever removed. `--force` replaces the ones that
+differ and names each of them.
+
+```sh
+synch fill media                                               # newest
+synch fill media/talks                                         # one directory of it
+synch fill media --from nas@cluster.acme.example.com           # that origin's versions
+synch fill media --strict                                      # report divergent paths
+synch fill media --dry-run                                     # decide, write nothing
+synch fill media --force                                       # replace what differs
+```
+
+```
+filled 3 · current 41 · differing 1 · skipped 0
+differing media/notes.txt (local content differs; --force replaces it)
+the next scan publishes what was filled as this node's own view
+```
+
+A fill does not publish: the files land where the scanner will find them, and
+they carry the mtime and mode the origin published, so the next scan republishes
+the version that was filled rather than a newer one.
+
+A node in key-loss recovery refuses to fill — a scan would refuse there too, so
+everything filled would sit unannounced. Run `synch recover` first, then fill,
+then scan. `synch take` refuses there for the same reason, before it touches
+the file rather than after.
 
 A **pin** keeps content regardless of retention. It names an object root, or a
 path — in which case the reading policy supplies the root. Pinning content this

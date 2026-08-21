@@ -144,7 +144,7 @@ impl Node {
         // Passes serialize node-wide: whether the standing loop or `synch
         // mirror sync` asked, two passes over one root would plan against
         // each other's half-written state.
-        let _pass = self.lock_mirrors().await;
+        let _pass = self.lock_materialization().await;
         let root_dir = PathBuf::from(&mirror.local_path);
 
         // A pass runs in three phases, because only the middle one is
@@ -220,23 +220,8 @@ impl Node {
                     .push((want.path, "no provider could serve the content".into()));
                 continue;
             }
-            // Counted in bytes rather than groups, and clamped to the object,
-            // so the tail group of a 100-byte file does not report 16 KiB.
-            let bytes_of = |groups: &ChunkRanges| {
-                groups
-                    .ranges
-                    .iter()
-                    .map(|r| {
-                        let end = r
-                            .end
-                            .saturating_mul(synch_core::CHUNK_GROUP_SIZE)
-                            .min(want.size);
-                        end.saturating_sub(r.start.saturating_mul(synch_core::CHUNK_GROUP_SIZE))
-                    })
-                    .sum::<u64>()
-            };
-            report.fetched_bytes += bytes_of(&fetched.fetched);
-            report.reused_bytes += bytes_of(&fetched.promoted);
+            report.fetched_bytes += bytes_of(&fetched.fetched, want.size);
+            report.reused_bytes += bytes_of(&fetched.promoted, want.size);
             // Cloned out of the CAS and renamed into place: a mirror of
             // multi-gigabyte objects must not hold one in memory, and a pass
             // interrupted halfway must not leave a truncated file wearing a
@@ -725,6 +710,22 @@ fn plan_pass(
     })
 }
 
+/// How many bytes of an object a set of chunk groups covers.
+///
+/// Counted in bytes rather than groups, and clamped to the object, so the tail
+/// group of a 100-byte file does not report 16 KiB. Shared with `synch fill`
+/// (fill.rs), which reports the same reused-versus-fetched pair.
+pub(crate) fn bytes_of(groups: &ChunkRanges, size: u64) -> u64 {
+    groups
+        .ranges
+        .iter()
+        .map(|r| {
+            let end = r.end.saturating_mul(synch_core::CHUNK_GROUP_SIZE).min(size);
+            end.saturating_sub(r.start.saturating_mul(synch_core::CHUNK_GROUP_SIZE))
+        })
+        .sum::<u64>()
+}
+
 /// The stored key for a mirror: its canonical directory path.
 fn mirror_key(path: &Path) -> String {
     stored_root(&path.to_string_lossy())
@@ -752,7 +753,7 @@ fn mirror_key(path: &Path) -> String {
 /// writing the target's *contents* under the link's name would silently turn a
 /// link into a file and hand the next scanner on that machine a change nobody
 /// made.
-fn materialize_symlink(
+pub(crate) fn materialize_symlink(
     target: &Path,
     link_target: Option<&str>,
 ) -> std::result::Result<bool, String> {
@@ -787,7 +788,7 @@ fn materialize_symlink(
 
 /// The metadata a mirror reproduces alongside a file's bytes (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Metadata {
+pub(crate) struct Metadata {
     /// The origin's observed mtime, in unix nanoseconds.
     mtime_ns: i64,
     /// The origin's advisory unix mode, or `None` where it published none —
@@ -797,7 +798,7 @@ struct Metadata {
 }
 
 impl Metadata {
-    fn of(entry: &EntryRow) -> Metadata {
+    pub(crate) fn of(entry: &EntryRow) -> Metadata {
         Metadata {
             mtime_ns: entry.mtime_ns,
             unix_mode: entry.unix_mode,
@@ -823,7 +824,7 @@ const MODE_MASK: u32 = 0o777;
 /// "repair" every file it had itself just stamped, forever. A stamp is only
 /// ever coarsened downward, so a stored value inside this window below the
 /// published one is the published one.
-const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
+pub(crate) const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
 
 /// True if `target` already carries the metadata `meta` describes.
 ///
@@ -854,7 +855,7 @@ fn metadata_matches(target: &Path, meta: Metadata) -> bool {
 /// published mode is read-only — `0444` is an ordinary mode for published media
 /// — cannot be stamped once its own mode has been applied, and a pass that got
 /// the mode right would break the pass after it.
-fn apply_metadata(target: &Path, meta: Metadata) -> std::io::Result<()> {
+pub(crate) fn apply_metadata(target: &Path, meta: Metadata) -> std::io::Result<()> {
     #[cfg(unix)]
     let stamped = {
         use std::os::unix::fs::PermissionsExt;
@@ -1066,7 +1067,7 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf
 /// Names Windows refuses, plus trailing dots and spaces, plus reserved
 /// characters. Checked on every platform so a mirror behaves identically
 /// everywhere (§7.2).
-fn unsafe_name(path: &str) -> Option<String> {
+pub(crate) fn unsafe_name(path: &str) -> Option<String> {
     const RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -1090,7 +1091,7 @@ fn unsafe_name(path: &str) -> Option<String> {
 }
 
 /// Folds a path the way a case-insensitive, normalizing filesystem would.
-fn fold(path: &str) -> String {
+pub(crate) fn fold(path: &str) -> String {
     path.to_lowercase()
 }
 

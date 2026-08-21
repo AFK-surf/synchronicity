@@ -420,6 +420,34 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Fill a space's own directory with the content of the unified tree.
+    ///
+    /// One-shot, and additive: a path missing here is written, a path whose
+    /// bytes already match is left alone, and a path whose bytes differ is
+    /// reported rather than overwritten. Nothing is ever removed — that is the
+    /// difference between filling the directory this node publishes from and
+    /// mirroring into one it owns.
+    ///
+    /// Filling does not publish. The files land where the scanner will find
+    /// them, and the next scan publishes them as this node's own view.
+    Fill {
+        /// `[<origin>:]<space>[/<dir>]`. The origin-prefixed form fills from
+        /// one origin's versions instead of the unified tree's selection.
+        reference: String,
+        /// Fill from this origin's version of every path.
+        #[arg(long, value_name = "ORIGIN")]
+        from: Option<String>,
+        /// Report divergent paths instead of picking one of their versions.
+        #[arg(long, conflicts_with = "from")]
+        strict: bool,
+        /// Replace local files whose content differs from the selected
+        /// version. Without it they are reported and left alone.
+        #[arg(long)]
+        force: bool,
+        /// Decide everything and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Continuous read-only materialization.
     Mirror {
         /// The mirror subcommand.

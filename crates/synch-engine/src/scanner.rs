@@ -710,6 +710,7 @@ impl Node {
     /// indexing pipeline republishes them as this node's entry, with `prev`
     /// pointing at the content we replaced.
     pub fn adopt(&self, space_id: &str, path: &str, content: &[u8]) -> Result<PathBuf> {
+        self.ensure_adoptable(space_id, path)?;
         let target = self.adoption_target(space_id, path)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -733,9 +734,23 @@ impl Node {
         path: &str,
     ) -> Result<PathBuf> {
         let policy = synch_store::VersionPolicy::Origin(origin.clone());
+        // Above the detached branch, not inside the other one. A detached
+        // adoption writes no local file, but it crosses the network, promotes
+        // the object to the backend's durable tier — a real, billable write on
+        // a cloud CAS — and stages an `f:`/`b:` pair that a node in recovery
+        // cannot publish: the buffer then re-fails on every quiesce tick and is
+        // lost outright, durable blob orphaned, if the daemon restarts first.
+        // The operator is told the adoption happened either way.
+        //
+        // `adopt_deletion` and `open_adoption` both gate above their own
+        // detached branches; this is the same place.
         let detached = {
-            let (node, space_id) = (self.clone(), space_id.to_string());
-            crate::blocking::offload(move || node.is_detached_space(&space_id)).await?
+            let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
+            crate::blocking::offload(move || {
+                node.ensure_adoptable(&space_id, &path)?;
+                node.is_detached_space(&space_id)
+            })
+            .await?
         };
         if detached {
             // `prepare_range` fetches and verifies the complete selected
@@ -779,6 +794,9 @@ impl Node {
     /// here to remove — which is not an error: the assertion being adopted is
     /// "this path is gone", and it already is.
     pub fn adopt_deletion(&self, space_id: &str, path: &str) -> Result<Option<PathBuf>> {
+        // The publishability half only: an excluded path is exactly the stray
+        // file a deletion is here to clear up (`refuse_if_ignored`).
+        self.ensure_publishable()?;
         if self.is_detached_space(space_id)? {
             let normalized = normalized_adoption_path(path)?;
             let previous = self
@@ -822,6 +840,7 @@ impl Node {
     /// other one is exactly what must not happen.
     pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
         if self.is_detached_space(space_id)? {
+            self.ensure_adoptable(space_id, path)?;
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
                 "detached-{}-{}.payload",
@@ -830,8 +849,7 @@ impl Node {
             ));
             return Adoption::open(target);
         }
-        let target = self.adoption_target(space_id, path)?;
-        Adoption::open(target)
+        Adoption::into_space(self, space_id, path)
     }
 
     /// Ingests a committed detached-space staging file and stages its records.
@@ -853,6 +871,19 @@ impl Node {
             source.to_path_buf(),
         );
         let (normalized, size) = crate::blocking::offload(move || {
+            // The detached half of `ensure_adoptable`, and the last adoption
+            // entry point that trusted its caller for it. Both callers do check
+            // — the `put` handler and `complete_upload` — but both then do the
+            // work in a spawned task, so an inbound `Hello` can floor this node
+            // in between, and an embedder calling this `pub fn` has no check at
+            // all. What follows is a durable-tier promotion (a billable write
+            // on a cloud CAS) and an `f:`/`b:` pair staged for a publish that
+            // would be refused, re-failing on every quiesce tick and orphaning
+            // the blob if the daemon restarts first.
+            //
+            // `refuse_if_ignored` is the other half and is a no-op here: a
+            // detached space has no directory to hold a `.syncignore`.
+            node.ensure_publishable()?;
             if !node.is_detached_space(&checked_space)? {
                 return Err(EngineError::invalid(format!(
                     "space {checked_space} has a local checkout"
@@ -914,6 +945,53 @@ impl Node {
         Ok(())
     }
 
+    /// The gates every adoption into a space directory takes, before it
+    /// touches anything.
+    ///
+    /// Publishability first. A node in key-loss recovery cannot publish (§3.4),
+    /// and an adoption that writes before finding that out has destroyed the
+    /// local copy and can tell nobody — no version, no `prev`, no trace. That
+    /// is the reasoning `Node::delete_object` already states over the very same
+    /// `adopt_deletion` this guards; `synch take` reached the gate only at its
+    /// publish, which is after the file is gone.
+    ///
+    /// Then the space's own ignore rules.
+    pub(crate) fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
+        self.ensure_publishable()?;
+        self.refuse_if_ignored(space_id, path)
+    }
+
+    /// Refuses a write at a path the space's own ignore rules exclude.
+    ///
+    /// Taken by every writer into a space directory — `synch take` in both its
+    /// forms, and the streamed write an S3 `PutObject` becomes — because a file
+    /// written where the scanner will never look is worse than a refused write:
+    /// it is never published, never swept (it is in neither `local_files` nor
+    /// the published tree), and it sits in the operator's own directory
+    /// indefinitely. `create_upload` takes the same check at *initiate* as
+    /// well, so a multipart client learns before it streams gigabytes rather
+    /// than after.
+    ///
+    /// Deliberately not on the deletion path: a delete of an excluded key is
+    /// how a stray file like that gets cleaned up, and S3 `DELETE` is
+    /// idempotent besides.
+    pub(crate) fn refuse_if_ignored(&self, space_id: &str, path: &str) -> Result<()> {
+        let Some(space) = self.store().space(space_id)? else {
+            return Ok(());
+        };
+        let Some(local_path) = space.local_path.as_deref() else {
+            return Ok(());
+        };
+        let normalized =
+            synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
+        if IgnoreSet::for_space(Path::new(local_path))?.excludes_path(&normalized) {
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{path} matches an ignore rule, so it could never be published"
+            )));
+        }
+        Ok(())
+    }
+
     /// Where a path lives locally, refusing anything outside a configured
     /// space.
     ///
@@ -931,41 +1009,51 @@ impl Node {
                 "space {space_id} is detached and has no filesystem adoption target"
             ))
         })?;
-        let normalized = normalized_adoption_path(path)?;
-        // And the platform has to agree the result is purely relative before it
-        // is joined onto the space root.
-        //
-        // `normalize_path` works in the protocol's own path language, where `/`
-        // is the only separator — deliberately, so a trie key means the same
-        // thing on every node. On Windows the *platform* reads more than that: a
-        // key of `..\..\evil.txt` is one `Normal` component to the protocol and
-        // a traversal to `Path::join`, and one of `C:/Windows/Temp/evil.txt`
-        // carries a drive prefix, which makes `join` discard the space root
-        // entirely. Either writes outside every space, as the daemon user, from
-        // any key the S3 gateway accepts.
-        //
-        // A no-op on POSIX, where none of those parse as anything but `Normal`.
-        // The mirror's `unsafe_name` already refuses these on the way out; this
-        // is the way in.
-        // Lexical safety is still not enough. A space root is canonicalized when
-        // it is added but its *interior* never is, so a symlinked directory
-        // inside the space resolves through to wherever it points, and the write
-        // or the delete lands outside every space as whatever uid the daemon
-        // runs as. The mirror loop has always checked this; every other writer
-        // needs the same check, and a deletion needs it as much as a write does.
-        if crate::mirror::escapes_via_symlink(Path::new(local_path), &normalized) {
-            return Err(EngineError::invalid(format!(
-                "{space_id}/{path} resolves through a symlinked directory and would leave the space"
-            )));
-        }
-        Ok(PathBuf::from(local_path).join(&normalized))
+        target_within(Path::new(local_path), space_id, path)
     }
+}
+
+/// The guard itself, over a space root already in hand.
+///
+/// [`Node::adoption_target`] is the form that reads the space row first; this
+/// is the form for a caller holding the root already and asking it of many
+/// paths in a row (`synch fill`, fill.rs), where re-reading that row per path
+/// would be one store acquisition per file in the space.
+pub(crate) fn target_within(root: &Path, space_id: &str, path: &str) -> Result<PathBuf> {
+    let normalized = normalized_adoption_path(path)?;
+    // Lexical safety is still not enough. A space root is canonicalized when
+    // it is added but its *interior* never is, so a symlinked directory
+    // inside the space resolves through to wherever it points, and the write
+    // or the delete lands outside every space as whatever uid the daemon
+    // runs as. The mirror loop has always checked this; every other writer
+    // needs the same check, and a deletion needs it as much as a write does.
+    if crate::mirror::escapes_via_symlink(root, &normalized) {
+        return Err(EngineError::invalid(format!(
+            "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+        )));
+    }
+    Ok(root.join(&normalized))
 }
 
 /// Normalizes a write path and applies the host platform's relative-path rules.
 fn normalized_adoption_path(path: &str) -> Result<String> {
     let normalized =
         synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
+    // And the platform has to agree the result is purely relative before it
+    // is joined onto the space root.
+    //
+    // `normalize_path` works in the protocol's own path language, where `/`
+    // is the only separator — deliberately, so a trie key means the same
+    // thing on every node. On Windows the *platform* reads more than that: a
+    // key of `..\..\evil.txt` is one `Normal` component to the protocol and
+    // a traversal to `Path::join`, and one of `C:/Windows/Temp/evil.txt`
+    // carries a drive prefix, which makes `join` discard the space root
+    // entirely. Either writes outside every space, as the daemon user, from
+    // any key the S3 gateway accepts.
+    //
+    // A no-op on POSIX, where none of those parse as anything but `Normal`.
+    // The mirror's `unsafe_name` already refuses these on the way out; this
+    // is the way in.
     if Path::new(&normalized)
         .components()
         .any(|part| !matches!(part, std::path::Component::Normal(_)))
@@ -1004,6 +1092,25 @@ pub struct Adoption {
     staging: PathBuf,
     file: Option<std::fs::File>,
     written: u64,
+    /// Set when the target is inside an indexed space, and `None` when it is a
+    /// staging file the daemon owns.
+    ///
+    /// This is what makes the gates a property of the *write* rather than of
+    /// each of the eight places that start one. Every adoption ends here, in
+    /// `commit`, at a rename that destroys what it lands on — and until this
+    /// field existed `commit` was the one step that could not check anything,
+    /// because it held nothing to ask. Each caller therefore had to re-take the
+    /// gates immediately before it, and the review history of this branch is
+    /// mostly the record of callers that did not.
+    space: Option<SpaceWrite>,
+}
+
+/// What a write into an indexed space needs to re-check before it lands.
+#[derive(Debug)]
+struct SpaceWrite {
+    node: Node,
+    space: String,
+    path: String,
 }
 
 impl Adoption {
@@ -1014,6 +1121,19 @@ impl Adoption {
     /// (§7.2), which by construction lives outside every indexed space.
     pub fn at(target: impl Into<PathBuf>) -> Result<Adoption> {
         Adoption::open(target.into())
+    }
+
+    /// The same, for a target inside an indexed space: the write carries the
+    /// gates with it and re-takes them at `commit`.
+    fn into_space(node: &Node, space_id: &str, path: &str) -> Result<Adoption> {
+        node.ensure_adoptable(space_id, path)?;
+        let mut adoption = Adoption::open(node.adoption_target(space_id, path)?)?;
+        adoption.space = Some(SpaceWrite {
+            node: node.clone(),
+            space: space_id.to_string(),
+            path: path.to_string(),
+        });
+        Ok(adoption)
     }
 
     fn open(target: PathBuf) -> Result<Adoption> {
@@ -1046,6 +1166,7 @@ impl Adoption {
             staging,
             file: Some(file),
             written: 0,
+            space: None,
         })
     }
 
@@ -1260,6 +1381,19 @@ impl Adoption {
     }
 
     fn commit_inner(&mut self) -> Result<()> {
+        // Immediately before the rename, because this is the moment the gates
+        // are about: a write that opened minutes or days ago — an S3 body
+        // streaming at the client's pace, a multipart upload assembled out of
+        // parts — commits into a node that may have been floored by an inbound
+        // `Hello` since, or into a space whose ignore rules have moved. The
+        // rename destroys what it lands on, and a refusal after it is a file
+        // gone with nothing published to show for it.
+        //
+        // Taken here rather than by each caller: `commit` is the one step every
+        // adoption reaches, so a gate here cannot be the one somebody forgets.
+        if let Some(space) = &self.space {
+            space.node.ensure_adoptable(&space.space, &space.path)?;
+        }
         let file = self
             .file
             .take()
@@ -1842,6 +1976,47 @@ mod tests {
                 "no tombstone may be staged for {path}, which is still there"
             );
         }
+        node.shutdown().await.unwrap();
+    }
+
+    /// The gates travel with the write, so they are re-taken at the rename
+    /// rather than only at the open.
+    ///
+    /// That is the whole point of `Adoption` carrying them: a write can be open
+    /// for as long as its client takes — an S3 body, a multipart assembly — and
+    /// the node it commits into is not the node it opened against. Removing the
+    /// check in `commit_inner` fails this.
+    #[tokio::test]
+    async fn a_space_write_re_takes_its_gates_at_the_commit() {
+        let (_d, space, node) = crate::testkit::node_with_space().await;
+        let victim = space.path().join("f.txt");
+        std::fs::write(&victim, b"mine, unpublished").unwrap();
+
+        // Opened against a healthy node, and written.
+        let mut adoption = node.open_adoption("media", "f.txt").unwrap();
+        adoption.write(b"theirs").unwrap();
+
+        // A peer advertises a head for our own origin that we have no history
+        // for: key-loss recovery, arriving while the body was on the wire.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        let refused = adoption.commit().unwrap_err().to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"mine, unpublished",
+            "the rename must not have landed on a file nothing could then \
+             publish a replacement for"
+        );
         node.shutdown().await.unwrap();
     }
 

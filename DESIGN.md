@@ -1288,19 +1288,99 @@ Materialization reads the unified tree (§8), so every materializing surface nam
 - `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to
   stdout with verified random access; this is where hash-tree reads shine (e.g.
   seeking in a large video).
+- `synch fill [<origin>:]<space>[/<dir>] [--from <origin>|--strict] [--force]
+  [--dry-run]` — not to be confused with `synch space sync`, which is the other
+  half of the same wish. Replication (`--replicate`, docs/REPLICATION.md) holds
+  the *bytes* of every version in the CAS and materializes nothing; a fill
+  writes *files*, one selected version per path, and holds nothing beyond what
+  the store already keeps. They compose: on a replicated space every object a
+  fill wants is already local, so the fill is materialization with no network
+  in it at all.
+
+  A fill is
+  one-shot materialization into the *space's own* directory, the one `synch space
+  add` named. Where a mirror owns the directory it writes into, a fill writes into
+  the directory this node indexes and publishes from, so it may only ever add: a
+  missing path is written, a path whose bytes already match is left alone, and a
+  path whose bytes differ is reported rather than overwritten (`--force` replaces
+  it, which is `synch take`'s adoption in bulk — though not its publish: a fill
+  waits for the scan, where `take` publishes before it answers). **Nothing is
+  ever removed** — not a
+  tombstoned version, not a local file no origin publishes; adopting a deletion
+  stays the deliberate, one-path act `synch take` of a tombstone is. A fill does
+  not publish either: the files land where the scanner will find them and the next
+  scan (§7.1) publishes them as this node's own view.
+
+  A node in recovery refuses to fill (§3.4), like every other command that does
+  irreversible work before publishing. A scan refuses there too, so a fill would
+  write a tree nothing would ever announce — and `--force`'s own-origin guard,
+  which needs this node to publish something, would be inert while it did: a
+  recovering node publishes nothing under its own origin, so every path selects
+  a peer's version and every local file that differs is overwritten. `synch
+  recover`, then fill, then scan.
+
+  A fill does not exclude the scanner: the two share no lock, and the fill's own
+  writes are what wake the watcher (§7.1), so a scan running during a fill is
+  the normal case rather than the exotic one. That is what the write-time guards
+  are written against, and why a filled path's `local_files` row is dropped as
+  the path is written rather than at the end.
+
+  A fill is bound by the rules that bind indexing, and by the same guard on the
+  space root: it writes nothing the space's `.syncignore` excludes — such a file
+  would sit where the scanner never looks, never published and never swept, and
+  the exclusion covers a path under an excluded *directory*, which is what the
+  scanner gets for free by never descending into one — and it refuses a root
+  that has gone, before it starts and again before each write, since a fill of a
+  large tree runs for hours and an unplugged drive mid-run would otherwise have
+  its mount point recreated and the rest of the tree materialized onto the disk
+  underneath (§7.1 takes the same guard against the opposite misreading, that
+  every file was deleted).
+
+  Two refusals follow from writing into a directory somebody works in. A file
+  the operator was not shown is never overwritten, `--force` or not — one that
+  *appeared* at a path the plan found empty, and equally one whose bytes were
+  *rewritten* since the plan stat'd them, because `--force` answers for the file
+  it was pointed at rather than for whatever the path became while an object was
+  being fetched: the plan's "nothing was here" has a shelf life, and materialization ends
+  in a rename. And a file this node cannot *read* is never called differing and
+  never replaced — "differs" would be a claim the failed read did not establish,
+  and a rename needs no read permission to act on it. `--force` also declines
+  the one case where there is nothing to adopt: when the selected version is
+  this node's own and what is here differs from it — a file's bytes or a link's
+  target — the disk holds an edit no scan has published yet, and overwriting it
+  would lose that edit leaving no version, no `prev`, and no trace in the
+  cluster. A path that is *absent* locally is filled either way, including from
+  this node's own version: that is what makes a fill the way back from a lost
+  checkout, and it means a deletion made while the daemon was down is undone
+  rather than published — `synch scan` first if the deletion was meant.
+
+  Which is why the metadata rule below is load-bearing here rather than cosmetic.
+  The mtime a filled path is stamped with is the one the next scan publishes, so a
+  fill restates the version it filled instead of minting a newer one — and `newest`
+  orders on `(mtime, content root, origin)`, so a fill stamped with the wall clock
+  would make this node win the selection for every path it touched, cluster-wide.
 
 Materialized files carry the metadata their selected version published, not the
 metadata of the copy: the origin's `mtime_ns`, and the permission bits of its
 advisory `unix_mode` (§4.2, masked — setuid/setgid/sticky are never reproduced,
-since the mode is a peer's assertion and the daemon may be privileged). A file
-whose bytes are already current but whose mode or mtime has drifted is stamped
-back in place rather than refetched. A symbolic link's metadata is not
+since the mode is a peer's assertion and the daemon may be privileged). In a
+*mirror*, a file whose bytes are already current but whose mode or mtime has
+drifted is stamped back in place rather than refetched — the directory is the
+mirror's own and the published metadata is the whole of what it should say. A
+*fill* stamps only what it writes: a path already holding the right bytes is
+left completely alone, mtime included, because that metadata is this node's own
+assertion and restamping it would republish every path a fill looked at. A
+symbolic link's metadata is not
 reproduced: its target *is* its version (§8), and stamping a link's own times
 needs a facility the standard library does not expose.
 
 Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
-filesystems may not be. When two published paths collide under the target
-filesystem's folding (case-insensitivity, Unicode normalization), materialization
+filesystems may not be. A fill applies the rule below on every platform, as a
+mirror does. It could ask the filesystem instead — and did, briefly — but the
+two ways of being wrong are not symmetric: refusing a name is a report about two
+files that are both sitting there, while a wrong "this filesystem does not fold"
+is a silent clobber. When two published paths collide under the target
+filesystem's case folding, materialization
 writes the lexicographically first and **skips and reports** the rest — never
 silently clobbers. Names invalid on the target platform (Windows reserved device
 names, trailing dot/space, forbidden characters) are likewise skipped and reported.
@@ -1481,6 +1561,9 @@ synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/
                                              content fetched, --from defaults to self
 synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
+synch fill [<origin>:]<space>[/<dir>]        one-shot materialization into the space's
+           [--from <o>|--strict]             own directory: adds what is missing, never
+           [--force] [--dry-run]             removes, reports what differs (§7.2)
 
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
                                              (a path pins its selected version's root;

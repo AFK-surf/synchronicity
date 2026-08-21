@@ -2183,6 +2183,145 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::Fill(pb::Fill {
+            reference,
+            from,
+            strict,
+            force,
+            dry_run,
+        }) => {
+            let reference = parse_reference(&reference)?;
+            let policy = policy_for(&reference, from.as_deref(), strict)?;
+            // Space first and origin second, the order `ls` states its reason
+            // for: one typo should be reported as the same mistake whichever
+            // command met it.
+            //
+            // A space nobody publishes and a space nobody indexes fail for
+            // different reasons, and the second is the one `fill` is picky
+            // about: it writes into the directory `synch space add` named, so
+            // an unindexed space has nowhere to put anything. `fill_space`
+            // says so; this is the other half, so a typo'd id does not report
+            // "no local space" when the real answer is "no such space at all".
+            ensure_known_space(node, &reference.space).await?;
+            // The policy's origin, not the reference's: `--from nsa` and
+            // `nsa:media` are the same typo, and only one of them was being
+            // checked. A fill of an origin nobody has heard of selects nothing
+            // for every path, and `Absent` is silent by design — so the typo
+            // reported as a complete, clean fill of nothing.
+            if let VersionPolicy::Origin(origin) = &policy {
+                ensure_known_origin(node, origin).await?;
+            }
+            let options = synch_engine::FillOptions { force, dry_run };
+            let report = node
+                .fill_space(&reference.space, &reference.dir_prefix(), &policy, options)
+                .await?;
+            let mut summary = format!(
+                "{} {} · current {} · differing {} · skipped {}",
+                if report.dry_run {
+                    "would fill"
+                } else {
+                    "filled"
+                },
+                report.filled,
+                report.current,
+                report.differing.len(),
+                report.skipped.len()
+            );
+            // Counted apart from `differing` rather than folded into it: under
+            // `--force` nothing can be differing, so a folded count of 3 would
+            // read as three paths `--force` is about to fix, when they are three
+            // it deliberately did not touch.
+            if !report.appeared.is_empty() {
+                summary.push_str(&format!(" · appeared {}", report.appeared.len()));
+            }
+            if report.ignored > 0 {
+                summary.push_str(&format!(" · ignored {}", report.ignored));
+            }
+            if !report.replaced.is_empty() {
+                summary.push_str(&format!(
+                    " · {} {}",
+                    if report.dry_run {
+                        "would replace"
+                    } else {
+                        "replaced"
+                    },
+                    report.replaced.len()
+                ));
+            }
+            out.line(summary).await?;
+            if report.reused_bytes > 0 || report.reflinked > 0 {
+                out.line(format!(
+                    "reused {} B · fetched {} B · reflinked {}",
+                    report.reused_bytes, report.fetched_bytes, report.reflinked
+                ))
+                .await?;
+            }
+            // Every per-path line here goes to stdout, unlike the per-path
+            // lines of `scan` and `mirror sync`. Those report how a pass went,
+            // path by path; these are the paths the operator has to decide
+            // about — under `--dry-run` the list *is* the command's answer, and
+            // under `--strict` the skipped paths are the entire reason the
+            // command was run. Splitting one decision list across two streams
+            // so that `synch fill media --strict > plan` wrote the count and
+            // dropped the paths would be the worst of both.
+            for path in &report.replaced {
+                out.line(format!(
+                    "{} {}/{path}",
+                    if report.dry_run {
+                        "would replace"
+                    } else {
+                        "replaced"
+                    },
+                    reference.space
+                ))
+                .await?;
+            }
+            for path in &report.differing {
+                out.line(format!(
+                    "differing {}/{path} (local content differs; --force replaces it)",
+                    reference.space
+                ))
+                .await?;
+            }
+            // Kept apart from `differing` because the advice is the opposite:
+            // these are paths that are no longer what the fill was shown, so
+            // `--force` — which answers for the file it was pointed at —
+            // neither caused this nor resolves it.
+            for path in &report.appeared {
+                out.line(format!(
+                    "appeared {}/{path} (not the file this fill was shown; left alone)",
+                    reference.space
+                ))
+                .await?;
+            }
+            for (path, reason) in &report.skipped {
+                out.line(format!("skipped {}/{path}: {reason}", reference.space))
+                    .await?;
+            }
+            // Written, but not wholly: kept out of the skipped count so that
+            // `filled` and `skipped` never describe the same path.
+            for (path, reason) in &report.warnings {
+                out.line(format!("filled {}/{path}, but {reason}", reference.space))
+                    .await?;
+            }
+            // A prefix that names nothing is almost always a typo, and it
+            // reports exactly what an already-full directory reports. `status`
+            // refuses to let a named path that matches nothing pass as silence;
+            // a fill that writes nothing because of a typo is the same trap.
+            if !reference.is_space_root() && report.considered == 0 {
+                out.line(format!(
+                    "note: no path in {} starts with {}",
+                    reference.space,
+                    reference.dir_prefix()
+                ))
+                .await?;
+            }
+            if report.filled > 0 && !report.dry_run {
+                out.line("the next scan publishes what was filled as this node's own view")
+                    .await?;
+            }
+        }
+
         Command::MirrorAdd(pb::MirrorAdd {
             space,
             path,
@@ -2590,7 +2729,10 @@ async fn receive(
         None => None,
     })
     .await?;
-    // The commit fsyncs the payload and renames it into place.
+    // The commit fsyncs the payload and renames it into place — and re-takes
+    // the gates first, since the write carries them (`Adoption`). The body
+    // streams here for as long as the client cares to take, and an inbound
+    // `Hello` can floor this node anywhere in that window.
     let target = offload(move || Ok(adoption.commit()?)).await?;
 
     let detached = {

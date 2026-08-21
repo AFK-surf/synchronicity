@@ -196,6 +196,9 @@ message Command {
     SpaceSet space_set = 44;
     // `synch space sync [<id>]`
     SpaceSync space_sync = 45;
+    // `synch fill [<origin>:]<space>[/<dir>] [--from <o>|--strict] [--force]
+    // [--dry-run]`
+    Fill fill = 46;
   }
 }
 
@@ -422,6 +425,20 @@ message MirrorRm {
 message MirrorLs {}
 
 message MirrorSync {}
+
+message Fill {
+  // `[<origin>:]<space>[/<dir>]` — the space to fill, and optionally one
+  // directory within it.
+  string reference = 1;
+  // `--from <origin>`: fill from that origin's version of every path.
+  optional string from = 2;
+  // `--strict`: report divergent paths instead of picking a version.
+  bool strict = 3;
+  // `--force`: replace local files whose content differs.
+  bool force = 4;
+  // `--dry-run`: decide everything, write nothing.
+  bool dry_run = 5;
+}
 
 message PinAdd {
   // A hex object root, or a `<space>/<path>` whose selected version's root is

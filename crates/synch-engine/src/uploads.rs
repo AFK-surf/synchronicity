@@ -124,24 +124,17 @@ impl Node {
         principal: Option<&str>,
         _target: &Path,
     ) -> Result<String> {
+        // A space that does not exist cannot hold an upload; `refuse_if_ignored`
+        // passes over one rather than inventing an error, so it is named here.
+        if self.store().space(space)?.is_none() {
+            return Err(EngineError::not_found(format!("space {space}")));
+        }
         // A key the scanner would skip can never become an object, and finding
         // that out at completion — after the client has streamed gigabytes and
         // the parts have been consumed — is the worst possible moment for it.
-        let space_row = self
-            .store()
-            .space(space)?
-            .ok_or_else(|| EngineError::not_found(format!("space {space}")))?;
-        let normalized =
-            synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        if let Some(local_path) = space_row.local_path.as_deref() {
-            if crate::ignore::IgnoreSet::for_space(Path::new(local_path))?
-                .is_ignored(&normalized, false)
-            {
-                return Err(EngineError::invalid(format!(
-                    "{space}/{path} matches an ignore rule, so it could never be published"
-                )));
-            }
-        }
+        // It is checked again there all the same: an upload outlives the rules
+        // it opened under.
+        self.refuse_if_ignored(space, path)?;
         self.check_upload_capacity(principal)?;
         let id = new_upload_id()?;
         let dir = self.store().upload_dir(&id);
@@ -388,6 +381,12 @@ impl Node {
                 "a cloud-CAS node cannot complete into a path-backed space",
             ));
         }
+        // A detached completion assembles into a staging file the daemon owns.
+        // A path-backed one assembles into the space itself, and opens that
+        // write through `open_adoption` below — which resolves the target, takes
+        // the gates, and carries them to the commit, so an upload open for days
+        // is judged by the rules in force when it lands rather than the ones it
+        // started under.
         let target = if detached {
             dir.join(format!(
                 "assembled.{}{}",
@@ -395,10 +394,7 @@ impl Node {
                 crate::scanner::PART_SUFFIX
             ))
         } else {
-            let (node, space_owned, path_owned) =
-                (self.clone(), space.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_owned, &path_owned))
-                .await?
+            PathBuf::new()
         };
 
         let (root, size) = if remote_parts {
@@ -427,8 +423,14 @@ impl Node {
         } else {
             let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
             let assembled_target = target.clone();
+            let (node, space_owned, path_owned) =
+                (self.clone(), space.to_string(), path.to_string());
             let assembled = crate::blocking::offload(move || {
-                let mut adoption = Adoption::at(&assembled_target)?;
+                let mut adoption = if detached {
+                    Adoption::at(&assembled_target)?
+                } else {
+                    node.open_adoption(&space_owned, &path_owned)?
+                };
                 for source in &sources {
                     adoption.append_file(source)?;
                 }
@@ -1119,6 +1121,58 @@ mod sweeper_tests {
         let part = node.commit_part(staging, adoption).unwrap();
         assert_eq!(part.size, 14);
         assert_eq!(node.store().upload_parts(&id).unwrap().len(), 1);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A completion into a node that cannot publish lands nothing (issue #71).
+    ///
+    /// End to end rather than at the moment of the rename: the assembly opens
+    /// its write through `open_adoption`, so this is refused at the open. What
+    /// pins the *commit* — a node floored between the open and the rename, on
+    /// an upload that may have been assembling for minutes — is
+    /// `a_space_write_re_takes_its_gates_at_the_commit` in scanner.rs, where
+    /// the gate now lives.
+    #[tokio::test]
+    async fn a_completion_floored_after_it_opened_does_not_land() {
+        let (_d, space, node) = node_with_space().await;
+        let victim = space.path().join("joined.bin");
+        std::fs::write(&victim, b"mine, unpublished").unwrap();
+
+        let target = node.upload_target("media", "joined.bin").unwrap();
+        let id = node
+            .create_upload("media", "joined.bin", None, &target)
+            .unwrap();
+        let bytes = vec![7u8; MIN_PART_SIZE as usize];
+        let staging = node.open_part(&id, "media", "joined.bin", None, 1).unwrap();
+        let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
+        adoption.write(&bytes).unwrap();
+        node.commit_part(staging, adoption).unwrap();
+
+        // A peer advertises a head for our own origin that we have no history
+        // for — key-loss recovery, arriving while the upload is open.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                synch_core::now_ns(),
+            )
+            .unwrap();
+
+        let refused = node
+            .complete_upload(&id, "media", "joined.bin", None, &[(1, None)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"mine, unpublished",
+            "the assembly must not have renamed over a file nothing could then \
+             publish a replacement for"
+        );
         node.shutdown().await.unwrap();
     }
 

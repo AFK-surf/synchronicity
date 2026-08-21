@@ -352,8 +352,8 @@ the changed bytes roughly once (§6.3's O(N) swarm property, now for updates too
 ### 3.5 Materialization: one path onto the filesystem
 
 `materialize_blob` is the only way an object becomes a file. The mirror pass
-(§7.2), `synch take`/`adopt_from` (§8) and the gateway's fetch-to-file all go
-through it, and all get the same guarantees: the target is old-or-new and never
+(§7.2), `synch fill` of a space (§7.2), `synch take`/`adopt_from` (§8) and the
+gateway's fetch-to-file all go through it, and all get the same guarantees: the target is old-or-new and never
 half, no staging residue is left on any path, and the object is never held in
 memory.
 
