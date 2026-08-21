@@ -172,6 +172,14 @@ impl Node {
                 }
             }
         }
+        // The live release path runs inside the head-flip transaction and reads
+        // this from `config`, because there is no engine to ask down there.
+        // Written whenever replication is configured, so the two paths cannot
+        // disagree about the floor.
+        self.store().set_config(
+            "replica.release_floor",
+            &self.config().replica_release_floor.to_string(),
+        )?;
         if let Some(grace) = grace {
             self.store().set_space_grace(id, grace)?;
         }
@@ -205,6 +213,14 @@ impl Node {
         if self.store().space(id)?.is_none() {
             return Err(EngineError::not_found(format!("no space {id}")));
         }
+        // The live release path runs inside the head-flip transaction and reads
+        // this from `config`, because there is no engine to ask down there.
+        // Written whenever replication is configured, so the two paths cannot
+        // disagree about the floor.
+        self.store().set_config(
+            "replica.release_floor",
+            &self.config().replica_release_floor.to_string(),
+        )?;
         if let Some(grace) = grace {
             self.store().set_space_grace(id, grace)?;
         }
@@ -350,6 +366,10 @@ impl Node {
                     let (root, holder) = (want.root, want.holder.clone());
                     crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
                 }
+                // Checked before the budget arm, so a full batch stops rather
+                // than going on to count every remaining candidate as
+                // over-budget in a report nobody can act on.
+                Some(_) if admitted.len() >= limit => break,
                 Some((held, budget)) if *budget > 0 && *held + want.size > *budget => {
                     // Skipped, not stopped: a smaller want further down still
                     // fits, and rejecting one must not end the pass. Nothing is
@@ -358,13 +378,12 @@ impl Node {
                     // into the backoff and eventually into `unreachable`.
                     report.over_budget += 1;
                 }
-                Some((held, _)) if admitted.len() < limit => {
+                Some((held, _)) => {
                     // Counted as though it lands, so one batch cannot overshoot
                     // a budget by the size of the whole batch.
                     *held = held.saturating_add(want.size);
                     admitted.push(WantPlan { want, space });
                 }
-                Some(_) => break,
             }
         }
 

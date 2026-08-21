@@ -11,6 +11,7 @@ use synch_core::{
 };
 use synch_mpt::{ChangeKind, ChangeView, Trie};
 
+use crate::replica::NOT_SELF;
 use crate::{
     db::{hash_column, origin_column, Store, Txn},
     error::{Result, StoreError},
@@ -140,6 +141,14 @@ impl std::str::FromStr for ReplicaPolicy {
         }
     }
 }
+
+/// How many other origins must advertise a complete copy before a replica lets
+/// a stale root of its own go, when nothing says otherwise (§4.3).
+///
+/// One: a replica will not be the last holder to let go of something. It does
+/// not try to enforce a cluster-wide floor either — that is the deferred half
+/// of §4.3, and the hazard is written down there.
+pub const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 
 /// How long a released root outlives the last entry naming it, when a space
 /// does not say (`docs/REPLICATION.md` §5).
@@ -1181,6 +1190,9 @@ struct ReplicaTarget {
     holder: String,
     grace_ns: i64,
     releases: bool,
+    /// How many *other* origins must advertise a complete copy before this
+    /// node lets a stale root of its own go (§4.3).
+    release_floor: i64,
 }
 
 impl ReplicaTargets {
@@ -1188,6 +1200,18 @@ impl ReplicaTargets {
     /// effect is the one the transaction can see rather than one a concurrent
     /// `space set` changed underneath it.
     fn of(conn: &rusqlite::Connection) -> Result<ReplicaTargets> {
+        // Read on the same connection as everything else here: the live release
+        // path runs inside the head-flip transaction, where there is no engine
+        // to ask for configuration.
+        let release_floor: i64 = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'replica.release_floor'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(DEFAULT_REPLICA_RELEASE_FLOOR);
         let mut by_space = std::collections::HashMap::new();
         let mut stmt = conn.prepare(
             "SELECT id, local_path, replicate, grace, budget
@@ -1202,6 +1226,7 @@ impl ReplicaTargets {
                     holder: space.holder().render(),
                     grace_ns: space.grace_secs().saturating_mul(1_000_000_000),
                     releases: space.replicate.is_some_and(ReplicaPolicy::releases),
+                    release_floor,
                 },
             );
         }
@@ -1311,6 +1336,25 @@ fn replica_releases(
     )?;
     if referenced {
         return Ok(());
+    }
+    // The §4.3 floor applies here too, and this is where it matters most: the
+    // live path is where releases are decided in the ordinary case, so a floor
+    // enforced only in the sweep is a promise kept on the rare path and broken
+    // on the common one. `replica_release_floor`'s stated guarantee — that a
+    // replica will not be the last holder to let go of something — has to hold
+    // wherever a release is scheduled or it is not a guarantee.
+    if target.release_floor > 0 {
+        let holders: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM blob_providers
+                  WHERE object_root = ?1 AND complete != 0 AND {NOT_SELF}"
+            ),
+            params![root.as_bytes().to_vec()],
+            |row| row.get(0),
+        )?;
+        if holders < target.release_floor {
+            return Ok(());
+        }
     }
     // A want for something on its way out is work nobody needs doing: the
     // cheaper order is to drop the intent rather than fetch and then release.

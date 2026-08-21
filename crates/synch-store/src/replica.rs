@@ -19,14 +19,6 @@
 /// for the rare object in a batch to win without the pass reading the queue.
 const RARITY_WINDOW: usize = 8;
 
-/// The §3.6 precondition, as a SQL predicate.
-///
-/// True when this node's picture of what the cluster publishes is a faithful
-/// one: no head is sitting pending — its origin's entries are absent or stale
-/// while it does — and no bound origin is missing a complete head, which would
-/// mean this node has never materialized what that member publishes. Either
-/// makes "no entry names this root" mean "I do not know", and a release decided
-/// from that is a release decided from ignorance.
 /// "Some origin other than this one", for counting *other* holders.
 ///
 /// A node advertises its own `b:` records like any other origin, so a provider
@@ -34,9 +26,22 @@ const RARITY_WINDOW: usize = 8;
 /// and a replica deciding whether it may be the last holder to let go would
 /// always find one holder left, itself. The brake would then never engage at
 /// its default.
-const NOT_SELF: &str = "origin_id != COALESCE(
+pub(crate) const NOT_SELF: &str = "origin_id != COALESCE(
         (SELECT value FROM config WHERE key = 'self_origin_id'), '')";
 
+/// The §3.6 precondition, as a SQL predicate.
+///
+/// True when this node's picture of what the cluster publishes is a faithful
+/// one: no head is sitting pending — its origin's entries are absent or stale
+/// while one does — and no bound origin is missing a complete head, which would
+/// mean this node has never materialized what that member publishes. Either
+/// makes "no entry names this root" mean "I do not know", and a release decided
+/// from that is a release decided from ignorance.
+///
+/// Spliced into a `WHERE` rather than checked first, so it cannot go stale
+/// between the check and the update it guards. Every splice site is a pure
+/// conjunction; this fragment contains a top-level `AND` of its own and would
+/// need parentheses in any other context.
 const VIEW_IS_COMPLETE: &str = "NOT EXISTS (SELECT 1 FROM heads WHERE slot = 'pending')
      AND NOT EXISTS (
            SELECT 1 FROM bindings b
@@ -221,21 +226,38 @@ impl Store {
         max_backoff: i64,
         limit: usize,
     ) -> Result<Vec<WantRow>> {
-        let mut candidates = Vec::new();
+        // Ranked within a space, then interleaved across them. Ranking the
+        // pooled candidates globally is what §3.3 first specified and it
+        // starves: a space bootstrapping four million equally-rare objects
+        // sorts ahead of every newer want in every other space, so a space
+        // added afterwards fetches nothing until the first one drains — months,
+        // at four objects a pass. Rarity is the right order *within* a space;
+        // between spaces the only defensible order is a turn each.
+        let mut per_space = Vec::new();
         for space in self.replicated_spaces()? {
-            candidates.extend(self.wants_ready_of(
+            let ready = self.wants_ready_of(
                 &space.holder(),
                 now,
                 min_backoff,
                 max_backoff,
                 limit * RARITY_WINDOW,
-            )?);
+            )?;
+            if !ready.is_empty() {
+                per_space.push(self.rank_rarest_first(ready)?.into_iter());
+            }
         }
-        // Ranked, not truncated: the caller may skip some — a want larger than
-        // a space's remaining budget, say — and truncating here would leave it
-        // nothing to fall back on, so a space near its ceiling would stop
-        // fetching entirely rather than take the smaller wants that still fit.
-        self.rank_rarest_first(candidates)
+        // Interleaved, not truncated: the caller may decline some — a want
+        // larger than a space's remaining budget, say — so it is handed a
+        // ranked window rather than exactly `limit` rows.
+        let mut out = Vec::new();
+        while per_space.iter_mut().any(|space| match space.next() {
+            Some(want) => {
+                out.push(want);
+                true
+            }
+            None => false,
+        }) {}
+        Ok(out)
     }
 
     /// One holder's oldest ready wants, in `first_wanted` order.
@@ -245,8 +267,8 @@ impl Store {
     /// `ORDER BY first_wanted` over a holder-leading index cannot be served by
     /// it: the plan is a scan of the whole queue plus a temp-B-tree sort, on
     /// every pass, on the one write connection that publishes and GC also want.
-    /// Per holder is also what keeps a space with a large old backlog from
-    /// starving every other replicated space.
+    /// Fairness between spaces is [`Store::wants_to_attempt`]'s job, not this
+    /// one's: this returns one space's window, and the caller interleaves.
     pub fn wants_ready_of(
         &self,
         holder: &PinHolder,
@@ -932,6 +954,79 @@ mod tests {
         assert_eq!(
             store.held_back_by_replication_floor(&media(), 1).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_durable_claim_becomes_a_want_again() {
+        let (_dir, store) = store();
+        let root = synch_core::Hash::new(b"in the bucket, until it was not");
+        // The shape a cloud replica's holding takes once its cache is dropped:
+        // durable, no local bytes.
+        store.record_remote_durable_blob(&root, 4096, 1).unwrap();
+        store
+            .put_entry(
+                &origin(),
+                "media",
+                "held.bin",
+                &synch_core::FileEntry::file(4096, 1, root, 1),
+            )
+            .unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+        store.pin(&root, &PinHolder::Operator, 1).unwrap();
+
+        // The backend answers NotFound for a content address. That is a
+        // statement about the bytes, unlike `entries` merely not naming a root,
+        // and it is the one case where absence of bytes is evidence.
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+
+        // The replica's claim must not outlive the bytes it promised: both
+        // staging paths skip a root this holder already pins, so a pin left
+        // standing over a deleted row is one no sweep could ever re-want, and
+        // the node would advertise coverage it does not have for ever.
+        let pins = store.pins_for(&root).unwrap();
+        assert_eq!(pins.len(), 1, "only the operator's own pin survives");
+        assert_eq!(pins[0].holder, PinHolder::Operator);
+        let wants = store.wants_of(&media()).unwrap();
+        assert_eq!(wants.len(), 1, "and the replica wants it again");
+        assert_eq!(wants[0].size, 4096, "at the size its entry knows");
+    }
+
+    #[test]
+    fn one_space_with_a_backlog_does_not_starve_another() {
+        let (_dir, store) = store();
+        store.put_detached_space("archive").unwrap();
+        store.put_detached_space("docs").unwrap();
+        for id in ["archive", "docs"] {
+            store
+                .set_space_policy(id, Some(ReplicaPolicy::Tree))
+                .unwrap();
+        }
+        let archive = PinHolder::Replica("archive".into());
+        let docs = PinHolder::Replica("docs".into());
+
+        // `archive` is bootstrapping: many old wants. `docs` was added after,
+        // so every want it has is newer than all of them.
+        for i in 0..50u8 {
+            store
+                .stage_want(
+                    &synch_core::Hash::new(&[i, 1]),
+                    &archive,
+                    10,
+                    None,
+                    i as i64,
+                )
+                .unwrap();
+        }
+        store
+            .stage_want(&synch_core::Hash::new(b"docs one"), &docs, 10, None, 9_000)
+            .unwrap();
+
+        let batch = store.wants_to_attempt(1_000_000, 60, 3600, 4).unwrap();
+        assert!(
+            batch.iter().any(|want| want.holder == docs),
+            "a space added after a large backlog must still get a turn, or it \
+             fetches nothing until the backlog drains — months, at four a pass"
         );
     }
 

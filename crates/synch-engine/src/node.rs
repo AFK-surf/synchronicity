@@ -1109,7 +1109,10 @@ impl Node {
         // here that can publish a mass deletion: it takes the publishing gate,
         // and a node that cannot publish must not be stopped from giving up a
         // space it never published into (`docs/REPLICATION.md` §3.2).
-        let publishes_here = publishes_into(&space, self.store().count_entries(self.origin(), id)?);
+        // Or has published: a record advertised under an earlier answer to that
+        // predicate must still be retractable, or `space rm` leaves it behind.
+        let publishes_here = publishes_into(&space, self.store().count_entries(self.origin(), id)?)
+            || self.space_info_of(self.origin(), id)?.is_some();
         if publishes_here {
             self.ensure_publishable()?;
         }
@@ -1355,6 +1358,17 @@ impl Node {
             // predicate is shared with `remove_space`, so what is advertised
             // and what is withdrawn cannot drift apart.
             if !publishes_into(&space, entry_count) {
+                // Withdraw rather than merely stop refreshing. The predicate
+                // depends on `count_entries`, so it changes under a space that
+                // is standing still: a detached space that took gateway writes
+                // qualifies until its last tombstone ages out at
+                // `tombstone_ttl`, and after that nothing would refresh the
+                // record and `remove_space` would see the same answer and skip
+                // its removal. The record would sit in this node's own trie for
+                // ever, claiming a space it no longer participates in.
+                if self.space_info_of(self.origin(), &space.id)?.is_some() {
+                    out.push(self.space_info_removal(&space.id)?);
+                }
                 continue;
             }
             let info = SpaceInfo {

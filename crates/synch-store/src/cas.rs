@@ -1044,11 +1044,42 @@ impl Store {
                 "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
                 params![root.as_bytes().to_vec()],
             )?;
-            tx.execute(
+            let dropped = tx.execute(
                 "DELETE FROM blobs
                    WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
                 params![root.as_bytes().to_vec()],
             )?;
+            // A replica's claim must not outlive the bytes it was a promise
+            // about (`docs/REPLICATION.md` §8). This is the one place where
+            // absence of bytes *is* evidence: the backend answered `NotFound`
+            // about a content address, which is a statement, unlike `entries`
+            // merely not naming a root.
+            //
+            // Turning the claim back into a want rather than dropping it
+            // outright is what closes the hole. Both staging paths skip a root
+            // this holder already pins, so a pin left standing over a deleted
+            // row is one no sweep can ever re-want: the node would go on
+            // counting the object as held, advertising coverage it does not
+            // have, for ever. The operator's own pins are left alone — those
+            // are a person's promise, not this node's bookkeeping, and a
+            // vanished object is something they should be told about rather
+            // than have quietly rewritten.
+            if dropped > 0 {
+                tx.execute(
+                    "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+                     SELECT p.root, p.holder, COALESCE(
+                              (SELECT e.size FROM entries e WHERE e.content = p.root LIMIT 1), 0),
+                            NULL, ?2
+                       FROM pins p
+                      WHERE p.root = ?1 AND p.holder LIKE 'replica:%'
+                     ON CONFLICT(root, holder) DO NOTHING",
+                    params![root.as_bytes().to_vec(), synch_core::now_ns()],
+                )?;
+                tx.execute(
+                    "DELETE FROM pins WHERE root = ?1 AND holder LIKE 'replica:%'",
+                    params![root.as_bytes().to_vec()],
+                )?;
+            }
             Ok(changed > 0)
         })
     }
@@ -1269,12 +1300,17 @@ impl Store {
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
         self.with_immediate_tx(|tx| {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1)",
+            // Held, not merely known: a `blobs` row exists for a partial fetch
+            // too. `take_possession` enforces the same thing on the other entry
+            // point, and a promise about bytes belongs in the store rather than
+            // in the discipline of every caller.
+            let held: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs
+                                WHERE root = ?1 AND (complete != 0 OR durable != 0))",
                 params![root.as_bytes().to_vec()],
                 |row| row.get(0),
             )?;
-            if !exists {
+            if !held {
                 return Ok(false);
             }
             tx.execute(

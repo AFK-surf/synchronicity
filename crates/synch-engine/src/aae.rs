@@ -327,10 +327,16 @@ impl Node {
         // a space removed with its pins kept still has releases that were
         // scheduled before it went, and nothing else would ever run them
         // (`docs/REPLICATION.md` §3.1).
-        if let Some(expired) = contained(
-            "expiring pins",
-            self.store().expire_pins(now).map_err(EngineError::from),
-        ) {
+        // The store's reading, not the bare `now` this pass carries: releases
+        // are scheduled against `read_instant` and this is the second thing
+        // that runs them, so the two must date by the same clock or the
+        // catch-all and the sweep disagree about when a grace window ended.
+        let releasing = self
+            .store()
+            .read_instant()
+            .and_then(|reading| self.store().expire_pins(reading))
+            .map_err(EngineError::from);
+        if let Some(expired) = contained("expiring pins", releasing) {
             if expired > 0 {
                 tracing::info!(expired, "scheduled releases fell due");
             }
