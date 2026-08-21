@@ -1,4 +1,4 @@
-# Replica mode
+# Replication
 
 Status: **proposed**. Nothing below is built. Section 11 is the order it should
 land in; each phase is useful on its own, and the first one is worth doing even
@@ -32,17 +32,19 @@ make availability cluster-visible (§6.3) — but there is no way to say *hold a
 of this*, and no way to see whether anybody is.
 
 The gap is named in DESIGN.md §13 as future work ("smarter placement policies,
-built on the same `BlobAd` availability data"). This document proposes the node
-role first and the placement policy last, because the role is the part that is
-both useful alone and hard to get wrong later.
+built on the same `BlobAd` availability data"). This document proposes the
+per-space role first and the cluster-wide placement policy last, because the
+role is the part that is both useful alone and hard to get wrong later.
 
-## 2. What replica mode is
+## 2. What replication is
 
 **A replica is a node that holds a whole copy of every version the unified tree
 currently names, for the spaces it replicates.** Every origin's version of every
 path — not the one a policy would select — fetched as it appears, held whole,
-served to anyone. It materializes nothing onto the filesystem and publishes no
-spaces of its own.
+served to anyone. Replicating is not publishing and not materializing: a node
+may replicate a space it also indexes a directory for, or one it has no
+directory for at all (§3.2), and replication itself writes no files and
+publishes no entries either way.
 
 | | selects | holds | releases when |
 |---|---|---|---|
@@ -91,7 +93,8 @@ wrong in three ways that matter:
   already written, already transactional, and already correct against a
   concurrent fetch.
 
-So replica mode is a **fetch** policy far more than it is a retention policy.
+So replication here is a **fetch** policy far more than it is a retention
+policy.
 What it adds is: fetch everything referenced rather than only what someone reads,
 hold it whole rather than in the ranges a read happened to want, and release it
 on a schedule the operator sets rather than on the `root_retention` clock that
@@ -126,9 +129,10 @@ interval the deployment believes in — thirty days is a defensible default,
 seven is not — and a deployment that wants deletion-proof retention runs
 `--policy archive` and pays for it.
 
-Saying this in the documentation is not enough; `synch replicate add` should print
-it, and `replicate status` should show the grace window beside the held size,
-because the number that matters is the one an operator sees the day they need it.
+Saying this in the documentation is not enough; `space add --replicate` should
+print it, and `space ls` should show the grace window beside the held size,
+because the number that matters is the one an operator sees the day they need
+it.
 
 ## 3. Design
 
@@ -184,27 +188,73 @@ object it does not hold must not write a pin row for it — a pin whose bytes ar
 absent makes `pin ls` a list of claims rather than of contents. Intent lives in
 its own table and becomes a pin in the transaction that retires it (§3.3).
 
-### 3.2 Configuration: one row per replicated space
+### 3.2 Replication is a property of a space
+
+Cardinality decides where this lives. A mirror is keyed by *directory* — many
+mirrors of one space, each with its own root and its own version policy — so
+`mirrors` is its own table and `synch mirror` is its own noun, correctly.
+Replication is one per space, so its natural primary key is the space id, which
+is already the primary key of `spaces`. A table whose primary key is another
+table's primary key is a column on that table.
+
+So there is no `replicas` table and no `synch replicate` command. `spaces` gains
+the columns, by the rename-and-rebuild the migration chain already uses for this
+(V14):
 
 ```sql
-CREATE TABLE replicas (
-  space    TEXT PRIMARY KEY,
-  policy   TEXT NOT NULL,          -- 'tree' | 'archive'
-  grace    INTEGER NOT NULL,       -- seconds a released root is still held
-  budget   INTEGER,                -- optional byte ceiling, NULL for none
-  added_at INTEGER NOT NULL
+-- schema v20
+CREATE TABLE spaces (
+  id         TEXT PRIMARY KEY,
+  local_path TEXT,              -- was NOT NULL. NULL = replicated here, not indexed here
+  replicate  TEXT,              -- NULL | 'tree' | 'archive'
+  grace      INTEGER,           -- seconds a released root is still held; NULL under 'archive'
+  budget     INTEGER            -- optional byte ceiling, NULL for none
 );
 ```
 
-Per space, not per node, for the reason mirrors are per directory: "replicate
-everything this node can see" is expressible by adding every space, while a
-node-wide flag would silently enrol spaces admitted later. A delegated replica
-can only add spaces its scope covers, which `materialization_scope` already
-decides — there is no path around it and none is added.
+**The real change is the second line, and it is what a `spaces` row means.**
+Today a row means "a local directory I index and publish under this id":
+`local_path` is `NOT NULL` and every consumer treats a row as a directory to
+walk. It becomes "this node's participation in this space" — indexing a
+directory is one kind of participation, holding every origin's copies is
+another, and a row may be either or both.
+
+That is a better model than the one it replaces, and it closes a gap that exists
+today: there is no way to say "this node cares about space `media`" without
+publishing a directory into it. The CLI already works around the gap —
+`ensure_known_space` reaches past `spaces()` to `known_spaces()`, the spaces
+some origin has published entries for, precisely because the local table cannot
+answer the question.
+
+Six places read `spaces()` expecting a directory and must skip a path-less row:
+the scanner's two walks, the watcher's root list, the overlap checks in
+`add_space` and `add_mirror` (a row with no root overlaps nothing), and the
+space list the cloud attach publishes. Those are skips. Two are decisions:
+
+- **`Node::space_info_changes` must not publish `m:space/<id>` for a
+  replicate-only space.** The record carries `description: space.local_path` and
+  this origin's entry count for the space; a replicate-only row has neither — no
+  path to describe and no entries of its own — and publishing it anyway
+  advertises a space this node does not publish. `m:space/<id>` stays tied to
+  the indexed half; the replicated half publishes `r:<space>` (§4.1) and nothing
+  else. A space that is both publishes both.
+- **`Node::remove_space` is an unpublish, and must not be one here.** It stages
+  a tombstone for every key under the space prefix, removes the `m:space/<id>`
+  record, and calls `ensure_publishable()` first. On a space this node only
+  replicates there is nothing of its own under that prefix, so the loop stages
+  nothing and the outcome is correct *by accident*. That is not good enough for
+  the one command in this design that can publish a mass deletion: it must
+  branch on which halves are configured, and a space that was only ever
+  replicated must not reach `ensure_publishable()` at all (§8).
+
+One consequence worth naming: a space can now be added twice over, at different
+times, in either order — indexed first and replicated later, or replicated first
+and a local directory added afterwards. Both orders are ordinary `space set`
+calls, and the second one must not disturb what the first established.
 
 ### 3.3 The want queue, resurrected
 
-Schema v3 dropped a `want(root, ranges, priority, reason)` table. Replica mode
+Schema v3 dropped a `want(root, ranges, priority, reason)` table. Replication
 needs it back, in a shape fitted to this job:
 
 ```sql
@@ -256,7 +306,7 @@ the oldest want, so nothing starves.
 
 **Live: the promotion diff.** `Syncer::try_promote` flips a head to complete
 inside one transaction that also calls `materialize_diff`, which streams every
-resolved change under the origin's scope into `entries`. Replica mode adds one
+resolved change under the origin's scope into `entries`. Replication adds one
 step to `apply_change`'s `f:` arm, in that same transaction:
 
 - A change carrying a content root in a replicated space **stages a want** — or,
@@ -281,7 +331,8 @@ is not tidiness, it is where the data loss is.
 loop (its own interval, rung early by the same promotion bell). It walks
 `entries` for replicated spaces and stages a want for every content root with no
 pin and no want row. It covers a space added after the fact, promotions that
-happened while replica mode was off, a views rebuild, and whatever the live path
+happened while replication was off for the space, a views rebuild, and whatever
+the live path
 gets wrong.
 
 The sweep may **stage**, and it may **release only under §3.6**. Staging from
@@ -311,7 +362,7 @@ the window rather than a paragraph asserting it.
 
 ### 3.6 Eviction discipline: absence is not evidence
 
-A replica's eviction is the ordinary `gc_content` pass. What replica mode adds
+A replica's eviction is the ordinary `gc_content` pass. What replication adds
 is a rule about **who is allowed to conclude that a root left the tree**, and it
 is the one piece of this design that has to be right.
 
@@ -347,7 +398,7 @@ preconditions are locally checkable:
 3. No rebuild is in flight.
 
 If any fails, the sweep stages as usual and releases nothing, and says why in
-`replicate status` and `synch doctor`. Holding too much for a day is a cost;
+`space ls` and `synch doctor`. Holding too much for a day is a cost;
 releasing the last copy of something is not recoverable, and the asymmetry
 should be visible in the code as plainly as it is here.
 
@@ -390,11 +441,11 @@ holding history nobody can read.
 
 ### 3.8 The budget, and what "full" does
 
-`replicas.budget` is an optional ceiling on bytes held for a space. When it is
+`spaces.budget` is an optional ceiling on bytes held for a space. When it is
 reached the fetch loop stops taking new work for that space, want rows stay —
 they are the record of what is missing, and dropping them converts a storage
-problem into a silent data-loss problem — and `replicate status` and `synch
-doctor` report the shortfall in objects and bytes.
+problem into a silent data-loss problem — and `space ls` and `synch doctor`
+report the shortfall in objects and bytes.
 
 **Reaching the budget never accelerates a release.** Under `tree` the release
 schedule is the tree's, not the disk's; a replica that shortened its grace
@@ -432,7 +483,7 @@ and to the read scope, or a delegated replica cannot claim what it replicates.
 The argument is the one already made for `b:` — a delegate that holds content
 must be able to say so, or the swarm loses a source.
 
-With claims published, `replicate status` can answer the question an operator
+With claims published, `space ls` can answer the question an operator
 actually asks — *is anything replicating `media`, with what grace, and how far
 behind is it?* — across the cluster rather than on one box.
 
@@ -473,9 +524,9 @@ count them.
 
 | knob | default | what it is |
 |---|---|---|
-| `replicas.policy` | `tree` | per space: `tree` (release with the tree) or `archive` (never release) |
-| `replicas.grace` | 30 d | how long a root outlives the last entry naming it |
-| `replicas.budget` | none | per space byte ceiling; stops fetching, never evicts |
+| `spaces.replicate` | unset | per space: unset, `tree` (release with the tree) or `archive` (never release) |
+| `spaces.grace` | 30 d | how long a root outlives the last entry naming it |
+| `spaces.budget` | none | per space byte ceiling; stops fetching, never evicts |
 | `replica_interval` | 300 s | reconciling sweep backstop; the promotion bell rings it early |
 | `replica_concurrency` | 4 | concurrent object fetches for replica work |
 | `replica_backoff` | 60 s … 6 h | per-want retry schedule, exponential in `attempts` |
@@ -489,22 +540,47 @@ the cluster's actual users is a worse problem than one that converges overnight.
 
 ## 6. CLI surface
 
-```
-synch replicate add <space> [--policy tree|archive] [--grace <dur>] [--budget <size>]
-synch replicate rm <space> [--release]
-synch replicate ls
-synch replicate status [<space>] [--json]
-synch replicate sync                     run a reconciling sweep now
-```
-
-`replicate rm` keeps the pins by default and `--release` drops them, because
-releasing terabytes should not follow from typing the opposite of `add`.
-
-`replicate status` is the whole operator interface, and should read like an
-answer:
+No new noun. Replication is a flag on the command that already names spaces:
 
 ```
-media   policy tree   grace 30d   since 2026-03-04
+synch space add <id> <path> [--replicate[=tree|archive]] [--grace <dur>] [--budget <size>]
+synch space add <id> --replicate[=tree|archive] [--grace <dur>] [--budget <size>]
+synch space set <id> [--replicate[=tree|archive]] [--no-replicate [--release]]
+                     [--grace <dur>] [--budget <size>]
+synch space rm  <id> [--release]
+synch space ls  [<id>]
+synch space sync [<id>]                  run a reconciling sweep now
+```
+
+The first two forms are the two halves. `space add media /srv/media
+--replicate` is the common deployment in one line — publish my copy of `media`
+*and* hold everyone else's versions of it — and `space add media --replicate`
+with no path is the dedicated replica, which indexes nothing and publishes
+nothing. `--replicate` defaults to `tree`; `--replicate=archive` is the opt-in
+that releases nothing (§2.1).
+
+`--release` on `space rm` and on `--no-replicate` drops the held pins; without
+it they are kept, because releasing terabytes should not follow from typing the
+opposite of `add`. On a space with both halves, `space rm` unpublishes *and*
+stops replicating; `--no-replicate` stops only the latter and leaves the
+indexed directory alone.
+
+`space ls` becomes the participation table, which is the question an operator
+has when they ask what a node is for:
+
+```
+$ synch space ls
+media    /srv/media   replicate tree · grace 30d · 6.02 TiB held
+photos   —            replicate archive · 880 GiB held
+docs     /srv/docs    —
+```
+
+and naming one space prints the detail, which is the whole operator interface
+for this feature and should read like an answer:
+
+```
+$ synch space ls media
+media   indexed /srv/media   replicate tree   grace 30d   since 2026-03-04
   held          412,880 objects   6.02 TiB   (covers every version in the tree)
   releasing       1,204 objects  31.7 GiB   (oldest leaves in 3d)
   wanted            412 objects  10.4 GiB   (oldest 4m ago)
@@ -544,7 +620,7 @@ the difference between a replica that is behaving and one that is broken.
 - **Content nobody serves.** A want row failing with "no provider" past the
   alarm threshold means the last holder left before the replica reached it.
   Nothing can be done about it, so the value is entirely in saying so early —
-  `replicate status`, `synch doctor`, a warning per retry. The realistic
+  `space ls`, `synch doctor`, a warning per retry. The realistic
   mitigations are operational: replicas that are up when members are, and more
   than one of them.
 - **A partitioned or lagging replica.** Its view is incomplete, so §3.6 pauses
@@ -560,14 +636,21 @@ the difference between a replica that is behaving and one that is broken.
   replica of that space fetches it. That is the membership trust model working
   as designed (§12: members are trusted to publish), but it argues for
   `--budget` on any replica facing a large membership, and for a per-origin byte
-  breakdown in `replicate status` so the operator can see whose content grew.
+  breakdown in `space ls <id>` so the operator can see whose content grew.
 - **Clock skew.** `release_after` is an instant, so a backwards clock delays
   releases and a forwards one advances them. It should be compared against
   `Store::read_instant` rather than the bare clock, for the reason mirror passes
   already do, and a release should never fire from a reading the trust floor
   rejects.
 - **The replica is also a publisher.** Benign — its own content is referenced by
-  its own entries. Worth a test, not a rule.
+  its own entries, and both halves of the `spaces` row are independent. Worth a
+  test, not a rule.
+- **`space rm` on a replicate-only space.** The one command here that can
+  publish a mass deletion, pointed at a space where this node publishes
+  nothing. It must stop the replication and unpublish nothing, rather than
+  arriving at that outcome because the tombstone loop happened to find no keys
+  (§3.2). The test is a node that replicates a space it does not index, running
+  `space rm`, and no peer seeing a single tombstone.
 
 ## 9. Cost model
 
@@ -588,7 +671,7 @@ roots a day.
 a year changes nothing. `archive` costs the integral of churn and has no steady
 state at all — which is what "keep every version forever" means, and some
 deployments genuinely want it, but it should be chosen with that table in front
-of the operator. `replicate add --policy archive` should print the current tree
+of the operator. `space add --replicate=archive` should print the current tree
 size and the last 30 days' observed churn before it agrees.
 
 Note that the tree is larger than "the size of the data": every origin's version
@@ -616,7 +699,7 @@ and is unexplored (§12).
   operators with deletion obligations must know before they choose it. This is
   the strongest argument for `tree` being the default: the surprising behaviour
   should be the one you opt into.
-- **Claims are assertions.** §4.2. `replicate status` renders peer claims as
+- **Claims are assertions.** §4.2. `space ls <id>` renders peer claims as
   claims ("nas says complete"), never as verified coverage.
 - **Scope holds.** A delegated replica replicates what it may read, and replica
   mode adds no path around `materialization_scope`.
@@ -634,20 +717,26 @@ Phases in dependency order. Each lands on its own and leaves the tree working.
    behavior; everything after this depends on it.
 2. **Read by root.** `synch cat --root`, `synch get --root`. Independent,
    useful immediately, and what makes a replica's contents reachable.
-3. **The replica, sweep-driven, hold-only.** `replicas` table, `replica_want`,
-   the reconciling sweep, the fetch loop, `replicate add|rm|ls|status|sync`.
-   Policy `archive` semantics — nothing is released yet — so the risky half is
-   absent while the fetching half is proven.
-4. **The live path.** Staging and release-scheduling from `apply_change` inside
+3. **`spaces` learns what a row means.** Migration v20 rebuilds the table with a
+   nullable `local_path` and the three new columns, `FINAL_SCHEMA` follows, and
+   the six readers learn to skip a path-less row. `space add --replicate`,
+   `space set`, `space ls` and the `space rm` branch land here, holding nothing
+   yet — a config change with no fetcher behind it, which is the cheap half to
+   get wrong.
+4. **The replica, sweep-driven, hold-only.** `replica_want`, the reconciling
+   sweep, the fetch loop, `space sync`. Policy `archive` semantics — nothing is
+   released yet — so the risky half is absent while the fetching half is
+   proven.
+5. **The live path.** Staging and release-scheduling from `apply_change` inside
    the promotion transaction, plus the `entries_by_content` check that makes
    deduplication safe.
-5. **Release, with the discipline.** `tree` policy, grace, the §3.6
-   preconditions, `view` in `replicate status`, and the partition test. This is
+6. **Release, with the discipline.** `tree` policy, grace, the §3.6
+   preconditions, `view` in `space ls <id>`, and the partition test. This is
    the phase to be slow about.
-6. **Budget and reporting.** `--budget`, per-origin breakdown, doctor lines.
-7. **Claims.** The `r:` prefix, `ReplicaClaim`, `publish_prefixes` for
-   delegates, peer coverage in `replicate status`.
-8. **Under-replication brake**, then **cooperative k-replication** (§4.3) — the
+7. **Budget and reporting.** `--budget`, per-origin breakdown, doctor lines.
+8. **Claims.** The `r:` prefix, `ReplicaClaim`, `publish_prefixes` for
+   delegates, peer coverage in `space ls <id>`.
+9. **Under-replication brake**, then **cooperative k-replication** (§4.3) — the
    two that should wait for operational experience.
 
 ## 12. Open questions
@@ -668,6 +757,6 @@ Phases in dependency order. Each lands on its own and leaves the tree working.
 - **Claim granularity.** `ReplicaClaim` carries counts. A per-space digest that
   let two replicas compare coverage without enumerating objects would make §4.3
   much easier, and looks like it wants to be a trie of its own.
-- **What `replicate add` should refuse.** A space whose current size already
+- **What `space add --replicate` should refuse.** A space whose current size already
   exceeds free disk is an error at `add` time, not a surprise at 3am. The check
   is easy; the policy for "it fits now and will not in a month" is not.

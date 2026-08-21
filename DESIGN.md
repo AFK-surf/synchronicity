@@ -2135,12 +2135,14 @@ CI (GitHub Actions):
   delegation rather than by cluster size; pointing it at very large clusters is a
   policy question that has not been answered.
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
-  built on the same `BlobAd` availability data. The node role such a policy would
-  be placed on — a *replica*, which holds a whole copy of every version the
-  unified tree currently names and releases a root once the tree stops naming
-  it — is designed in [docs/REPLICATION.md](docs/REPLICATION.md), which proposes
-  the role first and leaves cluster-wide placement where this bullet has it.
-  (Content replication in that sense, not the trie-scope sense of §5.5.)
+  built on the same `BlobAd` availability data. The role such a policy would be
+  placed on — a *replica* of a space, holding a whole copy of every version the
+  unified tree currently names and releasing a root once the tree stops naming
+  it — is designed in [docs/REPLICATION.md](docs/REPLICATION.md) as a property
+  of a space rather than a surface of its own (`synch space add <id>
+  --replicate`), which proposes the role first and leaves cluster-wide placement
+  where this bullet has it. (Content replication in that sense, not the
+  trie-scope sense of §5.5.)
 - Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,
   never as core. (HTTP access ships as the S3 gateway, §9.4.)
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.
