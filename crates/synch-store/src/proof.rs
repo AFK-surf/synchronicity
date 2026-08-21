@@ -657,6 +657,57 @@ impl Store {
         Ok((encoded, served))
     }
 
+    /// Encodes a proof for a remotely durable complete object from its whole
+    /// outboard, validating every visited pair back to `root`.
+    pub(crate) fn encode_complete_proof(
+        root: Hash,
+        size: u64,
+        requested: &ChunkRanges,
+        level: u8,
+        budget: u64,
+        outboard_bytes: Vec<u8>,
+    ) -> Result<(Vec<u8>, ChunkRanges)> {
+        let tree = Self::tree(size);
+        if outboard_bytes.len() as u64 != tree.outboard_size() {
+            return Err(StoreError::Verification {
+                root,
+                reason: format!(
+                    "cloud outboard is {} bytes, expected {}",
+                    outboard_bytes.len(),
+                    tree.outboard_size()
+                ),
+            });
+        }
+        let groups = group_count(size);
+        let wanted = requested.intersect(&ChunkRanges::single(0, groups));
+        if wanted.is_empty() || groups <= 1 {
+            return Ok((Vec::new(), wanted));
+        }
+        let outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree,
+            data: outboard_bytes,
+        };
+        let (proof, truncated) = walk_proof(&root, size, &wanted, level, budget, |node| {
+            load_from_outboard(&outboard, &root, node)
+        })?;
+        if let Some(at) = truncated {
+            return Err(StoreError::Verification {
+                root,
+                reason: format!(
+                    "a proof over these ranges at level {level} exceeds the \
+                     {budget}-node budget (stopped at group {at}); the requester \
+                     must split the request"
+                ),
+            });
+        }
+        let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
+        for (_, pair) in proof.nodes {
+            encoded.extend_from_slice(&pair);
+        }
+        Ok((encoded, wanted))
+    }
+
     // ---- proof receiving --------------------------------------------------
 
     /// Verifies a received proof and commits its nodes to the object's tree.

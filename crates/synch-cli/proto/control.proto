@@ -300,6 +300,8 @@ message SpaceAdd {
   string id = 1;
   // The local directory, already made absolute by the client.
   string path = 2;
+  // True when this space deliberately has no local checkout.
+  bool detached = 3;
 }
 
 message SpaceLs {}

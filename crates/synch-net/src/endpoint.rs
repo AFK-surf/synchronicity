@@ -63,6 +63,9 @@ pub(crate) async fn under_deadline<T>(
 /// How the endpoint should be bound.
 #[derive(Debug, Clone, Default)]
 pub struct NetOptions {
+    /// Async CAS backend mounted by the blob protocol. LocalFs is used when
+    /// absent, which keeps standalone/test endpoint construction compatible.
+    pub cas: Option<Arc<dyn synch_store::backend::CasBackend>>,
     /// An explicit bind address. `None` binds an ephemeral port on all
     /// interfaces.
     pub bind_addr: Option<SocketAddr>,
@@ -133,6 +136,7 @@ impl NetOptions {
     /// Options for a loopback-only, fully offline endpoint.
     pub fn loopback() -> Self {
         NetOptions {
+            cas: None,
             bind_addr: Some("127.0.0.1:0".parse().expect("valid loopback address")),
             offline: true,
             relay_urls: Vec::new(),
@@ -347,7 +351,13 @@ impl Net {
             )
             .accept(
                 ALPN_BLOB,
-                BlobProtocol::new(store.clone()).on_unknown_key(options.on_unknown_key.clone()),
+                BlobProtocol::new(
+                    store.clone(),
+                    options.cas.clone().unwrap_or_else(|| {
+                        Arc::new(synch_store::backend::LocalFs::new(store.clone()))
+                    }),
+                )
+                .on_unknown_key(options.on_unknown_key.clone()),
             )
             .spawn();
 

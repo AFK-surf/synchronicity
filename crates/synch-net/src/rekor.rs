@@ -1458,8 +1458,8 @@ impl LogKeys {
     ///
     /// These are what a client runs on until it learns better. A client that
     /// accepts a chain from Sigstore's TUF repository runs on the tlogs its
-    /// trusted root names instead, persisted in
-    /// `<data-dir>/rekor-pins.json` and **replacing** this set rather than
+    /// trusted root names instead, persisted in SQLite config as
+    /// `rekor.pin_state` and **replacing** this set rather than
     /// unioning with it (§10, [`crate::tuf`]). So the resolution order is
     /// `--rekor-key` if given, else the last TUF-verified pin set, else this.
     /// Rotating a Sigstore log key — or a whole log — is therefore not a new

@@ -810,16 +810,17 @@ impl Control for ControlService {
         request: Request<pb::AbortUploadRequest>,
     ) -> Result<Response<pb::AbortUploadResponse>, Status> {
         let reference = request.into_inner().upload.unwrap_or_default();
-        let node = self.served.node()?.clone();
-        let existed = offload(move || {
-            Ok(node.abort_upload(
+        let existed = self
+            .served
+            .node()?
+            .abort_upload_durable(
                 &reference.upload_id,
                 &reference.space,
                 &reference.path,
                 principal(&reference.principal).as_deref(),
-            )?)
-        })
-        .await?;
+            )
+            .await
+            .map_err(ControlError::from)?;
         Ok(Response::new(pb::AbortUploadResponse { existed }))
     }
 
@@ -1716,13 +1717,23 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SpaceAdd(pb::SpaceAdd { id, path }) => {
+        Command::SpaceAdd(pb::SpaceAdd { id, path, detached }) => {
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
             //
             // The `stat` goes over with the store work rather than inline: on a
             // hung mount it blocks for the mount's timeout, and a runtime
             // worker that stops polling is the thing §10 exists to prevent.
+            if detached {
+                let detached_id = id.clone();
+                read(node, move |n| {
+                    n.add_detached_space(&detached_id)?;
+                    Ok(())
+                })
+                .await?;
+                out.line(format!("holding detached space {id}")).await?;
+                return Ok(());
+            }
             let created = {
                 let (id, path) = (id.clone(), path.clone());
                 read(node, move |n| {
@@ -1746,8 +1757,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     .await?;
             }
             for space in spaces {
-                out.line(format!("{:<20} {}", space.id, space.local_path))
-                    .await?;
+                out.line(format!(
+                    "{:<20} {}",
+                    space.id,
+                    space.local_path.as_deref().unwrap_or("detached")
+                ))
+                .await?;
             }
         }
 
@@ -2462,9 +2477,33 @@ async fn receive(
     // The commit fsyncs the payload and renames it into place.
     let target = offload(move || Ok(adoption.commit()?)).await?;
 
-    // The ordinary indexing pipeline takes it from here: hash, CAS, stage,
-    // publish. A write answers with a published seq for the same reason `scan`
-    // does — the entry it reports has to be one peers can already see.
+    let detached = {
+        let space = header.space.clone();
+        read(node, move |n| Ok(n.is_detached_space(&space)?)).await?
+    };
+    let reported_path = if detached {
+        let (committing, space, path, source) = (
+            node.clone(),
+            header.space.clone(),
+            header.path.clone(),
+            target.clone(),
+        );
+        let result = committing
+            .commit_detached_file(&space, &path, &source, synch_core::now_ns())
+            .await;
+        // The content-addressed payload is durable now, or the operation
+        // failed and the client owns the retry. The pre-hash scratch is never
+        // part of the acknowledged state.
+        let _ = tokio::fs::remove_file(&source).await;
+        result?;
+        format!("{}/{}", header.space, header.path)
+    } else {
+        target.display().to_string()
+    };
+
+    // Path-backed writes enter through the scanner; detached writes already
+    // staged their CAS-direct `f:`/`b:` pair above. `scan_publish_push` skips
+    // detached spaces but flushes the shared batch in either case.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
     let (set, now) = {
@@ -2476,7 +2515,7 @@ async fn receive(
     };
     let row = node.resolve_set(&set, &ours, now)?;
     Ok(pb::Written {
-        path: target.display().to_string(),
+        path: reported_path,
         entry: Some(entry_info(&row, &set).into()),
     })
 }
@@ -2505,8 +2544,7 @@ async fn receive_part(
         None => None,
     })
     .await?;
-    let node = node.clone();
-    let part = offload(move || Ok(node.commit_part(staging, adoption)?)).await?;
+    let part = node.commit_part_durable(staging, adoption).await?;
     Ok(pb::UploadPartResponse {
         number: part.number,
         size: part.size,
@@ -2564,9 +2602,8 @@ async fn stream_range(
         // Every piece is a verified read out of the CAS — payload and outboard
         // off disk — so it runs on the blocking pool rather than on the worker
         // polling this connection.
-        let store = node.store().clone();
         let root = range.root;
-        let bytes = offload(move || Ok(store.read_range(&root, offset, take)?)).await?;
+        let bytes = node.cas_backend().read_range(root, offset, take).await?;
         if bytes.is_empty() {
             break;
         }

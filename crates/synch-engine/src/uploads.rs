@@ -18,6 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio::io::AsyncWriteExt;
+
 use synch_core::Hash;
 use synch_store::{UploadPart, UploadState, MAX_PART_NUMBER, MAX_PART_SIZE, MIN_PART_SIZE};
 
@@ -101,6 +103,11 @@ impl Node {
     /// Resolved at creation rather than at completion so a path the space
     /// cannot hold is refused before the client streams a single part.
     pub fn upload_target(&self, space: &str, path: &str) -> Result<PathBuf> {
+        if self.is_detached_space(space)? {
+            let normalized = synch_core::normalize_path(path)
+                .map_err(|error| EngineError::invalid(error.to_string()))?;
+            return Ok(PathBuf::from(format!("{space}/{normalized}")));
+        }
         self.adoption_target(space, path)
     }
 
@@ -126,12 +133,14 @@ impl Node {
             .ok_or_else(|| EngineError::not_found(format!("space {space}")))?;
         let normalized =
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        if crate::ignore::IgnoreSet::for_space(Path::new(&space_row.local_path))?
-            .is_ignored(&normalized, false)
-        {
-            return Err(EngineError::invalid(format!(
-                "{space}/{path} matches an ignore rule, so it could never be published"
-            )));
+        if let Some(local_path) = space_row.local_path.as_deref() {
+            if crate::ignore::IgnoreSet::for_space(Path::new(local_path))?
+                .is_ignored(&normalized, false)
+            {
+                return Err(EngineError::invalid(format!(
+                    "{space}/{path} matches an ignore rule, so it could never be published"
+                )));
+            }
         }
         self.check_upload_capacity(principal)?;
         let id = new_upload_id()?;
@@ -243,6 +252,57 @@ impl Node {
         Ok(part)
     }
 
+    /// Commits one gateway part to the backend's durable part store.
+    ///
+    /// Local nodes use the fsync-before-row path above. Cloud nodes upload the
+    /// part object before recording its row, so an `UploadPart` acknowledgement
+    /// never rests on ephemeral scratch.
+    pub async fn commit_part_durable(
+        &self,
+        staging: PartStaging,
+        adoption: Adoption,
+    ) -> Result<UploadPart> {
+        if !self.cas_backend().remote_upload_parts() {
+            let node = self.clone();
+            return crate::blocking::offload(move || node.commit_part(staging, adoption)).await;
+        }
+        let upload = staging.upload.clone();
+        let file = staging.file.clone();
+        let number = staging.number;
+        let (path, size, root) = crate::blocking::offload(move || {
+            let size = adoption.written();
+            if size > MAX_PART_SIZE {
+                return Err(EngineError::invalid(format!(
+                    "a part of {size} byte(s) is larger than the {MAX_PART_SIZE}-byte maximum"
+                )));
+            }
+            let path = adoption.commit()?;
+            let root =
+                synch_core::hash_reader(std::io::BufReader::new(std::fs::File::open(&path)?))?;
+            Ok((path, size, root))
+        })
+        .await?;
+        let key = cloud_part_key(&upload, &file);
+        let uploaded = self.cas_backend().put_upload_part(key, path.clone()).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        uploaded?;
+        let part = UploadPart {
+            number,
+            file,
+            size,
+            root,
+            created_ns: synch_core::now_ns(),
+        };
+        let (store, upload) = (self.store().clone(), upload);
+        let recorded = part.clone();
+        crate::blocking::offload(move || {
+            store.record_part(&upload, &recorded)?;
+            Ok(())
+        })
+        .await?;
+        Ok(part)
+    }
+
     /// Assembles the named parts, publishes the object, and reports its root.
     pub async fn complete_upload(
         &self,
@@ -318,72 +378,117 @@ impl Node {
     ) -> Result<CompletedUpload> {
         let chosen = choose_parts(wanted, available)?;
         let dir = self.store().upload_dir(upload);
-        // Reads the space row, so it goes to the blocking pool like every other
-        // store read on an async path (§10).
-        let target = {
+        let detached = {
+            let (node, space) = (self.clone(), space.to_string());
+            crate::blocking::offload(move || node.is_detached_space(&space)).await?
+        };
+        let remote_parts = self.cas_backend().remote_upload_parts();
+        if remote_parts && !detached {
+            return Err(EngineError::invalid(
+                "a cloud-CAS node cannot complete into a path-backed space",
+            ));
+        }
+        let target = if detached {
+            dir.join(format!(
+                "assembled.{}{}",
+                nonce(),
+                crate::scanner::PART_SUFFIX
+            ))
+        } else {
             let (node, space_owned, path_owned) =
                 (self.clone(), space.to_string(), path.to_string());
             crate::blocking::offload(move || node.adoption_target(&space_owned, &path_owned))
                 .await?
         };
-        let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
 
-        // One blocking closure for the whole assembly: `copy_file_range` is a
-        // syscall per part and the fallback is a read/write loop, and neither
-        // belongs on a runtime worker that is also polling every other
-        // connection. The root is taken here, from the bytes that were actually
-        // written, rather than read back out of the tree afterwards — a
-        // read-back describes whatever the tree holds by then, which a
-        // concurrent write to the same key wins.
-        let (root, size) = crate::blocking::offload(move || {
-            let mut adoption = Adoption::at(&target)?;
-            for source in &sources {
-                adoption.append_file(source)?;
-            }
-            let written = adoption.written();
-            let root = adoption.hash_staged()?;
-            adoption.commit()?;
-            Ok((root, written))
-        })
-        .await?;
-
-        // Past here the object is in the space and this node *will* publish it
-        // — the watcher picks it up even if nothing below runs. So the result is
-        // recorded before anything else can fail, and the parts are unlinked
-        // only once nothing is left that could send the caller back. Unlinking
-        // them any earlier, for the peak-disk saving it buys, leaves rows naming
-        // payloads that are gone: every retry then dies on a missing file
-        // instead of being told what was actually wrong.
-        {
-            let (node, upload_id) = (self.clone(), upload.to_string());
-            let files: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
-            let dir = dir.clone();
-            crate::blocking::offload(move || {
-                node.store()
-                    .finish_complete(&upload_id, &root, size, synch_core::now_ns())?;
-                for file in &files {
-                    let _ = std::fs::remove_file(file);
+        let (root, size) = if remote_parts {
+            tokio::fs::create_dir_all(&dir).await?;
+            let mut output = tokio::fs::File::create(&target).await?;
+            for part in &chosen {
+                let key = cloud_part_key(upload, &part.file);
+                let mut offset = 0u64;
+                while offset < part.size {
+                    let end = (offset + 8 * 1024 * 1024).min(part.size);
+                    let bytes = self
+                        .cas_backend()
+                        .read_upload_part(key.clone(), offset..end)
+                        .await?;
+                    if bytes.len() as u64 != end - offset {
+                        return Err(EngineError::invalid(format!(
+                            "cloud part {} returned {} byte(s) for {offset}..{end}",
+                            part.number,
+                            bytes.len()
+                        )));
+                    }
+                    output.write_all(&bytes).await?;
+                    offset = end;
                 }
-                let _ = std::fs::remove_dir_all(&dir);
-                Ok(())
+            }
+            output.sync_all().await?;
+            drop(output);
+            let committed = self
+                .commit_detached_file(space, path, &target, synch_core::now_ns())
+                .await;
+            let _ = tokio::fs::remove_file(&target).await;
+            committed?
+        } else {
+            let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
+            let assembled_target = target.clone();
+            let assembled = crate::blocking::offload(move || {
+                let mut adoption = Adoption::at(&assembled_target)?;
+                for source in &sources {
+                    adoption.append_file(source)?;
+                }
+                let written = adoption.written();
+                let root = adoption.hash_staged()?;
+                adoption.commit()?;
+                Ok((root, written))
             })
             .await?;
-        }
+            if detached {
+                let committed = self
+                    .commit_detached_file(space, path, &target, synch_core::now_ns())
+                    .await;
+                let _ = tokio::fs::remove_file(&target).await;
+                let committed = committed?;
+                if committed != assembled {
+                    return Err(EngineError::invalid(
+                        "multipart assembly changed during detached ingest",
+                    ));
+                }
+                committed
+            } else {
+                assembled
+            }
+        };
 
-        // The ordinary indexing pipeline takes it from here — hash, CAS, stage,
-        // publish — exactly as a `PutObject` does, so a completed upload is a
-        // version like any other. A failure here is *not* a failed completion:
-        // the object is committed and the answer recorded, and the next scan
-        // publishes it. Reporting failure would tell the client to retry an
-        // upload that has already landed.
-        if let Err(e) = self.scan_publish_push().await {
-            tracing::warn!(
-                upload,
-                error = %e,
-                "the completed object is in the space but this publish failed; \
-                 the next scan will pick it up"
-            );
+        // Publication is part of the completion promise, especially for a
+        // detached space with no watcher to repair it later.
+        self.scan_publish_push().await?;
+
+        let (node, upload_id) = (self.clone(), upload.to_string());
+        crate::blocking::offload(move || {
+            node.store()
+                .finish_complete(&upload_id, &root, size, synch_core::now_ns())?;
+            Ok(())
+        })
+        .await?;
+        if remote_parts {
+            for part in &chosen {
+                if let Err(error) = self
+                    .cas_backend()
+                    .delete_upload_part(cloud_part_key(upload, &part.file))
+                    .await
+                {
+                    tracing::warn!(upload, part = part.number, %error, "cloud upload part left for lifecycle sweep");
+                }
+            }
+        } else {
+            for part in &chosen {
+                let _ = std::fs::remove_file(dir.join(&part.file));
+            }
         }
+        let _ = tokio::fs::remove_dir_all(&dir).await;
         Ok(CompletedUpload {
             root,
             size,
@@ -532,6 +637,33 @@ impl Node {
         Ok(existed)
     }
 
+    /// Drops an upload and its durable cloud part objects, if configured.
+    pub async fn abort_upload_durable(
+        &self,
+        upload: &str,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<bool> {
+        let (node, upload_id, space, path, principal) = (
+            self.clone(),
+            upload.to_string(),
+            space.to_string(),
+            path.to_string(),
+            principal.map(str::to_string),
+        );
+        let existed = crate::blocking::offload(move || {
+            node.abort_upload(&upload_id, &space, &path, principal.as_deref())
+        })
+        .await?;
+        if existed && self.cas_backend().remote_upload_parts() {
+            self.cas_backend()
+                .delete_upload_prefix(format!("uploads/{upload}/"))
+                .await?;
+        }
+        Ok(existed)
+    }
+
     /// Every upload still accepting parts under a prefix.
     pub fn open_uploads(
         &self,
@@ -671,6 +803,34 @@ impl Node {
         Ok(collected)
     }
 
+    /// Runs the upload TTL sweep and removes the corresponding cloud prefixes.
+    pub async fn sweep_uploads_durable(&self, ttl: std::time::Duration) -> Result<usize> {
+        let cutoff =
+            synch_core::now_ns().saturating_sub(i64::try_from(ttl.as_nanos()).unwrap_or(i64::MAX));
+        let old = {
+            let store = self.store().clone();
+            crate::blocking::offload(move || Ok(store.uploads_before(cutoff)?)).await?
+        };
+        let node = self.clone();
+        let collected = crate::blocking::offload(move || node.sweep_uploads(ttl)).await?;
+        if self.cas_backend().remote_upload_parts() {
+            let store = self.store().clone();
+            let remaining: std::collections::HashSet<String> =
+                crate::blocking::offload(move || Ok(store.upload_ids()?.into_iter().collect()))
+                    .await?;
+            for upload in old.into_iter().filter(|id| !remaining.contains(id)) {
+                if let Err(error) = self
+                    .cas_backend()
+                    .delete_upload_prefix(format!("uploads/{upload}/"))
+                    .await
+                {
+                    tracing::warn!(%upload, %error, "cloud upload prefix left for lifecycle sweep");
+                }
+            }
+        }
+        Ok(collected)
+    }
+
     /// Returns every interrupted completion to `open`, at startup.
     ///
     /// A completion severed by a daemon stop or a crash leaves the latch set,
@@ -793,6 +953,10 @@ fn nonce() -> String {
     Hash::new(&seed).to_hex()[..16].to_string()
 }
 
+fn cloud_part_key(upload: &str, file: &str) -> String {
+    format!("uploads/{upload}/{file}")
+}
+
 /// Flushes a directory entry, best effort — the same posture the CAS takes.
 fn fsync_dir(path: &Path) {
     if let Ok(dir) = std::fs::File::open(path) {
@@ -803,6 +967,79 @@ fn fsync_dir(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cloud_parts_are_durable_before_rows_and_complete_detached() {
+        let data = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let mut config = crate::config::NodeConfig::loopback(data.path());
+        config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+            cache_bytes: None,
+        });
+        let node = Node::open(config).await.unwrap();
+        node.add_detached_space("media").unwrap();
+        let target = node.upload_target("media", "joined.bin").unwrap();
+        let upload = node
+            .create_upload("media", "joined.bin", None, &target)
+            .unwrap();
+        let head = vec![7u8; MIN_PART_SIZE as usize];
+        let tail = b"cloud tail".to_vec();
+        let mut keys = Vec::new();
+        for (number, bytes) in [(1u32, &head), (2u32, &tail)] {
+            let staging = node
+                .open_part(&upload, "media", "joined.bin", None, number)
+                .unwrap();
+            let key = cloud_part_key(&upload, &staging.file);
+            let mut adoption = Adoption::at(&staging.path).unwrap();
+            adoption.write(bytes).unwrap();
+            let part = node.commit_part_durable(staging, adoption).await.unwrap();
+            assert_eq!(part.size, bytes.len() as u64);
+            assert_eq!(
+                node.cas_backend()
+                    .read_upload_part(key.clone(), 0..bytes.len() as u64)
+                    .await
+                    .unwrap(),
+                **bytes
+            );
+            keys.push(key);
+        }
+
+        let completed = node
+            .complete_upload(
+                &upload,
+                "media",
+                "joined.bin",
+                None,
+                &[(1, None), (2, None)],
+            )
+            .await
+            .unwrap();
+        let mut expected = head;
+        expected.extend_from_slice(&tail);
+        assert_eq!(completed.root, Hash::new(&expected));
+        assert_eq!(completed.size, expected.len() as u64);
+        assert!(node.store().blob(&completed.root).unwrap().unwrap().durable);
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "joined.bin")
+                .unwrap()
+                .unwrap()
+                .content,
+            Some(completed.root)
+        );
+        for key in keys {
+            assert!(matches!(
+                node.cas_backend().read_upload_part(key, 0..1).await,
+                Err(synch_store::StoreError::CloudNotFound { .. })
+            ));
+        }
+        node.shutdown().await.unwrap();
+    }
 
     fn part(number: u32, size: u64) -> UploadPart {
         UploadPart {

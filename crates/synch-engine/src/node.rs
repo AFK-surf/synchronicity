@@ -56,6 +56,8 @@ pub struct Node {
 #[derive(Debug)]
 struct NodeInner {
     store: Arc<Store>,
+    /// Object-safe CAS semantics used by engine and network call sites.
+    cas: Arc<dyn synch_store::backend::CasBackend>,
     /// The endpoint under the currently active device key: what this node
     /// dials from and what peers reach first.
     net: std::sync::RwLock<Net>,
@@ -507,12 +509,69 @@ impl Node {
 
     /// Opens an initialized data directory and binds the endpoint.
     pub async fn open(mut config: NodeConfig) -> Result<Node> {
+        let cloud_cas = config
+            .cloud
+            .as_ref()
+            .map(synch_store::cloud::CloudStore::open)
+            .transpose()?;
         // Opening runs migrations and hardens file permissions, both of which
         // are filesystem work, so it goes to the blocking pool like everything
         // else that touches the disk.
         let data_dir = config.data_dir.clone();
+        let desired_backend = config
+            .cloud
+            .as_ref()
+            .map(|cloud| cloud.service.as_str())
+            .unwrap_or("local")
+            .to_string();
+        let cloud_settings = config
+            .cloud
+            .as_ref()
+            .map(persisted_cloud_settings)
+            .unwrap_or_default();
+        let cloud_namespace: Vec<(String, Option<String>)> = cloud_settings
+            .iter()
+            .filter(|(key, _)| !key.ends_with(".cache_bytes") && !key.ends_with(".upload"))
+            .cloned()
+            .collect();
         let opened = crate::blocking::offload(move || {
             let store = Store::open(&data_dir)?;
+            match store.config("cas.backend")? {
+                Some(stored) if stored != desired_backend => {
+                    return Err(EngineError::invalid(format!(
+                        "this node uses the {stored} CAS backend, not {desired_backend}; run \
+                         `synch cas migrate --to {desired_backend}` instead of flipping the flag"
+                    )))
+                }
+                Some(_) => {}
+                None if desired_backend != "local" && !store.blob_candidates()?.is_empty() => {
+                    return Err(EngineError::invalid(format!(
+                        "this node already has local CAS content; migrate it before selecting \
+                         the {desired_backend} backend"
+                    )))
+                }
+                None => store.set_config("cas.backend", &desired_backend)?,
+            }
+            let mut namespace_was_stored = false;
+            for (key, _) in &cloud_namespace {
+                namespace_was_stored |= store.config(key)?.is_some();
+            }
+            if namespace_was_stored {
+                for (key, desired) in &cloud_namespace {
+                    if store.config(key)? != *desired {
+                        return Err(EngineError::invalid(format!(
+                            "cloud CAS setting {key} changed; run `synch cas migrate --to \
+                             {desired_backend}` instead of pointing this node at another namespace"
+                        )));
+                    }
+                }
+            }
+            for (key, value) in cloud_settings {
+                match value {
+                    Some(value) => store.set_config(&key, &value)?,
+                    None => store.clear_config(&key)?,
+                }
+            }
             // No device key at all is an uninitialized directory; keys but
             // none active is a rotation that got halfway (§3.4), and the two
             // want different words.
@@ -525,6 +584,23 @@ impl Node {
         })
         .await?;
         let (store, secret) = opened;
+        store.set_remote_cas(config.cloud.is_some());
+        let legacy_pin_state = config.data_dir.join("rekor-pins.json");
+        let pin_store = store.clone();
+        crate::blocking::offload(move || {
+            if pin_store.config("rekor.pin_state")?.is_none() && legacy_pin_state.exists() {
+                let text = std::fs::read_to_string(&legacy_pin_state)?;
+                pin_store.set_config("rekor.pin_state", &text)?;
+                // The database is authoritative after the row commits. Keeping
+                // a second writable copy would let the two monotonic floors
+                // drift and makes the next cold restore choose ambiguously.
+                std::fs::remove_file(&legacy_pin_state)?;
+            }
+            Ok(())
+        })
+        .await?;
+        config.dns.rekor_state = None;
+        config.dns.rekor_config = Some(store.clone());
         // Before the endpoint, before any loop: what this node is called, and
         // the migration if the zone has changed its mind (§3.1).
         //
@@ -571,11 +647,25 @@ impl Node {
             .on_change(Some(mirror_wake.clone()))
             .on_pending(Some(pending_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
+        let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {
+            (Some(objects), Some(cloud)) => Arc::new(
+                synch_store::backend::Cloud::open(
+                    store.clone(),
+                    objects,
+                    cloud.upload_policy,
+                    cloud.cache_bytes,
+                )
+                .await?,
+            ),
+            _ => Arc::new(synch_store::backend::LocalFs::new(store.clone())),
+        };
+        config.net.cas = Some(cas.clone());
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
             inner: Arc::new(NodeInner {
                 store,
+                cas,
                 net: std::sync::RwLock::new(net),
                 retiring: std::sync::Mutex::new(Vec::new()),
                 syncer,
@@ -616,6 +706,11 @@ impl Node {
     /// The metadata and content store.
     pub fn store(&self) -> &Arc<Store> {
         &self.inner.store
+    }
+
+    /// The configured async CAS backend.
+    pub fn cas_backend(&self) -> &Arc<dyn synch_store::backend::CasBackend> {
+        &self.inner.cas
     }
 
     /// The batch between staging and one signed root (§7.1).
@@ -898,6 +993,11 @@ impl Node {
     /// Space roots may not overlap a mirror target, which is what makes the
     /// "no echo" guarantee structural rather than conventional (§7.2).
     pub fn add_space(&self, id: &str, path: impl AsRef<Path>) -> Result<()> {
+        if self.cas_backend().remote_upload_parts() {
+            return Err(EngineError::invalid(
+                "a cloud-CAS node may only add detached spaces; use `synch space add <id> --detached`",
+            ));
+        }
         validate_space(id)?;
         let path = canonical_dir(path.as_ref())?;
         for mirror in self.store().mirrors()? {
@@ -910,7 +1010,15 @@ impl Node {
             }
         }
         for space in self.store().spaces()? {
-            if space.id != id && paths_overlap(&path, &stored_root(&space.local_path)) {
+            let Some(local_path) = space.local_path.as_deref() else {
+                if space.id == id {
+                    return Err(EngineError::invalid(format!(
+                        "space {id} is detached; remove it before attaching a local directory"
+                    )));
+                }
+                continue;
+            };
+            if space.id != id && paths_overlap(&path, &stored_root(local_path)) {
                 return Err(EngineError::invalid(format!(
                     "space root {} overlaps space {}",
                     path.display(),
@@ -931,7 +1039,7 @@ impl Node {
             // sibling case it does not test, where the root is present, is a
             // directory, and is simply somewhere else.
             if space.id == id {
-                let current = stored_root(&space.local_path);
+                let current = stored_root(local_path);
                 if current != path {
                     return Err(EngineError::invalid(format!(
                         "space {id} is already rooted at {}. Re-pointing it at {} would publish a \
@@ -943,7 +1051,23 @@ impl Node {
                 }
             }
         }
-        self.store().put_space(id, &path.to_string_lossy())?;
+        self.store().put_space(id, Some(&path.to_string_lossy()))?;
+        self.spaces_changed();
+        Ok(())
+    }
+
+    /// Registers a space without a local checkout (`docs/SERVERLESS.md` §10).
+    pub fn add_detached_space(&self, id: &str) -> Result<()> {
+        validate_space(id)?;
+        if let Some(space) = self.store().space(id)? {
+            return match space.local_path {
+                None => Ok(()),
+                Some(path) => Err(EngineError::invalid(format!(
+                    "space {id} is already rooted at {path}; remove it before detaching it"
+                ))),
+            };
+        }
+        self.store().put_detached_space(id)?;
         self.spaces_changed();
         Ok(())
     }
@@ -1175,7 +1299,9 @@ impl Node {
             let entry_count = self.store().count_entries(self.origin(), &space.id)?;
             let info = SpaceInfo {
                 v: synch_core::RECORD_VERSION,
-                description: space.local_path,
+                // Local paths are host-private implementation details and are
+                // never meaningful to another member of the cluster.
+                description: String::new(),
                 entry_count,
             };
             let bytes =
@@ -1417,6 +1543,44 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 pub fn stored_root(path: &str) -> PathBuf {
     let raw = PathBuf::from(path);
     std::fs::canonicalize(&raw).unwrap_or(raw)
+}
+
+fn persisted_cloud_settings(
+    cloud: &synch_store::cloud::CloudConfig,
+) -> Vec<(String, Option<String>)> {
+    let prefix = format!("cas.cloud.{}", cloud.service.as_str());
+    let admitted: &[&str] = match cloud.service {
+        synch_store::cloud::CloudService::S3 => &[
+            "root",
+            "bucket",
+            "region",
+            "endpoint",
+            "enable_virtual_host_style",
+        ],
+        synch_store::cloud::CloudService::Gcs => &["root", "bucket", "endpoint"],
+        synch_store::cloud::CloudService::Azblob => {
+            &["root", "container", "endpoint", "account_name"]
+        }
+        synch_store::cloud::CloudService::Memory => &["root"],
+    };
+    let mut settings: Vec<(String, Option<String>)> = admitted
+        .iter()
+        .map(|name| {
+            (
+                format!("{prefix}.{name}"),
+                cloud.options.get(*name).cloned(),
+            )
+        })
+        .collect();
+    settings.push((
+        format!("{prefix}.cache_bytes"),
+        cloud.cache_bytes.map(|bytes| bytes.to_string()),
+    ));
+    settings.push((
+        format!("{prefix}.upload"),
+        Some(cloud.upload_policy.as_str().to_string()),
+    ));
+    settings
 }
 
 /// Encodes an endpoint address for the `peers_seen.last_addr` column.
@@ -1901,17 +2065,7 @@ mod tests {
         // Space info is the node's own record, shown to a delegated peer and
         // withheld from one that is not (§5.5).
         let info = node.space_info_of(node.origin(), "media").unwrap().unwrap();
-        // Against what the store recorded, not the path handed in: roots are
-        // canonicalized on the way in (on macOS `/var` -> `/private/var`).
-        let recorded = node
-            .store()
-            .spaces()
-            .unwrap()
-            .into_iter()
-            .find(|s| s.id == "media")
-            .unwrap()
-            .local_path;
-        assert_eq!(info.description, recorded);
+        assert_eq!(info.description, "");
         assert!(node
             .space_info_of(node.origin(), "absent")
             .unwrap()
@@ -1945,6 +2099,30 @@ mod tests {
         node.add_space("a", a.path()).unwrap();
 
         node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cloud_namespace_change_requires_cas_migration() {
+        let data = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let configured = |root: &str| {
+            let mut config = NodeConfig::loopback(data.path());
+            config.cloud = Some(synch_store::cloud::CloudConfig {
+                service: synch_store::cloud::CloudService::Memory,
+                options: [("root".to_string(), root.to_string())]
+                    .into_iter()
+                    .collect(),
+                scratch_dir: data.path().join("cloud-scratch"),
+                io_timeout: std::time::Duration::from_secs(5),
+                upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+                cache_bytes: None,
+            });
+            config
+        };
+        let node = Node::open(configured("/one/")).await.unwrap();
+        node.shutdown().await.unwrap();
+        let error = Node::open(configured("/two/")).await.unwrap_err();
+        assert!(error.to_string().contains("synch cas migrate"), "{error}");
     }
 
     /// Static trust binds the key and only the key: names are the zone's to

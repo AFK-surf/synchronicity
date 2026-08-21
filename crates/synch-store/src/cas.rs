@@ -120,6 +120,10 @@ pub struct BlobSummary {
     pub size: u64,
     /// True if every group is present and verified.
     pub complete: bool,
+    /// True when the backend has committed the complete object to its durable tier.
+    pub durable: bool,
+    /// True when verification found corruption in a durable backend object.
+    pub quarantined: bool,
     /// True if the blob is pinned against GC.
     pub pinned: bool,
     /// When the blob was last written to, in unix nanoseconds.
@@ -135,6 +139,10 @@ pub struct BlobRow {
     pub size: u64,
     /// True if every group is present and verified.
     pub complete: bool,
+    /// True when the backend has committed the complete object to stable storage.
+    pub durable: bool,
+    /// True when a durable copy failed verification and must not be advertised.
+    pub quarantined: bool,
     /// The verified-group bitmap, when partial.
     pub bitmap: Option<Vec<u8>>,
     /// The payload, for blobs small enough to inline (§6.2).
@@ -148,6 +156,9 @@ pub struct BlobRow {
 impl BlobRow {
     /// The groups this holder has verified.
     pub fn verified_groups(&self) -> ChunkRanges {
+        // This is cache availability, not the durable-tier promise. A cold
+        // cloud row advertises complete through `to_ad`, while the fetch/read
+        // planner still sees which groups are actually local.
         if self.complete {
             return ChunkRanges::single(0, group_count(self.size));
         }
@@ -159,7 +170,7 @@ impl BlobRow {
 
     /// The advertisement this holder should publish for the object (§6.3).
     pub fn to_ad(&self) -> BlobAd {
-        if self.complete {
+        if self.complete || self.durable {
             return BlobAd::complete(self.size);
         }
         let spans: Vec<(u64, u64)> = self
@@ -376,31 +387,53 @@ pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
 }
 
 /// Writes an object's index row, creating it or replacing what it claimed.
-fn upsert_blob_row(
-    conn: &rusqlite::Connection,
-    root: &Hash,
+struct BlobRowWrite<'a> {
+    root: &'a Hash,
     size: u64,
     complete: bool,
     bitmap: Option<Vec<u8>>,
     inline: Option<Vec<u8>>,
     now: i64,
-) -> Result<()> {
+    durable: bool,
+}
+
+fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result<()> {
+    let BlobRowWrite {
+        root,
+        size,
+        complete,
+        bitmap,
+        inline,
+        now,
+        durable,
+    } = row;
     conn.execute(
-        "INSERT INTO blobs (root, size, complete, bitmap, inline, pinned, last_access)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+        "DELETE FROM backend_deletes WHERE root = ?1",
+        params![root.as_bytes().to_vec()],
+    )?;
+    conn.execute(
+        "INSERT INTO blobs
+           (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, 0)
          ON CONFLICT(root) DO UPDATE SET
            size = excluded.size,
            complete = excluded.complete,
            bitmap = excluded.bitmap,
            inline = COALESCE(excluded.inline, blobs.inline),
-           last_access = excluded.last_access",
+           last_access = excluded.last_access,
+           durable = max(blobs.durable, excluded.durable),
+           quarantined = CASE
+             WHEN excluded.durable != 0 THEN 0
+             ELSE blobs.quarantined
+           END",
         params![
             root.as_bytes().to_vec(),
             size as i64,
             complete as i64,
             bitmap,
             inline,
-            now
+            now,
+            (complete && durable) as i64
         ],
     )?;
     Ok(())
@@ -446,15 +479,30 @@ fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
     out
 }
 
+fn cache_file_bytes(path: &std::path::Path) -> u64 {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return 0;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
 impl Store {
     /// The filesystem path of a blob payload: `store/<hex[0..2]>/<hex>` (§6.2).
-    pub fn blob_path(&self, root: &Hash) -> PathBuf {
+    pub(crate) fn blob_path(&self, root: &Hash) -> PathBuf {
         let hex = root.to_hex();
         self.cas_dir().join(&hex[..2]).join(&hex)
     }
 
     /// The filesystem path of a blob's outboard.
-    pub fn outboard_path(&self, root: &Hash) -> PathBuf {
+    pub(crate) fn outboard_path(&self, root: &Hash) -> PathBuf {
         let mut path = self.blob_path(root);
         path.set_extension("obao");
         path
@@ -583,7 +631,45 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
-        upsert_blob_row(&self.conn(), root, size, complete, bitmap, inline, now)
+        let durable = self.complete_is_durable(inline.is_some());
+        upsert_blob_row(
+            &self.conn(),
+            BlobRowWrite {
+                root,
+                size,
+                complete,
+                bitmap,
+                inline,
+                now,
+                durable,
+            },
+        )
+    }
+
+    /// Records a complete object whose bytes were durably committed by a
+    /// remote backend before this call.
+    ///
+    /// No local groups are claimed: a cold cloud cache is still a complete
+    /// holder because `durable=1`, and the backend refills it on demand.
+    pub fn record_remote_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
+        self.with_immediate_tx(|tx| {
+            tx.execute(
+                "DELETE FROM backend_deletes WHERE root = ?1",
+                params![root.as_bytes().to_vec()],
+            )?;
+            tx.execute(
+                "INSERT INTO blobs
+               (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
+             VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1, 0)
+             ON CONFLICT(root) DO UPDATE SET
+               size = excluded.size,
+               durable = 1,
+               quarantined = 0,
+               last_access = excluded.last_access",
+                params![root.as_bytes().to_vec(), size as i64, now],
+            )?;
+            Ok(())
+        })
     }
 
     /// Folds newly verified groups into an object's row, atomically (§10).
@@ -640,14 +726,18 @@ impl Store {
             };
             let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
             let complete = verified.count() >= total;
+            let durable = self.complete_is_durable(inline.is_some());
             upsert_blob_row(
                 tx,
-                root,
-                size,
-                complete,
-                (!complete).then(|| ranges_to_blob(&verified)),
-                inline,
-                now,
+                BlobRowWrite {
+                    root,
+                    size,
+                    complete,
+                    bitmap: (!complete).then(|| ranges_to_blob(&verified)),
+                    inline,
+                    now,
+                    durable,
+                },
             )?;
             Ok(Commit { size, complete })
         })
@@ -689,7 +779,8 @@ impl Store {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT root, size, complete, bitmap, inline, pinned, last_access
+                "SELECT root, size, complete, bitmap, inline, pinned, last_access,
+                        durable, quarantined
                  FROM blobs WHERE root = ?1",
                 params![root.as_bytes().to_vec()],
                 |row| {
@@ -701,17 +792,23 @@ impl Store {
                         row.get::<_, Option<Vec<u8>>>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((root, size, complete, bitmap, inline, pinned, last_access)) = row else {
+        let Some((root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)) =
+            row
+        else {
             return Ok(None);
         };
         Ok(Some(BlobRow {
             root: hash_column(root, "blobs.root")?,
             size: size as u64,
             complete: complete != 0,
+            durable: durable != 0,
+            quarantined: quarantined != 0,
             bitmap,
             inline,
             pinned: pinned != 0,
@@ -730,7 +827,7 @@ impl Store {
     pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT root, size, complete, pinned, last_access FROM blobs
+            "SELECT root, size, complete, durable, quarantined, pinned, last_access FROM blobs
              ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -740,15 +837,19 @@ impl Store {
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (root, size, complete, pinned, last_access) = row?;
+            let (root, size, complete, durable, quarantined, pinned, last_access) = row?;
             out.push(BlobSummary {
                 root: hash_column(root, "blobs.root")?,
                 size: size as u64,
                 complete: complete != 0,
+                durable: durable != 0,
+                quarantined: quarantined != 0,
                 pinned: pinned != 0,
                 last_access,
             });
@@ -760,7 +861,8 @@ impl Store {
     pub fn blobs(&self) -> Result<Vec<BlobRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT root, size, complete, bitmap, inline, pinned, last_access FROM blobs
+            "SELECT root, size, complete, bitmap, inline, pinned, last_access,
+                    durable, quarantined FROM blobs
              ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -772,15 +874,20 @@ impl Store {
                 row.get::<_, Option<Vec<u8>>>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (root, size, complete, bitmap, inline, pinned, last_access) = row?;
+            let (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined) =
+                row?;
             out.push(BlobRow {
                 root: hash_column(root, "blobs.root")?,
                 size: size as u64,
                 complete: complete != 0,
+                durable: durable != 0,
+                quarantined: quarantined != 0,
                 bitmap,
                 inline,
                 pinned: pinned != 0,
@@ -792,12 +899,212 @@ impl Store {
 
     /// True if the whole object is present and verified locally.
     pub fn has_complete_blob(&self, root: &Hash) -> Result<bool> {
-        Ok(self.blob(root)?.is_some_and(|b| b.complete))
+        Ok(self
+            .blob(root)?
+            .is_some_and(|b| !b.quarantined && (b.complete || b.durable)))
     }
 
     /// The advertisement this node should publish for an object (§6.3).
     pub fn local_ad(&self, root: &Hash) -> Result<Option<BlobAd>> {
-        Ok(self.blob(root)?.map(|b| b.to_ad()))
+        Ok(self
+            .blob(root)?
+            .filter(|blob| !blob.quarantined)
+            .map(|blob| blob.to_ad()))
+    }
+
+    /// Records that the configured backend has promoted a complete object to
+    /// stable storage. Call only after the backend's durability promise.
+    pub fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+            params![root.as_bytes().to_vec()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Quarantines a durable object whose bytes failed verification.
+    pub fn quarantine_blob(&self, root: &Hash) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE blobs SET quarantined = 1 WHERE root = ?1 AND durable != 0",
+            params![root.as_bytes().to_vec()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Applies the authoritative S3 `NoSuchKey` heal rule.
+    ///
+    /// The durable claim is withdrawn. A row with no verified cache bytes is
+    /// removed altogether; otherwise it remains a partial peer-fetched cache.
+    pub fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
+        self.with_immediate_tx(|tx| {
+            let changed = tx.execute(
+                "UPDATE blobs SET durable = 0, quarantined = 0 WHERE root = ?1 AND durable != 0",
+                params![root.as_bytes().to_vec()],
+            )?;
+            tx.execute(
+                "DELETE FROM blobs
+                   WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
+                params![root.as_bytes().to_vec()],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Reconciles database cache claims with an ephemeral scratch generation.
+    ///
+    /// A changed marker drops staged-only rows and clears cached groups on
+    /// durable rows in one transaction. A matching marker is an O(1) no-op.
+    pub fn reconcile_scratch_generation(&self, marker: &str) -> Result<bool> {
+        const KEY: &str = "cas.cloud.scratch_generation";
+        self.with_immediate_tx(|tx| {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM config WHERE key = ?1",
+                    params![KEY],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous.as_deref() == Some(marker) {
+                return Ok(false);
+            }
+            tx.execute(
+                "DELETE FROM blobs
+                   WHERE durable = 0 AND inline IS NULL",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE blobs
+                    SET complete = 0, bitmap = NULL
+                  WHERE durable != 0 AND inline IS NULL",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![KEY, marker],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Whether both files behind a complete out-of-line cache claim exist at
+    /// their exact expected lengths.
+    pub(crate) fn cached_blob_files_present(&self, root: &Hash, size: u64) -> bool {
+        std::fs::metadata(self.blob_path(root)).is_ok_and(|metadata| metadata.len() == size)
+            && std::fs::metadata(self.outboard_path(root))
+                .is_ok_and(|metadata| metadata.len() == Self::tree(size).outboard_size())
+    }
+
+    /// Reads the whole cached outboard only when its exact tree length is
+    /// present; a short/torn copy is treated as a cache miss.
+    pub(crate) fn cached_outboard(&self, root: &Hash, size: u64) -> Option<Vec<u8>> {
+        let path = self.outboard_path(root);
+        std::fs::metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.len() == Self::tree(size).outboard_size())?;
+        std::fs::read(path).ok()
+    }
+
+    /// Caches a complete remote outboard without claiming any payload groups.
+    pub(crate) fn cache_outboard(&self, root: &Hash, size: u64, bytes: &[u8]) -> Result<()> {
+        let expected = Self::tree(size).outboard_size();
+        if bytes.len() as u64 != expected {
+            return Err(StoreError::Verification {
+                root: *root,
+                reason: format!(
+                    "cloud outboard is {} bytes, expected {expected}",
+                    bytes.len()
+                ),
+            });
+        }
+        let _lease = self.lease_write(root);
+        write_and_sync(&self.staging_dir(), &self.outboard_path(root), bytes)
+    }
+
+    /// Drops only reconstructible local bytes while retaining a remote durable
+    /// claim. The row changes first, so a crash can leave only harmless orphan
+    /// files, never a warm-cache claim with missing bytes.
+    pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
+            params![root.as_bytes().to_vec()],
+        )?;
+        conn.execute(
+            "UPDATE blobs SET complete = 0, bitmap = NULL
+               WHERE root = ?1 AND durable != 0 AND inline IS NULL",
+            params![root.as_bytes().to_vec()],
+        )?;
+        let _ = std::fs::remove_file(self.blob_path(root));
+        let _ = std::fs::remove_file(self.outboard_path(root));
+        drop(conn);
+        Ok(())
+    }
+
+    /// Current out-of-line bytes occupied by reconstructible durable cache
+    /// entries (payload plus outboard).
+    pub(crate) fn durable_cache_bytes(&self) -> Result<u64> {
+        Ok(self
+            .durable_cache_entries()?
+            .into_iter()
+            .map(|(_, _, bytes)| bytes)
+            .sum())
+    }
+
+    /// Evicts least-recently-used durable cache entries until `target_bytes`
+    /// is met. Pinned rows are eligible because their promise lives remotely;
+    /// staged-only rows are never eligible because scratch is their only copy.
+    pub(crate) fn evict_durable_cache_to(&self, target_bytes: u64) -> Result<(usize, u64)> {
+        let mut entries = self.durable_cache_entries()?;
+        entries.sort_unstable_by_key(|(_, last_access, _)| *last_access);
+        let mut usage: u64 = entries.iter().map(|(_, _, bytes)| *bytes).sum();
+        let mut evicted = 0usize;
+        let mut freed = 0u64;
+        for (root, _, bytes) in entries {
+            if usage <= target_bytes {
+                break;
+            }
+            if self.is_being_written(&root) {
+                continue;
+            }
+            self.clear_blob_cache(&root)?;
+            usage = usage.saturating_sub(bytes);
+            freed = freed.saturating_add(bytes);
+            evicted += 1;
+        }
+        Ok((evicted, freed))
+    }
+
+    /// Advances a cache entry's LRU clock after a backend-served read.
+    pub(crate) fn touch_blob(&self, root: &Hash, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE blobs SET last_access = max(last_access, ?2) WHERE root = ?1",
+            params![root.as_bytes().to_vec(), now],
+        )?;
+        Ok(())
+    }
+
+    fn durable_cache_entries(&self) -> Result<Vec<(Hash, i64, u64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT root, last_access FROM blobs
+              WHERE durable != 0 AND inline IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (encoded, last_access) = row?;
+            let root = hash_column(encoded, "blobs.root")?;
+            let payload = cache_file_bytes(&self.blob_path(&root));
+            let outboard = cache_file_bytes(&self.outboard_path(&root));
+            let bytes = payload.saturating_add(outboard);
+            if bytes > 0 {
+                out.push((root, last_access, bytes));
+            }
+        }
+        Ok(out)
     }
 
     /// Pins or unpins an object against GC (§9.2).
@@ -872,6 +1179,20 @@ impl Store {
             return Ok(false);
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if self.has_remote_cas() {
+            tx.execute(
+                "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
+                   SELECT root, ?3 FROM blobs
+                    WHERE root = ?1
+                      AND inline IS NULL
+                      AND pinned = 0
+                      AND last_access < ?2
+                      AND NOT EXISTS (
+                        SELECT 1 FROM entries WHERE entries.content = blobs.root
+                      )",
+                params![root.as_bytes().to_vec(), before, synch_core::now_ns()],
+            )?;
+        }
         let rows = tx.execute(
             "DELETE FROM blobs
                WHERE root = ?1
@@ -920,14 +1241,49 @@ impl Store {
         // `delete_blob_if_collectable` holds it: a writer committing a row for
         // this root between the delete and the unlinks would be left with a row
         // whose bytes are gone.
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if self.has_remote_cas() {
+            tx.execute(
+                "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
+                   SELECT root, ?2 FROM blobs WHERE root = ?1 AND inline IS NULL",
+                params![root.as_bytes().to_vec(), synch_core::now_ns()],
+            )?;
+        }
+        tx.execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
         )?;
+        tx.commit()?;
         let _ = std::fs::remove_file(self.blob_path(root));
         let _ = std::fs::remove_file(self.outboard_path(root));
         drop(conn);
+        Ok(())
+    }
+
+    /// Remote objects whose row-first deletion has committed and still needs
+    /// its idempotent backend half.
+    pub fn pending_backend_deletes(&self) -> Result<Vec<Hash>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT root FROM backend_deletes
+              WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.root = backend_deletes.root)
+              ORDER BY queued_at, root",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(hash_column(row?, "backend_deletes.root")?);
+        }
+        Ok(out)
+    }
+
+    /// Clears one remote-delete intent after the backend confirms deletion.
+    pub fn finish_backend_delete(&self, root: &Hash) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM backend_deletes WHERE root = ?1",
+            params![root.as_bytes().to_vec()],
+        )?;
         Ok(())
     }
 
@@ -1063,6 +1419,36 @@ impl Store {
         .map_err(|e| StoreError::Verification {
             root: blob.root,
             reason: e.to_string(),
+        })?;
+        Ok(encoded)
+    }
+
+    /// Encodes and verifies ranges from backend-private sparse files without
+    /// creating a public filesystem-path API.
+    pub(crate) fn encode_slice_files(
+        root: Hash,
+        size: u64,
+        ranges: &ChunkRanges,
+        payload: &std::path::Path,
+        outboard: &std::path::Path,
+    ) -> Result<Vec<u8>> {
+        let tree = Self::tree(size);
+        let bao_ranges = to_bao_ranges(ranges);
+        let mut encoded = Vec::new();
+        let outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree,
+            data: DataFile(File::open(outboard)?),
+        };
+        encode_ranges_validated(
+            DataFile(File::open(payload)?),
+            outboard,
+            &bao_ranges,
+            &mut encoded,
+        )
+        .map_err(|error| StoreError::Verification {
+            root,
+            reason: error.to_string(),
         })?;
         Ok(encoded)
     }
@@ -1287,9 +1673,9 @@ impl bao_tree::io::sync::OutboardMut for MemOutboard {
 
 /// A reader that copies everything it yields into a sink, so hashing a file and
 /// writing it into the CAS take one pass over the bytes.
-struct TeeReader<R, W> {
-    inner: R,
-    sink: W,
+pub(crate) struct TeeReader<R, W> {
+    pub(crate) inner: R,
+    pub(crate) sink: W,
 }
 
 impl<R: Read, W: Write> Read for TeeReader<R, W> {
@@ -1300,7 +1686,11 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
     }
 }
 
-fn compute_outboard(data: impl Read, tree: BaoTree, outboard: &mut [u8]) -> Result<Hash> {
+pub(crate) fn compute_outboard(
+    data: impl Read,
+    tree: BaoTree,
+    outboard: &mut [u8],
+) -> Result<Hash> {
     let mut ob = bao_tree::io::outboard::PreOrderMemOutboard {
         root: blake3::Hash::from_bytes([0u8; 32]),
         tree,
@@ -1313,6 +1703,78 @@ fn compute_outboard(data: impl Read, tree: BaoTree, outboard: &mut [u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_rows_survive_cold_scratch_and_heal_or_quarantine_loudly() {
+        let (_dir, store) = crate::testutil::store();
+        let root = store.ingest_bytes(&vec![7u8; 100_000], 1).unwrap();
+
+        assert!(store.reconcile_scratch_generation("first").unwrap());
+        let cold = store.blob(&root).unwrap().unwrap();
+        assert!(!cold.complete);
+        assert!(cold.durable);
+        assert!(store.has_complete_blob(&root).unwrap());
+        assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
+        assert!(!store.reconcile_scratch_generation("first").unwrap());
+
+        assert!(store.quarantine_blob(&root).unwrap());
+        assert!(!store.has_complete_blob(&root).unwrap());
+        assert!(store.local_ad(&root).unwrap().is_none());
+
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+        assert!(store.blob(&root).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_complete_cache_is_not_a_durability_claim() {
+        let (_provider_dir, provider) = crate::testutil::store();
+        let (_cache_dir, cache) = crate::testutil::store();
+        cache.set_remote_cas(true);
+        let payload = crate::testutil::data(100_000);
+        let root = provider.ingest_bytes(&payload, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(payload.len() as u64));
+        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
+        cache
+            .write_slice(&root, payload.len() as u64, &served, &encoded, 1)
+            .unwrap();
+        let row = cache.blob(&root).unwrap().unwrap();
+        assert!(row.complete);
+        assert!(!row.durable);
+        assert!(cache.local_ad(&root).unwrap().unwrap().is_complete());
+
+        // A fresh scratch volume drops the cache-only row entirely.
+        cache.reconcile_scratch_generation("new").unwrap();
+        assert!(cache.blob(&root).unwrap().is_none());
+
+        let inline = cache.ingest_bytes(b"inline", 2).unwrap();
+        assert!(cache.blob(&inline).unwrap().unwrap().durable);
+    }
+
+    #[test]
+    fn remote_deletes_are_queued_row_first_and_reingest_cancels_them() {
+        let (_dir, store) = crate::testutil::store();
+        store.set_remote_cas(true);
+        let payload = crate::testutil::data(100_000);
+        let root = store.ingest_bytes(&payload, 1).unwrap();
+        store.mark_blob_durable(&root).unwrap();
+
+        store.delete_blob(&root).unwrap();
+        assert!(store.blob(&root).unwrap().is_none());
+        assert_eq!(store.pending_backend_deletes().unwrap(), vec![root]);
+
+        // A retry that recreates the same content address wins over the old
+        // delete intent before maintenance can remove its new remote object.
+        assert_eq!(store.ingest_bytes(&payload, 2).unwrap(), root);
+        assert!(store.pending_backend_deletes().unwrap().is_empty());
+
+        store.delete_blob(&root).unwrap();
+        store.finish_backend_delete(&root).unwrap();
+        assert!(store.pending_backend_deletes().unwrap().is_empty());
+
+        let inline = store.ingest_bytes(b"inline", 3).unwrap();
+        store.delete_blob(&inline).unwrap();
+        assert!(store.pending_backend_deletes().unwrap().is_empty());
+    }
     use crate::testutil::{data, store};
 
     #[test]

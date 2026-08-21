@@ -15,6 +15,7 @@ use synch_store::{Binding, BindingSource, Slot, Store};
 pub(crate) struct WireNode {
     pub _dir: tempfile::TempDir,
     pub store: Arc<Store>,
+    pub cas: Arc<dyn synch_store::backend::CasBackend>,
     pub net: Net,
     pub secret: SecretKey,
     pub origin: OriginId,
@@ -37,6 +38,9 @@ impl WireNode {
         // The endpoint reconciles through a head sink — the §5.2 acceptance
         // rule — and dials with the same object it serves through.
         let mut options = NetOptions::loopback();
+        let cas: Arc<dyn synch_store::backend::CasBackend> =
+            Arc::new(synch_store::backend::LocalFs::new(store.clone()));
+        options.cas = Some(cas.clone());
         options.heads = Some(Arc::new(Syncer::new(store.clone())) as Arc<dyn synch_net::HeadSink>);
         let net = Net::bind(store.clone(), secret.clone(), options)
             .await
@@ -44,6 +48,7 @@ impl WireNode {
         WireNode {
             _dir: dir,
             store,
+            cas,
             net,
             secret,
             origin,

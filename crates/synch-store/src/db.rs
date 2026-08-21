@@ -201,6 +201,9 @@ fn in_transaction() -> bool {
 pub struct Store {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
+    /// Whether complete out-of-line bytes are only cache until explicitly
+    /// finalized into a remote backend.
+    remote_cas: std::sync::atomic::AtomicBool,
     /// Roots a full walk has established this store holds entirely.
     ///
     /// "Do I hold this whole trie?" is asked on every `Hello` (§5.1) and
@@ -282,6 +285,7 @@ impl Store {
         let store = Store {
             conn: Mutex::new(conn),
             data_dir,
+            remote_cas: std::sync::atomic::AtomicBool::new(false),
             complete_roots: Mutex::new(std::collections::HashSet::new()),
             writing: Mutex::new(std::collections::HashMap::new()),
         };
@@ -300,6 +304,7 @@ impl Store {
         let store = Store {
             conn: Mutex::new(Connection::open_in_memory()?),
             data_dir,
+            remote_cas: std::sync::atomic::AtomicBool::new(false),
             complete_roots: Mutex::new(std::collections::HashSet::new()),
             writing: Mutex::new(std::collections::HashMap::new()),
         };
@@ -313,7 +318,11 @@ impl Store {
         // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        // Litestream checkpoints in a second process. A trie GC transaction
+        // can legitimately hold the write lock beyond SQLite's old five
+        // second wait, so give replication and daemon writers room to queue
+        // instead of surfacing transient SQLITE_BUSY as an engine fault.
+        conn.pragma_update(None, "busy_timeout", 30_000)?;
         migrate(&mut conn, MIGRATIONS)?;
         Ok(())
     }
@@ -321,6 +330,25 @@ impl Store {
     /// The data directory.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Selects remote durability semantics for this process.
+    ///
+    /// Must be called during node open, before any CAS writer runs. Inline
+    /// objects remain durable in SQLite; complete out-of-line writes remain
+    /// staged until the remote backend explicitly marks them durable.
+    pub fn set_remote_cas(&self, remote: bool) {
+        self.remote_cas
+            .store(remote, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn complete_is_durable(&self, inline: bool) -> bool {
+        inline || !self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether row-first byte deletion must be handed to a remote backend.
+    pub(crate) fn has_remote_cas(&self) -> bool {
+        self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The CAS root directory.

@@ -1878,11 +1878,17 @@ CREATE TABLE blobs (
   bitmap      BLOB,                      -- verified 16 KiB-group bitmap when partial
   inline      BLOB,                      -- payload for small blobs, else NULL (fs store)
   pinned      INTEGER NOT NULL DEFAULT 0,
-  last_access INTEGER NOT NULL
+  last_access INTEGER NOT NULL,
+  durable     INTEGER NOT NULL DEFAULT 0, -- backend stable-storage promise (docs/SERVERLESS.md §5)
+  quarantined INTEGER NOT NULL DEFAULT 0  -- durable bytes failed verification
+);
+CREATE TABLE backend_deletes (
+  root      BLOB PRIMARY KEY,             -- row-first remote delete intent
+  queued_at INTEGER NOT NULL
 );
 
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL);
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT); -- NULL = detached
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));

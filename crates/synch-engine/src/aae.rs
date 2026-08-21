@@ -260,9 +260,30 @@ impl Node {
                 // the store has accumulated since the last one (§5.4).
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     let node = self.clone();
-                    let pass = crate::blocking::offload(move || node.maintenance_pass()).await;
+                    let blocking = node.clone();
+                    let pass = crate::blocking::offload(move || blocking.maintenance_pass()).await;
                     if let Err(e) = pass {
                         tracing::warn!(error = %e, "maintenance pass failed");
+                    }
+                    match node.cas_backend().maintain(now_ns()).await {
+                        Ok(report)
+                            if report.local_orphans > 0
+                                || report.remote_deleted > 0
+                                || report.remote_deletes_completed > 0
+                                || report.cache_entries_evicted > 0 =>
+                        {
+                            tracing::info!(
+                                local_orphans = report.local_orphans,
+                                remote_inspected = report.remote_inspected,
+                                remote_deleted = report.remote_deleted,
+                                remote_deletes_completed = report.remote_deletes_completed,
+                                cache_entries_evicted = report.cache_entries_evicted,
+                                cache_bytes_evicted = report.cache_bytes_evicted,
+                                "CAS backend maintenance completed"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "CAS backend maintenance failed"),
                     }
                 }
             }

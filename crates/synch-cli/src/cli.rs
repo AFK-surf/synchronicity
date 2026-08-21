@@ -17,6 +17,78 @@ pub struct Cli {
     #[arg(long, global = true, env = "SYNCH_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// CAS storage: local disk, S3, Google Cloud Storage, or Azure Blob.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_CAS_BACKEND",
+        default_value = "local"
+    )]
+    pub cas_backend: CasBackendArg,
+
+    /// Prefix/root below the selected cloud bucket or container.
+    #[arg(long, global = true, env = "SYNCH_CLOUD_ROOT", default_value = "/")]
+    pub cloud_root: String,
+
+    /// Which fetched objects are uploaded to the cloud CAS.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_CLOUD_UPLOAD",
+        default_value = "own+pinned"
+    )]
+    pub cloud_upload: CloudUploadArg,
+
+    /// Maximum bytes used by the reconstructible cloud read cache. Without a
+    /// value, maintenance evicts enough to keep 20% of its filesystem free.
+    #[arg(long, global = true, env = "SYNCH_CLOUD_CACHE_BYTES")]
+    pub cloud_cache_bytes: Option<u64>,
+
+    /// S3 bucket (also used by compatible endpoints such as MinIO).
+    #[arg(long, global = true, env = "SYNCH_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// S3 signing region.
+    #[arg(long, global = true, env = "SYNCH_S3_REGION")]
+    pub s3_region: Option<String>,
+
+    /// S3-compatible endpoint override.
+    #[arg(long, global = true, env = "SYNCH_S3_ENDPOINT")]
+    pub s3_endpoint: Option<String>,
+
+    /// GCS bucket.
+    #[arg(long, global = true, env = "SYNCH_GCS_BUCKET")]
+    pub gcs_bucket: Option<String>,
+
+    /// GCS endpoint override (primarily for test/emulator deployments).
+    #[arg(long, global = true, env = "SYNCH_GCS_ENDPOINT")]
+    pub gcs_endpoint: Option<String>,
+
+    /// GCS service-account credential file.
+    #[arg(long, global = true, env = "SYNCH_GCS_CREDENTIAL_PATH")]
+    pub gcs_credential_path: Option<PathBuf>,
+
+    /// Azure Blob container.
+    #[arg(long, global = true, env = "SYNCH_AZBLOB_CONTAINER")]
+    pub azblob_container: Option<String>,
+
+    /// Azure Blob endpoint override (including Azurite).
+    #[arg(long, global = true, env = "SYNCH_AZBLOB_ENDPOINT")]
+    pub azblob_endpoint: Option<String>,
+
+    /// Azure Storage account name.
+    #[arg(long, global = true, env = "SYNCH_AZBLOB_ACCOUNT_NAME")]
+    pub azblob_account_name: Option<String>,
+
+    /// Azure Storage account key. Environment use is preferred.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_AZBLOB_ACCOUNT_KEY",
+        hide_env_values = true
+    )]
+    pub azblob_account_key: Option<String>,
+
     /// Bind the endpoint to this address instead of an ephemeral port.
     #[arg(long, global = true)]
     pub bind: Option<String>,
@@ -146,6 +218,53 @@ pub enum RekorMode {
     Require,
     /// Do not consult the log at all.
     Off,
+}
+
+/// The configured CAS backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CasBackendArg {
+    /// Durable local filesystem storage.
+    Local,
+    /// Amazon S3 or a compatible endpoint through OpenDAL.
+    S3,
+    /// Google Cloud Storage through OpenDAL.
+    Gcs,
+    /// Azure Blob Storage through OpenDAL.
+    Azblob,
+}
+
+/// Cloud promotion policy for peer-fetched content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CloudUploadArg {
+    /// Upload only content ingested on this node.
+    Own,
+    /// Also upload anything pinned here.
+    #[value(name = "own+pinned")]
+    OwnPinned,
+    /// Upload every object fetched to completion.
+    All,
+}
+
+impl From<CloudUploadArg> for synch_store::cloud::CloudUploadPolicy {
+    fn from(value: CloudUploadArg) -> Self {
+        match value {
+            CloudUploadArg::Own => Self::Own,
+            CloudUploadArg::OwnPinned => Self::OwnPinned,
+            CloudUploadArg::All => Self::All,
+        }
+    }
+}
+
+impl CasBackendArg {
+    /// The value persisted in the node database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CasBackendArg::Local => "local",
+            CasBackendArg::S3 => "s3",
+            CasBackendArg::Gcs => "gcs",
+            CasBackendArg::Azblob => "azblob",
+        }
+    }
 }
 
 impl From<RekorMode> for synch_net::RekorPolicy {
@@ -321,6 +440,24 @@ pub enum Command {
         #[command(subcommand)]
         command: CloudCommand,
     },
+    /// Inspect or migrate the node's content-addressed storage backend.
+    Cas {
+        /// The CAS subcommand.
+        #[command(subcommand)]
+        command: CasCommand,
+    },
+}
+
+/// `synch cas ...`
+#[derive(Debug, Subcommand)]
+pub enum CasCommand {
+    /// Copy and verify every durable object into another backend, then switch.
+    /// The daemon must be stopped; rerunning after interruption is safe.
+    Migrate {
+        /// Destination backend.
+        #[arg(long, value_enum)]
+        to: CasBackendArg,
+    },
 }
 
 /// `synch cloud ...`
@@ -468,12 +605,16 @@ pub enum DomainCommand {
 /// `synch space ...`
 #[derive(Debug, Subcommand)]
 pub enum SpaceCommand {
-    /// Index a local directory.
+    /// Add a path-backed or detached space.
     Add {
         /// The space id.
         id: String,
-        /// The local directory.
-        path: PathBuf,
+        /// The local directory. Omit with `--detached`.
+        #[arg(required_unless_present = "detached", conflicts_with = "detached")]
+        path: Option<PathBuf>,
+        /// Publish into the space without a local checkout, scanner, or watcher.
+        #[arg(long)]
+        detached: bool,
     },
     /// List configured spaces.
     Ls,

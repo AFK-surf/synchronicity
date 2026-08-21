@@ -189,6 +189,69 @@ pub struct RecoveryReport {
 }
 
 impl Node {
+    /// Re-adopts a newer own-origin head retained by peers after a database
+    /// restore, before any local publisher is allowed to run.
+    ///
+    /// Peer summaries decide only whether to ask. The full head must verify
+    /// through ordinary reconciliation and its signer must be one of the
+    /// device keys still present in this database; unlike key-loss recovery,
+    /// no unauthenticated sequence claim is acted on.
+    pub async fn readopt_self_on_startup(&self) -> Result<bool> {
+        let before = {
+            let node = self.clone();
+            crate::blocking::offload(move || Ok(node.store().complete_head(node.origin())?)).await?
+        };
+        let held_keys: std::collections::HashSet<NodeId> = {
+            let node = self.clone();
+            crate::blocking::offload(move || {
+                Ok(node
+                    .store()
+                    .device_keys()?
+                    .into_iter()
+                    .map(|key| key.node_id)
+                    .collect())
+            })
+            .await?
+        };
+
+        for (peer, addr) in self.dial_targets().await? {
+            let client = match self.net().connect_mpt(addr).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::debug!(peer = %peer.fmt_short(), %error, "startup readoption peer unreachable");
+                    continue;
+                }
+            };
+            match tokio::time::timeout(
+                self.config().sync_round_budget,
+                self.syncer().readopt_self_with(&client, &held_keys),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(
+                    peer = %peer.fmt_short(),
+                    %error,
+                    "startup readoption exchange failed"
+                ),
+                Err(_) => tracing::debug!(
+                    peer = %peer.fmt_short(),
+                    "startup readoption exchange exceeded its sync budget"
+                ),
+            }
+        }
+
+        let after = {
+            let node = self.clone();
+            crate::blocking::offload(move || Ok(node.store().complete_head(node.origin())?)).await?
+        };
+        Ok(match (before, after) {
+            (Some(before), Some(after)) => after.supersedes(Some(&(before.seq, before.root))),
+            (None, Some(_)) => true,
+            _ => false,
+        })
+    }
+
     /// The recovery settings this node was opened with.
     pub fn recovery_options(&self) -> RecoveryOptions {
         RecoveryOptions {

@@ -167,23 +167,24 @@ pub struct TufMetadata {
     pub trusted_root: Vec<u8>,
 }
 
-/// The on-disk format of the pin state.
+/// The serialized format of the pin state.
 ///
 /// The version is what makes the file's *contents* a contract rather than a
-/// hint: a file written to any other format is not read at all. A client that
+/// hint: a config value written to any other format is not read at all. A client that
 /// meets one starts from the embedded bootstrap and re-learns on its next
 /// walk, which costs one refresh and concedes nothing.
 const STATE_FORMAT_VERSION: u64 = 4;
 
 /// The pin set a client is running on, and where it came from (§10.2).
 ///
-/// Persisted as one file, global across domains: `<data-dir>/rekor-pins.json`
-/// at mode 0600. Global is the point — the pin set is a property of Sigstore
+/// Persisted in the SQLite `config` row `rekor.pin_state`, global across
+/// domains, so it is replicated with the rest of the serverless database.
+/// Global is the point — the pin set is a property of Sigstore
 /// and not of any domain being resolved, so every domain shares one floor
 /// and a hostile mirror gets one client's versions to walk back, not one per
 /// domain it is asked about.
 ///
-/// The on-disk format is versioned; a file this build cannot read is
+/// The serialized format is versioned; a value this build cannot read is
 /// ignored rather than trusted, which lands on the bootstrap pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinState {
@@ -325,7 +326,12 @@ impl PinState {
     /// on every load bought nothing that access did not already concede.
     pub fn load_anchored(path: &Path, anchor: &[u8]) -> Option<PinState> {
         let text = std::fs::read_to_string(path).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Self::decode_anchored(&text, anchor)
+    }
+
+    /// Decodes persisted JSON against the selected TUF root anchor.
+    pub fn decode_anchored(text: &str, anchor: &[u8]) -> Option<PinState> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
         // A file this build cannot read is not an error: the pin set falls
         // back to the bootstrap snapshot and the next accepted update
         // rewrites it, which is the safe direction.
@@ -362,14 +368,9 @@ impl PinState {
         (state.anchor_digest == crate::rekor::sha256(anchor)).then_some(state)
     }
 
-    /// Writes the state at mode 0600, replacing whatever was there.
-    ///
-    /// The pin set is not a secret; 0600 is the same hygiene the rest of the
-    /// data directory gets (§9.3), which is where the trust in these bytes
-    /// comes from in the first place.
-    ///
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let text = serde_json::json!({
+    /// Encodes the versioned persisted JSON representation.
+    pub fn encode(&self) -> String {
+        serde_json::json!({
             "version": STATE_FORMAT_VERSION,
             "root": base64_encode(&self.root),
             "root_chain": self
@@ -386,7 +387,17 @@ impl PinState {
             "updated_at": self.updated_at,
             "anchor_digest": base64_encode(&self.anchor_digest),
         })
-        .to_string();
+        .to_string()
+    }
+
+    /// Writes the state at mode 0600, replacing whatever was there.
+    ///
+    /// The pin set is not a secret; 0600 is the same hygiene the rest of the
+    /// data directory gets (§9.3), which is where the trust in these bytes
+    /// comes from in the first place.
+    ///
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let text = self.encode();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

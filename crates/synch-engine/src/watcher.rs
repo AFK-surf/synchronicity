@@ -98,7 +98,7 @@ impl SpaceWatcher {
             .store()
             .spaces()?
             .into_iter()
-            .map(|space| PathBuf::from(&space.local_path))
+            .filter_map(|space| space.local_path.map(PathBuf::from))
             .collect())
     }
 
