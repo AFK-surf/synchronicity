@@ -55,8 +55,10 @@ impl Nibbles {
         }
         Some(
             self.0
-                .chunks_exact(2)
-                .map(|pair| (pair[0] << 4) | pair[1])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[hi, lo]| (hi << 4) | lo)
                 .collect(),
         )
     }
