@@ -11,6 +11,9 @@ pub enum NetError {
     /// Binding or dialing the iroh endpoint failed.
     #[error("endpoint: {0}")]
     Endpoint(String),
+    /// The host's certificate trust store could not be read ([`crate::tls`]).
+    #[error("system certificate store: {0}")]
+    Tls(String),
     /// A QUIC stream failed.
     #[error("stream: {0}")]
     Stream(String),

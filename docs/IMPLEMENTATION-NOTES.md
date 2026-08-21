@@ -765,3 +765,17 @@ Pinned in the workspace `Cargo.toml`. The notable ones:
   (`synch_net::tls::install_crypto_provider`), and `sim` builds install it
   before `main` via `ctor` because test binaries have no `main` of ours.
 - No `openssl` anywhere: `rustls` throughout.
+- `rustls-platform-verifier` 0.7 supplies the trust anchors for every outbound
+  TLS connection, so a server certificate is checked against the *host's*
+  store — the platform APIs on macOS and Windows, `/etc/ssl` (honouring
+  `SSL_CERT_FILE` and `SSL_CERT_DIR`) elsewhere — and never against a copy of
+  Mozilla's roots frozen into the binary. An operator running a control plane
+  or relay behind an enterprise or private CA installs a root and the daemon
+  follows; a root the machine has distrusted stops being trusted here at the
+  same moment. reqwest picks the verifier up by default; iroh's relay and pkarr
+  clients take `CaTlsConfig::system()` (`iroh`'s `platform-verifier` feature);
+  the cloud-attach WebSocket is handed a config from
+  `synch_net::tls::client_config`, and `tokio-tungstenite` takes
+  `rustls-tls-native-roots` rather than `rustls-tls-webpki-roots` so even its
+  unused fallback reads the host store. The store is read once per process and
+  cached, so a certificate added afterwards takes a restart to see.

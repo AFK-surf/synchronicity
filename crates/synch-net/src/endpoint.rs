@@ -7,6 +7,7 @@ use iroh::{
     address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::{presets, Connection, RelayMode},
     protocol::Router,
+    tls::CaTlsConfig,
     Endpoint, EndpointAddr, RelayUrl, TransportAddr,
 };
 use iroh_base::SecretKey;
@@ -275,7 +276,14 @@ impl Net {
         // relays by default, overridable for self-hosted deployments, plus the
         // Mainline DHT on request. None of it is trusted — see NetOptions — so
         // these are plain configuration.
-        let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+        // The relay and pkarr clients are the endpoint's only HTTPS: they
+        // verify against the host's trust store rather than iroh's default
+        // compiled-in Mozilla bundle, so a self-hosted relay behind a private
+        // CA — or any node behind a TLS-inspecting proxy — needs the operator
+        // to install a root, not to rebuild synchronicity (`crate::tls`).
+        let mut builder = Endpoint::builder(presets::N0)
+            .secret_key(secret)
+            .ca_tls_config(CaTlsConfig::system());
         if options.offline {
             // Nothing to configure once nothing may leave the machine, and the
             // knobs below would only be cleared again on the way out.

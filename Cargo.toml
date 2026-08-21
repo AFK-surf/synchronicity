@@ -46,7 +46,10 @@ hex = "0.4.3"
 hmac = "0.13.0"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-aws-lc-rs", "tokio"] }
-iroh = { version = "1.0.3", default-features = false, features = ["tls-aws-lc-rs"] }
+# `platform-verifier` is what lets the relay client be pointed at the host's
+# trust store (`CaTlsConfig::system()`) instead of iroh's default compiled-in
+# Mozilla bundle — see `synch_net::tls`.
+iroh = { version = "1.0.3", default-features = false, features = ["tls-aws-lc-rs", "platform-verifier"] }
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 # 0.5 is the first release that takes iroh with `default-features = false`;
 # on 0.4 iroh's defaults come back in and with them the ring provider.
@@ -67,6 +70,10 @@ range-collections = "0.4.6"
 # builds via `ctor`.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
+# The host's trust store, in one crate for every TLS client here: the macOS
+# and Windows platform APIs, and `/etc/ssl` (honouring `SSL_CERT_FILE` and
+# `SSL_CERT_DIR`) elsewhere. See `synch_net::tls`.
+rustls-platform-verifier = "0.7.0"
 # `ring-io` is what makes the key, signature and digest outputs `AsRef<[u8]>`,
 # the shape the signing and hashing call sites here are written against.
 aws-lc-rs = { version = "1.18.0", features = ["ring-io"] }
@@ -80,7 +87,13 @@ time = "0.3"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# `rustls-tls-native-roots`, not `rustls-tls-webpki-roots`: the cloud-attach
+# tunnel hands it a config built from the host's trust store
+# (`synch_net::tls::client_config`), and the feature that would otherwise be
+# picked compiles a Mozilla root bundle in as the fallback. Native roots keep
+# the fallback on the host's store too, so no path here trusts a bundle
+# frozen at build time.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "router", "server"] }
 tonic-prost = "0.14.6"

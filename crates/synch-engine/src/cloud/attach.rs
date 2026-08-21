@@ -309,10 +309,19 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
         let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_DOWN_FRAME);
         config.max_frame_size = Some(MAX_DOWN_FRAME);
-        let (socket, _) =
-            tokio_tungstenite::connect_async_with_config(websocket_url(&url), Some(config), false)
-                .await
-                .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
+        // Verify the control plane's certificate against the host's trust
+        // store, not the roots tungstenite would otherwise compile in: an
+        // operator running the control plane behind a private or enterprise CA
+        // installs a root, and this dials it (`synch_net::tls`).
+        let connector = tokio_tungstenite::Connector::Rustls(synch_net::tls::client_config()?);
+        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            websocket_url(&url),
+            Some(config),
+            false,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
         let (mut sink, mut stream) = socket.split();
 
         // Two store reads, so they go over together (§10).
