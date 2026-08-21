@@ -1367,15 +1367,11 @@ reproduced: its target *is* its version (§8), and stamping a link's own times
 needs a facility the standard library does not expose.
 
 Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
-filesystems may not be. A mirror applies the rule below on every platform, so
-that one tree is one directory everywhere. A *fill* asks the filesystem
-instead — one create, one stat, one unlink, in the directory concerned and only
-when two candidates really do fold together — because it writes into a directory
-this machine's own scanner publishes from, where two cased names may be two real
-files that this node itself published, and refusing one of them would report a
-permanent collision about two files that are both sitting there. Per directory
-rather than per space, since a case-insensitive volume mounted inside a
-case-sensitive root is an ordinary thing to have. When two published paths collide under the target
+filesystems may not be. A fill applies the rule below on every platform, as a
+mirror does. It could ask the filesystem instead — and did, briefly — but the
+two ways of being wrong are not symmetric: refusing a name is a report about two
+files that are both sitting there, while a wrong "this filesystem does not fold"
+is a silent clobber. When two published paths collide under the target
 filesystem's case folding, materialization
 writes the lexicographically first and **skips and reports** the rest — never
 silently clobbers. Names invalid on the target platform (Windows reserved device

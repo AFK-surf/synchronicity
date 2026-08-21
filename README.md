@@ -274,7 +274,7 @@ synch fill media                                           # newest, by default
 synch fill media/talks                                     # one directory of it
 synch fill media --from nas@cluster.example.com            # that origin's versions
 synch fill media --strict                                  # report divergent paths, skip them
-synch fill media --dry-run                                 # decide, change nothing
+synch fill media --dry-run                                 # decide everything, write nothing
 synch fill media --force                                   # replace local files that differ
 ```
 

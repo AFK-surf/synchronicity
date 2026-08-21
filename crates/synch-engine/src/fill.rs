@@ -72,13 +72,6 @@ pub struct FillOptions {
     pub force: bool,
     /// Decide everything and write nothing: the report says what a real run
     /// would do, down to which files it would replace.
-    ///
-    /// "Nothing" is about the tree: no path is created, replaced or removed. A
-    /// fill whose candidates include two names that fold together still asks
-    /// the filesystem whether it folds them, which is a create and an unlink of
-    /// an ignored probe name in the directory concerned — the alternative being
-    /// a dry run that reports a collision the real run will not make, or misses
-    /// one it will.
     pub dry_run: bool,
 }
 
@@ -707,9 +700,6 @@ fn decide(
     // first claimant of a folded name wins and the rest are reported — but only
     // where this space's filesystem actually folds them.
     let mut claimed: HashMap<String, String> = HashMap::new();
-    // Answered per directory, and only for a directory that turns out to hold a
-    // folded pair.
-    let mut folds: HashMap<PathBuf, bool> = HashMap::new();
 
     for set in listing {
         // A mirror refuses these names on every platform, so that one mirror of
@@ -821,20 +811,25 @@ fn decide(
         // does it: without the claim, `--force` would write one over the other
         // and call both of them filled. Where the filesystem does *not* fold,
         // there is no collision to report and both are written.
+        // Two published paths that fold onto one local name — `Link` and
+        // `link` on a case-insensitive filesystem — are not both materializable
+        // there. The first claimant wins and the rest are reported, exactly as a
+        // mirror does it: without the claim, `--force` would write one over the
+        // other and call both of them filled.
+        //
+        // Applied on every platform, as the mirror applies it. A fill could ask
+        // the filesystem instead — and did, for three revisions — but the cost
+        // of being wrong runs the other way: refusing a name is a report about
+        // two files that are both there, while a wrong "does not fold" is a
+        // silent clobber. §7.2 takes the conservative side.
         let folded = fold(&set.path);
         match claimed.get(&folded) {
-            // Two candidates fold together. Only now is it worth asking the
-            // filesystem whether it folds them, and only of the directory they
-            // would land in.
             Some(winner) if winner != &set.path => {
-                let dir = target.parent().unwrap_or(root_dir).to_path_buf();
-                if folds_case(&dir, root_dir, &mut folds) {
-                    report.skipped.push((
-                        set.path.clone(),
-                        format!("collides with {winner} under filesystem name folding"),
-                    ));
-                    continue;
-                }
+                report.skipped.push((
+                    set.path.clone(),
+                    format!("collides with {winner} under filesystem name folding"),
+                ));
+                continue;
             }
             _ => {
                 claimed.insert(folded, set.path.clone());
@@ -985,72 +980,6 @@ fn indexed_content(
         && known.file_id == crate::scanner::file_identity(stat)
         && known.scanned_at.saturating_sub(known.mtime_ns) >= crate::scanner::RACY_WINDOW_NS;
     fresh.then_some(known.content).flatten()
-}
-
-/// Whether the directory a path lands in folds two names that differ only in
-/// case onto one file.
-///
-/// A mirror applies the fold rule everywhere, so that one tree is one directory
-/// on every OS. A fill has the opposite obligation — it writes into *this*
-/// machine's directory, where this machine's own scanner published half these
-/// paths — and on a case-sensitive filesystem `Makefile` and `makefile` are two
-/// real files that this node itself publishes. Refusing one of them would
-/// report a permanent collision about two files that are both sitting there,
-/// and would leave the loser unrestorable after a lost checkout.
-///
-/// Compile-time is the wrong axis: macOS is unix and folds, Linux does not, and
-/// one machine can mount both — a case-insensitive card under a case-sensitive
-/// root is an ordinary thing to have, and a single answer for the whole tree
-/// would silently clobber inside it. So the question is asked of the directory
-/// the colliding paths actually land in, and memoized per directory.
-///
-/// Asked lazily, only when two candidate paths really do fold onto one name,
-/// which on almost every tree is never: a fill that has no such pair writes
-/// nothing here at all, `--dry-run` included.
-///
-/// The probe wears a `.synch-part` suffix, which the built-in ignore rules
-/// already cover, so a crash between the create and the unlink leaves nothing a
-/// scan would pick up. Anything unwritable answers "folds", which is the
-/// conservative direction: it keeps the collision guard rather than dropping
-/// it.
-fn folds_case(dir: &Path, root: &Path, memo: &mut HashMap<PathBuf, bool>) -> bool {
-    // Folding is a property of the mount, and `decide` runs to completion
-    // before `write_fill` creates a single directory — so on a first fill the
-    // directory a colliding path lands in usually does not exist yet. Probing
-    // it directly would fail `ENOENT`, answer "folds" conservatively, and
-    // refuse one of two names that are two perfectly good files: the very
-    // report this function exists to stop. Walk up to the nearest ancestor that
-    // does exist, which is on the mount the new directory will be created in,
-    // and never above the space root — the plan has already established that
-    // one is a directory.
-    let mut probe = dir;
-    while probe != root && !probe.is_dir() {
-        match probe.parent() {
-            Some(parent) => probe = parent,
-            None => break,
-        }
-    }
-    let dir = probe;
-    if let Some(known) = memo.get(dir) {
-        return *known;
-    }
-    let name = |case: char| {
-        dir.join(format!(
-            ".synch-case-{case}{}{}",
-            std::process::id(),
-            crate::scanner::PART_SUFFIX
-        ))
-    };
-    let (upper, lower) = (name('A'), name('a'));
-    let folds = if std::fs::write(&upper, b"").is_err() {
-        true
-    } else {
-        let folds = lower.symlink_metadata().is_ok();
-        let _ = std::fs::remove_file(&upper);
-        folds
-    };
-    memo.insert(dir.to_path_buf(), folds);
-    folds
 }
 
 /// Why the space root cannot be written into right now, or `None`.
@@ -1754,11 +1683,10 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The fold-collision rule follows the filesystem, not the platform: where
-    /// two cased names are two files, both are written; where they are one
-    /// file, the first claimant wins by name and the loser is reported.
+    /// The fold-collision rule, named both ways: which path wins, and that the
+    /// winner's bytes are what is on disk.
     #[tokio::test]
-    async fn a_folded_name_collides_only_where_the_filesystem_folds() {
+    async fn the_first_claimant_of_a_folded_name_wins() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "Fold.txt", b"upper", STAMP);
         publish(&node, &peer(), "fold.txt", b"lower", STAMP);
@@ -1767,39 +1695,15 @@ mod tests {
             .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
             .await
             .unwrap();
-        // Ask the filesystem the same question the fill asked it.
-        let probe = space.path().join("CaseProbe");
-        std::fs::write(&probe, b"").unwrap();
-        let folds = space.path().join("caseprobe").symlink_metadata().is_ok();
-        std::fs::remove_file(&probe).unwrap();
-
-        if folds {
-            assert_eq!(report.filled, 1, "{report:?}");
-            assert_eq!(report.skipped.len(), 1, "{report:?}");
-            // The listing is ordered, so the first claimant is the
-            // lexicographically first path — the winner a mirror picks (§7.2).
-            assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
-            assert!(report.skipped[0].1.contains("collides with Fold.txt"));
-        } else {
-            assert_eq!(report.filled, 2, "both are real files here: {report:?}");
-            assert!(report.skipped.is_empty(), "{report:?}");
-            assert_eq!(
-                std::fs::read(space.path().join("fold.txt")).unwrap(),
-                b"lower"
-            );
-        }
+        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        // The listing is ordered, so the first claimant is the lexicographically
+        // first path — the same winner a mirror picks (§7.2).
+        assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
+        assert!(report.skipped[0].1.contains("collides with Fold.txt"));
         assert_eq!(
             std::fs::read(space.path().join("Fold.txt")).unwrap(),
             b"upper"
-        );
-        // Whatever the filesystem does, the probe leaves nothing behind.
-        assert!(
-            !std::fs::read_dir(space.path()).unwrap().any(|e| e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("synch-case")),
-            "the case probe must clean up after itself"
         );
         node.shutdown().await.unwrap();
     }
@@ -2140,10 +2044,10 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A dry run over a tree with no folded pair touches the filesystem not at
-    /// all: the probe is asked only when two candidates really do collide.
+    /// A dry run creates nothing at all, not even beside the paths it decided
+    /// about.
     #[tokio::test]
-    async fn a_dry_run_without_a_collision_leaves_no_trace() {
+    async fn a_dry_run_leaves_no_trace() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "a.txt", b"one", STAMP);
         publish(&node, &peer(), "sub/b.txt", b"two", STAMP);
@@ -2164,7 +2068,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(space.path()).unwrap().count(),
             0,
-            "a dry run with nothing to disambiguate creates nothing at all"
+            "a dry run must leave the directory exactly as it found it"
         );
         node.shutdown().await.unwrap();
     }
@@ -2195,47 +2099,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("recover"), "{refused}");
-        node.shutdown().await.unwrap();
-    }
-
-    /// The fold probe asks the mount, and a directory this fill has not created
-    /// yet is on the mount its nearest existing ancestor is on. Probing the
-    /// missing directory itself would fail and answer "folds", refusing one of
-    /// two names that are two perfectly good files here — on the first fill
-    /// into an emptied checkout, which is the case fill exists for.
-    #[tokio::test]
-    async fn a_collision_below_a_directory_that_does_not_exist_yet_asks_the_mount() {
-        let (_data, space, node) = node_with_space().await;
-        publish(&node, &peer(), "sub/Fold.txt", b"upper", STAMP);
-        publish(&node, &peer(), "sub/fold.txt", b"lower", STAMP);
-
-        let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
-            .await
-            .unwrap();
-
-        // Ask the filesystem the same question, at the root — which is where
-        // the probe has to ask, since `sub/` did not exist when it was asked.
-        let probe = space.path().join("CaseProbe");
-        std::fs::write(&probe, b"").unwrap();
-        let folds = space.path().join("caseprobe").symlink_metadata().is_ok();
-        std::fs::remove_file(&probe).unwrap();
-
-        if folds {
-            assert_eq!(report.filled, 1, "{report:?}");
-            assert_eq!(report.skipped.len(), 1, "{report:?}");
-        } else {
-            assert_eq!(
-                report.filled, 2,
-                "both are real files on this filesystem, and a missing parent \
-                 must not be read as one that folds: {report:?}"
-            );
-            assert!(report.skipped.is_empty(), "{report:?}");
-            assert_eq!(
-                std::fs::read(space.path().join("sub/fold.txt")).unwrap(),
-                b"lower"
-            );
-        }
         node.shutdown().await.unwrap();
     }
 
