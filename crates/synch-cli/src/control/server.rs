@@ -2729,19 +2729,10 @@ async fn receive(
         None => None,
     })
     .await?;
-    // Re-taken immediately before the rename, not trusted from the header
-    // exchange that opened this write. The gates are taken there too, but the
-    // body streams in a spawned task for as long as the client cares to take,
-    // and an inbound `Hello` can floor this node anywhere in that window — at
-    // which point a commit destroys the file that was there and nothing can
-    // publish the replacement: no version, no `prev`, no trace. `Adoption`
-    // holds no `Node`, so `commit` cannot ask on its own; `complete_upload`
-    // re-takes the same gate immediately before its own assembly write.
-    {
-        let (space, path) = (header.space.clone(), header.path.clone());
-        read(node, move |n| Ok(n.ensure_adoptable(&space, &path)?)).await?;
-    }
-    // The commit fsyncs the payload and renames it into place.
+    // The commit fsyncs the payload and renames it into place — and re-takes
+    // the gates first, since the write carries them (`Adoption`). The body
+    // streams here for as long as the client cares to take, and an inbound
+    // `Hello` can floor this node anywhere in that window.
     let target = offload(move || Ok(adoption.commit()?)).await?;
 
     let detached = {

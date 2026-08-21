@@ -839,8 +839,8 @@ impl Node {
     /// the control socket — where holding the object in memory to call the
     /// other one is exactly what must not happen.
     pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
-        self.ensure_adoptable(space_id, path)?;
         if self.is_detached_space(space_id)? {
+            self.ensure_adoptable(space_id, path)?;
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
                 "detached-{}-{}.payload",
@@ -849,8 +849,7 @@ impl Node {
             ));
             return Adoption::open(target);
         }
-        let target = self.adoption_target(space_id, path)?;
-        Adoption::open(target)
+        Adoption::into_space(self, space_id, path)
     }
 
     /// Ingests a committed detached-space staging file and stages its records.
@@ -957,7 +956,7 @@ impl Node {
     /// publish, which is after the file is gone.
     ///
     /// Then the space's own ignore rules.
-    pub fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
+    pub(crate) fn ensure_adoptable(&self, space_id: &str, path: &str) -> Result<()> {
         self.ensure_publishable()?;
         self.refuse_if_ignored(space_id, path)
     }
@@ -1093,6 +1092,25 @@ pub struct Adoption {
     staging: PathBuf,
     file: Option<std::fs::File>,
     written: u64,
+    /// Set when the target is inside an indexed space, and `None` when it is a
+    /// staging file the daemon owns.
+    ///
+    /// This is what makes the gates a property of the *write* rather than of
+    /// each of the eight places that start one. Every adoption ends here, in
+    /// `commit`, at a rename that destroys what it lands on — and until this
+    /// field existed `commit` was the one step that could not check anything,
+    /// because it held nothing to ask. Each caller therefore had to re-take the
+    /// gates immediately before it, and the review history of this branch is
+    /// mostly the record of callers that did not.
+    space: Option<SpaceWrite>,
+}
+
+/// What a write into an indexed space needs to re-check before it lands.
+#[derive(Debug)]
+struct SpaceWrite {
+    node: Node,
+    space: String,
+    path: String,
 }
 
 impl Adoption {
@@ -1103,6 +1121,19 @@ impl Adoption {
     /// (§7.2), which by construction lives outside every indexed space.
     pub fn at(target: impl Into<PathBuf>) -> Result<Adoption> {
         Adoption::open(target.into())
+    }
+
+    /// The same, for a target inside an indexed space: the write carries the
+    /// gates with it and re-takes them at `commit`.
+    fn into_space(node: &Node, space_id: &str, path: &str) -> Result<Adoption> {
+        node.ensure_adoptable(space_id, path)?;
+        let mut adoption = Adoption::open(node.adoption_target(space_id, path)?)?;
+        adoption.space = Some(SpaceWrite {
+            node: node.clone(),
+            space: space_id.to_string(),
+            path: path.to_string(),
+        });
+        Ok(adoption)
     }
 
     fn open(target: PathBuf) -> Result<Adoption> {
@@ -1135,6 +1166,7 @@ impl Adoption {
             staging,
             file: Some(file),
             written: 0,
+            space: None,
         })
     }
 
@@ -1349,6 +1381,19 @@ impl Adoption {
     }
 
     fn commit_inner(&mut self) -> Result<()> {
+        // Immediately before the rename, because this is the moment the gates
+        // are about: a write that opened minutes or days ago — an S3 body
+        // streaming at the client's pace, a multipart upload assembled out of
+        // parts — commits into a node that may have been floored by an inbound
+        // `Hello` since, or into a space whose ignore rules have moved. The
+        // rename destroys what it lands on, and a refusal after it is a file
+        // gone with nothing published to show for it.
+        //
+        // Taken here rather than by each caller: `commit` is the one step every
+        // adoption reaches, so a gate here cannot be the one somebody forgets.
+        if let Some(space) = &self.space {
+            space.node.ensure_adoptable(&space.space, &space.path)?;
+        }
         let file = self
             .file
             .take()
@@ -1931,6 +1976,47 @@ mod tests {
                 "no tombstone may be staged for {path}, which is still there"
             );
         }
+        node.shutdown().await.unwrap();
+    }
+
+    /// The gates travel with the write, so they are re-taken at the rename
+    /// rather than only at the open.
+    ///
+    /// That is the whole point of `Adoption` carrying them: a write can be open
+    /// for as long as its client takes — an S3 body, a multipart assembly — and
+    /// the node it commits into is not the node it opened against. Removing the
+    /// check in `commit_inner` fails this.
+    #[tokio::test]
+    async fn a_space_write_re_takes_its_gates_at_the_commit() {
+        let (_d, space, node) = crate::testkit::node_with_space().await;
+        let victim = space.path().join("f.txt");
+        std::fs::write(&victim, b"mine, unpublished").unwrap();
+
+        // Opened against a healthy node, and written.
+        let mut adoption = node.open_adoption("media", "f.txt").unwrap();
+        adoption.write(b"theirs").unwrap();
+
+        // A peer advertises a head for our own origin that we have no history
+        // for: key-loss recovery, arriving while the body was on the wire.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+
+        let refused = adoption.commit().unwrap_err().to_string();
+        assert!(refused.contains("recover"), "{refused}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"mine, unpublished",
+            "the rename must not have landed on a file nothing could then \
+             publish a replacement for"
+        );
         node.shutdown().await.unwrap();
     }
 
