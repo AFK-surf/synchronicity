@@ -21,15 +21,15 @@ A node holds bytes for one of three reasons, and none of them is durability.
 
 So the cluster's retention story is: every version currently named by some
 origin's entries is held *by the origins that published it*, and everything else
-is held by whoever happened to touch it recently. Supersede a file and the old
-version's bytes survive only where a `pin` was placed on purpose. Remove the
-member that published a path and the last copy can leave with it.
+is held by whoever happened to touch it recently. Remove the member that
+published a path and the last copy can leave with it. Nothing in the design
+holds a second copy of a live path on purpose, and nothing can be asked to.
 
 That is a reasonable default for a laptop and a wrong one for the machine in the
-rack whose whole job is to still have things. The mechanism such a machine needs
-already exists — `pin` makes retention unconditional, and `BlobAd` records make
-availability cluster-visible (§6.3) — but there is no way to say *keep all of
-this*, and no way at all to see whether anybody is.
+rack whose job is to still have things. The mechanism such a machine needs
+already exists — content GC is reference- and pin-driven, and `BlobAd` records
+make availability cluster-visible (§6.3) — but there is no way to say *hold all
+of this*, and no way to see whether anybody is.
 
 The gap is named in DESIGN.md §13 as future work ("smarter placement policies,
 built on the same `BlobAd` availability data"). This document proposes the node
@@ -38,148 +38,158 @@ both useful alone and hard to get wrong later.
 
 ## 2. What archive mode is
 
-**An archive is a node that holds every version of every path in the spaces it
-archives, and never releases one on its own.** It publishes nothing of its own —
-it may, but archiving is orthogonal to having spaces — and it materializes
-nothing onto the filesystem. It accumulates objects in its CAS, pins them, and
-serves them.
-
-The distinction from the two existing surfaces is worth being exact about,
-because all three are easy to confuse:
+**An archive is a node that holds a whole copy of every version the unified tree
+currently names, for the spaces it archives.** Every origin's version of every
+path — not the one a policy would select — fetched as it appears, held whole,
+served to anyone. It materializes nothing onto the filesystem and publishes no
+spaces of its own.
 
 | | selects | holds | releases when |
 |---|---|---|---|
 | **mirror** (§7.2) | one version per path, by policy | files on disk, plus the CAS objects behind them | the tree stops naming the path |
 | **pin** (§9.2) | one object root, named by hand | that object | an operator says so |
-| **archive** | every version it ever observes | every object under them | its policy says so, or never |
+| **archive** | every version of every path, all origins | every object under them | the tree stops naming it, plus a grace window |
 
-A mirror is a *view*: it follows the unified tree, and what the tree drops it
-drops. A pin is *possession* of one thing. An archive is possession of a
-*set defined by a rule*, and the rule is a standing one — new content joins the
-set as it appears, without an operator naming it.
+A mirror is a *view* of the tree, one version deep, on the filesystem. A pin is
+possession of one named thing. An archive is possession of everything the tree
+points at — which is a set that shrinks as well as grows.
 
-### 2.1 What "everything" can honestly mean
+### 2.1 The tree decides, not the archive
 
-Three readings, and only one of them is a promise this design can keep.
+The retention rule is the whole design and it is one sentence:
 
-- **E1 — every version currently in the unified tree.** Computable from a
-  listing at any instant. Insufficient: a path written twice between two passes
-  loses its intermediate version, and that is precisely the version an archive
-  exists to have.
-- **E2 — every version this node observes.** Each promotion that flips a head to
-  complete carries a diff of changed leaves (`Store::materialize_diff`). An
-  archive that takes its work from that diff sees every version that passes
-  through it, whether or not it survives to the next pass. **This is what
-  archive mode promises.**
-- **E3 — every version that ever existed anywhere.** Not achievable and should
-  not be implied. Anti-entropy can carry an origin from seq 40 to seq 45 in one
-  round without the intervening roots ever being fetched; a publisher's own
-  history is pruned at its `root_retention`; a member that never met this node
-  and then left took its versions with it. §4.4's fork evidence is the only
-  thing that reaches backwards, and it reaches for heads, not content.
+> **An archive holds exactly the content some origin's current trie references,
+> plus a grace window after a root falls out.**
 
-E2 is a guarantee about *this node's observations*, so it is only as good as the
-node's uptime. An archive that was down for a day archives what it can still see
-when it comes back, which is E1 for that day plus whatever history is still
-reachable. §3.7 describes a bounded backfill that narrows the gap and does not
-close it. The status output must state the guarantee in those terms rather than
-in the words "everything", which an operator will otherwise read as E3.
+Content that no origin's current entry names is garbage in an archive for the
+same reason it is garbage on a laptop. The alternative — hold every version ever
+observed, release nothing — was the first draft of this document, and it is
+wrong in three ways that matter:
+
+- **It does not converge.** Holding every version forever costs the integral of
+  the cluster's churn, not the size of its tree, and that integral has no limit.
+  An archive under that rule is a machine that eventually stops, and the date it
+  stops is a function of how much other people write. §9 has the arithmetic.
+- **It confuses two jobs.** "Nothing is lost when a member dies" and "every
+  version is recoverable forever" are different products with different costs.
+  The first is what the cluster structurally lacks and what a second copy
+  actually buys. The second is a backup policy, and one an operator should have
+  to ask for by name.
+- **It fights the existing machinery instead of using it.** `gc_content` already
+  computes "referenced by any current entry" — `referenced_content()` is
+  `SELECT DISTINCT content FROM entries`, over every origin's materialized
+  leaves. An archive whose rule is the tree's rule inherits a GC pass that is
+  already written, already transactional, and already correct against a
+  concurrent fetch.
+
+So archive mode is a **fetch** policy far more than it is a retention policy.
+What it adds is: fetch everything referenced rather than only what someone reads,
+hold it whole rather than in the ranges a read happened to want, and release it
+on a schedule the operator sets rather than on the `root_retention` clock that
+happens to govern a read cache.
+
+Two policies, then, and the second is the opt-in:
+
+- **`tree`** (default) — the rule above. Storage tracks the size of the tree.
+- **`all`** — release nothing, ever. The archive-of-record, for deployments that
+  want one and have costed it. Everything in this document applies except the
+  release path.
+
+### 2.2 What an archive does and does not protect against
+
+Worth stating plainly at the top, because "archive" invites an assumption that
+the default policy does not honor.
+
+**It protects against loss of a node.** A member's disk dies, a laptop is
+stolen, a VM is deleted, a member is removed from the zone: every path it
+published is still held whole by the archive, and the archive advertises it, so
+the swarm keeps serving it. This is the failure the cluster currently has no
+answer to, and it is the common one.
+
+**It does not protect against deletion.** A member deleting a path publishes a
+tombstone; the content stops being referenced; the archive releases it when the
+grace window expires. Ransomware that rewrites a member's files in place is the
+same event wearing a different hat. **The grace window is the entire recovery
+story under the `tree` policy**, so it should be set to the longest "oh no"
+interval the deployment believes in — thirty days is a defensible default,
+seven is not — and a deployment that wants deletion-proof retention runs `all`
+and pays for it.
+
+Saying this in the documentation is not enough; `synch archive add` should print
+it, and `archive status` should show the grace window beside the held size,
+because the number that matters is the one an operator sees the day they need it.
 
 ## 3. Design
 
-### 3.1 Pins gain a holder
+### 3.1 Archive pins are leases
 
-Archive mode cannot be built on the pin column as it stands. `blobs.pinned` is a
-boolean with no provenance, and the moment two things pin for two reasons the
-boolean cannot answer the only question that matters on removal: *may these
-bytes go now?*
+Content the archive is holding must be pinned. It cannot ride on
+`referenced_content` alone even though the rule is the same, for two reasons:
+the grace window means the archive holds roots the tree no longer references,
+and the ordinary retention clock is measured from the wrong event —
+`last_access` is stamped when an object is *written*, so an object fetched a
+year ago and superseded today is already cold and would go on the next pass with
+no grace at all.
 
-Three cases make this concrete:
-
-1. An operator pins `media/keynote.mp4`'s root by hand. The archive later covers
-   `media` and pins the same root. Removing the space from the archive must not
-   drop the operator's pin.
-2. Two archived spaces name the same content. Deduplication is real here —
-   objects are keyed by hash and `entries_by_content` is indexed for exactly
-   this — so `archive rm photos` must not release bytes `documents` still
-   covers.
-3. An archive under a `window=` policy releases a superseded root. It may
-   release only its own claim on it.
-
-So: replace the column with a table.
+So the archive pins what it holds, and the pin carries its own expiry:
 
 ```sql
 -- schema v20
 CREATE TABLE pins (
-  root       BLOB NOT NULL,
-  holder     TEXT NOT NULL,        -- 'operator' | 'archive:<space>'
-  created_at INTEGER NOT NULL,
+  root          BLOB NOT NULL,
+  holder        TEXT NOT NULL,       -- 'operator' | 'archive:<space>'
+  created_at    INTEGER NOT NULL,
+  release_after INTEGER,             -- NULL = held; set = leaving at this instant
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX pins_by_holder ON pins (holder);
+CREATE INDEX pins_by_release ON pins (release_after) WHERE release_after IS NOT NULL;
 ```
 
-and make pinnedness derived rather than stored, because a denormalized copy of
-this is a second source of truth for a question with one right answer. The GC
-predicate inside `delete_blob_if_collectable` changes from `pinned = 0` to a
-`NOT EXISTS` over `pins`, keeping the property that makes it correct today: the
-predicate is re-read inside the immediate transaction that does the delete, so a
-pin landing between the candidate snapshot and the delete decides the delete.
-`Store::pinned_blobs` becomes `SELECT DISTINCT root FROM pins`.
+A holder column rather than the current boolean, because the boolean cannot
+answer the only question that matters on release — *may these bytes go now?* —
+once more than one thing holds a root. Three cases make that concrete: an
+operator pins a root by hand and an archive later covers it; two archived spaces
+name the same content, which deduplicates to one object (`entries_by_content` is
+indexed for exactly this); and a release under the `tree` policy must drop one
+claim without touching another's.
 
-The migration backfills `('operator', now)` for every row with `pinned != 0` and
-drops the column. Nothing an operator pinned before the upgrade changes meaning.
+Pinnedness becomes derived rather than stored — a denormalized copy of it would
+be a second source of truth for a question with one right answer. The predicate
+inside `delete_blob_if_collectable` changes from `pinned = 0` to a `NOT EXISTS`
+over live `pins` rows, keeping the property that makes it correct today: it is
+re-read inside the immediate transaction that does the delete, so a pin landing
+between the candidate snapshot and the delete decides the delete. The migration
+backfills `('operator', NULL)` for every `pinned != 0` row and drops the column.
 
-`synch pin rm` removes the `operator` holder only, and says what remains:
+`synch pin rm` removes the `operator` holder only, and reports what remains:
 
 ```
 $ synch pin rm media/talks/keynote.mp4
-unpinned 9f86d081… (still held by archive:media)
+unpinned 9f86d081… (still held by archive:media until 2026-09-20)
 ```
 
-which is the honest report — the bytes are not going anywhere, and a command
-that said "unpinned" flat would be lying about the outcome the operator cares
-about.
-
 **Want is intent; a pin is possession.** An archive that has decided it needs an
-object it does not hold must not write a pin row for it: a pin whose bytes are
-absent guards nothing and makes `pin ls` a list of claims rather than of
-contents. The intent lives in its own table (§3.3) and becomes a pin in the same
-transaction that retires the want, once the fetch has completed.
+object it does not hold must not write a pin row for it — a pin whose bytes are
+absent makes `pin ls` a list of claims rather than of contents. Intent lives in
+its own table and becomes a pin in the transaction that retires it (§3.3).
 
 ### 3.2 Configuration: one row per archived space
 
 ```sql
 CREATE TABLE archives (
-  space      TEXT PRIMARY KEY,
-  policy     TEXT NOT NULL,        -- 'all' | 'current' | 'window=<secs>'
-  budget     INTEGER,              -- optional byte ceiling, NULL for none
-  added_at   INTEGER NOT NULL
+  space    TEXT PRIMARY KEY,
+  policy   TEXT NOT NULL,          -- 'tree' | 'all'
+  grace    INTEGER NOT NULL,       -- seconds a released root is still held
+  budget   INTEGER,                -- optional byte ceiling, NULL for none
+  added_at INTEGER NOT NULL
 );
 ```
 
-Per space, not per node, for the same reason mirrors are per directory: "archive
-everything this node can see" is a policy an operator can express by adding every
-space, and a node-wide flag would silently enrol spaces admitted later.
-
-The three policies are the deployable range between "keep one copy of now" and
-"keep the integral of all churn":
-
-- **`all`** — every version ever observed, released never. The literal reading of
-  archive mode, and the one whose storage curve is unbounded (§9).
-- **`current`** — every version *currently* named by some origin's entry, in
-  every origin's view, including versions no policy would select. Superseded
-  roots are released. This is not E1-with-gaps: the archive still fetches an
-  intermediate version the instant it sees it, and releases it only when the
-  promotion that supersedes it arrives. It differs from `all` in what it keeps,
-  not in what it notices.
-- **`window=<dur>`** — `current`, plus superseded roots for `dur` after they were
-  superseded. The setting most deployments actually want: "you can get last
-  month back".
-
-A release under `current` or `window=` deletes one row from `pins`. The object
-then survives or not on the ordinary rules — an entry may still name it, another
-holder may hold it — which is the point of the holder model.
+Per space, not per node, for the reason mirrors are per directory: "archive
+everything this node can see" is expressible by adding every space, while a
+node-wide flag would silently enrol spaces admitted later. A delegated archive
+can only add spaces its scope covers, which `materialization_scope` already
+decides — there is no path around it and none is added.
 
 ### 3.3 The want queue, resurrected
 
@@ -198,76 +208,74 @@ CREATE TABLE archive_want (
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX archive_want_by_attempt ON archive_want (last_attempt);
 ```
-
-Three properties earn the table, and none of them is served by an in-memory
-queue:
-
-- **Durable intent.** A version observed once and superseded before the next
-  sweep is not in any listing any more. If the intent to fetch it does not
-  survive a restart, E2 is not a guarantee, it is a hope about uptime.
-- **A place for failure to accumulate.** `attempts`, `last_attempt` and
-  `last_error` are what turn "the archive is behind" into "these 14 objects have
-  had no provider for six days", which is the alarm this whole feature exists to
-  raise (§8).
-- **Backpressure.** A promotion diff can name millions of roots. The staging
-  step must be one insert per changed leaf and nothing else; the fetching is a
-  separate loop with its own concurrency.
 
 `size` and `prev` are carried because the fetch needs both and neither survives
 the entry. `fetch_all_from` fetches *by* size — a bare root nobody holds even
 partially has none, which is the case `pin_object` refuses outright — and `prev`
-is the delta donor. Both are in the `FileEntry` that stages the want and are
-recorded there rather than looked up later, when the version may have been
-superseded and its row replaced.
+is the delta donor: `Node::donors_for` derives donors from the selected entry's
+`prev` and from the other versions in the set, and by the time the fetch loop
+reaches a want row those rows may be gone.
 
-**Priority is rarest-first.** The fetch loop orders candidates by how many
-distinct origins advertise a complete `BlobAd` for the root
-(`blob_providers`), ascending, then by `first_wanted`. An archive's job is to
-raise the floor on the number of copies, so the object with one advertised
-holder is worth more than the object with nine — and the object with one
-advertised holder is the one about to be lost when that holder leaves. Ties go
-to the oldest want, so nothing starves.
+Three properties earn a table rather than an in-memory queue:
 
-### 3.4 Two sources of work
+- **Durable intent.** A promotion diff naming four million roots is staged in
+  one transaction and fetched over days. Losing that on restart means
+  rediscovering it by full sweep every time.
+- **A place for failure to accumulate.** `attempts`, `last_attempt` and
+  `last_error` turn "the archive is behind" into "these 14 objects have had no
+  provider for six days", which is the alarm the whole feature exists to raise
+  (§8).
+- **Backpressure.** Staging must be one insert per changed leaf and nothing
+  else; fetching is a separate loop with its own concurrency.
+
+**Want rows self-clean.** A root that leaves the tree before the fetch loop
+reaches it is dropped from the queue rather than fetched and then released —
+which is both the cheaper order and the one that stops a churning path from
+generating permanent false entries in the `unreachable` count.
+
+**Priority is rarest-first.** Order by the number of distinct origins
+advertising a complete `BlobAd` for the root (`blob_providers`), ascending, then
+by `first_wanted`. An archive exists to raise the floor on the number of copies,
+so the object with one advertised holder is worth more than the object with
+nine — and it is the one about to be lost when that holder leaves. Ties go to
+the oldest want, so nothing starves.
+
+### 3.4 Two sources of work, and only one may release
 
 **Live: the promotion diff.** `Syncer::try_promote` flips a head to complete
 inside one transaction that also calls `materialize_diff`, which streams every
 resolved change under the origin's scope into `entries`. Archive mode adds one
-step to `apply_change`'s `f:` arm: when the entry carries a content root and its
-space is archived, insert an `archive_want` row.
+step to `apply_change`'s `f:` arm, in that same transaction:
 
-In that same transaction, deliberately. A want row that can be lost while the
-entry row lands is the one failure that costs a version permanently, and the
-argument is the one `gc_trie` already makes about splitting its pass: this is
-not tidiness, it is where the data loss is. The added cost is one insert per
-changed leaf, against a transaction that is already writing that leaf.
+- A change carrying a content root in an archived space **stages a want** — or,
+  if the root is already pinned with a `release_after` set, clears it. Content
+  that comes back is content that stays: the same root can reappear because
+  another origin still published it, because a `take` adopted it, or because a
+  file was restored from a copy.
+- A change that *replaces or removes* a root **sets `release_after = now +
+  grace`** on the archive's pin for the old root — but only after confirming no
+  other current entry still names it. The check is one indexed lookup
+  (`entries_by_content`) and it is what makes deduplication safe: two paths
+  sharing content release when the second one goes, not the first.
 
-Two things fall out for free, and both are consequences of pins being
-content-addressed rather than path-addressed:
-
-- **Deletion needs no handling.** A tombstone removes the entry; the pin on the
-  content root the path used to name is untouched, because it was never about the
-  path. The bytes of a deleted file survive in the archive with no special case
-  anywhere.
-- **`take`, adoption and divergence need no handling.** Every version any origin
-  publishes is a change in some origin's trie, so all of them arrive through the
-  same door. An archive holds both sides of a divergence without knowing what
-  divergence is.
+In the same transaction as the head flip, deliberately. A want row that can be
+lost while the entry row lands is a version that goes unfetched with nothing
+recording that it was ever wanted, and a release that lands while the entry row
+does not is bytes leaving on the strength of a change that did not happen. The
+argument is the one `gc_trie` already makes about splitting its own pass: this
+is not tidiness, it is where the data loss is.
 
 **Reconciling: a periodic sweep.** A standing loop, in the mould of the mirror
-loop (`mirror_interval`, rung by the same promotion bell, with a backstop
-interval). It walks `entries` for archived spaces and stages a want for every
-content root that has no pin row and no want row.
+loop (its own interval, rung early by the same promotion bell). It walks
+`entries` for archived spaces and stages a want for every content root with no
+pin and no want row. It covers a space added after the fact, promotions that
+happened while archive mode was off, a views rebuild, and whatever the live path
+gets wrong.
 
-The sweep is not redundant with the live path. It covers: a space added to the
-archive after the fact, promotions that happened while archive mode was off or
-the space was not yet archived, a views rebuild (`synch doctor --rebuild`), and
-whatever the live path gets wrong. It is a scan of current entries — bounded by
-the size of the tree, not by its history — and it is the reason an operator can
-turn archive mode on for an existing cluster and have it converge without
-anything special being done.
+The sweep may **stage**, and it may **release only under §3.6**. Staging from
+absence is safe — the worst case is fetching something already held. Releasing
+from absence is not, and that asymmetry is the next section.
 
 ### 3.5 The fetch loop
 
@@ -275,82 +283,114 @@ A third standing task, separate from both, because it is the only one that
 touches the network and the only one that should be rate-limited:
 
 1. Take up to `archive_concurrency` want rows in priority order, skipping rows
-   whose `last_attempt` is inside a backoff derived from `attempts`.
-2. For each, `fetch_all_from(root, size, donors)` — the ordinary §6.4 path, so
-   delta descent, provider fanout and resumption all apply unchanged. This is
-   the best case for the descent and an archive hits it constantly: it is
-   fetching version *n+1* of a file whose version *n* it is guaranteed to hold.
-   The donor has to be recorded at staging time, though, not rediscovered here:
-   `Node::donors_for` derives donors from the selected entry's `prev` and from
-   the other versions in the set, and by the time the fetch loop reaches a want
-   row those entries may be gone. Hence the `prev` column.
+   inside a backoff derived from `attempts`.
+2. `fetch_all_from(root, size, donors)` — the ordinary §6.4 path, so delta
+   descent, provider fanout and resumption apply unchanged. This is the best
+   case for the descent and an archive hits it constantly: it is fetching
+   version *n+1* of a file whose version *n* it is guaranteed to hold.
 3. On completion: delete the want row and insert the pin row, in one
    transaction.
 4. On failure: increment `attempts`, record `last_error`, leave the row.
 
-Between the fetch's last commit and the pin insert there is a window in which the
-object is complete, possibly unreferenced, and unpinned. It survives it for the
-reason `pin_object` already relies on: the fetch stamped `last_access`, so the
-retention test in `gc_content` holds it. Worth stating rather than discovering
-later, and worth a test that runs a GC pass in that window.
+Between the fetch's last commit and the pin insert the object is complete,
+possibly unreferenced, and unpinned. It survives the window for the reason
+`pin_object` already relies on — the fetch stamped `last_access`, so the
+retention test holds it — and that deserves a test that runs a GC pass inside
+the window rather than a paragraph asserting it.
 
-### 3.6 History retention becomes a role property
+### 3.6 Eviction discipline: absence is not evidence
 
-An archive that prunes `head_history` at seven days holds bytes it can no longer
-explain. `synch log` walks retained roots to show a path's versions; the trie
-mark set is built from complete and pending heads plus retained history roots, so
-pruning history is also what sweeps the historical trie nodes. The objects would
-survive on their pins and nothing would be able to say what any of them was.
+An archive's eviction is the ordinary `gc_content` pass. What archive mode adds
+is a rule about **who is allowed to conclude that a root left the tree**, and it
+is the one piece of this design that has to be right.
 
-So an archive node sets `root_retention` to never prune. The knob is node-wide
-today, and this design keeps it node-wide rather than inventing per-origin
-retention: the thing being retained is trie nodes and head rows, which are small
-beside content, and the complexity of a per-origin policy buys an archive
-nothing it wants.
+> A release is driven by an **observed change**. Absence of a reference is not,
+> by itself, evidence that a reference was removed.
 
-This is what makes an archive answer the interesting question. DESIGN.md §8 says
-history depth is a storage policy rather than a protocol constant; an archive is
-the node that sets that policy to *keep it*, and having done so it can answer
-"what did this path look like in March" from its own store, for every origin, with
-the signed roots to prove each answer.
+The live path (§3.4) always has positive evidence: a diff said this leaf
+changed, and the lookup said nothing else names the old root. The sweep has only
+absence — `entries` does not name this root *now* — and there are at least three
+routine ways for `entries` to stop naming something that is not a deletion:
 
-Which surfaces a gap in the CLI: there is no read-by-root. `synch log` prints
-content roots, `synch pin add <root>` is the only command that takes one, and
-DESIGN.md §8 says reading an old version back "is done by content root, not by a
-time-travel flag" — but nothing implements the former. Archive mode should ship
-`synch cat --root <hex>` and `synch get --root <hex>`, or it is a machine that
-holds history nobody can read. This is small (the fetch and verify paths are
-root-keyed already) and it is not optional.
+- **`Store::set_read_scope`.** A scope change throws away every foreign origin's
+  `entries` and `blob_providers` rows by design and drops every foreign complete
+  head back to pending, because derived state whose premise changed is
+  discarded rather than reconciled. For a moment the archive's view of the tree
+  is *empty*. An absence-driven release at that moment would evict the entire
+  store.
+- **`Store::rematerialize`** (`synch doctor --rebuild`). Deletes an origin's
+  entries and rebuilds them from the trie. The comment on it already records
+  that a mirror pass reading in that window unlinks the user's files; a GC pass
+  reading in that window would do the same to the CAS.
+- **A member removed, a binding lapsed, an origin not yet synced.** The rows are
+  gone or were never there. The content is not garbage; this node's knowledge is
+  incomplete.
 
-### 3.7 Backfill: narrowing E2 toward E3
+So the sweep may release only from a **complete view**, and all three
+preconditions are locally checkable:
 
-Best-effort, bounded, and off by default.
+1. Every origin with a live binding has a complete head materialized — none
+   sitting pending, none stale beyond a threshold.
+2. The read scope has not changed since the last successful anti-entropy round
+   with each peer.
+3. No rebuild is in flight.
 
-When an archive adopts an origin whose `head_history` shows seq gaps — it
-learned of seq 45 having last seen seq 40 — it may ask peers for the roots at
-41…44 and walk their tries for content it lacks. The constraint is a rule
-already enforced on the serving side: a peer answers `GetNodes`/`GetValues` only
-for a root it holds a head for, so backfill reaches exactly as far as some peer's
-own retained history, and no further.
+If any fails, the sweep stages as usual and releases nothing, and says why in
+`archive status` and `synch doctor`. Holding too much for a day is a cost;
+releasing the last copy of something is not recoverable, and the asymmetry
+should be visible in the code as plainly as it is here.
 
-This does not close the gap to E3 and must not be described as if it does. It
-converts "the archive was down for six hours" from a permanent hole into a
-recoverable one, provided some peer that was up still holds those roots. It
-belongs in a later phase than the rest.
+Two further brakes, both strictly conservative:
+
+- **Under-replication delays a release.** An archive that is about to let a root
+  go may check how many distinct origins advertise a complete `BlobAd` for it
+  and hold on if the answer is too few. This uses peers' claims only to *keep*
+  bytes, never to drop them, which is the safe half of §4.2's invariant.
+- **A release is never a delete.** Setting `release_after` schedules the pin's
+  removal; the object then faces the ordinary GC rule like anything else. If a
+  current entry still names it — because another origin published the same
+  bytes — it stays, and nothing special had to notice.
+
+### 3.7 History: roots without bytes
+
+Under the `tree` policy an archive is not a time machine, and the documentation
+should not let anyone believe otherwise. `synch log` will keep showing every
+version's seq and content root for as long as the retained head history goes
+back, and the *bytes* of superseded versions will be gone once grace expires.
+Roots without bytes.
+
+That is the correct trade for the default and it is worth being loud about,
+because the failure is silent: the log looks complete, and the read fails.
+`synch log` should mark which versions the local store can still serve.
+
+Head history is still worth retaining longer on an archive than on a laptop —
+it is what `synch log`, fork evidence (§4.4) and the whole provenance story rest
+on, and trie nodes are small beside content. But it is now a separate decision
+from content retention rather than the same one, and `root_retention` keeps its
+current job.
+
+Which leaves a gap in the CLI either way. There is no read-by-root: `synch log`
+prints content roots, `synch pin add <root>` is the only command that takes one,
+and DESIGN.md §8 says reading an old version back "is done by content root, not
+by a time-travel flag" — but nothing implements the former. `synch cat --root
+<hex>` and `synch get --root <hex>` are small (the fetch and verify paths are
+root-keyed already), and without them an `all` archive is a machine holding
+history nobody can read.
 
 ### 3.8 The budget, and what "full" does
 
-`archives.budget` is an optional ceiling on bytes held on behalf of that space.
-When it is reached:
+`archives.budget` is an optional ceiling on bytes held for a space. When it is
+reached the fetch loop stops taking new work for that space, want rows stay —
+they are the record of what is missing, and dropping them converts a storage
+problem into a silent data-loss problem — and `archive status` and `synch
+doctor` report the shortfall in objects and bytes.
 
-- The fetch loop stops taking new work for that space.
-- Want rows stay. They are the record of what is missing, and dropping them
-  would convert a storage problem into a silent data-loss problem.
-- `archive status` and `synch doctor` report the shortfall in bytes and objects.
-- **Nothing is ever unpinned to make room.** An archive that evicts under
-  pressure is a cache with a misleading name. The failure mode of a full archive
-  must be "it stopped taking new things and said so", never "it quietly dropped
-  the oldest thing".
+**Reaching the budget never accelerates a release.** Under `tree` the release
+schedule is the tree's, not the disk's; an archive that shortened its grace
+window because it was full would drop the recovery story exactly when the
+operator was least likely to be watching. Full means "stopped taking new
+things, loudly", and the remedy is more disk or a shorter configured grace, both
+of which are decisions rather than side effects.
 
 An object larger than the remaining budget is skipped, not dropped: it stays
 wanted and is retried when the budget rises.
@@ -365,111 +405,108 @@ An archive may declare what it archives, in its own signed trie, under a new key
 prefix:
 
 ```
-a:<space>   ->   ArchiveClaim { v, since_ns, policy, objects, bytes, complete }
+a:<space>   ->   ArchiveClaim { v, since_ns, policy, grace, objects, bytes, complete }
 ```
 
-A new prefix rather than a field on `SpaceInfo` (`m:space/<id>`), and the reason
-is compatibility, not taste. postcard is not self-describing and every record
-carries a version stamp that older builds check with `v <= RECORD_VERSION`, so
-appending a field to `SpaceInfo` means bumping `RECORD_VERSION` to 2 and having
-every 0.1.x node *refuse* the record — a flag day for a feature that should be
-additive. An unknown key prefix, by contrast, already falls through
-`apply_change` to `Ok(())`: existing builds ignore `a:` records completely and
-keep materializing everything else in the trie.
+A new prefix rather than a field on `SpaceInfo` (`m:space/<id>`), for
+compatibility rather than taste. postcard is not self-describing and every
+record carries a version stamp checked with `v <= RECORD_VERSION`, so appending
+a field to `SpaceInfo` means bumping the stamp and having every 0.1.x node
+*refuse* the record — a flag day for a feature that should be additive. An
+unknown key prefix already falls through `apply_change` to `Ok(())`: existing
+builds ignore `a:` records and keep materializing everything else in the trie.
 
 For a delegate, `a:` must be added to `publish_prefixes` for its granted spaces
 and to the read scope, or a delegated archive cannot claim what it archives. The
-argument is the one already made for `b:`: a delegate that holds content must be
-able to say so, or the swarm loses a source.
+argument is the one already made for `b:` — a delegate that holds content must
+be able to say so, or the swarm loses a source.
 
-With claims published, `synch archive status` can answer the question an operator
-actually asks — *is anything archiving `media`, and how far behind is it?* —
-across the cluster rather than on one box.
+With claims published, `archive status` can answer the question an operator
+actually asks — *is anything archiving `media`, with what grace, and how far
+behind is it?* — across the cluster rather than on one box.
 
 ### 4.2 Enforcement is not
 
 No node can make another node retain anything, and this design does not pretend
-otherwise. A claim is an assertion by a member, in exactly the sense §12 already
-accepts for `mtime_ns` and for `BlobAd`: a member with a full disk, a bug, or bad
-intent can claim a coverage it does not have.
+otherwise. A claim is an assertion by a member, in the sense §12 already accepts
+for `mtime_ns` and for `BlobAd`: a member with a full disk, a bug, or bad intent
+can claim coverage it does not have. Hence:
 
-Which yields the invariant that keeps the feature safe:
+> **A peer's claim may order this node's work, and may cause it to keep bytes.
+> It may never cause it to drop them.**
 
-> **A peer's claim may order this node's work. It may never release this node's
-> bytes.**
-
-Rarest-first (§3.3) uses provider counts to decide what to fetch *first*.
-Nothing anywhere uses another node's claim, ad, or count to decide what to
-unpin. An archive that trusted claims for release decisions would give any member
-the ability to talk the cluster's last copy out of existence, and it would do so
-through the same door that a plain bug in somebody's disk-full handling opens.
+Rarest-first (§3.3) uses provider counts to decide what to fetch first;
+under-replication (§3.6) uses them to *delay* a release. Neither direction lets
+another node's statement shorten this node's holdings. An archive that trusted
+claims for release decisions would hand any member the ability to talk the
+cluster's last copy out of existence, through the same door that a plain bug in
+somebody's disk-full handling opens.
 
 ### 4.3 Cooperative k-replication, deferred
 
 The obvious next step — several archives sharing a space, each holding a subset,
 targeting *k* copies cluster-wide — is DESIGN.md §13's "keep ≥ 2 replicas of
-every object cluster-wide", and it should be built after single-node archiving
-has run somewhere for a while.
+every object cluster-wide", and it should wait until single-node archiving has
+run somewhere for a while.
 
-The mechanism is available (`blob_providers` carries per-origin complete/partial
-spans). The hazard is specific and worth writing down before anyone implements
-it: *k* as a **floor on fetching** is safe, and *k* as a **licence to release**
-is how a pool of archives converges on zero copies — every member observing that
-"the others have it" at the same moment as the others observe the same thing.
-Against a partition, that observation is wrong for everybody simultaneously.
-
-So the shape, when it is built: an archive may decline to *start* a fetch while
-*k* distinct origins advertise complete ads, and may never release what it holds
-on those grounds. Deployments that want a hard floor run archives on `all` and
-count machines.
+The mechanism is available (`blob_providers` carries per-origin complete and
+partial spans). The hazard is specific and worth writing down before anyone
+implements it: *k* as a **floor on fetching** is safe, and *k* as a **licence to
+release** is how a pool of archives converges on zero copies — every member
+observing that "the others have it" at the same moment the others observe the
+same thing, and all of them wrong together during a partition. Deployments that
+want a hard floor run archives on every machine they are willing to pay for and
+count them.
 
 ## 5. Configuration
 
 | knob | default | what it is |
 |---|---|---|
-| `archives.policy` | `all` | per space: `all`, `current`, `window=<dur>` |
+| `archives.policy` | `tree` | per space: `tree` (release with the tree) or `all` (never release) |
+| `archives.grace` | 30 d | how long a root outlives the last entry naming it |
 | `archives.budget` | none | per space byte ceiling; stops fetching, never evicts |
 | `archive_interval` | 300 s | reconciling sweep backstop; the promotion bell rings it early |
 | `archive_concurrency` | 4 | concurrent object fetches for archive work |
 | `archive_backoff` | 60 s … 6 h | per-want retry schedule, exponential in `attempts` |
-| `root_retention` | 7 d, **never** on an archive | §3.6 |
+| `root_retention` | 7 d | unchanged; head history depth, now independent of content |
 
-Archive fetches share the node's endpoint with anti-entropy and with foreground
-reads, and nothing schedules between them today — DESIGN.md §13 lists bandwidth
-QoS as future work. `archive_concurrency` is the crude lever in the meantime, and
-its default is deliberately low: an archive that saturates the link it shares
-with the cluster's actual users is a worse problem than an archive that converges
-overnight.
+Archive fetches share the endpoint with anti-entropy and with foreground reads,
+and nothing schedules between them today — DESIGN.md §13 lists bandwidth QoS as
+future work. `archive_concurrency` is the crude lever in the meantime, and its
+default is deliberately low: an archive that saturates the link it shares with
+the cluster's actual users is a worse problem than one that converges overnight.
 
 ## 6. CLI surface
 
 ```
-synch archive add <space> [--policy all|current|window=<dur>] [--budget <size>]
+synch archive add <space> [--policy tree|all] [--grace <dur>] [--budget <size>]
 synch archive rm <space> [--release]
 synch archive ls
 synch archive status [<space>] [--json]
 synch archive sync                     run a reconciling sweep now
 ```
 
-`archive rm` keeps the pins by default and `--release` drops them. Releasing
-terabytes is not something a command should do because an operator typed the
-opposite of `add`.
+`archive rm` keeps the pins by default and `--release` drops them, because
+releasing terabytes should not follow from typing the opposite of `add`.
 
-`archive status` is the whole operator interface and should read like an answer,
-not a dump:
+`archive status` is the whole operator interface and should read like an answer:
 
 ```
-media   policy all   since 2026-03-04
-  held        1,284,551 objects   8.11 TiB
+media   policy tree   grace 30d   since 2026-03-04
+  held          412,880 objects   6.02 TiB   (covers every version in the tree)
+  releasing       1,204 objects  31.7 GiB   (oldest leaves in 3d)
   wanted            412 objects  10.4 GiB   (oldest 4m ago)
   unreachable        14 objects   2.1 GiB   ← no provider for 6d
-  history     retained from seq 1 for 7 origins
-  claims      nas@cluster.example.com (complete), vps@cluster.example.com (99.4%)
+  view          complete — releases are running
+  claims        nas@cluster.example.com (complete), vps@… (99.4%, claimed)
 ```
 
-The `unreachable` line is the one that matters and it must never be folded into
-`wanted`. Fourteen objects with no provider for six days is not a backlog, it is
-fourteen versions that are probably already gone; §8 covers what to do about it.
+Three of those lines exist to be read on a bad day. `unreachable` must never be
+folded into `wanted`: fourteen objects with no provider for six days is not a
+backlog, it is fourteen versions that are probably already gone. `releasing` is
+what an operator checks before deleting something they may want back.  And
+`view` says whether §3.6's preconditions hold, because "releases are paused" is
+the difference between an archive that is behaving and one that is broken.
 
 ## 7. What this deliberately does not do
 
@@ -477,146 +514,153 @@ fourteen versions that are probably already gone; §8 covers what to do about it
   tree. An operator who wants both runs a mirror beside it, and the mirror's
   reflink write means the tree costs no second copy of the bytes
   (`docs/DELTA-SYNC.md` §3.5).
-- **No erasure coding, no sharding within a space.** The unit is the object and
-  the copy is whole. Partial-object placement across archives is a different
-  design and a much larger one.
-- **No cross-cluster federation.** An archive archives spaces of its own
-  cluster, under its own membership. Pulling from a cluster you are not a member
-  of has no story here and should not acquire one by accident.
-- **No retention override of the trust rules.** An archive of a space it may not
-  read is not a thing: a delegate archives its granted spaces, and the
-  materialization scope already enforces that (§5.5).
-- **No eviction.** Ever, on any pressure, under any policy. Releases happen only
-  where the configured policy says a version has aged out, and never because
-  something ran out of room.
+- **No protection against deletion beyond the grace window**, under the default
+  policy. §2.2.
+- **No eviction to make room.** Storage pressure stops fetching; it never
+  shortens a release (§3.8).
+- **No release from absence of knowledge.** §3.6.
+- **No erasure coding, no partial-object placement.** The unit is the object and
+  the copy is whole.
+- **No cross-cluster federation.** An archive archives spaces of its own cluster
+  under its own membership.
+- **No retention override of the trust rules.** A delegated archive archives its
+  granted spaces, because `materialization_scope` decides what its `entries`
+  ever contained.
 
 ## 8. Failure modes
 
-- **Content nobody serves.** A want row that has failed with "no provider" for
-  longer than the alarm threshold means the last holder left before the archive
-  reached it. There is nothing the archive can do, so the whole value is in
-  saying so loudly and early: `archive status`, `synch doctor`, and a warning log
-  on each retry. The realistic mitigations are operational — archive nodes that
-  are up when members are, and more than one of them.
+- **Content nobody serves.** A want row failing with "no provider" past the
+  alarm threshold means the last holder left before the archive reached it.
+  Nothing can be done about it, so the value is entirely in saying so early —
+  `archive status`, `synch doctor`, a warning per retry. The realistic
+  mitigations are operational: archives that are up when members are, and more
+  than one of them.
+- **A partitioned or lagging archive.** Its view is incomplete, so §3.6 pauses
+  releases. It keeps fetching and keeps holding; it just stops making
+  irreversible decisions. This is the failure the discipline exists for and it
+  should be exercised by a test that partitions a node mid-sweep.
+- **A scope change or a rebuild.** Both empty `entries` transiently or by
+  design. Releases pause (§3.6); staging continues and re-derives.
+- **A member deletes everything.** The archive follows, after grace. This is
+  intended under `tree` and is why `--grace` is not a small decision. A
+  deployment that treats this as unacceptable runs `all`.
 - **A member fills the archive.** Any member can publish content and every
-  archive of that space will fetch it. This is the membership trust model working
-  as designed (§12: members are trusted to publish), but it is worth a per-origin
-  byte counter in `archive status` so the operator can see *whose* content grew,
-  and it argues for `--budget` being set on any archive facing a large
-  membership.
-- **A views rebuild.** `doctor --rebuild` drops and re-materializes `entries`.
-  Pins are content-addressed and live in their own table, so nothing is
-  released; want rows re-derive from the next sweep. This is the case that
-  justifies the sweep existing even after the live path works.
-- **Clock skew.** Pins do not expire, so retention has no clock dependence.
-  `window=` policies do — they compare a supersession time to a duration — and
-  should use `Store::read_instant` rather than the bare clock, for the same
-  reason mirror passes do.
-- **The archive is also a publisher.** Nothing prevents it, and the interaction
-  is benign: its own content is referenced by its own entries and pinned by the
-  archive besides. Worth a test, not a rule.
-- **Two archives, one machine.** Two daemons on one data directory is already
-  refused; two archives of the same space in one daemon is one row in `archives`.
-  No new case.
+  archive of that space fetches it. That is the membership trust model working
+  as designed (§12: members are trusted to publish), but it argues for
+  `--budget` on any archive facing a large membership, and for a per-origin byte
+  breakdown in `archive status` so the operator can see whose content grew.
+- **Clock skew.** `release_after` is an instant, so a backwards clock delays
+  releases and a forwards one advances them. It should be compared against
+  `Store::read_instant` rather than the bare clock, for the reason mirror passes
+  already do, and a release should never fire from a reading the trust floor
+  rejects.
+- **The archive is also a publisher.** Benign — its own content is referenced by
+  its own entries. Worth a test, not a rule.
 
 ## 9. Cost model
 
-The number an operator needs before turning this on, and it is not the size of
-the tree.
+The `tree` policy is what makes this arithmetic tractable, and the comparison
+with the alternative is the argument for it.
 
-Take a cluster with 8 TiB of current content across 40 members, where 2% of
-paths are rewritten daily and the average rewritten object is 40 MiB. Daily churn
-is then roughly 160 GiB of *new* roots, of which delta sync moves only the
-changed spans — but the archive **stores** whole objects, because an object is
-the unit of a pin.
+Take a cluster with 8 TiB of current content across 40 members, 2% of paths
+rewritten daily, average rewritten object 40 MiB — so roughly 160 GiB of new
+roots a day.
 
 | policy | steady state after a year |
 |---|---|
-| `current` | ≈ 8 TiB, flat, tracking the tree |
-| `window=30d` | ≈ 8 TiB + 30 × 160 GiB ≈ 12.7 TiB, flat after 30 days |
-| `all` | 8 TiB + 365 × 160 GiB ≈ 65 TiB, and still climbing |
+| `tree`, grace 7 d | ≈ 8 TiB + 7 × 160 GiB ≈ 9.1 TiB, flat |
+| `tree`, grace 30 d | ≈ 8 TiB + 30 × 160 GiB ≈ 12.7 TiB, flat |
+| `all` | 8 TiB + 365 × 160 GiB ≈ 65 TiB, still climbing |
 
-So: `all` costs the *integral of churn*, not the size of the tree, and the
-integral does not converge. That is not an argument against `all` — it is what
-"keep every version forever" means, and some deployments genuinely want it — but
-it must be on the first page of the operator documentation and in the output of
-`archive add`, which should print the current tree size and the last 30 days'
-observed churn before it agrees.
+`tree` converges: it costs the tree plus one grace window of churn, and adding a
+year changes nothing. `all` costs the integral of churn and has no steady state
+at all — which is what "keep every version forever" means, and some deployments
+genuinely want it, but it should be chosen with that table in front of the
+operator. `archive add --policy all` should print the current tree size and the
+last 30 days' observed churn before it agrees.
 
-Delta sync helps the network and not the disk here. Fetching version *n+1* of a
-file whose version *n* is pinned locally is the best case for the descent
-(§3.5 of `docs/DELTA-SYNC.md`), so an archive's *bandwidth* tracks changed
-spans. Its *storage* tracks whole objects. On btrfs/XFS/bcachefs the CAS write
-does not reflink between distinct objects, so nothing recovers that on disk in
-v1; whether the promotion path could clone shared extents into the new payload
-is an open question (§12).
+Note that the tree is larger than "the size of the data": every origin's version
+of every divergent path is held, because all of them are current. A cluster with
+substantial two-way sharing pays for both sides of every divergence until it is
+resolved — which is correct, and is also the state `synch status` exists to make
+visible.
+
+Delta sync helps the network and not the disk. Fetching version *n+1* of a file
+whose version *n* is held is the best case for the descent
+(`docs/DELTA-SYNC.md` §3.3), so an archive's *bandwidth* tracks changed spans
+while its *storage* tracks whole objects. Whether the promotion path could clone
+shared extents into the new payload — turning storage into changed spans too, on
+filesystems that support it — is the largest available improvement to this table
+and is unexplored (§12).
 
 ## 10. Security
 
-- **An archive is a concentrated target.** It holds every version of everything
-  in its spaces, including versions the origins have since deleted — which
-  means an archive can serve content that every other node in the cluster has
-  forgotten, and a deletion is no longer a way to make bytes go away
-  cluster-wide. That is the intended behavior and it is also a data-handling
-  fact an operator must consent to. `archive add` should say it. At-rest
-  encryption remains delegated to OS disk encryption (§12), and per-space
-  content keys remain future work — an archive is a strong argument for
-  finishing them.
-- **Claims are assertions.** §4.2. A claim never releases another node's bytes,
-  and `archive status` should render peer claims as claims ("nas says
-  complete"), never as verified coverage.
-- **Backfill widens what this node asks for.** §3.7 walks historical roots, and
-  the serving-side rule (a root must be one the responder holds a head for) is
-  what keeps that from becoming an arbitrary-root oracle. The archive must not
-  acquire a way to ask for roots outside that rule.
-- **Scope holds.** A delegated archive archives its granted spaces only, because
-  `materialization_scope` decides what its `entries` ever contained. Archive mode
-  adds no path around that.
+- **An archive is a concentrated target.** It holds a whole copy of every
+  version of everything in its spaces. At-rest encryption remains delegated to
+  OS disk encryption (§12) and per-space content keys remain future work; an
+  archive is a strong argument for finishing them.
+- **A deleted file survives the grace window.** Under `tree` that is bounded and
+  stated; under `all` a deletion never removes the bytes from the archive, which
+  operators with deletion obligations must know before they choose it. This is
+  the strongest argument for `tree` being the default: the surprising behaviour
+  should be the one you opt into.
+- **Claims are assertions.** §4.2. `archive status` renders peer claims as
+  claims ("nas says complete"), never as verified coverage.
+- **Scope holds.** A delegated archive archives what it may read, and archive
+  mode adds no path around `materialization_scope`.
+- **Eviction is the dangerous verb.** Every code path that can set
+  `release_after` should be countable on one hand and each should be justified
+  where it is written, in the manner of `delete_blob_if_collectable`. A bug in
+  the fetch path costs bandwidth; a bug in the release path costs the data.
 
 ## 11. Implementation map
 
-Phases, in dependency order. Each lands on its own and leaves the tree working.
+Phases in dependency order. Each lands on its own and leaves the tree working.
 
-1. **Pin holders.** `pins` table, migration v20, GC predicate becomes `NOT
-   EXISTS`, `pin ls`/`pin rm` report holders. No new behavior; everything after
-   this depends on it.
-2. **Read by root.** `synch cat --root`, `synch get --root`. Independent of the
-   rest, useful immediately, and the thing that makes an archive readable.
-3. **The archive, sweep-driven.** `archives` table, `archive_want`, the
-   reconciling sweep, the fetch loop, `archive add|rm|ls|status|sync`. Policy
-   `all` only, no budget. At this point the feature works and its guarantee is
-   E1-plus-whatever-the-sweep-catches.
-4. **The live path.** Staging from `apply_change` inside the promotion
-   transaction. This is what upgrades the guarantee to E2, and it is one insert
-   plus a test that a doubly-rewritten path keeps both versions.
-5. **Policies and budget.** `current`, `window=`, release on supersession,
-   `--budget` and the full-archive reporting.
-6. **History as a role property.** `root_retention` never on an archive, `synch
-   log` over the retained depth, history figures in `archive status`.
-7. **Claims.** The `a:` prefix, `ArchiveClaim`, `publish_prefixes` for delegates,
-   peer coverage in `archive status`.
-8. **Backfill** (§3.7), then **cooperative k-replication** (§4.3) — the two that
-   should wait for operational experience.
+1. **Pin holders and leases.** `pins` table, migration v20, GC predicate becomes
+   `NOT EXISTS`, `pin ls`/`pin rm` report holders and pending releases. No new
+   behavior; everything after this depends on it.
+2. **Read by root.** `synch cat --root`, `synch get --root`. Independent,
+   useful immediately, and what makes an archive's contents reachable.
+3. **The archive, sweep-driven, hold-only.** `archives` table, `archive_want`,
+   the reconciling sweep, the fetch loop, `archive add|rm|ls|status|sync`.
+   Policy `all` semantics — nothing is released yet — so the risky half is
+   absent while the fetching half is proven.
+4. **The live path.** Staging and release-scheduling from `apply_change` inside
+   the promotion transaction, plus the `entries_by_content` check that makes
+   deduplication safe.
+5. **Release, with the discipline.** `tree` policy, grace, the §3.6
+   preconditions, `view` in `archive status`, and the partition test. This is
+   the phase to be slow about.
+6. **Budget and reporting.** `--budget`, per-origin breakdown, doctor lines.
+7. **Claims.** The `a:` prefix, `ArchiveClaim`, `publish_prefixes` for
+   delegates, peer coverage in `archive status`.
+8. **Under-replication brake**, then **cooperative k-replication** (§4.3) — the
+   two that should wait for operational experience.
 
 ## 12. Open questions
 
-- **Per-origin retention.** §3.6 keeps `root_retention` node-wide. A node that
-  archives one space of a fifty-space cluster retains every origin's whole
-  history for all of them. The trie is small, but "small" is doing work in that
-  sentence that nobody has measured.
+- **Is "archive" the right name?** Under `tree` this is a full replica of the
+  live tree with a recovery window, not an archive of record. `synch replicate`
+  would describe the default honestly and make `--policy all` read as the
+  exception it is. Renaming later is cheap now and expensive after the first
+  release.
 - **Extent sharing between versions.** An archive holds *n* and *n+1* of a large
-  object whose difference is small, and the delta descent already knows which
-  spans were promoted from the donor. Whether the CAS write could clone those
-  extents rather than copy them — turning the storage curve from whole objects
-  into changed spans on filesystems that support it — is the single largest
-  possible improvement to §9 and is unexplored.
+  object whose difference is small, and the descent already knows which spans
+  were promoted from the donor. Cloning those extents rather than copying them
+  would change §9's storage column from whole objects to changed spans on
+  filesystems that support it.
+- **How stale is "stale" in §3.6?** The completeness precondition needs a
+  threshold for how far behind an origin's head may be before releases pause. Too
+  tight and an archive with one flaky peer never releases anything; too loose and
+  the precondition stops meaning much.
 - **Should archives be preferred providers?** They hold everything, so ranking
-  them first in `providers_for` would make cold reads fast. It would also point
-  every cold read in the cluster at one machine. Probably the answer is "prefer
-  them last, as the backstop that always has it", but it needs measuring.
-- **Claim granularity.** `ArchiveClaim` as proposed carries counts. A per-space
-  digest that let two archives compare coverage without enumerating objects
-  would make §4.3 much easier, and looks like it wants to be a trie of its own.
+  them first in `providers_for` makes cold reads fast and points every cold read
+  in the cluster at one machine. Probably "prefer them last, as the backstop that
+  always has it", but it needs measuring.
+- **Claim granularity.** `ArchiveClaim` carries counts. A per-space digest that
+  let two archives compare coverage without enumerating objects would make §4.3
+  much easier, and looks like it wants to be a trie of its own.
 - **What `archive add` should refuse.** A space whose current size already
-  exceeds the free disk is an error at `add` time, not a surprise at 3am. The
-  check is easy; the policy for "it fits now and won't in a month" is not.
+  exceeds free disk is an error at `add` time, not a surprise at 3am. The check
+  is easy; the policy for "it fits now and will not in a month" is not.
