@@ -43,16 +43,48 @@ import util/id
 @external(erlang, "cp_crypto_ffi", "ed25519_verify_safe")
 fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 
-/// The tunnel protocol version this build speaks.
+/// The newest tunnel protocol version this build speaks.
 ///
-/// A mismatch is a refusal naming both versions, not a negotiation: protobuf
-/// keeps a field addition readable, but nothing makes a control plane that has
-/// not learnt a frame out of one that has.
-///
-/// v3 added the replication query. Both ends are deployed together or the
-/// attach is refused by a sentence naming both numbers, which is the point of
-/// checking rather than hoping.
+/// v2 added the delegations query, v3 the replication one. Each is additive on
+/// the wire, and the number exists because additive is not the same as safe: a
+/// daemon that meets a frame it has not learnt cannot decode it, and drops the
+/// connection rather than answering. What the version buys is knowing which
+/// questions a given daemon can be asked at all.
 pub const protocol_version = 3
+
+/// The oldest version this build still serves.
+///
+/// An attach settles on the **daemon's** version when it falls in this range,
+/// rather than demanding it equal ours. A node whose operator has not upgraded
+/// keeps its tunnel and goes on answering everything its version defines; it
+/// is simply never asked a question that came later (see `speaks`). Refusing
+/// it outright would take the whole browse surface away from an org to add a
+/// panel, which is a bad trade for the org and no safer for anyone.
+///
+/// Two, not one: v1 predates the delegations query, and the delegations route
+/// picks a session without consulting its version. Nothing at v1 can attach
+/// today, so the floor records that rather than reopening it.
+pub const min_protocol_version = 2
+
+/// The version a question first appeared in.
+///
+/// Every question here is one some older daemon cannot decode, so this is the
+/// table that says which. It is a function of the question rather than a flag
+/// on the session, because a new question is added by extending this — and
+/// forgetting to is a dropped tunnel rather than a compile error, which is
+/// exactly the kind of mistake to make impossible to overlook.
+pub fn introduced_in(question: Question) -> Int {
+  case question {
+    Ls(..) | Stat(..) | Resolve(..) -> 1
+    Delegations -> 2
+    Replication -> 3
+  }
+}
+
+/// Whether an attached daemon is new enough to be asked this.
+pub fn speaks(session: Session, question: Question) -> Bool {
+  session.version >= introduced_in(question)
+}
 
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
@@ -503,6 +535,12 @@ pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
 /// than failing the call: the answer to "what does the fleet replicate" is
 /// per node, so one node that cannot say is a fact about that node and not a
 /// reason to withhold the others.
+///
+/// **A daemon too old for the question is never sent it.** It could not decode
+/// the frame, and a frame it cannot decode ends its tunnel — so asking would
+/// cost an operator their whole browse surface to fill in one cell. It answers
+/// `outdated` here instead, which is a fact about that node like any other
+/// refusal.
 pub fn ask_all(
   sessions: List(Session),
   question: Question,
@@ -510,22 +548,39 @@ pub fn ask_all(
   let budget = per_node_timeout(list.length(sessions))
   let pending =
     list.map(sessions, fn(session) {
-      let reply = process.new_subject()
-      process.send(session.inbox, Query(question, reply))
-      #(session, reply)
+      case speaks(session, question) {
+        False -> #(session, None)
+        True -> {
+          let reply = process.new_subject()
+          process.send(session.inbox, Query(question, reply))
+          #(session, Some(reply))
+        }
+      }
     })
   list.map(pending, fn(entry) {
     let #(session, reply) = entry
-    let answer = case process.receive(reply, budget) {
-      Ok(answer) -> answer
-      Error(Nil) ->
-        Error(Refusal(
-          "unavailable",
-          "the attached daemon did not answer in time",
-        ))
+    let answer = case reply {
+      None -> Error(Refusal("outdated", outdated(session, question)))
+      Some(reply) ->
+        case process.receive(reply, budget) {
+          Ok(answer) -> answer
+          Error(Nil) ->
+            Error(Refusal(
+              "unavailable",
+              "the attached daemon did not answer in time",
+            ))
+        }
     }
     #(session, answer)
   })
+}
+
+fn outdated(session: Session, question: Question) -> String {
+  "this daemon speaks tunnel v"
+  <> int.to_string(session.version)
+  <> "; the question was added in v"
+  <> int.to_string(introduced_in(question))
+  <> " — upgrade the node to see this"
 }
 
 /// How long each daemon gets when several are asked together.
@@ -682,12 +737,19 @@ fn hello(
   case json.parse(body, hello_decoder()) {
     Error(_) -> refuse(conn, "invalid", "malformed hello")
     Ok(claim) ->
-      case claim.version == protocol_version {
+      // A range rather than equality: the attach settles on the daemon's
+      // version, and an older one keeps every question its version defines.
+      case
+        claim.version >= min_protocol_version
+        && claim.version <= protocol_version
+      {
         False ->
           refuse(
             conn,
             "version-mismatch",
             "this control plane speaks tunnel v"
+              <> int.to_string(min_protocol_version)
+              <> " to v"
               <> int.to_string(protocol_version)
               <> ", the daemon speaks v"
               <> int.to_string(claim.version),
@@ -750,7 +812,11 @@ fn proof(
               json.object([
                 #("t", json.string("attached")),
                 #("session", json.string(session.id)),
-                #("v", json.int(protocol_version)),
+                // The version settled on, which is the daemon's own — not this
+                // build's. An older daemon checks the echo against what it
+                // sent, so echoing ours would refuse exactly the connection
+                // the range above was widened to keep.
+                #("v", json.int(session.version)),
               ]),
             )
           mist.continue(Conn(..state, phase: Live(session)))

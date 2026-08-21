@@ -788,6 +788,16 @@ every other frame. Nothing is stored control-plane side — a stored count is
 stale the moment a fetch lands, and the tunnel is what makes storing it
 unnecessary.
 
+**A node too old for the question is not asked it, and does not lose its
+tunnel.** The frames are tagged, so a daemon that has not learnt this one
+cannot decode it, and a frame that does not decode ends the connection. That is
+what the protocol version is for: the attach settles on the *daemon's* version
+within a range the control plane serves, and each question records the version
+it appeared in. An older node keeps everything its own version defines and is
+simply never sent this — reported as "does not report replication" rather than
+as a node replicating nothing. Taking an org's whole browse surface away to
+fill in one panel would be a bad trade for the org and no safer for anyone.
+
 The one structural difference from the delegations query is who may answer.
 A delegation is a `d:` record every member holds, so any attached node speaks
 for the cluster. **Replication is a per-node decision**: one node replicates

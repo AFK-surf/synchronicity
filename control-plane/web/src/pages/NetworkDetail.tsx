@@ -412,11 +412,16 @@ function SpaceRow({
   )
 }
 
-/// The nodes that were asked and did not answer.
+/// The nodes that did not answer, and why.
 ///
 /// Listed rather than dropped: a daemon that could not say what it replicates
 /// leaves a hole in every count above, and a panel that quietly rendered the
 /// rest would be reporting a smaller fleet as though it were the whole one.
+///
+/// `outdated` reads differently from the rest and is worded so. A node running
+/// a tunnel version older than the replication query was never asked — asking
+/// would have ended its tunnel — so nothing is wrong with it beyond its age,
+/// and the fix is an upgrade rather than an investigation.
 function Unanswered({ nodes }: { nodes: NodeReplication[] }) {
   const silent = nodes.filter((node) => node.error !== '')
   if (silent.length === 0) return null
@@ -424,8 +429,9 @@ function Unanswered({ nodes }: { nodes: NodeReplication[] }) {
     <ul className="mt-2 space-y-1 text-xs text-neutral-500">
       {silent.map((node) => (
         <li key={node.origin}>
-          <span className="text-neutral-400">{node.device}</span> did not
-          answer: {node.message || node.error}
+          <span className="text-neutral-400">{node.device}</span>{' '}
+          {node.error === 'outdated' ? 'does not report replication' : 'did not answer'}
+          : {node.message || node.error}
         </li>
       ))}
     </ul>

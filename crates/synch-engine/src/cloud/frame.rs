@@ -14,23 +14,38 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The tunnel protocol version, carried in the hello and echoed on attach.
+/// The newest tunnel protocol version this daemon speaks, carried in the hello.
 ///
-/// A mismatch is a refusal naming both versions, the same posture
-/// `x-synch-control-version` takes on the local socket.
-///
-/// v2 added the delegations query. Additive on the wire, and bumped anyway: a
-/// v1 control plane asking a v2 daemon nothing new would work by luck, while a
-/// v2 control plane asking a v1 daemon for delegations would meet an
-/// undecodable frame and a dropped connection rather than a sentence naming
-/// the mismatch. The version check exists so the failure is the legible one.
-///
-/// v3 added the replication query, and is bumped for the same reason and no
-/// other. The two ends of this tunnel are deployed together or the attach is
-/// refused by a sentence naming both numbers, which is the whole posture: a
-/// frame one side has not learnt is not something the other can negotiate its
-/// way around.
+/// v2 added the delegations query, v3 the replication one. Each is additive on
+/// the wire, and the number exists because additive is not the same as safe:
+/// a frame an end has not learnt fails to decode, and a failed decode ends the
+/// connection rather than answering. The version is how the control plane
+/// knows which questions this daemon can be asked at all.
 pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The oldest settled version this daemon will serve under.
+///
+/// The control plane settles on the daemon's version when it can, so the usual
+/// echo is `PROTOCOL_VERSION`. Accepting a *lower* settled version is what
+/// makes this daemon work against a control plane older than it: this end only
+/// answers questions, so serving at v2 costs it nothing — it is asked less.
+/// Without the range, upgrading a node before its control plane would take
+/// that node's tunnel down, which is the wrong way round for a fleet where
+/// nodes belong to their operators.
+///
+/// Two, not one: v1 predates the delegations query, and a control plane that
+/// settled on v1 would be old enough that nothing in this tree has met one.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
+
+/// Whether this daemon will serve under the version a control plane settled on.
+///
+/// Named rather than left inline in the handshake's match guard so the range
+/// has one definition and a test can hold it to it: getting the ends wrong is
+/// either a tunnel that drops on upgrade or one that stays up while a frame
+/// goes undecoded, and neither announces itself.
+pub fn settles_at(version: u32) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
 
 /// The domain-separation tag an attach proof signs under.
 ///
@@ -487,6 +502,34 @@ mod tests {
         .unwrap();
         assert!(bare["delegations"][0]["not_after"].is_null());
         assert!(bare["delegations"][0]["note"].is_null());
+    }
+
+    /// A daemon serves under an older control plane, and refuses a version
+    /// neither end could have meant.
+    ///
+    /// The upgrade order in a real fleet is not chosen by anyone: nodes belong
+    /// to their operators, so a node may be newer than the control plane it
+    /// attaches to, or older. Both work, because this end only *answers* — a
+    /// lower settled version costs it nothing but questions it is not asked.
+    /// What must not happen is a settled version outside the range being taken
+    /// as agreement, since the frames that follow are then anyone's guess.
+    #[test]
+    fn a_daemon_serves_the_versions_it_still_speaks() {
+        assert!(settles_at(PROTOCOL_VERSION), "its own, the ordinary case");
+        assert!(
+            settles_at(MIN_PROTOCOL_VERSION),
+            "and the oldest it still serves — an older control plane is a \
+             control plane, not a fault"
+        );
+        assert!(
+            !settles_at(MIN_PROTOCOL_VERSION - 1),
+            "below the floor is a version this build has no frames for"
+        );
+        assert!(
+            !settles_at(PROTOCOL_VERSION + 1),
+            "and above its own is a control plane that will ask questions this \
+             daemon cannot decode — which ends the tunnel, so it must not attach"
+        );
     }
 
     /// The replication answer's field names are the contract, for the same

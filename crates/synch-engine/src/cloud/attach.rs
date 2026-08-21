@@ -19,8 +19,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cloud::frame::{
-        attach_signing_input, encode_chunk, DelegationJson, Down, EntryJson, ReplicaSpaceJson, Up,
-        VersionJson, MAX_CHUNK, NONCE_LEN, PROTOCOL_VERSION,
+        attach_signing_input, encode_chunk, settles_at, DelegationJson, Down, EntryJson,
+        ReplicaSpaceJson, Up, VersionJson, MAX_CHUNK, MIN_PROTOCOL_VERSION, NONCE_LEN,
+        PROTOCOL_VERSION,
     },
     error::{EngineError, Result},
     node::Node,
@@ -365,13 +366,28 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
         .await?;
 
         match receive(&mut stream).await? {
-            Down::Attached { session, v } if v == PROTOCOL_VERSION => {
-                tracing::info!(domain, session, url, "cloud attach established");
+            // A range rather than equality. The control plane settles on this
+            // daemon's version when it can, so the ordinary echo is ours; a
+            // lower one means an older control plane, and serving under it
+            // costs this end nothing but questions it will not be asked.
+            Down::Attached { session, v } if settles_at(v) => {
+                if v != PROTOCOL_VERSION {
+                    tracing::info!(
+                        domain,
+                        session,
+                        url,
+                        settled = v,
+                        speaks = PROTOCOL_VERSION,
+                        "cloud attach established on an older tunnel version"
+                    );
+                } else {
+                    tracing::info!(domain, session, url, "cloud attach established");
+                }
             }
             Down::Attached { v, .. } => {
                 return Err(EngineError::invalid(format!(
-                    "tunnel protocol mismatch: this daemon speaks v{PROTOCOL_VERSION}, \
-                     the control plane settled on v{v}"
+                    "tunnel protocol mismatch: this daemon speaks v{MIN_PROTOCOL_VERSION} to \
+                     v{PROTOCOL_VERSION}, the control plane settled on v{v}"
                 )))
             }
             Down::Err { code, message, .. } => {

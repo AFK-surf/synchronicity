@@ -97,6 +97,14 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   replicating nothing. Nothing is stored: a held-object count is stale the
   moment a fetch lands, and the tunnel is what makes storing it unnecessary.
 
+  **The tunnel version is negotiated, not required to match.** An attach
+  settles on the daemon's version when it falls in the range this build serves
+  (v2 to v3 today), and each question records the version it appeared in. So a
+  node whose operator has not upgraded keeps its tunnel and everything its own
+  version defines, and is never sent a frame it could not decode — a frame that
+  fails to decode ends a connection, which is why the number exists at all.
+  Such a node shows in the replication panel as one that does not report it.
+
   The record names **every node** of the deployment, one `v=synccp1 url=`
   each (`CP_ENDPOINTS` on the primary), and a daemon opens a tunnel to all of
   them. It has to: the registry of open tunnels is one process's memory, so a

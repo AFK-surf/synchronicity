@@ -532,6 +532,31 @@ pub fn a_node_that_refused_is_not_counted_as_replicating_nothing_test() {
   assert browse_api.replica_counts([silent]) == []
 }
 
+/// A daemon older than a question is never sent it.
+///
+/// The frame would not decode, and a frame that does not decode ends the
+/// tunnel — so asking an old node one new question would cost its operator the
+/// whole browse surface. Its version is what says which questions it can take,
+/// which is the only reason the number is bumped at all.
+pub fn an_old_daemon_is_asked_only_what_its_version_defines_test() {
+  let current = session("nas", "nas@x.example")
+  let old = agent.Session(..current, version: 2)
+
+  assert agent.speaks(current, agent.Replication)
+  assert !agent.speaks(old, agent.Replication)
+  // And it keeps everything its own version defines, which is the point of
+  // admitting it rather than refusing the attach.
+  assert agent.speaks(old, agent.Delegations)
+  assert agent.speaks(old, agent.Ls("media", "", "", False))
+
+  // The table is per question, so a version this build has never issued is
+  // still ordered against the questions correctly.
+  assert agent.introduced_in(agent.Replication)
+    > agent.introduced_in(agent.Delegations)
+  assert agent.introduced_in(agent.Delegations)
+    > agent.introduced_in(agent.Stat("media", "a"))
+}
+
 /// Asking every daemon must not cost a full timeout per daemon: the questions
 /// go out together, so the budget is shared rather than laid end to end.
 pub fn asking_a_fleet_does_not_multiply_the_wait_test() {

@@ -273,6 +273,10 @@ export interface ReplicaSpace {
 /// a node that could not be asked have identical counts and call for entirely
 /// different actions, so they are told apart by this field and not by reading
 /// the numbers.
+///
+/// `outdated` is its own case: the node speaks a tunnel version older than the
+/// replication query, so it was never asked — asking would have ended its
+/// tunnel. Nothing is wrong with it beyond its age.
 export interface NodeReplication {
   device: string
   origin: string
