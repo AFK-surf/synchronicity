@@ -444,8 +444,9 @@ impl Store {
     /// `scope set` landing between it and this update commits `set_read_scope`'s
     /// wholesale delete of every foreign origin's entries, after which this
     /// would schedule a release for every root only those entries named. As one
-    /// statement the two cannot separate. [`Node::view_state`] answers the same
-    /// question for reporting, and says *why* when the answer is no.
+    /// statement the two cannot separate. `synch_engine`'s `Node::view_state`
+    /// answers the same question for reporting, and says *why* when the answer
+    /// is no. (Named rather than linked: the dependency runs the other way.)
     pub fn schedule_stale_releases(&self, holder: &PinHolder, at: i64) -> Result<usize> {
         Ok(self.conn().execute(
             &format!(
