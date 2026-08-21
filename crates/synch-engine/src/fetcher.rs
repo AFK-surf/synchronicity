@@ -256,7 +256,12 @@ impl Node {
                      fetch knows the object's size"
                 )));
             };
-            self.fetch_all(root, size).await?;
+            let fetched = self.fetch_all(root, size).await?;
+            if !fetched.complete {
+                return Err(EngineError::NotFound(format!(
+                    "no provider could supply the complete object {root}; it was not pinned"
+                )));
+            }
         }
         self.finalize_cloud_object(root, true).await?;
         let pinned = {
@@ -269,7 +274,36 @@ impl Node {
                 "object {root} left the store before it could be pinned"
             )));
         }
+        if self.config().cloud.is_some() {
+            let node = self.clone();
+            let root = *root;
+            let change = crate::blocking::offload(move || node.ad_change(&root)).await?;
+            if let Some(change) = change {
+                self.stage([change]);
+                self.flush_staged().await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Removes a pin and durably retires its b-only recovery record.
+    pub async fn unpin_object(&self, root: &Hash) -> Result<bool> {
+        let store = self.store().clone();
+        let root_value = *root;
+        let removed =
+            crate::blocking::offload(move || Ok(store.set_pinned(&root_value, false)?)).await?;
+        if removed && self.config().cloud.is_some() {
+            let store = self.store().clone();
+            let root_value = *root;
+            let referenced =
+                crate::blocking::offload(move || Ok(store.content_is_referenced(&root_value)?))
+                    .await?;
+            if !referenced {
+                self.stage([(synch_core::blob_key(root), None)]);
+                self.flush_staged().await?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Fetches specific chunk groups (§6.4).
@@ -494,20 +528,23 @@ impl Node {
         let Some(config) = self.config().cloud.as_ref() else {
             return Ok(());
         };
-        if pin && config.upload_policy == synch_store::cloud::CloudUploadPolicy::Own {
+        let (size, durable) = {
+            let (store, root) = (self.store().clone(), *root);
+            crate::blocking::offload(move || {
+                store
+                    .blob(&root)?
+                    .map(|row| (row.size, row.durable))
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!("no local object with root {root}"))
+                    })
+            })
+            .await?
+        };
+        if pin && !durable && config.upload_policy == synch_store::cloud::CloudUploadPolicy::Own {
             return Err(EngineError::invalid(
                 "cas.cloud.upload=own refuses a durability pin for peer-fetched content; use own+pinned or all",
             ));
         }
-        let size = {
-            let (store, root) = (self.store().clone(), *root);
-            crate::blocking::offload(move || {
-                store.blob(&root)?.map(|row| row.size).ok_or_else(|| {
-                    EngineError::NotFound(format!("no local object with root {root}"))
-                })
-            })
-            .await?
-        };
         Ok(self.cas_backend().finalize(*root, size).await?)
     }
 
@@ -1131,7 +1168,8 @@ impl Node {
         Ok(self
             .store()
             .blob(root)?
-            .map(|b| b.verified_groups())
+            .filter(|blob| !blob.quarantined)
+            .map(|blob| blob.verified_groups())
             .unwrap_or_else(ChunkRanges::empty))
     }
 
@@ -1355,7 +1393,7 @@ mod tests {
             scratch_dir: data.path().join("cloud-scratch"),
             io_timeout: std::time::Duration::from_secs(5),
             upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
-            cache_bytes: None,
+            cache_bytes: Some(512 * 1024 * 1024),
         });
         let node = Node::open(config).await.unwrap();
         let payload = vec![41u8; 100_000];
@@ -1363,6 +1401,10 @@ mod tests {
         let before = node.store().blob(&root).unwrap().unwrap();
         assert!(before.complete);
         assert!(!before.durable);
+        assert_eq!(
+            node.ad_change(&root).unwrap(),
+            Some((synch_core::blob_key(&root), None))
+        );
 
         node.pin_object(&root, Some(payload.len() as u64))
             .await
@@ -1370,6 +1412,22 @@ mod tests {
         let after = node.store().blob(&root).unwrap().unwrap();
         assert!(after.pinned);
         assert!(after.durable);
+        assert!(node
+            .store()
+            .providers(&root)
+            .unwrap()
+            .into_iter()
+            .any(|(origin, ad)| origin == *node.origin() && ad.is_complete()));
+        assert!(node.unpin_object(&root).await.unwrap());
+        assert!(!node.store().blob(&root).unwrap().unwrap().pinned);
+        assert!(!node
+            .store()
+            .providers(&root)
+            .unwrap()
+            .into_iter()
+            .any(|(origin, _)| origin == *node.origin()));
+        node.reconstruct_recovered_cloud_rows().await.unwrap();
+        assert!(!node.store().blob(&root).unwrap().unwrap().pinned);
         assert_eq!(
             node.cas_backend()
                 .read_range(root, 17, 901 - 17)
@@ -1378,6 +1436,64 @@ mod tests {
             payload[17..901]
         );
         node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pin_refuses_an_incomplete_fetch_and_own_accepts_an_existing_durable_object() {
+        let partial_data = tempfile::tempdir().unwrap();
+        Node::init(partial_data.path(), None).unwrap();
+        let mut partial_config = crate::config::NodeConfig::loopback(partial_data.path());
+        partial_config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: partial_data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let partial_node = Node::open(partial_config).await.unwrap();
+        let payload = vec![0x51; 100_000];
+        let provider_dir = tempfile::tempdir().unwrap();
+        let provider = synch_store::Store::open(provider_dir.path()).unwrap();
+        let root = provider.ingest_bytes(&payload, now_ns()).unwrap();
+        let wanted = ChunkRanges::single(0, 1);
+        let (encoded, served) = provider.encode_slice(&root, &wanted).unwrap();
+        partial_node
+            .cas_backend()
+            .write_slice(root, payload.len() as u64, served, encoded, now_ns())
+            .await
+            .unwrap();
+        assert!(partial_node
+            .pin_object(&root, Some(payload.len() as u64))
+            .await
+            .is_err());
+        assert!(!partial_node.store().blob(&root).unwrap().unwrap().pinned);
+        partial_node.shutdown().await.unwrap();
+
+        let own_data = tempfile::tempdir().unwrap();
+        Node::init(own_data.path(), None).unwrap();
+        let mut own_config = crate::config::NodeConfig::loopback(own_data.path());
+        own_config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: own_data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::Own,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let own_node = Node::open(own_config).await.unwrap();
+        let durable = own_node
+            .cas_backend()
+            .ingest_bytes(payload, now_ns())
+            .await
+            .unwrap();
+        own_node
+            .pin_object(&durable.root, Some(durable.size))
+            .await
+            .unwrap();
+        let row = own_node.store().blob(&durable.root).unwrap().unwrap();
+        assert!(row.durable && row.pinned);
+        own_node.shutdown().await.unwrap();
     }
     use synch_core::{BlobAd, FileEntry, GroupRange};
     use synch_store::{Binding, BindingSource};

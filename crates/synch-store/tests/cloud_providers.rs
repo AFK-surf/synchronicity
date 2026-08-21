@@ -78,6 +78,12 @@ async fn provider_contract(service: CloudService) {
     // binary has no application `main`, so reproduce that process contract.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let Some(options) = configured(service) else {
+        assert_ne!(
+            std::env::var("SYNCH_TEST_CLOUD_REQUIRED").as_deref(),
+            Ok("1"),
+            "{} provider contract is required but its namespace is not configured",
+            service.as_str()
+        );
         eprintln!(
             "{} provider contract skipped: test namespace is not configured",
             service.as_str()
@@ -96,7 +102,47 @@ async fn provider_contract(service: CloudService) {
         cache_bytes: None,
     })
     .unwrap();
-    let backend = Cloud::new(store, objects.clone(), CloudUploadPolicy::OwnPinned, None);
+    let backend = Cloud::new(
+        store.clone(),
+        objects.clone(),
+        CloudUploadPolicy::OwnPinned,
+        None,
+    );
+    let inline = backend
+        .ingest_bytes(b"provider inline object".to_vec(), synch_core::now_ns())
+        .await
+        .unwrap();
+    assert!(store.blob(&inline.root).unwrap().unwrap().durable);
+    assert_eq!(
+        objects
+            .read_range(&inline.root, 0..inline.size)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"provider inline object"
+    );
+
+    let part_path = data.path().join("upload-part");
+    std::fs::write(&part_path, b"durable upload part").unwrap();
+    let part_key = format!("uploads/contract-{}/1", synch_core::now_ns());
+    backend
+        .put_upload_part(part_key.clone(), part_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .read_upload_part(part_key.clone(), 0..19)
+            .await
+            .unwrap(),
+        b"durable upload part"
+    );
+    assert_eq!(
+        backend
+            .delete_upload_prefix(part_key.rsplit_once('/').unwrap().0.to_string() + "/")
+            .await
+            .unwrap(),
+        1
+    );
     let payload: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
     let ingested = backend
         .ingest_bytes(payload.clone(), synch_core::now_ns())
@@ -195,6 +241,23 @@ async fn provider_contract(service: CloudService) {
     for root in [partial_root, donor.root, target_root] {
         backend.delete(root).await.unwrap();
     }
+    backend.delete(inline.root).await.unwrap();
+
+    // Crash shape: provider acknowledgement happened, but no SQLite row did.
+    // A fabricated future horizon must identify and remove the leaked pair.
+    let leaked = objects
+        .ingest_bytes(b"acked before row commit")
+        .await
+        .unwrap();
+    assert!(store.blob(&leaked.root).unwrap().is_none());
+    let future = synch_core::now_ns() + 8 * 24 * 60 * 60 * 1_000_000_000;
+    let report = backend.maintain(future).await.unwrap();
+    assert!(report.remote_inspected >= 2);
+    assert!(report.remote_deleted >= 2);
+    assert!(matches!(
+        objects.read_range(&leaked.root, 0..1).await,
+        Err(StoreError::CloudNotFound { .. })
+    ));
 }
 
 #[tokio::test]

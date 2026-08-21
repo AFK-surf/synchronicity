@@ -210,7 +210,7 @@ impl Node {
                     // because the rescan walks every space and re-hashes
                     // whatever moved — unbounded work that must not sit on a
                     // worker thread the endpoint needs (§10).
-                    if let Err(e) = self.scan_and_stage_off_runtime().await {
+                    if let Err(e) = self.scan_and_stage_async().await {
                         tracing::warn!(error = %e, "rescan failed");
                     }
                 }
@@ -229,7 +229,7 @@ impl Node {
             tokio::select! {
                 _ = &mut shutdown => return,
                 _ = tokio::time::sleep(self.config().scan_interval) => {
-                    if let Err(e) = self.scan_and_stage_off_runtime().await {
+                    if let Err(e) = self.scan_and_stage_async().await {
                         tracing::warn!(error = %e, "periodic scan failed");
                     }
                 }

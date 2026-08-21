@@ -17,6 +17,10 @@ use crate::{control::Server, render};
 /// Stopping happens on `Ctrl-C` or on a `synch daemon stop` request; both fire
 /// the same broadcast, which every task shuts down on.
 pub async fn run(config: NodeConfig) -> Result<()> {
+    // Before Store open and before iroh bind: offline migration holds the same
+    // lock, so the two can never overlap during initialization either.
+    let _lifecycle = crate::control::transport::LifecycleLock::acquire(&config.data_dir)
+        .context("another daemon or CAS migration owns this data directory")?;
     // No "(run `synch init` first?)" stapled onto every failure: the
     // uninitialized case already says exactly that itself, and the hint sent
     // an operator with a taken port off to re-init a healthy node.
@@ -77,7 +81,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     match node.readopt_self_on_startup().await {
         Ok(true) => tracing::info!("re-adopted a newer own-origin head from a peer"),
         Ok(false) => {}
-        Err(error) => tracing::warn!(%error, "startup own-head readoption failed"),
+        Err(error) => {
+            let _ = node.shutdown().await;
+            return Err(anyhow::Error::new(error)
+                .context("startup own-head/cloud durability recovery failed"));
+        }
     }
 
     let control = tokio::spawn(server.run());

@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use synch_engine::{Node, VersionPolicy};
-use synch_store::Slot;
 
 mod common;
 use common::{
@@ -45,66 +44,73 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
         .await
         .unwrap();
 
-    std::fs::write(publisher.space.path().join("version.txt"), b"two").unwrap();
-    let second = publisher.node.scan_publish_push().await.unwrap().unwrap();
+    // Take an actual closed SQLite snapshot after the first acknowledged
+    // publish, as Litestream would. The checkout and CAS volume are not part of
+    // this metadata backup.
+    let common::Peer {
+        _data: publisher_data,
+        space: publisher_space,
+        node: first_publisher,
+    } = publisher;
+    first_publisher.shutdown().await.unwrap();
+    drop(first_publisher);
+    let backup = publisher_data.path().join("first-publish.backup");
+    std::fs::copy(publisher_data.path().join(synch_store::DB_FILE), &backup).unwrap();
+    let mut publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
+        .await
+        .unwrap();
+    introduce_nodes(&[&publisher, &witness.node]);
+
+    std::fs::write(publisher_space.path().join("version.txt"), b"two").unwrap();
+    let second = publisher.scan_publish_push().await.unwrap().unwrap();
     witness
         .node
-        .sync_with_peer(&publisher.node.node_id())
+        .sync_with_peer(&publisher.node_id())
         .await
         .unwrap();
     assert_eq!(
         witness
             .node
             .store()
-            .complete_head(publisher.node.origin())
+            .complete_head(publisher.origin())
             .unwrap(),
         Some(second.clone())
     );
-
-    // Shape a Litestream rollback: the signer and all trie objects survive,
-    // but the complete slot and its derived views trail by one publish.
-    let store = publisher.node.store().clone();
-    let first_for_restore = first.clone();
-    off_runtime(move || {
-        store
-            .transaction(|txn| {
-                txn.put_head(
-                    Slot::Complete,
-                    &first_for_restore,
-                    synch_core::now_ns(),
-                    synch_core::now_ns(),
-                )?;
-                txn.materialize_diff(
-                    &first_for_restore.origin,
-                    second.root,
-                    first_for_restore.root,
-                )?;
-                Ok::<_, synch_store::StoreError>(())
-            })
-            .unwrap();
-    })
-    .await;
-    assert_eq!(publisher.node.own_head().unwrap(), Some(first));
-
-    assert!(publisher.node.readopt_self_on_startup().await.unwrap());
-    assert_eq!(publisher.node.own_head().unwrap(), Some(second));
-    let entry = publisher
-        .node
+    let expected_entry = publisher
         .store()
-        .entry(publisher.node.origin(), "media", "version.txt")
+        .entry(publisher.origin(), "media", "version.txt")
         .unwrap()
         .unwrap();
+
+    // Restore the older file, reopen from it, and only then contact the peer.
+    publisher.shutdown().await.unwrap();
+    drop(publisher);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(
+            publisher_data
+                .path()
+                .join(format!("{}{suffix}", synch_store::DB_FILE)),
+        );
+    }
+    std::fs::copy(&backup, publisher_data.path().join(synch_store::DB_FILE)).unwrap();
+    publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
+        .await
+        .unwrap();
+    introduce_nodes(&[&publisher, &witness.node]);
+    assert_eq!(publisher.own_head().unwrap(), Some(first));
+
+    assert!(publisher.readopt_self_on_startup().await.unwrap());
+    assert_eq!(publisher.own_head().unwrap(), Some(second));
     assert_eq!(
         publisher
-            .node
-            .cas_backend()
-            .read_range(entry.content.unwrap(), 0, entry.size)
-            .await
+            .store()
+            .entry(publisher.origin(), "media", "version.txt")
+            .unwrap()
             .unwrap(),
-        b"two"
+        expected_entry
     );
 
-    shutdown(&[&publisher.node, &witness.node]).await;
+    shutdown(&[&publisher, &witness.node]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -118,7 +124,7 @@ async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
             scratch_dir: config.data_dir.join("cloud-scratch"),
             io_timeout: Duration::from_secs(5),
             upload_policy: synch_store::cloud::CloudUploadPolicy::Own,
-            cache_bytes: None,
+            cache_bytes: Some(512 * 1024 * 1024),
         });
     })
     .await;

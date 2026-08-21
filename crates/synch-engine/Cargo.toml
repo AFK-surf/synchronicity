@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 aws-lc-rs.workspace = true
+blake3.workspace = true
 directories.workspace = true
 futures-util.workspace = true
 hex.workspace = true

@@ -43,6 +43,7 @@ ctor = "0.4"
 directories = "6.0.0"
 futures-core = "0.3"
 futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
+fs2 = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -104,6 +105,7 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-normalization = "0.1.25"
+windows-sys = "0.61.2"
 
 [profile.release]
 opt-level = 3

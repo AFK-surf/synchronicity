@@ -245,11 +245,75 @@ impl Node {
             let node = self.clone();
             crate::blocking::offload(move || Ok(node.store().complete_head(node.origin())?)).await?
         };
-        Ok(match (before, after) {
+        let adopted = match (before, after) {
             (Some(before), Some(after)) => after.supersedes(Some(&(before.seq, before.root))),
             (None, Some(_)) => true,
             _ => false,
-        })
+        };
+        if self.config().cloud.is_some() {
+            self.reconstruct_recovered_cloud_rows().await?;
+        }
+        Ok(adopted)
+    }
+
+    /// Rebuilds cloud durability rows named by recovered own availability ads.
+    pub(crate) async fn reconstruct_recovered_cloud_rows(&self) -> Result<()> {
+        // A Litestream snapshot can predate both a recovered entry and its blob
+        // row. Signed own `b:` records carry the trustworthy sizes; probing
+        // with an empty range reconstructs cold rows without downloading
+        // payload, including b-only pins. This finishes before maintenance can
+        // retire ads or drain stale deletes.
+        let advertised = {
+            let node = self.clone();
+            crate::blocking::offload(move || {
+                let mut advertised = Vec::new();
+                for root in node.store().provider_roots_for_origin(node.origin())? {
+                    if let Some((_, ad)) = node
+                        .store()
+                        .providers(&root)?
+                        .into_iter()
+                        .find(|(origin, ad)| origin == node.origin() && ad.is_complete())
+                    {
+                        advertised.push((root, ad.size));
+                    }
+                }
+                Ok(advertised)
+            })
+            .await?
+        };
+        for (root, size) in advertised {
+            self.cas_backend()
+                .ensure_ranges(root, size, synch_core::ChunkRanges::empty())
+                .await?;
+            let durable = {
+                let node = self.clone();
+                crate::blocking::offload(move || {
+                    Ok(node
+                        .store()
+                        .blob(&root)?
+                        .is_some_and(|row| row.durable && row.size == size))
+                })
+                .await?
+            };
+            if !durable {
+                return Err(EngineError::NotFound(format!(
+                    "recovered own ad names unavailable cloud object {root} ({size} bytes)"
+                )));
+            }
+            let node = self.clone();
+            crate::blocking::offload(move || {
+                // The head has no separate pin record. A complete own b-only ad
+                // is the surviving evidence of a bare pin, so recover it
+                // conservatively; pinning a stale ad leaks bytes, while failing
+                // to pin can delete an acknowledged durability promise.
+                if !node.store().content_is_referenced(&root)? {
+                    node.store().set_pinned(&root, true)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// The recovery settings this node was opened with.

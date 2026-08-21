@@ -334,16 +334,16 @@ impl Store {
 
     /// Selects remote durability semantics for this process.
     ///
-    /// Must be called during node open, before any CAS writer runs. Inline
-    /// objects remain durable in SQLite; complete out-of-line writes remain
-    /// staged until the remote backend explicitly marks them durable.
+    /// Must be called during node open, before any CAS writer runs. Every
+    /// complete write, inline or out-of-line, remains staged until the remote
+    /// backend explicitly marks it durable.
     pub fn set_remote_cas(&self, remote: bool) {
         self.remote_cas
             .store(remote, std::sync::atomic::Ordering::Release);
     }
 
-    pub(crate) fn complete_is_durable(&self, inline: bool) -> bool {
-        inline || !self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
+    pub(crate) fn complete_is_durable(&self, _inline: bool) -> bool {
+        !self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether row-first byte deletion must be handed to a remote backend.

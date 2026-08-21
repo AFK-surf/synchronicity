@@ -131,10 +131,11 @@ Two consequences of that cut, named up front:
 
 **Only complete blobs are durable in the cloud store**, which is what makes
 immutable objects sufficient and spares the design a chunked object layout with its
-request amplification. Objects ≤ 16 KiB stay inline in SQLite and ride
-Litestream; the store answers them before any backend is consulted, so
-backends never see them and the small-file case costs no per-object cloud
-overhead. This preserves the local CAS behavior.
+request amplification. Objects ≤ 16 KiB remain inline in SQLite as a fast local
+copy, but the Cloud backend also writes their payload and outboard objects before
+it reports `Durable`. Litestream is asynchronous, so an inline SQLite row alone
+cannot satisfy the serverless durability promise. LocalFs retains the original
+inline-only behavior.
 
 ---
 
@@ -394,11 +395,12 @@ backend's ephemeral scratch instead of depending on a provider's copy API:
    ~size/256 memory is the cost today's ingest already accepts. This full-size
    staging file is unacknowledged work; deployment scratch capacity therefore
    bounds the largest concurrent ingest.
-2. Stat both final keys. If a previous attempt already committed payload and
-   outboard, verify/read them as necessary and skip the upload. Otherwise stream
-   the scratch payload to `cas/…/<root>` with an OpenDAL writer, write the
-   outboard, and wait for both operations to complete. Only then return
-   `Durable`; the caller may commit the row and acknowledge.
+2. Stream the scratch payload to `cas/…/<root>` with an OpenDAL writer, write
+   the deterministic outboard, and wait for both operations to complete. A
+   retry overwrites the same keys with the same verified content; avoiding the
+   duplicate transfer is an optional optimization, not a correctness branch.
+   Only then return `Durable`; the durable row may be committed and the caller
+   may acknowledge.
 
 The final keys are immutable. A crash during step 1 loses only unacknowledged
 scratch. A crash during step 2 can leave one completed final object without its
@@ -432,7 +434,9 @@ operator reports copy support; it cannot change the baseline semantics.
   durability means the configured cloud service), and a pin on already-complete
   cached content finalizes immediately. Content that completes without qualifying stays
   a cache entry: servable, evictable, gone on scratch loss — correctly,
-  since its providers still advertise it. `all` exists for the
+  since its providers still advertise it. It may advertise partial progress,
+  but a complete cache-only `b:` ad is retired: every complete cloud ad must
+  remain an unambiguous durable promise after SQLite restore. `all` exists for the
   serve-everything cloud replica whose whole job is durable coverage.
 - **Reads** (`read_range`/`encode_slice`) serve from the cache when the
   groups are present, else use an OpenDAL range read in ≤ 8 MiB windows,
@@ -442,18 +446,24 @@ operator reports copy support; it cannot change the baseline semantics.
   from peers; a cold cache is the backend's private problem. Peers remain
   the source for objects this node does not hold at all — the fetch planner
   is untouched.
-- **Eviction**: the scratch cache is bounded (`cas.cloud.cache_bytes`;
-  default: keep 20% of the volume free), LRU by the existing
+- **Eviction**: `cas.cloud.cache_bytes` is an LRU maintenance target, not a
+  per-operation hard ceiling: one active read, materialization, or unacknowledged
+  ingest may need more scratch than the target. Deployment scratch capacity is
+  the hard bound. Without an explicit target on Unix, maintenance evicts enough
+  to keep 20% of the volume free; non-Unix cloud nodes require an explicit
+  target. LRU uses the existing
   `last_access`. Only `durable` objects' cache files are evictable —
   eviction unlinks spill/cache files and clears the bitmap, leaving row,
   ad, and cloud objects untouched. Pinned blobs are evictable like any
   durable blob: on this backend the pin's promise is kept remotely, not by
   the cache.
-- **Verification failure** against a durable object is **corruption of a
-  durable copy** — possibly the only one — and is handled loudly: the
+- **Verification failure** against a freshly read durable object is
+  **corruption of a durable copy** — possibly the only one — and is handled loudly: the
   object is quarantined (row marked, ad retired, `synch doctor` reports
   it) and the read falls back to peer donors if any exist. It is never
-  treated as a cache miss to retry, and never deleted.
+  deleted. A failure involving a cached outboard first discards that
+  reconstructible cache state and retries the outboard from the durable tier;
+  only a fresh remote failure quarantines the object.
 
 ### 6.4 The NotFound heal rule
 
@@ -526,7 +536,9 @@ and also has `SYNCH_…` environment fallbacks:
   OpenDAL's AWS role/web-identity/instance credential chain; path-style mode is
   available for compatible stores such as MinIO.
 - `gcs`: bucket, optional endpoint, service-account credential material or the
-  OpenDAL GCS default credential chain.
+  OpenDAL GCS default credential chain. Trusted emulators may also opt into
+  `--gcs-skip-signature --gcs-disable-vm-metadata`; neither is implied merely
+  by setting an endpoint.
 - `azblob`: container, optional endpoint, account name/key or bearer/SAS
   credential forms supported by OpenDAL.
 
@@ -545,13 +557,13 @@ credentials, not only static keys.
 | Failure | State afterwards | Repair |
 | --- | --- | --- |
 | Scratch disk lost (container replaced) | Cache cold; Staged rows stale | Generation marker mismatch clears claims in one UPDATE (§6.1); refill on demand |
-| Crash mid-ingest | Scratch spill and possibly an incomplete provider upload; no row; client unacked | Scratch/provider lifecycle sweeps; client retries |
-| Crash between finalize and row | Durable object, no row | Orphan sweep after horizon; a retried ingest stats and skips |
+| Crash mid-ingest | Scratch spill and possibly an incomplete provider upload; no durable row; client unacked | Backend scratch/provider lifecycle sweeps; client retries |
+| Crash between finalize and row | Durable object, no row | Orphan sweep after horizon; a retried ingest overwrites the same deterministic keys |
 | Crash between row and publish | Window does not exist — row and staged records commit in one transaction, so the publish batch either carried the entry or the ingest never acked |  |
 | Crash between publish and Litestream ship | Acked write's metadata rolled back; bytes durable remotely | §8.3 |
 | DB restore rolls back a deletion | Row resurrected, object gone | OpenDAL NotFound heal on first read (§6.4); sweep horizon prevents the mirror-image race |
 | Cloud object corrupt | Read verification fails | Quarantine + doctor + peer fallback; never silent |
-| Cloud service unavailable | Durable tier unreachable | Reads degrade to cache + peers; ingests and pinned fetches fail closed (nothing acks without durability); doctor says so |
+| Cloud service unavailable | Durable tier unreachable | Reads degrade to cache + peers; ingests and pinned fetches fail closed (nothing acks without durability); operation and maintenance errors are logged |
 
 ### 8.2 Litestream and the database
 
@@ -586,7 +598,11 @@ restored-from-backup mitigation (which only avoids seq collision): the
 node *recovers the lost publishes* rather than forking past them, because
 unlike the general recovery case these heads are self-signed and fully
 verifiable. Delegations, ads, entries — everything in the lost window
-comes back. The mechanism reuses the recovery machinery's observation path
+comes back. Before maintenance starts, every recovered complete own `b:` ad
+(including a b-only pin) supplies its signed size to the backend; the backend
+verifies the final cloud pair and reconstructs any missing cold `durable` row.
+Provider reads repeat that safe adoption on demand, using the signed ad size
+rather than mutable object metadata. The mechanism reuses the recovery machinery's observation path
 and the ordinary trie fetch; what is new is the willingness to adopt an
 own-origin head, gated on the signature verifying under a currently held
 key.
@@ -626,7 +642,9 @@ parts cannot stage on scratch. Parts become cloud objects through OpenDAL:
   instead of a directory, with the lifecycle rule as its backstop.
 
 Local-backend nodes keep the `s3-uploads/` directory exactly as today; the
-part store is selected by the same backend switch.
+part store is selected by the same backend switch. Completion re-verifies every
+part against the root acknowledged by `UploadPart`, then removes the whole
+remote upload prefix so superseded attempts cannot leak.
 
 ---
 
@@ -643,8 +661,9 @@ funneling through `adoption_target`, `local_path`, and a full scan:
 ```
 
 - `synch space add <id> --detached` creates the row with no path. The
-  scanner, watcher, and overlap guards skip detached spaces; `scan`
-  reports them as not-scannable rather than empty. The
+  scanner, watcher, and overlap guards skip detached spaces; aggregate scans
+  simply omit them, while any direct operation requiring a checkout refuses
+  them as not-scannable. The
   present-but-empty-directory mass-tombstone hazard cannot arise for a
   space that has no directory to mistake for its contents.
 - **Writes publish CAS-direct**: gateway `PUT`/`Complete` run
@@ -728,7 +747,18 @@ volumes: emptyDir (scratch)               # db working copy, backend scratch, so
 replicas: 1, strategy: Recreate
 ```
 
-**Backend migration.** `synch cas migrate --to s3|gcs|azblob` walks complete blobs,
+**Backend migration.** `synch cas migrate --to s3|gcs|azblob` first refuses a
+node with path-backed spaces: detaching a checkout is an explicit metadata and
+publication decision, not a storage-side effect. The command owns the same
+cross-platform lifecycle lock a daemon takes before opening its Store or iroh
+endpoint, so a daemon cannot start and acknowledge a source-only write
+mid-migration. It probes rowless own ads and referenced entry roots against a
+cloud source, then walks every durable object plus every complete cache object
+whose verified bytes are still present (including inline content). Preserving
+complete cache objects keeps their published availability ads truthful; stale
+or partial nondurable filesystem rows are discarded at the switch. Every
+destination uses an isolated temporary SQLite index, so target retries or
+failures cannot rewrite source durability before the final transaction,
 `ingest`s each into the new backend (content-addressed, so restartable and
 idempotent), then flips the stored backend setting at the end; `--to
 local` is the same walk in reverse, and cloud-to-cloud migration uses the same
@@ -741,17 +771,18 @@ node has one backend — which is the simplicity "backends" buys over
 gate below has executable evidence:
 
 1. Carve the trait: `LocalFs` behind `CasBackend`, one backend instance threaded
-   through node/network/engine/CLI, all semantic CAS call sites async, no public
+   through node/network/engine/CLI, all runtime semantic CAS call sites async, no public
    `blob_path`, and a shared contract test suite. No behavior change; a `local`
    node is today's node, including reflink materialization.
 2. OpenDAL integration and service factory; the Litestream/SIGTERM/
    busy-timeout/pin-state fixes (§8.2). Independently worthwhile.
 3. The cloud backend: portable scratch ingest, spill + finalize + upload policy,
-   read cache + enforced byte bound and eviction, generation marker, orphan
+   read cache + maintenance target and eviction, generation marker, orphan
    sweep, NotFound heal, quarantine/ad retirement/doctor reporting. The contract
    suite runs against memory fault injection, MinIO, fake-gcs-server, and
-   Azurite in CI; provider credential/configuration smoke tests cover every
-   admitted builder.
+   Azurite in CI; those required emulator jobs cover every admitted builder's
+   endpoint/auth configuration. Expiring workload credentials remain a
+   deployment smoke test because CI cannot faithfully emulate their issuers.
 4. Detached spaces (§10).
 5. Multipart parts as OpenDAL objects (§9).
 6. Self-readoption at boot (§8.3), tested with a restored database behind an

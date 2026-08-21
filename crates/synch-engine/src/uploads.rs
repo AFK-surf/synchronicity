@@ -407,6 +407,7 @@ impl Node {
             for part in &chosen {
                 let key = cloud_part_key(upload, &part.file);
                 let mut offset = 0u64;
+                let mut hasher = blake3::Hasher::new();
                 while offset < part.size {
                     let end = (offset + 8 * 1024 * 1024).min(part.size);
                     let bytes = self
@@ -420,8 +421,16 @@ impl Node {
                             bytes.len()
                         )));
                     }
+                    hasher.update(&bytes);
                     output.write_all(&bytes).await?;
                     offset = end;
+                }
+                let actual = Hash(*hasher.finalize().as_bytes());
+                if actual != part.root {
+                    return Err(EngineError::invalid(format!(
+                        "multipart part {} changed after it was acknowledged: expected {}, got {actual}",
+                        part.number, part.root
+                    )));
                 }
             }
             output.sync_all().await?;
@@ -432,11 +441,23 @@ impl Node {
             let _ = tokio::fs::remove_file(&target).await;
             committed?
         } else {
-            let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
+            let sources: Vec<(u32, Hash, PathBuf)> = chosen
+                .iter()
+                .map(|part| (part.number, part.root, dir.join(&part.file)))
+                .collect();
             let assembled_target = target.clone();
             let assembled = crate::blocking::offload(move || {
                 let mut adoption = Adoption::at(&assembled_target)?;
-                for source in &sources {
+                for (number, expected, source) in &sources {
+                    let actual = synch_core::hash_reader(std::io::BufReader::new(
+                        std::fs::File::open(source)?,
+                    ))?;
+                    if actual != *expected {
+                        return Err(EngineError::invalid(format!(
+                            "multipart part {} changed after it was acknowledged: expected {}, got {actual}",
+                            number, expected
+                        )));
+                    }
                     adoption.append_file(source)?;
                 }
                 let written = adoption.written();
@@ -474,14 +495,12 @@ impl Node {
         })
         .await?;
         if remote_parts {
-            for part in &chosen {
-                if let Err(error) = self
-                    .cas_backend()
-                    .delete_upload_part(cloud_part_key(upload, &part.file))
-                    .await
-                {
-                    tracing::warn!(upload, part = part.number, %error, "cloud upload part left for lifecycle sweep");
-                }
+            if let Err(error) = self
+                .cas_backend()
+                .delete_upload_prefix(format!("uploads/{upload}/"))
+                .await
+            {
+                tracing::warn!(upload, %error, "cloud upload prefix left for lifecycle sweep");
             }
         } else {
             for part in &chosen {
@@ -733,7 +752,7 @@ impl Node {
             // is what should happen: an assembly in flight is not abandoned. A
             // latch nothing is behind any more ages out on its own and is
             // collected on a later pass.
-            match self.store().abort_upload(&id) {
+            match self.store().expire_upload(&id) {
                 Ok(true) => {
                     let _ = std::fs::remove_dir_all(self.store().upload_dir(&id));
                     collected += 1;
@@ -815,10 +834,19 @@ impl Node {
         let collected = crate::blocking::offload(move || node.sweep_uploads(ttl)).await?;
         if self.cas_backend().remote_upload_parts() {
             let store = self.store().clone();
-            let remaining: std::collections::HashSet<String> =
-                crate::blocking::offload(move || Ok(store.upload_ids()?.into_iter().collect()))
-                    .await?;
-            for upload in old.into_iter().filter(|id| !remaining.contains(id)) {
+            let cleanup = crate::blocking::offload(move || {
+                let mut cleanup = Vec::new();
+                for id in old {
+                    match store.upload(&id)? {
+                        None => cleanup.push(id),
+                        Some(upload) if upload.state == UploadState::Completed => cleanup.push(id),
+                        Some(_) => {}
+                    }
+                }
+                Ok(cleanup)
+            })
+            .await?;
+            for upload in cleanup {
                 if let Err(error) = self
                     .cas_backend()
                     .delete_upload_prefix(format!("uploads/{upload}/"))
@@ -979,7 +1007,7 @@ mod tests {
             scratch_dir: data.path().join("cloud-scratch"),
             io_timeout: std::time::Duration::from_secs(5),
             upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
-            cache_bytes: None,
+            cache_bytes: Some(512 * 1024 * 1024),
         });
         let node = Node::open(config).await.unwrap();
         node.add_detached_space("media").unwrap();
@@ -1008,6 +1036,32 @@ mod tests {
             );
             keys.push(key);
         }
+
+        let corrupt = data.path().join("corrupt-cloud-part");
+        std::fs::write(&corrupt, vec![8u8; head.len()]).unwrap();
+        node.cas_backend()
+            .put_upload_part(keys[0].clone(), corrupt)
+            .await
+            .unwrap();
+        let error = node
+            .complete_upload(
+                &upload,
+                "media",
+                "joined.bin",
+                None,
+                &[(1, None), (2, None)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed after it was acknowledged"));
+        let restored = data.path().join("restored-cloud-part");
+        std::fs::write(&restored, &head).unwrap();
+        node.cas_backend()
+            .put_upload_part(keys[0].clone(), restored)
+            .await
+            .unwrap();
 
         let completed = node
             .complete_upload(
@@ -1141,6 +1195,20 @@ mod sweeper_tests {
             adoption.write(bytes).unwrap();
             node.commit_part(staging, adoption).unwrap();
         }
+        let first = node.store().upload_parts(&id).unwrap()[0].clone();
+        std::fs::write(
+            node.store().upload_dir(&id).join(&first.file),
+            vec![8u8; head.len()],
+        )
+        .unwrap();
+        let error = node
+            .complete_upload(&id, "media", "joined.bin", None, &[(1, None), (2, None)])
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed after it was acknowledged"));
+        std::fs::write(node.store().upload_dir(&id).join(&first.file), &head).unwrap();
         let done = node
             .complete_upload(&id, "media", "joined.bin", None, &[(1, None), (2, None)])
             .await
@@ -1157,6 +1225,8 @@ mod sweeper_tests {
         // The parts and their directory go once the answer is recorded.
         assert!(!node.store().upload_dir(&id).exists());
         assert!(node.store().upload_parts(&id).unwrap().is_empty());
+        assert_eq!(node.sweep_uploads(std::time::Duration::ZERO).unwrap(), 1);
+        assert!(node.store().upload(&id).unwrap().is_none());
         node.shutdown().await.unwrap();
     }
 }

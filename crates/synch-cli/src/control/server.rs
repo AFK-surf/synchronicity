@@ -1785,32 +1785,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // hashed, so a scan whose publish is refused would leave the node
             // believing it had published files it never did (§3.4).
             read(node, |n| Ok(n.ensure_publishable()?)).await?;
-            // Hashing a tree is long and blocking, so it runs off the runtime
-            // — the daemon keeps serving other requests — and each space is
-            // reported as a progress message while the scan is still going.
-            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let scanning = {
-                let node = node.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _scope = synch_core::BlockingScope::enter();
-                    node.scan_all_with(|space, report| {
-                        let _ = progress_tx.send(format!(
-                            "scanned {space}: hashed {} · unchanged {} · deleted {}",
-                            report.hashed, report.unchanged, report.deleted
-                        ));
-                    })
-                })
-            };
-            while let Some(line) = progress_rx.recv().await {
-                out.progress(line).await?;
+            // The engine owns the blocking handoff and the selected CAS
+            // backend. Keeping the old synchronous scanner here would bypass a
+            // cloud backend and publish scratch-only content.
+            let (report, spaces) = node.scan_and_stage_async_with_reports().await?;
+            for (space, one) in spaces {
+                out.progress(format!(
+                    "scanned {space}: hashed {} · unchanged {} · deleted {}",
+                    one.hashed, one.unchanged, one.deleted
+                ))
+                .await?;
             }
-            let report = scanning
-                .await
-                .map_err(|e| ControlError::internal(format!("the scan task failed: {e}")))??;
             // An explicit scan is already one batch, so it stages and then
             // flushes rather than waiting out the quiesce: the "published seq"
             // line below is true by the time the client reads it (§7.1).
-            node.stage(report.staged.clone());
             let head = node.flush_staged().await?;
             let mut summary = format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
@@ -2178,7 +2166,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::PinRm(pb::PinRm { target }) => {
             let (root, _) = pin_target(node, &target).await?;
-            if !read(node, move |n| Ok(n.store().set_pinned(&root, false)?)).await? {
+            if !node.unpin_object(&root).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("no object {root} in the local store"),

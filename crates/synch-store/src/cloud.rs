@@ -92,8 +92,8 @@ pub struct CloudConfig {
     pub io_timeout: std::time::Duration,
     /// Promotion policy for peer-fetched content.
     pub upload_policy: CloudUploadPolicy,
-    /// Hard upper bound for verified local cache bytes. `None` keeps only the
-    /// automatic 20%-free filesystem floor.
+    /// Maintenance target for verified local cache bytes. `None` keeps only
+    /// the automatic 20%-free filesystem target on Unix.
     pub cache_bytes: Option<u64>,
 }
 
@@ -140,13 +140,11 @@ pub struct CloudIngested {
     pub size: u64,
 }
 
-/// Result of one recursive cloud orphan sweep.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CloudSweepReport {
-    /// Payload/outboard objects inspected.
-    pub inspected: usize,
-    /// Unclaimed old objects removed.
-    pub deleted: usize,
+/// One old unclaimed CAS object returned by a provider listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloudOrphan {
+    pub(crate) root: Hash,
+    pub(crate) path: String,
 }
 
 impl CloudStore {
@@ -245,6 +243,53 @@ impl CloudStore {
         .await;
         let _ = tokio::fs::remove_file(&staged.payload).await;
         result
+    }
+
+    /// Durably uploads a small in-memory object and its deterministic outboard.
+    pub async fn ingest_bytes(&self, data: &[u8]) -> Result<CloudIngested> {
+        let size = data.len() as u64;
+        let tree = BaoTree::new(size, bao_tree::BlockSize::from_chunk_log(CHUNK_GROUP_LOG2));
+        let mut outboard = vec![0u8; tree.outboard_size() as usize];
+        let root = compute_outboard(data, tree, &mut outboard)?;
+        let payload_key = Self::payload_key(&root);
+        let outboard_key = Self::outboard_key(&root);
+        self.operator
+            .write(&payload_key, Bytes::copy_from_slice(data))
+            .await
+            .map_err(|source| cloud("write", &payload_key, source))?;
+        self.operator
+            .write(&outboard_key, Bytes::from(outboard))
+            .await
+            .map_err(|source| cloud("write", &outboard_key, source))?;
+        Ok(CloudIngested { root, size })
+    }
+
+    /// Confirms both durable objects exist at their exact expected lengths.
+    pub async fn verify_pair(&self, root: &Hash, size: u64) -> Result<()> {
+        for (key, expected) in [
+            (Self::payload_key(root), size),
+            (
+                Self::outboard_key(root),
+                BaoTree::new(size, bao_tree::BlockSize::from_chunk_log(CHUNK_GROUP_LOG2))
+                    .outboard_size(),
+            ),
+        ] {
+            let metadata = self
+                .operator
+                .stat(&key)
+                .await
+                .map_err(|source| cloud("stat", &key, source))?;
+            if metadata.content_length() != expected {
+                return Err(StoreError::Verification {
+                    root: *root,
+                    reason: format!(
+                        "cloud object {key} is {} bytes, expected {expected}",
+                        metadata.content_length()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Reads one byte range from an immutable payload.
@@ -407,26 +452,32 @@ impl CloudStore {
         Ok(deleted)
     }
 
-    /// Removes old cloud CAS objects no live SQLite row claims.
-    pub async fn sweep_orphans(
+    /// Lists old cloud CAS objects no live SQLite row claimed in the snapshot.
+    /// The backend rechecks each root under its remote mutation lock before
+    /// deleting it.
+    pub(crate) async fn orphan_candidates(
         &self,
         live: &HashSet<Hash>,
         cutoff_unix_seconds: i64,
-    ) -> Result<CloudSweepReport> {
+    ) -> Result<(usize, Vec<CloudOrphan>)> {
         let entries = self
             .operator
             .list_with("cas/")
             .recursive(true)
             .await
             .map_err(|source| cloud("list", "cas/", source))?;
-        let mut report = CloudSweepReport::default();
+        let mut inspected = 0;
+        let mut candidates = Vec::new();
         for entry in entries {
             if !entry.metadata().is_file() {
                 continue;
             }
-            report.inspected += 1;
+            inspected += 1;
             let path = entry.path();
-            let claimed = cloud_key_root(path).is_some_and(|root| live.contains(&root));
+            let Some(root) = cloud_key_root(path) else {
+                continue;
+            };
+            let claimed = live.contains(&root);
             if claimed {
                 continue;
             }
@@ -453,13 +504,40 @@ impl CloudStore {
             if modified_seconds >= cutoff_unix_seconds {
                 continue;
             }
-            self.operator
-                .delete(path)
-                .await
-                .map_err(|source| cloud("delete", path, source))?;
-            report.deleted += 1;
+            candidates.push(CloudOrphan {
+                root,
+                path: path.to_string(),
+            });
         }
-        Ok(report)
+        Ok((inspected, candidates))
+    }
+
+    /// Removes abandoned local cloud-operation temporaries older than `cutoff`.
+    pub(crate) async fn sweep_scratch(&self, cutoff: std::time::SystemTime) -> Result<usize> {
+        let scratch = self.scratch_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut removed = 0;
+            let Ok(entries) = std::fs::read_dir(&scratch) else {
+                return Ok(0);
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.starts_with("ingest-") || name.starts_with("slice-")) {
+                    continue;
+                }
+                let old = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| modified < cutoff);
+                if old && std::fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
+        .await
+        .map_err(|error| StoreError::invalid(format!("cloud scratch sweep failed: {error}")))?
     }
 }
 
@@ -591,16 +669,38 @@ mod tests {
         let live = cloud.ingest_file(&live_source).await.unwrap();
         let orphan = cloud.ingest_file(&orphan_source).await.unwrap();
 
-        let report = cloud
-            .sweep_orphans(&HashSet::from([live.root]), i64::MAX)
+        let (inspected, candidates) = cloud
+            .orphan_candidates(&HashSet::from([live.root]), i64::MAX)
             .await
             .unwrap();
-        assert_eq!(report.inspected, 4);
-        assert_eq!(report.deleted, 2);
+        assert_eq!(inspected, 4);
+        assert_eq!(candidates.len(), 2);
+        for candidate in candidates {
+            cloud.delete_object(&candidate.path).await.unwrap();
+        }
         assert!(cloud.read_range(&live.root, 0..1).await.is_ok());
         assert!(matches!(
             cloud.read_range(&orphan.root, 0..1).await,
             Err(StoreError::CloudNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn scratch_sweep_removes_only_abandoned_cloud_temporaries() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cloud = CloudStore::from_operator(
+            Operator::new(Memory::default()).unwrap(),
+            scratch.path().to_path_buf(),
+        )
+        .unwrap();
+        for name in ["ingest-dead.tmp", "slice-dead", "keep-me"] {
+            std::fs::write(scratch.path().join(name), b"temporary").unwrap();
+        }
+        let removed = cloud
+            .sweep_scratch(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert!(scratch.path().join("keep-me").exists());
     }
 }

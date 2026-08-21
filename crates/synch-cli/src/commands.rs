@@ -117,6 +117,12 @@ fn cloud_config_with_fallback(
                     path.to_string_lossy().into_owned(),
                 );
             }
+            if cli.gcs_skip_signature {
+                options.insert("skip_signature".into(), "true".into());
+            }
+            if cli.gcs_disable_vm_metadata {
+                options.insert("disable_vm_metadata".into(), "true".into());
+            }
             synch_store::cloud::CloudService::Gcs
         }
         CasBackendArg::Azblob => {
@@ -208,19 +214,21 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Result<()> {
-    match transport::connect(data_dir).await {
-        Ok(_) => anyhow::bail!(
-            "a daemon is running for {}; stop it before migrating the CAS backend",
-            data_dir.display()
-        ),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) => {}
-        Err(error) => return Err(error).context("could not establish that the daemon is stopped"),
-    }
+    // Own the same process lock the daemon takes before Store/endpoint open,
+    // for the whole migration. A connect-only preflight is a TOCTOU check.
+    let _lifecycle = transport::LifecycleLock::acquire(data_dir)
+        .with_context(|| {
+            format!(
+                "could not exclusively lock {} for CAS migration; stop its daemon and any other migration",
+                data_dir.display()
+            )
+        })?;
 
+    let target_index = data_dir.join(format!(
+        "cas-migrate/target-index-{}-{}",
+        std::process::id(),
+        synch_core::now_ns()
+    ));
     let directory = data_dir.to_path_buf();
     let (source_store, stored) = tokio::task::spawn_blocking(move || {
         let _scope = synch_core::BlockingScope::enter();
@@ -233,6 +241,21 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
     .await
     .context("the source CAS opening task did not complete")??;
     let source = parse_backend(&stored)?;
+    if target != CasBackendArg::Local {
+        let checked = source_store.clone();
+        let path_spaces = tokio::task::spawn_blocking(move || {
+            let _scope = synch_core::BlockingScope::enter();
+            path_backed_space_ids(&checked)
+        })
+        .await
+        .context("the space inventory task did not complete")??;
+        if !path_spaces.is_empty() {
+            anyhow::bail!(
+                "cloud CAS migration requires detached spaces; path-backed space(s): {}",
+                path_spaces.join(", ")
+            );
+        }
+    }
 
     let fallback_store = source_store.clone();
     let (source_fallback, target_fallback) = tokio::task::spawn_blocking(move || {
@@ -265,7 +288,7 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
         println!("CAS backend is already {}", target.as_str());
         return Ok(());
     }
-    let directory = data_dir.to_path_buf();
+    let directory = target_index.clone();
     let target_store = tokio::task::spawn_blocking(move || {
         let _scope = synch_core::BlockingScope::enter();
         Ok::<_, synch_store::StoreError>(Arc::new(synch_store::Store::open(directory)?))
@@ -279,16 +302,17 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
     let source_backend = build_migration_backend(source_store.clone(), source_config)?;
     let target_backend = build_migration_backend(target_store.clone(), target_config)?;
 
-    let migrated = copy_and_switch_backends(
+    let migration = copy_and_switch_backends(
         source_store,
-        target_store,
         source_backend,
         target_backend,
         target.as_str(),
         target_settings,
         data_dir.join("cas-migrate/materialized"),
     )
-    .await?;
+    .await;
+    let _ = tokio::fs::remove_dir_all(target_index).await;
+    let migrated = migration?;
     println!(
         "CAS backend switched to {} ({migrated} object(s))",
         target.as_str()
@@ -296,27 +320,120 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
     Ok(())
 }
 
+fn path_backed_space_ids(
+    store: &synch_store::Store,
+) -> std::result::Result<Vec<String>, synch_store::StoreError> {
+    Ok(store
+        .spaces()?
+        .into_iter()
+        .filter(|space| space.local_path.is_some())
+        .map(|space| space.id)
+        .collect())
+}
+
 async fn copy_and_switch_backends(
     source_store: Arc<synch_store::Store>,
-    target_store: Arc<synch_store::Store>,
     source_backend: Arc<dyn synch_store::backend::CasBackend>,
     target_backend: Arc<dyn synch_store::backend::CasBackend>,
     target_name: &str,
     target_settings: Vec<(String, Option<String>)>,
     staging: PathBuf,
 ) -> Result<usize> {
-    let listed = source_store;
+    let source_is_cloud = source_backend.remote_upload_parts();
+    if source_is_cloud {
+        let advertised_store = source_store.clone();
+        let advertised = tokio::task::spawn_blocking(move || {
+            let _scope = synch_core::BlockingScope::enter();
+            let mut probes: std::collections::HashMap<synch_core::Hash, (u64, bool)> =
+                std::collections::HashMap::new();
+            if let Some(ours) = advertised_store.self_origin()? {
+                for root in advertised_store.provider_roots_for_origin(&ours)? {
+                    let row = advertised_store.blob(&root)?;
+                    if row.as_ref().is_none_or(|row| !row.durable) {
+                        if let Some((_, ad)) = advertised_store
+                            .providers(&root)?
+                            .into_iter()
+                            .find(|(origin, ad)| origin == &ours && ad.is_complete())
+                        {
+                            probes.insert(root, (ad.size, true));
+                        }
+                    }
+                }
+            }
+            for (root, size) in advertised_store.referenced_content_sizes()? {
+                if advertised_store.blob(&root)?.is_some_and(|row| row.durable) {
+                    continue;
+                }
+                match probes.get(&root) {
+                    Some((known, _)) if *known != size => {
+                        return Err(synch_store::StoreError::Verification {
+                            root,
+                            reason: format!(
+                                "recovered metadata gives both {known} and {size} bytes"
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        probes.insert(root, (size, false));
+                    }
+                }
+            }
+            Ok::<_, synch_store::StoreError>(
+                probes
+                    .into_iter()
+                    .map(|(root, (size, required))| (root, size, required))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .context("the source cloud advertisement inventory task did not complete")??;
+        for (root, size, required) in advertised {
+            source_backend
+                .ensure_ranges(root, size, synch_core::ChunkRanges::empty())
+                .await
+                .with_context(|| format!("could not verify advertised source object {root}"))?;
+            let checked = source_store.clone();
+            let (durable, complete_cache) = tokio::task::spawn_blocking(move || {
+                let _scope = synch_core::BlockingScope::enter();
+                let row = checked.blob(&root)?;
+                Ok::<_, synch_store::StoreError>(match row {
+                    Some(row) => (
+                        row.durable && row.size == size,
+                        row.size == size
+                            && row.complete
+                            && (row.inline.is_some()
+                                || checked.cached_blob_files_present(&root, size)),
+                    ),
+                    None => (false, false),
+                })
+            })
+            .await
+            .context("the source cloud durability check did not complete")??;
+            if required && !durable && !complete_cache {
+                anyhow::bail!(
+                    "source advertises cloud object {root} ({size} bytes), but its final pair is unavailable"
+                );
+            }
+        }
+    }
+    let listed = source_store.clone();
     let candidates = tokio::task::spawn_blocking(move || {
         let _scope = synch_core::BlockingScope::enter();
-        Ok::<_, synch_store::StoreError>(
-            listed
-                .blob_candidates()?
-                .into_iter()
-                .filter(|blob| {
-                    blob.size > synch_core::INLINE_BLOB_MAX && (blob.complete || blob.durable)
-                })
-                .collect::<Vec<_>>(),
-        )
+        let mut candidates = Vec::new();
+        for blob in listed.blob_candidates()? {
+            if blob.durable || (!source_is_cloud && blob.complete) {
+                candidates.push(blob);
+                continue;
+            }
+            if source_is_cloud && blob.complete {
+                let row = listed.blob(&blob.root)?.expect("candidate row exists");
+                if row.inline.is_some() || listed.cached_blob_files_present(&blob.root, blob.size) {
+                    candidates.push(blob);
+                }
+            }
+        }
+        Ok::<_, synch_store::StoreError>(candidates)
     })
     .await
     .context("the CAS inventory task did not complete")??;
@@ -332,21 +449,49 @@ async fn copy_and_switch_backends(
             .materialize(blob.root, blob.size, materialized.clone())
             .await
             .with_context(|| format!("could not read source object {}", blob.root))?;
-        let ingested = target_backend
-            .ingest_file(materialized.clone(), synch_core::now_ns())
-            .await
-            .with_context(|| format!("could not write destination object {}", blob.root));
-        let _ = tokio::fs::remove_file(&materialized).await;
-        let ingested = ingested?;
-        if (ingested.root, ingested.size) != (blob.root, blob.size) {
-            anyhow::bail!(
-                "destination verification changed {} ({} bytes) into {} ({} bytes)",
-                blob.root,
-                blob.size,
-                ingested.root,
-                ingested.size
-            );
+        let copied: Result<()> = async {
+            let ingested = target_backend
+                .ingest_file(materialized.clone(), synch_core::now_ns())
+                .await
+                .with_context(|| format!("could not write destination object {}", blob.root))?;
+            if (ingested.root, ingested.size) != (blob.root, blob.size) {
+                anyhow::bail!(
+                    "destination verification changed {} ({} bytes) into {} ({} bytes)",
+                    blob.root,
+                    blob.size,
+                    ingested.root,
+                    ingested.size
+                );
+            }
+            if target_name == "local" {
+                // Install through the real future-local Store, not merely the
+                // isolated validation index. This rebuilds and fsyncs both the
+                // payload and outboard, so same-length cache corruption cannot
+                // survive the backend flip.
+                let installed = source_store.clone();
+                let path = materialized.clone();
+                let expected = (blob.root, blob.size);
+                let actual = tokio::task::spawn_blocking(move || {
+                    let _scope = synch_core::BlockingScope::enter();
+                    installed.ingest_file(&path, synch_core::now_ns())
+                })
+                .await
+                .context("the local CAS install task did not complete")??;
+                if actual != expected {
+                    anyhow::bail!(
+                        "local CAS install changed {} ({} bytes) into {} ({} bytes)",
+                        expected.0,
+                        expected.1,
+                        actual.0,
+                        actual.1
+                    );
+                }
+            }
+            Ok(())
         }
+        .await;
+        let _ = tokio::fs::remove_file(&materialized).await;
+        copied?;
         tracing::info!(
             completed = index + 1,
             total = candidates.len(),
@@ -355,20 +500,41 @@ async fn copy_and_switch_backends(
         );
     }
 
-    let switched = target_store;
-    let target_name = target_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        let _scope = synch_core::BlockingScope::enter();
-        switched.transaction(|txn| {
-            txn.set_config("cas.backend", &target_name)?;
-            for (key, value) in target_settings {
-                match value {
-                    Some(value) => txn.set_config(&key, &value)?,
-                    None => txn.clear_config(&key)?,
+    if target_name == "local" {
+        let checked = source_store.clone();
+        let expected: Vec<(synch_core::Hash, u64)> = candidates
+            .iter()
+            .map(|blob| (blob.root, blob.size))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let _scope = synch_core::BlockingScope::enter();
+            for (root, size) in expected {
+                let row = checked
+                    .blob(&root)?
+                    .ok_or(synch_store::StoreError::MissingBlob(root))?;
+                if row.inline.is_none() && !checked.cached_blob_files_present(&root, size) {
+                    return Err(synch_store::StoreError::MissingBlob(root));
                 }
             }
             Ok::<_, synch_store::StoreError>(())
         })
+        .await
+        .context("the local destination CAS verification task did not complete")??;
+    }
+
+    let switched = source_store;
+    let target_name = target_name.to_string();
+    let migrated_roots: Vec<synch_core::Hash> = candidates.iter().map(|blob| blob.root).collect();
+    tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        switched
+            .commit_cas_migration(
+                &target_name,
+                &target_settings,
+                &migrated_roots,
+                source_is_cloud,
+            )
+            .map(|_| ())
     })
     .await
     .context("the CAS switch task did not complete")??;
@@ -386,7 +552,13 @@ fn cloud_option_names(backend: CasBackendArg) -> &'static [&'static str] {
             "endpoint",
             "enable_virtual_host_style",
         ],
-        CasBackendArg::Gcs => &["root", "bucket", "endpoint"],
+        CasBackendArg::Gcs => &[
+            "root",
+            "bucket",
+            "endpoint",
+            "skip_signature",
+            "disable_vm_metadata",
+        ],
         CasBackendArg::Azblob => &["root", "container", "endpoint", "account_name"],
     }
 }
@@ -753,6 +925,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--gcs-bucket"));
+
+        let emulator = Cli::parse_from([
+            "synch",
+            "--cas-backend",
+            "gcs",
+            "--gcs-bucket",
+            "test",
+            "--gcs-endpoint",
+            "http://127.0.0.1:4443",
+            "--gcs-skip-signature",
+            "--gcs-disable-vm-metadata",
+            "daemon",
+            "run",
+        ]);
+        let cloud = node_config(&emulator).unwrap().cloud.unwrap();
+        assert_eq!(cloud.options["skip_signature"], "true");
+        assert_eq!(cloud.options["disable_vm_metadata"], "true");
+    }
+
+    #[test]
+    fn cloud_migration_preflight_names_path_backed_spaces() {
+        let data = tempfile::tempdir().unwrap();
+        let store = synch_store::Store::open(data.path()).unwrap();
+        store.put_space("detached", None).unwrap();
+        store.put_space("checkout", Some("/srv/checkout")).unwrap();
+        assert_eq!(
+            path_backed_space_ids(&store).unwrap(),
+            vec!["checkout".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -761,6 +962,9 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let source_store = Arc::new(synch_store::Store::open(data.path()).unwrap());
+        source_store
+            .set_self_origin(&synch_core::OriginId::named("migration", "test.example").unwrap())
+            .unwrap();
         source_store.set_config("cas.backend", "local").unwrap();
         let source: Arc<dyn synch_store::backend::CasBackend> =
             Arc::new(synch_store::backend::LocalFs::new(source_store.clone()));
@@ -770,8 +974,15 @@ mod tests {
             .await
             .unwrap()
             .root;
+        let inline_payload = b"inline migration must reach every backend".to_vec();
+        let inline_root = source
+            .ingest_bytes(inline_payload.clone(), synch_core::now_ns())
+            .await
+            .unwrap()
+            .root;
 
-        let target_store = Arc::new(synch_store::Store::open(data.path()).unwrap());
+        let target_index = tempfile::tempdir().unwrap();
+        let target_store = Arc::new(synch_store::Store::open(target_index.path()).unwrap());
         let objects = synch_store::cloud::CloudStore::open(&synch_store::cloud::CloudConfig {
             service: synch_store::cloud::CloudService::Memory,
             options: std::collections::HashMap::new(),
@@ -788,9 +999,18 @@ mod tests {
                 synch_store::cloud::CloudUploadPolicy::OwnPinned,
                 None,
             ));
+        // Resume shape: the destination object was acknowledged before a
+        // previous process reached the final backend-config transaction.
+        target
+            .ingest_bytes(payload.clone(), synch_core::now_ns())
+            .await
+            .unwrap();
+        target
+            .ingest_bytes(inline_payload.clone(), synch_core::now_ns())
+            .await
+            .unwrap();
         let count = copy_and_switch_backends(
             source_store.clone(),
-            target_store,
             source,
             target,
             "s3",
@@ -799,7 +1019,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
         assert_eq!(
             source_store.config("cas.backend").unwrap().as_deref(),
             Some("s3")
@@ -812,6 +1032,14 @@ mod tests {
                 .as_ref(),
             &payload[17..90_017]
         );
+        assert_eq!(
+            objects
+                .read_range(&inline_root, 0..inline_payload.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            inline_payload
+        );
 
         // The same verified walk covers cloud-to-cloud and cloud-to-local;
         // force each source cache cold so the test cannot pass by reusing the
@@ -823,7 +1051,7 @@ mod tests {
         let cloud_source: Arc<dyn synch_store::backend::CasBackend> =
             Arc::new(synch_store::backend::Cloud::new(
                 cloud_source_store.clone(),
-                objects,
+                objects.clone(),
                 synch_store::cloud::CloudUploadPolicy::OwnPinned,
                 None,
             ));
@@ -838,7 +1066,8 @@ mod tests {
                 cache_bytes: None,
             })
             .unwrap();
-        let second_store = Arc::new(synch_store::Store::open(data.path()).unwrap());
+        let second_index = tempfile::tempdir().unwrap();
+        let second_store = Arc::new(synch_store::Store::open(second_index.path()).unwrap());
         let second_cloud: Arc<dyn synch_store::backend::CasBackend> =
             Arc::new(synch_store::backend::Cloud::new(
                 second_store.clone(),
@@ -846,9 +1075,77 @@ mod tests {
                 synch_store::cloud::CloudUploadPolicy::OwnPinned,
                 None,
             ));
-        copy_and_switch_backends(
+        let stale = cloud_source_store
+            .ingest_bytes(&vec![0x6d; 100_000], synch_core::now_ns())
+            .unwrap();
+        assert!(!cloud_source_store.blob(&stale).unwrap().unwrap().durable);
+        let _ = std::fs::remove_file(
+            cloud_source_store
+                .data_dir()
+                .join(synch_store::CAS_DIR)
+                .join({
+                    let hex = stale.to_hex();
+                    format!("{}/{hex}", &hex[..2])
+                }),
+        );
+        let ours = cloud_source_store.self_origin().unwrap().unwrap();
+        let cached_payload = vec![0x72; 100_000];
+        let cached = cloud_source_store
+            .ingest_bytes(&cached_payload, synch_core::now_ns())
+            .unwrap();
+        let inline_cached_payload = b"complete inline peer cache".to_vec();
+        let inline_cached = cloud_source_store
+            .ingest_bytes(&inline_cached_payload, synch_core::now_ns())
+            .unwrap();
+        cloud_source_store
+            .put_provider(
+                &cached,
+                &ours,
+                &cloud_source_store.local_ad(&cached).unwrap().unwrap(),
+            )
+            .unwrap();
+        cloud_source_store
+            .put_provider(
+                &inline_cached,
+                &ours,
+                &cloud_source_store
+                    .local_ad(&inline_cached)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let masked_payload = vec![0x33; 100_000];
+        let masked = cloud_source_store
+            .ingest_bytes(&masked_payload, synch_core::now_ns())
+            .unwrap();
+        objects.ingest_bytes(&masked_payload).await.unwrap();
+        let masked_hex = masked.to_hex();
+        let _ = std::fs::remove_file(
+            cloud_source_store
+                .data_dir()
+                .join(synch_store::CAS_DIR)
+                .join(format!("{}/{masked_hex}", &masked_hex[..2])),
+        );
+        cloud_source_store
+            .put_entry(
+                &synch_core::OriginId::named("peer", "test.example").unwrap(),
+                "shared",
+                "masked.bin",
+                &synch_core::FileEntry::file(masked_payload.len() as u64, 1, masked, 1),
+            )
+            .unwrap();
+        let rowless_payload = b"self-readopted rowless cloud object".to_vec();
+        let rowless = objects.ingest_bytes(&rowless_payload).await.unwrap();
+        cloud_source_store
+            .put_provider(
+                &rowless.root,
+                &ours,
+                &synch_core::BlobAd::complete(rowless.size),
+            )
+            .unwrap();
+        assert!(cloud_source_store.blob(&rowless.root).unwrap().is_none());
+        let migrated = copy_and_switch_backends(
             cloud_source_store,
-            second_store,
             cloud_source,
             second_cloud,
             "gcs",
@@ -857,6 +1154,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(migrated, 6);
+        assert!(source_store.blob(&stale).unwrap().is_none());
         assert_eq!(
             second_objects
                 .read_range(&root, 17..90_017)
@@ -865,11 +1164,66 @@ mod tests {
                 .as_ref(),
             &payload[17..90_017]
         );
+        assert_eq!(
+            second_objects
+                .read_range(&inline_root, 0..inline_payload.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            inline_payload
+        );
+        assert_eq!(
+            second_objects
+                .read_range(&rowless.root, 0..rowless.size)
+                .await
+                .unwrap()
+                .as_ref(),
+            rowless_payload
+        );
+        assert_eq!(
+            second_objects
+                .read_range(&cached, 0..cached_payload.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            cached_payload
+        );
+        assert_eq!(
+            second_objects
+                .read_range(&inline_cached, 0..inline_cached_payload.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            inline_cached_payload
+        );
+        assert_eq!(
+            second_objects
+                .read_range(&masked, 0..masked_payload.len() as u64)
+                .await
+                .unwrap()
+                .as_ref(),
+            masked_payload
+        );
 
         let reverse_source_store = Arc::new(synch_store::Store::open(data.path()).unwrap());
-        reverse_source_store
-            .reconcile_scratch_generation("cloud-to-local-cold")
-            .unwrap();
+        let root_hex = root.to_hex();
+        let payload_path = reverse_source_store
+            .data_dir()
+            .join(synch_store::CAS_DIR)
+            .join(format!("{}/{root_hex}", &root_hex[..2]));
+        let mut outboard_path = payload_path.clone();
+        outboard_path.set_extension("obao");
+        let _ = std::fs::remove_file(payload_path);
+        let _ = std::fs::remove_file(outboard_path);
+        let cached_hex = cached.to_hex();
+        let mut cached_outboard = reverse_source_store
+            .data_dir()
+            .join(synch_store::CAS_DIR)
+            .join(format!("{}/{cached_hex}", &cached_hex[..2]));
+        cached_outboard.set_extension("obao");
+        let mut corrupt_outboard = std::fs::read(&cached_outboard).unwrap();
+        corrupt_outboard[0] ^= 0xff;
+        std::fs::write(&cached_outboard, corrupt_outboard).unwrap();
         let reverse_source: Arc<dyn synch_store::backend::CasBackend> =
             Arc::new(synch_store::backend::Cloud::new(
                 reverse_source_store.clone(),
@@ -878,11 +1232,12 @@ mod tests {
                 None,
             ));
         let local_store = Arc::new(synch_store::Store::open(data.path()).unwrap());
+        let local_index = tempfile::tempdir().unwrap();
+        let local_target_store = Arc::new(synch_store::Store::open(local_index.path()).unwrap());
         let local: Arc<dyn synch_store::backend::CasBackend> =
-            Arc::new(synch_store::backend::LocalFs::new(local_store.clone()));
+            Arc::new(synch_store::backend::LocalFs::new(local_target_store));
         copy_and_switch_backends(
             reverse_source_store,
-            local_store.clone(),
             reverse_source,
             local,
             "local",
@@ -896,6 +1251,102 @@ mod tests {
             Some("local")
         );
         assert_eq!(local_store.read_all(&root).unwrap(), payload);
+        assert_eq!(local_store.read_all(&inline_root).unwrap(), inline_payload);
+        assert_eq!(
+            local_store.read_all(&rowless.root).unwrap(),
+            rowless_payload
+        );
+        assert_eq!(local_store.read_all(&cached).unwrap(), cached_payload);
+        assert_eq!(
+            local_store.read_all(&inline_cached).unwrap(),
+            inline_cached_payload
+        );
+        assert_eq!(local_store.read_all(&masked).unwrap(), masked_payload);
+        let all_cached = synch_core::ChunkRanges::single(
+            0,
+            synch_core::group_count(cached_payload.len() as u64),
+        );
+        local_store.encode_slice(&cached, &all_cached).unwrap();
+
+        // A complete own durability promise must not disappear merely because
+        // an older staged row masks it. With neither source final pair nor
+        // verified cache, migration fails before the backend flip.
+        let unavailable_data = tempfile::tempdir().unwrap();
+        let unavailable_scratch = tempfile::tempdir().unwrap();
+        let unavailable_store =
+            Arc::new(synch_store::Store::open(unavailable_data.path()).unwrap());
+        let unavailable_origin =
+            synch_core::OriginId::named("unavailable", "test.example").unwrap();
+        unavailable_store
+            .set_self_origin(&unavailable_origin)
+            .unwrap();
+        unavailable_store.set_config("cas.backend", "s3").unwrap();
+        let unavailable_objects =
+            synch_store::cloud::CloudStore::open(&synch_store::cloud::CloudConfig {
+                service: synch_store::cloud::CloudService::Memory,
+                options: Default::default(),
+                scratch_dir: unavailable_scratch.path().to_path_buf(),
+                io_timeout: std::time::Duration::from_secs(5),
+                upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+                cache_bytes: None,
+            })
+            .unwrap();
+        let unavailable_source: Arc<dyn synch_store::backend::CasBackend> =
+            Arc::new(synch_store::backend::Cloud::new(
+                unavailable_store.clone(),
+                unavailable_objects,
+                synch_store::cloud::CloudUploadPolicy::OwnPinned,
+                None,
+            ));
+        let unavailable_root = unavailable_store
+            .ingest_bytes(&vec![0x28; 100_000], synch_core::now_ns())
+            .unwrap();
+        unavailable_store
+            .put_provider(
+                &unavailable_root,
+                &unavailable_origin,
+                &synch_core::BlobAd::complete(100_000),
+            )
+            .unwrap();
+        let unavailable_hex = unavailable_root.to_hex();
+        let _ = std::fs::remove_file(
+            unavailable_store
+                .data_dir()
+                .join(synch_store::CAS_DIR)
+                .join(format!("{}/{unavailable_hex}", &unavailable_hex[..2])),
+        );
+        let unavailable_target_index = tempfile::tempdir().unwrap();
+        let unavailable_target_store =
+            Arc::new(synch_store::Store::open(unavailable_target_index.path()).unwrap());
+        let unavailable_target: Arc<dyn synch_store::backend::CasBackend> =
+            Arc::new(synch_store::backend::Cloud::new(
+                unavailable_target_store,
+                synch_store::cloud::CloudStore::open(&synch_store::cloud::CloudConfig {
+                    service: synch_store::cloud::CloudService::Memory,
+                    options: Default::default(),
+                    scratch_dir: unavailable_target_index.path().join("scratch"),
+                    io_timeout: std::time::Duration::from_secs(5),
+                    upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+                    cache_bytes: None,
+                })
+                .unwrap(),
+                synch_store::cloud::CloudUploadPolicy::OwnPinned,
+                None,
+            ));
+        assert!(copy_and_switch_backends(
+            unavailable_store.clone(),
+            unavailable_source,
+            unavailable_target,
+            "gcs",
+            Vec::new(),
+            unavailable_data.path().join("migration"),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            unavailable_store.config("cas.backend").unwrap().as_deref(),
+            Some("s3")
+        );
 
         // A source verification/read failure returns before the final config
         // transaction, leaving the stored backend untouched for a retry.
@@ -916,7 +1367,6 @@ mod tests {
         std::fs::write(&broken_staging, b"not a directory").unwrap();
         assert!(copy_and_switch_backends(
             broken_source.clone(),
-            destination_store,
             broken_backend,
             destination,
             "s3",

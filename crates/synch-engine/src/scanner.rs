@@ -82,6 +82,11 @@ impl Node {
 
     /// Walks one space and stages everything that changed.
     pub fn scan_space(&self, space_id: &str) -> Result<ScanReport> {
+        if self.cas_backend().remote_upload_parts() {
+            return Err(EngineError::invalid(
+                "cloud-CAS scans must use the async backend-aware scan path",
+            ));
+        }
         let store = self.store().clone();
         self.scan_space_with_ingest(space_id, &mut move |path| {
             Ok(store.ingest_file(path, now_ns())?)
@@ -411,6 +416,11 @@ impl Node {
     /// Hashing a large tree takes as long as it takes; `on_space` is how a
     /// caller says so while it happens, rather than after everything is done.
     pub fn scan_all_with(&self, mut on_space: impl FnMut(&str, &ScanReport)) -> Result<ScanReport> {
+        if self.cas_backend().remote_upload_parts() {
+            return Err(EngineError::invalid(
+                "cloud-CAS scans must use the async backend-aware scan path",
+            ));
+        }
         let store = self.store().clone();
         self.scan_all_with_ingest(&mut on_space, &mut move |path| {
             Ok(store.ingest_file(path, now_ns())?)
@@ -613,19 +623,31 @@ impl Node {
     /// a worker thread it stops that thread from polling for as long as it
     /// takes, which on a multi-gigabyte space is the daemon going quiet: no
     /// peer answered, no control request served, no timer fired on time (§10).
-    pub(crate) async fn scan_and_stage_off_runtime(&self) -> Result<ScanReport> {
+    pub async fn scan_and_stage_async(&self) -> Result<ScanReport> {
+        Ok(self.scan_and_stage_async_with_reports().await?.0)
+    }
+
+    /// Backend-aware scan plus the per-space reports used by an explicit CLI
+    /// scan's progress output.
+    pub async fn scan_and_stage_async_with_reports(
+        &self,
+    ) -> Result<(ScanReport, Vec<(String, ScanReport)>)> {
         let node = self.clone();
         let backend = self.cas_backend().clone();
         crate::blocking::offload(move || {
             node.ensure_publishable()?;
             let runtime = tokio::runtime::Handle::current();
-            let report = node.scan_all_with_ingest(&mut |_, _| {}, &mut |path| {
-                let ingested =
-                    runtime.block_on(backend.ingest_file(path.to_path_buf(), now_ns()))?;
-                Ok((ingested.root, ingested.size))
-            })?;
+            let mut spaces = Vec::new();
+            let report = node.scan_all_with_ingest(
+                &mut |space, report| spaces.push((space.to_string(), report.clone())),
+                &mut |path| {
+                    let ingested =
+                        runtime.block_on(backend.ingest_file(path.to_path_buf(), now_ns()))?;
+                    Ok((ingested.root, ingested.size))
+                },
+            )?;
             node.stage(report.staged.iter().cloned());
-            Ok(report)
+            Ok((report, spaces))
         })
         .await
     }
@@ -1527,7 +1549,7 @@ mod tests {
             scratch_dir: scratch,
             io_timeout: std::time::Duration::from_secs(5),
             upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
-            cache_bytes: None,
+            cache_bytes: Some(512 * 1024 * 1024),
         });
         let node = Node::open(config).await.unwrap();
         node.add_detached_space("media").unwrap();
@@ -1559,6 +1581,42 @@ mod tests {
         );
         node.flush_staged().await.unwrap().unwrap();
         assert_eq!(published(&node, "media", "large.bin").content, Some(root));
+
+        // Shape a self-readopted head whose older SQLite snapshot lacks the
+        // blob row. Maintenance must keep the recovered own ad while the
+        // provider-serving path reconstructs the cold row from final keys.
+        node.store().delete_blob(&root).unwrap();
+        assert!(node.store().blob(&root).unwrap().is_none());
+        node.reconstruct_recovered_cloud_rows().await.unwrap();
+        assert!(node.retired_ad_changes().unwrap().is_empty());
+        let (encoded, served) = node
+            .cas_backend()
+            .encode_slice(root, synch_core::ChunkRanges::single(0, 1))
+            .await
+            .unwrap();
+        assert_eq!(served, synch_core::ChunkRanges::single(0, 1));
+        assert!(!encoded.is_empty());
+        assert!(node.store().blob(&root).unwrap().unwrap().durable);
+
+        let pinned = node
+            .cas_backend()
+            .ingest_bytes(b"b-only recovered pin".to_vec(), now_ns())
+            .await
+            .unwrap();
+        let ad = node.store().local_ad(&pinned.root).unwrap().unwrap();
+        node.publish(&[(
+            blob_key(&pinned.root),
+            Some(postcard::to_stdvec(&ad).unwrap()),
+        )])
+        .unwrap();
+        assert!(!node.store().content_is_referenced(&pinned.root).unwrap());
+        node.store().delete_blob(&pinned.root).unwrap();
+        assert!(node.store().blob(&pinned.root).unwrap().is_none());
+        node.reconstruct_recovered_cloud_rows().await.unwrap();
+        let recovered_pin = node.store().blob(&pinned.root).unwrap().unwrap();
+        assert!(recovered_pin.durable && recovered_pin.pinned);
+        assert!(node.store().pending_backend_deletes().unwrap().is_empty());
+        assert!(node.retired_ad_changes().unwrap().is_empty());
 
         // Simulate a replacement container: only the database and remote
         // object survive. The first read refills and verifies the cache.
@@ -2130,7 +2188,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let before = ticks.load(Ordering::Relaxed);
-        let report = node.scan_and_stage_off_runtime().await.unwrap();
+        let report = node.scan_and_stage_async().await.unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
         // Calibrated to failure modes, not machine speed: an inline hash ticks

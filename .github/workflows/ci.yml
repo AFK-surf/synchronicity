@@ -125,6 +125,7 @@ jobs:
       - name: Run the shared backend contract against all providers
         run: cargo test -p synch-store --test cloud_providers -- --nocapture
         env:
+          SYNCH_TEST_CLOUD_REQUIRED: "1"
           SYNCH_TEST_S3_BUCKET: synch-s3
           SYNCH_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           SYNCH_TEST_S3_REGION: us-east-1

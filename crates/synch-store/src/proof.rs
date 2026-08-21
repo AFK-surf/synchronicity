@@ -738,7 +738,11 @@ impl Store {
             // The cheap refusal; `commit_groups` makes the same decision again
             // inside the transaction that records it (`settle_size`).
             let held = row.verified_groups();
-            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
+            crate::cas::settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
         }
         if !encoded.len().is_multiple_of(PROOF_NODE_LEN) {
             return Err(StoreError::Verification {
@@ -961,7 +965,11 @@ impl Store {
             held = row.verified_groups();
             // The cheap refusal; `commit_groups` decides again inside the
             // transaction that records the result (`settle_size`).
-            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
+            crate::cas::settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }

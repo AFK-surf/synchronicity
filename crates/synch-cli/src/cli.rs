@@ -39,8 +39,8 @@ pub struct Cli {
     )]
     pub cloud_upload: CloudUploadArg,
 
-    /// Maximum bytes used by the reconstructible cloud read cache. Without a
-    /// value, maintenance evicts enough to keep 20% of its filesystem free.
+    /// Maintenance target for the reconstructible cloud read cache. Without a
+    /// value on Unix, maintenance targets 20% free space.
     #[arg(long, global = true, env = "SYNCH_CLOUD_CACHE_BYTES")]
     pub cloud_cache_bytes: Option<u64>,
 
@@ -67,6 +67,14 @@ pub struct Cli {
     /// GCS service-account credential file.
     #[arg(long, global = true, env = "SYNCH_GCS_CREDENTIAL_PATH")]
     pub gcs_credential_path: Option<PathBuf>,
+
+    /// Disable GCS request signing for an explicitly trusted emulator endpoint.
+    #[arg(long, global = true, env = "SYNCH_GCS_SKIP_SIGNATURE")]
+    pub gcs_skip_signature: bool,
+
+    /// Do not query the GCE metadata service for GCS credentials.
+    #[arg(long, global = true, env = "SYNCH_GCS_DISABLE_VM_METADATA")]
+    pub gcs_disable_vm_metadata: bool,
 
     /// Azure Blob container.
     #[arg(long, global = true, env = "SYNCH_AZBLOB_CONTAINER")]

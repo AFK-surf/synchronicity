@@ -536,6 +536,20 @@ impl Node {
             .collect();
         let opened = crate::blocking::offload(move || {
             let store = Store::open(&data_dir)?;
+            if desired_backend != "local" {
+                let path_spaces: Vec<String> = store
+                    .spaces()?
+                    .into_iter()
+                    .filter(|space| space.local_path.is_some())
+                    .map(|space| space.id)
+                    .collect();
+                if !path_spaces.is_empty() {
+                    return Err(EngineError::invalid(format!(
+                        "cloud CAS requires detached spaces; path-backed space(s): {}",
+                        path_spaces.join(", ")
+                    )));
+                }
+            }
             match store.config("cas.backend")? {
                 Some(stored) if stored != desired_backend => {
                     return Err(EngineError::invalid(format!(
@@ -588,9 +602,11 @@ impl Node {
         let legacy_pin_state = config.data_dir.join("rekor-pins.json");
         let pin_store = store.clone();
         crate::blocking::offload(move || {
-            if pin_store.config("rekor.pin_state")?.is_none() && legacy_pin_state.exists() {
-                let text = std::fs::read_to_string(&legacy_pin_state)?;
-                pin_store.set_config("rekor.pin_state", &text)?;
+            if legacy_pin_state.exists() {
+                if pin_store.config("rekor.pin_state")?.is_none() {
+                    let text = std::fs::read_to_string(&legacy_pin_state)?;
+                    pin_store.set_config("rekor.pin_state", &text)?;
+                }
                 // The database is authoritative after the row commits. Keeping
                 // a second writable copy would let the two monotonic floors
                 // drift and makes the next cold restore choose ambiguously.
@@ -1353,6 +1369,19 @@ impl Node {
 
     /// The `b:` record for a locally held object, if we hold any of it.
     pub fn ad_change(&self, root: &Hash) -> Result<Option<StagedChange>> {
+        if self.cas_backend().remote_upload_parts()
+            && self
+                .store()
+                .blob(root)?
+                .is_some_and(|row| row.complete && !row.durable)
+        {
+            // A complete cloud ad survives in a signed head, so recovery must
+            // be able to treat it as a durability promise. Cache-only objects
+            // may advertise partial progress, but completion under `own` /
+            // `own+pinned` retires that transient ad instead of making an
+            // ambiguous promise the next SQLite restore cannot interpret.
+            return Ok(Some((blob_key(root), None)));
+        }
         let Some(ad) = self.store().local_ad(root)? else {
             return Ok(None);
         };
@@ -2115,7 +2144,7 @@ mod tests {
                 scratch_dir: data.path().join("cloud-scratch"),
                 io_timeout: std::time::Duration::from_secs(5),
                 upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
-                cache_bytes: None,
+                cache_bytes: Some(512 * 1024 * 1024),
             });
             config
         };
@@ -2123,6 +2152,54 @@ mod tests {
         node.shutdown().await.unwrap();
         let error = Node::open(configured("/two/")).await.unwrap_err();
         assert!(error.to_string().contains("synch cas migrate"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cloud_node_refuses_an_existing_path_backed_space() {
+        let data = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        Store::open(data.path())
+            .unwrap()
+            .put_space("media", Some(&checkout.path().to_string_lossy()))
+            .unwrap();
+        let mut config = NodeConfig::loopback(data.path());
+        config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let error = Node::open(config).await.unwrap_err();
+        assert!(error.to_string().contains("path-backed space"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_rekor_pin_state_moves_once_into_sqlite() {
+        let data = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let legacy = data.path().join("rekor-pins.json");
+        std::fs::write(&legacy, r#"{"generation":1}"#).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        assert_eq!(
+            node.store().config("rekor.pin_state").unwrap().as_deref(),
+            Some(r#"{"generation":1}"#)
+        );
+        assert!(!legacy.exists());
+        node.shutdown().await.unwrap();
+
+        // A stale legacy file can reappear after restoring mixed volumes; the
+        // SQLite floor wins and the second writable copy is removed.
+        std::fs::write(&legacy, r#"{"generation":0}"#).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        assert_eq!(
+            node.store().config("rekor.pin_state").unwrap().as_deref(),
+            Some(r#"{"generation":1}"#)
+        );
+        assert!(!legacy.exists());
+        node.shutdown().await.unwrap();
     }
 
     /// Static trust binds the key and only the key: names are the zone's to

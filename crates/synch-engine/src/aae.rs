@@ -196,7 +196,7 @@ impl Node {
     /// one batch and one head — including anything a watcher-triggered rescan
     /// had already staged — and the head is out before this returns.
     pub async fn scan_publish_push(&self) -> Result<Option<SignedHead>> {
-        self.scan_and_stage_off_runtime().await?;
+        self.scan_and_stage_async().await?;
         self.flush_staged().await
     }
 

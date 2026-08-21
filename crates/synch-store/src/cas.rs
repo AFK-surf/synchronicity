@@ -58,6 +58,42 @@ pub(crate) fn fsync_parent(path: &std::path::Path) {
     }
 }
 
+/// Atomically replaces a file on platforms whose plain rename refuses an
+/// existing destination.
+#[cfg(not(windows))]
+pub(crate) fn replace_file(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_file(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Writes a file whole and flushes it (contents and directory entry) to stable
 /// storage before returning.
 ///
@@ -103,7 +139,7 @@ fn write_and_sync(
     }
     // `rename` is atomic within a filesystem: a reader sees either the whole
     // old file or the whole new one, never a truncated prefix of either.
-    if let Err(e) = std::fs::rename(&staging, path) {
+    if let Err(e) = replace_file(&staging, path) {
         let _ = std::fs::remove_file(&staging);
         return Err(e.into());
     }
@@ -262,7 +298,7 @@ pub(crate) struct Settlement {
 /// refusing every honest writer for good (`docs/DELTA-SYNC.md` §6).
 pub(crate) fn settle_size(
     root: &Hash,
-    existing: Option<(u64, bool, &ChunkRanges)>,
+    existing: Option<(u64, bool, bool, &ChunkRanges)>,
     claimed: u64,
 ) -> Result<Settlement> {
     let settled = |size| {
@@ -271,13 +307,13 @@ pub(crate) fn settle_size(
             reset_held: false,
         })
     };
-    let Some((recorded, complete, held)) = existing else {
+    let Some((recorded, complete, durable, held)) = existing else {
         return settled(claimed);
     };
     if recorded == claimed {
         return settled(recorded);
     }
-    if size_is_attested(recorded, complete, held) {
+    if durable || size_is_attested(recorded, complete, held) {
         return Err(StoreError::Verification {
             root: *root,
             reason: format!("size mismatch: have {recorded}, offered {claimed}"),
@@ -302,6 +338,7 @@ pub(crate) struct Commit {
 struct RowClaim {
     size: u64,
     complete: bool,
+    durable: bool,
     held: ChunkRanges,
 }
 
@@ -444,14 +481,14 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
 /// The bitmap is read against the row's *own* size, not the caller's: the two
 /// can differ, and that difference is the whole subject of [`settle_size`].
 fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
-    let row: Option<(i64, i64, Option<Vec<u8>>)> = conn
+    let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
         .query_row(
-            "SELECT size, complete, bitmap FROM blobs WHERE root = ?1",
+            "SELECT size, complete, durable, bitmap FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    Ok(row.map(|(size, complete, bitmap)| {
+    Ok(row.map(|(size, complete, durable, bitmap)| {
         let size = size as u64;
         let total = group_count(size);
         let complete = complete != 0;
@@ -463,6 +500,7 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         RowClaim {
             size,
             complete,
+            durable: durable != 0,
             held,
         }
     }))
@@ -602,7 +640,7 @@ impl Store {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::rename(&staging, &target)?;
+        replace_file(&staging, &target)?;
         // Flush the payload contents, the outboard, and the directory entries
         // before the index row claims this blob is complete. Checked, like the
         // flushes below it: a swallowed ENOSPC or EIO here is a row claiming
@@ -710,7 +748,9 @@ impl Store {
             let claim = read_claim(tx, root)?;
             let settlement = settle_size(
                 root,
-                claim.as_ref().map(|c| (c.size, c.complete, &c.held)),
+                claim
+                    .as_ref()
+                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
                 size,
             )?;
             let size = settlement.size;
@@ -922,6 +962,44 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Reconstructs a cold durable row after metadata restore, once the remote
+    /// backend has verified that the final payload/outboard pair exists.
+    pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
+        self.with_immediate_tx(|tx| {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT size FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing as u64 != size {
+                    return Err(StoreError::Verification {
+                        root: *root,
+                        reason: format!("size mismatch: have {existing}, offered {size}"),
+                    });
+                }
+                tx.execute(
+                    "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO blobs
+                       (root, size, complete, bitmap, inline, pinned, last_access, durable, quarantined)
+                     VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1, 0)",
+                    params![root.as_bytes().to_vec(), size as i64, now],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM backend_deletes WHERE root = ?1",
+                params![root.as_bytes().to_vec()],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Quarantines a durable object whose bytes failed verification.
     pub fn quarantine_blob(&self, root: &Hash) -> Result<bool> {
         let changed = self.conn().execute(
@@ -989,7 +1067,7 @@ impl Store {
 
     /// Whether both files behind a complete out-of-line cache claim exist at
     /// their exact expected lengths.
-    pub(crate) fn cached_blob_files_present(&self, root: &Hash, size: u64) -> bool {
+    pub fn cached_blob_files_present(&self, root: &Hash, size: u64) -> bool {
         std::fs::metadata(self.blob_path(root)).is_ok_and(|metadata| metadata.len() == size)
             && std::fs::metadata(self.outboard_path(root))
                 .is_ok_and(|metadata| metadata.len() == Self::tree(size).outboard_size())
@@ -1024,8 +1102,11 @@ impl Store {
     /// Drops only reconstructible local bytes while retaining a remote durable
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
-    pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<()> {
+    pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
         let conn = self.conn();
+        if self.is_being_written(root) {
+            return Ok(false);
+        }
         conn.execute(
             "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
             params![root.as_bytes().to_vec()],
@@ -1038,7 +1119,66 @@ impl Store {
         let _ = std::fs::remove_file(self.blob_path(root));
         let _ = std::fs::remove_file(self.outboard_path(root));
         drop(conn);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Atomically commits a verified backend migration and drops leftover
+    /// cloud-only staged filesystem rows. The caller holds the lifecycle lock.
+    pub fn commit_cas_migration(
+        &self,
+        target: &str,
+        settings: &[(String, Option<String>)],
+        migrated: &[Hash],
+        discard_nondurable: bool,
+    ) -> Result<usize> {
+        let discarded = self.with_immediate_tx(|tx| {
+            for root in migrated {
+                tx.execute(
+                    "UPDATE blobs SET durable = 1, quarantined = 0 WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                )?;
+            }
+            let discarded = if discard_nondurable {
+                let mut stmt =
+                    tx.prepare("SELECT root FROM blobs WHERE durable = 0 AND inline IS NULL")?;
+                let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                let mut roots = Vec::new();
+                for row in rows {
+                    roots.push(hash_column(row?, "blobs.root")?);
+                }
+                roots
+            } else {
+                Vec::new()
+            };
+            if discard_nondurable {
+                tx.execute("DELETE FROM blobs WHERE durable = 0 AND inline IS NULL", [])?;
+            }
+            tx.execute(
+                "INSERT INTO config (key, value) VALUES ('cas.backend', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![target],
+            )?;
+            for (key, value) in settings {
+                match value {
+                    Some(value) => {
+                        tx.execute(
+                            "INSERT INTO config (key, value) VALUES (?1, ?2)
+                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            params![key, value],
+                        )?;
+                    }
+                    None => {
+                        tx.execute("DELETE FROM config WHERE key = ?1", params![key])?;
+                    }
+                }
+            }
+            Ok(discarded)
+        })?;
+        for root in &discarded {
+            let _ = std::fs::remove_file(self.blob_path(root));
+            let _ = std::fs::remove_file(self.outboard_path(root));
+        }
+        Ok(discarded.len())
     }
 
     /// Current out-of-line bytes occupied by reconstructible durable cache
@@ -1064,10 +1204,9 @@ impl Store {
             if usage <= target_bytes {
                 break;
             }
-            if self.is_being_written(&root) {
+            if !self.clear_blob_cache(&root)? {
                 continue;
             }
-            self.clear_blob_cache(&root)?;
             usage = usage.saturating_sub(bytes);
             freed = freed.saturating_add(bytes);
             evicted += 1;
@@ -1184,7 +1323,6 @@ impl Store {
                 "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
                    SELECT root, ?3 FROM blobs
                     WHERE root = ?1
-                      AND inline IS NULL
                       AND pinned = 0
                       AND last_access < ?2
                       AND NOT EXISTS (
@@ -1246,7 +1384,7 @@ impl Store {
         if self.has_remote_cas() {
             tx.execute(
                 "INSERT OR IGNORE INTO backend_deletes (root, queued_at)
-                   SELECT root, ?2 FROM blobs WHERE root = ?1 AND inline IS NULL",
+                   SELECT root, ?2 FROM blobs WHERE root = ?1",
                 params![root.as_bytes().to_vec(), synch_core::now_ns()],
             )?;
         }
@@ -1486,7 +1624,11 @@ impl Store {
             // at the commit — this one is here so a claim that cannot possibly
             // stand never reaches the disk at all.
             let held = row.verified_groups();
-            settle_size(root, Some((row.size, row.complete, &held)), size)?;
+            settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }
@@ -1747,7 +1889,7 @@ mod tests {
         assert!(cache.blob(&root).unwrap().is_none());
 
         let inline = cache.ingest_bytes(b"inline", 2).unwrap();
-        assert!(cache.blob(&inline).unwrap().unwrap().durable);
+        assert!(!cache.blob(&inline).unwrap().unwrap().durable);
     }
 
     #[test]
@@ -1773,7 +1915,7 @@ mod tests {
 
         let inline = store.ingest_bytes(b"inline", 3).unwrap();
         store.delete_blob(&inline).unwrap();
-        assert!(store.pending_backend_deletes().unwrap().is_empty());
+        assert_eq!(store.pending_backend_deletes().unwrap(), vec![inline]);
     }
     use crate::testutil::{data, store};
 
@@ -2224,6 +2366,26 @@ mod tests {
 
         // Once the lease is gone both sweeps do their job.
         assert!(store.gc_orphans(i64::MAX).unwrap() > 0);
+        assert!(!store.blob_path(&root).exists());
+    }
+
+    #[test]
+    fn cache_eviction_leaves_an_object_a_write_is_in_flight_for() {
+        let (_d, store) = store();
+        store.set_remote_cas(true);
+        let payload = data(100_000);
+        let root = store.ingest_bytes(&payload, 0).unwrap();
+        store.mark_blob_durable(&root).unwrap();
+
+        {
+            let _lease = store.lease_write(&root);
+            assert!(!store.clear_blob_cache(&root).unwrap());
+            assert!(store.blob(&root).unwrap().unwrap().complete);
+            assert!(store.blob_path(&root).exists());
+        }
+        assert!(store.clear_blob_cache(&root).unwrap());
+        let row = store.blob(&root).unwrap().unwrap();
+        assert!(row.durable && !row.complete);
         assert!(!store.blob_path(&root).exists());
     }
 

@@ -1158,6 +1158,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4823,6 +4833,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "fs2",
  "hyper-util",
  "iroh",
  "iroh-base",
@@ -4865,6 +4876,7 @@ name = "synch-engine"
 version = "0.1.1"
 dependencies = [
  "aws-lc-rs",
+ "blake3",
  "directories",
  "futures-util",
  "hex",
@@ -4999,6 +5011,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
