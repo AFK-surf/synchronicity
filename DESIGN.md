@@ -2135,7 +2135,11 @@ CI (GitHub Actions):
   delegation rather than by cluster size; pointing it at very large clusters is a
   policy question that has not been answered.
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
-  built on the same `BlobAd` availability data.
+  built on the same `BlobAd` availability data. The node role such a policy would
+  be placed on — an archive that holds every version of every path in the spaces
+  it archives, and releases none — is designed in
+  [docs/ARCHIVE-MODE.md](docs/ARCHIVE-MODE.md), which proposes the role first and
+  leaves cluster-wide placement where this bullet has it.
 - Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,
   never as core. (HTTP access ships as the S3 gateway, §9.4.)
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.
