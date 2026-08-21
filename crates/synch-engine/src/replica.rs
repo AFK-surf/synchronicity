@@ -549,9 +549,16 @@ impl Node {
             oldest_want: self.store().oldest_want(&holder)?,
             next_release: self.store().next_release(&holder)?,
             view: self.view_state()?,
-            held_back: self
-                .store()
-                .held_back_by_replication_floor(&holder, self.config().replica_release_floor)?,
+            // Only meaningful where the policy releases at all. Under
+            // `archive` nothing is ever let go, so "too few peers advertise
+            // these to let them go" would imply a release that peers could
+            // unblock — and none is waiting on them.
+            held_back: match space.replicate.is_some_and(ReplicaPolicy::releases) {
+                true => self
+                    .store()
+                    .held_back_by_replication_floor(&holder, self.config().replica_release_floor)?,
+                false => 0,
+            },
             by_origin: self.store().held_bytes_by_origin(&holder)?,
             claims: self.replica_claims_on(id)?,
             space,
