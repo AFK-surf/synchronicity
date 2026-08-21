@@ -1065,12 +1065,20 @@ impl Store {
             // vanished object is something they should be told about rather
             // than have quietly rewritten.
             if dropped > 0 {
+                // Re-wanted only where an entry still names the root, because
+                // the entry is where the size comes from and a want without one
+                // cannot be fetched — the design refuses a bare root nobody
+                // holds for exactly that reason. A root no entry names is a
+                // superseded version being held out its grace window: its bytes
+                // are gone, nothing can restore them, and a want that could
+                // only ever fail would dress that up as a backlog.
                 tx.execute(
                     "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
-                     SELECT p.root, p.holder, COALESCE(
-                              (SELECT e.size FROM entries e WHERE e.content = p.root LIMIT 1), 0),
-                            NULL, ?2
+                     SELECT p.root, p.holder, e.size, NULL, ?2
                        FROM pins p
+                       JOIN (SELECT content, MIN(size) AS size FROM entries
+                              WHERE content IS NOT NULL GROUP BY content) e
+                         ON e.content = p.root
                       WHERE p.root = ?1 AND p.holder LIKE 'replica:%'
                      ON CONFLICT(root, holder) DO NOTHING",
                     params![root.as_bytes().to_vec(), synch_core::now_ns()],

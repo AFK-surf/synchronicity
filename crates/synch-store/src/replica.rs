@@ -993,6 +993,21 @@ mod tests {
     }
 
     #[test]
+    fn a_withdrawn_claim_over_content_nothing_names_is_simply_dropped() {
+        let (_dir, store) = store();
+        let root = synch_core::Hash::new(b"a superseded version, held out its grace");
+        store.record_remote_durable_blob(&root, 4096, 1).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+
+        // No entry names it, so there is no size to fetch by and nothing to
+        // restore. A want here could only ever fail, and would dress a
+        // permanent loss up as a backlog.
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+        assert!(store.pins_for(&root).unwrap().is_empty());
+        assert!(store.wants_of(&media()).unwrap().is_empty());
+    }
+
+    #[test]
     fn one_space_with_a_backlog_does_not_starve_another() {
         let (_dir, store) = store();
         store.put_detached_space("archive").unwrap();
