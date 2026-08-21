@@ -294,7 +294,7 @@ mod tests {
         // Re-registering an unchanged set is a no-op.
         assert_eq!(watcher.resync(&node).unwrap(), 0);
 
-        node.remove_space("two").unwrap();
+        node.remove_space("two", false).unwrap();
         assert_eq!(watcher.resync(&node).unwrap(), 1);
         assert_eq!(watcher.watched().len(), 1);
         node.shutdown().await.unwrap();

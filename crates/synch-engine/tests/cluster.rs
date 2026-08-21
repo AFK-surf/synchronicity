@@ -516,7 +516,13 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
 
     // A pinned object with no entry pointing at it: retention must not touch it.
     let pinned = node.store().ingest_bytes(b"pinned bytes", 0).unwrap();
-    node.store().set_pinned(&pinned, true).unwrap();
+    node.store()
+        .pin(
+            &pinned,
+            &synch_store::PinHolder::Operator,
+            synch_core::now_ns(),
+        )
+        .unwrap();
 
     std::fs::write(peer.space.path().join("notes.txt"), b"second revision").unwrap();
     // A distinct mtime, so the scanner cannot mistake the rewrite for no change.

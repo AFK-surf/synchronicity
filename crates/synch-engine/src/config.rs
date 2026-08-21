@@ -45,6 +45,17 @@ pub struct NodeConfig {
     pub ad_update_interval: Duration,
     /// How many providers a single range fetch is split across (§6.4).
     pub fetch_fanout: usize,
+    /// The backstop interval between replication sweeps (`docs/REPLICATION.md`
+    /// §5, default 300 s with ±50 % jitter). Like the mirror interval, passes
+    /// normally run because the unified tree changed and rang the bell.
+    pub replica_interval: Duration,
+    /// How many objects a replica fetches at once.
+    ///
+    /// Deliberately low. Replica fetches share the endpoint with anti-entropy
+    /// and with foreground reads, and nothing schedules between them today
+    /// (§13): a replica that saturates the link it shares with the cluster's
+    /// actual users is a worse problem than one that converges overnight.
+    pub replica_concurrency: usize,
     /// The smallest object a fetch will run the delta descent for
     /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
     ///
@@ -117,6 +128,8 @@ impl NodeConfig {
             publish_batch_max: crate::publisher::DEFAULT_PUBLISH_BATCH_MAX,
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
+            replica_interval: Duration::from_secs(300),
+            replica_concurrency: 4,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             pending_head_ttl: Duration::from_secs(900),
             sync_round_budget: Duration::from_secs(300),

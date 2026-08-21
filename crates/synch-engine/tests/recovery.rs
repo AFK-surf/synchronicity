@@ -112,7 +112,7 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     assert!(message.contains("synch recover"), "{message}");
     assert!(message.contains("seq 3"), "{message}");
     assert!(recovered.store().local_files("media").unwrap().is_empty());
-    assert!(recovered.remove_space("media").is_err());
+    assert!(recovered.remove_space("media", false).is_err());
 
     // `--wait 0` collects one round and returns promptly.
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

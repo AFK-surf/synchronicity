@@ -97,13 +97,92 @@ fn kind_from_int(value: i64) -> Result<EntryKind> {
     })
 }
 
-/// A configured space (§4.1, `docs/SERVERLESS.md` §10).
+/// How much of a space this node holds (`docs/REPLICATION.md` §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaPolicy {
+    /// Hold what the tree names, and release a root once it stops naming it.
+    Tree,
+    /// Hold everything ever seen, and release nothing.
+    Archive,
+}
+
+impl ReplicaPolicy {
+    /// The stored and command-line spelling.
+    pub fn render(self) -> &'static str {
+        match self {
+            ReplicaPolicy::Tree => "tree",
+            ReplicaPolicy::Archive => "archive",
+        }
+    }
+
+    /// True if this policy ever lets go of a root.
+    pub fn releases(self) -> bool {
+        matches!(self, ReplicaPolicy::Tree)
+    }
+}
+
+impl std::fmt::Display for ReplicaPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.render())
+    }
+}
+
+impl std::str::FromStr for ReplicaPolicy {
+    type Err = StoreError;
+
+    fn from_str(text: &str) -> Result<ReplicaPolicy> {
+        match text {
+            "tree" => Ok(ReplicaPolicy::Tree),
+            "archive" => Ok(ReplicaPolicy::Archive),
+            other => Err(StoreError::Invalid(format!(
+                "{other} is not a replication policy; use tree or archive"
+            ))),
+        }
+    }
+}
+
+/// How long a released root outlives the last entry naming it, when a space
+/// does not say (`docs/REPLICATION.md` §5).
+///
+/// Thirty days rather than the seven `root_retention` uses, because these are
+/// different clocks measuring different things: `root_retention` bounds how
+/// long a read cache keeps what nobody references, while this is the entire
+/// recovery story for an accidental deletion under the `tree` policy. The one
+/// an operator regrets is the short one.
+pub const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
+
+/// A configured space (§4.1, `docs/SERVERLESS.md` §10, `docs/REPLICATION.md`).
+///
+/// A row is this node's participation in a space, and the two halves are
+/// independent: `local_path` says whether a directory is indexed here,
+/// `replicate` whether every origin's version of every path is held here.
+/// Either, both, or — briefly, between `space add` and `space set` — neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceRow {
     /// The space id, used in `f:<space>/...` keys.
     pub id: String,
     /// The local directory being indexed, or `None` for a detached space.
     pub local_path: Option<String>,
+    /// The replication policy, or `None` when this node holds only what it
+    /// publishes and reads.
+    pub replicate: Option<ReplicaPolicy>,
+    /// Seconds a released root is still held. `None` takes
+    /// [`DEFAULT_REPLICA_GRACE_SECS`].
+    pub grace: Option<i64>,
+    /// A ceiling on bytes held for this space, or `None` for no ceiling.
+    pub budget: Option<u64>,
+}
+
+impl SpaceRow {
+    /// The grace window in effect, in seconds.
+    pub fn grace_secs(&self) -> i64 {
+        self.grace.unwrap_or(DEFAULT_REPLICA_GRACE_SECS)
+    }
+
+    /// The pin holder that stands for this space's claims.
+    pub fn holder(&self) -> crate::PinHolder {
+        crate::PinHolder::Replica(self.id.clone())
+    }
 }
 
 /// A row of the scanner's change-detection state (§7.1).
@@ -510,7 +589,7 @@ impl Store {
 
     // ---- spaces -----------------------------------------------------------
 
-    /// Registers a local space.
+    /// Registers a local space, leaving its replication half as it was.
     pub fn put_space(&self, id: &str, local_path: Option<&str>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO spaces (id, local_path) VALUES (?1, ?2)
@@ -536,14 +615,43 @@ impl Store {
     /// Every configured local space.
     pub fn spaces(&self) -> Result<Vec<SpaceRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, local_path FROM spaces ORDER BY id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SpaceRow {
-                id: row.get(0)?,
-                local_path: row.get(1)?,
-            })
-        })?;
+        let mut stmt = conn
+            .prepare("SELECT id, local_path, replicate, grace, budget FROM spaces ORDER BY id")?;
+        let rows = stmt.query_map([], space_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every space this node replicates.
+    pub fn replicated_spaces(&self) -> Result<Vec<SpaceRow>> {
+        Ok(self
+            .spaces()?
+            .into_iter()
+            .filter(|space| space.replicate.is_some())
+            .collect())
+    }
+
+    /// Sets or clears a space's replication policy and its two tunables.
+    ///
+    /// Writes only the replication half, so turning replication on for a space
+    /// that already has a checkout leaves the checkout alone — and the reverse.
+    /// Returns whether there was a space to configure.
+    pub fn set_space_replication(
+        &self,
+        id: &str,
+        policy: Option<ReplicaPolicy>,
+        grace: Option<i64>,
+        budget: Option<u64>,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE spaces SET replicate = ?2, grace = ?3, budget = ?4 WHERE id = ?1",
+            params![
+                id,
+                policy.map(|p| p.render()),
+                grace,
+                budget.map(|b| b as i64)
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// One configured local space.
@@ -551,14 +659,9 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, local_path FROM spaces WHERE id = ?1",
+                "SELECT id, local_path, replicate, grace, budget FROM spaces WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(SpaceRow {
-                        id: row.get(0)?,
-                        local_path: row.get(1)?,
-                    })
-                },
+                space_row,
             )
             .optional()?)
     }
@@ -961,13 +1064,16 @@ impl Txn<'_> {
         // *own* origin the scope is the whole keyspace, whose trie it built.
         let scope = self.materialization_scope(origin)?;
         let now = now_ns();
+        // One read for the whole diff. An ordinary node gets an empty set and
+        // every per-leaf replication step below short-circuits on it.
+        let replicas = ReplicaTargets::of(self.conn())?;
         // Streamed, not collected. The walk's position ceiling bounds how many
         // changes there can be and says nothing about how large each one is, so
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
         // in ([`Trie::for_each_resolved_change`]).
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
-            apply_change(self.conn(), origin, &change, now)
+            apply_change(self.conn(), origin, &change, now, &replicas)
         })
     }
 
@@ -1022,11 +1128,183 @@ impl Txn<'_> {
     }
 }
 
+/// Reads one `spaces` row.
+///
+/// A policy spelling this build does not understand reads as no replication
+/// rather than as an error: a row is configuration, and refusing to list the
+/// space would make one bad value hide every good one beside it. The value
+/// itself is left in place, so a downgrade does not quietly rewrite it.
+fn space_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceRow> {
+    let replicate: Option<String> = row.get(2)?;
+    Ok(SpaceRow {
+        id: row.get(0)?,
+        local_path: row.get(1)?,
+        replicate: replicate.and_then(|text| text.parse().ok()),
+        grace: row.get(3)?,
+        budget: row.get::<_, Option<i64>>(4)?.map(|b| b as u64),
+    })
+}
+
+/// The replicated spaces a materialization is running against
+/// (`docs/REPLICATION.md` §3.4).
+///
+/// Read once per promotion rather than once per changed leaf. A diff can name
+/// millions of keys and this is a handful of rows; asking the `spaces` table
+/// again for each of them would put a query per leaf inside the transaction the
+/// head flip runs in.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplicaTargets {
+    by_space: std::collections::HashMap<String, ReplicaTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplicaTarget {
+    holder: String,
+    grace_ns: i64,
+    releases: bool,
+}
+
+impl ReplicaTargets {
+    /// Read on the connection the head flip is running on, so the policy in
+    /// effect is the one the transaction can see rather than one a concurrent
+    /// `space set` changed underneath it.
+    fn of(conn: &rusqlite::Connection) -> Result<ReplicaTargets> {
+        let mut by_space = std::collections::HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, local_path, replicate, grace, budget
+               FROM spaces WHERE replicate IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], space_row)?;
+        for space in rows {
+            let space = space?;
+            by_space.insert(
+                space.id.clone(),
+                ReplicaTarget {
+                    holder: space.holder().render(),
+                    grace_ns: space.grace_secs().saturating_mul(1_000_000_000),
+                    releases: space.replicate.is_some_and(ReplicaPolicy::releases),
+                },
+            );
+        }
+        Ok(ReplicaTargets { by_space })
+    }
+
+    fn get(&self, space: &str) -> Option<&ReplicaTarget> {
+        self.by_space.get(space)
+    }
+}
+
+/// The content root an origin's entry names right now, before the change that
+/// is about to replace it lands.
+///
+/// The diff walk resolves only the *new* side of a change, so the superseded
+/// root has to come from the row the change is about to overwrite. It is still
+/// there — one lookup by primary key, inside the transaction doing the write.
+fn current_content(
+    tx: &rusqlite::Connection,
+    origin: &OriginId,
+    space: &str,
+    path: &str,
+) -> Result<Option<Hash>> {
+    let bytes: Option<Option<Vec<u8>>> = tx
+        .query_row(
+            "SELECT content FROM entries WHERE origin_id = ?1 AND space = ?2 AND path = ?3",
+            params![origin.canonical(), space, path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match bytes.flatten() {
+        None => Ok(None),
+        Some(bytes) => Ok(Some(hash_column(bytes, "entries.content")?)),
+    }
+}
+
+/// Stages a want for a root a replicated space has just been shown, and calls
+/// off any release scheduled against it.
+///
+/// Content that comes back is content that stays: the same root reappears when
+/// another origin publishes the same bytes, when a `take` adopts them, or when
+/// a file is restored from a copy, and in each case the release was decided
+/// against a tree that has since changed its mind.
+fn replica_wants(
+    tx: &rusqlite::Connection,
+    target: &ReplicaTarget,
+    entry: &FileEntry,
+    root: &Hash,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE pins SET release_after = NULL WHERE root = ?1 AND holder = ?2",
+        params![root.as_bytes().to_vec(), target.holder],
+    )?;
+    tx.execute(
+        "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE NOT EXISTS (SELECT 1 FROM pins WHERE root = ?1 AND holder = ?2)
+         ON CONFLICT(root, holder) DO NOTHING",
+        params![
+            root.as_bytes().to_vec(),
+            target.holder,
+            entry.size as i64,
+            entry.prev.map(|p| p.as_bytes().to_vec()),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// Schedules the release of a root this origin has stopped naming, if nothing
+/// else names it either.
+///
+/// This is the one place with *positive* evidence that a root left the tree: a
+/// diff said this leaf changed, and the reference check ran after the write it
+/// describes. The sweep has only absence, which is a different and much weaker
+/// thing (`docs/REPLICATION.md` §3.6).
+///
+/// The reference check is global rather than per space, so a root another space
+/// still names is not scheduled: content is addressed by hash, and one space
+/// does not get to decide for another.
+fn replica_releases(
+    tx: &rusqlite::Connection,
+    target: &ReplicaTarget,
+    root: &Hash,
+    now: i64,
+) -> Result<()> {
+    if !target.releases {
+        return Ok(());
+    }
+    let referenced: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+        params![root.as_bytes().to_vec()],
+        |row| row.get(0),
+    )?;
+    if referenced {
+        return Ok(());
+    }
+    // A want for something on its way out is work nobody needs doing: the
+    // cheaper order is to drop the intent rather than fetch and then release.
+    tx.execute(
+        "DELETE FROM replica_want WHERE root = ?1 AND holder = ?2",
+        params![root.as_bytes().to_vec(), target.holder],
+    )?;
+    tx.execute(
+        "UPDATE pins SET release_after = ?3
+          WHERE root = ?1 AND holder = ?2 AND release_after IS NULL",
+        params![
+            root.as_bytes().to_vec(),
+            target.holder,
+            now.saturating_add(target.grace_ns)
+        ],
+    )?;
+    Ok(())
+}
+
 fn apply_change(
     tx: &rusqlite::Connection,
     origin: &OriginId,
     change: &ChangeView<'_>,
     now: i64,
+    replicas: &ReplicaTargets,
 ) -> Result<()> {
     let key = change.key;
     if key.first() == Some(&synch_core::record::PREFIX_FILE) {
@@ -1036,12 +1314,24 @@ fn apply_change(
             tracing::debug!(origin = %origin, "skipping unparseable f: key");
             return Ok(());
         };
+        // Read before writing: the diff resolves only the new side, so the
+        // root this change supersedes is whatever the row about to be
+        // overwritten still names. Skipped entirely when nothing replicates
+        // this space, which is the ordinary node and must not pay for this.
+        let target = replicas.get(&space);
+        let superseded = match target {
+            None => None,
+            Some(_) => current_content(tx, origin, &space, &path)?,
+        };
         match change.kind {
             ChangeKind::Deleted => {
                 tx.execute(
                     "DELETE FROM entries WHERE origin_id = ?1 AND space = ?2 AND path = ?3",
                     params![origin.canonical(), space, path],
                 )?;
+                if let (Some(target), Some(root)) = (target, superseded) {
+                    replica_releases(tx, target, &root, now)?;
+                }
             }
             _ => {
                 let bytes = change.new.expect("non-delete change has a value");
@@ -1062,6 +1352,22 @@ fn apply_change(
                     )));
                 }
                 put_entry_in(tx, origin, &space, &path, &entry)?;
+                if let Some(target) = target {
+                    if let Some(root) = entry.content {
+                        replica_wants(tx, target, &entry, &root, now)?;
+                    }
+                    // A tombstone supersedes its own content, and so does a
+                    // rewrite. Both land here; the reference check inside
+                    // decides, and it runs after the write above so that a
+                    // path whose new version names the same root is not
+                    // scheduled against itself.
+                    match superseded {
+                        Some(root) if Some(root) != entry.content => {
+                            replica_releases(tx, target, &root, now)?;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     } else if key.first() == Some(&synch_core::record::PREFIX_BLOB) {

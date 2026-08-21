@@ -5,10 +5,10 @@
 
 use synch_core::{now_ns, EntryKind};
 use synch_engine::{
-    CompareReport, CompareStatus, EntryRef, Node, RekorPolicy, ResolverStatus, VersionPolicy,
-    VersionSet,
+    replica::ReplicaStatus, CompareReport, CompareStatus, EntryRef, Node, RekorPolicy,
+    ResolverStatus, VersionPolicy, VersionSet,
 };
-use synch_store::EntryRow;
+use synch_store::{EntryRow, ReplicaCoverage, ReplicaPolicy, SpaceRow};
 
 use crate::control::ControlError;
 
@@ -135,6 +135,115 @@ pub fn ago(timestamp: i64) -> String {
         s if s < 86400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86400),
     }
+}
+
+/// A coarse duration in seconds, for grace windows.
+pub fn duration(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// One line of `synch space ls`: what this node does about a space.
+///
+/// The two halves of a row are independent and the line has to show both, or
+/// an operator cannot tell a detached replica from a checkout that replicates
+/// nothing — which are opposite answers to "what is this machine for".
+pub fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -> String {
+    let replication = match (space.replicate, coverage) {
+        (None, _) => "—".to_string(),
+        (Some(policy), None) => format!("replicate {policy}"),
+        (Some(policy), Some(coverage)) => {
+            let grace = match policy {
+                ReplicaPolicy::Tree => format!(" · grace {}", duration(space.grace_secs())),
+                ReplicaPolicy::Archive => String::new(),
+            };
+            format!(
+                "replicate {policy}{grace} · {} B held{}",
+                coverage.held_bytes,
+                match coverage.wanted {
+                    0 => String::new(),
+                    n => format!(" · {n} wanted"),
+                }
+            )
+        }
+    };
+    format!(
+        "{:<20} {:<28} {}",
+        space.id,
+        space.local_path.as_deref().unwrap_or("—"),
+        replication
+    )
+}
+
+/// The detailed report of `synch space ls <id>`.
+///
+/// Three of these lines exist to be read on a bad day. `unreachable` is never
+/// folded into `wanted`: objects with no provider are not a backlog, they are
+/// versions that are probably already gone, and the difference is the whole
+/// reason to run a replica. `releasing` is what an operator checks before
+/// deleting something they may want back. And `view` says whether releases are
+/// running at all, because "paused" is the difference between a replica that is
+/// behaving and one that is stuck.
+pub fn replica_status(status: &ReplicaStatus) -> Lines {
+    let space = &status.space;
+    let mut out = vec![format!(
+        "{}   indexed {}   {}",
+        space.id,
+        space.local_path.as_deref().unwrap_or("—"),
+        match space.replicate {
+            None => "not replicated".to_string(),
+            Some(policy @ ReplicaPolicy::Tree) => format!(
+                "replicate {policy}   grace {}",
+                duration(space.grace_secs())
+            ),
+            Some(policy) => format!("replicate {policy}"),
+        }
+    )];
+    if space.replicate.is_none() {
+        return Ok(out);
+    }
+    let coverage = &status.coverage;
+    out.push(format!(
+        "  held          {:>9} objects  {:>14} B",
+        coverage.held, coverage.held_bytes
+    ));
+    if coverage.releasing > 0 {
+        out.push(format!(
+            "  releasing     {:>9} objects  {:>14} B{}",
+            coverage.releasing,
+            coverage.releasing_bytes,
+            match status.next_release {
+                Some(at) => format!("   (soonest leaves in {})", remaining(at, now_ns())),
+                None => String::new(),
+            }
+        ));
+    }
+    if coverage.wanted > 0 {
+        out.push(format!(
+            "  wanted        {:>9} objects  {:>14} B{}",
+            coverage.wanted - coverage.unreachable,
+            coverage.wanted_bytes - coverage.unreachable_bytes,
+            match status.oldest_want {
+                Some(at) => format!("   (oldest {})", ago(at)),
+                None => String::new(),
+            }
+        ));
+    }
+    if coverage.unreachable > 0 {
+        out.push(format!(
+            "  unreachable   {:>9} objects  {:>14} B   <- no provider has answered for these",
+            coverage.unreachable, coverage.unreachable_bytes
+        ));
+    }
+    out.push(match status.view.reason() {
+        None => "  view          complete — releases are running".to_string(),
+        Some(why) => format!("  view          incomplete, releases paused: {why}"),
+    });
+    Ok(out)
 }
 
 /// How long until an expiry, for `delegate ls` and `doctor`.

@@ -179,9 +179,7 @@ impl PinHolder {
     /// Reads a stored spelling. Never fails; see [`PinHolder::Other`].
     pub fn parse(text: &str) -> PinHolder {
         match text.split_once(':') {
-            Some(("replica", space)) if !space.is_empty() => {
-                PinHolder::Replica(space.to_string())
-            }
+            Some(("replica", space)) if !space.is_empty() => PinHolder::Replica(space.to_string()),
             _ if text == "operator" => PinHolder::Operator,
             _ => PinHolder::Other(text.to_string()),
         }

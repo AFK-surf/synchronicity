@@ -300,6 +300,7 @@ fn cat(reference: &str, range: Option<&str>, from: Option<&str>) -> Command {
         range: range.map(String::from),
         from: from.map(String::from),
         strict: false,
+        root: None,
     })
 }
 
@@ -340,7 +341,7 @@ fn key_ls() -> Command {
     Command::KeyLs(pb::KeyLs {})
 }
 fn space_ls() -> Command {
-    Command::SpaceLs(pb::SpaceLs {})
+    Command::SpaceLs(pb::SpaceLs { id: String::new() })
 }
 fn scan() -> Command {
     Command::Scan(pb::Scan {})
@@ -447,6 +448,9 @@ fn space_add(id: &str, path: &str) -> Command {
         id: id.into(),
         path: path.into(),
         detached: false,
+        replicate: None,
+        grace: None,
+        budget: None,
     })
 }
 fn detached_space_add(id: &str) -> Command {
@@ -454,10 +458,16 @@ fn detached_space_add(id: &str) -> Command {
         id: id.into(),
         path: String::new(),
         detached: true,
+        replicate: None,
+        grace: None,
+        budget: None,
     })
 }
 fn space_rm(id: &str) -> Command {
-    Command::SpaceRm(pb::SpaceRm { id: id.into() })
+    Command::SpaceRm(pb::SpaceRm {
+        id: id.into(),
+        release: false,
+    })
 }
 fn take(reference: &str) -> Command {
     Command::Take(pb::Take {

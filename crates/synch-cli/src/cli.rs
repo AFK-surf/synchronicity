@@ -624,23 +624,77 @@ pub enum DomainCommand {
 /// `synch space ...`
 #[derive(Debug, Subcommand)]
 pub enum SpaceCommand {
-    /// Add a path-backed or detached space.
+    /// Add a path-backed or detached space, optionally replicating it.
     Add {
         /// The space id.
         id: String,
         /// The local directory. Omit with `--detached`.
-        #[arg(required_unless_present = "detached", conflicts_with = "detached")]
+        #[arg(
+            required_unless_present_any = ["detached", "replicate"],
+            conflicts_with = "detached"
+        )]
         path: Option<PathBuf>,
         /// Publish into the space without a local checkout, scanner, or watcher.
         #[arg(long)]
         detached: bool,
+        /// Hold every version of every path in this space, from every origin
+        /// (`docs/REPLICATION.md`). `tree` releases a root once the tree stops
+        /// naming it; `archive` releases nothing.
+        #[arg(long, value_name = "POLICY", num_args = 0..=1, default_missing_value = "tree")]
+        replicate: Option<String>,
+        /// How long a released root is still held. Only meaningful under
+        /// `--replicate=tree`, where it is the whole recovery story for an
+        /// accidental deletion.
+        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// A ceiling on bytes held for this space. Reaching it stops fetching;
+        /// it never releases anything.
+        #[arg(long, value_name = "BYTES")]
+        budget: Option<u64>,
     },
-    /// List configured spaces.
-    Ls,
+    /// Change one half of a space's configuration, leaving the other alone.
+    Set {
+        /// The space id.
+        id: String,
+        /// Start replicating, or change the policy.
+        #[arg(
+            long,
+            value_name = "POLICY",
+            num_args = 0..=1,
+            default_missing_value = "tree",
+            conflicts_with = "no_replicate"
+        )]
+        replicate: Option<String>,
+        /// Stop replicating. The pins stay unless `--release` says otherwise.
+        #[arg(long)]
+        no_replicate: bool,
+        /// With `--no-replicate`, also drop what this space's replication holds.
+        #[arg(long, requires = "no_replicate")]
+        release: bool,
+        /// How long a released root is still held.
+        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// A ceiling on bytes held for this space.
+        #[arg(long, value_name = "BYTES")]
+        budget: Option<u64>,
+    },
+    /// List configured spaces, or report on one.
+    Ls {
+        /// One space id, for the detailed report.
+        id: Option<String>,
+    },
+    /// Bring one replicated space — or every one — up to date now.
+    Sync {
+        /// One space id. Omit to sweep them all.
+        id: Option<String>,
+    },
     /// Stop indexing a space and unpublish its entries.
     Rm {
         /// The space id.
         id: String,
+        /// Also drop what this space's replication holds.
+        #[arg(long)]
+        release: bool,
     },
 }
 

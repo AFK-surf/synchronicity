@@ -268,7 +268,11 @@ impl Node {
             let store = self.store().clone();
             let root = *root;
             crate::blocking::offload(move || {
-                Ok(store.pin(&root, &synch_store::PinHolder::Operator, synch_core::now_ns())?)
+                Ok(store.pin(
+                    &root,
+                    &synch_store::PinHolder::Operator,
+                    synch_core::now_ns(),
+                )?)
             })
             .await?
         };
@@ -529,7 +533,7 @@ impl Node {
     }
 
     /// Promotes a complete cache entry into the remote durable tier.
-    async fn finalize_cloud_object(&self, root: &Hash, pin: bool) -> Result<()> {
+    pub(crate) async fn finalize_cloud_object(&self, root: &Hash, pin: bool) -> Result<()> {
         let Some(config) = self.config().cloud.as_ref() else {
             return Ok(());
         };

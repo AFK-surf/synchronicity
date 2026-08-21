@@ -192,6 +192,10 @@ message Command {
     DelegateRm delegate_rm = 42;
     // `synch delegate ls`
     DelegateLs delegate_ls = 43;
+    // `synch space set <id> [--replicate[=policy]|--no-replicate] ...`
+    SpaceSet space_set = 44;
+    // `synch space sync [<id>]`
+    SpaceSync space_sync = 45;
   }
 }
 
@@ -302,13 +306,46 @@ message SpaceAdd {
   string path = 2;
   // True when this space deliberately has no local checkout.
   bool detached = 3;
+  // `--replicate[=tree|archive]`: hold every version the tree names (§2).
+  optional string replicate = 4;
+  // `--grace <dur>`: seconds a released root is still held.
+  optional int64 grace = 5;
+  // `--budget <size>`: a ceiling on bytes held for this space.
+  optional uint64 budget = 6;
 }
 
-message SpaceLs {}
+// Changes one half of a space's configuration, leaving the other alone.
+message SpaceSet {
+  // The space id.
+  string id = 1;
+  // `--replicate[=tree|archive]`, when the policy is being turned on or changed.
+  optional string replicate = 2;
+  // `--no-replicate`: stop replicating.
+  bool no_replicate = 3;
+  // `--release`: drop the pins this space's replication holds.
+  bool release = 4;
+  // `--grace <dur>`: seconds a released root is still held.
+  optional int64 grace = 5;
+  // `--budget <size>`: a ceiling on bytes held for this space.
+  optional uint64 budget = 6;
+}
+
+message SpaceLs {
+  // One space id, for the detailed report. Empty lists them all.
+  string id = 1;
+}
+
+// Runs a reconciling replication sweep now, rather than at the next interval.
+message SpaceSync {
+  // One space id. Empty sweeps every replicated space.
+  string id = 1;
+}
 
 message SpaceRm {
   // The space id.
   string id = 1;
+  // `--release`: also drop the pins this space's replication holds.
+  bool release = 2;
 }
 
 message Ls {

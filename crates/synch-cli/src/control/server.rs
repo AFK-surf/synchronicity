@@ -14,8 +14,8 @@ use std::{
 };
 
 use synch_core::{now_ns, Hash, NodeId, OriginId};
-use synch_engine::{EntryRef, Node, VersionPolicy};
-use synch_store::{EntryRow, VersionSet};
+use synch_engine::{replica::UNREACHABLE_ATTEMPTS, EntryRef, Node, VersionPolicy};
+use synch_store::{EntryRow, ReplicaPolicy, VersionSet};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::{
@@ -1717,14 +1717,25 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SpaceAdd(pb::SpaceAdd { id, path, detached }) => {
+        Command::SpaceAdd(pb::SpaceAdd {
+            id,
+            path,
+            detached,
+            replicate,
+            grace,
+            budget,
+        }) => {
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
             //
             // The `stat` goes over with the store work rather than inline: on a
             // hung mount it blocks for the mount's timeout, and a runtime
             // worker that stops polling is the thing §10 exists to prevent.
-            if detached {
+            // A space asked to replicate with no path is detached by
+            // construction: replication materializes nothing, so there is no
+            // third state between "a directory is indexed here" and "there
+            // isn't one" for it to occupy.
+            if detached || (path.is_empty() && replicate.is_some()) {
                 let detached_id = id.clone();
                 read(node, move |n| {
                     n.add_detached_space(&detached_id)?;
@@ -1732,6 +1743,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 })
                 .await?;
                 out.line(format!("holding detached space {id}")).await?;
+                apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
                 return Ok(());
             }
             let created = {
@@ -1748,29 +1760,106 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(format!("note: created {path}, which did not exist"))
                     .await?;
             }
+            apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
         }
 
-        Command::SpaceLs(pb::SpaceLs {}) => {
-            let spaces = read(node, |n| Ok(n.store().spaces()?)).await?;
+        Command::SpaceLs(pb::SpaceLs { id }) => {
+            // Naming one space asks a different question from listing them —
+            // "what is this node doing about `media`" rather than "what is this
+            // node for" — and answers at a different length.
+            if !id.is_empty() {
+                let reporting = id.clone();
+                let status = read(node, move |n| Ok(n.replica_status(&reporting)?)).await?;
+                for line in crate::render::replica_status(&status)? {
+                    out.line(line).await?;
+                }
+                return Ok(());
+            }
+            let spaces = read(node, |n| {
+                let spaces = n.store().spaces()?;
+                let mut out = Vec::new();
+                for space in spaces {
+                    let coverage = space.replicate.map(|_| {
+                        n.store()
+                            .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)
+                    });
+                    out.push((space, coverage.transpose()?));
+                }
+                Ok(out)
+            })
+            .await?;
             if spaces.is_empty() {
                 out.progress("(no local spaces; add one with `synch space add`)")
                     .await?;
             }
-            for space in spaces {
-                out.line(format!(
-                    "{:<20} {}",
-                    space.id,
-                    space.local_path.as_deref().unwrap_or("detached")
-                ))
-                .await?;
+            for (space, coverage) in spaces {
+                out.line(crate::render::space_line(&space, coverage.as_ref()))
+                    .await?;
             }
         }
 
-        Command::SpaceRm(pb::SpaceRm { id }) => {
+        Command::SpaceSet(pb::SpaceSet {
+            id,
+            replicate,
+            no_replicate,
+            release,
+            grace,
+            budget,
+        }) => {
+            if no_replicate {
+                let (space, dropping) = (id.clone(), release);
+                read(node, move |n| {
+                    Ok(n.set_space_replication(&space, None, None, None, dropping)?)
+                })
+                .await?;
+                out.line(match release {
+                    true => format!("{id} is no longer replicated; its content was released"),
+                    false => format!(
+                        "{id} is no longer replicated; what it held stays pinned                          (`--release` drops it)"
+                    ),
+                })
+                .await?;
+                return Ok(());
+            }
+            if replicate.is_none() && grace.is_none() && budget.is_none() {
+                return Err(ControlError::invalid(
+                    "space set needs something to set: --replicate, --no-replicate,                      --grace or --budget",
+                ));
+            }
+            apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
+        }
+
+        Command::SpaceSync(pb::SpaceSync { id }) => {
+            let sweeping = node.clone();
+            let only = (!id.is_empty()).then(|| id.clone());
+            let reports = offload(move || Ok(sweeping.sweep_replicas(only.as_deref())?)).await?;
+            if reports.is_empty() {
+                out.progress("(no replicated spaces; add one with `synch space set --replicate`)")
+                    .await?;
+            }
+            for (space, report) in reports {
+                out.line(format!(
+                    "{space}  wanted {} · reprieved {} · scheduled {} · released {}",
+                    report.wanted, report.reprieved, report.scheduled, report.released
+                ))
+                .await?;
+            }
+            // The sweep only decides; the fetching is what takes time, and an
+            // explicit sync should not answer before it has done a pass of it.
+            let fetched = node.fetch_replica_wants().await?;
+            out.line(format!(
+                "held {} · failed {} · fetched {} B · reused {} B",
+                fetched.held, fetched.failed, fetched.fetched_bytes, fetched.reused_bytes
+            ))
+            .await?;
+        }
+
+        Command::SpaceRm(pb::SpaceRm { id, release }) => {
             // Unpublishing a space scans its whole prefix out of the trie.
             let removing = node.clone();
             let removed_id = id.clone();
-            let staged = offload(move || Ok(removing.remove_space(&removed_id)?)).await?;
+            let dropping = release;
+            let staged = offload(move || Ok(removing.remove_space(&removed_id, dropping)?)).await?;
             let removed = staged.len();
             // Explicit commands publish before they answer, so the count they
             // report is one that peers can already see (§7.1).
@@ -2954,6 +3043,87 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
+/// Applies the replication half of `space add` and `space set`.
+///
+/// Shared because the two commands mean the same thing by the same flags, and
+/// because the reply is the part worth getting right: an operator turning this
+/// on for a large space has just committed the node to fetching all of it, and
+/// under the default policy has also just decided how long a deletion stays
+/// recoverable.
+async fn apply_replication(
+    node: &Node,
+    id: &str,
+    policy: Option<&str>,
+    grace: Option<i64>,
+    budget: Option<u64>,
+    out: &mut Frames,
+) -> Result<(), ControlError> {
+    let Some(policy) = policy else {
+        // `--grace`/`--budget` alone tune a space that is already replicating.
+        if grace.is_some() || budget.is_some() {
+            let (space, existing) = (id.to_string(), current_policy(node, id).await?);
+            read(node, move |n| {
+                Ok(n.set_space_replication(&space, existing, grace, budget, false)?)
+            })
+            .await?;
+        }
+        return Ok(());
+    };
+    let policy: ReplicaPolicy = policy
+        .parse()
+        .map_err(|e: synch_store::error::StoreError| ControlError::invalid(e.to_string()))?;
+    let (space, applied) = (id.to_string(), policy);
+    read(node, move |n| {
+        Ok(n.set_space_replication(&space, Some(applied), grace, budget, false)?)
+    })
+    .await?;
+    let configured = {
+        let space = id.to_string();
+        read(node, move |n| {
+            Ok(n.store()
+                .space(&space)?
+                .ok_or_else(|| synch_engine::error::EngineError::not_found(space))?)
+        })
+        .await?
+    };
+    out.line(format!(
+        "replicating {id} ({policy}), holding every version of every path",
+    ))
+    .await?;
+    match policy {
+        ReplicaPolicy::Tree => {
+            out.line(format!(
+                "a deleted version stays recoverable here for {} — that is the whole \
+                 recovery story under this policy",
+                crate::render::duration(configured.grace_secs())
+            ))
+            .await?;
+        }
+        ReplicaPolicy::Archive => {
+            out.line(
+                "nothing is ever released, so this space costs the sum of every version \
+                 ever published rather than the size of the tree"
+                    .to_string(),
+            )
+            .await?;
+        }
+    }
+    if let Some(budget) = configured.budget {
+        out.line(format!(
+            "budget {budget} B: reaching it stops fetching and never releases anything"
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// The policy a space already has, so tuning one knob does not clear it.
+async fn current_policy(node: &Node, id: &str) -> Result<Option<ReplicaPolicy>, ControlError> {
+    let space = id.to_string();
+    let row = read(node, move |n| Ok(n.store().space(&space)?)).await?;
+    Ok(row.and_then(|row| row.replicate))
+}
+
 /// Reads a `--root` argument.
 ///
 /// Its own function because the error an operator gets for a typo'd hash should

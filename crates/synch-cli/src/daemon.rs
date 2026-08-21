@@ -112,6 +112,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mirrors = spawn_loop("mirrors", &node, &stop_tx, |node, shutdown| async move {
         node.run_mirrors(shutdown).await
     });
+    // The standing replication loop: reconciles what the replicated spaces
+    // should hold against what they do, and fetches the difference
+    // (`docs/REPLICATION.md` §3.4). A node replicating nothing sweeps an empty
+    // list and sleeps.
+    let replicas = spawn_loop("replicas", &node, &stop_tx, |node, shutdown| async move {
+        node.run_replicas(shutdown).await
+    });
     // Membership is only as live as its last validated lookup: without this
     // loop a DNSSEC cluster dissolves one TTL plus grace after the last manual
     // refresh, because `run_maintenance` expires bindings and nothing renews
@@ -187,10 +194,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         publisher,
         dns,
         mirrors,
+        replicas,
         uploads,
         cloud
     );
-    let named: [(&str, bool); 9] = [
+    // One entry per joined task, in the order they are joined. The names and
+    // the indices have to be read together — a list shorter than the join
+    // silently reports one loop's outcome under another loop's name, which is
+    // worse than not reporting it, since the message sends whoever reads it to
+    // the wrong place.
+    let named: [(&str, bool); 11] = [
         ("control", outcomes.0.is_err()),
         ("anti-entropy", outcomes.1.is_err()),
         ("scanner", outcomes.2.is_err()),
@@ -199,7 +212,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         ("publisher", outcomes.5.is_err()),
         ("dns", outcomes.6.is_err()),
         ("mirrors", outcomes.7.is_err()),
-        ("cloud", outcomes.8.is_err()),
+        ("replicas", outcomes.8.is_err()),
+        ("uploads", outcomes.9.is_err()),
+        ("cloud", outcomes.10.is_err()),
     ];
     let lost: Vec<&str> = named
         .iter()

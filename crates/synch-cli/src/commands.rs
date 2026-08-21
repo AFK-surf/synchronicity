@@ -684,7 +684,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         Command::Space { command } => match command {
             // The daemon's working directory is its own; a relative path is
             // resolved against the caller's before it crosses the socket.
-            SpaceCommand::Add { id, path, detached } => Cmd::SpaceAdd(pb::SpaceAdd {
+            SpaceCommand::Add {
+                id,
+                path,
+                detached,
+                replicate,
+                grace,
+                budget,
+            } => Cmd::SpaceAdd(pb::SpaceAdd {
                 id: id.clone(),
                 path: path
                     .as_deref()
@@ -692,9 +699,35 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                     .transpose()?
                     .unwrap_or_default(),
                 detached: *detached,
+                replicate: replicate.clone(),
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
             }),
-            SpaceCommand::Ls => Cmd::SpaceLs(pb::SpaceLs {}),
-            SpaceCommand::Rm { id } => Cmd::SpaceRm(pb::SpaceRm { id: id.clone() }),
+            SpaceCommand::Set {
+                id,
+                replicate,
+                no_replicate,
+                release,
+                grace,
+                budget,
+            } => Cmd::SpaceSet(pb::SpaceSet {
+                id: id.clone(),
+                replicate: replicate.clone(),
+                no_replicate: *no_replicate,
+                release: *release,
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
+            }),
+            SpaceCommand::Ls { id } => Cmd::SpaceLs(pb::SpaceLs {
+                id: id.clone().unwrap_or_default(),
+            }),
+            SpaceCommand::Sync { id } => Cmd::SpaceSync(pb::SpaceSync {
+                id: id.clone().unwrap_or_default(),
+            }),
+            SpaceCommand::Rm { id, release } => Cmd::SpaceRm(pb::SpaceRm {
+                id: id.clone(),
+                release: *release,
+            }),
         },
 
         Command::Mirror { command } => match command {
