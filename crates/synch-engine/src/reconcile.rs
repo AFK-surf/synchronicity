@@ -1074,8 +1074,12 @@ impl Syncer {
         {
             let syncer = self.clone();
             let scope = exchange.scope.clone();
+            let summaries = exchange.summaries.clone();
             let peer = client.remote_id();
-            crate::blocking::offload(move || syncer.adopt_scope(peer, scope.as_deref())).await?;
+            crate::blocking::offload(move || {
+                syncer.adopt_scope(peer, scope.as_deref(), &summaries)
+            })
+            .await?;
         }
         {
             let syncer = self.clone();
