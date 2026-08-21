@@ -288,6 +288,36 @@ synch pin ls
 synch pin rm media/talks/keynote.mp4
 ```
 
+Hold a whole space instead of naming objects one at a time. A replicated space
+is one this node keeps every version of — every origin's version of every path,
+not the one a policy selects — fetched as it appears and held for as long as
+its policy says. It materializes nothing: that is what a mirror is for, and the
+two compose.
+
+```sh
+synch space add media /srv/media --replicate    # publish my copy, hold everyone else's
+synch space add photos --replicate              # a replica with no checkout at all
+synch space add cold --replicate=archive        # never release anything, ever
+synch space ls                                  # what this node does about each space
+synch space ls media                            # held, wanted, releasing, unreachable
+synch space set media --grace 90d               # how long a deleted version stays here
+synch space set media --no-replicate            # stop; `--release` also drops the bytes
+```
+
+Under the default `tree` policy a replica holds what the tree names and lets a
+root go once nothing names it — after `--grace`, which is the whole recovery
+story for an accidental deletion. `--replicate=archive` releases nothing and
+costs the sum of every version ever published rather than the size of the tree.
+See [docs/REPLICATION.md](docs/REPLICATION.md).
+
+Read a version that no path names any more — what `synch log` prints:
+
+```sh
+synch log media/talks/keynote.mp4               # every version, with its content root
+synch cat --root 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+synch get --root 9f86d081… -o keynote-v1.mp4
+```
+
 Serve the same data over S3. The gateway is a control client of the
 daemon — it opens no database of its own — so a `synch daemon run` must be
 live on the same data directory for any `synch-s3` command to work:

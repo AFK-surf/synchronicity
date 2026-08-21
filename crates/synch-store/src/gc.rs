@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
 use synch_mpt::Trie;
 
@@ -299,6 +299,34 @@ impl Store {
             out.push((hash_column(root, "entries.content")?, size as u64));
         }
         Ok(out)
+    }
+
+    /// The size of an object, from whichever local record knows it.
+    ///
+    /// Reading by content root has no entry to carry the size, and every fetch
+    /// path needs one — `fetch_groups_from` splits a range into groups against
+    /// it, and a root nobody holds even partially has nothing to divide. Three
+    /// records may know, in descending order of authority: this node's own blob
+    /// row, an entry that names the root, and a peer's advertisement. The ad is
+    /// last because it is a claim rather than a verified fact, but a wrong size
+    /// from it costs a failed fetch and not a wrong answer — the bytes are still
+    /// verified against the root per group (§5.1).
+    pub fn object_size(&self, root: &Hash) -> Result<Option<u64>> {
+        let conn = self.conn();
+        let key = root.as_bytes().to_vec();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT size FROM blobs WHERE root = ?1
+                 UNION ALL
+                 SELECT size FROM entries WHERE content = ?1
+                 UNION ALL
+                 SELECT size FROM blob_providers WHERE object_root = ?1
+                 LIMIT 1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.map(|size| size as u64))
     }
 
     /// Whether any materialized entry still names this content root.
@@ -617,7 +645,7 @@ mod tests {
                 &FileEntry::file(100_000, 0, referenced, 1),
             )
             .unwrap();
-        store.set_pinned(&pinned, true).unwrap();
+        store.pin(&pinned, &crate::PinHolder::Operator, 1).unwrap();
 
         // Ingested at 0, so a horizon of 1 puts all three past retention.
         let stats = store.gc_content(1).unwrap();

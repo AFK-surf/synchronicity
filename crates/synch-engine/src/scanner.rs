@@ -492,6 +492,10 @@ impl Node {
             // that what this node advertises about a space can be shown to a
             // peer delegated that space and to nobody else (§5.5).
             report.staged.extend(self.space_info_changes()?);
+            // Coverage claims ride along with a publish this node is making
+            // anyway, so their counts refresh without costing a head of their
+            // own (`docs/REPLICATION.md` §4.1).
+            report.staged.extend(self.replica_claim_changes()?);
         }
         Ok(report)
     }

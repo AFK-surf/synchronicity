@@ -18,10 +18,11 @@ pub use origin::{NodeId, OriginId, OriginParseError};
 pub use path::{normalize_native_path, normalize_path, PathError, MAX_KEY_LEN};
 pub use record::{
     blob_key, blob_prefix, delegation_key, delegation_prefix, dir_prefix, file_key, manifest_key,
-    parse_blob_key, parse_delegation_key, parse_file_key, parse_space_info_key, publish_prefixes,
-    scope_prefixes, space_info_key, space_prefix, validate_space, AdState, BlobAd, ChunkFormat,
-    ChunkParams, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, ScopeKeys, SpaceInfo,
-    AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+    parse_blob_key, parse_delegation_key, parse_file_key, parse_replica_claim_key,
+    parse_space_info_key, publish_prefixes, replica_claim_key, scope_prefixes, space_info_key,
+    space_prefix, validate_space, AdState, BlobAd, ChunkFormat, ChunkParams, Delegation, EntryKind,
+    FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
+    MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT,

@@ -30,6 +30,8 @@ pub const PREFIX_BLOB: u8 = b'b';
 pub const PREFIX_MANIFEST: u8 = b'm';
 /// The `d:` key prefix: a delegation this origin has issued (§3.5).
 pub const PREFIX_DELEGATION: u8 = b'd';
+/// The `r:` key prefix: what this origin replicates (`docs/REPLICATION.md` §4.1).
+pub const PREFIX_REPLICA: u8 = b'r';
 
 /// The most spaces one [`Delegation`] may name. A delegation is a restriction,
 /// so a list too long to be unreadable is the wrong shape — and the record is
@@ -363,6 +365,39 @@ pub struct NodeManifest {
     pub software: String,
 }
 
+/// What this origin holds of a space, published under `r:<space>`
+/// (`docs/REPLICATION.md` §4.1).
+///
+/// A claim, in exactly the sense §12 already accepts for `mtime_ns` and for
+/// `BlobAd`: a member with a full disk, a bug, or bad intent can say it holds a
+/// space it does not. So a reader may let this *order* its work, and may let it
+/// keep bytes, and may never let it drop them. Nothing in this design consults
+/// another node's claim to decide a release.
+///
+/// A new key prefix rather than a field on [`SpaceInfo`], for compatibility
+/// rather than taste: postcard is not self-describing and every record carries a
+/// version stamp checked with `v <= RECORD_VERSION`, so appending a field to
+/// `SpaceInfo` would make every older node *refuse* the record. An unknown
+/// prefix already falls through the materializer untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaClaim {
+    /// Schema version.
+    pub v: u8,
+    /// When this node started replicating the space, in unix nanoseconds.
+    pub since_ns: i64,
+    /// The policy, as `tree` or `archive`.
+    pub policy: String,
+    /// Seconds a released root is still held. Zero under `archive`, which
+    /// releases nothing.
+    pub grace_secs: i64,
+    /// Objects held for the space.
+    pub objects: u64,
+    /// Bytes those objects account for.
+    pub bytes: u64,
+    /// True when nothing is outstanding: everything the tree names is held.
+    pub complete: bool,
+}
+
 /// A delegation this origin has issued, published under `d:<device key>`
 /// (§3.5).
 ///
@@ -556,6 +591,26 @@ pub fn parse_space_info_key(key: &[u8]) -> Result<String, KeyError> {
     Ok(space.to_string())
 }
 
+/// Builds the trie key `r:<space>`.
+pub fn replica_claim_key(space: &str) -> Result<Vec<u8>, KeyError> {
+    validate_space(space)?;
+    let mut key = Vec::with_capacity(2 + space.len());
+    key.push(PREFIX_REPLICA);
+    key.push(b':');
+    key.extend_from_slice(space.as_bytes());
+    Ok(key)
+}
+
+/// Parses `r:<space>`.
+pub fn parse_replica_claim_key(key: &[u8]) -> Result<String, KeyError> {
+    if key.len() < 3 || key[0] != PREFIX_REPLICA || key[1] != b':' {
+        return Err(KeyError::Malformed);
+    }
+    let space = std::str::from_utf8(&key[2..]).map_err(|_| KeyError::Malformed)?;
+    validate_space(space)?;
+    Ok(space.to_string())
+}
+
 /// Builds the trie key `d:<32-byte device key>`.
 pub fn delegation_key(subject: &crate::NodeId) -> Vec<u8> {
     let mut key = Vec::with_capacity(34);
@@ -600,6 +655,12 @@ pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
         if let Ok(key) = space_info_key(space) {
             out.exact.push(key);
         }
+        // A delegate must be able to *read* the coverage claims on its granted
+        // spaces as well as publish its own, or it can say what it holds and
+        // never learn what anyone else does (`docs/REPLICATION.md` §4.1).
+        if let Ok(key) = replica_claim_key(space) {
+            out.exact.push(key);
+        }
     }
     out
 }
@@ -638,6 +699,13 @@ pub fn publish_prefixes(spaces: &[String]) -> ScopeKeys {
             out.prefixes.push(prefix);
         }
         if let Ok(key) = space_info_key(space) {
+            out.exact.push(key);
+        }
+        // A delegate that replicates a granted space must be able to say so,
+        // for the reason `b:` is in this list: a holder the swarm cannot see is
+        // a holder it loses. Exact rather than a prefix, since `r:photos` must
+        // not admit `r:photos-raw`.
+        if let Ok(key) = replica_claim_key(space) {
             out.exact.push(key);
         }
     }

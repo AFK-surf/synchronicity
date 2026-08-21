@@ -1456,8 +1456,10 @@ synch domain set|clear|ls|refresh            the DNSSEC zone this node belongs t
                                              (§3.1) and clear drops the zone's bindings
 synch peers                                  live peers, addresses, last sync, lag
 
-synch space add <id> <path>                  index a local directory as a space
-synch space ls|rm
+synch space add <id> <path> [--replicate[=tree|archive]] [--grace <dur>] [--budget <n>]
+synch space add <id> --detached [--replicate…]  index a directory as a space, hold every
+synch space set <id> [--replicate…|--no-replicate [--release]]   version of it, or both
+synch space ls [<id>] | rm <id> [--release] | sync [<id>]   (§4.1, docs/REPLICATION.md)
 synch scan                                   walk every space now: hash changes, publish
 
 synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent paths
@@ -1468,6 +1470,8 @@ synch status [<space>[/<path>]]              the version inspector: every versio
                                              a path, its attestors, side by side
 synch cat  [<origin>:]<space>/<path>         verified streaming read of the selected
            [--range] [--from <o>|--strict]   version (§8 policy; default newest)
+synch cat|get --root <hex>                   read an object by content root, no path
+                                             involved — how a superseded version is read
 synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
            [--from <o>|--strict]
 synch take <origin>:<space>/<path>           adopt a version as my own (ends divergence)
@@ -1479,7 +1483,9 @@ synch mirror add <space> <dir> [--policy …]  continuous materialization of the
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
-                                             (a path pins its selected version's root)
+                                             (a path pins its selected version's root;
+                                             `ls` and `rm` name every holder, since a
+                                             replicated space may hold it too)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by
@@ -1878,12 +1884,34 @@ CREATE TABLE blobs (
   complete    INTEGER NOT NULL,
   bitmap      BLOB,                      -- verified 16 KiB-group bitmap when partial
   inline      BLOB,                      -- payload for small blobs, else NULL (fs store)
-  pinned      INTEGER NOT NULL DEFAULT 0,
   last_access INTEGER NOT NULL,
   durable     INTEGER NOT NULL DEFAULT 0  -- backend stable-storage promise (docs/SERVERLESS.md §5)
 );
+CREATE TABLE pins (                       -- who holds an object (docs/REPLICATION.md §3.1)
+  root          BLOB NOT NULL,
+  holder        TEXT NOT NULL,            -- 'operator' | 'replica:<space>'
+  created_at    INTEGER NOT NULL,
+  release_after INTEGER,                  -- NULL = held; set = due to go then
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
+CREATE TABLE replica_want (               -- content a replicated space lacks (§3.3)
+  root         BLOB NOT NULL,
+  holder       TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  prev         BLOB,                      -- delta donor: the root this version replaced
+  first_wanted INTEGER NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_error   TEXT,
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT); -- NULL = detached
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,  -- NULL = detached
+                            replicate TEXT,      -- NULL | 'tree' | 'archive'
+                            grace INTEGER, budget INTEGER);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
@@ -2136,7 +2164,15 @@ CI (GitHub Actions):
   delegation rather than by cluster size; pointing it at very large clusters is a
   policy question that has not been answered.
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
-  built on the same `BlobAd` availability data.
+  built on the same `BlobAd` availability data. The role such a policy would be
+  placed on — a *replica* of a space, holding a whole copy of every version the
+  unified tree currently names and releasing a root once the tree stops naming
+  it — is designed in [docs/REPLICATION.md](docs/REPLICATION.md) as a property
+  of a space rather than a surface of its own (`synch space add <id>
+  --replicate`), which proposes the role first and leaves cluster-wide placement
+  where this bullet has it. (Content replication in that sense, not the
+  trie-scope sense of §5.5; and on a cloud backend, a claim and a cache rather
+  than a bill — `docs/SERVERLESS.md` §6.5.)
 - Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,
   never as core. (HTTP access ships as the S3 gateway, §9.4.)
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.

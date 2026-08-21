@@ -152,6 +152,13 @@ pub struct Syncer {
     /// Rung when a promotion flips a head to complete: the unified tree just
     /// changed, and anything materializing it — mirrors — should look again.
     on_change: Option<Arc<tokio::sync::Notify>>,
+    /// Rung by the same events as `on_change`, for the replication loop.
+    ///
+    /// Its own bell rather than a second waiter on `on_change`, because the
+    /// bell is `notify_one`: two loops waiting on one permit means each wake
+    /// reaches whichever of them happened to be waiting, and the other sleeps
+    /// out its interval on a tree that changed.
+    on_replica: Option<Arc<tokio::sync::Notify>>,
     /// Rung when a head is adopted as *pending*: its trie is not here and
     /// nothing in this process is going to fetch it until somebody dials.
     on_pending: Option<Arc<tokio::sync::Notify>>,
@@ -197,6 +204,7 @@ impl Syncer {
         Syncer {
             store,
             on_change: None,
+            on_replica: None,
             on_pending: None,
             refused: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -231,6 +239,12 @@ impl Syncer {
     /// Every merge path ends in [`Syncer::try_promote`] — the Hello exchange
     /// in either direction, a pushed head whose trie was already here, a
     /// pending head's completed fetch — so this one bell covers all of them.
+    pub fn on_replica(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.on_replica = wake;
+        self
+    }
+
+    /// The bell rung when a promotion flips a head to complete.
     pub fn on_change(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_change = wake;
         self
@@ -707,9 +721,9 @@ impl Syncer {
         };
         if promoted == Promotion::Flipped {
             tracing::debug!(origin = %origin, "head flipped to complete");
-            if let Some(wake) = &self.on_change {
-                // One permit no matter how often this rings: passes coalesce,
-                // and a wake landing mid-pass is not lost.
+            // One permit no matter how often this rings: passes coalesce,
+            // and a wake landing mid-pass is not lost.
+            for wake in [&self.on_change, &self.on_replica].into_iter().flatten() {
                 wake.notify_one();
             }
         }
@@ -1270,7 +1284,7 @@ impl Syncer {
                 spaces = ?scope,
                 "the read scope moved: every foreign origin will be refetched and rebuilt under it"
             );
-            if let Some(wake) = &self.on_change {
+            for wake in [&self.on_change, &self.on_replica].into_iter().flatten() {
                 wake.notify_one();
             }
         }

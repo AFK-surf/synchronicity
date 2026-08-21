@@ -110,6 +110,8 @@ struct NodeInner {
     /// complete, a local publish landed, a mirror was added — so the standing
     /// mirror loop materializes it without waiting out its interval (§7.2).
     mirror_wake: Arc<tokio::sync::Notify>,
+    replica_wake: Arc<tokio::sync::Notify>,
+    replica_rotation: Arc<std::sync::atomic::AtomicUsize>,
     /// Rung when a head lands in the pending slot: its trie has to be fetched
     /// and only an anti-entropy round does that.
     pending_wake: Arc<tokio::sync::Notify>,
@@ -655,12 +657,14 @@ impl Node {
         // as the head sink the serve side reconciles through, and it is the
         // same object this node's own rounds dial with.
         let mirror_wake = Arc::new(tokio::sync::Notify::new());
+        let replica_wake = Arc::new(tokio::sync::Notify::new());
         // And every head adopted as *pending* rings the anti-entropy loop: its
         // trie is not here, and until somebody dials for it the head is a
         // pointer no reading surface follows (§5.3).
         let pending_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone())
             .on_change(Some(mirror_wake.clone()))
+            .on_replica(Some(replica_wake.clone()))
             .on_pending(Some(pending_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
         let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {
@@ -696,6 +700,8 @@ impl Node {
                 dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
                 mirror_wake,
+                replica_wake,
+                replica_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
@@ -1093,28 +1099,52 @@ impl Node {
     /// Staging the removal is half of a publish, so it takes the same recovery
     /// gate (§3.4): a node that cannot publish must not drop the space either,
     /// or the unpublish would be lost with it.
-    pub fn remove_space(&self, id: &str) -> Result<Vec<StagedChange>> {
+    pub fn remove_space(&self, id: &str, release: bool) -> Result<Vec<StagedChange>> {
         // "removed ghost and unpublished 0 record(s)" for a space that never
         // existed is a lie with a friendly face.
-        if !self.store().spaces()?.iter().any(|space| space.id == id) {
+        let Some(space) = self.store().space(id)? else {
             return Err(EngineError::NotFound(format!("no space {id}")));
+        };
+        // A space this node only replicates has nothing of its own under the
+        // prefix, so the scan below would stage nothing and the outcome would
+        // be right by accident. That is not good enough for the one command
+        // here that can publish a mass deletion: it takes the publishing gate,
+        // and a node that cannot publish must not be stopped from giving up a
+        // space it never published into (`docs/REPLICATION.md` §3.2).
+        // Or has published: a record advertised under an earlier answer to that
+        // predicate must still be retractable, or `space rm` leaves it behind.
+        let publishes_here = publishes_into(&space, self.store().count_entries(self.origin(), id)?)
+            || self.space_info_of(self.origin(), id)?.is_some();
+        if publishes_here {
+            self.ensure_publishable()?;
         }
-        self.ensure_publishable()?;
         let mut staged = Vec::new();
-        let root = self.current_root()?;
-        let trie = Trie::new(self.store().as_ref());
-        let prefix = synch_core::space_prefix(id)?;
-        for (key, _) in trie.scan(root, &prefix, None, None)? {
-            staged.push((key, None));
+        if publishes_here {
+            let root = self.current_root()?;
+            let trie = Trie::new(self.store().as_ref());
+            let prefix = synch_core::space_prefix(id)?;
+            for (key, _) in trie.scan(root, &prefix, None, None)? {
+                staged.push((key, None));
+            }
+            // The space's advertised record goes with its entries; leaving it
+            // would advertise a space this node no longer has.
+            staged.push(self.space_info_removal(id)?);
         }
-        // The space's advertised record goes with its entries; leaving it
-        // would advertise a space this node no longer has.
-        staged.push(self.space_info_removal(id)?);
         self.store().remove_space(id)?;
         for path in self.store().local_files(id)? {
             self.store().remove_local_file(id, &path)?;
         }
+        // Whatever this space replicated stops being wanted either way; the
+        // pins it already holds go only when asked, because re-fetching
+        // terabytes is not something a command should do because an operator
+        // typed the opposite of `add`.
+        let holder = space.holder();
+        self.store().drop_wants(&holder)?;
+        if release {
+            self.store().unpin_all(&holder)?;
+        }
         self.spaces_changed();
+        self.replica_wake().notify_one();
         Ok(staged)
     }
 
@@ -1137,6 +1167,21 @@ impl Node {
     /// The bell that wakes the standing mirror loop (§7.2).
     pub(crate) fn mirror_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.mirror_wake.clone()
+    }
+
+    /// The bell a replication sweep waits on (`docs/REPLICATION.md` §3.4).
+    ///
+    /// Its own rather than shared with the mirrors': the two react to the same
+    /// events but at different costs, and a mirror pass over an unchanged tree
+    /// must not drag a sweep of four million entries along with it.
+    pub(crate) fn replica_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.replica_wake.clone()
+    }
+
+    /// Which replicated space leads the next fetch batch (`docs/REPLICATION.md`
+    /// §3.3). In memory only: fairness across a restart is not worth a write.
+    pub(crate) fn replica_rotation(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.inner.replica_rotation.clone()
     }
 
     /// The bell a head landing in the pending slot rings (§5.3).
@@ -1313,6 +1358,27 @@ impl Node {
         let mut out = Vec::new();
         for space in self.store().spaces()? {
             let entry_count = self.store().count_entries(self.origin(), &space.id)?;
+            // A space this node only replicates is not a space it publishes.
+            // The record says "here is my view of this space, and here is how
+            // much of it I have", and a replica's answer to the second half is
+            // permanently zero — advertising that would claim a space this node
+            // publishes nothing into (`docs/REPLICATION.md` §3.2). The
+            // predicate is shared with `remove_space`, so what is advertised
+            // and what is withdrawn cannot drift apart.
+            if !publishes_into(&space, entry_count) {
+                // Withdraw rather than merely stop refreshing. The predicate
+                // depends on `count_entries`, so it changes under a space that
+                // is standing still: a detached space that took gateway writes
+                // qualifies until its last tombstone ages out at
+                // `tombstone_ttl`, and after that nothing would refresh the
+                // record and `remove_space` would see the same answer and skip
+                // its removal. The record would sit in this node's own trie for
+                // ever, claiming a space it no longer participates in.
+                if self.space_info_of(self.origin(), &space.id)?.is_some() {
+                    out.push(self.space_info_removal(&space.id)?);
+                }
+                continue;
+            }
             let info = SpaceInfo {
                 v: synch_core::RECORD_VERSION,
                 // Local paths are host-private implementation details and are
@@ -1544,6 +1610,16 @@ impl Node {
     pub fn key_for(&self, space: &str, path: &str) -> Result<Vec<u8>> {
         Ok(file_key(space, path)?)
     }
+}
+
+/// Whether this node publishes into a space, as opposed to only replicating it.
+///
+/// A checkout means it does — that is what the scanner walks — and so does
+/// having published an entry, which is how a detached space serves gateway
+/// writes without one. A space with neither is one this node holds copies of
+/// and asserts nothing about.
+fn publishes_into(space: &synch_store::SpaceRow, own_entries: u64) -> bool {
+    space.local_path.is_some() || own_entries > 0
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf> {

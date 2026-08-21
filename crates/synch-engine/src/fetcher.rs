@@ -267,7 +267,14 @@ impl Node {
         let pinned = {
             let store = self.store().clone();
             let root = *root;
-            crate::blocking::offload(move || Ok(store.set_pinned(&root, true)?)).await?
+            crate::blocking::offload(move || {
+                Ok(store.pin(
+                    &root,
+                    &synch_store::PinHolder::Operator,
+                    synch_core::now_ns(),
+                )?)
+            })
+            .await?
         };
         if !pinned {
             return Err(EngineError::NotFound(format!(
@@ -290,8 +297,10 @@ impl Node {
     pub async fn unpin_object(&self, root: &Hash) -> Result<bool> {
         let store = self.store().clone();
         let root_value = *root;
-        let removed =
-            crate::blocking::offload(move || Ok(store.set_pinned(&root_value, false)?)).await?;
+        let removed = crate::blocking::offload(move || {
+            Ok(store.unpin(&root_value, &synch_store::PinHolder::Operator)?)
+        })
+        .await?;
         if removed && self.config().cloud.is_some() {
             let store = self.store().clone();
             let root_value = *root;
@@ -524,7 +533,7 @@ impl Node {
     }
 
     /// Promotes a complete cache entry into the remote durable tier.
-    async fn finalize_cloud_object(&self, root: &Hash, pin: bool) -> Result<()> {
+    pub(crate) async fn finalize_cloud_object(&self, root: &Hash, pin: bool) -> Result<()> {
         let Some(config) = self.config().cloud.as_ref() else {
             return Ok(());
         };
@@ -1311,6 +1320,58 @@ impl Node {
         Ok(PreparedRange {
             root,
             size: entry.size,
+            start,
+            end,
+        })
+    }
+
+    /// Prepares a read of an object named by its content root, with no path
+    /// and no version policy involved (§8).
+    ///
+    /// `synch log` prints content roots and DESIGN.md §8 says reading an old
+    /// version back is done by one; this is what makes that true. It is also
+    /// what makes a replica's holdings reachable — an object no current entry
+    /// names has no `<space>/<path>` left to ask for it by.
+    ///
+    /// No donors: a bare root has no entry, so it has no `prev` and no sibling
+    /// versions to descend against. The read is an ordinary verified fetch.
+    pub async fn prepare_root_range(
+        &self,
+        root: &Hash,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<PreparedRange> {
+        let size = {
+            let store = self.store().clone();
+            let root = *root;
+            crate::blocking::offload(move || Ok(store.object_size(&root)?)).await?
+        }
+        .ok_or_else(|| {
+            EngineError::not_found(format!(
+                "nothing here knows the size of {root}: no local object, no entry naming \
+                 it, and no peer advertising it"
+            ))
+        })?;
+        if start > size {
+            return Err(EngineError::invalid(format!(
+                "offset {start} is past the end of a {size}-byte object"
+            )));
+        }
+        let end = match len {
+            Some(len) => start.saturating_add(len).min(size),
+            None => size,
+        };
+        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
+            .intersect(&ChunkRanges::single(0, group_count(size)));
+        let report = self.fetch_groups_from(root, size, &wanted, &[]).await?;
+        if !report.complete {
+            return Err(EngineError::not_found(format!(
+                "no provider could serve bytes {start}..{end} of {root}"
+            )));
+        }
+        Ok(PreparedRange {
+            root: *root,
+            size,
             start,
             end,
         })

@@ -145,6 +145,74 @@ fn write_and_sync(
     Ok(())
 }
 
+/// Who holds a pin (`docs/REPLICATION.md` §3.1).
+///
+/// The holder is what makes a release decidable. Two things can hold one
+/// object — content is deduplicated by hash, so one root is reachable from any
+/// number of spaces and from an operator's own `pin add` — and "may these bytes
+/// go now?" is a question about the whole set of claims, not about any one of
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinHolder {
+    /// `synch pin add`: an operator asked for this by hand.
+    Operator,
+    /// A replicated space holds this for as long as its policy says.
+    Replica(String),
+    /// A spelling this build does not know, kept verbatim.
+    ///
+    /// A claim it cannot read is still a claim. Dropping it — or refusing to
+    /// list it — is how a downgrade turns another version's pins into
+    /// collectable garbage.
+    Other(String),
+}
+
+impl PinHolder {
+    /// The stored spelling.
+    pub fn render(&self) -> String {
+        match self {
+            PinHolder::Operator => "operator".to_string(),
+            PinHolder::Replica(space) => format!("replica:{space}"),
+            PinHolder::Other(text) => text.clone(),
+        }
+    }
+
+    /// Reads a stored spelling. Never fails; see [`PinHolder::Other`].
+    pub fn parse(text: &str) -> PinHolder {
+        match text.split_once(':') {
+            Some(("replica", space)) if !space.is_empty() => PinHolder::Replica(space.to_string()),
+            _ if text == "operator" => PinHolder::Operator,
+            _ => PinHolder::Other(text.to_string()),
+        }
+    }
+
+    /// The space this claim is on behalf of, if it is a replica's.
+    pub fn space(&self) -> Option<&str> {
+        match self {
+            PinHolder::Replica(space) => Some(space),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PinHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
+/// One claim on one object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRow {
+    /// The object held.
+    pub root: Hash,
+    /// Who holds it.
+    pub holder: PinHolder,
+    /// When the claim was made, in unix nanoseconds.
+    pub created_at: i64,
+    /// When the claim is due to end, if it has been scheduled to.
+    pub release_after: Option<i64>,
+}
+
 /// A blob index row without its payload: what a sweep or a report needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobSummary {
@@ -440,8 +508,8 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
     } = row;
     conn.execute(
         "INSERT INTO blobs
-           (root, size, complete, bitmap, inline, pinned, last_access, durable)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+           (root, size, complete, bitmap, inline, last_access, durable)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(root) DO UPDATE SET
            size = excluded.size,
            complete = excluded.complete,
@@ -679,8 +747,8 @@ impl Store {
         self.with_immediate_tx(|tx| {
             tx.execute(
                 "INSERT INTO blobs
-               (root, size, complete, bitmap, inline, pinned, last_access, durable)
-             VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1)
+               (root, size, complete, bitmap, inline, last_access, durable)
+             VALUES (?1, ?2, 0, NULL, NULL, ?3, 1)
              ON CONFLICT(root) DO UPDATE SET
                size = excluded.size,
                durable = 1,
@@ -800,8 +868,9 @@ impl Store {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT root, size, complete, bitmap, inline, pinned, last_access,
-                        durable
+                "SELECT root, size, complete, bitmap, inline,
+                        EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
+                        last_access, durable
                  FROM blobs WHERE root = ?1",
                 params![root.as_bytes().to_vec()],
                 |row| {
@@ -844,8 +913,10 @@ impl Store {
     pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT root, size, complete, durable, pinned, last_access FROM blobs
-             ORDER BY last_access DESC",
+            "SELECT root, size, complete, durable,
+                    EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
+                    last_access
+             FROM blobs ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -876,9 +947,10 @@ impl Store {
     pub fn blobs(&self) -> Result<Vec<BlobRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT root, size, complete, bitmap, inline, pinned, last_access,
-                    durable FROM blobs
-             ORDER BY last_access DESC",
+            "SELECT root, size, complete, bitmap, inline,
+                    EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
+                    last_access, durable
+             FROM blobs ORDER BY last_access DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -953,8 +1025,8 @@ impl Store {
             } else {
                 tx.execute(
                     "INSERT INTO blobs
-                       (root, size, complete, bitmap, inline, pinned, last_access, durable)
-                     VALUES (?1, ?2, 0, NULL, NULL, 0, ?3, 1)",
+                       (root, size, complete, bitmap, inline, last_access, durable)
+                     VALUES (?1, ?2, 0, NULL, NULL, ?3, 1)",
                     params![root.as_bytes().to_vec(), size as i64, now],
                 )?;
             }
@@ -968,15 +1040,67 @@ impl Store {
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
         self.with_immediate_tx(|tx| {
+            let key = root.as_bytes().to_vec();
+            // Read before anything is written: this row is the most
+            // authoritative record of the object's size, and it is about to be
+            // withdrawn or deleted.
+            let size: Option<i64> = tx
+                .query_row(
+                    "SELECT size FROM blobs WHERE root = ?1",
+                    params![key.clone()],
+                    |row| row.get(0),
+                )
+                .optional()?;
             let changed = tx.execute(
                 "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
-                params![root.as_bytes().to_vec()],
+                params![key.clone()],
             )?;
             tx.execute(
                 "DELETE FROM blobs
                    WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
-                params![root.as_bytes().to_vec()],
+                params![key.clone()],
             )?;
+            // A replica's claim must not outlive the bytes it was a promise
+            // about (`docs/REPLICATION.md` §8). This is the one place where
+            // absence of bytes *is* evidence: the backend answered `NotFound`
+            // about a content address, which is a statement — unlike `entries`
+            // merely not naming a root.
+            //
+            // Gated on the *withdrawal*, not on the row disappearing. A cloud
+            // replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
+            // ordinary course of things — the cache LRU clears a durable row
+            // and any later ranged read writes a partial bitmap back — and for
+            // such a row the delete above matches nothing. Gating on it left
+            // the pin standing over bytes that are neither complete nor
+            // durable, which is the same permanent hole this exists to close:
+            // both staging paths skip a root the holder already pins, so no
+            // sweep could ever re-want it.
+            if changed > 0 {
+                // `blobs.size` is `NOT NULL` and `changed > 0` means the row
+                // was there to withdraw, so the size is always in hand — which
+                // is the point: a root no entry names is still re-fetchable
+                // from any provider that has it, and `blob_providers` survives
+                // independently of `entries`. Dropping such a claim silently
+                // would lose exactly the objects an `archive` replica is bought
+                // to keep, since nothing else names a superseded version.
+                tx.execute(
+                    "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+                     SELECT p.root, p.holder, ?2, NULL, ?3
+                       FROM pins p
+                      WHERE p.root = ?1 AND p.holder LIKE 'replica:%'
+                     ON CONFLICT(root, holder) DO NOTHING",
+                    params![key.clone(), size.unwrap_or(0), synch_core::now_ns()],
+                )?;
+                // The claim goes either way: it was a promise about bytes this
+                // node no longer holds. The operator's own pins are left alone
+                // — those are a person's promise, not this node's bookkeeping,
+                // and a vanished object is something they should be told about
+                // rather than have quietly rewritten.
+                tx.execute(
+                    "DELETE FROM pins WHERE root = ?1 AND holder LIKE 'replica:%'",
+                    params![key],
+                )?;
+            }
             Ok(changed > 0)
         })
     }
@@ -1181,28 +1305,151 @@ impl Store {
         Ok(out)
     }
 
-    /// Pins or unpins an object against GC (§9.2).
+    /// Records one holder's claim on an object against GC (§9.2,
+    /// `docs/REPLICATION.md` §3.1).
     ///
-    /// Returns whether an object with this root was there to mark. A pin
-    /// that matched nothing guards nothing, and the caller is the one that
-    /// can say so — silently succeeding here is how a pin of never-fetched
-    /// content once vanished without a trace.
-    pub fn set_pinned(&self, root: &Hash, pinned: bool) -> Result<bool> {
-        let matched = self.conn().execute(
-            "UPDATE blobs SET pinned = ?2 WHERE root = ?1",
-            params![root.as_bytes().to_vec(), pinned as i64],
+    /// Returns whether an object with this root was there to hold. A pin that
+    /// matched nothing guards nothing, and the caller is the one that can say
+    /// so — silently succeeding here is how a pin of never-fetched content once
+    /// vanished without a trace. The check and the insert share one immediate
+    /// transaction, or a GC pass landing between them collects the object this
+    /// call is about to report as pinned.
+    ///
+    /// Re-pinning what this holder already holds clears any scheduled release:
+    /// content that comes back is content that stays, and the root reappearing
+    /// under a live entry is exactly the evidence that the release was decided
+    /// against a tree that has since changed its mind.
+    pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
+        self.with_immediate_tx(|tx| {
+            // Held, not merely known: a `blobs` row exists for a partial fetch
+            // too. `take_possession` enforces the same thing on the other entry
+            // point, and a promise about bytes belongs in the store rather than
+            // in the discipline of every caller.
+            let held: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs
+                                WHERE root = ?1 AND (complete != 0 OR durable != 0))",
+                params![root.as_bytes().to_vec()],
+                |row| row.get(0),
+            )?;
+            if !held {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO pins (root, holder, created_at, release_after)
+                 VALUES (?1, ?2, ?3, NULL)
+                 ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+                params![root.as_bytes().to_vec(), holder.render(), now],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Drops one holder's claim. Returns whether there was one to drop.
+    pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
+        let dropped = self.conn().execute(
+            "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
+            params![root.as_bytes().to_vec(), holder.render()],
         )?;
-        Ok(matched > 0)
+        Ok(dropped > 0)
+    }
+
+    /// Drops every claim one holder has, for `space rm --release` and
+    /// `--no-replicate --release`. Returns how many went.
+    pub fn unpin_all(&self, holder: &PinHolder) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM pins WHERE holder = ?1",
+            params![holder.render()],
+        )?)
+    }
+
+    /// Schedules one holder's claim to end, without ending it yet
+    /// (`docs/REPLICATION.md` §3.4).
+    ///
+    /// Idempotent in the direction that matters: a release already scheduled
+    /// keeps its original instant rather than being pushed further out by a
+    /// second observation of the same departure, so a path that churns cannot
+    /// hold a superseded root forever.
+    pub fn schedule_release(&self, root: &Hash, holder: &PinHolder, at: i64) -> Result<bool> {
+        let touched = self.conn().execute(
+            "UPDATE pins SET release_after = ?3
+               WHERE root = ?1 AND holder = ?2 AND release_after IS NULL",
+            params![root.as_bytes().to_vec(), holder.render(), at],
+        )?;
+        Ok(touched > 0)
+    }
+
+    /// Drops one holder's claims whose scheduled release has arrived.
+    ///
+    /// Per holder so that a sweep can report what *this* space let go of. The
+    /// node-wide [`Store::expire_pins`] stays as the catch-all for holders no
+    /// sweep visits any more: a space removed with its pins kept still has
+    /// claims that were scheduled before it went.
+    pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM pins
+              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2",
+            params![holder.render(), now],
+        )?)
+    }
+
+    /// Drops claims whose scheduled release has arrived, so that every other
+    /// predicate over `pins` can stay free of the clock. Returns how many went.
+    pub fn expire_pins(&self, now: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM pins WHERE release_after IS NOT NULL AND release_after <= ?1",
+            params![now],
+        )?)
+    }
+
+    /// Every claim on one object, oldest first.
+    pub fn pins_for(&self, root: &Hash) -> Result<Vec<PinRow>> {
+        self.query_pins("WHERE root = ?1", params![root.as_bytes().to_vec()])
+    }
+
+    /// Every claim this node holds, by object and then by holder.
+    pub fn pins(&self) -> Result<Vec<PinRow>> {
+        self.query_pins("", params![])
+    }
+
+    fn query_pins(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<PinRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT root, holder, created_at, release_after FROM pins {filter}
+             ORDER BY root, holder"
+        ))?;
+        let rows = stmt.query_map(args, |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (root, holder, created_at, release_after) = row?;
+            out.push(PinRow {
+                root: hash_column(root, "pins.root")?,
+                // A holder spelling this build does not know is kept as a
+                // holder rather than dropped: an unreadable claim is still a
+                // claim, and forgetting it is how bytes go missing after a
+                // downgrade.
+                holder: PinHolder::parse(&holder),
+                created_at,
+                release_after,
+            });
+        }
+        Ok(out)
     }
 
     /// Every pinned object.
     pub fn pinned_blobs(&self) -> Result<Vec<Hash>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT root FROM blobs WHERE pinned != 0")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT root FROM pins ORDER BY root")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(hash_column(row?, "blobs.root")?);
+            out.push(hash_column(row?, "pins.root")?);
         }
         Ok(out)
     }
@@ -1256,7 +1503,7 @@ impl Store {
         let rows = tx.execute(
             "DELETE FROM blobs
                WHERE root = ?1
-                 AND pinned = 0
+                 AND NOT EXISTS (SELECT 1 FROM pins WHERE pins.root = blobs.root)
                  AND last_access < ?2
                  AND NOT EXISTS (
                    SELECT 1 FROM entries WHERE entries.content = blobs.root
@@ -2039,10 +2286,22 @@ mod tests {
         let (_d, store) = store();
         let root = store.ingest_bytes(&data(100_000), 0).unwrap();
         assert!(store.pinned_blobs().unwrap().is_empty());
-        store.set_pinned(&root, true).unwrap();
+        store.pin(&root, &PinHolder::Operator, 1).unwrap();
         assert_eq!(store.pinned_blobs().unwrap(), vec![root]);
-        store.set_pinned(&root, false).unwrap();
+        // A second holder keeps the object pinned when the first lets go: the
+        // whole reason the flag became a set of claims.
+        let replica = PinHolder::Replica("media".into());
+        store.pin(&root, &replica, 2).unwrap();
+        store.unpin(&root, &PinHolder::Operator).unwrap();
+        assert_eq!(store.pinned_blobs().unwrap(), vec![root]);
+        assert!(store.blob(&root).unwrap().unwrap().pinned);
+        store.unpin(&root, &replica).unwrap();
         assert!(store.pinned_blobs().unwrap().is_empty());
+        assert!(!store.blob(&root).unwrap().unwrap().pinned);
+        // A pin of content this node does not hold guards nothing and says so.
+        assert!(!store
+            .pin(&Hash::new(b"absent"), &PinHolder::Operator, 3)
+            .unwrap());
 
         assert_eq!(store.blobs().unwrap().len(), 1);
         store.delete_blob(&root).unwrap();

@@ -45,6 +45,27 @@ pub struct NodeConfig {
     pub ad_update_interval: Duration,
     /// How many providers a single range fetch is split across (§6.4).
     pub fetch_fanout: usize,
+    /// The backstop interval between replication sweeps (`docs/REPLICATION.md`
+    /// §5, default 300 s with ±50 % jitter). Like the mirror interval, passes
+    /// normally run because the unified tree changed and rang the bell.
+    pub replica_interval: Duration,
+    /// How many other origins must advertise a complete copy before a replica
+    /// lets a stale root of its own go (`docs/REPLICATION.md` §4.3).
+    ///
+    /// One by default: a replica will not be the last holder to let go of
+    /// something, but it does not try to enforce a cluster-wide floor either —
+    /// that is the deferred half of §4.3, and the hazard is written down there.
+    /// Zero disables the brake, which is the right setting for a lone replica
+    /// whose peers never advertise anything it holds.
+    pub replica_release_floor: i64,
+    /// How many objects a replica fetches at once — concurrently, which is
+    /// what makes this a rate limit rather than a batch size.
+    ///
+    /// Deliberately low. Replica fetches share the endpoint with anti-entropy
+    /// and with foreground reads, and nothing schedules between them today
+    /// (§13): a replica that saturates the link it shares with the cluster's
+    /// actual users is a worse problem than one that converges overnight.
+    pub replica_concurrency: usize,
     /// The smallest object a fetch will run the delta descent for
     /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
     ///
@@ -117,6 +138,9 @@ impl NodeConfig {
             publish_batch_max: crate::publisher::DEFAULT_PUBLISH_BATCH_MAX,
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
+            replica_interval: Duration::from_secs(300),
+            replica_concurrency: 4,
+            replica_release_floor: 1,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             pending_head_ttl: Duration::from_secs(900),
             sync_round_budget: Duration::from_secs(300),

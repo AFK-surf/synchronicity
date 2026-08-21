@@ -23,6 +23,7 @@ pub mod publisher;
 pub mod reconcile;
 pub mod recovery;
 pub mod reference;
+pub mod replica;
 pub mod rotation;
 pub mod scanner;
 #[cfg(test)]

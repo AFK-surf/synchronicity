@@ -84,6 +84,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V18_REDACTED_NODES),
     Migration::Sql(V19_S3_MULTIPART_UPLOADS),
     Migration::Sql(V20_SERVERLESS_FOUNDATION),
+    Migration::Sql(V21_REPLICATION),
 ];
 
 /// v20 — state shared by filesystem and serverless CAS backends.
@@ -104,6 +105,73 @@ ALTER TABLE spaces RENAME TO spaces_v19;
 CREATE TABLE spaces (id TEXT PRIMARY KEY, local_path TEXT);
 INSERT INTO spaces (id, local_path) SELECT id, local_path FROM spaces_v19;
 DROP TABLE spaces_v19;
+"#;
+
+/// v21 — replication: pins gain a holder, spaces gain a policy (`docs/REPLICATION.md`).
+///
+/// `blobs.pinned` was a boolean with no provenance, which cannot answer the one
+/// question that matters when something stops holding an object: *may these
+/// bytes go now?* Once an operator's `pin add` and one or more replicated
+/// spaces can hold the same root — and they can, because content is
+/// deduplicated by hash across every space — a single flag has to be either set
+/// or clear for all of them, and clearing it for one holder drops it for every
+/// other. So the flag becomes a set of claims, and pinnedness becomes derived:
+/// `EXISTS` a row, rather than a column that must be kept in agreement with one.
+///
+/// A row is live while it exists. `release_after` is when a claim is *due* to
+/// go, and `expire_pins` is what actually removes it, so every predicate that
+/// asks "is this pinned" stays free of the clock — including the one inside
+/// `delete_blob_if_collectable`, which is re-read in the transaction that does
+/// the delete and must not start depending on when it runs.
+///
+/// The backfill dates each recovered pin at its blob's `last_access` rather
+/// than at migration time: it is the only timestamp the old row carries, and a
+/// fabricated "now" would make every pre-existing pin look newer than the
+/// content it holds.
+///
+/// The two indexes are the ones the queries actually use. `pins` is filtered by
+/// `holder` on every status read and every release sweep, and its primary key
+/// leads with `root`, so without `pins_by_holder` each of those scans the whole
+/// table. `replica_want` is walked oldest-first per holder, which is what
+/// `replica_want_by_holder` answers — an index on `last_attempt` alone would
+/// look plausible and serve no statement, since the backoff is computed from
+/// `attempts` and cannot seek on it.
+///
+/// `spaces` gains the replication policy in the same step, because v20 already
+/// made a row mean "this node's participation in this space" — a nullable
+/// `local_path` for detached spaces — and holding every version of a space is
+/// the second kind of participation that row can describe. One per space, so a
+/// column rather than a table.
+const V21_REPLICATION: &str = r#"
+CREATE TABLE pins (
+  root          BLOB NOT NULL,
+  holder        TEXT NOT NULL,             -- 'operator' | 'replica:<space>'
+  created_at    INTEGER NOT NULL,
+  release_after INTEGER,                   -- NULL = held; set = due to go then
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
+INSERT INTO pins (root, holder, created_at, release_after)
+  SELECT root, 'operator', last_access, NULL FROM blobs WHERE pinned != 0;
+ALTER TABLE blobs DROP COLUMN pinned;
+
+ALTER TABLE spaces ADD COLUMN replicate TEXT;      -- NULL | 'tree' | 'archive'
+ALTER TABLE spaces ADD COLUMN grace     INTEGER;   -- seconds a released root is still held
+ALTER TABLE spaces ADD COLUMN budget    INTEGER;   -- optional byte ceiling
+
+CREATE TABLE replica_want (
+  root         BLOB NOT NULL,
+  holder       TEXT NOT NULL,              -- 'replica:<space>', as in pins.holder
+  size         INTEGER NOT NULL,
+  prev         BLOB,                       -- delta donor: the root this version replaced
+  first_wanted INTEGER NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_error   TEXT,
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
 "#;
 
 /// v19 — the multipart uploads an S3 client has open (§9.4).
@@ -671,11 +739,32 @@ CREATE TABLE blobs (
   complete    INTEGER NOT NULL,
   bitmap      BLOB,
   inline      BLOB,
-  pinned      INTEGER NOT NULL DEFAULT 0,
   last_access INTEGER NOT NULL,
   durable     INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT);
+CREATE TABLE pins (                       -- who holds an object, and until when
+  root          BLOB NOT NULL,
+  holder        TEXT NOT NULL,            -- 'operator' | 'replica:<space>'
+  created_at    INTEGER NOT NULL,
+  release_after INTEGER,
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
+CREATE INDEX pins_by_holder ON pins (holder);
+CREATE TABLE replica_want (               -- content a replicated space wants (§3.3)
+  root         BLOB NOT NULL,
+  holder       TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  prev         BLOB,
+  first_wanted INTEGER NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_error   TEXT,
+  PRIMARY KEY (root, holder)
+);
+CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,
+                            replicate TEXT, grace INTEGER, budget INTEGER);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));

@@ -690,7 +690,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         Command::Space { command } => match command {
             // The daemon's working directory is its own; a relative path is
             // resolved against the caller's before it crosses the socket.
-            SpaceCommand::Add { id, path, detached } => Cmd::SpaceAdd(pb::SpaceAdd {
+            SpaceCommand::Add {
+                id,
+                path,
+                detached,
+                replicate,
+                grace,
+                budget,
+            } => Cmd::SpaceAdd(pb::SpaceAdd {
                 id: id.clone(),
                 path: path
                     .as_deref()
@@ -698,9 +705,35 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                     .transpose()?
                     .unwrap_or_default(),
                 detached: *detached,
+                replicate: replicate.clone(),
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
             }),
-            SpaceCommand::Ls => Cmd::SpaceLs(pb::SpaceLs {}),
-            SpaceCommand::Rm { id } => Cmd::SpaceRm(pb::SpaceRm { id: id.clone() }),
+            SpaceCommand::Set {
+                id,
+                replicate,
+                no_replicate,
+                release,
+                grace,
+                budget,
+            } => Cmd::SpaceSet(pb::SpaceSet {
+                id: id.clone(),
+                replicate: replicate.clone(),
+                no_replicate: *no_replicate,
+                release: *release,
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
+            }),
+            SpaceCommand::Ls { id } => Cmd::SpaceLs(pb::SpaceLs {
+                id: id.clone().unwrap_or_default(),
+            }),
+            SpaceCommand::Sync { id } => Cmd::SpaceSync(pb::SpaceSync {
+                id: id.clone().unwrap_or_default(),
+            }),
+            SpaceCommand::Rm { id, release } => Cmd::SpaceRm(pb::SpaceRm {
+                id: id.clone(),
+                release: *release,
+            }),
         },
 
         Command::Mirror { command } => match command {
@@ -742,21 +775,25 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             range,
             from,
             strict,
+            root,
         } => Cmd::Cat(pb::Cat {
-            reference: reference.clone(),
+            reference: reference.clone().unwrap_or_default(),
             range: range.clone(),
             from: from.clone(),
             strict: *strict,
+            root: root.clone(),
         }),
         Command::Get {
             reference,
             from,
             strict,
+            root,
             ..
         } => Cmd::Get(pb::Get {
-            reference: reference.clone(),
+            reference: reference.clone().unwrap_or_default(),
             from: from.clone(),
             strict: *strict,
+            root: root.clone(),
         }),
         Command::Take { reference } => Cmd::Take(pb::Take {
             reference: reference.clone(),
@@ -805,14 +842,24 @@ async fn deliver(data_dir: &Path, cli: &Cli, command: Cmd) -> Result<()> {
     // `get` is the one command whose payload lands in a file rather than on
     // stdout, so it needs the destination the caller named.
     if let Command::Get {
-        reference, output, ..
+        reference,
+        output,
+        root,
+        ..
     } = &cli.command
     {
-        let target = match output {
-            Some(path) => path.clone(),
-            None => {
+        let target = match (output, reference, root) {
+            (Some(path), _, _) => path.clone(),
+            (None, Some(reference), _) => {
                 let reference: EntryRef = reference.parse()?;
                 PathBuf::from(reference.path.rsplit('/').next().unwrap_or(&reference.path))
+            }
+            // A root names no file, so the root is the file name. Better than
+            // guessing: whoever asked for a bare object knows what it is, and a
+            // hex name is at least unambiguous about which one they got.
+            (None, None, Some(root)) => PathBuf::from(root),
+            (None, None, None) => {
+                anyhow::bail!("get needs a <space>/<path> or a --root")
             }
         };
         // The destination is created when the first byte arrives, so a read

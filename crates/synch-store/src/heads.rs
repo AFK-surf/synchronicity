@@ -150,6 +150,28 @@ impl Store {
         head_floor_in(&self.conn(), origin)
     }
 
+    /// Every origin whose complete trie this node holds.
+    ///
+    /// The candidate list for reading what other origins publish about
+    /// themselves — a manifest, a space record, a replication claim. Wider than
+    /// the origins with `entries`, deliberately: a node that publishes no files
+    /// still publishes records about itself, and a dedicated replica is exactly
+    /// that shape.
+    pub fn origins_with_complete_heads(&self) -> Result<Vec<OriginId>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT origin_id FROM heads WHERE slot = 'complete' ORDER BY origin_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(
+                row?.parse()
+                    .map_err(|_| StoreError::column("heads.origin_id", "unparseable origin"))?,
+            );
+        }
+        Ok(out)
+    }
+
     /// Every slot for every origin.
     ///
     /// A row that will not build is skipped, not propagated. This is the bulk

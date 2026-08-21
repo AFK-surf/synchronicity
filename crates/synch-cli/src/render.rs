@@ -5,10 +5,10 @@
 
 use synch_core::{now_ns, EntryKind};
 use synch_engine::{
-    CompareReport, CompareStatus, EntryRef, Node, RekorPolicy, ResolverStatus, VersionPolicy,
-    VersionSet,
+    replica::ReplicaStatus, CompareReport, CompareStatus, EntryRef, Node, RekorPolicy,
+    ResolverStatus, VersionPolicy, VersionSet,
 };
-use synch_store::EntryRow;
+use synch_store::{EntryRow, ReplicaCoverage, ReplicaPolicy, SpaceRow};
 
 use crate::control::ControlError;
 
@@ -135,6 +135,156 @@ pub fn ago(timestamp: i64) -> String {
         s if s < 86400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86400),
     }
+}
+
+/// A coarse duration in seconds, for grace windows.
+pub fn duration(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// One line of `synch space ls`: what this node does about a space.
+///
+/// The two halves of a row are independent and the line has to show both, or
+/// an operator cannot tell a detached replica from a checkout that replicates
+/// nothing — which are opposite answers to "what is this machine for".
+pub fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -> String {
+    let replication = match (space.replicate, coverage) {
+        (None, _) => "—".to_string(),
+        (Some(policy), None) => format!("replicate {policy}"),
+        (Some(policy), Some(coverage)) => {
+            let grace = match policy {
+                ReplicaPolicy::Tree => format!(" · grace {}", duration(space.grace_secs())),
+                ReplicaPolicy::Archive => String::new(),
+            };
+            format!(
+                "replicate {policy}{grace} · {} B held{}",
+                coverage.held_bytes,
+                match coverage.wanted {
+                    0 => String::new(),
+                    n => format!(" · {n} wanted"),
+                }
+            )
+        }
+    };
+    format!(
+        "{:<20} {:<28} {}",
+        space.id,
+        space.local_path.as_deref().unwrap_or("—"),
+        replication
+    )
+}
+
+/// The detailed report of `synch space ls <id>`.
+///
+/// Three of these lines exist to be read on a bad day. `unreachable` is never
+/// folded into `wanted`: objects with no provider are not a backlog, they are
+/// versions that are probably already gone, and the difference is the whole
+/// reason to run a replica. `releasing` is what an operator checks before
+/// deleting something they may want back. And `view` says whether releases are
+/// running at all, because "paused" is the difference between a replica that is
+/// behaving and one that is stuck.
+pub fn replica_status(status: &ReplicaStatus) -> Lines {
+    let space = &status.space;
+    let mut out = vec![format!(
+        "{}   indexed {}   {}",
+        space.id,
+        space.local_path.as_deref().unwrap_or("—"),
+        match space.replicate {
+            None => "not replicated".to_string(),
+            Some(policy @ ReplicaPolicy::Tree) => format!(
+                "replicate {policy}   grace {}",
+                duration(space.grace_secs())
+            ),
+            Some(policy) => format!("replicate {policy}"),
+        }
+    )];
+    if space.replicate.is_none() {
+        return Ok(out);
+    }
+    let coverage = &status.coverage;
+    out.push(format!(
+        "  held          {:>9} objects  {:>14} B",
+        coverage.held, coverage.held_bytes
+    ));
+    if coverage.releasing > 0 {
+        out.push(format!(
+            "  releasing     {:>9} objects  {:>14} B{}",
+            coverage.releasing,
+            coverage.releasing_bytes,
+            match status.next_release {
+                Some(at) => format!("   (soonest leaves in {})", remaining(at, now_ns())),
+                None => String::new(),
+            }
+        ));
+    }
+    if coverage.wanted > 0 {
+        out.push(format!(
+            "  wanted        {:>9} objects  {:>14} B{}",
+            coverage.wanted - coverage.unreachable,
+            coverage.wanted_bytes - coverage.unreachable_bytes,
+            match status.oldest_want {
+                Some(at) => format!("   (oldest {})", ago(at)),
+                None => String::new(),
+            }
+        ));
+    }
+    if coverage.unreachable > 0 {
+        out.push(format!(
+            "  unreachable   {:>9} objects  {:>14} B   <- no provider has answered for these",
+            coverage.unreachable, coverage.unreachable_bytes
+        ));
+    }
+    if status.held_back > 0 {
+        out.push(format!(
+            "  held back     {:>9} objects                     \
+             too few peers advertise these to let them go",
+            status.held_back
+        ));
+    }
+    if let Some(budget) = space.budget {
+        let held = coverage.held_bytes;
+        out.push(match held >= budget {
+            true => format!(
+                "  budget        {budget} B — reached, so nothing new is being fetched; \
+                 no release was shortened for it"
+            ),
+            false => format!("  budget        {budget} B, {} B of it used", held),
+        });
+    }
+    out.push(match status.view.reason() {
+        None => "  view          complete — releases are running".to_string(),
+        Some(why) => format!("  view          incomplete, releases paused: {why}"),
+    });
+    // Whose content this is, because a budget raises the question and cannot
+    // answer it: any member can publish, and every replica of the space fetches
+    // what they publish.
+    for (origin, bytes) in status.by_origin.iter().take(8) {
+        out.push(format!("  from {origin:<32} {bytes:>14} B"));
+    }
+    // Rendered as claims, never as verified coverage: this node has no way to
+    // check another's disk (§4.2).
+    for (origin, claim) in &status.claims {
+        out.push(format!(
+            "  claim   {origin} says it holds {} objects ({} B{}, {}{})",
+            claim.objects,
+            claim.bytes,
+            match claim.complete {
+                true => ", nothing outstanding",
+                false => ", still fetching",
+            },
+            claim.policy,
+            match claim.grace_secs {
+                0 => String::new(),
+                secs => format!(", grace {}", duration(secs)),
+            }
+        ));
+    }
+    Ok(out)
 }
 
 /// How long until an expiry, for `delegate ls` and `doctor`.
@@ -513,6 +663,33 @@ pub fn doctor(node: &Node) -> Lines {
         "storage: {} trie nodes, {} trie values, {} objects ({} complete)",
         report.trie.nodes, report.trie.values, report.blobs.0, report.blobs.1
     ));
+
+    // Replication belongs in the examination rather than only in `space ls`,
+    // because the two lines that matter here are ones nobody thinks to look
+    // for: content no provider will serve, and releases that have stopped
+    // running. Both mean a replica is not doing what it was asked to.
+    for space in node.store().replicated_spaces()? {
+        let status = node.replica_status(&space.id)?;
+        out.push(format!(
+            "replicating {}: {} objects held, {} wanted{}",
+            space.id,
+            status.coverage.held,
+            status.coverage.wanted,
+            match status.coverage.unreachable {
+                0 => String::new(),
+                n => format!(
+                    ", {n} UNREACHABLE — no provider has answered for these, so they are \
+                     most likely gone from the cluster"
+                ),
+            }
+        ));
+        if let Some(why) = status.view.reason() {
+            out.push(format!(
+                "  releases are paused: {why} — this node is holding more than its \
+                 policy asks, which is the safe direction"
+            ));
+        }
+    }
     Ok(out)
 }
 

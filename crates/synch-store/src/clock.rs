@@ -29,6 +29,8 @@
 
 use synch_core::clock_is_trusted;
 
+use rusqlite::OptionalExtension;
+
 use crate::{db::Store, error::Result};
 
 /// The config key holding the monotonic trust-clock floor, in unix
@@ -67,6 +69,23 @@ impl Store {
             .config(CLOCK_FLOOR_KEY)?
             .and_then(|text| text.parse::<i64>().ok())
             .unwrap_or(0))
+    }
+
+    /// The reading a caller should date a decision by: the clock, floored.
+    ///
+    /// The same value [`Store::read_instant`] returns, and the reason it exists
+    /// twice is that a decision taken *inside* a transaction must be dated by
+    /// what that transaction can see.
+    pub fn read_instant_on(conn: &rusqlite::Connection) -> Result<i64> {
+        let floor: Option<String> = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                rusqlite::params![CLOCK_FLOOR_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let floor = floor.and_then(|text| text.parse::<i64>().ok()).unwrap_or(0);
+        Ok(synch_core::now_ns().max(floor))
     }
 
     /// Records `reading` as the floor when it is trustworthy and higher, and
