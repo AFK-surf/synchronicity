@@ -29,6 +29,7 @@ hickory-resolver.workspace = true
 iroh.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 rustls.workspace = true
+rustls-platform-verifier.workspace = true
 iroh-base.workspace = true
 iroh-mainline-address-lookup.workspace = true
 n0-mainline.workspace = true
