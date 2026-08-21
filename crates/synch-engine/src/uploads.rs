@@ -391,14 +391,19 @@ impl Node {
             let (node, space_owned, path_owned) =
                 (self.clone(), space.to_string(), path.to_string());
             // Re-taken here and not only at initiate. An upload may have been
-            // open for days, and the rules can have changed under it — the same
-            // reason the recovery gate is re-taken at completion rather than
-            // trusted from when the upload opened. Without it, the one write
-            // path into a space that `refuse_if_ignored` did not reach would
-            // assemble the object into the indexed directory, publish nothing
-            // (the scan skips it), and answer the client `Ok`.
+            // open for days, and the rules can have changed under it. Without
+            // it, the one write path into a space that `refuse_if_ignored` did
+            // not reach would assemble the object into the indexed directory,
+            // publish nothing (the scan skips it), and answer the client `Ok`.
+            //
+            // Publishability with it, for the reason every other adoption gates
+            // itself rather than trusting its caller: the control handler does
+            // check, but the completion is deliberately spawned detached, so an
+            // inbound `Hello` can floor this node between that check and this
+            // write — and an embedder calling `complete_upload` directly has no
+            // check at all. The rename below destroys what it lands on.
             crate::blocking::offload(move || {
-                node.refuse_if_ignored(&space_owned, &path_owned)?;
+                node.ensure_adoptable(&space_owned, &path_owned)?;
                 node.adoption_target(&space_owned, &path_owned)
             })
             .await?

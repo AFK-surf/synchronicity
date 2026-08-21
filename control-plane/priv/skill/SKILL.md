@@ -381,6 +381,11 @@ A fill does not publish: the files land where the scanner will find them, and
 they carry the mtime and mode the origin published, so the next scan republishes
 the version that was filled rather than a newer one.
 
+A node in key-loss recovery refuses to fill — a scan would refuse there too, so
+everything filled would sit unannounced. Run `synch recover` first, then fill,
+then scan. `synch take` refuses there for the same reason, before it touches
+the file rather than after.
+
 A **pin** keeps content regardless of retention. It names an object root, or a
 path — in which case the reading policy supplies the root. Pinning content this
 node has never read fetches it first.

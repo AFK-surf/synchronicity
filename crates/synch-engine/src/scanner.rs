@@ -734,9 +734,23 @@ impl Node {
         path: &str,
     ) -> Result<PathBuf> {
         let policy = synch_store::VersionPolicy::Origin(origin.clone());
+        // Above the detached branch, not inside the other one. A detached
+        // adoption writes no local file, but it crosses the network, promotes
+        // the object to the backend's durable tier — a real, billable write on
+        // a cloud CAS — and stages an `f:`/`b:` pair that a node in recovery
+        // cannot publish: the buffer then re-fails on every quiesce tick and is
+        // lost outright, durable blob orphaned, if the daemon restarts first.
+        // The operator is told the adoption happened either way.
+        //
+        // `adopt_deletion` and `open_adoption` both gate above their own
+        // detached branches; this is the same place.
         let detached = {
-            let (node, space_id) = (self.clone(), space_id.to_string());
-            crate::blocking::offload(move || node.is_detached_space(&space_id)).await?
+            let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
+            crate::blocking::offload(move || {
+                node.ensure_adoptable(&space_id, &path)?;
+                node.is_detached_space(&space_id)
+            })
+            .await?
         };
         if detached {
             // `prepare_range` fetches and verifies the complete selected
@@ -760,11 +774,7 @@ impl Node {
         // path (§10).
         let target = {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || {
-                node.ensure_adoptable(&space_id, &path)?;
-                node.adoption_target(&space_id, &path)
-            })
-            .await?
+            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
         };
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
         self.materialize_blob(&range.root, range.size, target.clone())

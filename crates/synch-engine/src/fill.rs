@@ -694,8 +694,10 @@ fn decide(
     // nothing" from "everything under it was already here or was passed over".
     report.considered = listing.len();
     // Detected before anything is written, the way a mirror pass does it: the
-    // first claimant of a folded name wins and the rest are reported.
+    // first claimant of a folded name wins and the rest are reported — but only
+    // where this space's filesystem actually folds them.
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let folds = folds_case(root_dir);
 
     for set in listing {
         // A mirror refuses these names on every platform, so that one mirror of
@@ -802,21 +804,24 @@ fn decide(
         }
 
         // Two published paths that fold onto one local name — `Link` and
-        // `link` on a case-insensitive filesystem — are not both materializable
-        // here. The first claimant wins and the rest are reported, exactly as a
-        // mirror does it: without the claim, `--force` would write one over the
-        // other and call both of them filled.
-        let folded = fold(&set.path);
-        match claimed.get(&folded) {
-            Some(winner) if winner != &set.path => {
-                report.skipped.push((
-                    set.path.clone(),
-                    format!("collides with {winner} under filesystem name folding"),
-                ));
-                continue;
-            }
-            _ => {
-                claimed.insert(folded, set.path.clone());
+        // `link` — are not both materializable where the filesystem folds them.
+        // The first claimant wins and the rest are reported, exactly as a mirror
+        // does it: without the claim, `--force` would write one over the other
+        // and call both of them filled. Where the filesystem does *not* fold,
+        // there is no collision to report and both are written.
+        if folds {
+            let folded = fold(&set.path);
+            match claimed.get(&folded) {
+                Some(winner) if winner != &set.path => {
+                    report.skipped.push((
+                        set.path.clone(),
+                        format!("collides with {winner} under filesystem name folding"),
+                    ));
+                    continue;
+                }
+                _ => {
+                    claimed.insert(folded, set.path.clone());
+                }
             }
         }
 
@@ -964,6 +969,45 @@ fn indexed_content(
         && known.file_id == crate::scanner::file_identity(stat)
         && known.scanned_at.saturating_sub(known.mtime_ns) >= crate::scanner::RACY_WINDOW_NS;
     fresh.then_some(known.content).flatten()
+}
+
+/// Whether this space's filesystem folds two names that differ only in case
+/// onto one file.
+///
+/// A mirror applies the fold rule everywhere, so that one tree is one directory
+/// on every OS. A fill has the opposite obligation — it writes into *this*
+/// machine's directory, where this machine's own scanner published half these
+/// paths — and on a case-sensitive filesystem `Makefile` and `makefile` are two
+/// real files that this node itself publishes. Refusing one of them would
+/// report a permanent collision about two files that are both sitting there,
+/// and would leave the loser unrestorable after a lost checkout.
+///
+/// Compile-time is the wrong answer: macOS is unix and folds, Linux does not,
+/// and a single machine can mount both kinds. So it is asked of the root
+/// itself, once per fill — one create, one stat, one unlink.
+///
+/// The probe wears a `.synch-part` suffix, which the built-in ignore rules
+/// already cover, so a crash between the create and the unlink leaves nothing
+/// a scan would pick up. Anything unreadable answers "folds", which is the
+/// conservative direction: it keeps the collision guard rather than dropping
+/// it.
+fn folds_case(root: &Path) -> bool {
+    let upper = root.join(format!(
+        ".synch-case-A{}{}",
+        std::process::id(),
+        crate::scanner::PART_SUFFIX
+    ));
+    let lower = root.join(format!(
+        ".synch-case-a{}{}",
+        std::process::id(),
+        crate::scanner::PART_SUFFIX
+    ));
+    if std::fs::write(&upper, b"").is_err() {
+        return true;
+    }
+    let folds = lower.symlink_metadata().is_ok();
+    let _ = std::fs::remove_file(&upper);
+    folds
 }
 
 /// Why the space root cannot be written into right now, or `None`.
@@ -1425,18 +1469,14 @@ mod tests {
     }
 
     /// A symlink is a version like any other: written where nothing stands,
-    /// reported where something else does. A fold collision is reported rather
-    /// than resolved by whichever path happens to be written second.
+    /// reported where something else does.
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinks_and_folded_names_are_written_or_reported_but_never_clobbered() {
+    async fn a_symlink_is_written_where_nothing_stands_and_reported_where_something_does() {
         let (_data, space, node) = node_with_space().await;
         publish_link(&node, &peer(), "link", "target.txt");
         publish_link(&node, &peer(), "taken", "elsewhere.txt");
         std::fs::write(space.path().join("taken"), b"a real file").unwrap();
-        // Two published paths, one local name on a case-insensitive filesystem.
-        publish(&node, &peer(), "Fold.txt", b"upper", STAMP);
-        publish(&node, &peer(), "fold.txt", b"lower", STAMP);
 
         let report = node
             .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
@@ -1457,12 +1497,7 @@ mod tests {
             std::fs::read(space.path().join("taken")).unwrap(),
             b"a real file"
         );
-        assert_eq!(
-            report.skipped.len(),
-            1,
-            "one of the folded pair is refused: {report:?}"
-        );
-        assert!(report.skipped[0].1.contains("folding"), "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
@@ -1522,7 +1557,8 @@ mod tests {
         assert_eq!(
             report.appeared,
             vec!["late.txt".to_string()],
-            "reported as appeared, not differing: nothing had looked at this              file, so `--force` neither caused it nor resolves it"
+            "reported as appeared, not differing: this is no longer the file the fill was \
+             shown, so `--force` neither caused it nor resolves it"
         );
         assert!(report.differing.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
@@ -1675,10 +1711,11 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The fold-collision rule, named both ways: which path wins, and that the
-    /// winner's bytes are what is on disk.
+    /// The fold-collision rule follows the filesystem, not the platform: where
+    /// two cased names are two files, both are written; where they are one
+    /// file, the first claimant wins by name and the loser is reported.
     #[tokio::test]
-    async fn the_first_claimant_of_a_folded_name_wins() {
+    async fn a_folded_name_collides_only_where_the_filesystem_folds() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "Fold.txt", b"upper", STAMP);
         publish(&node, &peer(), "fold.txt", b"lower", STAMP);
@@ -1687,15 +1724,39 @@ mod tests {
             .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
-        assert_eq!(report.skipped.len(), 1, "{report:?}");
-        // The listing is ordered, so the first claimant is the lexicographically
-        // first path — the same winner a mirror picks (§7.2).
-        assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
-        assert!(report.skipped[0].1.contains("collides with Fold.txt"));
+        // Ask the filesystem the same question the fill asked it.
+        let probe = space.path().join("CaseProbe");
+        std::fs::write(&probe, b"").unwrap();
+        let folds = space.path().join("caseprobe").symlink_metadata().is_ok();
+        std::fs::remove_file(&probe).unwrap();
+
+        if folds {
+            assert_eq!(report.filled, 1, "{report:?}");
+            assert_eq!(report.skipped.len(), 1, "{report:?}");
+            // The listing is ordered, so the first claimant is the
+            // lexicographically first path — the winner a mirror picks (§7.2).
+            assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
+            assert!(report.skipped[0].1.contains("collides with Fold.txt"));
+        } else {
+            assert_eq!(report.filled, 2, "both are real files here: {report:?}");
+            assert!(report.skipped.is_empty(), "{report:?}");
+            assert_eq!(
+                std::fs::read(space.path().join("fold.txt")).unwrap(),
+                b"lower"
+            );
+        }
         assert_eq!(
             std::fs::read(space.path().join("Fold.txt")).unwrap(),
             b"upper"
+        );
+        // Whatever the filesystem does, the probe leaves nothing behind.
+        assert!(
+            !std::fs::read_dir(space.path()).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("synch-case")),
+            "the case probe must clean up after itself"
         );
         node.shutdown().await.unwrap();
     }
