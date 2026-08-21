@@ -2219,7 +2219,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 },
                 report.filled,
                 report.current,
-                report.differing.len(),
+                report.differing.len() + report.appeared.len(),
                 report.skipped.len()
             );
             if !report.replaced.is_empty() {
@@ -2268,6 +2268,16 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ))
                 .await?;
             }
+            // Kept apart from `differing` because the advice is the opposite:
+            // these are paths nothing had looked at when the fill planned them,
+            // so `--force` neither caused this nor resolves it.
+            for path in &report.appeared {
+                out.line(format!(
+                    "appeared {}/{path} (written here while the fill ran; left alone)",
+                    reference.space
+                ))
+                .await?;
+            }
             for (path, reason) in &report.skipped {
                 out.line(format!("skipped {}/{path}: {reason}", reference.space))
                     .await?;
@@ -2276,11 +2286,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // reports exactly what an already-full directory reports. `status`
             // refuses to let a named path that matches nothing pass as silence;
             // a fill that writes nothing because of a typo is the same trap.
-            if !reference.is_space_root()
-                && report.filled + report.current == 0
-                && report.differing.is_empty()
-                && report.skipped.is_empty()
-            {
+            if !reference.is_space_root() && report.considered == 0 {
                 out.line(format!(
                     "note: no path in {} starts with {}",
                     reference.space,

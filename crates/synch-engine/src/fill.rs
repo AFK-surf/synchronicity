@@ -33,6 +33,7 @@ use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
+    ignore::{IgnoreSet, IGNORE_FILE},
     mirror::{apply_metadata, escapes_via_symlink, fold, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
@@ -67,6 +68,11 @@ pub struct FillReport {
     /// Paths whose local copy differs from the selected version and was left
     /// alone. `--force`, or `synch take` per path, is what ends the standoff.
     pub differing: Vec<String>,
+    /// Paths that were empty when this fill planned them and were not by the
+    /// time it came to write. Refused whatever the flags say — `--force` means
+    /// "replace what I have looked at", and nobody has looked at these — so
+    /// they are kept apart from `differing`, which `--force` does resolve.
+    pub appeared: Vec<String>,
     /// Paths a fill could not write, with the reason — including every path a
     /// `strict` fill refused to guess at.
     pub skipped: Vec<(String, String)>,
@@ -80,6 +86,12 @@ pub struct FillReport {
     pub reflinked: usize,
     /// Whether this report describes a run that wrote nothing on purpose.
     pub dry_run: bool,
+    /// How many paths the unified tree carried under the prefix that was
+    /// filled, whatever became of them. Zero means the prefix names nothing —
+    /// which a caller cannot infer from the counters, since a path the policy
+    /// selects nothing for and a tombstoned one are both passed over in
+    /// silence.
+    pub considered: usize,
 }
 
 impl Node {
@@ -102,7 +114,7 @@ impl Node {
         // space's, so sharing it costs nothing but the wait.
         let _pass = self.lock_materialization().await;
         let plan = self.plan_fill(space_id, prefix, policy, options).await?;
-        self.write_fill(plan, options).await
+        self.write_fill(plan).await
     }
 
     /// Everything a fill can settle before the network: which paths need
@@ -139,6 +151,27 @@ impl Node {
                          `synch mirror add {space_id} <dir>` materializes one"
                     ))
                 })?;
+                // The guard `scan_space` takes, for the same reason and the
+                // opposite failure. A vanished root — an unmounted drive, a
+                // renamed mount — must not read to the scanner as "every file
+                // deleted", and must not read to a fill as "every file
+                // missing": nothing would stop it recreating the mount point on
+                // the underlying filesystem and materializing the whole tree
+                // into it, filling the system disk with a copy that the next
+                // scan refuses to publish and the returning drive hides.
+                match std::fs::metadata(&local_path) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => {
+                        return Err(EngineError::invalid(format!(
+                            "space {space_id} root {local_path} is not a directory"
+                        )))
+                    }
+                    Err(e) => {
+                        return Err(EngineError::invalid(format!(
+                            "space {space_id} root {local_path} is unavailable: {e}"
+                        )))
+                    }
+                }
                 Ok(PathBuf::from(local_path))
             })
             .await?
@@ -152,37 +185,94 @@ impl Node {
         let (space, prefix) = (space_id.to_string(), prefix.to_string());
         let policy = policy.clone();
         crate::blocking::offload(move || {
+            // A fill writes into an *indexed* directory, so it is bound by the
+            // rules that indexing applies. Writing a path this space ignores
+            // would put a file where the scanner will never look: never
+            // published, never swept — it is in neither `local_files` nor the
+            // published tree — and reported `current` by every fill after it.
+            // A mirror needs none of this because nothing indexes what it
+            // writes.
+            let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
-            let (report, wanted) = decide(&node, &space, &root_dir, &listing, &policy, options)?;
+            let (report, wanted, links) = decide(
+                &node, &space, &root_dir, &listing, &policy, &ignore, options,
+            )?;
             Ok(FillPlan {
                 space,
                 root_dir,
+                options,
                 report,
                 wanted,
+                links,
             })
         })
         .await
     }
 
     /// Fetches and writes what the plan decided it must, and reports.
-    async fn write_fill(&self, plan: FillPlan, options: FillOptions) -> Result<FillReport> {
+    async fn write_fill(&self, plan: FillPlan) -> Result<FillReport> {
         let FillPlan {
             space: space_id,
             root_dir,
+            options,
             mut report,
             wanted,
+            links,
         } = plan;
         if options.dry_run {
             // The plan *is* the answer: everything it decided is already in the
-            // report, and `wanted` is what a real run would go and fetch.
-            report.filled += wanted.len();
+            // report, and these two are what a real run would go and write.
+            report.filled += wanted.len() + links.len();
+            report.replaced.extend(
+                links
+                    .iter()
+                    .filter(|l| l.replacing)
+                    .map(|l| l.path.clone())
+                    .chain(
+                        wanted
+                            .iter()
+                            .filter(|w| w.replacing)
+                            .map(|w| w.path.clone()),
+                    ),
+            );
             return Ok(report);
+        }
+
+        // Links first, and cheaply: they need no fetch, so nothing is gained by
+        // interleaving them with objects that do.
+        for link in links {
+            let PendingLink {
+                path,
+                target,
+                link_target,
+                replacing,
+            } = link;
+            let (root, guarded) = (root_dir.clone(), path.clone());
+            let outcome = crate::blocking::offload(move || {
+                if escapes_via_symlink(&root, &guarded) {
+                    return Ok(Err(
+                        "path resolves through a symlink; refusing to write outside \
+                                   the space"
+                            .to_string(),
+                    ));
+                }
+                Ok(materialize_symlink(&target, Some(&link_target)).map(|_| ()))
+            })
+            .await?;
+            match outcome {
+                Ok(()) => {
+                    report.filled += 1;
+                    if replacing {
+                        report.replaced.push(path);
+                    }
+                }
+                Err(reason) => report.skipped.push((path, reason)),
+            }
         }
 
         // Phase 2: fetch what phase 1 could not satisfy locally — building each
         // object out of a donor where the descent can — and write it as it
         // lands.
-        let mut reindex: Vec<String> = Vec::new();
         for want in wanted {
             let Wanted {
                 path,
@@ -213,8 +303,6 @@ impl Node {
                     .push((path, "no provider could serve the content".into()));
                 continue;
             }
-            report.fetched_bytes += crate::mirror::bytes_of(&fetched.fetched, size);
-            report.reused_bytes += crate::mirror::bytes_of(&fetched.promoted, size);
 
             // Both guards are re-taken here, in the same blocking step as the
             // write they protect, because a fetch stands between the plan and
@@ -241,12 +329,18 @@ impl Node {
                 Ok(match std::fs::symlink_metadata(&stat_target) {
                     // Planned as a replacement, and something is still there:
                     // `--force` was given for exactly this.
-                    Ok(_) if replacing => Ready::Write,
+                    Ok(_) if replacing => Ready::Write { over: true },
                     Ok(_) => Ready::Appeared,
-                    Err(_) => Ready::Write,
+                    // Nothing here now — including the case where this path was
+                    // planned as a replacement and the file has since been
+                    // deleted by someone else. Writing is right either way; what
+                    // changes is that `replaced` must not claim a file this fill
+                    // did not overwrite.
+                    Err(_) => Ready::Write { over: false },
                 })
             })
             .await?;
+            let over = matches!(ready, Ready::Write { over: true });
             let outcome = if let Ready::Escaped = ready {
                 Written::Escaped
             } else if let Ready::Appeared = ready {
@@ -262,11 +356,35 @@ impl Node {
                         // reported rather than allowed to fail the pass. Not
                         // cosmetic here: the stamped mtime is the one the next
                         // scan publishes.
+                        let (node, space, relpath) = (self.clone(), space_id.clone(), path.clone());
                         crate::blocking::offload(move || {
-                            Ok(match apply_metadata(&target, meta) {
+                            let written = match apply_metadata(&target, meta) {
                                 Ok(()) => Written::Fully(kind),
                                 Err(e) => Written::WithoutMetadata(kind, e.to_string()),
-                            })
+                            };
+                            // The scanner skips a file whose `(size, mtime_ns,
+                            // file_id)` still matches its `local_files` row, and
+                            // this path's row describes bytes that are gone.
+                            // Dropping it makes the next scan re-hash.
+                            //
+                            // It matters most where `file_identity` is `None` —
+                            // every non-unix platform — because there the
+                            // comparison is only `(size, mtime)`, and a fill
+                            // stamps the selected version's mtime. A version
+                            // tying this node's own published one on both (the
+                            // tie `newest` breaks on content root) would leave
+                            // the scan calling a filled path unchanged and never
+                            // publishing it: the disk holding the peer's bytes
+                            // while this node went on publishing its own. §7.2
+                            // rests on that publish happening.
+                            //
+                            // Per path rather than batched at the end: a fill of
+                            // a large space runs for minutes, and a client that
+                            // hangs up drops this future at an await. A batch
+                            // deferred to the end is a batch a Ctrl-C loses,
+                            // which is exactly how the drift above gets in.
+                            node.store().remove_local_file(&space, &relpath)?;
+                            Ok(written)
                         })
                         .await?
                     }
@@ -276,13 +394,14 @@ impl Node {
                 Written::Fully(kind) | Written::WithoutMetadata(kind, _) => {
                     report.filled += 1;
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
-                    if replacing {
+                    // Counted here rather than at the fetch, so the pair
+                    // describes the bytes behind the files this fill wrote
+                    // rather than including work the guards then turned away.
+                    report.fetched_bytes += crate::mirror::bytes_of(&fetched.fetched, size);
+                    report.reused_bytes += crate::mirror::bytes_of(&fetched.promoted, size);
+                    if over {
                         report.replaced.push(path.clone());
                     }
-                    // The scanner's record for this path describes the file
-                    // that *was* here, and a fill just replaced it. The rows go
-                    // below, in one step.
-                    reindex.push(path.clone());
                     if let Written::WithoutMetadata(_, why) = outcome {
                         report.skipped.push((
                             path,
@@ -297,39 +416,13 @@ impl Node {
                     path,
                     "path resolves through a symlink; refusing to write outside the space".into(),
                 )),
-                Written::Appeared => report.differing.push(path),
+                Written::Appeared => report.appeared.push(path),
                 Written::Failed(why) => report
                     .skipped
                     .push((path, format!("content could not be written: {why}"))),
             }
         }
 
-        // The scanner skips a file whose `(size, mtime_ns, file_id)` still
-        // matches its `local_files` row, and a fill has just written bytes
-        // those rows do not describe. Dropping them makes the next scan re-hash
-        // every path this fill wrote.
-        //
-        // It matters most where `file_identity` is `None` — every non-unix
-        // platform — because there the comparison is only `(size, mtime)`, and
-        // a fill stamps the *selected version's* mtime. A selected version that
-        // ties this node's own published one on size and mtime (the tie
-        // `newest` breaks on content root) would leave the scan calling the
-        // filled path unchanged and never publishing it: the disk would hold
-        // the peer's bytes while this node went on publishing its own. §7.2
-        // rests on that publish happening.
-        //
-        // One blocking step for all of them rather than one acquisition of the
-        // store's connection per file (§10).
-        if !reindex.is_empty() {
-            let (node, space) = (self.clone(), space_id.to_string());
-            crate::blocking::offload(move || {
-                for path in reindex {
-                    node.store().remove_local_file(&space, &path)?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
         Ok(report)
     }
 }
@@ -348,9 +441,21 @@ impl Node {
             .expect("the plan half should succeed")
     }
 
+    /// The same, under options other than the default.
+    pub(crate) async fn fill_plan_with_options_for_test(
+        &self,
+        space_id: &str,
+        policy: &VersionPolicy,
+        options: FillOptions,
+    ) -> FillPlan {
+        self.plan_fill(space_id, "", policy, options)
+            .await
+            .expect("the plan half should succeed")
+    }
+
     /// The write half alone, against a plan taken earlier.
     pub(crate) async fn finish_fill_for_test(&self, plan: FillPlan) -> Result<FillReport> {
-        self.write_fill(plan, FillOptions::default()).await
+        self.write_fill(plan).await
     }
 }
 
@@ -377,8 +482,9 @@ struct Wanted {
 /// What the guards taken immediately before a write decided.
 #[derive(Debug)]
 enum Ready {
-    /// Write it.
-    Write,
+    /// Write it. `over` is whether something is actually there to be replaced,
+    /// which the plan can only guess at and this stat knows.
+    Write { over: bool },
     /// An ancestor is a symlink: the write would land outside the space.
     Escaped,
     /// Nothing was here when this path was planned and something is here now.
@@ -408,23 +514,45 @@ pub(crate) struct FillPlan {
     space: String,
     /// Its configured directory.
     root_dir: PathBuf,
+    /// The options both halves branch on. Carried rather than passed again, so
+    /// a plan cannot be written under options it was not decided under.
+    options: FillOptions,
     /// Everything already decided.
     report: FillReport,
     /// What is left for the network half to fetch.
     wanted: Vec<Wanted>,
+    /// Symbolic links, which need no fetch — but are written by the same half
+    /// as everything else, so that deciding stays free of side effects and a
+    /// dry run is a dry run all the way down.
+    links: Vec<PendingLink>,
+}
+
+/// A symbolic link the plan decided to write.
+#[derive(Debug)]
+struct PendingLink {
+    /// The path within the space, for the report.
+    path: String,
+    /// Where it goes on disk.
+    target: PathBuf,
+    /// What the link should point at.
+    link_target: String,
+    /// Whether something is being replaced, which only `--force` reaches.
+    replacing: bool,
 }
 
 /// Decides, and performs, everything a fill can settle without the network.
 ///
 /// Blocking from end to end: [`Node::plan_fill`] runs it on the blocking pool.
+#[allow(clippy::too_many_arguments)]
 fn decide(
     node: &Node,
     space_id: &str,
     root_dir: &Path,
     listing: &[VersionSet],
     policy: &VersionPolicy,
+    ignore: &IgnoreSet,
     options: FillOptions,
-) -> Result<(FillReport, Vec<Wanted>)> {
+) -> Result<(FillReport, Vec<Wanted>, Vec<PendingLink>)> {
     // One clock reading for the pass, and the store's rather than the bare
     // clock, so every path selects against the same instant (`plan_pass`,
     // mirror.rs).
@@ -434,6 +562,10 @@ fn decide(
         ..FillReport::default()
     };
     let mut wanted: Vec<Wanted> = Vec::new();
+    let mut links: Vec<PendingLink> = Vec::new();
+    // What the listing carried, so the caller can tell "this prefix names
+    // nothing" from "everything under it was already here or was passed over".
+    report.considered = listing.len();
     // Detected before anything is written, the way a mirror pass does it: the
     // first claimant of a folded name wins and the rest are reported.
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -465,6 +597,24 @@ fn decide(
                 continue;
             }
         };
+
+        // Whatever this space excludes, a fill does not write.
+        //
+        // Every ancestor is asked as a directory and the leaf as a file, which
+        // is what the scanner's walk gets for free by descending: a `raw/` rule
+        // excludes the directory entry, and the walk simply never reaches what
+        // is under it. A fill has whole paths and no descent, so it has to ask
+        // the same questions in the same order.
+        if is_ignored_at_any_depth(ignore, &set.path) {
+            report.skipped.push((
+                set.path.clone(),
+                format!(
+                    "{} excludes this path, so a scan would never publish it",
+                    IGNORE_FILE
+                ),
+            ));
+            continue;
+        }
 
         let selected = match set.select(policy, now) {
             synch_store::Selection::Selected(entry) => *entry,
@@ -536,26 +686,27 @@ fn decide(
             } else if on_disk.is_some() && !options.force {
                 report.differing.push(set.path.clone());
             } else if let Some(reason) = symlink_refusal(wanted_target) {
-                // Asked before the dry-run branch, not after: a dry run that
-                // counted a link this platform cannot create — every non-unix
-                // one — would promise a fill the real run then reports as a
-                // skip, which is the one thing a dry run must not do.
+                // Asked here rather than at the write, so a dry run cannot
+                // promise a link this platform will refuse — on every non-unix
+                // one, that is all of them.
                 report.skipped.push((set.path.clone(), reason));
-            } else if options.dry_run {
-                report.filled += 1;
-                if on_disk.is_some() {
-                    report.replaced.push(set.path.clone());
-                }
+            } else if on_disk.is_some() && selected.origin == *node.origin() {
+                // The same refusal the regular-file branch makes, for the same
+                // reason: `--force` adopts a peer's version, and this version is
+                // ours. A link retargeted since the last scan is an unpublished
+                // edit, and recreating the published target would restore what
+                // we already publish — so the next scan would stage nothing and
+                // the retarget would vanish without a trace.
+                report
+                    .skipped
+                    .push((set.path.clone(), OWN_VERSION_DIFFERS.into()));
             } else {
-                match materialize_symlink(&target, wanted_target) {
-                    Ok(_) => {
-                        report.filled += 1;
-                        if on_disk.is_some() {
-                            report.replaced.push(set.path.clone());
-                        }
-                    }
-                    Err(reason) => report.skipped.push((set.path.clone(), reason)),
-                }
+                links.push(PendingLink {
+                    path: set.path.clone(),
+                    target,
+                    link_target: wanted_target.unwrap_or_default().to_string(),
+                    replacing: on_disk.is_some(),
+                });
             }
             continue;
         }
@@ -593,13 +744,9 @@ fn decide(
                     // version, no `prev`, and no trace anywhere in the cluster.
                     // `--force` means "take theirs"; there is no theirs here.
                     if selected.origin == *node.origin() {
-                        report.skipped.push((
-                            set.path.clone(),
-                            "the selected version is this node's own, and the file here differs \
-                             from it: that is an edit no scan has published yet, not a version to \
-                             adopt. Run `synch scan` to publish it"
-                                .into(),
-                        ));
+                        report
+                            .skipped
+                            .push((set.path.clone(), OWN_VERSION_DIFFERS.into()));
                         continue;
                     }
                 }
@@ -643,17 +790,7 @@ fn decide(
         });
     }
 
-    // Under `--force` the plan already knows what it would overwrite, and a
-    // dry run has to report it without ever reaching the write.
-    if options.dry_run {
-        report.replaced.extend(
-            wanted
-                .iter()
-                .filter(|w| w.replacing)
-                .map(|w| w.path.clone()),
-        );
-    }
-    Ok((report, wanted))
+    Ok((report, wanted, links))
 }
 
 /// The content root the scanner recorded for a path, when the stat on disk
@@ -679,6 +816,39 @@ fn indexed_content(
         && known.scanned_at.saturating_sub(known.mtime_ns) >= crate::scanner::RACY_WINDOW_NS;
     fresh.then_some(known.content).flatten()
 }
+
+/// Whether a space's ignore rules exclude a path, or any directory above it.
+///
+/// [`IgnoreSet::is_ignored`] answers about one entry, because the scanner asks
+/// it about one entry at a time as it walks. A fill holds the whole path, so
+/// the walk's descent has to be replayed against it: `raw/photo.raw` is
+/// excluded by a `raw/` rule that names only the directory.
+fn is_ignored_at_any_depth(ignore: &IgnoreSet, path: &str) -> bool {
+    let mut prefix = String::new();
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        // The last component is the file or link being materialized; every
+        // component before it is a directory the walk would have descended.
+        if ignore.is_ignored(&prefix, parts.peek().is_some()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Why `--force` declines a path whose selected version is this node's own.
+///
+/// There is nothing to adopt: the file on disk is an edit no scan has
+/// published, and writing the published version over it would restore content
+/// this node already publishes — so the next scan would stage nothing, and the
+/// edit would be gone with no version, no `prev`, and no trace in the cluster.
+const OWN_VERSION_DIFFERS: &str =
+    "the selected version is this node's own, and what is here differs from it: that is an edit \
+     no scan has published yet, not a version to adopt. Run `synch scan` to publish it";
 
 /// What is on disk where the selected version belongs.
 #[derive(Debug)]
@@ -1186,7 +1356,12 @@ mod tests {
             "the file written during the fill must survive it"
         );
         assert_eq!(report.filled, 0, "{report:?}");
-        assert_eq!(report.differing, vec!["late.txt".to_string()], "{report:?}");
+        assert_eq!(
+            report.appeared,
+            vec!["late.txt".to_string()],
+            "reported as appeared, not differing: nothing had looked at this              file, so `--force` neither caused it nor resolves it"
+        );
+        assert!(report.differing.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
@@ -1376,6 +1551,137 @@ mod tests {
             .to_string();
         assert!(refused.contains("detached"), "{refused}");
         assert!(refused.contains("synch mirror add cloud"), "{refused}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A space root that has gone — an unmounted drive, a renamed mount — is
+    /// refused rather than recreated. `scan_space` takes the same guard against
+    /// the opposite misreading, that every file was deleted.
+    #[tokio::test]
+    async fn a_vanished_space_root_is_refused_rather_than_recreated() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "f.txt", b"theirs", STAMP);
+        let root = space.path().to_path_buf();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let refused = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("unavailable"), "{refused}");
+        assert!(
+            !root.exists(),
+            "a fill must not recreate a mount point and write the tree into it"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A fill is bound by the rules that bind indexing: writing a path this
+    /// space ignores would put a file where the scanner never looks — never
+    /// published, never swept, and reported current by every fill after it.
+    #[tokio::test]
+    async fn a_fill_does_not_write_what_the_space_ignores() {
+        let (_data, space, node) = node_with_space().await;
+        std::fs::write(
+            space.path().join(".syncignore"),
+            "raw/
+",
+        )
+        .unwrap();
+        publish(&node, &peer(), "raw/photo.raw", b"theirs", STAMP);
+        publish(&node, &peer(), "keep.txt", b"theirs", STAMP);
+
+        let report = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.filled, 1, "{report:?}");
+        assert!(space.path().join("keep.txt").exists());
+        assert!(
+            !space.path().join("raw/photo.raw").exists(),
+            "an ignored path would never be published, so a fill does not write it"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(p, why)| p == "raw/photo.raw" && why.contains(".syncignore")),
+            "{report:?}"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// The own-origin refusal covers links as well as files: a link retargeted
+    /// since the last scan is an unpublished edit, not a version to adopt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_will_not_revert_an_unscanned_symlink_retarget() {
+        let (_data, space, node) = node_with_space().await;
+        let link = space.path().join("latest");
+        std::fs::write(space.path().join("v1"), b"one").unwrap();
+        std::fs::write(space.path().join("v2"), b"two").unwrap();
+        std::os::unix::fs::symlink("v1", &link).unwrap();
+        node.scan_publish_push().await.unwrap();
+        // Retargeted, and no scan since.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("v2", &link).unwrap();
+
+        let report = node
+            .fill_space(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: true,
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap().to_string_lossy(),
+            "v2",
+            "the retarget must survive: nothing would record its loss"
+        );
+        assert!(report.replaced.is_empty(), "{report:?}");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(p, why)| p == "latest" && why.contains("synch scan")),
+            "{report:?}"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// `--force` resolves `differing`, which is about files somebody looked at.
+    /// A file that arrived mid-fill was looked at by nobody, so it is refused
+    /// under `--force` too, and reported apart from the paths `--force` fixes.
+    #[tokio::test]
+    async fn a_file_that_appears_mid_fill_survives_force_too() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "late.txt", b"theirs", STAMP);
+
+        let plan = node
+            .fill_plan_with_options_for_test(
+                "media",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: true,
+                    dry_run: false,
+                },
+            )
+            .await;
+        std::fs::write(space.path().join("late.txt"), b"mine, just now").unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(space.path().join("late.txt")).unwrap(),
+            b"mine, just now"
+        );
+        assert_eq!(report.appeared, vec!["late.txt".to_string()], "{report:?}");
+        assert!(report.replaced.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 

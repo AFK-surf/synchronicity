@@ -1303,6 +1303,13 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   not publish either: the files land where the scanner will find them and the next
   scan (§7.1) publishes them as this node's own view.
 
+  A fill is bound by the rules that bind indexing, and by the same guard on the
+  space root: it writes nothing the space's `.syncignore` excludes — such a file
+  would sit where the scanner never looks, never published and never swept — and
+  it refuses a root that has gone, rather than recreating an unmounted drive's
+  mount point and materializing the tree onto the disk underneath (§7.1 takes
+  the same guard against the opposite misreading, that every file was deleted).
+
   Two refusals follow from writing into a directory somebody works in. A file
   that *appears* while the fill is fetching is never overwritten, `--force` or
   not: the plan's "nothing was here" has a shelf life, and materialization ends
@@ -1310,9 +1317,13 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   never replaced — "differs" would be a claim the failed read did not establish,
   and a rename needs no read permission to act on it. `--force` also declines
   the one case where there is nothing to adopt: when the selected version is
-  this node's own and the file differs from it, the disk holds an edit no scan
-  has published yet, and overwriting it would lose that edit leaving no version,
-  no `prev`, and no trace in the cluster.
+  this node's own and what is here differs from it — a file's bytes or a link's
+  target — the disk holds an edit no scan has published yet, and overwriting it
+  would lose that edit leaving no version, no `prev`, and no trace in the
+  cluster. A path that is *absent* locally is filled either way, including from
+  this node's own version: that is what makes a fill the way back from a lost
+  checkout, and it means a deletion made while the daemon was down is undone
+  rather than published — `synch scan` first if the deletion was meant.
 
   Which is why the metadata rule below is load-bearing here rather than cosmetic.
   The mtime a filled path is stamped with is the one the next scan publishes, so a
