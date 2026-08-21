@@ -1815,7 +1815,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(match release {
                     true => format!("{id} is no longer replicated; its content was released"),
                     false => format!(
-                        "{id} is no longer replicated; what it held stays pinned                          (`--release` drops it)"
+                        "{id} is no longer replicated; what it held stays pinned \
+                         (`--release` drops it)"
                     ),
                 })
                 .await?;
