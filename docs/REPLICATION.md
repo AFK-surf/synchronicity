@@ -809,9 +809,10 @@ and is unexplored (§12).
 
 Phases in dependency order. Each lands on its own and leaves the tree working.
 
-1. **Pin holders and leases.** `pins` table, migration v20, GC predicate becomes
-   `NOT EXISTS`, `pin ls`/`pin rm` report holders and pending releases. No new
-   behavior; everything after this depends on it.
+1. **Pin holders and leases.** `pins` table, GC predicate becomes `NOT EXISTS`,
+   `pin ls`/`pin rm` report holders and pending releases. No new behavior;
+   everything after this depends on it. (Landed in v21 with phase 3, since the
+   two are one migration.)
 2. **Read by root.** `synch cat --root`, `synch get --root`. Independent,
    useful immediately, and what makes a replica's contents reachable.
 3. **`spaces` gains three columns.** Migration v21, `FINAL_SCHEMA` follows.
@@ -835,6 +836,19 @@ Phases in dependency order. Each lands on its own and leaves the tree working.
    delegates, peer coverage in `space ls <id>`.
 9. **Under-replication brake**, then **cooperative k-replication** (§4.3) — the
    two that should wait for operational experience.
+
+Two things the build taught that the plan did not anticipate:
+
+- **The advertisement and its withdrawal must share a predicate.** Skipping only
+  the tombstone scan in `space rm`, as §3.2 originally proposed, would have left
+  a replicate-only space advertising an `m:space` record that the removal then
+  stranded in the trie. `publishes_into` gates both.
+- **Tests that enter a `BlockingScope` cannot see a §10 violation.** The fetch
+  loop read a donor's blob row on the runtime worker; every integration test
+  passed, because the house pattern for engine tests is to enter the scope at
+  the top and that suppresses the guard for the thread polling the future. A
+  real daemon aborted on the first supersede. Anything new on an async path
+  wants a run against a live daemon, not only a green suite.
 
 ## 12. Open questions
 

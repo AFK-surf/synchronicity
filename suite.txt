@@ -1,0 +1,5 @@
+   Compiling synch-store v0.1.1 (/home/user/synchronicity/crates/synch-store)
+   Compiling synch-net v0.1.1 (/home/user/synchronicity/crates/synch-net)
+   Compiling synch-engine v0.1.1 (/home/user/synchronicity/crates/synch-engine)
+   Compiling synch-cli v0.1.1 (/home/user/synchronicity/crates/synch-cli)
+   Compiling synch-monitor v0.1.1 (/home/user/synchronicity/crates/synch-monitor)
