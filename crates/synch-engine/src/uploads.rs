@@ -135,7 +135,7 @@ impl Node {
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
         if let Some(local_path) = space_row.local_path.as_deref() {
             if crate::ignore::IgnoreSet::for_space(Path::new(local_path))?
-                .is_ignored(&normalized, false)
+                .excludes_path(&normalized)
             {
                 return Err(EngineError::invalid(format!(
                     "{space}/{path} matches an ignore rule, so it could never be published"

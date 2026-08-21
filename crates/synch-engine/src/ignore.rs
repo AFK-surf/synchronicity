@@ -111,10 +111,38 @@ impl IgnoreSet {
         }
     }
 
-    /// True if `path` — a normalized, `/`-separated path relative to the space
-    /// root — should be skipped.
+    /// Whether a whole path is excluded — by a rule naming it, or by one
+    /// naming any directory above it.
     ///
-    /// Later rules win, which is what makes `!` un-ignore work.
+    /// [`IgnoreSet::is_ignored`] answers about one entry, because the scanner
+    /// asks it about one entry at a time as it walks and simply never descends
+    /// into a directory it excluded. Every other caller holds a whole path and
+    /// has to replay that descent: `raw/photo.raw` is excluded by a `raw/` rule
+    /// that names only the directory, and a caller asking about the leaf alone
+    /// hears "not excluded" and writes a file the scanner will never look at.
+    pub fn excludes_path(&self, path: &str) -> bool {
+        let mut prefix = String::new();
+        let mut parts = path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            // The last component is the file or link in question; every
+            // component before it is a directory the walk would have descended.
+            if self.is_ignored(&prefix, parts.peek().is_some()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if `path` — a normalized, `/`-separated path relative to the space
+    /// root — should be skipped, judged as the single entry it is.
+    ///
+    /// Later rules win, which is what makes `!` un-ignore work. A caller
+    /// holding a whole path rather than walking one wants
+    /// [`IgnoreSet::excludes_path`].
     pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for rule in &self.rules {

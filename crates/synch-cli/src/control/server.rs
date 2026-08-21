@@ -2203,7 +2203,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // says so; this is the other half, so a typo'd id does not report
             // "no local space" when the real answer is "no such space at all".
             ensure_known_space(node, &reference.space).await?;
-            if let Some(origin) = &reference.origin {
+            // The policy's origin, not the reference's: `--from nsa` and
+            // `nsa:media` are the same typo, and only one of them was being
+            // checked. A fill of an origin nobody has heard of selects nothing
+            // for every path, and `Absent` is silent by design — so the typo
+            // reported as a complete, clean fill of nothing.
+            if let VersionPolicy::Origin(origin) = &policy {
                 ensure_known_origin(node, origin).await?;
             }
             let options = synch_engine::FillOptions { force, dry_run };
@@ -2219,9 +2224,19 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 },
                 report.filled,
                 report.current,
-                report.differing.len() + report.appeared.len(),
+                report.differing.len(),
                 report.skipped.len()
             );
+            // Counted apart from `differing` rather than folded into it: under
+            // `--force` nothing can be differing, so a folded count of 3 would
+            // read as three paths `--force` is about to fix, when they are three
+            // it deliberately did not touch.
+            if !report.appeared.is_empty() {
+                summary.push_str(&format!(" · appeared {}", report.appeared.len()));
+            }
+            if report.ignored > 0 {
+                summary.push_str(&format!(" · ignored {}", report.ignored));
+            }
             if !report.replaced.is_empty() {
                 summary.push_str(&format!(
                     " · {} {}",

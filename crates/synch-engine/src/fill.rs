@@ -25,6 +25,13 @@
 //! orders on `(mtime, content root, origin)`, so a fill stamped with the wall
 //! clock would make this node win the selection for every path it touched,
 //! cluster-wide.
+//!
+//! A symbolic link is the exception, and cannot help being one: stamping a
+//! link's own times needs a facility the standard library does not expose
+//! (§7.2), so a filled link does publish as newer than the version it came
+//! from. The consequence is bounded — a link's target *is* its version, and the
+//! target is identical, so every node still converges on the same link — but
+//! the "restates rather than mints" rule above is a rule about files.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +40,7 @@ use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
-    ignore::{IgnoreSet, IGNORE_FILE},
+    ignore::IgnoreSet,
     mirror::{apply_metadata, escapes_via_symlink, fold, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
@@ -86,6 +93,10 @@ pub struct FillReport {
     pub reflinked: usize,
     /// Whether this report describes a run that wrote nothing on purpose.
     pub dry_run: bool,
+    /// Paths the space's ignore rules exclude, which a fill does not write
+    /// because a scan would never publish them. Counted, not named: one rule
+    /// like `node_modules/` covers arbitrarily many.
+    pub ignored: usize,
     /// How many paths the unified tree carried under the prefix that was
     /// filled, whatever became of them. Zero means the prefix names nothing —
     /// which a caller cannot infer from the counters, since a path the policy
@@ -247,25 +258,33 @@ impl Node {
                 link_target,
                 replacing,
             } = link;
+            // The same three guards the object loop takes below, and for the
+            // same reasons: `materialize_symlink` unlinks whatever stands at the
+            // target, so a link is exactly as capable of destroying a file that
+            // arrived since the plan as a rename is.
             let (root, guarded) = (root_dir.clone(), path.clone());
             let outcome = crate::blocking::offload(move || {
-                if escapes_via_symlink(&root, &guarded) {
-                    return Ok(Err(
-                        "path resolves through a symlink; refusing to write outside \
-                                   the space"
-                            .to_string(),
-                    ));
+                if let Some(reason) = root_is_gone(&root) {
+                    return Ok(Err(reason));
                 }
-                Ok(materialize_symlink(&target, Some(&link_target)).map(|_| ()))
+                if escapes_via_symlink(&root, &guarded) {
+                    return Ok(Err(ESCAPED.to_string()));
+                }
+                let over = target.symlink_metadata().is_ok();
+                if over && !replacing {
+                    return Ok(Err(APPEARED.to_string()));
+                }
+                Ok(materialize_symlink(&target, Some(&link_target)).map(|_| over))
             })
             .await?;
             match outcome {
-                Ok(()) => {
+                Ok(over) => {
                     report.filled += 1;
-                    if replacing {
+                    if over {
                         report.replaced.push(path);
                     }
                 }
+                Err(reason) if reason == APPEARED => report.appeared.push(path),
                 Err(reason) => report.skipped.push((path, reason)),
             }
         }
@@ -323,6 +342,9 @@ impl Node {
             let (root, guarded) = (root_dir.clone(), path.clone());
             let stat_target = target.clone();
             let ready = crate::blocking::offload(move || {
+                if let Some(reason) = root_is_gone(&root) {
+                    return Ok(Ready::RootGone(reason));
+                }
                 if escapes_via_symlink(&root, &guarded) {
                     return Ok(Ready::Escaped);
                 }
@@ -341,15 +363,20 @@ impl Node {
             })
             .await?;
             let over = matches!(ready, Ready::Write { over: true });
-            let outcome = if let Ready::Escaped = ready {
-                Written::Escaped
+            // `stale` rides along: dropping the scanner's row is bookkeeping
+            // done in the same blocking step as the stamp, and its failure is a
+            // report line rather than the end of the run.
+            let (outcome, stale) = if let Ready::RootGone(reason) = ready {
+                (Written::Failed(reason), None)
+            } else if let Ready::Escaped = ready {
+                (Written::Escaped, None)
             } else if let Ready::Appeared = ready {
-                Written::Appeared
+                (Written::Appeared, None)
             } else {
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched.
                 match self.materialize_blob(&content, size, target.clone()).await {
-                    Err(e) => Written::Failed(e.to_string()),
+                    Err(e) => (Written::Failed(e.to_string()), None),
                     Ok(kind) => {
                         // The bytes are the file; the metadata is stamped right
                         // after, and a filesystem that refuses the stamp is
@@ -383,8 +410,19 @@ impl Node {
                             // hangs up drops this future at an await. A batch
                             // deferred to the end is a batch a Ctrl-C loses,
                             // which is exactly how the drift above gets in.
-                            node.store().remove_local_file(&space, &relpath)?;
-                            Ok(written)
+                            //
+                            // Reported, never propagated: this is bookkeeping
+                            // that runs *after* the bytes and the stamp landed,
+                            // and a `?` here would throw away the account of
+                            // every file the fill had already written — the
+                            // failure round two removed from the fetch and the
+                            // donor lookup for the same reason.
+                            let stale = node
+                                .store()
+                                .remove_local_file(&space, &relpath)
+                                .err()
+                                .map(|e| e.to_string());
+                            Ok((written, stale))
                         })
                         .await?
                     }
@@ -402,6 +440,15 @@ impl Node {
                     if over {
                         report.replaced.push(path.clone());
                     }
+                    if let Some(why) = stale {
+                        report.skipped.push((
+                            path.clone(),
+                            format!(
+                                "written, but the scanner's record of the old file could not be \
+                                 dropped, so the next scan may not re-index it: {why}"
+                            ),
+                        ));
+                    }
                     if let Written::WithoutMetadata(_, why) = outcome {
                         report.skipped.push((
                             path,
@@ -412,10 +459,7 @@ impl Node {
                         ));
                     }
                 }
-                Written::Escaped => report.skipped.push((
-                    path,
-                    "path resolves through a symlink; refusing to write outside the space".into(),
-                )),
+                Written::Escaped => report.skipped.push((path, ESCAPED.into())),
                 Written::Appeared => report.appeared.push(path),
                 Written::Failed(why) => report
                     .skipped
@@ -485,6 +529,8 @@ enum Ready {
     /// Write it. `over` is whether something is actually there to be replaced,
     /// which the plan can only guess at and this stat knows.
     Write { over: bool },
+    /// The space's own directory has gone since the fill started.
+    RootGone(String),
     /// An ancestor is a symlink: the write would land outside the space.
     Escaped,
     /// Nothing was here when this path was planned and something is here now.
@@ -563,6 +609,10 @@ fn decide(
     };
     let mut wanted: Vec<Wanted> = Vec::new();
     let mut links: Vec<PendingLink> = Vec::new();
+    // Paths this pass will make into symbolic links, so that what they shadow
+    // is judged against the tree the fill is about to create rather than the
+    // one it started with.
+    let mut planned_links: Vec<String> = Vec::new();
     // What the listing carried, so the caller can tell "this prefix names
     // nothing" from "everything under it was already here or was passed over".
     report.considered = listing.len();
@@ -588,6 +638,25 @@ fn decide(
             report.skipped.push((set.path.clone(), reason));
             continue;
         }
+        // A link this same pass is about to write shadows everything beneath
+        // it. `target_within` cannot see that — the link is not on disk yet, so
+        // its escape check passes — and the write phase, which takes the guard
+        // again once the link *is* there, then refuses the path. Without this
+        // the plan promises what the write will not do, which under `--dry-run`
+        // is the one thing a plan must never do.
+        //
+        // The mirror gets this for free by materializing in listing order, so a
+        // link written for `sub` is on disk before `sub/passwd` is judged
+        // (mirror.rs). A fill decides everything before it writes anything, so
+        // it has to carry the knowledge instead of reading it off the disk. The
+        // listing is sorted, so a link at `sub` is always seen before `sub/…`.
+        if planned_links
+            .iter()
+            .any(|link| set.path.starts_with(&format!("{link}/")))
+        {
+            report.skipped.push((set.path.clone(), ESCAPED.to_string()));
+            continue;
+        }
         // The same guard `synch take` and the S3 gateway write through: a
         // published path only ever lands inside the space it belongs to.
         let target = match target_within(root_dir, space_id, &set.path) {
@@ -597,24 +666,6 @@ fn decide(
                 continue;
             }
         };
-
-        // Whatever this space excludes, a fill does not write.
-        //
-        // Every ancestor is asked as a directory and the leaf as a file, which
-        // is what the scanner's walk gets for free by descending: a `raw/` rule
-        // excludes the directory entry, and the walk simply never reaches what
-        // is under it. A fill has whole paths and no descent, so it has to ask
-        // the same questions in the same order.
-        if is_ignored_at_any_depth(ignore, &set.path) {
-            report.skipped.push((
-                set.path.clone(),
-                format!(
-                    "{} excludes this path, so a scan would never publish it",
-                    IGNORE_FILE
-                ),
-            ));
-            continue;
-        }
 
         let selected = match set.select(policy, now) {
             synch_store::Selection::Selected(entry) => *entry,
@@ -643,6 +694,22 @@ fn decide(
         // it will not do — `synch take` of that version is how a deletion is
         // adopted, deliberately and one path at a time (§8).
         if selected.kind == EntryKind::Tombstone || selected.kind == EntryKind::Dir {
+            continue;
+        }
+
+        // Whatever this space excludes, a fill does not write: such a file
+        // would sit where the scanner never looks — never published, never
+        // swept, and reported `current` by every fill after it.
+        //
+        // Counted rather than named, the way a scan counts them
+        // (`ScanReport::ignored`): a peer that published `node_modules/` before
+        // this space had a `.syncignore` would otherwise turn every fill into a
+        // hundred thousand lines of stdout. And asked here rather than at the
+        // top of the loop, so a path the policy passes over in silence — a
+        // tombstone, a version an `origin=` pin does not carry — stays silent
+        // rather than being reported as excluded.
+        if ignore.excludes_path(&set.path) {
+            report.ignored += 1;
             continue;
         }
 
@@ -701,6 +768,7 @@ fn decide(
                     .skipped
                     .push((set.path.clone(), OWN_VERSION_DIFFERS.into()));
             } else {
+                planned_links.push(set.path.clone());
                 links.push(PendingLink {
                     path: set.path.clone(),
                     target,
@@ -817,28 +885,32 @@ fn indexed_content(
     fresh.then_some(known.content).flatten()
 }
 
-/// Whether a space's ignore rules exclude a path, or any directory above it.
+/// Why the space root cannot be written into right now, or `None`.
 ///
-/// [`IgnoreSet::is_ignored`] answers about one entry, because the scanner asks
-/// it about one entry at a time as it walks. A fill holds the whole path, so
-/// the walk's descent has to be replayed against it: `raw/photo.raw` is
-/// excluded by a `raw/` rule that names only the directory.
-fn is_ignored_at_any_depth(ignore: &IgnoreSet, path: &str) -> bool {
-    let mut prefix = String::new();
-    let mut parts = path.split('/').peekable();
-    while let Some(part) = parts.next() {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(part);
-        // The last component is the file or link being materialized; every
-        // component before it is a directory the walk would have descended.
-        if ignore.is_ignored(&prefix, parts.peek().is_some()) {
-            return true;
-        }
+/// Taken again before every write, not just once in the plan. The plan's check
+/// is what stops a fill onto a root that was already gone; this is what stops
+/// one that is *unplugged halfway through* — a fill of a large tree runs for
+/// hours, and materialization does `create_dir_all` on the target's parent,
+/// which for a top-level path is the root itself. Without this, minute five of
+/// a fill onto an unmounted drive recreates the mount point and materializes
+/// the rest of the tree onto the disk underneath it.
+///
+/// One `stat` of a directory that is by now certainly in the page cache.
+fn root_is_gone(root: &Path) -> Option<String> {
+    match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => None,
+        Ok(_) => Some(format!("{} is no longer a directory", root.display())),
+        Err(e) => Some(format!("{} became unavailable: {e}", root.display())),
     }
-    false
 }
+
+/// The refusal reported for a path whose ancestors include a symlink.
+const ESCAPED: &str = "path resolves through a symlink; refusing to write outside the space";
+
+/// The marker the write guards use for a path that stopped being empty while
+/// the fill ran. Never shown to anyone: the caller turns it into a
+/// [`FillReport::appeared`] entry, which the CLI describes in its own words.
+const APPEARED: &str = "a file appeared here while the fill ran";
 
 /// Why `--force` declines a path whose selected version is this node's own.
 ///
@@ -1602,13 +1674,11 @@ mod tests {
             !space.path().join("raw/photo.raw").exists(),
             "an ignored path would never be published, so a fill does not write it"
         );
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|(p, why)| p == "raw/photo.raw" && why.contains(".syncignore")),
-            "{report:?}"
+        assert_eq!(
+            report.ignored, 1,
+            "counted, not named: one rule can cover a hundred thousand paths"
         );
+        assert!(report.skipped.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
@@ -1682,6 +1752,102 @@ mod tests {
         );
         assert_eq!(report.appeared, vec!["late.txt".to_string()], "{report:?}");
         assert!(report.replaced.is_empty(), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A link is as capable of destroying a file that arrived since the plan as
+    /// a rename is: `materialize_symlink` unlinks whatever stands at the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_that_appears_where_a_link_goes_is_not_unlinked() {
+        let (_data, space, node) = node_with_space().await;
+        publish_link(&node, &peer(), "latest", "v1");
+
+        let plan = node
+            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .await;
+        std::fs::write(space.path().join("latest"), b"mine, just now").unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(space.path().join("latest")).unwrap(),
+            b"mine, just now",
+            "a link must not unlink a file that appeared while the fill ran"
+        );
+        assert_eq!(report.appeared, vec!["latest".to_string()], "{report:?}");
+        assert_eq!(report.filled, 0, "{report:?}");
+        assert!(report.replaced.is_empty(), "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// What a dry run counts is what a real run does. The case that separates
+    /// them is a path under a link the same pass is about to write: the link is
+    /// not on disk when the path is judged, and it is by the time it is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dry_run_counts_what_the_real_run_writes() {
+        let (_data, space, node) = node_with_space().await;
+        let outside = tempfile::tempdir().unwrap();
+        publish_link(&node, &peer(), "sub", &outside.path().to_string_lossy());
+        publish(&node, &peer(), "sub/escaped.txt", b"not yours", STAMP);
+
+        let dry = node
+            .fill_space(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                FillOptions {
+                    force: false,
+                    dry_run: true,
+                },
+            )
+            .await
+            .unwrap();
+        let real = node
+            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dry.filled, real.filled,
+            "a dry run promised {} and the real run wrote {}: dry {dry:?} real {real:?}",
+            dry.filled, real.filled
+        );
+        assert_eq!(dry.skipped.len(), real.skipped.len(), "{dry:?} {real:?}");
+        assert!(
+            !outside.path().join("escaped.txt").exists(),
+            "and the path under the link is still refused"
+        );
+        assert!(space.path().join("sub").is_symlink());
+        node.shutdown().await.unwrap();
+    }
+
+    /// The root guard is taken per write, not once: a fill of a large tree runs
+    /// for hours, and an unplugged drive mid-run must not have its mount point
+    /// recreated and the rest of the tree written onto the disk underneath.
+    #[tokio::test]
+    async fn a_root_that_vanishes_mid_fill_stops_the_writes() {
+        let (_data, space, node) = node_with_space().await;
+        publish(&node, &peer(), "a.txt", b"one", STAMP);
+        publish(&node, &peer(), "b.txt", b"two", STAMP);
+
+        let plan = node
+            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .await;
+        let root = space.path().to_path_buf();
+        std::fs::remove_dir_all(&root).unwrap();
+        let report = node.finish_fill_for_test(plan).await.unwrap();
+
+        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 2, "{report:?}");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|(_, why)| why.contains("unavailable")),
+            "{report:?}"
+        );
+        assert!(!root.exists(), "the root must not be recreated mid-fill");
         node.shutdown().await.unwrap();
     }
 

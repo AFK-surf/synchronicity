@@ -1303,12 +1303,22 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   not publish either: the files land where the scanner will find them and the next
   scan (§7.1) publishes them as this node's own view.
 
+  A fill does not exclude the scanner: the two share no lock, and the fill's own
+  writes are what wake the watcher (§7.1), so a scan running during a fill is
+  the normal case rather than the exotic one. That is what the write-time guards
+  are written against, and why a filled path's `local_files` row is dropped as
+  the path is written rather than at the end.
+
   A fill is bound by the rules that bind indexing, and by the same guard on the
   space root: it writes nothing the space's `.syncignore` excludes — such a file
-  would sit where the scanner never looks, never published and never swept — and
-  it refuses a root that has gone, rather than recreating an unmounted drive's
-  mount point and materializing the tree onto the disk underneath (§7.1 takes
-  the same guard against the opposite misreading, that every file was deleted).
+  would sit where the scanner never looks, never published and never swept, and
+  the exclusion covers a path under an excluded *directory*, which is what the
+  scanner gets for free by never descending into one — and it refuses a root
+  that has gone, before it starts and again before each write, since a fill of a
+  large tree runs for hours and an unplugged drive mid-run would otherwise have
+  its mount point recreated and the rest of the tree materialized onto the disk
+  underneath (§7.1 takes the same guard against the opposite misreading, that
+  every file was deleted).
 
   Two refusals follow from writing into a directory somebody works in. A file
   that *appears* while the fill is fetching is never overwritten, `--force` or
