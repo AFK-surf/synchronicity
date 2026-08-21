@@ -4,6 +4,11 @@ Status: **proposed**. Nothing below is built. Section 11 is the order it should
 land in; each phase is useful on its own, and the first one is worth doing even
 if the rest is never built.
 
+Checked against `09d89a3` (OpenDAL CAS backends, `docs/SERVERLESS.md`). That
+work moved three things this design leaned on — `spaces.local_path` is already
+nullable, `blobs` carries a `durable` column, and a cloud-backed CAS never
+deletes its final objects — and each is marked below where it lands.
+
 ## 1. Problem
 
 A node holds bytes for one of three reasons, and none of them is durability.
@@ -80,7 +85,8 @@ wrong in three ways that matter:
 - **It does not converge.** Holding every version forever costs the integral of
   the cluster's churn, not the size of its tree, and that integral has no limit.
   A replica under that rule is a machine that eventually stops, and the date it
-  stops is a function of how much other people write. §9 has the arithmetic.
+  stops is a function of how much other people write. §9 has the arithmetic —
+  and §9.1 the one backend where releasing does not win the bill back.
 - **It confuses two jobs.** "Nothing is lost when a member dies" and "every
   version is recoverable forever" are different products with different costs.
   The first is what the cluster structurally lacks and what a second copy
@@ -188,6 +194,23 @@ object it does not hold must not write a pin row for it — a pin whose bytes ar
 absent makes `pin ls` a list of claims rather than of contents. Intent lives in
 its own table and becomes a pin in the transaction that retires it (§3.3).
 
+**Possession now has two meanings, and a pin already picks the right one.**
+Since `09d89a3` a node's CAS is either `LocalFs` or an OpenDAL cloud store, and
+`blobs.durable` records the backend's stable-storage promise separately from
+`complete`, which is only cache availability. `Node::pin_object` already
+resolves this: it calls `finalize_cloud_object` before `set_pinned`, so a pin
+returns only once `durable = 1` — "a pin is a durability promise, and on this
+backend durability means the configured cloud service"
+(`docs/SERVERLESS.md` §6.3). A replica's pins inherit that rule and its
+ordering: **finalize, then pin**, never the reverse (§3.5).
+
+One good consequence falls out and needs no new configuration. The cloud
+upload policy `own+pinned` — the default — promotes locally ingested content
+plus everything pinned here. A replica pins everything it holds, so a
+cloud-backed replica is durably covering its spaces under the default policy
+already. `cas.cloud.upload = all` stays what it is for: a node that wants
+durable coverage *without* pinning.
+
 ### 3.2 Replication is a property of a space
 
 Cardinality decides where this lives. A mirror is keyed by *directory* — many
@@ -197,60 +220,72 @@ Replication is one per space, so its natural primary key is the space id, which
 is already the primary key of `spaces`. A table whose primary key is another
 table's primary key is a column on that table.
 
-So there is no `replicas` table and no `synch replicate` command. `spaces` gains
-the columns, by the rename-and-rebuild the migration chain already uses for this
-(V14):
+So there is no `replicas` table and no `synch replicate` command, and — since
+`09d89a3` — no table rebuild either. The serverless work already made a
+`spaces` row mean what this needs it to mean.
+
+**What that work already settled.** `spaces.local_path` is nullable today
+(`NULL = detached`, V20), `synch space add <id> --detached` exists, `SpaceRow`
+carries `Option<String>`, and the scanner, the watcher and the overlap guards
+already skip a row with no root. An earlier draft of this section proposed all
+of that as new work and argued for it at length; it is built, for a different
+reason — a serverless node publishing into a space it holds no checkout of —
+and the reasoning transfers intact. A `spaces` row already means "this node's
+participation in this space" rather than "a directory I walk".
+
+So the change is three columns:
 
 ```sql
--- schema v20
-CREATE TABLE spaces (
-  id         TEXT PRIMARY KEY,
-  local_path TEXT,              -- was NOT NULL. NULL = replicated here, not indexed here
-  replicate  TEXT,              -- NULL | 'tree' | 'archive'
-  grace      INTEGER,           -- seconds a released root is still held; NULL under 'archive'
-  budget     INTEGER            -- optional byte ceiling, NULL for none
-);
+-- schema v21 (v20 is the serverless foundation)
+ALTER TABLE spaces ADD COLUMN replicate TEXT;    -- NULL | 'tree' | 'archive'
+ALTER TABLE spaces ADD COLUMN grace     INTEGER; -- seconds; NULL under 'archive'
+ALTER TABLE spaces ADD COLUMN budget    INTEGER; -- optional byte ceiling
 ```
 
-**The real change is the second line, and it is what a `spaces` row means.**
-Today a row means "a local directory I index and publish under this id":
-`local_path` is `NOT NULL` and every consumer treats a row as a directory to
-walk. It becomes "this node's participation in this space" — indexing a
-directory is one kind of participation, holding every origin's copies is
-another, and a row may be either or both.
+`--replicate` and `--detached` are orthogonal, and the four combinations are all
+meaningful: a path with no replication is today's ordinary space; a path with
+replication is the durable-disk node that publishes its own copy and holds
+everyone else's; detached with replication is the dedicated replica; detached
+without it is the serverless write target that already exists. In the CLI
+`--replicate` joins `--detached` in `required_unless_present` for the path
+argument, and a path-less replicated space *is* detached — there is no third
+state to name.
 
-That is a better model than the one it replaces, and it closes a gap that exists
-today: there is no way to say "this node cares about space `media`" without
-publishing a directory into it. The CLI already works around the gap —
-`ensure_known_space` reaches past `spaces()` to `known_spaces()`, the spaces
-some origin has published entries for, precisely because the local table cannot
-answer the question.
+Two corrections to what an earlier draft claimed here, both from reading the
+merged code rather than the older tree:
 
-Six places read `spaces()` expecting a directory and must skip a path-less row:
-the scanner's two walks, the watcher's root list, the overlap checks in
-`add_space` and `add_mirror` (a row with no root overlaps nothing), and the
-space list the cloud attach publishes. Those are skips. Two are decisions:
+- **The cloud attach's space list must not skip a path-less row.** `held_spaces`
+  maps every `spaces()` row plus every mirror, and its comment says why: a node
+  that only mirrors a space is routable for it rather than a bystander. A
+  detached or replicate-only space is servable for the same reason and should
+  count for the same reason. The earlier draft had this backwards.
+- **`m:space/<id>` no longer publishes the local path.** `space_info_changes`
+  now sends `description: String::new()` for every space — "local paths are
+  host-private implementation details" — so half the argument for suppressing
+  the record on a replicate-only space is gone, fixed upstream and more
+  broadly. What survives is thinner: the record still carries this origin's
+  `entry_count` for the space, which is permanently zero where the row exists
+  only to replicate, and a zero record says "I publish this space" to anything
+  reading space info. Suppressing it there is a small improvement, not the
+  correctness point it was drafted as; the `r:` claim (§4.1) is what carries the
+  real information either way.
 
-- **`Node::space_info_changes` must not publish `m:space/<id>` for a
-  replicate-only space.** The record carries `description: space.local_path` and
-  this origin's entry count for the space; a replicate-only row has neither — no
-  path to describe and no entries of its own — and publishing it anyway
-  advertises a space this node does not publish. `m:space/<id>` stays tied to
-  the indexed half; the replicated half publishes `r:<space>` (§4.1) and nothing
-  else. A space that is both publishes both.
+One decision does survive intact, and it is the sharp one:
+
 - **`Node::remove_space` is an unpublish, and must not be one here.** It stages
   a tombstone for every key under the space prefix, removes the `m:space/<id>`
-  record, and calls `ensure_publishable()` first. On a space this node only
-  replicates there is nothing of its own under that prefix, so the loop stages
-  nothing and the outcome is correct *by accident*. That is not good enough for
-  the one command in this design that can publish a mass deletion: it must
-  branch on which halves are configured, and a space that was only ever
-  replicated must not reach `ensure_publishable()` at all (§8).
+  record, and calls `ensure_publishable()` first — unchanged by `09d89a3`. That
+  is right for a detached *write target*, which does publish entries. On a space
+  this node only replicates there is nothing of its own under that prefix, so
+  the loop stages nothing and the outcome is correct *by accident*. That is not
+  good enough for the one command in this design that can publish a mass
+  deletion: it must branch on which halves are configured, and a space that was
+  only ever replicated must not reach `ensure_publishable()` at all (§8).
 
-One consequence worth naming: a space can now be added twice over, at different
-times, in either order — indexed first and replicated later, or replicated first
-and a local directory added afterwards. Both orders are ordinary `space set`
-calls, and the second one must not disturb what the first established.
+A space can also now be added twice over, in either order — indexed first and
+replicated later, or replicated first and a directory attached afterwards. Both
+are ordinary `space set` calls, and the second must not disturb what the first
+established.
 
 ### 3.3 The want queue, resurrected
 
@@ -316,8 +351,9 @@ step to `apply_change`'s `f:` arm, in that same transaction:
   file was restored from a copy.
 - A change that *replaces or removes* a root **sets `release_after = now +
   grace`** on the replica's pin for the old root — but only after confirming no
-  other current entry still names it. The check is one indexed lookup
-  (`entries_by_content`) and it is what makes deduplication safe: two paths
+  other current entry still names it. `09d89a3` added exactly that primitive:
+  `Store::content_is_referenced(root)`, one `EXISTS` over the
+  `entries_by_content` index. It is what makes deduplication safe — two paths
   sharing content release when the second one goes, not the first.
 
 In the same transaction as the head flip, deliberately. A want row that can be
@@ -350,8 +386,11 @@ touches the network and the only one that should be rate-limited:
    descent, provider fanout and resumption apply unchanged. This is the best
    case for the descent and a replica hits it constantly: it is fetching
    version *n+1* of a file whose version *n* it is guaranteed to hold.
-3. On completion: delete the want row and insert the pin row, in one
-   transaction.
+3. On completion: finalize to the backend's durable tier, then delete the want
+   row and insert the pin row in one transaction. The order matters on a cloud
+   backend and is the order `pin_object` already uses — a pin row written before
+   `durable = 1` is a promise about bytes that live only in a scratch cache, and
+   `docs/SERVERLESS.md` §6.3 makes cache-only content evictable by design.
 4. On failure: increment `attempts`, record `last_error`, leave the row.
 
 Between the fetch's last commit and the pin insert the object is complete,
@@ -360,11 +399,19 @@ possibly unreferenced, and unpinned. It survives the window for the reason
 retention test holds it — and that deserves a test that runs a GC pass inside
 the window rather than a paragraph asserting it.
 
-### 3.6 Eviction discipline: absence is not evidence
+### 3.6 Release discipline: absence is not evidence
 
-A replica's eviction is the ordinary `gc_content` pass. What replication adds
-is a rule about **who is allowed to conclude that a root left the tree**, and it
-is the one piece of this design that has to be right.
+**"Eviction" is taken.** On a cloud backend it means the LRU that drops cache
+files for objects the bucket still holds — `cas.cloud.cache_bytes`, keyed on
+`last_access`, and explicitly applied to pinned blobs too, "since on this
+backend the pin's promise is kept remotely, not by the cache". That is a
+different verb from the one here. This document says **release** for giving up a
+claim on content, and never "evict"; a released root loses a pin, and what
+happens to its bytes afterwards is the backend's business (§9).
+
+A replica's release runs through the ordinary `gc_content` pass. What
+replication adds is a rule about **who is allowed to conclude that a root left
+the tree**, and it is the one piece of this design that has to be right.
 
 > A release is driven by an **observed change**. Absence of a reference is not,
 > by itself, evidence that a reference was removed.
@@ -378,8 +425,8 @@ routine ways for `entries` to stop naming something that is not a deletion:
   `entries` and `blob_providers` rows by design and drops every foreign complete
   head back to pending, because derived state whose premise changed is
   discarded rather than reconciled. For a moment the replica's view of the tree
-  is *empty*. An absence-driven release at that moment would evict the entire
-  store.
+  is *empty*. An absence-driven release at that moment would let go of the
+  entire store.
 - **`Store::rematerialize`** (`synch doctor --rebuild`). Deletes an origin's
   entries and rebuilds them from the trie. The comment on it already records
   that a mirror pass reading in that window unlinks the user's files; a GC pass
@@ -526,11 +573,12 @@ count them.
 |---|---|---|
 | `spaces.replicate` | unset | per space: unset, `tree` (release with the tree) or `archive` (never release) |
 | `spaces.grace` | 30 d | how long a root outlives the last entry naming it |
-| `spaces.budget` | none | per space byte ceiling; stops fetching, never evicts |
+| `spaces.budget` | none | per space byte ceiling; stops fetching, never releases |
 | `replica_interval` | 300 s | reconciling sweep backstop; the promotion bell rings it early |
 | `replica_concurrency` | 4 | concurrent object fetches for replica work |
 | `replica_backoff` | 60 s … 6 h | per-want retry schedule, exponential in `attempts` |
 | `root_retention` | 7 d | unchanged; head history depth, now independent of content |
+| `cas.cloud.upload` | `own+pinned` | not new and not changed: the default already covers a replica's holdings, since a replica pins what it holds (§3.1) |
 
 Replica fetches share the endpoint with anti-entropy and with foreground reads,
 and nothing schedules between them today — DESIGN.md §13 lists bandwidth QoS as
@@ -543,8 +591,8 @@ the cluster's actual users is a worse problem than one that converges overnight.
 No new noun. Replication is a flag on the command that already names spaces:
 
 ```
-synch space add <id> <path> [--replicate[=tree|archive]] [--grace <dur>] [--budget <size>]
-synch space add <id> --replicate[=tree|archive] [--grace <dur>] [--budget <size>]
+synch space add <id> <path>   [--replicate[=tree|archive]] [--grace <dur>] [--budget <size>]
+synch space add <id> --detached [--replicate[=tree|archive]] [--grace <dur>] [--budget <size>]
 synch space set <id> [--replicate[=tree|archive]] [--no-replicate [--release]]
                      [--grace <dur>] [--budget <size>]
 synch space rm  <id> [--release]
@@ -552,12 +600,12 @@ synch space ls  [<id>]
 synch space sync [<id>]                  run a reconciling sweep now
 ```
 
-The first two forms are the two halves. `space add media /srv/media
---replicate` is the common deployment in one line — publish my copy of `media`
-*and* hold everyone else's versions of it — and `space add media --replicate`
-with no path is the dedicated replica, which indexes nothing and publishes
-nothing. `--replicate` defaults to `tree`; `--replicate=archive` is the opt-in
-that releases nothing (§2.1).
+`--replicate` composes with the existing `--detached` rather than competing
+with it (§3.2). `space add media /srv/media --replicate` is the common
+deployment in one line — publish my copy of `media` *and* hold everyone else's
+versions of it. `space add media --detached --replicate` is the dedicated
+replica, which indexes nothing and publishes nothing. `--replicate` defaults to
+`tree`; `--replicate=archive` is the opt-in that releases nothing (§2.1).
 
 `--release` on `space rm` and on `--no-replicate` drops the held pins; without
 it they are kept, because releasing terabytes should not follow from typing the
@@ -599,13 +647,16 @@ the difference between a replica that is behaving and one that is broken.
 ## 7. What this deliberately does not do
 
 - **No filesystem materialization.** A replica holds objects, not a directory
-  tree. An operator who wants both runs a mirror beside it, and the mirror's
-  reflink write means the tree costs no second copy of the bytes
-  (`docs/DELTA-SYNC.md` §3.5).
+  tree. An operator who wants both runs a mirror beside it — on `LocalFs` the
+  mirror's reflink write means the tree costs no second copy of the bytes
+  (`docs/DELTA-SYNC.md` §3.5); on a cloud backend `materialize` fills the cache
+  and writes the file, so the checkout is a real second copy and a replica is
+  the wrong machine to keep one on.
 - **No protection against deletion beyond the grace window**, under the default
   policy. §2.2.
-- **No eviction to make room.** Storage pressure stops fetching; it never
-  shortens a release (§3.8).
+- **No releasing to make room.** Storage pressure stops fetching; it never
+  shortens a release (§3.8). Cache eviction on a cloud backend is a different
+  verb and is none of this design's business (§3.6).
 - **No release from absence of knowledge.** §3.6.
 - **No erasure coding, no partial-object placement.** The unit is the object and
   the copy is whole.
@@ -637,6 +688,19 @@ the difference between a replica that is behaving and one that is broken.
   as designed (§12: members are trusted to publish), but it argues for
   `--budget` on any replica facing a large membership, and for a per-origin byte
   breakdown in `space ls <id>` so the operator can see whose content grew.
+- **A durable claim withdrawn under the node's feet.** `docs/SERVERLESS.md` §6.4
+  gives a cloud node a heal rule: an OpenDAL `NotFound` on an object a row calls
+  `durable` is authoritative, so the store takes the claim back — `durable → 0`,
+  the row dropped if the cache holds nothing either, the `b:` ad retired. For an
+  ordinary node that is a strict gain, and the design calls it the one genuine
+  consistency gain of the port. For a replica it is also a **hole in the
+  coverage it has promised**, arriving without any change in the tree. So the
+  withdrawal must re-enter the want queue: whatever retires an ad must stage a
+  want for the same root where a replicated space still references it, or the
+  replica silently stops holding something and its own status output goes on
+  saying it holds it. This is the one place where absence of bytes *is*
+  evidence — the backend said so about a content address, which is not the same
+  kind of statement as `entries` not naming a root (§3.6).
 - **Clock skew.** `release_after` is an instant, so a backwards clock delays
   releases and a forwards one advances them. It should be compared against
   `Store::read_instant` rather than the bare clock, for the reason mirror passes
@@ -674,6 +738,33 @@ deployments genuinely want it, but it should be chosen with that table in front
 of the operator. `space add --replicate=archive` should print the current tree
 size and the last 30 days' observed churn before it agrees.
 
+### 9.1 On a cloud backend, releasing frees the claim and not the bucket
+
+The table above is a `LocalFs` table, and the difference matters more than a
+footnote. Content GC on the cloud backend "deletes only the SQLite claim and
+reconstructible cache. Final payload/outboard keys under `cas/` are never
+deleted by the daemon" (`docs/SERVERLESS.md` §6.5), because a content address
+may be shared by every node using the bucket and no node can know the others
+have released it without distributed reference counting the design deliberately
+refuses.
+
+So on a cloud-backed replica a release frees the pin, the row, and the cache —
+and nothing in object storage. Bucket bytes grow monotonically whatever the
+policy says, and the `tree` policy's convergence, which is the whole argument
+for it being the default (§2.1), is a property of the local backend only. Under
+`tree` a cloud replica converges in *claimed* bytes, in cache footprint, and in
+what it advertises; its bill does not converge.
+
+That does not sink `tree` on cloud — the claim, the cache and the ad are what
+the cluster and the operator interact with, and the residue is reusable by
+re-ingest and self-readoption at the same deterministic address. But an operator
+choosing a policy for a cloud replica is choosing what the node *serves*, not
+what the bucket *costs*, and `space add --replicate` should say so on that
+backend rather than let the §9 table be read as a bill. Where the bill is the
+point, the lever is a provider lifecycle rule over `cas/` — which §6.5 forbids
+the daemon to rely on and does not forbid an operator to set, with the residue
+rules in hand. §12 keeps the harder question.
+
 Note that the tree is larger than "the size of the data": every origin's version
 of every divergent path is held, because all of them are current. A cluster with
 substantial two-way sharing pays for both sides of every divergence until it is
@@ -703,7 +794,7 @@ and is unexplored (§12).
   claims ("nas says complete"), never as verified coverage.
 - **Scope holds.** A delegated replica replicates what it may read, and replica
   mode adds no path around `materialization_scope`.
-- **Eviction is the dangerous verb.** Every code path that can set
+- **Release is the dangerous verb.** Every code path that can set
   `release_after` should be countable on one hand and each should be justified
   where it is written, in the manner of `delete_blob_if_collectable`. A bug in
   the fetch path costs bandwidth; a bug in the release path costs the data.
@@ -717,12 +808,12 @@ Phases in dependency order. Each lands on its own and leaves the tree working.
    behavior; everything after this depends on it.
 2. **Read by root.** `synch cat --root`, `synch get --root`. Independent,
    useful immediately, and what makes a replica's contents reachable.
-3. **`spaces` learns what a row means.** Migration v20 rebuilds the table with a
-   nullable `local_path` and the three new columns, `FINAL_SCHEMA` follows, and
-   the six readers learn to skip a path-less row. `space add --replicate`,
-   `space set`, `space ls` and the `space rm` branch land here, holding nothing
-   yet — a config change with no fetcher behind it, which is the cheap half to
-   get wrong.
+3. **`spaces` gains three columns.** Migration v21, `FINAL_SCHEMA` follows.
+   Much smaller than it was drafted: V20 already rebuilt the table with a
+   nullable `local_path` and taught the scanner, watcher and overlap guards
+   about a row with no root. `space add --replicate`, `space set`, `space ls`
+   and the `space rm` branch land here, holding nothing yet — a config change
+   with no fetcher behind it, which is the cheap half to get wrong.
 4. **The replica, sweep-driven, hold-only.** `replica_want`, the reconciling
    sweep, the fetch loop, `space sync`. Policy `archive` semantics — nothing is
    released yet — so the risky half is absent while the fetching half is
@@ -741,11 +832,21 @@ Phases in dependency order. Each lands on its own and leaves the tree working.
 
 ## 12. Open questions
 
+- **May a replica ever delete a `cas/` key?** §9.1 is the largest unanswered
+  cost in this design. `docs/SERVERLESS.md` §6.5 refuses distributed reference
+  counting and makes final keys append-only, which is right for a shared bucket
+  and possibly wrong for a bucket one replica owns outright. A per-node root
+  that no other node writes into would make release mean release; whether that
+  is worth a configuration flag that is catastrophic when set wrongly is the
+  question, and "no" is a defensible answer.
 - **Extent sharing between versions.** A replica holds *n* and *n+1* of a large
   object whose difference is small, and the descent already knows which spans
   were promoted from the donor. Cloning those extents rather than copying them
-  would change §9's storage column from whole objects to changed spans on
-  filesystems that support it.
+  would change §9's storage column from whole objects to changed spans — on
+  `LocalFs`, where `promote` already uses `copy_file_range` and could reflink
+  instead. On a cloud backend the equivalent question is whether an object can
+  be composed server-side from an existing key plus a delta, which is a
+  different and much harder one.
 - **How stale is "stale" in §3.6?** The completeness precondition needs a
   threshold for how far behind an origin's head may be before releases pause. Too
   tight and a replica with one flaky peer never releases anything; too loose and

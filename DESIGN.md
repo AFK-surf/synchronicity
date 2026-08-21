@@ -2142,7 +2142,8 @@ CI (GitHub Actions):
   of a space rather than a surface of its own (`synch space add <id>
   --replicate`), which proposes the role first and leaves cluster-wide placement
   where this bullet has it. (Content replication in that sense, not the
-  trie-scope sense of §5.5.)
+  trie-scope sense of §5.5; and on a cloud backend, a claim and a cache rather
+  than a bill — `docs/SERVERLESS.md` §6.5.)
 - Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,
   never as core. (HTTP access ships as the S3 gateway, §9.4.)
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.
