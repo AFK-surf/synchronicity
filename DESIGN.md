@@ -1288,13 +1288,16 @@ Materialization reads the unified tree (§8), so every materializing surface nam
 - `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to
   stdout with verified random access; this is where hash-tree reads shine (e.g.
   seeking in a large video).
-- `synch fill <space>[/<dir>] [--from <origin>|--strict] [--force] [--dry-run]` —
+- `synch fill [<origin>:]<space>[/<dir>] [--from <origin>|--strict] [--force]
+  [--dry-run]` —
   one-shot materialization into the *space's own* directory, the one `synch space
   add` named. Where a mirror owns the directory it writes into, a fill writes into
   the directory this node indexes and publishes from, so it may only ever add: a
   missing path is written, a path whose bytes already match is left alone, and a
   path whose bytes differ is reported rather than overwritten (`--force` replaces
-  it, which is the bulk form of `synch take`). **Nothing is ever removed** — not a
+  it, which is `synch take`'s adoption in bulk — though not its publish: a fill
+  waits for the scan, where `take` publishes before it answers). **Nothing is
+  ever removed** — not a
   tombstoned version, not a local file no origin publishes; adopting a deletion
   stays the deliberate, one-path act `synch take` of a tombstone is. A fill does
   not publish either: the files land where the scanner will find them and the next
@@ -1309,9 +1312,14 @@ Materialization reads the unified tree (§8), so every materializing surface nam
 Materialized files carry the metadata their selected version published, not the
 metadata of the copy: the origin's `mtime_ns`, and the permission bits of its
 advisory `unix_mode` (§4.2, masked — setuid/setgid/sticky are never reproduced,
-since the mode is a peer's assertion and the daemon may be privileged). A file
-whose bytes are already current but whose mode or mtime has drifted is stamped
-back in place rather than refetched. A symbolic link's metadata is not
+since the mode is a peer's assertion and the daemon may be privileged). In a
+*mirror*, a file whose bytes are already current but whose mode or mtime has
+drifted is stamped back in place rather than refetched — the directory is the
+mirror's own and the published metadata is the whole of what it should say. A
+*fill* stamps only what it writes: a path already holding the right bytes is
+left completely alone, mtime included, because that metadata is this node's own
+assertion and restamping it would republish every path a fill looked at. A
+symbolic link's metadata is not
 reproduced: its target *is* its version (§8), and stamping a link's own times
 needs a facility the standard library does not expose.
 

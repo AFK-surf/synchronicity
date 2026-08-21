@@ -196,7 +196,8 @@ message Command {
     SpaceSet space_set = 44;
     // `synch space sync [<id>]`
     SpaceSync space_sync = 45;
-    // `synch fill <space>[/<dir>] [--from <origin>|--strict] [--force]`
+    // `synch fill [<origin>:]<space>[/<dir>] [--from <o>|--strict] [--force]
+    // [--dry-run]`
     Fill fill = 46;
   }
 }
