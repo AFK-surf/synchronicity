@@ -284,6 +284,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Referenced content roots with the sizes authenticated by their entries.
+    pub fn referenced_content_sizes(&self) -> Result<Vec<(Hash, u64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT content, size FROM entries WHERE content IS NOT NULL ORDER BY content",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (root, size) = row?;
+            out.push((hash_column(root, "entries.content")?, size as u64));
+        }
+        Ok(out)
+    }
+
+    /// Whether any materialized entry still names this content root.
+    pub fn content_is_referenced(&self, root: &Hash) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+            params![root.as_bytes().to_vec()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Counts of the content-addressed tables, for `synch doctor` GC stats.
     pub fn trie_stats(&self) -> Result<TrieStats> {
         let conn = self.conn();

@@ -196,7 +196,7 @@ impl Node {
     /// one batch and one head — including anything a watcher-triggered rescan
     /// had already staged — and the head is out before this returns.
     pub async fn scan_publish_push(&self) -> Result<Option<SignedHead>> {
-        self.scan_and_stage_off_runtime().await?;
+        self.scan_and_stage_async().await?;
         self.flush_staged().await
     }
 
@@ -260,9 +260,25 @@ impl Node {
                 // the store has accumulated since the last one (§5.4).
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     let node = self.clone();
-                    let pass = crate::blocking::offload(move || node.maintenance_pass()).await;
+                    let blocking = node.clone();
+                    let pass = crate::blocking::offload(move || blocking.maintenance_pass()).await;
                     if let Err(e) = pass {
                         tracing::warn!(error = %e, "maintenance pass failed");
+                    }
+                    match node.cas_backend().maintain(now_ns()).await {
+                        Ok(report)
+                            if report.local_orphans > 0
+                                || report.cache_entries_evicted > 0 =>
+                        {
+                            tracing::info!(
+                                local_orphans = report.local_orphans,
+                                cache_entries_evicted = report.cache_entries_evicted,
+                                cache_bytes_evicted = report.cache_bytes_evicted,
+                                "CAS backend maintenance completed"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "CAS backend maintenance failed"),
                     }
                 }
             }

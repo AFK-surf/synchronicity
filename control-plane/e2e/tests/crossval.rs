@@ -31,6 +31,7 @@ fn test_resolver(doh_url: String, anchor: String, rekor: Option<RekorPolicy>) ->
         rekor,
         rekor_key: None,
         rekor_state: None,
+        rekor_config: None,
         tuf_url: None,
         // An e2e run never needs Sigstore's CDN: the refusal the second test asserts is about this zone's missing proof.
         no_tuf: true,

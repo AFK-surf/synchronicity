@@ -810,16 +810,17 @@ impl Control for ControlService {
         request: Request<pb::AbortUploadRequest>,
     ) -> Result<Response<pb::AbortUploadResponse>, Status> {
         let reference = request.into_inner().upload.unwrap_or_default();
-        let node = self.served.node()?.clone();
-        let existed = offload(move || {
-            Ok(node.abort_upload(
+        let existed = self
+            .served
+            .node()?
+            .abort_upload_durable(
                 &reference.upload_id,
                 &reference.space,
                 &reference.path,
                 principal(&reference.principal).as_deref(),
-            )?)
-        })
-        .await?;
+            )
+            .await
+            .map_err(ControlError::from)?;
         Ok(Response::new(pb::AbortUploadResponse { existed }))
     }
 
@@ -1716,13 +1717,23 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SpaceAdd(pb::SpaceAdd { id, path }) => {
+        Command::SpaceAdd(pb::SpaceAdd { id, path, detached }) => {
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
             //
             // The `stat` goes over with the store work rather than inline: on a
             // hung mount it blocks for the mount's timeout, and a runtime
             // worker that stops polling is the thing §10 exists to prevent.
+            if detached {
+                let detached_id = id.clone();
+                read(node, move |n| {
+                    n.add_detached_space(&detached_id)?;
+                    Ok(())
+                })
+                .await?;
+                out.line(format!("holding detached space {id}")).await?;
+                return Ok(());
+            }
             let created = {
                 let (id, path) = (id.clone(), path.clone());
                 read(node, move |n| {
@@ -1746,8 +1757,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     .await?;
             }
             for space in spaces {
-                out.line(format!("{:<20} {}", space.id, space.local_path))
-                    .await?;
+                out.line(format!(
+                    "{:<20} {}",
+                    space.id,
+                    space.local_path.as_deref().unwrap_or("detached")
+                ))
+                .await?;
             }
         }
 
@@ -1770,32 +1785,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // hashed, so a scan whose publish is refused would leave the node
             // believing it had published files it never did (§3.4).
             read(node, |n| Ok(n.ensure_publishable()?)).await?;
-            // Hashing a tree is long and blocking, so it runs off the runtime
-            // — the daemon keeps serving other requests — and each space is
-            // reported as a progress message while the scan is still going.
-            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let scanning = {
-                let node = node.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _scope = synch_core::BlockingScope::enter();
-                    node.scan_all_with(|space, report| {
-                        let _ = progress_tx.send(format!(
-                            "scanned {space}: hashed {} · unchanged {} · deleted {}",
-                            report.hashed, report.unchanged, report.deleted
-                        ));
-                    })
-                })
-            };
-            while let Some(line) = progress_rx.recv().await {
-                out.progress(line).await?;
+            // The engine owns the blocking handoff and the selected CAS
+            // backend. Keeping the old synchronous scanner here would bypass a
+            // cloud backend and publish scratch-only content.
+            let (report, spaces) = node.scan_and_stage_async_with_reports().await?;
+            for (space, one) in spaces {
+                out.progress(format!(
+                    "scanned {space}: hashed {} · unchanged {} · deleted {}",
+                    one.hashed, one.unchanged, one.deleted
+                ))
+                .await?;
             }
-            let report = scanning
-                .await
-                .map_err(|e| ControlError::internal(format!("the scan task failed: {e}")))??;
             // An explicit scan is already one batch, so it stages and then
             // flushes rather than waiting out the quiesce: the "published seq"
             // line below is true by the time the client reads it (§7.1).
-            node.stage(report.staged.clone());
             let head = node.flush_staged().await?;
             let mut summary = format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
@@ -2163,7 +2166,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::PinRm(pb::PinRm { target }) => {
             let (root, _) = pin_target(node, &target).await?;
-            if !read(node, move |n| Ok(n.store().set_pinned(&root, false)?)).await? {
+            if !node.unpin_object(&root).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("no object {root} in the local store"),
@@ -2462,9 +2465,33 @@ async fn receive(
     // The commit fsyncs the payload and renames it into place.
     let target = offload(move || Ok(adoption.commit()?)).await?;
 
-    // The ordinary indexing pipeline takes it from here: hash, CAS, stage,
-    // publish. A write answers with a published seq for the same reason `scan`
-    // does — the entry it reports has to be one peers can already see.
+    let detached = {
+        let space = header.space.clone();
+        read(node, move |n| Ok(n.is_detached_space(&space)?)).await?
+    };
+    let reported_path = if detached {
+        let (committing, space, path, source) = (
+            node.clone(),
+            header.space.clone(),
+            header.path.clone(),
+            target.clone(),
+        );
+        let result = committing
+            .commit_detached_file(&space, &path, &source, synch_core::now_ns())
+            .await;
+        // The content-addressed payload is durable now, or the operation
+        // failed and the client owns the retry. The pre-hash scratch is never
+        // part of the acknowledged state.
+        let _ = tokio::fs::remove_file(&source).await;
+        result?;
+        format!("{}/{}", header.space, header.path)
+    } else {
+        target.display().to_string()
+    };
+
+    // Path-backed writes enter through the scanner; detached writes already
+    // staged their CAS-direct `f:`/`b:` pair above. `scan_publish_push` skips
+    // detached spaces but flushes the shared batch in either case.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
     let (set, now) = {
@@ -2476,7 +2503,7 @@ async fn receive(
     };
     let row = node.resolve_set(&set, &ours, now)?;
     Ok(pb::Written {
-        path: target.display().to_string(),
+        path: reported_path,
         entry: Some(entry_info(&row, &set).into()),
     })
 }
@@ -2505,8 +2532,7 @@ async fn receive_part(
         None => None,
     })
     .await?;
-    let node = node.clone();
-    let part = offload(move || Ok(node.commit_part(staging, adoption)?)).await?;
+    let part = node.commit_part_durable(staging, adoption).await?;
     Ok(pb::UploadPartResponse {
         number: part.number,
         size: part.size,
@@ -2561,12 +2587,10 @@ async fn stream_range(
     let mut offset = range.start;
     while offset < range.end {
         let take = (CHUNK_SIZE as u64).min(range.end - offset);
-        // Every piece is a verified read out of the CAS — payload and outboard
-        // off disk — so it runs on the blocking pool rather than on the worker
-        // polling this connection.
-        let store = node.store().clone();
+        // Every piece is a trusted backend read, so local filesystem work runs
+        // on the blocking pool rather than on the worker polling this connection.
         let root = range.root;
-        let bytes = offload(move || Ok(store.read_range(&root, offset, take)?)).await?;
+        let bytes = node.cas_backend().read_range(root, offset, take).await?;
         if bytes.is_empty() {
             break;
         }

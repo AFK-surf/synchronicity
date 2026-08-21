@@ -1035,6 +1035,80 @@ impl Syncer {
         Ok(exchange.summaries)
     }
 
+    /// Fetches and adopts a peer-retained head for this node's own origin,
+    /// provided it was signed by a device key this database still holds.
+    ///
+    /// This is restore readoption, not key-loss recovery: a Litestream restore
+    /// may be behind while retaining every signing key, so the peer's full head
+    /// is independently verifiable and can safely replace the restored one.
+    pub(crate) async fn readopt_self_with(
+        &self,
+        client: &MptClient,
+        held_keys: &std::collections::HashSet<synch_core::NodeId>,
+    ) -> Result<()> {
+        let Advertisement {
+            summaries: ours,
+            declared,
+            ..
+        } = self.advertisement_off_runtime(client.remote_id()).await?;
+        let own = {
+            let store = self.store.clone();
+            crate::blocking::offload(move || {
+                store
+                    .self_origin()?
+                    .ok_or_else(|| EngineError::invalid("the node has no self origin"))
+            })
+            .await?
+        };
+        let wanted = own.clone();
+        let exchange = client
+            .head_exchange(ours, declared, move |summaries| {
+                let peer_has_own = summaries.iter().any(|summary| summary.origin == wanted);
+                (
+                    Vec::new(),
+                    peer_has_own.then_some(wanted.clone()).into_iter().collect(),
+                )
+            })
+            .await?;
+
+        {
+            let syncer = self.clone();
+            let scope = exchange.scope.clone();
+            let summaries = exchange.summaries.clone();
+            let peer = client.remote_id();
+            crate::blocking::offload(move || {
+                syncer.adopt_scope(peer, scope.as_deref(), &summaries)
+            })
+            .await?;
+        }
+        {
+            let syncer = self.clone();
+            let summaries = exchange.summaries.clone();
+            let peer = client.remote_id();
+            crate::blocking::offload(move || {
+                syncer.observe_summaries_from(Some(peer), &summaries, now_ns())
+            })
+            .await?;
+        }
+
+        for head in exchange.received {
+            if head.origin != own || !held_keys.contains(&head.signed_by) {
+                continue;
+            }
+            match self.offer_head_off_runtime(&head).await? {
+                HeadOutcome::Pending => {
+                    let _ = self.fetch_pending(client, &own).await?;
+                }
+                HeadOutcome::Completed
+                | HeadOutcome::NotNewer
+                | HeadOutcome::BadSignature
+                | HeadOutcome::Unbound
+                | HeadOutcome::Refused => {}
+            }
+        }
+        Ok(())
+    }
+
     /// [`Syncer::offer_head`] on the blocking pool.
     async fn offer_head_off_runtime(&self, head: &SignedHead) -> Result<HeadOutcome> {
         let syncer = self.clone();

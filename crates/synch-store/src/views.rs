@@ -97,13 +97,13 @@ fn kind_from_int(value: i64) -> Result<EntryKind> {
     })
 }
 
-/// A configured local space (§4.1).
+/// A configured space (§4.1, `docs/SERVERLESS.md` §10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceRow {
     /// The space id, used in `f:<space>/...` keys.
     pub id: String,
-    /// The local directory being indexed.
-    pub local_path: String,
+    /// The local directory being indexed, or `None` for a detached space.
+    pub local_path: Option<String>,
 }
 
 /// A row of the scanner's change-detection state (§7.1).
@@ -511,13 +511,18 @@ impl Store {
     // ---- spaces -----------------------------------------------------------
 
     /// Registers a local space.
-    pub fn put_space(&self, id: &str, local_path: &str) -> Result<()> {
+    pub fn put_space(&self, id: &str, local_path: Option<&str>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO spaces (id, local_path) VALUES (?1, ?2)
              ON CONFLICT(id) DO UPDATE SET local_path = excluded.local_path",
             params![id, local_path],
         )?;
         Ok(())
+    }
+
+    /// Registers a space with no checkout, scanner, or watcher root.
+    pub fn put_detached_space(&self, id: &str) -> Result<()> {
+        self.put_space(id, None)
     }
 
     /// Removes a local space.
@@ -1621,13 +1626,15 @@ mod tests {
     #[test]
     fn spaces_and_mirrors() {
         let (_d, store) = store();
-        store.put_space("media", "/srv/media").unwrap();
-        store.put_space("media", "/srv/media2").unwrap();
+        store.put_space("media", Some("/srv/media")).unwrap();
+        store.put_space("media", Some("/srv/media2")).unwrap();
         assert_eq!(store.spaces().unwrap().len(), 1);
         assert_eq!(
-            store.space("media").unwrap().unwrap().local_path,
-            "/srv/media2"
+            store.space("media").unwrap().unwrap().local_path.as_deref(),
+            Some("/srv/media2")
         );
+        store.put_detached_space("cloud").unwrap();
+        assert_eq!(store.space("cloud").unwrap().unwrap().local_path, None);
         assert!(store.remove_space("media").unwrap());
         assert!(!store.remove_space("media").unwrap());
 

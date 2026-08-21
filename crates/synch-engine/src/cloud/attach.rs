@@ -1284,9 +1284,7 @@ async fn read(
             .map_err(|_| EngineError::invalid("the stream was cancelled"))?;
         permit.forget();
         let take = (MAX_CHUNK as u64).min(end - offset);
-        let store = node.store().clone();
-        let bytes =
-            crate::blocking::offload(move || Ok(store.read_range(&root, offset, take)?)).await?;
+        let bytes = node.cas_backend().read_range(root, offset, take).await?;
         if bytes.is_empty() {
             break;
         }

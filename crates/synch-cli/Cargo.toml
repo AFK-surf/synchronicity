@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+fs2.workspace = true
 hyper-util.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true

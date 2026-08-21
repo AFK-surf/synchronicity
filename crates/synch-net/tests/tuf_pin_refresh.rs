@@ -365,6 +365,7 @@ fn refreshing(
         // No --rekor-key: the pin set starts as the embedded Sigstore bootstrap.
         rekor_key: None,
         rekor_state: state_path,
+        rekor_config: None,
         tuf_url: None,
         no_tuf: false,
         // The harness mints its own TUF root; that is the anchor every persisted pin state records itself against.
@@ -564,6 +565,7 @@ async fn discovery_refuses_an_unlogged_zone_under_require() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        rekor_config: None,
         tuf_url: None,
         no_tuf: true,
         tuf_root: None,

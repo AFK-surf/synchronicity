@@ -486,6 +486,27 @@ impl Store {
         })
     }
 
+    /// Expires an upload after its retry window, including a completed answer.
+    /// An in-flight completion keeps its latch and is retried by a later sweep.
+    pub fn expire_upload(&self, id: &str) -> Result<bool> {
+        self.with_tx(|tx| {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM s3_uploads WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match state.as_deref() {
+                None | Some("completing") => return Ok(false),
+                Some(_) => {}
+            }
+            tx.execute("DELETE FROM s3_upload_parts WHERE upload = ?1", params![id])?;
+            tx.execute("DELETE FROM s3_uploads WHERE id = ?1", params![id])?;
+            Ok(true)
+        })
+    }
+
     /// Every upload still accepting parts for a space, in key order, that the
     /// asking principal opened.
     ///

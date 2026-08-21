@@ -357,6 +357,8 @@ struct Walk<'a, L> {
     level: u8,
     budget: u64,
     load: L,
+    /// Whether pairs came from an untrusted peer and must chain to the root.
+    verify: bool,
     out: Proof,
     /// The first group whose proof did not fit in the budget, if any.
     truncated_at: Option<u64>,
@@ -408,22 +410,25 @@ where
         let pair = (self.load)(&node.node)?;
         let left = Cv(pair[..32].try_into().expect("32 of 64 bytes"));
         let right = Cv(pair[32..].try_into().expect("32 of 64 bytes"));
-        // The one check the whole exchange rests on. A pair is believed because
-        // recomputing its parent from it lands on a value that was itself
-        // believed, all the way up to the root the entry named — so a flipped
-        // bit fails at the node it occurs in, exactly as it does in a slice.
-        match expected {
-            Some(cv) => {
-                if join_cvs(&left, &right) != cv {
-                    return Err(self.verification(format!(
-                        "proof node at group {} does not hash to the value its parent proved",
-                        node.start
-                    )));
+        if self.verify {
+            // Received proofs cross an untrusted boundary and must chain to the
+            // requested root. Provider-side reads come from trusted storage and
+            // simply serialize the stored tree for the receiver to verify.
+            match expected {
+                Some(cv) => {
+                    if join_cvs(&left, &right) != cv {
+                        return Err(self.verification(format!(
+                            "proof node at group {} does not hash to the value its parent proved",
+                            node.start
+                        )));
+                    }
                 }
-            }
-            None => {
-                if join_root(&left, &right) != self.root {
-                    return Err(self.verification("the top proof node does not hash to the root"));
+                None => {
+                    if join_root(&left, &right) != self.root {
+                        return Err(
+                            self.verification("the top proof node does not hash to the root")
+                        );
+                    }
                 }
             }
         }
@@ -447,6 +452,7 @@ fn walk_proof<L>(
     ranges: &ChunkRanges,
     level: u8,
     budget: u64,
+    verify: bool,
     load: L,
 ) -> Result<(Proof, Option<u64>)>
 where
@@ -460,6 +466,7 @@ where
         level,
         budget,
         load,
+        verify,
         out: Proof::default(),
         truncated_at: None,
     };
@@ -614,9 +621,10 @@ impl Store {
             tree,
             data: DataFile(File::open(self.outboard_path(root))?),
         };
-        let (proof, truncated) = walk_proof(root, blob.size, &wanted, level, budget, |node| {
-            load_from_outboard(&outboard, root, node)
-        })?;
+        let (proof, truncated) =
+            walk_proof(root, blob.size, &wanted, level, budget, false, |node| {
+                load_from_outboard(&outboard, root, node)
+            })?;
         // A truncated walk is a refused request, not a partial answer.
         //
         // The requester sizes its window from `proof_nodes_upper_bound` so that
@@ -657,6 +665,47 @@ impl Store {
         Ok((encoded, served))
     }
 
+    /// Encodes a proof for a remotely durable complete object from its whole
+    /// trusted outboard. The receiver validates the emitted pairs.
+    pub(crate) fn encode_complete_proof(
+        root: Hash,
+        size: u64,
+        requested: &ChunkRanges,
+        level: u8,
+        budget: u64,
+        outboard_bytes: Vec<u8>,
+    ) -> Result<(Vec<u8>, ChunkRanges)> {
+        let tree = Self::tree(size);
+        let groups = group_count(size);
+        let wanted = requested.intersect(&ChunkRanges::single(0, groups));
+        if wanted.is_empty() || groups <= 1 {
+            return Ok((Vec::new(), wanted));
+        }
+        let outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree,
+            data: outboard_bytes,
+        };
+        let (proof, truncated) = walk_proof(&root, size, &wanted, level, budget, false, |node| {
+            load_from_outboard(&outboard, &root, node)
+        })?;
+        if let Some(at) = truncated {
+            return Err(StoreError::Verification {
+                root,
+                reason: format!(
+                    "a proof over these ranges at level {level} exceeds the \
+                     {budget}-node budget (stopped at group {at}); the requester \
+                     must split the request"
+                ),
+            });
+        }
+        let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
+        for (_, pair) in proof.nodes {
+            encoded.extend_from_slice(&pair);
+        }
+        Ok((encoded, wanted))
+    }
+
     // ---- proof receiving --------------------------------------------------
 
     /// Verifies a received proof and commits its nodes to the object's tree.
@@ -687,7 +736,11 @@ impl Store {
             // The cheap refusal; `commit_groups` makes the same decision again
             // inside the transaction that records it (`settle_size`).
             let held = row.verified_groups();
-            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
+            crate::cas::settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
         }
         if !encoded.len().is_multiple_of(PROOF_NODE_LEN) {
             return Err(StoreError::Verification {
@@ -697,19 +750,20 @@ impl Store {
         }
 
         let mut cursor = 0usize;
-        let (proof, truncated) = walk_proof(root, size, &served, level, MAX_PROOF_NODES, |_| {
-            let end = cursor + PROOF_NODE_LEN;
-            if end > encoded.len() {
-                return Err(StoreError::Verification {
-                    root: *root,
-                    reason: "the proof ended before the ranges it claimed".into(),
-                });
-            }
-            let mut bytes = [0u8; PROOF_NODE_LEN];
-            bytes.copy_from_slice(&encoded[cursor..end]);
-            cursor = end;
-            Ok(bytes)
-        })?;
+        let (proof, truncated) =
+            walk_proof(root, size, &served, level, MAX_PROOF_NODES, true, |_| {
+                let end = cursor + PROOF_NODE_LEN;
+                if end > encoded.len() {
+                    return Err(StoreError::Verification {
+                        root: *root,
+                        reason: "the proof ended before the ranges it claimed".into(),
+                    });
+                }
+                let mut bytes = [0u8; PROOF_NODE_LEN];
+                bytes.copy_from_slice(&encoded[cursor..end]);
+                cursor = end;
+                Ok(bytes)
+            })?;
         if truncated.is_some() {
             // No honest provider emits more than one window's worth, so a proof
             // that needs more than that is not a proof of what it claims.
@@ -866,8 +920,8 @@ impl Store {
     /// Two positional reads per span, and a copy the kernel may not even have to
     /// perform: this is what makes an update cost the size of its change rather
     /// than the size of the object. The donor's bytes are not read back and
-    /// re-hashed — they were verified when they entered the CAS, and the module
-    /// header says why that is where the checking belongs.
+    /// re-hashed — they were accepted when they entered the CAS, and the module
+    /// header defines LocalFs/OpenDAL as the storage trust boundary.
     ///
     /// Two shapes of subtree are promotable, and between them they cover
     /// everything the descent produces: a whole subtree, whose chaining value is
@@ -910,7 +964,11 @@ impl Store {
             held = row.verified_groups();
             // The cheap refusal; `commit_groups` decides again inside the
             // transaction that records the result (`settle_size`).
-            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
+            crate::cas::settle_size(
+                root,
+                Some((row.size, row.complete, row.durable, &held)),
+                size,
+            )?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }
@@ -1000,7 +1058,7 @@ impl Store {
             // The nodes *under* the run come across as well, or the groups this
             // pass gains could be held and not served (§3.4, §6.3).
             let mut nodes = Vec::new();
-            if let Err(e) = copy_subtree_nodes(&donor, node, subtree.cv, &mut nodes) {
+            if let Err(e) = copy_subtree_nodes(&donor, node, &mut nodes) {
                 tracing::debug!(donor = %donor.root, error = %e, "donor tree not copied");
                 continue;
             }
@@ -1166,8 +1224,7 @@ struct Sink {
     outboard: PreOrderOutboard<DataFile>,
 }
 
-/// Copies a whole subtree's interior nodes out of a donor's tree, checking on
-/// the way up that they are the tree the proof proved.
+/// Copies a whole subtree's interior nodes out of a trusted donor tree.
 ///
 /// The new object needs them: a span promoted without the nodes beneath it is a
 /// span this node holds and cannot serve, which is the worse half of advertising
@@ -1175,19 +1232,12 @@ struct Sink {
 /// because a pair is 64 bytes per 16 KiB group — 1/256 of the bytes it describes
 /// — so reading the tree is cheap where reading the object is not.
 ///
-/// The recombination on the way back up is what keeps the copy honest: each pair
-/// has to hash to the value its parent already committed to, up to the chaining
-/// value the proof chained to the new object's root. A donor whose *outboard*
-/// rotted therefore cannot poison a tree this node will go on to serve, and the
-/// check costs one 64-byte hash per group rather than a pass over the bytes.
-///
 /// Only ever called for a whole subtree, whose shape — a full binary tree of
 /// `span` groups at a fixed position — is the same in every object that contains
 /// it, which is why the donor's nodes land at the same [`TreeNode`] here.
 fn copy_subtree_nodes(
     donor: &OpenDonor,
     node: Subtree,
-    expected: Cv,
     out: &mut Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
 ) -> Result<()> {
     if node.groups <= 1 {
@@ -1196,23 +1246,12 @@ fn copy_subtree_nodes(
         return Ok(());
     }
     let pair = load_from_outboard(&donor.outboard, &donor.root, &node.node)?;
-    let left = Cv(pair[..32].try_into().expect("32 of 64 bytes"));
-    let right = Cv(pair[32..].try_into().expect("32 of 64 bytes"));
-    if join_cvs(&left, &right) != expected {
-        return Err(StoreError::Verification {
-            root: donor.root,
-            reason: format!(
-                "the donor's tree at group {} does not hash to the value above it",
-                node.start
-            ),
-        });
-    }
     out.push((node.node, pair));
     let (left_child, right_child) = node
         .children()
         .ok_or_else(|| StoreError::invalid("a multi-group subtree has no children"))?;
-    copy_subtree_nodes(donor, left_child, left, out)?;
-    copy_subtree_nodes(donor, right_child, right, out)
+    copy_subtree_nodes(donor, left_child, out)?;
+    copy_subtree_nodes(donor, right_child, out)
 }
 
 /// How much of a run is held in memory when the kernel will not move it.
@@ -1563,47 +1602,6 @@ mod tests {
             .unwrap();
         assert_eq!(slice_served, ChunkRanges::single(0, 4));
         assert!(!slice.is_empty());
-        finish_via_slice(
-            &provider,
-            &fetcher,
-            &new_root,
-            size,
-            &all.difference(&promoted),
-            &new,
-        );
-    }
-
-    /// A donor whose outboard rotted cannot poison the tree: copied nodes must recombine to the proven value, or the span falls back to the network.
-    #[test]
-    fn a_rotted_donor_tree_is_refused_and_left_to_the_fetch() {
-        let old = testutil::data(16 * GROUP);
-        let mut new = old.clone();
-        new[15 * GROUP..].fill(0x11);
-        let (_d1, _d2, provider, fetcher, new_root, old_root, size) = pair_of_stores(&old, &new);
-        let all = ChunkRanges::single(0, group_count(size));
-        let (proven, _) = prove(&provider, &fetcher, &new_root, size, 2);
-        let span = proven.subtrees.iter().find(|s| s.start == 4).unwrap();
-        // A bit flips in the donor's outboard under span 4..8, behind the
-        // store's back — a value the span's own comparison cannot see.
-        let inner = Subtree::locate(&Store::tree(size), 16, 4, 2).unwrap().node;
-        let offset = outboard_of(&fetcher, &old_root, size)
-            .tree
-            .pre_order_offset(inner)
-            .unwrap()
-            * PROOF_NODE_LEN as u64;
-        let mut raw = std::fs::read(fetcher.outboard_path(&old_root)).unwrap();
-        raw[offset as usize + 8 + 3] ^= 0xff;
-        std::fs::write(fetcher.outboard_path(&old_root), &raw).unwrap();
-
-        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
-        assert!(
-            !promoted.overlaps(span.start, span.end()),
-            "the span over the rotted tree is refused: {promoted:?}"
-        );
-        assert!(
-            promoted.contains(0) && promoted.contains(8),
-            "the spans either side are not: {promoted:?}"
-        );
         finish_via_slice(
             &provider,
             &fetcher,

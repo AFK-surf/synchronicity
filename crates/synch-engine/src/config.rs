@@ -18,6 +18,8 @@ pub fn default_data_dir() -> Result<PathBuf> {
 pub struct NodeConfig {
     /// The data directory holding the database and the CAS.
     pub data_dir: PathBuf,
+    /// OpenDAL cloud CAS settings. `None` selects the local filesystem CAS.
+    pub cloud: Option<synch_store::cloud::CloudConfig>,
     /// How the endpoint is bound.
     pub net: NetOptions,
     /// The base anti-entropy round interval (§5.3, default 30 s with ±50 %
@@ -105,6 +107,7 @@ impl NodeConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         NodeConfig {
             data_dir: data_dir.into(),
+            cloud: None,
             net: NetOptions::default(),
             aae_interval: Duration::from_secs(30),
             mirror_interval: Duration::from_secs(60),

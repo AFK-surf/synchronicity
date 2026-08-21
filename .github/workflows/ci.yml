@@ -81,6 +81,63 @@ jobs:
       # it — is a fact about a build nothing ran.
       - run: cargo test --workspace --lib --bins --no-fail-fast
 
+  cloud-providers:
+    name: cloud CAS providers
+    runs-on: ubuntu-latest
+    env:
+      AZURITE_ACCOUNT: devstoreaccount1
+      AZURITE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO, fake-gcs-server, and Azurite
+        run: |
+          docker run -d --name synch-minio --network host \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data
+          mkdir -p "$RUNNER_TEMP/fake-gcs/synch-gcs"
+          docker run -d --name synch-fake-gcs --network host \
+            -v "$RUNNER_TEMP/fake-gcs:/data" \
+            fsouza/fake-gcs-server -scheme http -port 4443 \
+            -external-url http://127.0.0.1:4443
+          docker run -d --name synch-azurite --network host \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck \
+            --disableProductStyleUrl --disableTelemetry
+          for attempt in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null \
+              && curl -fsS http://127.0.0.1:4443/storage/v1/b >/dev/null \
+              && curl -sS http://127.0.0.1:10000/devstoreaccount1 >/dev/null \
+              && break
+            sleep 1
+          done
+      - name: Create provider namespaces
+        run: |
+          docker run --rm --network host --entrypoint=/bin/sh minio/mc -c '
+            mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+            mc mb --ignore-existing local/synch-s3
+          '
+          docker run --rm --network host mcr.microsoft.com/azure-cli \
+            az storage container create --name synch-azblob \
+            --connection-string "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT};AccountKey=${AZURITE_KEY};BlobEndpoint=http://127.0.0.1:10000/${AZURITE_ACCOUNT};"
+      - name: Run the shared backend contract against all providers
+        run: cargo test -p synch-store --test cloud_providers -- --nocapture
+        env:
+          SYNCH_TEST_CLOUD_REQUIRED: "1"
+          SYNCH_TEST_S3_BUCKET: synch-s3
+          SYNCH_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          SYNCH_TEST_S3_REGION: us-east-1
+          SYNCH_TEST_S3_ACCESS_KEY_ID: minioadmin
+          SYNCH_TEST_S3_SECRET_ACCESS_KEY: minioadmin
+          SYNCH_TEST_GCS_BUCKET: synch-gcs
+          SYNCH_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+          SYNCH_TEST_AZBLOB_CONTAINER: synch-azblob
+          SYNCH_TEST_AZBLOB_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+          SYNCH_TEST_AZBLOB_ACCOUNT_NAME: devstoreaccount1
+          SYNCH_TEST_AZBLOB_ACCOUNT_KEY: ${{ env.AZURITE_KEY }}
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

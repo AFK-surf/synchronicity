@@ -249,15 +249,21 @@ impl Node {
             let root = *root;
             crate::blocking::offload(move || Ok(store.blob(&root)?)).await?
         };
-        if !blob.as_ref().is_some_and(|b| b.complete) {
+        if !blob.as_ref().is_some_and(|b| b.complete || b.durable) {
             let Some(size) = blob.as_ref().map(|b| b.size).or(size_hint) else {
                 return Err(EngineError::NotFound(format!(
                     "no local object with root {root}; pin it as <space>/<path> so the \
                      fetch knows the object's size"
                 )));
             };
-            self.fetch_all(root, size).await?;
+            let fetched = self.fetch_all(root, size).await?;
+            if !fetched.complete {
+                return Err(EngineError::NotFound(format!(
+                    "no provider could supply the complete object {root}; it was not pinned"
+                )));
+            }
         }
+        self.finalize_cloud_object(root, true).await?;
         let pinned = {
             let store = self.store().clone();
             let root = *root;
@@ -268,7 +274,36 @@ impl Node {
                 "object {root} left the store before it could be pinned"
             )));
         }
+        if self.config().cloud.is_some() {
+            let node = self.clone();
+            let root = *root;
+            let change = crate::blocking::offload(move || node.ad_change(&root)).await?;
+            if let Some(change) = change {
+                self.stage([change]);
+                self.flush_staged().await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Removes a pin and durably retires its b-only recovery record.
+    pub async fn unpin_object(&self, root: &Hash) -> Result<bool> {
+        let store = self.store().clone();
+        let root_value = *root;
+        let removed =
+            crate::blocking::offload(move || Ok(store.set_pinned(&root_value, false)?)).await?;
+        if removed && self.config().cloud.is_some() {
+            let store = self.store().clone();
+            let root_value = *root;
+            let referenced =
+                crate::blocking::offload(move || Ok(store.content_is_referenced(&root_value)?))
+                    .await?;
+            if !referenced {
+                self.stage([(synch_core::blob_key(root), None)]);
+                self.flush_staged().await?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Fetches specific chunk groups (§6.4).
@@ -310,14 +345,24 @@ impl Node {
         donors: &[Donor],
     ) -> Result<FetchReport> {
         if size == 0 {
-            let node = self.clone();
-            let root = *root;
-            return crate::blocking::offload(move || node.take_empty_object(&root)).await;
+            return self.take_empty_object(root).await;
         }
         let mut report = FetchReport::default();
+        if let Err(error) = self
+            .cas_backend()
+            .ensure_ranges(*root, size, wanted.clone())
+            .await
+        {
+            tracing::warn!(root = %root, %error, "durable backend read fell back to peers");
+        }
         let mut remaining = wanted.difference(&self.local_groups_off_runtime(root).await?);
         if remaining.is_empty() {
             report.complete = true;
+            if self.config().cloud.as_ref().is_some_and(|cloud| {
+                cloud.upload_policy == synch_store::cloud::CloudUploadPolicy::All
+            }) {
+                self.finalize_cloud_object(root, false).await?;
+            }
             return Ok(report);
         }
 
@@ -467,7 +512,40 @@ impl Node {
         report.complete = wanted
             .difference(&self.local_groups_off_runtime(root).await?)
             .is_empty();
+        if self
+            .config()
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.upload_policy == synch_store::cloud::CloudUploadPolicy::All)
+        {
+            self.finalize_cloud_object(root, false).await?;
+        }
         Ok(report)
+    }
+
+    /// Promotes a complete cache entry into the remote durable tier.
+    async fn finalize_cloud_object(&self, root: &Hash, pin: bool) -> Result<()> {
+        let Some(config) = self.config().cloud.as_ref() else {
+            return Ok(());
+        };
+        let (size, durable) = {
+            let (store, root) = (self.store().clone(), *root);
+            crate::blocking::offload(move || {
+                store
+                    .blob(&root)?
+                    .map(|row| (row.size, row.durable))
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!("no local object with root {root}"))
+                    })
+            })
+            .await?
+        };
+        if pin && !durable && config.upload_policy == synch_store::cloud::CloudUploadPolicy::Own {
+            return Err(EngineError::invalid(
+                "cas.cloud.upload=own refuses a durability pin for peer-fetched content; use own+pinned or all",
+            ));
+        }
+        Ok(self.cas_backend().finalize(*root, size).await?)
     }
 
     /// The lineage of a version: every other root that might hold bytes of it
@@ -777,7 +855,7 @@ impl Node {
                     // through leaves what was already proven with the caller
                     // rather than discarding it.
                     client
-                        .fetch_proof_into(self.store(), *root, size, ask, level, out)
+                        .fetch_proof_into(self.cas_backend(), *root, size, ask, level, out)
                         .await?;
                     return Ok(());
                 }
@@ -804,48 +882,20 @@ impl Node {
         proven: Proven,
         report: &mut FetchReport,
     ) -> Result<Proven> {
-        let node = self.clone();
-        let root = *root;
-        let donors = donors.to_vec();
-        let (leftover, supplied) = crate::blocking::offload(move || {
-            let mut proven = proven;
-            let supplied = node.promote_blocking(&root, &donors, &mut proven)?;
-            Ok((proven, supplied))
-        })
-        .await?;
-        for (donor, got) in supplied {
-            report.promoted = report.promoted.union(&got);
-            match report.reused.iter_mut().find(|(had, _)| had == &donor) {
-                Some((_, ranges)) => *ranges = ranges.union(&got),
-                None => report.reused.push((donor, got)),
-            }
-        }
-        Ok(leftover)
-    }
-
-    /// The body of [`Node::promote_round`], for callers already off the runtime.
-    fn promote_blocking(
-        &self,
-        root: &Hash,
-        donors: &[Donor],
-        proven: &mut Proven,
-    ) -> Result<Vec<(Donor, ChunkRanges)>> {
-        let mut out = Vec::new();
+        let mut leftover = proven;
+        let mut supplied = Vec::new();
         for donor in donors {
-            if proven.is_empty() {
+            if leftover.is_empty() {
                 break;
             }
             if donor.root() == *root {
                 continue;
             }
-            // A donor that errors is a donor with nothing to give, exactly like
-            // one that matched nothing. Nothing in the descent may fail the
-            // fetch — that is the rule the rest of this path already keeps, and
-            // the proof rounds keep it per provider — but this call propagated,
-            // so a raced size settlement or an ENOSPC while copying a subtree
-            // failed a fetch that the ordinary slice path would have completed
-            // over the network.
-            let got = match self.store().promote(donor, proven, now_ns()) {
+            let got = match self
+                .cas_backend()
+                .promote(*donor, leftover.clone(), now_ns())
+                .await
+            {
                 Ok(got) => got,
                 Err(e) => {
                     tracing::debug!(
@@ -860,12 +910,19 @@ impl Node {
             if got.is_empty() {
                 continue;
             }
-            proven
+            leftover
                 .subtrees
                 .retain(|subtree| !got.overlaps(subtree.start, subtree.end()));
-            out.push((*donor, got));
+            supplied.push((*donor, got));
         }
-        Ok(out)
+        for (donor, got) in supplied {
+            report.promoted = report.promoted.union(&got);
+            match report.reused.iter_mut().find(|(had, _)| had == &donor) {
+                Some((_, ranges)) => *ranges = ranges.union(&got),
+                None => report.reused.push((donor, got)),
+            }
+        }
+        Ok(leftover)
     }
 
     /// Produces an object of no bytes locally, rather than fetching it.
@@ -884,16 +941,25 @@ impl Node {
     /// a provider would have sent. Ingesting it here is also what leaves the
     /// CAS row every later read goes through: `synch cat`, `get`, and `take` of
     /// an empty file all resolve through the store like any other object.
-    fn take_empty_object(&self, root: &Hash) -> Result<FetchReport> {
+    async fn take_empty_object(&self, root: &Hash) -> Result<FetchReport> {
         let mut report = FetchReport::default();
-        if self.store().blob(root)?.is_some_and(|blob| blob.complete) {
+        let held = {
+            let (store, root) = (self.store().clone(), *root);
+            crate::blocking::offload(move || Ok(store.blob(&root)?)).await?
+        };
+        if held.is_some_and(|blob| blob.complete) {
             report.complete = true;
             return Ok(report);
         }
         // An entry that declares no bytes while naming some other object is
         // inconsistent: nothing is invented for it, and the caller reports it
         // unservable exactly as it would any root nobody can supply.
-        report.complete = self.store().ingest_bytes(&[], now_ns())? == *root;
+        report.complete = self
+            .cas_backend()
+            .ingest_bytes(Vec::new(), now_ns())
+            .await?
+            .root
+            == *root;
         Ok(report)
     }
 
@@ -1028,7 +1094,7 @@ impl Node {
                     // later window fails, so the caller keeps them and does not
                     // ask another provider for bytes it already holds.
                     client
-                        .fetch_into(self.store(), *root, size, ask, got)
+                        .fetch_into(self.cas_backend(), *root, size, ask, got)
                         .await?;
                     return Ok(());
                 }
@@ -1102,7 +1168,7 @@ impl Node {
         Ok(self
             .store()
             .blob(root)?
-            .map(|b| b.verified_groups())
+            .map(|blob| blob.verified_groups())
             .unwrap_or_else(ChunkRanges::empty))
     }
 
@@ -1124,7 +1190,8 @@ impl Node {
     ///
     /// Buffers the whole range: callers streaming a large object want
     /// [`Node::prepare_range`] and then chunked
-    /// [`Store::read_range`](synch_store::Store::read_range) reads instead.
+    /// [`CasBackend::read_range`](synch_store::backend::CasBackend::read_range)
+    /// calls instead.
     pub async fn read_range(
         &self,
         space: &str,
@@ -1134,14 +1201,18 @@ impl Node {
         len: Option<u64>,
     ) -> Result<Vec<u8>> {
         let range = self.prepare_range(space, path, policy, start, len).await?;
-        // The read verifies every group it returns against the object's bao
-        // tree, reading payload and outboard off disk to do it: blocking work
-        // proportional to the range, so it runs on the blocking pool.
-        let store = self.store().clone();
-        crate::blocking::offload(move || {
-            Ok(store.read_range(&range.root, range.start, range.end - range.start)?)
-        })
-        .await
+        Ok(self
+            .cas_backend()
+            .read_range(range.root, range.start, range.end - range.start)
+            .await?)
+    }
+
+    /// Refills a cold local cache from the configured durable cloud backend.
+    ///
+    /// A durable row remains a complete holder after scratch loss. This is the
+    /// bridge from that metadata promise back to verified LocalFs cache bytes.
+    pub async fn ensure_blob_cached(&self, root: &Hash, size: u64) -> Result<()> {
+        Ok(self.cas_backend().ensure_cached(*root, size).await?)
     }
 
     /// Reads the policy-selected version of a path in full.
@@ -1199,6 +1270,8 @@ impl Node {
                 entry.size
             )));
         }
+        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
+            .intersect(&ChunkRanges::single(0, group_count(entry.size)));
         // Every read path resolved an entry to get here, which means the
         // lineage that makes delta possible is already in hand: `synch cat`, a
         // `take`, and the gateway's reads all get the descent for the price of
@@ -1227,8 +1300,6 @@ impl Node {
             })
             .await?
         };
-        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
-            .intersect(&ChunkRanges::single(0, group_count(entry.size)));
         let report = self
             .fetch_groups_from(&root, entry.size, &wanted, &donors)
             .await?;
@@ -1282,56 +1353,16 @@ impl Node {
         size: u64,
         target: impl Into<std::path::PathBuf>,
     ) -> Result<CloneKind> {
-        let node = self.clone();
-        let root = *root;
         let target = target.into();
-        crate::blocking::offload(move || node.materialize_blob_blocking(&root, size, &target)).await
-    }
-
-    /// The body of [`Node::materialize_blob`], for callers already off the
-    /// runtime.
-    pub(crate) fn materialize_blob_blocking(
-        &self,
-        root: &Hash,
-        size: u64,
-        target: &std::path::Path,
-    ) -> Result<CloneKind> {
-        let blob = self.store().blob(root)?.filter(|row| row.complete);
-        let Some(blob) = blob else {
-            return Err(EngineError::not_found(format!(
-                "{root} is not held whole here, so there is nothing to write to \
-                 {}",
-                target.display()
-            )));
+        let kind = self
+            .cas_backend()
+            .materialize(*root, size, target.clone())
+            .await?;
+        let kind = match kind {
+            synch_store::backend::Materialization::Reflink => CloneKind::Reflink,
+            synch_store::backend::Materialization::Copy => CloneKind::Copy,
         };
-        if blob.size != size {
-            return Err(EngineError::invalid(format!(
-                "{root} is {} bytes here, and {size} were asked for",
-                blob.size
-            )));
-        }
-        // An inline blob has no payload file to share extents with, and is at
-        // most one chunk group: it comes out of the index, verified on the way
-        // through like any other read.
-        if blob.inline.is_some() {
-            let mut out = crate::scanner::Adoption::at(target)?;
-            out.write(&self.store().read_all(root)?)?;
-            out.commit()?;
-            return Ok(CloneKind::Copy);
-        }
-        let (mut out, kind) =
-            crate::scanner::Adoption::cloning(target, &self.store().blob_path(root))?;
-        // The payload of a complete object is exactly its size; saying so costs
-        // one syscall and means a payload that somehow is not cannot produce a
-        // mirrored file that is not either.
-        out.set_len(size)?;
-        tracing::debug!(
-            target = %target.display(),
-            clone = ?kind,
-            size,
-            "materializing an object"
-        );
-        out.commit()?;
+        tracing::debug!(target = %target.display(), clone = ?kind, size, "materializing an object");
         Ok(kind)
     }
 }
@@ -1349,6 +1380,120 @@ const DESCENT_MIN_RANGE: u64 = synch_core::AD_SPAN_GRANULARITY;
 mod tests {
     use super::*;
     use crate::testkit::node;
+
+    #[tokio::test]
+    async fn a_cloud_pin_finalizes_cache_before_promising_it() {
+        let data = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let mut config = crate::config::NodeConfig::loopback(data.path());
+        config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let node = Node::open(config).await.unwrap();
+        let payload = vec![41u8; 100_000];
+        let root = node.store().ingest_bytes(&payload, now_ns()).unwrap();
+        let before = node.store().blob(&root).unwrap().unwrap();
+        assert!(before.complete);
+        assert!(!before.durable);
+        assert_eq!(
+            node.ad_change(&root).unwrap(),
+            Some((synch_core::blob_key(&root), None))
+        );
+
+        node.pin_object(&root, Some(payload.len() as u64))
+            .await
+            .unwrap();
+        let after = node.store().blob(&root).unwrap().unwrap();
+        assert!(after.pinned);
+        assert!(after.durable);
+        assert!(node
+            .store()
+            .providers(&root)
+            .unwrap()
+            .into_iter()
+            .any(|(origin, ad)| origin == *node.origin() && ad.is_complete()));
+        assert!(node.unpin_object(&root).await.unwrap());
+        assert!(!node.store().blob(&root).unwrap().unwrap().pinned);
+        assert!(!node
+            .store()
+            .providers(&root)
+            .unwrap()
+            .into_iter()
+            .any(|(origin, _)| origin == *node.origin()));
+        node.reconstruct_recovered_cloud_rows().await.unwrap();
+        assert!(!node.store().blob(&root).unwrap().unwrap().pinned);
+        assert_eq!(
+            node.cas_backend()
+                .read_range(root, 17, 901 - 17)
+                .await
+                .unwrap(),
+            payload[17..901]
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pin_refuses_an_incomplete_fetch_and_own_accepts_an_existing_durable_object() {
+        let partial_data = tempfile::tempdir().unwrap();
+        Node::init(partial_data.path(), None).unwrap();
+        let mut partial_config = crate::config::NodeConfig::loopback(partial_data.path());
+        partial_config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: partial_data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::OwnPinned,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let partial_node = Node::open(partial_config).await.unwrap();
+        let payload = vec![0x51; 100_000];
+        let provider_dir = tempfile::tempdir().unwrap();
+        let provider = synch_store::Store::open(provider_dir.path()).unwrap();
+        let root = provider.ingest_bytes(&payload, now_ns()).unwrap();
+        let wanted = ChunkRanges::single(0, 1);
+        let (encoded, served) = provider.encode_slice(&root, &wanted).unwrap();
+        partial_node
+            .cas_backend()
+            .write_slice(root, payload.len() as u64, served, encoded, now_ns())
+            .await
+            .unwrap();
+        assert!(partial_node
+            .pin_object(&root, Some(payload.len() as u64))
+            .await
+            .is_err());
+        assert!(!partial_node.store().blob(&root).unwrap().unwrap().pinned);
+        partial_node.shutdown().await.unwrap();
+
+        let own_data = tempfile::tempdir().unwrap();
+        Node::init(own_data.path(), None).unwrap();
+        let mut own_config = crate::config::NodeConfig::loopback(own_data.path());
+        own_config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: own_data.path().join("cloud-scratch"),
+            io_timeout: std::time::Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::Own,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+        let own_node = Node::open(own_config).await.unwrap();
+        let durable = own_node
+            .cas_backend()
+            .ingest_bytes(payload, now_ns())
+            .await
+            .unwrap();
+        own_node
+            .pin_object(&durable.root, Some(durable.size))
+            .await
+            .unwrap();
+        let row = own_node.store().blob(&durable.root).unwrap().unwrap();
+        assert!(row.durable && row.pinned);
+        own_node.shutdown().await.unwrap();
+    }
     use synch_core::{BlobAd, FileEntry, GroupRange};
     use synch_store::{Binding, BindingSource};
 

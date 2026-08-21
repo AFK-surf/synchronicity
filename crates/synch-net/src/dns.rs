@@ -632,6 +632,7 @@ enum Pins {
         /// variant, and this enum is cloned on every read of the pin set.
         state: Box<PinState>,
         path: Option<std::path::PathBuf>,
+        config: Option<std::sync::Arc<synch_store::Store>>,
         /// The `root.json` a persisted state must name as the repository it
         /// was accumulated under — [`tuf::EMBEDDED_TUF_ROOT`] unless
         /// `--tuf-root` replaced it. Held so a reload cannot anchor at
@@ -675,6 +676,27 @@ fn load_pin_state(path: &Path, anchor: &[u8]) -> Option<PinState> {
                      embedded bootstrap pins and re-learning on the next walk"
                 );
             }
+            None
+        }
+    }
+}
+
+fn load_config_pin_state(store: &synch_store::Store, anchor: &[u8]) -> Option<PinState> {
+    const KEY: &str = "rekor.pin_state";
+    match store.config(KEY) {
+        Ok(Some(text)) => match PinState::decode_anchored(&text, anchor) {
+            Some(state) => Some(state),
+            None => {
+                tracing::warn!(
+                    "the transparency pin state in SQLite was not loaded; starting from the \
+                     embedded bootstrap pins and re-learning on the next walk"
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not read transparency pin state from SQLite");
             None
         }
     }
@@ -817,7 +839,7 @@ pub struct DnssecTxt {
 /// root swapping the trust anchor. Neither weakens the §3.2 stance:
 /// validation happens in process against whatever anchor is in force, and
 /// the endpoint is a transport, never a validator we defer to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ResolverOptions {
     /// The DNS-over-HTTP(S) endpoint, [`DEFAULT_DOH_URL`] when unset:
     /// `https://` or `http://`, then `host[:port][/path]` (path defaults to
@@ -850,6 +872,9 @@ pub struct ResolverOptions {
     /// is global across domains and monotonic on purpose — the pin set
     /// belongs to Sigstore, not to any domain being resolved.
     pub rekor_state: Option<std::path::PathBuf>,
+    /// SQLite config store used by a daemon so pin state rides its database
+    /// replica. Takes precedence over the legacy file when both are set.
+    pub rekor_config: Option<std::sync::Arc<synch_store::Store>>,
     /// The Sigstore TUF repository the pin set follows,
     /// [`tuf::SIGSTORE_TUF_URL`] when unset (§10.2). A mirror knob rather
     /// than a trust knob: whatever it names, everything fetched under it is
@@ -943,9 +968,15 @@ impl DnssecResolver {
                         .map_err(|e| NetError::Dns(format!("TUF root {}: {e}", path.display())))?,
                 };
                 let state = options
-                    .rekor_state
+                    .rekor_config
                     .as_deref()
-                    .and_then(|path| load_pin_state(path, &anchor))
+                    .and_then(|store| load_config_pin_state(store, &anchor))
+                    .or_else(|| {
+                        options
+                            .rekor_state
+                            .as_deref()
+                            .and_then(|path| load_pin_state(path, &anchor))
+                    })
                     .unwrap_or_else(|| PinState::anchored(&anchor));
                 Pins::Tuf {
                     keys: state.log_keys().unwrap_or_else(LogKeys::embedded),
@@ -956,6 +987,7 @@ impl DnssecResolver {
                     checked_at: state.updated_at,
                     state: Box::new(state),
                     path: options.rekor_state.clone(),
+                    config: options.rekor_config.clone(),
                 }
             }
         };
@@ -1310,40 +1342,73 @@ impl DnssecResolver {
         };
         let metadata = self.walk_tuf(&source, from_root).await?;
 
-        // The state is re-read from disk rather than trusted from memory:
-        // two resolvers in one data directory share the file, and
-        // monotonicity is a property of the file, not of a process.
-        let mut pins = self.pins();
-        let Pins::Tuf {
-            keys,
-            state,
-            path,
-            anchor,
-            ..
-        } = &mut *pins
-        else {
-            return Ok(None);
+        // Persistence is read off the blocking pool with no pin mutex held:
+        // SQLite may wait behind any daemon transaction, and no runtime worker
+        // or concurrent resolver should wait with it.
+        let (memory, path, config, anchor) = {
+            let pins = self.pins();
+            let Pins::Tuf {
+                state,
+                path,
+                config,
+                anchor,
+                ..
+            } = &*pins
+            else {
+                return Ok(None);
+            };
+            (
+                (**state).clone(),
+                path.clone(),
+                config.clone(),
+                anchor.clone(),
+            )
+        };
+        let persisted = {
+            let path = path.clone();
+            let config = config.clone();
+            let anchor = anchor.clone();
+            crate::blocking::offload(move || {
+                Ok(match config.as_deref() {
+                    Some(store) => load_config_pin_state(store, &anchor),
+                    None => path
+                        .as_deref()
+                        .and_then(|path| load_pin_state(path, &anchor)),
+                })
+            })
+            .await?
         };
         // Whichever of the two is further along, whole: a state is a
         // coherent set, so taking the newer *state* is right and the newer
         // of each field would not be. Read against this resolver's anchor,
         // exactly as at startup: a state accumulated under some other TUF
         // repository is not this resolver's to adopt, however far along.
-        let current = match path
-            .as_deref()
-            .and_then(|path| load_pin_state(path, anchor))
-        {
-            Some(stored) if dominates(&stored, state) => stored,
-            _ => (**state).clone(),
+        let current = match persisted {
+            Some(stored) if dominates(&stored, &memory) => stored,
+            _ => memory,
         };
         let update = tuf::update(&metadata, &current, now).map_err(|e| tuf_error(&source, e))?;
-        if let Some(path) = path.as_deref() {
-            if let Err(e) = update.state.save(path) {
-                // A pin set that cannot be persisted is still a pin set: it
-                // is adopted for this process and re-learned next time.
-                tracing::warn!(path = %path.display(), error = %e, "could not persist the TUF pin state");
+        let persisted_state = update.state.clone();
+        let persisted = crate::blocking::offload(move || {
+            if let Some(store) = config {
+                store.set_config("rekor.pin_state", &persisted_state.encode())?;
+            } else if let Some(path) = path.as_deref() {
+                persisted_state.save(path).map_err(|error| {
+                    NetError::Dns(format!("pin state {}: {error}", path.display()))
+                })?;
             }
+            Ok(())
+        })
+        .await;
+        if let Err(error) = persisted {
+            // A pin set that cannot be persisted is still adopted for this
+            // process and re-learned next time.
+            tracing::warn!(%error, "could not persist the TUF pin state");
         }
+        let mut pins = self.pins();
+        let Pins::Tuf { keys, state, .. } = &mut *pins else {
+            return Ok(None);
+        };
         *keys = update.log_keys.clone();
         **state = update.state.clone();
         Ok(Some(update))
@@ -2187,6 +2252,32 @@ mod tests {
         SecretKey::generate().public()
     }
 
+    #[test]
+    fn resolver_loads_rekor_pin_state_from_sqlite_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let mut state = PinState::anchored(tuf::EMBEDDED_TUF_ROOT.as_bytes());
+        state.updated_at = 123;
+        store
+            .set_config("rekor.pin_state", &state.encode())
+            .unwrap();
+        let resolver = DnssecResolver::with_options(&ResolverOptions {
+            rekor_config: Some(store),
+            no_tuf: true,
+            ..ResolverOptions::default()
+        })
+        .unwrap();
+        let pins = resolver.pins();
+        let Pins::Tuf {
+            state, checked_at, ..
+        } = &*pins
+        else {
+            panic!("default resolver pins must be TUF-backed");
+        };
+        assert_eq!(state.updated_at, 123);
+        assert_eq!(*checked_at, 123);
+    }
+
     fn record(id: Option<&str>, key: &NodeId) -> String {
         match id {
             Some(id) => format!("v=sync1 id={id} nk={}", key.to_z32()),
@@ -2569,7 +2660,7 @@ mod tests {
             );
         }
         // The gate: a stamp ahead of the clock — an impossible one — is due
-        // rather than postponed, so a single integer in `rekor-pins.json`
+        // rather than postponed, so a single integer in `rekor.pin_state`
         // cannot stop every pin refresh for good, silently, across restarts.
         let t = 1_800_000_000;
         assert!(!refresh_due(t, t) && !refresh_due(t - 1, t));

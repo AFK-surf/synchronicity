@@ -81,7 +81,10 @@ impl Node {
         std::fs::create_dir_all(path)?;
         let path = std::fs::canonicalize(path)?;
         for existing in self.store().spaces()? {
-            if paths_overlap(&path, &stored_root(&existing.local_path)) {
+            let Some(local_path) = existing.local_path.as_deref() else {
+                continue;
+            };
+            if paths_overlap(&path, &stored_root(local_path)) {
                 return Err(EngineError::invalid(format!(
                     "mirror target {} overlaps space {}",
                     path.display(),
@@ -184,7 +187,30 @@ impl Node {
         // Phase 2: fetch what phase 1 could not satisfy locally — building each
         // new object in the CAS out of the old one where it can — and
         // materialize it as it lands.
-        for want in wanted {
+        for mut want in wanted {
+            if let Some(expected) = want.recoverable_donor {
+                match self
+                    .cas_backend()
+                    .ingest_file(want.target.clone(), synch_core::now_ns())
+                    .await
+                {
+                    Ok(ingested) if ingested.root == expected => {
+                        tracing::debug!(
+                            target = %want.target.display(),
+                            root = %expected,
+                            "re-ingested a mirrored file the CAS had collected"
+                        );
+                        want.donors.push(synch_store::Donor(expected));
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(
+                        target = %want.target.display(),
+                        root = %expected,
+                        %error,
+                        "could not recover a delta donor from the mirror"
+                    ),
+                }
+            }
             let fetched = self
                 .fetch_all_from(&want.content, want.size, &want.donors)
                 .await?;
@@ -220,13 +246,13 @@ impl Node {
             // as the write it protects. Phase 1 checked this path too, but a
             // fetch stands between the two and the whole point of the guard is
             // to describe the directory the write is about to land in.
-            let node = self.clone();
             let root = root_dir.clone();
             let path = want.path.clone();
             let written_target = want.target.clone();
-            let outcome = crate::blocking::offload(move || {
+            let target = want.target.clone();
+            let ready = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
-                    return Ok(Written::Escaped);
+                    return Ok(false);
                 }
                 // A directory standing where a file belongs is cleared first, if
                 // it is empty. The tree has published this path as a file and the
@@ -235,41 +261,55 @@ impl Node {
                 // pass after next. A non-empty directory still fails here, which
                 // is correct — its children are swept in phase 3 and the pass
                 // after that succeeds.
-                if want
-                    .target
-                    .symlink_metadata()
-                    .is_ok_and(|meta| meta.is_dir())
-                {
-                    let _ = std::fs::remove_dir(&want.target);
+                if target.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+                    let _ = std::fs::remove_dir(&target);
                 }
+                Ok(true)
+            })
+            .await?;
+            let outcome = if !ready {
+                Written::Escaped
+            } else {
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched, and the next pass
                 // tries again.
-                let kind =
-                    match node.materialize_blob_blocking(&want.content, want.size, &want.target) {
-                        Ok(kind) => kind,
-                        Err(e) => return Ok(Written::Failed(e.to_string())),
-                    };
-                // The bytes are the file; its metadata is stamped on right
-                // after, and a filesystem that refuses the stamp — a mount
-                // that will not take the mode, a foreign owner — is reported
-                // rather than allowed to fail the whole pass.
-                let stamped = apply_metadata(&want.target, want.meta);
-                // No read-back: a successful write is trusted the way the CAS
-                // trusts its own payloads (§2.1). What later passes trust is
-                // the record anchored to the fresh stat — anything that moves
-                // the file moves the stat, and the next pass hashes again.
-                Ok(match MirrorWrite::of(&want.target, want.content) {
-                    Some(record) => match stamped {
-                        Ok(()) => Written::Fully(kind, record),
-                        Err(e) => Written::WithoutMetadata(kind, record, e.to_string()),
-                    },
-                    None => Written::Failed(
-                        "the file was gone before its write could be recorded".into(),
-                    ),
+                let kind = match self
+                    .materialize_blob(&want.content, want.size, want.target.clone())
+                    .await
+                {
+                    Ok(kind) => kind,
+                    Err(e) => {
+                        report
+                            .skipped
+                            .push((want.path, format!("content could not be written: {e}")));
+                        continue;
+                    }
+                };
+                let target = want.target.clone();
+                let content = want.content;
+                let meta = want.meta;
+                crate::blocking::offload(move || {
+                    // The bytes are the file; its metadata is stamped on right
+                    // after, and a filesystem that refuses the stamp — a mount
+                    // that will not take the mode, a foreign owner — is reported
+                    // rather than allowed to fail the whole pass.
+                    let stamped = apply_metadata(&target, meta);
+                    // No read-back: a successful write is trusted the way the CAS
+                    // trusts its own payloads (§2.1). What later passes trust is
+                    // the record anchored to the fresh stat — anything that moves
+                    // the file moves the stat, and the next pass hashes again.
+                    Ok(match MirrorWrite::of(&target, content) {
+                        Some(record) => match stamped {
+                            Ok(()) => Written::Fully(kind, record),
+                            Err(e) => Written::WithoutMetadata(kind, record, e.to_string()),
+                        },
+                        None => Written::Failed(
+                            "the file was gone before its write could be recorded".into(),
+                        ),
+                    })
                 })
-            })
-            .await?;
+                .await?
+            };
             // Remembered whenever the bytes landed, so later passes can
             // believe the file's stat instead of re-hashing it
             // (`Node::note_mirror_write`).
@@ -414,6 +454,8 @@ struct WantedContent {
     /// Where the bytes might already be, in §3.2 priority order
     /// (`docs/DELTA-SYNC.md`).
     donors: Vec<synch_store::Donor>,
+    /// Root the target itself can become through backend ingest before fetch.
+    recoverable_donor: Option<synch_core::Hash>,
 }
 
 /// How one write in phase 2 ended.
@@ -657,11 +699,13 @@ fn plan_pass(
             // becomes the ordinary CAS donor it is a copy of — one pass over a
             // file this node was about to rewrite anyway. Only when delta would
             // use it: below `delta_min_size` there is no descent to feed.
-            let mut donors = node.donors_for(&selected, set)?;
-            if donors.is_empty() && selected.size >= node.config().delta_min_size {
-                let recovered = reingest_the_copy_on_disk(node, &selected, set, &target, on_disk)?;
-                donors.extend(recovered.map(synch_store::Donor));
-            }
+            let donors = node.donors_for(&selected, set)?;
+            let recoverable_donor =
+                if donors.is_empty() && selected.size >= node.config().delta_min_size {
+                    donor_copy_on_disk(node, &selected, set, &target, on_disk)?
+                } else {
+                    None
+                };
             wanted.push(WantedContent {
                 path: set.path.clone(),
                 target,
@@ -669,6 +713,7 @@ fn plan_pass(
                 size: selected.size,
                 meta,
                 donors,
+                recoverable_donor,
             });
         }
     }
@@ -906,7 +951,7 @@ fn hash_file(target: &Path) -> Option<synch_core::Hash> {
         .and_then(|file| synch_core::hash_reader(std::io::BufReader::new(file)).ok())
 }
 
-/// Recovers a donor the CAS has lost but the mirror is still sitting on
+/// Identifies a donor the CAS has lost but the mirror is still sitting on
 /// (`docs/DELTA-SYNC.md` §3.2).
 ///
 /// Delta donors are CAS objects, which leaves one capability to account for:
@@ -923,8 +968,10 @@ fn hash_file(target: &Path) -> Option<synch_core::Hash> {
 /// rewrite anyway; the ingest after it is a second one, and buys a rewrite that
 /// costs the change rather than the object.
 ///
-/// `known` is the file's root where the currency check already computed it.
-fn reingest_the_copy_on_disk(
+/// The async phase performs the backend ingest after this blocking planner has
+/// returned. `known` is the file's root where the currency check already
+/// computed it.
+fn donor_copy_on_disk(
     node: &Node,
     selected: &EntryRow,
     versions: &synch_store::VersionSet,
@@ -941,19 +988,7 @@ fn reingest_the_copy_on_disk(
     if !wanted.contains(&on_disk) {
         return Ok(None);
     }
-    let (root, _) = node.store().ingest_file(target, synch_core::now_ns())?;
-    // A file rewritten under the ingest is not the version that was wanted, and
-    // whatever did land in the CAS is some other object the collector will deal
-    // with in its own time.
-    if root != on_disk {
-        return Ok(None);
-    }
-    tracing::debug!(
-        target = %target.display(),
-        root = %root,
-        "re-ingested a mirrored file the CAS had collected"
-    );
-    Ok(Some(root))
+    Ok(Some(on_disk))
 }
 
 /// Returns true if any ancestor of `rel` under `root` is a symlink, so that
@@ -1559,7 +1594,8 @@ mod tests {
         let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
 
         let kind = node
-            .materialize_blob_blocking(&root, new.len() as u64, &target)
+            .materialize_blob(&root, new.len() as u64, &target)
+            .await
             .unwrap();
         assert!(matches!(
             kind,
@@ -1570,7 +1606,7 @@ mod tests {
 
         // And an object small enough to live in the index comes out of it.
         let root = node.store().ingest_bytes(b"tiny", now_ns()).unwrap();
-        node.materialize_blob_blocking(&root, 4, &target).unwrap();
+        node.materialize_blob(&root, 4, &target).await.unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"tiny");
         assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
         node.shutdown().await.unwrap();
@@ -1589,17 +1625,18 @@ mod tests {
         // An object this node does not hold at all.
         let absent = Hash::new(b"nobody has this");
         let err = node
-            .materialize_blob_blocking(&absent, 100_000, &target)
+            .materialize_blob(&absent, 100_000, &target)
+            .await
             .unwrap_err();
-        assert!(err.to_string().contains("not held whole"), "{err}");
+        assert!(err.to_string().contains("not in the local store"), "{err}");
 
-        // One whose payload has gone from under the index: the staging file is
-        // created, then the clone of the payload fails.
+        // One removed before materialization likewise leaves the target whole.
         let new: Vec<u8> = (0..100_000).map(|i| (i % 13) as u8).collect();
         let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
-        std::fs::remove_file(node.store().blob_path(&root)).unwrap();
+        node.store().delete_blob(&root).unwrap();
         assert!(node
-            .materialize_blob_blocking(&root, new.len() as u64, &target)
+            .materialize_blob(&root, new.len() as u64, &target)
+            .await
             .is_err());
 
         assert_eq!(

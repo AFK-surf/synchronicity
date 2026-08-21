@@ -9,10 +9,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bao-tree.workspace = true
 blake3.workspace = true
+bytes.workspace = true
 hex.workspace = true
 iroh-base.workspace = true
+opendal.workspace = true
 postcard.workspace = true
 range-collections.workspace = true
 rusqlite.workspace = true
@@ -20,15 +23,20 @@ serde.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
-# `copy_file_range`, which shares extents rather than copying them wherever the
-# CAS lives on a filesystem that can (`docs/DELTA-SYNC.md` §3.4).
-[target.'cfg(target_os = "linux")'.dependencies]
+# Filesystem capacity for the cloud cache's 20%-free floor on Unix, plus Linux
+# reflink/copy-range acceleration (`docs/SERVERLESS.md` §6.3).
+[target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 proptest.workspace = true
+rustls.workspace = true
 tempfile.workspace = true
 
 [lints]

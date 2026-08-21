@@ -290,7 +290,7 @@ async fn an_object_larger_than_one_frame_transfers() {
     let blob = connect_blob(&follower, &publisher).await;
     let all = ChunkRanges::single(0, synch_core::group_count(payload.len() as u64));
     let mut got = ChunkRanges::empty();
-    blob.fetch_into(&follower.store, root, payload.len() as u64, &all, &mut got)
+    blob.fetch_into(&follower.cas, root, payload.len() as u64, &all, &mut got)
         .await
         .unwrap();
     assert_eq!(got.count(), synch_core::group_count(payload.len() as u64));

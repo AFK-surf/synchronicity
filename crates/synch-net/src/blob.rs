@@ -116,14 +116,16 @@ fn check_served(served: ChunkRanges, requested: &ChunkRanges) -> Result<ChunkRan
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
     store: Arc<Store>,
+    backend: Arc<dyn synch_store::backend::CasBackend>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl BlobProtocol {
     /// Builds a handler over a store.
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<Store>, backend: Arc<dyn synch_store::backend::CasBackend>) -> Self {
         BlobProtocol {
             store,
+            backend,
             on_unknown_key: None,
         }
     }
@@ -237,16 +239,14 @@ impl BlobProtocol {
                 // a window is up to `MAX_SLICE_GROUPS` — so it runs on the
                 // blocking pool. Serving one peer's large object must not stop
                 // this node's connection tasks from polling (§10).
-                let store = self.store.clone();
-                let (encoded, served) =
-                    crate::blocking::offload(move || match store.encode_slice(&root, &ranges) {
-                        Ok(pair) => Ok(pair),
-                        Err(synch_store::StoreError::MissingBlob(_)) => {
-                            Ok((Vec::new(), ChunkRanges::empty()))
-                        }
-                        Err(e) => Err(e.into()),
-                    })
-                    .await?;
+                let backend = self.backend.clone();
+                let (encoded, served) = match backend.encode_slice(root, ranges).await {
+                    Ok(pair) => pair,
+                    Err(synch_store::StoreError::MissingBlob(_)) => {
+                        (Vec::new(), ChunkRanges::empty())
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 write_bytes(send, &encoded).await?;
                 write_frame(send, &BlobMessage::SliceEnd { served }).await?;
                 Ok(())
@@ -271,17 +271,17 @@ impl BlobProtocol {
                 // but it still walks a tree and reads an outboard off disk, and
                 // the leaf-level round over a large edit walks a lot of one. It
                 // goes to the blocking pool with everything else (§10).
-                let store = self.store.clone();
-                let (encoded, served) = crate::blocking::offload(move || {
-                    match store.encode_proof(&root, &ranges, level, MAX_PROOF_NODES) {
-                        Ok(pair) => Ok(pair),
-                        Err(synch_store::StoreError::MissingBlob(_)) => {
-                            Ok((Vec::new(), ChunkRanges::empty()))
-                        }
-                        Err(e) => Err(e.into()),
+                let backend = self.backend.clone();
+                let (encoded, served) = match backend
+                    .encode_proof(root, ranges, level, MAX_PROOF_NODES)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(synch_store::StoreError::MissingBlob(_)) => {
+                        (Vec::new(), ChunkRanges::empty())
                     }
-                })
-                .await?;
+                    Err(e) => return Err(e.into()),
+                };
                 write_bytes(send, &encoded).await?;
                 write_frame(send, &BlobMessage::ProofEnd { served }).await?;
                 Ok(())
@@ -424,7 +424,7 @@ impl BlobClient {
     /// every `ProvenSubtree` already received for `Store::promote`.
     pub async fn fetch_proof_into(
         &self,
-        store: &Arc<Store>,
+        backend: &Arc<dyn synch_store::backend::CasBackend>,
         root: Hash,
         size: u64,
         ranges: &ChunkRanges,
@@ -480,7 +480,7 @@ impl BlobClient {
                 continue;
             }
             barren = 0;
-            let store = store.clone();
+            let backend = backend.clone();
             let encoded = proof.encoded;
             let for_store = served.clone();
             // The fold goes over with the write it belongs to. `absorb`
@@ -489,9 +489,10 @@ impl BlobClient {
             // and it touches no store connection, so leaving it out here put
             // it somewhere §10's checker cannot see.
             let mut carried = std::mem::replace(&mut out.proven, Proven::none(root, size));
+            let proven = backend
+                .write_proof(root, size, for_store, level, encoded, now_ns())
+                .await?;
             out.proven = crate::blocking::offload(move || {
-                let proven =
-                    store.write_proof(&root, size, &for_store, level, &encoded, now_ns())?;
                 carried.absorb(proven)?;
                 Ok(carried)
             })
@@ -515,7 +516,7 @@ impl BlobClient {
     /// provider for bytes this node already held and re-decoded them.
     pub async fn fetch_into(
         &self,
-        store: &Arc<Store>,
+        backend: &Arc<dyn synch_store::backend::CasBackend>,
         root: Hash,
         size: u64,
         ranges: &ChunkRanges,
@@ -545,14 +546,13 @@ impl BlobClient {
             // writes both the sparse payload and its outboard, then fsyncs
             // them before the bitmap advances — the heaviest disk work a fetch
             // does, and it happens once per window. Off the runtime it goes.
-            let store = store.clone();
+            let backend = backend.clone();
             let served = slice.served.clone();
             let encoded = slice.encoded;
-            let written = crate::blocking::offload(move || {
-                Ok(store.write_slice(&root, size, &served, &encoded, now_ns())?)
-            })
-            .await?;
-            *got = got.union(&written);
+            let written = backend
+                .write_slice(root, size, served, encoded, now_ns())
+                .await?;
+            *got = got.union(&written.groups);
         }
         Ok(())
     }
@@ -662,6 +662,8 @@ mod tests {
         });
 
         let (_fetcher_dir, fetcher) = test_store();
+        let fetcher_backend: Arc<dyn synch_store::backend::CasBackend> =
+            Arc::new(synch_store::backend::LocalFs::new(fetcher));
         let dialer = bare_endpoint(ALPN_BLOB).await;
         let connection = dialer.connect(addr, ALPN_BLOB).await.unwrap();
         let client = BlobClient::new(connection);
@@ -672,7 +674,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             client.fetch_proof_into(
-                &fetcher,
+                &fetcher_backend,
                 root,
                 size,
                 &ChunkRanges::single(0, groups),

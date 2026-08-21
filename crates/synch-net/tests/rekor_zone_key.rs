@@ -78,6 +78,7 @@ fn resolver(
         rekor: Some(policy),
         rekor_key: Some(log_key.to_path_buf()),
         rekor_state: None,
+        rekor_config: None,
         tuf_url: None,
         no_tuf: true,
         tuf_root: None,

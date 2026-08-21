@@ -17,6 +17,10 @@ use crate::{control::Server, render};
 /// Stopping happens on `Ctrl-C` or on a `synch daemon stop` request; both fire
 /// the same broadcast, which every task shuts down on.
 pub async fn run(config: NodeConfig) -> Result<()> {
+    // Before Store open and before iroh bind: offline migration holds the same
+    // lock, so the two can never overlap during initialization either.
+    let _lifecycle = crate::control::transport::LifecycleLock::acquire(&config.data_dir)
+        .context("another daemon or CAS migration owns this data directory")?;
     // No "(run `synch init` first?)" stapled onto every failure: the
     // uninitialized case already says exactly that itself, and the hint sent
     // an operator with a taken port off to re-init a healthy node.
@@ -28,7 +32,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // it is configured for has nothing to serve past the current grace window,
     // and finding that out at startup is the difference between a fixable
     // message and a cluster that partitions on a timer.
-    let resolver = match build_resolver(&node) {
+    let resolver = match build_resolver(&node).await {
         Ok(resolver) => resolver,
         Err(e) => {
             let _ = node.shutdown().await;
@@ -69,6 +73,19 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         Ok(0) => {}
         Ok(reopened) => tracing::info!(reopened, "reopened interrupted multipart uploads"),
         Err(e) => tracing::warn!(error = %e, "could not reopen interrupted uploads"),
+    }
+
+    // A restored SQLite replica may trail an acknowledged publish whose bytes
+    // already reached the cloud CAS. Peers retain the signed head; recover it
+    // before scanner or publisher tasks can mint a competing successor.
+    match node.readopt_self_on_startup().await {
+        Ok(true) => tracing::info!("re-adopted a newer own-origin head from a peer"),
+        Ok(false) => {}
+        Err(error) => {
+            let _ = node.shutdown().await;
+            return Err(anyhow::Error::new(error)
+                .context("startup own-head/cloud durability recovery failed"));
+        }
     }
 
     let control = tokio::spawn(server.run());
@@ -245,7 +262,7 @@ async fn open_once_named(config: NodeConfig, stop: &broadcast::Sender<()>) -> Re
                     serving = Some((tokio::spawn(server.run()), pending_stop));
                 }
                 tokio::select! {
-                    signal = tokio::signal::ctrl_c() => {
+                    signal = termination_signal() => {
                         signal?;
                         stop_pending(serving.take()).await;
                         anyhow::bail!("stopped while waiting for {domain} to name this node");
@@ -339,7 +356,7 @@ async fn stop_pending(
 /// immediate, loose enough not to flood a name that does not exist yet.
 const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Waits for the daemon to be told to stop: `Ctrl-C`, or a `synch daemon stop`
+/// Waits for the daemon to be told to stop: SIGINT/SIGTERM, or a `synch daemon stop`
 /// request landing on the control socket.
 ///
 /// `Ctrl-C` fires the same broadcast a control request does, so both paths shut
@@ -349,7 +366,7 @@ async fn wait_for_stop(
     stopped: &mut broadcast::Receiver<()>,
 ) -> Result<()> {
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
+        signal = termination_signal() => {
             signal?;
             println!("shutting down");
             let _ = stop_tx.send(());
@@ -357,6 +374,28 @@ async fn wait_for_stop(
         _ = stopped.recv() => {}
     }
     Ok(())
+}
+
+/// Resolves the process-manager stop signals into one clean-shutdown path.
+///
+/// Containers and service managers send SIGTERM; terminals send SIGINT. Both
+/// must reach `Node::shutdown` so SQLite checkpoints and a Litestream sidecar
+/// can ship the WAL tail before the process exits.
+async fn termination_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 /// Builds the one resolver this daemon refreshes membership through, and
@@ -377,8 +416,15 @@ async fn wait_for_stop(
 /// none configured there is nothing to refresh, so the daemon runs on static
 /// trust and the reason is recorded where `doctor`, `daemon status` and the next
 /// `domain set` will say it.
-fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::DnssecResolver>>> {
-    match synch_net::DnssecResolver::with_options(&node.config().dns) {
+async fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::DnssecResolver>>> {
+    let dns = node.config().dns.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        synch_net::DnssecResolver::with_options(&dns)
+    })
+    .await
+    .context("the DNS resolver construction task did not complete")?;
+    match built {
         Ok(resolver) => {
             let resolver = std::sync::Arc::new(resolver);
             node.set_dns_resolver(Ok(resolver.clone()));
@@ -386,7 +432,14 @@ fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::Dnssec
         }
         Err(e) => {
             node.set_dns_resolver(Err(e.to_string()));
-            if let Some(domain) = node.domain()? {
+            let lookup = node.clone();
+            let domain = tokio::task::spawn_blocking(move || {
+                let _scope = synch_core::BlockingScope::enter();
+                lookup.domain()
+            })
+            .await
+            .context("the membership-domain lookup task did not complete")??;
+            if let Some(domain) = domain {
                 return Err(anyhow::Error::new(e).context(format!(
                     "no DNSSEC resolver could be built, so {domain} would never refresh: \
                      its bindings would lapse a grace window from now, and this node's own \
@@ -418,13 +471,9 @@ async fn run_upload_sweeper(node: &Node, shutdown: ShutdownSignal) {
         tokio::select! {
             _ = &mut shutdown => return,
             _ = tokio::time::sleep(UPLOAD_SWEEP_INTERVAL) => {
-                let sweeping = node.clone();
-                // Off the runtime: the sweep stats a directory tree and unlinks
-                // what it finds, which is real disk work.
-                let swept = synch_core::offload(move || {
-                    sweeping.sweep_uploads(synch_engine::DEFAULT_UPLOAD_TTL)
-                })
-                .await;
+                let swept = node
+                    .sweep_uploads_durable(synch_engine::DEFAULT_UPLOAD_TTL)
+                    .await;
                 match swept {
                     Ok(0) => {}
                     Ok(collected) => tracing::info!(collected, "swept multipart uploads"),

@@ -446,6 +446,14 @@ fn space_add(id: &str, path: &str) -> Command {
     Command::SpaceAdd(pb::SpaceAdd {
         id: id.into(),
         path: path.into(),
+        detached: false,
+    })
+}
+fn detached_space_add(id: &str) -> Command {
+    Command::SpaceAdd(pb::SpaceAdd {
+        id: id.into(),
+        path: String::new(),
+        detached: true,
     })
 }
 fn space_rm(id: &str) -> Command {
@@ -1095,6 +1103,57 @@ async fn a_dropped_write_publishes_nothing() {
         b"kept"
     );
 
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_space_put_publishes_from_the_cas_without_a_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    says(
+        data_dir,
+        detached_space_add("media"),
+        "holding detached space media",
+    )
+    .await;
+
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let mut put = client.put("media", "nested/cloud.txt").await.unwrap();
+    put.chunk(b"cloud bytes".to_vec()).await.unwrap();
+    let written = put.finish().await.unwrap();
+    assert_eq!(written.path, "media/nested/cloud.txt");
+    assert_eq!(written.entry.size, 11);
+    let root = written.entry.content.unwrap();
+    let inspecting = daemon.node.clone();
+    let (bytes, local_path, local_files) = synch_core::offload(move || {
+        Ok::<_, synch_engine::EngineError>((
+            inspecting.store().read_all(&root)?,
+            inspecting.store().space("media")?.unwrap().local_path,
+            inspecting.store().local_files("media")?,
+        ))
+    })
+    .await
+    .unwrap();
+    assert_eq!(bytes, b"cloud bytes");
+    assert_eq!(local_path, None);
+    assert!(local_files.is_empty());
+
+    let deleted = client.delete("media", "nested/cloud.txt").await.unwrap();
+    assert!(!deleted.still_published);
+    let inspecting = daemon.node.clone();
+    let kind = synch_core::offload(move || {
+        Ok::<_, synch_engine::EngineError>(
+            inspecting
+                .store()
+                .entry(inspecting.origin(), "media", "nested/cloud.txt")?
+                .unwrap()
+                .kind,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(kind, synch_core::EntryKind::Tombstone);
     daemon.shutdown().await;
 }
 

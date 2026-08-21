@@ -29,6 +29,7 @@ synch-engine = { path = "crates/synch-engine", version = "0.1.0" }
 synch-cli = { path = "crates/synch-cli", version = "0.1.0" }
 
 anyhow = "1.0.104"
+async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
 bao-tree = { version = "0.16.0", default-features = false, features = ["validate"] }
 base64 = "0.22.1"
@@ -42,6 +43,7 @@ ctor = "0.4"
 directories = "6.0.0"
 futures-core = "0.3"
 futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
+fs2 = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -56,6 +58,7 @@ iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 iroh-mainline-address-lookup = "0.5.0"
 n0-mainline = "0.6.0"
 notify = "8.2.0"
+opendal = { version = "0.58.1", default-features = false, features = ["executors-tokio", "reqwest-rustls-no-provider-tls", "layers-retry", "layers-timeout", "services-memory", "services-s3", "services-gcs", "services-azblob"] }
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 prost = "0.14.4"
 proptest = "1.11.0"
@@ -102,6 +105,7 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-normalization = "0.1.25"
+windows-sys = "0.61.2"
 
 [profile.release]
 opt-level = 3

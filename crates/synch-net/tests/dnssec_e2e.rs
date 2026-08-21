@@ -15,6 +15,7 @@ fn options(url: String, anchor: &std::path::Path) -> ResolverOptions {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        rekor_config: None,
         tuf_url: None,
         no_tuf: true,
         tuf_root: None,

@@ -14,6 +14,26 @@ pub enum StoreError {
     /// Filesystem I/O failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A cloud object-store operation failed.
+    #[error("cloud {operation} {path}: {source}")]
+    Cloud {
+        /// The semantic operation being attempted.
+        operation: &'static str,
+        /// The provider-neutral object path.
+        path: String,
+        /// OpenDAL's normalized provider error and source chain.
+        #[source]
+        source: Box<opendal::Error>,
+    },
+    /// A strongly consistent cloud service authoritatively reported no object.
+    #[error("cloud object {path} is missing")]
+    CloudNotFound {
+        /// The provider-neutral object path.
+        path: String,
+        /// OpenDAL's normalized NotFound error.
+        #[source]
+        source: Box<opendal::Error>,
+    },
     /// A trie operation failed.
     #[error(transparent)]
     Mpt(#[from] synch_mpt::MptError),
@@ -31,8 +51,8 @@ pub enum StoreError {
     /// A blob was not in the local content store.
     #[error("blob {0} is not in the local store")]
     MissingBlob(Hash),
-    /// A verified read or slice decode failed against the object root.
-    #[error("content verification failed for {root}: {reason}")]
+    /// Untrusted wire data or a metadata claim failed validation.
+    #[error("object validation failed for {root}: {reason}")]
     Verification {
         /// The object root the content failed against.
         root: Hash,

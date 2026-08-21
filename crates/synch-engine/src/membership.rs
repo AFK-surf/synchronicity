@@ -996,7 +996,6 @@ impl Node {
         // projection rather than every inline payload in the store.
         let blobs = self.store().blob_candidates()?;
         let complete_blobs = blobs.iter().filter(|b| b.complete).count();
-
         Ok(DoctorReport {
             origin: self.origin().clone(),
             device_keys: self

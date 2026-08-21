@@ -83,7 +83,28 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V17_DELEGATED_BINDINGS),
     Migration::Sql(V18_REDACTED_NODES),
     Migration::Sql(V19_S3_MULTIPART_UPLOADS),
+    Migration::Sql(V20_SERVERLESS_FOUNDATION),
 ];
+
+/// v20 — state shared by filesystem and serverless CAS backends.
+///
+/// `complete` describes the verified bytes available in the backend's local
+/// working set. `durable` is deliberately separate: an S3 backend may have a
+/// complete scratch copy which policy has not promoted, or a durable object
+/// whose local cache is empty. Local-filesystem rows are backfilled because a
+/// complete local object already passed the fsync-before-row invariant.
+///
+/// A nullable space path is the representation of a detached space. It has no
+/// scanner or watcher root, but remains a space this origin can publish into.
+const V20_SERVERLESS_FOUNDATION: &str = r#"
+ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
+UPDATE blobs SET durable = complete;
+
+ALTER TABLE spaces RENAME TO spaces_v19;
+CREATE TABLE spaces (id TEXT PRIMARY KEY, local_path TEXT);
+INSERT INTO spaces (id, local_path) SELECT id, local_path FROM spaces_v19;
+DROP TABLE spaces_v19;
+"#;
 
 /// v19 — the multipart uploads an S3 client has open (§9.4).
 ///
@@ -651,9 +672,10 @@ CREATE TABLE blobs (
   bitmap      BLOB,
   inline      BLOB,
   pinned      INTEGER NOT NULL DEFAULT 0,
-  last_access INTEGER NOT NULL
+  last_access INTEGER NOT NULL,
+  durable     INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL);
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));

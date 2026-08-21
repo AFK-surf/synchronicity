@@ -42,6 +42,85 @@ regenerated on every daemon start and sent as a header on every call. The servic
 schema is `crates/synch-cli/proto/control.proto`. With no daemon running, every
 command except `synch init` fails with a message naming that socket.
 
+## Serverless mode
+
+Serverless mode runs the daemon on an ephemeral local volume while keeping file
+content in S3, Google Cloud Storage, or Azure Blob through OpenDAL. SQLite is
+still the metadata database; run Litestream beside the daemon so that database,
+including the device identity, survives replacement. This is a long-running,
+scale-to-one peer, not request-scoped FaaS.
+
+An S3-backed node can be bootstrapped like this (standard AWS environment or
+workload credentials are used for authentication):
+
+```sh
+export SYNCH_DATA_DIR=/run/synch
+export SYNCH_CAS_BACKEND=s3
+export SYNCH_S3_BUCKET=my-synch-cas
+export SYNCH_S3_REGION=us-east-1
+export SYNCH_CAS_ROOT=nodes/production
+export SYNCH_CAS_CACHE_BYTES=10737418240     # 10 GiB maintenance target
+
+synch init --domain cluster.example.com     # once, only if restore found no database
+synch daemon run &
+synch space add media --detached
+```
+
+Use `SYNCH_CAS_BACKEND=gcs` with `SYNCH_GCS_BUCKET` (and optionally
+`SYNCH_GCS_CREDENTIAL_PATH`), or `SYNCH_CAS_BACKEND=azblob` with
+`SYNCH_AZBLOB_CONTAINER`, `SYNCH_AZBLOB_ACCOUNT_NAME`, and credentials supplied
+by the Azure environment or `SYNCH_AZBLOB_ACCOUNT_KEY`. S3-compatible stores can
+set `SYNCH_S3_ENDPOINT`; GCS and Azure have corresponding
+`SYNCH_GCS_ENDPOINT` and `SYNCH_AZBLOB_ENDPOINT` overrides. Run `synch --help`
+for the complete provider options. The storage-policy flags are `--cas-root`,
+`--cas-cache-bytes`, and `--cas-upload` when environment variables are not
+used.
+
+Only detached spaces are valid on a cloud-backed node. They have no scanner,
+watcher, or local checkout: gateway writes and `synch take` ingest directly into
+the cloud CAS, while `cat`, `get`, and gateway reads fill the ephemeral range
+cache on demand. A durable-disk node can still mirror a detached space when a
+checkout is wanted elsewhere.
+
+The default `SYNCH_CAS_UPLOAD=own+pinned` uploads content created by this node
+and peer content it pins. Use `own` to upload only locally created content, or
+`all` to make the node a durable replica of every object it fetches completely.
+`SYNCH_CAS_CACHE_BYTES` is a maintenance target, not a per-request hard limit;
+on Unix, omitting it targets at least 20% free space.
+
+For production deployment:
+
+1. Restore `<data-dir>/synchronicity.db` from Litestream before starting the
+   daemon; initialize only when no database exists.
+2. Replicate that database continuously while the daemon runs. The replica
+   contains device secret keys, so protect it separately from the CAS prefix.
+3. Run exactly one daemon for a data directory/identity (`replicas: 1`, with a
+   recreate rather than rolling-update strategy) and allow at least 30 seconds
+   for SIGTERM shutdown.
+4. Do not apply expiration or deletion lifecycle rules to the final `cas/`
+   prefix. Synchronicity deliberately leaves final cloud objects append-only;
+   local deletion removes only metadata and cache files.
+
+A write is acknowledged only after its payload and Bao outboard are stored in
+the provider and the durable metadata and published records commit. Provider
+errors therefore fail writes closed; cold reads fall back to cache or peers when
+possible. The provider is trusted to preserve acknowledged bytes—Synchronicity
+does not independently detect corruption at rest. The cloud CAS is sufficient
+as the only durable store for file bytes, but Litestream and signed peer heads
+remain necessary to recover filenames, versions, and pins.
+
+To convert an existing node, first ensure every space is detached, stop the
+daemon, supply the destination provider settings above, and run:
+
+```sh
+synch cas migrate --to s3                 # or gcs / azblob / local
+```
+
+Migration copies every candidate before atomically changing the configured
+backend and is safe to retry after interruption. See
+[docs/SERVERLESS.md](docs/SERVERLESS.md) for the full durability, recovery,
+failure, and Kubernetes deployment contract.
+
 Admit a peer. Trust is unilateral, so each side runs this for the other:
 
 ```sh

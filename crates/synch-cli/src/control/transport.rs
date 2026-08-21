@@ -30,8 +30,43 @@ pub const SOCKET_FILE: &str = "control.sock";
 /// The token file inside the data directory.
 pub const TOKEN_FILE: &str = "control.token";
 
+/// Stable inode used to exclude daemon startup and offline CAS migration.
+const LIFECYCLE_FILE: &str = "lifecycle.lock";
+
 /// How many bytes the control token has.
 pub const TOKEN_LEN: usize = 32;
+
+/// Process-held exclusive ownership of a data directory's mutable lifecycle.
+#[derive(Debug)]
+pub struct LifecycleLock(std::fs::File);
+
+impl LifecycleLock {
+    /// Acquires the lock before opening the Store or any network endpoint.
+    pub fn acquire(data_dir: &Path) -> io::Result<Self> {
+        use fs2::FileExt;
+        harden_data_dir(data_dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join(LIFECYCLE_FILE))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.try_lock_exclusive()
+            .map_err(|_| already_running_error(data_dir))?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
 
 /// The authority every control channel claims.
 ///
@@ -509,5 +544,15 @@ mod tests {
             err.to_string().contains(&endpoint_name(dir.path())),
             "{err}"
         );
+    }
+
+    #[test]
+    fn lifecycle_lock_excludes_daemon_and_migration_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = LifecycleLock::acquire(dir.path()).unwrap();
+        let error = LifecycleLock::acquire(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
+        drop(held);
+        LifecycleLock::acquire(dir.path()).unwrap();
     }
 }

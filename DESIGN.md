@@ -1878,11 +1878,11 @@ CREATE TABLE blobs (
   bitmap      BLOB,                      -- verified 16 KiB-group bitmap when partial
   inline      BLOB,                      -- payload for small blobs, else NULL (fs store)
   pinned      INTEGER NOT NULL DEFAULT 0,
-  last_access INTEGER NOT NULL
+  last_access INTEGER NOT NULL,
+  durable     INTEGER NOT NULL DEFAULT 0  -- backend stable-storage promise (docs/SERVERLESS.md §5)
 );
-
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL);
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT); -- NULL = detached
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
@@ -2002,10 +2002,11 @@ CI (GitHub Actions):
   space. That power is not created by delegation — a member already reads every space
   and can hand over its device secret — but delegation is what makes an exercise of it
   bounded, dated and published where `synch delegate ls` on any node can read it.
-- **Data integrity**: three independent hash-verification layers — trie nodes verified
-  against requested hashes, heads verified against origin signatures, content verified
-  against object roots per 16 KiB group. A compromised peer can withhold, but never
-  corrupt.
+- **Protocol integrity**: trie nodes are verified against requested hashes, heads
+  against origin signatures, and content received from peers against object roots per
+  16 KiB group. A compromised peer can withhold, but never inject bytes. LocalFs and
+  the configured OpenDAL service are trusted storage boundaries; stored bytes are not
+  re-hashed by the application.
 - **DNSSEC blast radius**: whoever controls the membership domain (or its DNSSEC keys)
   controls membership — adding a hostile node grants full read access and publish
   rights. With named origins the exposure is strictly larger: the domain controller

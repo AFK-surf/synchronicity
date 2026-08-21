@@ -30,6 +30,7 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        rekor_config: None,
         tuf_url: None,
         no_tuf: true,
         tuf_root: None,

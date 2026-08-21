@@ -1,9 +1,11 @@
 //! SQLite metadata store and content-addressed blob store (§6.2, §10).
 #![deny(missing_docs)]
 
+pub mod backend;
 pub mod bindings;
 pub mod cas;
 pub mod clock;
+pub mod cloud;
 pub mod db;
 pub mod error;
 pub mod gc;

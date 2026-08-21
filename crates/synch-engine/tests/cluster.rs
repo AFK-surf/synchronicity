@@ -23,6 +23,166 @@ fn introduce_nodes(nodes: &[&Node]) {
     }
 }
 
+/// A restored database may trail an acknowledged own-origin publish. The peer
+/// copy is a full signed head, so startup adopts it before minting another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let witness = spawn("witness").await;
+    introduce(&[&publisher, &witness]);
+
+    publisher
+        .node
+        .add_space("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("version.txt"), b"one").unwrap();
+    let first = publisher.node.scan_publish_push().await.unwrap().unwrap();
+    witness
+        .node
+        .sync_with_peer(&publisher.node.node_id())
+        .await
+        .unwrap();
+
+    // Take an actual closed SQLite snapshot after the first acknowledged
+    // publish, as Litestream would. The checkout and CAS volume are not part of
+    // this metadata backup.
+    let common::Peer {
+        _data: publisher_data,
+        space: publisher_space,
+        node: first_publisher,
+    } = publisher;
+    first_publisher.shutdown().await.unwrap();
+    drop(first_publisher);
+    let backup = publisher_data.path().join("first-publish.backup");
+    std::fs::copy(publisher_data.path().join(synch_store::DB_FILE), &backup).unwrap();
+    let mut publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
+        .await
+        .unwrap();
+    introduce_nodes(&[&publisher, &witness.node]);
+
+    std::fs::write(publisher_space.path().join("version.txt"), b"two").unwrap();
+    let second = publisher.scan_publish_push().await.unwrap().unwrap();
+    witness
+        .node
+        .sync_with_peer(&publisher.node_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        witness
+            .node
+            .store()
+            .complete_head(publisher.origin())
+            .unwrap(),
+        Some(second.clone())
+    );
+    let expected_entry = publisher
+        .store()
+        .entry(publisher.origin(), "media", "version.txt")
+        .unwrap()
+        .unwrap();
+
+    // Restore the older file, reopen from it, and only then contact the peer.
+    publisher.shutdown().await.unwrap();
+    drop(publisher);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(
+            publisher_data
+                .path()
+                .join(format!("{}{suffix}", synch_store::DB_FILE)),
+        );
+    }
+    std::fs::copy(&backup, publisher_data.path().join(synch_store::DB_FILE)).unwrap();
+    publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
+        .await
+        .unwrap();
+    introduce_nodes(&[&publisher, &witness.node]);
+    assert_eq!(publisher.own_head().unwrap(), Some(first));
+
+    assert!(publisher.readopt_self_on_startup().await.unwrap());
+    assert_eq!(publisher.own_head().unwrap(), Some(second));
+    assert_eq!(
+        publisher
+            .store()
+            .entry(publisher.origin(), "media", "version.txt")
+            .unwrap()
+            .unwrap(),
+        expected_entry
+    );
+
+    shutdown(&[&publisher, &witness.node]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let source = spawn("source").await;
+    let adopter = spawn_with("adopter", |config| {
+        config.cloud = Some(synch_store::cloud::CloudConfig {
+            service: synch_store::cloud::CloudService::Memory,
+            options: Default::default(),
+            scratch_dir: config.data_dir.join("cloud-scratch"),
+            io_timeout: Duration::from_secs(5),
+            upload_policy: synch_store::cloud::CloudUploadPolicy::Own,
+            cache_bytes: Some(512 * 1024 * 1024),
+        });
+    })
+    .await;
+    introduce(&[&source, &adopter]);
+
+    source.node.add_space("media", source.space.path()).unwrap();
+    let payload = big_payload(200_000);
+    std::fs::write(source.space.path().join("adopt.bin"), &payload).unwrap();
+    source.node.scan_publish_push().await.unwrap().unwrap();
+    adopter
+        .node
+        .sync_with_peer(&source.node.node_id())
+        .await
+        .unwrap();
+    adopter.node.add_detached_space("media").unwrap();
+
+    adopter
+        .node
+        .adopt_from(source.node.origin(), "media", "adopt.bin")
+        .await
+        .unwrap();
+    let adopted = adopter
+        .node
+        .store()
+        .entry(adopter.node.origin(), "media", "adopt.bin")
+        .unwrap();
+    assert!(adopted.is_none(), "the reference is staged until publish");
+    adopter.node.flush_staged().await.unwrap().unwrap();
+    let adopted = adopter
+        .node
+        .store()
+        .entry(adopter.node.origin(), "media", "adopt.bin")
+        .unwrap()
+        .unwrap();
+    let root = adopted.content.unwrap();
+    assert!(
+        adopter.node.store().blob(&root).unwrap().unwrap().durable,
+        "take must override cache-only upload policy before publishing"
+    );
+
+    adopter
+        .node
+        .store()
+        .reconcile_scratch_generation("replacement-container")
+        .unwrap();
+    assert_eq!(
+        adopter
+            .node
+            .cas_backend()
+            .read_range(root, 0, payload.len() as u64)
+            .await
+            .unwrap(),
+        payload
+    );
+
+    shutdown(&[&source.node, &adopter.node]).await;
+}
+
 /// The §14 walkthrough: scan-publish-push, pull, a verified partial range
 /// read, and a milestone ad (§6.3) turning a fetcher into a provider.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -391,10 +551,7 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
         node.store().blob(&old_content).unwrap().is_none(),
         "the superseded content must leave the index"
     );
-    assert!(
-        !node.store().blob_path(&old_content).exists(),
-        "and its bytes must leave the CAS directory"
-    );
+    assert!(node.store().read_all(&old_content).is_err());
     assert!(
         node.store().blob(&pinned).unwrap().is_some(),
         "a pin outlives retention"
