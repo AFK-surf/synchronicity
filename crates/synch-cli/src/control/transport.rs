@@ -81,7 +81,8 @@ pub fn no_daemon_error(data_dir: &Path) -> io::Error {
         io::ErrorKind::NotFound,
         format!(
             "no daemon is running for {}: nothing is listening on {}. \
-             Start one with `synch daemon run`",
+             Start one with `synch daemon start` (or keep `synch daemon run` \
+             in the foreground)",
             data_dir.display(),
             endpoint_name(data_dir),
         ),

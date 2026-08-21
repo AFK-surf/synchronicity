@@ -1,9 +1,9 @@
 //! Command dispatch.
 //!
-//! Two commands touch the data directory directly: `synch init`, which creates
-//! it before any daemon can exist, and `synch daemon run`, which *is* the
-//! daemon. Every other command is a control-service call to a running daemon
-//! (§9.1) — there is no in-process fallback.
+//! `synch init` creates the data directory before a daemon can exist; `synch
+//! daemon run` is the daemon, and `synch daemon start` launches that command in
+//! the background. Every other command is a control-service call to a running
+//! daemon (§9.1) — there is no in-process fallback.
 
 use std::{
     io::Write,
@@ -184,13 +184,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             match (&report.origin, &report.domain) {
                 (Some(origin), _) => {
                     println!("origin:     {origin}");
-                    println!("next:       synch daemon run");
+                    println!("next:       synch daemon start");
                 }
                 (None, Some(domain)) => {
                     // The record is the next step, and printing it is the
                     // difference between one copy-paste and a trip to the docs.
                     println!("domain:     {domain}");
-                    println!("next:       publish this record, then `synch daemon run`:");
+                    println!("next:       publish this record, then `synch daemon start`:");
                     println!(
                         "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
                         report.node_id.to_z32()
@@ -203,6 +203,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Daemon {
             command: DaemonCommand::Run,
         } => daemon::run(node_config(&cli)?).await,
+        Command::Daemon {
+            command: DaemonCommand::Start,
+        } => daemon::start(&data_dir, std::env::args_os().skip(1)).await,
         Command::Cas {
             command: CasCommand::Migrate { to },
         } => migrate_cas(&cli, &data_dir, *to).await,
@@ -616,6 +619,9 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         Command::Init { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
+        } => unreachable!("handled before dispatch"),
+        Command::Daemon {
+            command: DaemonCommand::Start,
         } => unreachable!("handled before dispatch"),
         Command::Cas { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {

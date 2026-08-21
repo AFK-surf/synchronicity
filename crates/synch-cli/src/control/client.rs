@@ -1,9 +1,10 @@
 //! The client side of the control service (§9.3).
 //!
-//! Every command except `synch init` and `synch daemon run` goes through here,
-//! and so does every gateway operation. There is no in-process fallback: with
-//! no daemon running, [`Client::connect`] fails with a message naming the
-//! socket and `synch daemon run` (§9.1).
+//! Every command except `synch init`, `synch daemon run`, and its background
+//! launcher `synch daemon start` goes through here, and so does every gateway
+//! operation. There is no in-process fallback: with no daemon running,
+//! [`Client::connect`] fails with a message naming the socket and both ways to
+//! start it (§9.1).
 
 use std::path::Path;
 

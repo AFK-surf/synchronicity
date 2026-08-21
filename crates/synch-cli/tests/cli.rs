@@ -31,14 +31,18 @@ impl Cli {
         }
     }
 
-    fn output(&self, args: &[&str]) -> std::process::Output {
-        Command::new(synch_bin())
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(synch_bin());
+        command
             .arg("--data-dir")
             .arg(&self.data_dir)
             .arg("--offline")
-            .args(args)
-            .output()
-            .expect("synch binary runs")
+            .args(args);
+        command
+    }
+
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().expect("synch binary runs")
     }
 
     fn try_run(&self, args: &[&str]) -> (bool, String, String) {
@@ -156,11 +160,15 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
     assert!(!ok);
     assert!(stderr.contains("synch init"), "{stderr}");
 
+    let (ok, _, stderr) = cli.try_run(&["daemon", "start"]);
+    assert!(!ok);
+    assert!(stderr.contains("synch init"), "{stderr}");
+
     // No domain: the device key is the identity and nothing has to be
     // published for the node to know what it is (§3.1).
     let out = cli.run(&["init"]);
     assert!(out.contains("origin:"), "{out}");
-    assert!(out.contains("synch daemon run"), "{out}");
+    assert!(out.contains("synch daemon start"), "{out}");
 
     // Init is not idempotent: a second one must not silently replace the key.
     let (ok, _, _) = cli.try_run(&["init"]);
@@ -176,6 +184,68 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
             "{args:?}: {stderr} must name the socket"
         );
     }
+}
+
+#[test]
+fn daemon_start_returns_once_the_background_socket_is_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Cli::new(dir.path());
+    cli.run(&["init"]);
+
+    let started = cli.run(&["daemon", "start"]);
+    assert!(started.contains("daemon started (pid "), "{started}");
+    assert!(started.contains("control socket:"), "{started}");
+    assert!(started.contains("daemon.log"), "{started}");
+
+    // Returning from start means the socket is usable immediately, without a
+    // caller-side retry loop.
+    assert!(cli.run(&["daemon", "status"]).contains("origin "));
+    let (ok, _, stderr) = cli.try_run(&["daemon", "start"]);
+    assert!(!ok);
+    assert!(stderr.contains("already running"), "{stderr}");
+
+    cli.run(&["daemon", "stop"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if !cli.try_run(&["daemon", "status"]).0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the background daemon did not stop");
+}
+
+#[test]
+fn simultaneous_daemon_starts_only_report_the_winning_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Cli::new(dir.path());
+    cli.run(&["init"]);
+
+    let mut first = cli.command(&["daemon", "start"]);
+    first.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let first = first.spawn().expect("first launcher starts");
+    let mut second = cli.command(&["daemon", "start"]);
+    second.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let second = second.spawn().expect("second launcher starts");
+
+    let first = first.wait_with_output().expect("first launcher exits");
+    let second = second.wait_with_output().expect("second launcher exits");
+    let successes = usize::from(first.status.success()) + usize::from(second.status.success());
+    assert_eq!(
+        successes, 1,
+        "exactly one spawned daemon may own the datadir"
+    );
+    assert!(cli.run(&["daemon", "status"]).contains("origin "));
+
+    cli.run(&["daemon", "stop"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if !cli.try_run(&["daemon", "status"]).0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("the winning background daemon did not stop");
 }
 
 #[test]

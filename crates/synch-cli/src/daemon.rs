@@ -1,4 +1,5 @@
-//! `synch daemon run`: the process that owns the node (§9.1).
+//! `synch daemon run`: the process that owns the node, and `synch daemon
+//! start`: its background launcher (§9.1).
 //!
 //! The daemon holds the one endpoint, the one database writer, and the one
 //! lifecycle. It serves the control socket concurrently with the engine's
@@ -6,17 +7,267 @@
 //! watcher, the batching publisher, the mirror loop, and the maintenance/GC
 //! pass.
 
+use std::{
+    ffi::{OsStr, OsString},
+    fs::OpenOptions,
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
 use anyhow::{Context, Result};
 use synch_engine::{Node, NodeConfig};
 use tokio::sync::broadcast;
 
-use crate::{control::Server, render};
+use crate::{
+    control::{proto::pb, Client, Command as ControlCommand, Server},
+    render,
+};
+
+/// The background daemon's combined stdout and stderr log.
+const LOG_FILE: &str = "daemon.log";
+
+/// Private handoff from the background launcher to the `daemon run` child.
+const READY_FILE_ENV: &str = "SYNCH_INTERNAL_READY_FILE";
+
+/// A pending server can become a named server in the same process. Only the
+/// first one is this process's startup boundary.
+static READY_SENT: AtomicBool = AtomicBool::new(false);
+
+/// Starts this executable's `daemon run` form in the background and waits
+/// until its control socket accepts connections.
+///
+/// All global arguments are preserved verbatim, including values supplied on
+/// the command line; values supplied through the environment are inherited by
+/// the child. The child gets its own process group and no terminal handles, so
+/// the launcher can exit without either forwarding Ctrl-C or keeping a caller's
+/// stdout/stderr pipes open.
+pub async fn start(data_dir: &Path, args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    // Refuse a running daemon (or an offline migration) before spawning. The
+    // child takes this same lock for its whole life; this acquisition is only
+    // a preflight and is dropped immediately before the spawn.
+    let lifecycle = crate::control::transport::LifecycleLock::acquire(data_dir)
+        .context("another daemon or CAS migration owns this data directory")?;
+    drop(lifecycle);
+
+    let args = run_args(args)?;
+    let log_path = data_dir.join(LOG_FILE);
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("could not open daemon log {}", log_path.display()))?;
+    writeln!(
+        log,
+        "\n--- synch daemon start (launcher pid {}) ---",
+        std::process::id()
+    )?;
+    log.flush()?;
+    let log_start = log.stream_position()?;
+    let stderr = log.try_clone()?;
+
+    // The socket identifies a data directory, not a process. This marker ties
+    // the later status round-trip to this exact child, so two simultaneous
+    // launchers cannot both claim whichever daemon won the lifecycle lock.
+    let ready = ReadyMarker::new(data_dir);
+
+    let mut command = Command::new(std::env::current_exe().context("could not locate synch")?);
+    command
+        .args(args)
+        .env(READY_FILE_ENV, ready.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    detach(&mut command);
+
+    let mut child = command.spawn().context("could not start the daemon")?;
+    loop {
+        if let Some(status) = child.try_wait().context("could not inspect the daemon")? {
+            return Err(startup_exit(status, &log_path, log_start));
+        }
+
+        // Binding the listener is earlier than serving it: startup recovery
+        // happens between those two events. A real authenticated round-trip is
+        // the boundary callers need before their next command can succeed.
+        if ready.belongs_to(child.id())
+            && tokio::time::timeout(Duration::from_secs(1), control_is_ready(data_dir))
+                .await
+                .unwrap_or(false)
+        {
+            // Close the last small race between the status response and the
+            // child losing its lifecycle. The marker is the primary identity
+            // proof; this makes an exit at the boundary report as an exit.
+            if let Some(status) = child.try_wait().context("could not inspect the daemon")? {
+                return Err(startup_exit(status, &log_path, log_start));
+            }
+            println!("daemon started (pid {})", child.id());
+            println!(
+                "control socket: {}",
+                crate::control::transport::endpoint_name(data_dir)
+            );
+            println!("log: {}", log_path.display());
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A unique, process-specific startup handshake file.
+#[derive(Debug)]
+struct ReadyMarker(std::path::PathBuf);
+
+impl ReadyMarker {
+    fn new(data_dir: &Path) -> Self {
+        Self(data_dir.join(format!(
+            ".daemon-start-{}-{}.ready",
+            std::process::id(),
+            synch_core::now_ns()
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn belongs_to(&self, pid: u32) -> bool {
+        std::fs::read_to_string(&self.0).is_ok_and(|value| value.trim() == pid.to_string())
+    }
+}
+
+impl Drop for ReadyMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Signals that this exact `daemon run` process has started its control
+/// server. The launcher still performs a status round-trip before returning.
+fn signal_background_ready(data_dir: &Path) -> Result<()> {
+    let Some(path) = std::env::var_os(READY_FILE_ENV).map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    if READY_SENT.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let valid = path.parent() == Some(data_dir)
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".daemon-start-"));
+    if !valid {
+        anyhow::bail!(
+            "refusing invalid background readiness path {}",
+            path.display()
+        );
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "could not create background readiness marker {}",
+                path.display()
+            )
+        })?;
+    writeln!(file, "{}", std::process::id()).with_context(|| {
+        format!(
+            "could not write background readiness marker {}",
+            path.display()
+        )
+    })?;
+    READY_SENT.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// A successful status response proves the listener, token, gRPC service and
+/// command handler are all ready. It works for both named nodes and the reduced
+/// service used while a membership zone has not named the device yet.
+async fn control_is_ready(data_dir: &Path) -> bool {
+    let Ok(mut client) = Client::connect(data_dir).await else {
+        return false;
+    };
+    let Ok(mut frames) = client
+        .run(ControlCommand::DaemonStatus(pb::DaemonStatus {}))
+        .await
+    else {
+        return false;
+    };
+    loop {
+        match frames.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Rewrites the launcher's subcommand while leaving every global option in
+/// exactly the position and spelling the caller used.
+fn run_args(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    let Some(start) = args
+        .windows(2)
+        .rposition(|pair| pair[0] == OsStr::new("daemon") && pair[1] == OsStr::new("start"))
+    else {
+        anyhow::bail!("could not reconstruct `synch daemon start` arguments");
+    };
+    args[start + 1] = OsString::from("run");
+    Ok(args)
+}
+
+/// Reads a bounded tail so a failed background launch still reports the
+/// daemon's actual startup error without loading an old, potentially large log.
+fn log_tail(path: &Path, current_start: u64) -> std::io::Result<String> {
+    const TAIL: u64 = 16 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(current_start.max(len.saturating_sub(TAIL))))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn startup_exit(
+    status: std::process::ExitStatus,
+    log_path: &Path,
+    log_start: u64,
+) -> anyhow::Error {
+    let detail = log_tail(log_path, log_start).unwrap_or_default();
+    let detail = detail.trim();
+    if detail.is_empty() {
+        anyhow::anyhow!(
+            "daemon exited with {status} before its control socket was ready; see {}",
+            log_path.display()
+        )
+    } else {
+        anyhow::anyhow!(
+            "daemon exited with {status} before its control socket was ready; {} contains:\n{detail}",
+            log_path.display()
+        )
+    }
+}
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
 
 /// Opens the node, binds the control socket, and runs until stopped.
 ///
 /// Stopping happens on `Ctrl-C` or on a `synch daemon stop` request; both fire
 /// the same broadcast, which every task shuts down on.
 pub async fn run(config: NodeConfig) -> Result<()> {
+    let data_dir = config.data_dir.clone();
     // Before Store open and before iroh bind: offline migration holds the same
     // lock, so the two can never overlap during initialization either.
     let _lifecycle = crate::control::transport::LifecycleLock::acquire(&config.data_dir)
@@ -88,6 +339,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         }
     }
 
+    if let Err(error) = signal_background_ready(&data_dir) {
+        crate::control::transport::remove_token(&data_dir);
+        let _ = node.shutdown().await;
+        return Err(error);
+    }
     let control = tokio::spawn(server.run());
     let aae = spawn_loop(
         "anti-entropy",
@@ -259,6 +515,10 @@ async fn open_once_named(config: NodeConfig, stop: &broadcast::Sender<()>) -> Re
                             )
                         })?;
                     println!("control socket: {}", server.endpoint_name());
+                    if let Err(error) = signal_background_ready(&config.data_dir) {
+                        crate::control::transport::remove_token(&config.data_dir);
+                        return Err(error);
+                    }
                     serving = Some((tokio::spawn(server.run()), pending_stop));
                 }
                 tokio::select! {
