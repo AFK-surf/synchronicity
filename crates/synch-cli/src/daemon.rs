@@ -321,7 +321,56 @@ fn detach(command: &mut Command) {
 fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+    disinherit_std_handles();
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// Stops the daemon from inheriting *this* process's stdout and stderr.
+///
+/// The child's own three handles are redirected to the log a few lines above,
+/// which is the part that looks like it settles the question. It does not.
+/// `CreateProcess` is called with `bInheritHandles = TRUE` — Rust's `Command`
+/// has no other way to hand a child its redirected stdio — and that flag is
+/// not selective: the child receives *every* handle in this process that is
+/// marked inheritable, not only the three that were redirected. When
+/// `daemon start` was itself launched with piped output, its stdout and stderr
+/// are the write ends of those pipes, they are inheritable, and so the daemon
+/// holds them open for its entire life.
+///
+/// The reader on the other end is then waiting for a pipe that will not close
+/// until the daemon exits, which is the opposite of what backgrounding it was
+/// for. `std::process::Command::output()` waits for EOF and not for exit, so
+/// anything reading this command that way — a script, a service manager, this
+/// repo's own `cli.rs` tests — blocks indefinitely even though the launcher
+/// exited long before. The launcher's own startup timeout cannot help: it
+/// exits on time and the pipe stays open regardless, because another process
+/// holds it.
+///
+/// Clearing the inherit flag first costs nothing. The child never reads or
+/// writes these handles — it was given the log instead — so the only thing
+/// lost is a handle it had no business holding.
+///
+/// Unix needs no equivalent: `exec` keeps only the descriptors explicitly
+/// dup'd into place, and the rest are closed by `CLOEXEC`.
+#[cfg(windows)]
+fn disinherit_std_handles() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` returns a handle this process owns, or an
+        // invalid one when there is no such stream. `SetHandleInformation`
+        // only clears a flag on it and reports failure through its return,
+        // which is ignored on purpose: a process without a console, or one
+        // whose stream is already non-inheritable, has nothing to clear and
+        // is not a reason to refuse to start a daemon.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// Opens the node, binds the control socket, and runs until stopped.
