@@ -643,6 +643,62 @@ pub fn an_outdated_fleet_does_not_eat_the_asked_nodes_window_test() {
 @external(erlang, "cp_sys_ffi", "monotonic_ms")
 fn monotonic_ms() -> Int
 
+@external(erlang, "cp_sys_ffi", "mailbox_len")
+fn mailbox_len() -> Int
+
+/// A daemon that answers, but only after the caller has given up on it.
+///
+/// The inbox is created *inside* the spawned process, because a subject is
+/// received on by whoever made it — which is what makes this a real session
+/// rather than a subject nobody serves.
+fn late_answering_session(id: String, delay: Int) -> agent.Session {
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    let assert Ok(agent.Query(_, reply)) = process.receive(inbox, 5000)
+    process.sleep(delay)
+    process.send(reply, Ok(agent.Replicating([])))
+  })
+  let assert Ok(inbox) = process.receive(ready, 1000)
+  agent.Session(..session(id, id <> "@x.example"), inbox: inbox)
+}
+
+/// A question the caller gave up on must not leave its answer behind.
+///
+/// The answer still arrives — the session is holding the request and will
+/// either answer it or have `sweep_waiting` refuse it at the lease — and
+/// nothing receives it, because `process.receive` matches one subject's ref
+/// and the caller has moved on. Under `mist` the caller is the connection
+/// actor, which the dashboard's poll keeps alive for the life of a tab, so
+/// every abandoned question used to leave a message in a mailbox that only
+/// grew, and every later selective receive in that process scanned the pile.
+///
+/// Invisible to every other test: the counts are right, the panel renders,
+/// and the only symptom is a process getting slower the longer somebody
+/// watches it. So it is asserted directly.
+pub fn a_question_the_caller_abandons_leaves_nothing_behind_test() {
+  let before = mailbox_len()
+  let fleet =
+    list.index_map(list.repeat(Nil, 5), fn(_, n) {
+      late_answering_session("late-" <> int.to_string(n), 400)
+    })
+
+  // Every daemon answers at 400ms; the call gives up at 100ms.
+  let answers = agent.ask_all_within(fleet, agent.Replication, 100)
+  assert list.length(answers) == 5
+  assert list.all(answers, fn(entry) {
+    case entry.1 {
+      Error(agent.Refusal("unavailable", _)) -> True
+      _ -> False
+    }
+  })
+
+  // Well past every answer, so a leak would have landed by now.
+  process.sleep(900)
+  assert mailbox_len() == before
+}
+
 /// One node attached twice is still one node.
 ///
 /// A daemon that redials after a blip joins before the registry reaps the

@@ -539,12 +539,19 @@ pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
   ask_within(session, question, query_timeout)
 }
 
+/// One session, through the same fanout — so the abandoned-subject problem
+/// `ask_all_within` documents is fixed for single questions too, rather than
+/// only for the one caller that happens to ask a fleet.
 fn ask_within(
   session: Session,
   question: Question,
   budget: Int,
 ) -> Result(Answer, Refusal) {
-  collect(session, question, dispatch(session, question), budget)
+  case ask_all_within([session], question, budget) {
+    [#(_, answer)] -> answer
+    _ ->
+      Error(Refusal("internal", "the fanout did not answer for this session"))
+  }
 }
 
 /// Sends the question, or declines to — the gate and the socket in one place.
@@ -626,7 +633,57 @@ pub fn ask_all(
 
 /// [`ask_all`] with the deadline named, so a test can bound a real fanout
 /// without waiting out the production one.
+///
+/// **The fanout runs in a process of its own, and that is not tidiness.** A
+/// question this call gives up on is still outstanding at the session, which
+/// will send into its reply subject later — the daemon's real answer, or the
+/// refusal `sweep_waiting` writes when the `waiting_lease` falls due. Nothing
+/// ever receives those: `process.receive` matches one subject's ref, and the
+/// caller has moved on. Under `mist` the caller is the *connection* actor, and
+/// the dashboard's poll keeps one alive for as long as a tab is open — so each
+/// abandoned question left a message in a mailbox that only ever grew, and
+/// every selective receive in that process, including the next poll's and any
+/// file browse sharing the socket, then scanned the pile. The cost was
+/// quadratic in how long the tab had been open.
+///
+/// Spawning makes the mailbox mortal. The child collects, sends one result
+/// back, and exits; a late answer arrives at a dead pid, which the VM
+/// discards. The wait here is deliberately looser than the child's own
+/// deadline, because timing out *here* abandons a subject in the caller —
+/// the very thing being fixed — so it has to stay pathological rather than
+/// routine.
 pub fn ask_all_within(
+  sessions: List(Session),
+  question: Question,
+  budget: Int,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  let done = process.new_subject()
+  process.spawn_unlinked(fn() {
+    process.send(done, fanout(sessions, question, budget))
+  })
+  case process.receive(done, budget + collect_slack) {
+    Ok(answers) -> answers
+    // The child is bounded by the same deadline and does nothing else, so
+    // reaching this means the scheduler stalled for `collect_slack` on top of
+    // it. Reported per session rather than raised: this panel's whole posture
+    // is that a node which could not be asked says so.
+    Error(Nil) ->
+      list.map(sessions, fn(session) {
+        #(
+          session,
+          Error(Refusal(
+            "unavailable",
+            "the control plane did not finish asking in time",
+          )),
+        )
+      })
+  }
+}
+
+/// How much longer than its own deadline the fanout is given to come back.
+const collect_slack = 2000
+
+fn fanout(
   sessions: List(Session),
   question: Question,
   budget: Int,
@@ -867,10 +924,12 @@ fn proof(
               json.object([
                 #("t", json.string("attached")),
                 #("session", json.string(session.id)),
-                // The version settled on, which is the daemon's own — not this
-                // build's. An older daemon checks the echo against what it
-                // sent, so echoing ours would refuse exactly the connection
-                // the range above was widened to keep.
+                // The version settled on: the daemon's own where this build
+                // can meet it, this build's where the daemon is newer. Not the
+                // claim, and not a constant — a daemon built before the range
+                // existed compares this against what it sent, and one built
+                // after checks it against `settles_at`'s range, and settling
+                // is what both of those accept.
                 #("v", json.int(session.version)),
               ]),
             )
