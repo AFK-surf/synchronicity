@@ -32,6 +32,17 @@ const LOG_FILE: &str = "daemon.log";
 /// Private handoff from the background launcher to the `daemon run` child.
 const READY_FILE_ENV: &str = "SYNCH_INTERNAL_READY_FILE";
 
+/// How long `daemon start` waits for the child's control socket before giving
+/// up on it.
+///
+/// Generous, because the wait covers real work: opening the store, running
+/// startup recovery over whatever the last run left behind, and binding iroh.
+/// A cold start on a large node behind a slow disk is entitled to take a while,
+/// and a launcher that gave up on a daemon that was merely busy would be worse
+/// than one that waited. What it may not do is wait *for ever* — that is not
+/// patience, it is a hang with no diagnosis, and it is what this bounds.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A pending server can become a named server in the same process. Only the
 /// first one is this process's startup boundary.
 static READY_SENT: AtomicBool = AtomicBool::new(false);
@@ -83,9 +94,28 @@ pub async fn start(data_dir: &Path, args: impl IntoIterator<Item = OsString>) ->
     detach(&mut command);
 
     let mut child = command.spawn().context("could not start the daemon")?;
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().context("could not inspect the daemon")? {
             return Err(startup_exit(status, &log_path, log_start));
+        }
+
+        // A child that neither comes up nor exits used to spin this loop for
+        // ever, and `daemon start` with it. That is the worst shape a failure
+        // can take: the launcher holds whatever invoked it — a shell, a service
+        // manager, a test harness reading its output — with nothing on stdout
+        // and nothing in the log to say what is wrong. It cost a CI run six
+        // hours before anyone could see which test was stuck.
+        //
+        // Every other startup failure here reports with the log tail, so this
+        // one does too. Killing the child first is the point of ordering: this
+        // process is about to say the daemon did not come up, and leaving a
+        // half-started one holding the lifecycle lock would make the next
+        // `daemon start` fail for a reason that is this call's fault.
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(startup_timeout(&log_path, log_start));
         }
 
         // Binding the listener is earlier than serving it: startup recovery
@@ -227,6 +257,25 @@ fn log_tail(path: &Path, current_start: u64) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn startup_timeout(log_path: &Path, log_start: u64) -> anyhow::Error {
+    let detail = log_tail(log_path, log_start).unwrap_or_default();
+    let detail = detail.trim();
+    let secs = STARTUP_TIMEOUT.as_secs();
+    if detail.is_empty() {
+        anyhow::anyhow!(
+            "daemon did not answer on its control socket within {secs}s and has been stopped; \
+             see {} (it wrote nothing)",
+            log_path.display()
+        )
+    } else {
+        anyhow::anyhow!(
+            "daemon did not answer on its control socket within {secs}s and has been stopped; \
+             {} contains:\n{detail}",
+            log_path.display()
+        )
+    }
 }
 
 fn startup_exit(
