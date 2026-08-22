@@ -18,6 +18,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import store/sqlite.{type Connection, Text}
+import util/id
 import wisp.{type Request, type Response}
 import zone/publish
 
@@ -68,21 +69,71 @@ fn redirect_uri(ctx: AuthContext, key: String) -> String {
   ctx.entry_url <> "/auth/callback/" <> key
 }
 
-/// `?link=1` on a start URL, from a live session, records that the
-/// resulting identity should be linked to the session's user instead of
-/// logging anyone in — the sanctioned path for custom-OIDC identities.
-fn maybe_link_user(req: Request, conn: Connection) -> Option(String) {
-  case list.key_find(wisp.get_query(req), "link") {
-    Ok("1") ->
-      case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
-        Ok(token) ->
-          case session.get(conn, token, now_unix()) {
-            Ok(live) -> option.Some(live.user_id)
-            Error(Nil) -> None
-          }
+/// The cookie a sessionless flow binds itself with. The flow sets it on the
+/// authorize redirect and the callback requires it back, so a
+/// state/authorize URL handed to a victim cannot complete in a browser that
+/// never held the initiating side of the flow (login CSRF).
+const oauth_flow_cookie = "cp_oauth_flow"
+
+/// A live session in this request's cookie, if any, as `#(user_id, hash)`
+/// where the hash is the cookie token's SHA-256 — the sessions table's key.
+fn live_session(req: Request, conn: Connection) -> Option(#(String, BitArray)) {
+  case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
+    Ok(token) ->
+      case session.get(conn, token, now_unix()) {
+        Ok(live) -> option.Some(#(live.user_id, id.hash_token(token)))
         Error(Nil) -> None
       }
-    _ -> None
+    Error(Nil) -> None
+  }
+}
+
+/// What a start URL asks for and binds:
+/// `#(link_user_id, binding_token_hash, browser_token_to_set)`.
+///
+/// `?link=1` from a live session records that the resulting identity should
+/// be linked to the session's user instead of logging anyone in — the
+/// sanctioned path for custom-OIDC identities. Every flow is bound to the
+/// browser that started it — the session's token hash when there is a
+/// session, otherwise a fresh per-flow token the caller sets as a cookie on
+/// the redirect — which is what the callback checks the completing browser
+/// against: a state/authorize URL handed to a victim cannot complete in the
+/// victim's browser, with or without a session on either side.
+fn flow_session(
+  req: Request,
+  conn: Connection,
+) -> #(Option(String), Option(BitArray), Option(String)) {
+  case live_session(req, conn) {
+    option.Some(#(user_id, hash)) -> {
+      let link_user_id = case list.key_find(wisp.get_query(req), "link") {
+        Ok("1") -> option.Some(user_id)
+        _ -> None
+      }
+      #(link_user_id, option.Some(hash), None)
+    }
+    None -> {
+      // No session: bind the flow to a fresh token carried by a cookie only
+      // the initiating browser receives. Absence of a session is not a
+      // browser identity — without this, an attacker's sessionless flow
+      // would complete in any other sessionless browser (login CSRF).
+      let token = id.secret()
+      #(None, option.Some(id.hash_token(token)), option.Some(token))
+    }
+  }
+}
+
+/// The authorize redirect, plus the per-flow cookie a sessionless flow
+/// binds itself with (10 minutes, the flow's own lifetime).
+fn redirect_with_flow_cookie(
+  req: Request,
+  url: String,
+  browser_token: Option(String),
+) -> Response {
+  case browser_token {
+    None -> wisp.redirect(url)
+    Some(token) ->
+      wisp.redirect(url)
+      |> wisp.set_cookie(req, oauth_flow_cookie, token, wisp.Signed, 600)
   }
 }
 
@@ -91,17 +142,19 @@ pub fn start(req: Request, ctx: AuthContext, key: String) -> Response {
     Error(Nil) -> error_json(404, "unknown_provider", "provider not configured")
     Ok(provider) ->
       with_db(ctx, fn(conn) {
+        let #(link_user_id, binding_hash, browser_token) = flow_session(req, conn)
         case
           oauth.start(
             conn,
             provider,
             redirect_uri(ctx, key),
             None,
-            maybe_link_user(req, conn),
+            link_user_id,
+            binding_hash,
             now_unix(),
           )
         {
-          Ok(url) -> wisp.redirect(url)
+          Ok(url) -> redirect_with_flow_cookie(req, url, browser_token)
           Error(_) -> error_json(500, "internal", "could not start flow")
         }
       })
@@ -118,20 +171,23 @@ pub fn oidc_start(
     case oidc.for_org_slug(conn, org_slug) {
       Error(Nil) ->
         error_json(404, "no_oidc", "this org has no OIDC provider configured")
-      Ok(org) ->
+      Ok(org) -> {
+        let #(link_user_id, binding_hash, browser_token) = flow_session(req, conn)
         case
           oauth.start(
             conn,
             org.provider,
             redirect_uri(ctx, "oidc"),
             option.Some(org.provider_id),
-            maybe_link_user(req, conn),
+            link_user_id,
+            binding_hash,
             now_unix(),
           )
         {
-          Ok(url) -> wisp.redirect(url)
+          Ok(url) -> redirect_with_flow_cookie(req, url, browser_token)
           Error(_) -> error_json(500, "internal", "could not start flow")
         }
+      }
     }
   })
 }
@@ -175,6 +231,7 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
                           "oidc",
                           option.Some(provider_id),
                           who,
+                          flow.binding_token_hash,
                           flow.link_user_id,
                         )
                     }
@@ -190,47 +247,140 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
 
 /// Shared tail of every callback: link to the session's user when the
 /// flow was started with ?link=1, otherwise log in under the policy.
+///
+/// Every flow is bound to the session it was started from, and the callback
+/// refuses a browser that is not that session (or, for a sessionless flow,
+/// a browser that has one): a state/authorize URL carried to a victim would
+/// otherwise link the victim's provider identity to the attacker's account
+/// (account-linking CSRF, OAuth Security BCP §4.7) or silently replace the
+/// victim's session with the attacker's (login CSRF).
 fn conclude(
   req: Request,
   conn: Connection,
   provider_key: String,
   oidc_provider_id: Option(String),
   who: oauth.ProviderIdentity,
+  flow_session_hash: Option(BitArray),
   link_user_id: Option(String),
 ) -> Response {
   case link_user_id {
     option.Some(user_id) ->
-      case
-        identity.link(
-          conn,
-          user_id,
-          provider_key,
-          oidc_provider_id,
-          who.subject,
-          now_unix(),
-        )
-      {
-        Ok(_) -> wisp.redirect("/settings?linked=" <> provider_key)
-        Error(_) -> error_json(409, "conflict", "identity already linked")
+      case flow_session_hash {
+        None ->
+          error_json(
+            400,
+            "bad_state",
+            "this linking flow was not started from a session",
+          )
+        Some(expected) ->
+          case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
+            Ok(token) ->
+              case session.get(conn, token, now_unix()) {
+                Ok(live) -> {
+                  let same_session =
+                    live.user_id == user_id && id.hash_token(token) == expected
+                  case same_session {
+                    True ->
+                      case
+                        identity.link(
+                          conn,
+                          user_id,
+                          provider_key,
+                          oidc_provider_id,
+                          who.subject,
+                          now_unix(),
+                        )
+                      {
+                        Ok(_) ->
+                          wisp.redirect("/settings?linked=" <> provider_key)
+                        Error(_) ->
+                          error_json(409, "conflict", "identity already linked")
+                      }
+                    False ->
+                      error_json(
+                        403,
+                        "session_mismatch",
+                        "this flow belongs to a different session",
+                      )
+                  }
+                }
+                _ ->
+                  error_json(
+                    403,
+                    "session_mismatch",
+                    "this flow belongs to a different session",
+                  )
+              }
+            Error(Nil) ->
+              error_json(
+                403,
+                "session_mismatch",
+                "this flow belongs to a different session",
+              )
+          }
       }
     None ->
-      case
-        identity.login(
-          conn,
-          provider_key,
-          oidc_provider_id,
-          who.subject,
-          who.email,
-          who.email_trusted,
-          who.name,
-          now_unix(),
-        )
-      {
-        Ok(user_id) -> sign_in(req, conn, user_id)
-        Error(identity.NeedsExplicitLink(_)) ->
-          wisp.redirect("/login?error=needs-link")
-        Error(identity.Db(_)) ->
-          error_json(500, "internal", "could not record identity")
+      case flow_browser_matches(req, flow_session_hash) {
+        False ->
+          error_json(
+            403,
+            "session_mismatch",
+            "this flow belongs to a different browser",
+          )
+        True ->
+          case
+            identity.login(
+              conn,
+              provider_key,
+              oidc_provider_id,
+              who.subject,
+              who.email,
+              who.email_trusted,
+              who.name,
+              now_unix(),
+            )
+          {
+            Ok(user_id) -> sign_in(req, conn, user_id)
+            Error(identity.NeedsExplicitLink(_)) ->
+              wisp.redirect("/login?error=needs-link")
+            Error(identity.Db(_)) ->
+              error_json(500, "internal", "could not record identity")
+          }
+      }
+  }
+}
+
+/// Whether the browser completing the flow is the one that started it.
+///
+/// Every flow is bound to a token the initiating browser holds — the session
+/// cookie's token when there was a session, the per-flow cookie otherwise —
+/// and the callback requires the stored binding to match one of this
+/// browser's cookies. Completing the flow from any other browser, including
+/// one with no session at all, is refused: the alternative would be an
+/// attacker's flow signing a victim into the attacker's account (login
+/// CSRF) or replacing the victim's session with the flow's outcome.
+fn flow_browser_matches(req: Request, flow_binding: Option(BitArray)) -> Bool {
+  case flow_binding {
+    option.Some(expected) ->
+      case current_binding_hash(req) {
+        option.Some(got) -> got == expected
+        None -> False
+      }
+    // Every flow this build starts stores a binding; a row without one is a
+    // flow this build cannot vouch for, and it must not complete either.
+    None -> False
+  }
+}
+
+/// The hash of whichever flow-binding token this browser holds: the session
+/// cookie's, or the per-flow cookie's.
+fn current_binding_hash(req: Request) -> Option(BitArray) {
+  case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
+    Ok(token) -> option.Some(id.hash_token(token))
+    Error(Nil) ->
+      case wisp.get_cookie(req, oauth_flow_cookie, wisp.Signed) {
+        Ok(token) -> option.Some(id.hash_token(token))
+        Error(Nil) -> None
       }
   }
 }
@@ -292,7 +442,16 @@ fn finish_oauth(
       }
       case fetched {
         Error(message) -> error_json(502, "identity_failed", message)
-        Ok(who) -> conclude(req, conn, key, None, who, flow.link_user_id)
+        Ok(who) ->
+          conclude(
+            req,
+            conn,
+            key,
+            None,
+            who,
+            flow.binding_token_hash,
+            flow.link_user_id,
+          )
       }
     }
   }

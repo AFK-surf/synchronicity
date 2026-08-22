@@ -1135,7 +1135,7 @@ pub fn delete_oidc_takes_its_children_test() {
     sqlite.exec(
       conn,
       "INSERT INTO oauth_states VALUES
-        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0)",
+        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0, NULL)",
       [],
     )
   sqlite.close(conn)
@@ -1268,7 +1268,7 @@ pub fn org_deletion_test() {
     sqlite.exec(
       conn,
       "INSERT INTO oauth_states VALUES
-        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0)",
+        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0, NULL)",
       [],
     )
   sqlite.close(conn)

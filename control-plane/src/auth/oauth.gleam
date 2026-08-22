@@ -16,7 +16,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
-import store/sqlite.{type Connection, Int as VInt, Null, Text}
+import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
 import util/id
 
 pub type Provider {
@@ -38,6 +38,10 @@ pub type FlowState {
     pkce_verifier: String,
     nonce: String,
     link_user_id: Option(String),
+    /// The SHA-256 of the token the flow is bound to — the session cookie's
+    /// when there was a session, a per-flow cookie's otherwise. What the
+    /// callback checks the completing browser against.
+    binding_token_hash: Option(BitArray),
   )
 }
 
@@ -64,6 +68,7 @@ pub fn start(
   redirect_uri: String,
   oidc_provider_id: Option(String),
   link_user_id: Option(String),
+  binding_token_hash: Option(BitArray),
   now: Int,
 ) -> Result(String, sqlite.Error) {
   let state = id.secret()
@@ -74,10 +79,17 @@ pub fn start(
       False,
     )
   let nonce = id.secret()
+  let session_hash_value = case binding_token_hash {
+    None -> Null
+    Some(hash) -> Blob(hash)
+  }
   use _ <- result.try(
     sqlite.exec(
       conn,
-      "INSERT INTO oauth_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO oauth_states
+         (state, provider, oidc_provider_id, pkce_verifier, nonce, redirect_to,
+          link_user_id, binding_token_hash, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         Text(state),
         Text(provider.key),
@@ -86,6 +98,7 @@ pub fn start(
         Text(nonce),
         Null,
         sqlite.optional_text(link_user_id),
+        session_hash_value,
         VInt(now),
         VInt(now + 600),
       ],
@@ -115,15 +128,28 @@ pub fn take_state(
     sqlite.query(
       conn,
       "SELECT provider, coalesce(oidc_provider_id, ''), pkce_verifier,
-              coalesce(nonce, ''), coalesce(link_user_id, '')
+              coalesce(nonce, ''), coalesce(link_user_id, ''),
+              binding_token_hash
        FROM oauth_states WHERE state = ? AND expires_at > ?",
       [Text(state), VInt(now)],
     )
   let _ =
     sqlite.exec(conn, "DELETE FROM oauth_states WHERE state = ?", [Text(state)])
   case lookup {
-    Ok([[Text(provider), Text(oidc), Text(verifier), Text(nonce), Text(link)]]) ->
-      Ok(FlowState(provider, non_empty(oidc), verifier, nonce, non_empty(link)))
+    Ok([[Text(provider), Text(oidc), Text(verifier), Text(nonce), Text(link), session_hash]]) -> {
+      let session_hash = case session_hash {
+        Blob(hash) -> Some(hash)
+        _ -> None
+      }
+      Ok(FlowState(
+        provider,
+        non_empty(oidc),
+        verifier,
+        nonce,
+        non_empty(link),
+        session_hash,
+      ))
+    }
     _ -> Error(Nil)
   }
 }

@@ -25,7 +25,7 @@ pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 /// protocol: reordering one changes the wire. `Hello`'s check is the whole
 /// compatibility story — a peer on another version is refused, not negotiated
 /// with.
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
 pub const MAX_BATCH: usize = 256;
@@ -132,27 +132,6 @@ pub const MAX_PROVIDER_ADS: usize = 256;
 /// extreme message"; a cap that fires after the work is not one. Refused
 /// outright rather than truncated: a truncated request is a different request,
 /// and a truncated answer silently misreports what a peer served.
-fn bounded_opt_vec<'de, D, T, const N: usize>(
-    deserializer: D,
-) -> std::result::Result<Option<Vec<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    /// A newtype so the inner vector is deserialized under the cap.
-    struct Bounded<T, const N: usize>(Vec<T>, std::marker::PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N> {
-        fn deserialize<D: serde::Deserializer<'de>>(
-            deserializer: D,
-        ) -> std::result::Result<Self, D::Error> {
-            bounded_vec::<D, T, N>(deserializer).map(|v| Bounded(v, std::marker::PhantomData))
-        }
-    }
-
-    Ok(Option::<Bounded<T, N>>::deserialize(deserializer)?.map(|b| b.0))
-}
-
 fn bounded_vec<'de, D, T, const N: usize>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -232,6 +211,34 @@ where
     deserializer.deserialize_str(Visitor)
 }
 
+/// What a peer declares it will serve the peer it is talking to (§5.5).
+///
+/// The declaration is what a delegated node learns its scope from: the
+/// peer's view of the caller's key, read from the same `d:` records the
+/// caller will materialize out of the trie. Three-valued on purpose — the
+/// old encoding collapsed the first two into `None`, and the difference is
+/// the whole of the revocation story: a peer that has *no* binding for the
+/// key (revoked) must not be mistaken for a peer that has a rooted one
+/// (promoted to a full member).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclaredScope {
+    /// No live binding for the peer's key: it is not in this node's view of
+    /// the zone at all.
+    Untrusted,
+    /// A live rooted binding: the peer may read anything.
+    Unrestricted,
+    /// Live delegations only: confined to these spaces.
+    Confined(#[serde(deserialize_with = "bounded_vec::<_, _, MAX_DELEGATION_SPACES>")] Vec<String>),
+}
+
+impl Default for DeclaredScope {
+    /// No statement: a peer that said nothing is read as holding no binding,
+    /// which is the fail-closed reading.
+    fn default() -> Self {
+        DeclaredScope::Untrusted
+    }
+}
+
 /// A message on the `sync/mpt/1` ALPN (§5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MptMessage {
@@ -242,8 +249,7 @@ pub enum MptMessage {
         /// The sender's head summaries.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         heads: Vec<HeadSummary>,
-        /// The spaces the sender will serve the peer it is talking to, or
-        /// `None` for the whole keyspace (§5.5).
+        /// What the sender will serve the peer it is talking to (§5.5).
         ///
         /// How a delegated node learns what it may ask for: its scope lives in
         /// the delegating origin's trie, which it cannot read until it knows
@@ -253,11 +259,7 @@ pub enum MptMessage {
         /// wrong value can only make a peer ask for less, never more — and it
         /// is adopted only from a peer this node holds a *rooted* binding for,
         /// so a delegate cannot narrow a member that admitted it.
-        ///
-        /// Bounded while decoding like every sequence here: the field mirrors a
-        /// `Delegation`'s space list, capped at [`MAX_DELEGATION_SPACES`].
-        #[serde(deserialize_with = "bounded_opt_vec::<_, _, MAX_DELEGATION_SPACES>")]
-        scope: Option<Vec<String>>,
+        scope: DeclaredScope,
     },
     /// "Yours is newer, send the full signed heads for these origins."
     HeadsWant {
@@ -727,7 +729,7 @@ mod tests {
                     root: Hash::new(b"r"),
                     complete: true,
                 }],
-                scope: Some(vec!["photos".into()]),
+                scope: DeclaredScope::Confined(vec!["photos".into()]),
             },
             MptMessage::HeadsWant {
                 origins: vec![origin.clone()],
@@ -921,7 +923,7 @@ mod bounded_decode_tests {
         refuses(&MptMessage::Hello {
             proto: 1,
             heads,
-            scope: None,
+            scope: DeclaredScope::Untrusted,
         });
         refuses(&MptMessage::GetNodes {
             root: Hash([0u8; 32]),
