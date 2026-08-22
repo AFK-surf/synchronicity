@@ -454,6 +454,297 @@ pub fn a_request_may_name_its_node_test() {
     == Error("no attached daemon holds media")
 }
 
+fn replicates(spaces: List(String)) -> List(agent.ReplicaSpace) {
+  list.map(spaces, fn(space) {
+    agent.ReplicaSpace(
+      space: space,
+      policy: "tree",
+      grace_secs: 2_592_000,
+      budget: 0,
+      held: 1,
+      held_bytes: 10,
+      releasing: 0,
+      releasing_bytes: 0,
+      wanted: 0,
+      wanted_bytes: 0,
+      unreachable: 0,
+      unreachable_bytes: 0,
+      held_back: 0,
+      oldest_want: 0,
+      next_release: 0,
+      view_complete: True,
+      view_reason: "",
+    )
+  })
+}
+
+/// How many nodes hold a space is the one fact reading each node on its own
+/// cannot show: a space one node replicates keeps every superseded version in
+/// exactly one place, and looks identical, node by node, to one that three
+/// nodes hold.
+pub fn a_space_is_counted_once_per_node_that_replicates_it_test() {
+  let nas =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media", "docs"]),
+      "",
+      "",
+    )
+  let laptop =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  // First-seen order, so the listing does not reshuffle between polls.
+  assert browse_api.replica_counts([nas, laptop])
+    == [#("media", 2), #("docs", 1)]
+}
+
+/// A daemon that could not be asked contributes nothing — not a zero.
+///
+/// Silence is not evidence that a node does not replicate a space. Counting it
+/// as though it were would report the fleet as thinner than it is, which is
+/// the direction that has somebody acting on a number nobody measured.
+pub fn a_node_that_refused_is_not_counted_as_replicating_nothing_test() {
+  let answered =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  let silent =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      [],
+      "unavailable",
+      "the attached daemon did not answer in time",
+    )
+  assert browse_api.replica_counts([answered, silent]) == [#("media", 1)]
+  // And a fleet where nobody answered reports no coverage at all rather than
+  // a row saying zero.
+  assert browse_api.replica_counts([silent]) == []
+}
+
+/// A daemon older than a question is never sent it.
+///
+/// The frame would not decode, and a frame that does not decode ends the
+/// tunnel — so asking an old node one new question would cost its operator the
+/// whole browse surface. Its version is what says which questions it can take,
+/// which is the only reason the number is bumped at all.
+pub fn an_old_daemon_is_asked_only_what_its_version_defines_test() {
+  let current = session("nas", "nas@x.example")
+  let old = agent.Session(..current, version: 2)
+
+  assert agent.speaks(current, agent.Replication)
+  assert !agent.speaks(old, agent.Replication)
+  // And it keeps everything its own version defines, which is the point of
+  // admitting it rather than refusing the attach.
+  assert agent.speaks(old, agent.Delegations)
+  assert agent.speaks(old, agent.Ls("media", "", "", False))
+
+  // The table is per question, so a version this build has never issued is
+  // still ordered against the questions correctly.
+  assert agent.introduced_in(agent.Replication)
+    > agent.introduced_in(agent.Delegations)
+  assert agent.introduced_in(agent.Delegations)
+    > agent.introduced_in(agent.Stat("media", "a"))
+
+  // A daemon *newer* than this build settles here rather than being refused,
+  // and is asked everything this build knows how to ask. The refusal in that
+  // direction is the one that cannot be caught by testing today's fleet: it
+  // does not fire until the next bump ships to nodes first, which is the
+  // ordinary case, since nodes belong to their operators.
+  assert agent.settled_version(agent.protocol_version + 4)
+    == agent.protocol_version
+  let newer =
+    agent.Session(
+      ..current,
+      version: agent.settled_version(agent.protocol_version + 4),
+    )
+  assert agent.speaks(newer, agent.Replication)
+
+  // Settling never invents a version either end lacks: at or below this
+  // build, the daemon's own number stands.
+  assert agent.settled_version(agent.protocol_version) == agent.protocol_version
+  assert agent.settled_version(agent.min_protocol_version)
+    == agent.min_protocol_version
+}
+
+/// Asking every daemon must not cost a full timeout per daemon.
+///
+/// The bound has to be measured on a real fanout rather than asserted about an
+/// arithmetic helper. A per-node budget passes any test of its own arithmetic
+/// and still spends N budgets in sequence, because each is handed to its own
+/// wait — which is a fact about the loop, not about the number, and only a
+/// clock around the whole call can see it.
+///
+/// Sessions built here have an inbox nobody serves, so every one of them is a
+/// daemon that never answers: the worst case, and the one that decides whether
+/// a dashboard panel returns or hangs.
+pub fn asking_a_fleet_does_not_multiply_the_wait_test() {
+  let budget = 400
+  let fleet =
+    list.index_map(list.repeat(Nil, 40), fn(_, n) {
+      session("node-" <> int.to_string(n), "n" <> int.to_string(n) <> "@x")
+    })
+
+  let started = monotonic_ms()
+  let answers = agent.ask_all_within(fleet, agent.Replication, budget)
+  let elapsed = monotonic_ms() - started
+
+  assert list.length(answers) == 40
+  // Laid end to end this would be 16 seconds. The deadline is what makes the
+  // fleet size stop mattering; the generous ceiling here is scheduling slack,
+  // not room for a second budget.
+  assert elapsed < budget * 2
+}
+
+/// A daemon that costs nothing must not take a share of the window.
+///
+/// This is the rollout the version range exists for: one upgraded node among
+/// many old ones. The old ones are answered locally without a frame, so if the
+/// window were divided by the session count the single node that *can* answer
+/// would get a hundredth of it and time out — and the panel would report the
+/// one node that was working as the one that failed.
+pub fn an_outdated_fleet_does_not_eat_the_asked_nodes_window_test() {
+  let budget = 400
+  let old =
+    list.index_map(list.repeat(Nil, 99), fn(_, n) {
+      let current =
+        session("old-" <> int.to_string(n), "o" <> int.to_string(n) <> "@x")
+      agent.Session(..current, version: 2)
+    })
+  let fleet = list.append(old, [session("new", "new@x")])
+
+  let started = monotonic_ms()
+  let answers = agent.ask_all_within(fleet, agent.Replication, budget)
+  let elapsed = monotonic_ms() - started
+
+  // The 99 are refused without a frame, and the one that was asked is wedged
+  // — so the call spends essentially the whole window on that one node.
+  assert elapsed >= budget * 3 / 4
+  let outdated =
+    list.filter(answers, fn(entry) {
+      case entry.1 {
+        Error(agent.Refusal("outdated", _)) -> True
+        _ -> False
+      }
+    })
+  assert list.length(outdated) == 99
+}
+
+@external(erlang, "cp_sys_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
+
+@external(erlang, "cp_sys_ffi", "mailbox_len")
+fn mailbox_len() -> Int
+
+/// A daemon that answers, but only after the caller has given up on it.
+///
+/// The inbox is created *inside* the spawned process, because a subject is
+/// received on by whoever made it — which is what makes this a real session
+/// rather than a subject nobody serves.
+fn late_answering_session(id: String, delay: Int) -> agent.Session {
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    let assert Ok(agent.Query(_, reply)) = process.receive(inbox, 5000)
+    process.sleep(delay)
+    process.send(reply, Ok(agent.Replicating([])))
+  })
+  let assert Ok(inbox) = process.receive(ready, 1000)
+  agent.Session(..session(id, id <> "@x.example"), inbox: inbox)
+}
+
+/// A question the caller gave up on must not leave its answer behind.
+///
+/// The answer still arrives — the session is holding the request and will
+/// either answer it or have `sweep_waiting` refuse it at the lease — and
+/// nothing receives it, because `process.receive` matches one subject's ref
+/// and the caller has moved on. Under `mist` the caller is the connection
+/// actor, which the dashboard's poll keeps alive for the life of a tab, so
+/// every abandoned question used to leave a message in a mailbox that only
+/// grew, and every later selective receive in that process scanned the pile.
+///
+/// Invisible to every other test: the counts are right, the panel renders,
+/// and the only symptom is a process getting slower the longer somebody
+/// watches it. So it is asserted directly.
+pub fn a_question_the_caller_abandons_leaves_nothing_behind_test() {
+  let before = mailbox_len()
+  let fleet =
+    list.index_map(list.repeat(Nil, 5), fn(_, n) {
+      late_answering_session("late-" <> int.to_string(n), 400)
+    })
+
+  // Every daemon answers at 400ms; the call gives up at 100ms.
+  let answers = agent.ask_all_within(fleet, agent.Replication, 100)
+  assert list.length(answers) == 5
+  assert list.all(answers, fn(entry) {
+    case entry.1 {
+      Error(agent.Refusal("unavailable", _)) -> True
+      _ -> False
+    }
+  })
+
+  // Well past every answer, so a leak would have landed by now.
+  process.sleep(900)
+  assert mailbox_len() == before
+}
+
+/// One node attached twice is still one node.
+///
+/// A daemon that redials after a blip joins before the registry reaps the
+/// half-open session, so for up to a minute the fleet holds two sessions for
+/// one origin. Counting both inflates the replica count in the direction that
+/// hides the warning — a single-copy space reads as two copies and the amber
+/// badge goes quiet — so the collapse happens before anything counts.
+pub fn one_node_attached_twice_counts_once_test() {
+  let stale =
+    browse_api.NodeReplication("nas", "nas@x.example", [], "unavailable", "…")
+  let live =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  let other =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+
+  // The answer wins over the refusal whichever order they arrive in: a node
+  // one of whose sessions answered is a node that answered.
+  let assert [kept, _] = browse_api.one_row_per_node([stale, live, other])
+  assert kept.error == ""
+  let assert [kept, _] = browse_api.one_row_per_node([live, stale, other])
+  assert kept.error == ""
+
+  // The double-count that matters is two tunnels that both answer, which is
+  // what a redial during a poll looks like. One node, one replica.
+  let both = [live, live, other]
+  assert browse_api.replica_counts(browse_api.one_row_per_node(both))
+    == [#("media", 2)]
+  // Without the collapse this is the wrong number, and wrong the quiet way:
+  // `media` reads as three copies when two nodes hold it, so the amber
+  // single-copy badge would stay silent on a fleet of one replica plus a
+  // reconnect.
+  assert browse_api.replica_counts(both) == [#("media", 3)]
+}
+
 /// Reads are same-origin GETs with cookies and no CSRF token, so a hostile
 /// page can start one with an `img` tag. The cap is what bounds how many.
 pub fn one_user_may_not_open_unbounded_downloads_test() {

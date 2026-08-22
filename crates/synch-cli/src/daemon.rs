@@ -32,6 +32,17 @@ const LOG_FILE: &str = "daemon.log";
 /// Private handoff from the background launcher to the `daemon run` child.
 const READY_FILE_ENV: &str = "SYNCH_INTERNAL_READY_FILE";
 
+/// How long `daemon start` waits for the child's control socket before giving
+/// up on it.
+///
+/// Generous, because the wait covers real work: opening the store, running
+/// startup recovery over whatever the last run left behind, and binding iroh.
+/// A cold start on a large node behind a slow disk is entitled to take a while,
+/// and a launcher that gave up on a daemon that was merely busy would be worse
+/// than one that waited. What it may not do is wait *for ever* — that is not
+/// patience, it is a hang with no diagnosis, and it is what this bounds.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A pending server can become a named server in the same process. Only the
 /// first one is this process's startup boundary.
 static READY_SENT: AtomicBool = AtomicBool::new(false);
@@ -83,9 +94,42 @@ pub async fn start(data_dir: &Path, args: impl IntoIterator<Item = OsString>) ->
     detach(&mut command);
 
     let mut child = command.spawn().context("could not start the daemon")?;
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().context("could not inspect the daemon")? {
             return Err(startup_exit(status, &log_path, log_start));
+        }
+
+        // A child that neither comes up nor exits used to spin this loop for
+        // ever, and `daemon start` with it. That is the worst shape a failure
+        // can take: the launcher holds whatever invoked it — a shell, a service
+        // manager, a test harness reading its output — with nothing on stdout
+        // and nothing in the log to say what is wrong. It cost a CI run six
+        // hours before anyone could see which test was stuck.
+        //
+        // Every other startup failure here reports with the log tail, so this
+        // one does too. Killing the child first is the point of ordering: this
+        // process is about to say the daemon did not come up, and leaving a
+        // half-started one holding the lifecycle lock would make the next
+        // `daemon start` fail for a reason that is this call's fault.
+        if std::time::Instant::now() >= deadline {
+            // Which of the two conditions was never met, before the child is
+            // killed and the answer becomes unobtainable. They fail for
+            // unrelated reasons and the difference decides where to look: a
+            // marker that never appeared is a child that did not reach its
+            // readiness signal, while a marker present and a socket that never
+            // answered means the daemon is serving somewhere this launcher is
+            // not looking — which is possible at all only because the endpoint
+            // name is computed independently by each process.
+            let marker = ready.belongs_to(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(startup_timeout(
+                &log_path,
+                log_start,
+                marker,
+                &crate::control::transport::endpoint_name(data_dir),
+            ));
         }
 
         // Binding the listener is earlier than serving it: startup recovery
@@ -229,6 +273,24 @@ fn log_tail(path: &Path, current_start: u64) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn startup_timeout(log_path: &Path, log_start: u64, marker: bool, endpoint: &str) -> anyhow::Error {
+    let detail = log_tail(log_path, log_start).unwrap_or_default();
+    let detail = detail.trim();
+    let secs = STARTUP_TIMEOUT.as_secs();
+    let reached = match marker {
+        true => "it signalled readiness, so it is running but not answering at",
+        false => "it never signalled readiness; this launcher was watching",
+    };
+    let detail = match detail.is_empty() {
+        true => "it wrote nothing to the log".to_string(),
+        false => format!("{} contains:\n{detail}", log_path.display()),
+    };
+    anyhow::anyhow!(
+        "daemon did not come up within {secs}s and has been stopped; \
+         {reached} {endpoint}; {detail}"
+    )
+}
+
 fn startup_exit(
     status: std::process::ExitStatus,
     log_path: &Path,
@@ -259,7 +321,56 @@ fn detach(command: &mut Command) {
 fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+    disinherit_std_handles();
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// Stops the daemon from inheriting *this* process's stdout and stderr.
+///
+/// The child's own three handles are redirected to the log a few lines above,
+/// which is the part that looks like it settles the question. It does not.
+/// `CreateProcess` is called with `bInheritHandles = TRUE` — Rust's `Command`
+/// has no other way to hand a child its redirected stdio — and that flag is
+/// not selective: the child receives *every* handle in this process that is
+/// marked inheritable, not only the three that were redirected. When
+/// `daemon start` was itself launched with piped output, its stdout and stderr
+/// are the write ends of those pipes, they are inheritable, and so the daemon
+/// holds them open for its entire life.
+///
+/// The reader on the other end is then waiting for a pipe that will not close
+/// until the daemon exits, which is the opposite of what backgrounding it was
+/// for. `std::process::Command::output()` waits for EOF and not for exit, so
+/// anything reading this command that way — a script, a service manager, this
+/// repo's own `cli.rs` tests — blocks indefinitely even though the launcher
+/// exited long before. The launcher's own startup timeout cannot help: it
+/// exits on time and the pipe stays open regardless, because another process
+/// holds it.
+///
+/// Clearing the inherit flag first costs nothing. The child never reads or
+/// writes these handles — it was given the log instead — so the only thing
+/// lost is a handle it had no business holding.
+///
+/// Unix needs no equivalent: `exec` keeps only the descriptors explicitly
+/// dup'd into place, and the rest are closed by `CLOEXEC`.
+#[cfg(windows)]
+fn disinherit_std_handles() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` returns a handle this process owns, or an
+        // invalid one when there is no such stream. `SetHandleInformation`
+        // only clears a flag on it and reports failure through its return,
+        // which is ignored on purpose: a process without a console, or one
+        // whose stream is already non-inheritable, has nothing to clear and
+        // is not a reason to refuse to start a daemon.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// Opens the node, binds the control socket, and runs until stopped.

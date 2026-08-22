@@ -19,8 +19,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cloud::frame::{
-        attach_signing_input, encode_chunk, DelegationJson, Down, EntryJson, Up, VersionJson,
-        MAX_CHUNK, NONCE_LEN, PROTOCOL_VERSION,
+        attach_signing_input, encode_chunk, settles_at, DelegationJson, Down, EntryJson,
+        ReplicaSpaceJson, Up, VersionJson, MAX_CHUNK, MIN_PROTOCOL_VERSION, NONCE_LEN,
+        PROTOCOL_VERSION,
     },
     error::{EngineError, Result},
     node::Node,
@@ -365,13 +366,28 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
         .await?;
 
         match receive(&mut stream).await? {
-            Down::Attached { session, v } if v == PROTOCOL_VERSION => {
-                tracing::info!(domain, session, url, "cloud attach established");
+            // A range rather than equality. The control plane settles on this
+            // daemon's version when it can, so the ordinary echo is ours; a
+            // lower one means an older control plane, and serving under it
+            // costs this end nothing but questions it will not be asked.
+            Down::Attached { session, v } if settles_at(v) => {
+                if v != PROTOCOL_VERSION {
+                    tracing::info!(
+                        domain,
+                        session,
+                        url,
+                        settled = v,
+                        speaks = PROTOCOL_VERSION,
+                        "cloud attach established on an older tunnel version"
+                    );
+                } else {
+                    tracing::info!(domain, session, url, "cloud attach established");
+                }
             }
             Down::Attached { v, .. } => {
                 return Err(EngineError::invalid(format!(
-                    "tunnel protocol mismatch: this daemon speaks v{PROTOCOL_VERSION}, \
-                     the control plane settled on v{v}"
+                    "tunnel protocol mismatch: this daemon speaks v{MIN_PROTOCOL_VERSION} to \
+                     v{PROTOCOL_VERSION}, the control plane settled on v{v}"
                 )))
             }
             Down::Err { code, message, .. } => {
@@ -759,6 +775,19 @@ fn handle(
             let internal = internal.clone();
             tokio::spawn(async move {
                 answer(&writes, id, delegations(&node, id).await).await;
+                let _ = internal.send(Internal::RequestDone).await;
+            });
+        }
+        Down::Replication { id } => {
+            if over_capacity(writes, streams, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
+            let node = node.clone();
+            let writes = writes.clone();
+            let internal = internal.clone();
+            tokio::spawn(async move {
+                answer(&writes, id, replication(&node, id).await).await;
                 let _ = internal.send(Internal::RequestDone).await;
             });
         }
@@ -1174,6 +1203,70 @@ async fn delegations(node: &Node, id: u32) -> Result<Up> {
     .await
 }
 
+/// What this node replicates, and how far behind it is
+/// (`docs/REPLICATION.md` §8).
+///
+/// Answers for this node alone, which is the whole difference from
+/// [`delegations`] above: a delegation is a `d:` record every member holds, so
+/// any node speaks for the cluster, while replication is a decision each node
+/// makes for itself. Two nodes of one network can disagree about whether
+/// `media` is replicated and both be right, so an answer that did not say
+/// *whose* it was would be worse than no answer.
+///
+/// The view is read once rather than per space. It is a property of this
+/// node's whole picture — a pending head, or a bound origin it has never
+/// synced — and asking per space would re-run the same two scans of `heads`
+/// and `bindings` for every replicated space to reach the same verdict.
+async fn replication(node: &Node, id: u32) -> Result<Up> {
+    let node = node.clone();
+    crate::blocking::offload(move || {
+        let view = node.view_state()?;
+        let floor = node.config().replica_release_floor;
+        let mut spaces = Vec::new();
+        for space in node.store().replicated_spaces()? {
+            let policy = space
+                .replicate
+                .expect("replicated_spaces filters on the parsed policy");
+            let holder = space.holder();
+            let coverage = node
+                .store()
+                .replica_coverage(&holder, crate::replica::UNREACHABLE_ATTEMPTS)?;
+            spaces.push(ReplicaSpaceJson {
+                space: space.id.clone(),
+                policy: policy.render().to_string(),
+                grace_secs: space.grace_secs(),
+                budget: space.budget,
+                held: coverage.held,
+                held_bytes: coverage.held_bytes,
+                releasing: coverage.releasing,
+                releasing_bytes: coverage.releasing_bytes,
+                wanted: coverage.wanted,
+                wanted_bytes: coverage.wanted_bytes,
+                unreachable: coverage.unreachable,
+                unreachable_bytes: coverage.unreachable_bytes,
+                // Meaningless where the policy never releases, and reported as
+                // zero there rather than as a count: under `archive` nothing is
+                // waiting on peers, so "too few peers to let these go" would
+                // describe a release that is not pending.
+                held_back: match policy.releases() {
+                    true => node
+                        .store()
+                        .held_back_by_replication_floor(&holder, floor)?,
+                    false => 0,
+                },
+                oldest_want: node
+                    .store()
+                    .oldest_want(&holder, crate::replica::UNREACHABLE_ATTEMPTS)?,
+                next_release: node.store().next_release(&holder)?,
+                view_complete: view.is_complete(),
+                view_reason: view.reason().map(str::to_string),
+            });
+        }
+        Ok(Up::Replication { id, spaces })
+    })
+    .await
+}
+
 /// Pins a path to one content root and names who holds it.
 async fn resolve(
     node: &Node,
@@ -1468,6 +1561,82 @@ mod tests {
         // someone since cut off" are different states, different actions.
         assert_eq!(lapsed.issuer, stranger.canonical());
         assert_eq!(lapsed.spaces, ["finance"]);
+
+        drop(to_node);
+        let _ = served.await;
+        node.shutdown().await.unwrap();
+    }
+
+    /// The control plane can ask what this node replicates, and is told about
+    /// this node alone (`docs/REPLICATION.md` §8).
+    ///
+    /// Two properties, and both are why the answer is per node rather than per
+    /// cluster: a space this node does not replicate is absent from the answer
+    /// entirely, and the space it does replicate reports *its* queue. A
+    /// dashboard that showed one node's backlog against another's name would be
+    /// worse than showing nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_answers_a_replication_query_for_this_node_alone() {
+        let (_blocking, dir, node) = scoped_node().await;
+
+        // One replicated space and one ordinary one. The ordinary one exists to
+        // be missing from the answer.
+        node.add_space("local", dir.path().join("local")).unwrap();
+        node.add_detached_space("media").unwrap();
+        node.set_space_replication(
+            "media",
+            Some(synch_store::ReplicaPolicy::Tree),
+            Some(3600),
+            Some(1 << 30),
+            false,
+        )
+        .unwrap();
+
+        // A want the fetch loop has not reached yet, so the counts under test
+        // are not all zero and `oldest_want` has something to carry.
+        let wanted = synch_core::Hash::new(b"a version nobody has sent yet");
+        node.store()
+            .stage_want(
+                &wanted,
+                &synch_store::PinHolder::Replica("media".into()),
+                4096,
+                None,
+                1_700_000_000_000_000_000,
+            )
+            .unwrap();
+
+        let (to_node, mut from_node, served) = serve_session(&node);
+        to_node
+            .send(down_msg(&Down::Replication { id: 9 }))
+            .unwrap();
+        let Up::Replication { id, spaces } = next_up(&mut from_node).await else {
+            panic!("expected a replication answer")
+        };
+        assert_eq!(id, 9);
+        assert_eq!(
+            spaces.len(),
+            1,
+            "only the replicated space is reported: {spaces:?}"
+        );
+
+        let row = &spaces[0];
+        assert_eq!(row.space, "media");
+        assert_eq!(row.policy, "tree");
+        assert_eq!(row.grace_secs, 3600);
+        assert_eq!(row.budget, Some(1 << 30));
+        assert_eq!(row.held, 0);
+        assert_eq!(row.wanted, 1, "the staged want is the backlog");
+        assert_eq!(row.wanted_bytes, 4096);
+        assert_eq!(
+            row.unreachable, 0,
+            "a want that has not been attempted has not failed"
+        );
+        assert_eq!(row.oldest_want, Some(1_700_000_000_000_000_000));
+        assert_eq!(row.next_release, None);
+        assert!(
+            row.view_complete && row.view_reason.is_none(),
+            "a node with nothing pending has a complete view: {row:?}"
+        );
 
         drop(to_node);
         let _ = served.await;

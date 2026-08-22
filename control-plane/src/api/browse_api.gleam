@@ -120,6 +120,206 @@ pub fn delegations(
   }
 }
 
+// -- replication -------------------------------------------------------------
+
+/// One node's replication report, or its refusal to give one.
+///
+/// The two are different rows rather than one row with empty counts: a node
+/// that replicates nothing and a node that could not be asked look identical
+/// in the numbers and call for entirely different actions.
+pub type NodeReplication {
+  NodeReplication(
+    device: String,
+    origin: String,
+    spaces: List(agent.ReplicaSpace),
+    /// The daemon's refusal code, empty when it answered.
+    error: String,
+    message: String,
+  )
+}
+
+/// What each attached daemon replicates (`docs/REPLICATION.md` §8).
+///
+/// **Every attached daemon is asked, not the first.** This is the one browse
+/// route where that matters: a delegation is a record every member holds, so
+/// any node speaks for the cluster, while replication is a decision each node
+/// makes for itself. Two nodes can disagree about whether `media` is
+/// replicated and both be right, so an answer that did not say whose it was
+/// would be worse than no answer at all.
+///
+/// Gated on the same switch as the rest of this module, for the reason
+/// `delegations` gives: the toggle decides whether this service asks an org's
+/// daemons questions at all.
+pub fn replication(
+  reads: Reads,
+  browse: Browse,
+  who: Principal,
+  slug: String,
+  network: String,
+) -> Response {
+  use net <- with_network(reads, who, slug, network, Member)
+  case net.enabled, attached(browse, net) {
+    False, _ ->
+      error_json(
+        409,
+        "browse-disabled",
+        "this network does not answer control-plane questions",
+      )
+    True, [] ->
+      error_json(
+        503,
+        "no-device-attached",
+        "no daemon of this network is attached",
+      )
+    True, sessions -> {
+      let nodes =
+        agent.ask_all(sessions, agent.Replication)
+        |> list.map(reported)
+        |> one_row_per_node
+      ok_json(
+        json.object([
+          #("nodes", json.array(nodes, node_replication_json)),
+          #("spaces", json.array(replica_counts(nodes), space_count_json)),
+        ]),
+      )
+    }
+  }
+}
+
+/// One session's answer, turned into the row the dashboard reads.
+fn reported(
+  entry: #(agent.Session, Result(agent.Answer, agent.Refusal)),
+) -> NodeReplication {
+  let #(session, answer) = entry
+  case answer {
+    Ok(agent.Replicating(spaces)) ->
+      NodeReplication(session.label, session.origin, spaces, "", "")
+    Ok(_) ->
+      NodeReplication(
+        session.label,
+        session.origin,
+        [],
+        "internal",
+        "the daemon answered the wrong question",
+      )
+    Error(refusal) ->
+      NodeReplication(
+        session.label,
+        session.origin,
+        [],
+        refusal.code,
+        refusal.message,
+      )
+  }
+}
+
+/// Collapses several sessions of the same node into the one node they are.
+///
+/// A node is its origin; a session is one tunnel it happens to hold. The two
+/// come apart after a network blip — the daemon redials and joins before the
+/// registry's heartbeat reaps the half-open session, so for up to a minute one
+/// node is attached twice. Everything downstream reads this list as a fleet,
+/// and a duplicate is then a wrong number in the direction that hides the
+/// warning: a space held by one node that reconnected a moment ago counts two
+/// replicas, and the single-copy badge this panel exists for goes quiet.
+///
+/// An answer beats a refusal for the same origin, because a node one of whose
+/// sessions answered is a node that answered — the wedged tunnel is the stale
+/// one. Order is first-seen, so the fleet does not reshuffle between polls.
+pub fn one_row_per_node(nodes: List(NodeReplication)) -> List(NodeReplication) {
+  list.fold(nodes, [], fn(kept, node) {
+    case
+      list.find(kept, fn(seen: NodeReplication) { seen.origin == node.origin })
+    {
+      Error(Nil) -> list.append(kept, [node])
+      Ok(seen) ->
+        case seen.error, node.error {
+          "", _ -> kept
+          _, "" ->
+            list.map(kept, fn(row) {
+              case row.origin == node.origin {
+                True -> node
+                False -> row
+              }
+            })
+          _, _ -> kept
+        }
+    }
+  })
+}
+
+/// How many attached nodes replicate each space, in first-seen order.
+///
+/// The one fact a per-node listing cannot show, and the one this panel exists
+/// for: a space every node replicates is covered, a space one node replicates
+/// holds every superseded version in exactly one place, and read node by node
+/// those two look the same.
+///
+/// A node that refused contributes nothing — not a zero, nothing. Silence is
+/// not evidence that a daemon does not replicate a space, and counting it as
+/// though it were would report a fleet as thinner than it is, which is the
+/// direction that prompts someone to act on a number that was never measured.
+pub fn replica_counts(nodes: List(NodeReplication)) -> List(#(String, Int)) {
+  list.fold(nodes, [], fn(counts, node) {
+    list.fold(node.spaces, counts, fn(counts, space) {
+      bump(counts, space.space)
+    })
+  })
+}
+
+fn bump(counts: List(#(String, Int)), space: String) -> List(#(String, Int)) {
+  case list.key_find(counts, space) {
+    Ok(_) ->
+      list.map(counts, fn(row) {
+        case row {
+          #(id, n) if id == space -> #(id, n + 1)
+          other -> other
+        }
+      })
+    Error(Nil) -> list.append(counts, [#(space, 1)])
+  }
+}
+
+fn space_count_json(row: #(String, Int)) -> Json {
+  let #(space, replicas) = row
+  json.object([
+    #("space", json.string(space)),
+    #("replicas", json.int(replicas)),
+  ])
+}
+
+fn node_replication_json(node: NodeReplication) -> Json {
+  json.object([
+    #("device", json.string(node.device)),
+    #("origin", json.string(node.origin)),
+    #("spaces", json.array(node.spaces, replica_space_json)),
+    #("error", json.string(node.error)),
+    #("message", json.string(node.message)),
+  ])
+}
+
+fn replica_space_json(space: agent.ReplicaSpace) -> Json {
+  json.object([
+    #("space", json.string(space.space)),
+    #("policy", json.string(space.policy)),
+    #("grace_secs", json.int(space.grace_secs)),
+    #("budget", json.int(space.budget)),
+    #("held", json.int(space.held)),
+    #("held_bytes", json.int(space.held_bytes)),
+    #("releasing", json.int(space.releasing)),
+    #("releasing_bytes", json.int(space.releasing_bytes)),
+    #("wanted", json.int(space.wanted)),
+    #("wanted_bytes", json.int(space.wanted_bytes)),
+    #("unreachable", json.int(space.unreachable)),
+    #("unreachable_bytes", json.int(space.unreachable_bytes)),
+    #("held_back", json.int(space.held_back)),
+    #("oldest_want", json.int(space.oldest_want)),
+    #("next_release", json.int(space.next_release)),
+    #("view_complete", json.bool(space.view_complete)),
+    #("view_reason", json.string(space.view_reason)),
+  ])
+}
+
 fn delegation_json(row: agent.Delegation) -> Json {
   json.object([
     #("key", json.string(row.key)),

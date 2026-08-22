@@ -236,6 +236,63 @@ export interface Delegations {
   delegations: Delegation[]
 }
 
+/// One replicated space, as the node holding it reports it
+/// (`docs/REPLICATION.md` §8).
+///
+/// `wanted` includes `unreachable`, because that is what the node means by it.
+/// Objects no provider has answered for are not a backlog that is draining;
+/// they are versions that are probably already gone, and telling those two
+/// apart is most of why anyone watches a replica. Subtract for the backlog,
+/// the way `synch space ls` does.
+///
+/// `budget`, `oldest_want` and `next_release` are `0` for "none", not for a
+/// value of zero — the same convention `Delegation.not_after` uses.
+export interface ReplicaSpace {
+  space: string
+  policy: 'tree' | 'archive'
+  grace_secs: number
+  budget: number
+  held: number
+  held_bytes: number
+  releasing: number
+  releasing_bytes: number
+  wanted: number
+  wanted_bytes: number
+  unreachable: number
+  unreachable_bytes: number
+  held_back: number
+  oldest_want: number
+  next_release: number
+  view_complete: boolean
+  view_reason: string
+}
+
+/// One node's replication report, or its refusal to give one.
+///
+/// `error` is empty when the node answered. A node that replicates nothing and
+/// a node that could not be asked have identical counts and call for entirely
+/// different actions, so they are told apart by this field and not by reading
+/// the numbers.
+///
+/// `outdated` is its own case: the node speaks a tunnel version older than the
+/// replication query, so it was never asked — asking would have ended its
+/// tunnel. Nothing is wrong with it beyond its age.
+export interface NodeReplication {
+  device: string
+  origin: string
+  spaces: ReplicaSpace[]
+  error: string
+  message: string
+}
+
+export interface Replication {
+  nodes: NodeReplication[]
+  /// How many attached nodes replicate each space. Nodes that refused
+  /// contribute nothing, so this counts what was measured and not what was
+  /// assumed.
+  spaces: { space: string; replicas: number }[]
+}
+
 export interface BrowseVersion {
   root: string
   kind: string

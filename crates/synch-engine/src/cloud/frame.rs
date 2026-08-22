@@ -14,17 +14,38 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The tunnel protocol version, carried in the hello and echoed on attach.
+/// The newest tunnel protocol version this daemon speaks, carried in the hello.
 ///
-/// A mismatch is a refusal naming both versions, the same posture
-/// `x-synch-control-version` takes on the local socket.
+/// v2 added the delegations query, v3 the replication one. Each is additive on
+/// the wire, and the number exists because additive is not the same as safe:
+/// a frame an end has not learnt fails to decode, and a failed decode ends the
+/// connection rather than answering. The version is how the control plane
+/// knows which questions this daemon can be asked at all.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The oldest settled version this daemon will serve under.
 ///
-/// v2 added the delegations query. Additive on the wire, and bumped anyway: a
-/// v1 control plane asking a v2 daemon nothing new would work by luck, while a
-/// v2 control plane asking a v1 daemon for delegations would meet an
-/// undecodable frame and a dropped connection rather than a sentence naming
-/// the mismatch. The version check exists so the failure is the legible one.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The control plane settles on the daemon's version when it can, so the usual
+/// echo is `PROTOCOL_VERSION`. Accepting a *lower* settled version is what
+/// makes this daemon work against a control plane older than it: this end only
+/// answers questions, so serving at v2 costs it nothing — it is asked less.
+/// Without the range, upgrading a node before its control plane would take
+/// that node's tunnel down, which is the wrong way round for a fleet where
+/// nodes belong to their operators.
+///
+/// Two, not one: v1 predates the delegations query, and a control plane that
+/// settled on v1 would be old enough that nothing in this tree has met one.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
+
+/// Whether this daemon will serve under the version a control plane settled on.
+///
+/// Named rather than left inline in the handshake's match guard so the range
+/// has one definition and a test can hold it to it: getting the ends wrong is
+/// either a tunnel that drops on upgrade or one that stays up while a frame
+/// goes undecoded, and neither announces itself.
+pub fn settles_at(version: u32) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
 
 /// The domain-separation tag an attach proof signs under.
 ///
@@ -176,6 +197,19 @@ pub enum Down {
         /// The request id.
         id: u32,
     },
+    /// What this node replicates and how far behind it is
+    /// (`docs/REPLICATION.md` §8), answered with [`Up::Replication`].
+    ///
+    /// Takes no argument, and unlike [`Down::Delegations`] that is not because
+    /// any node can answer for the cluster. Replication is a per-node decision
+    /// — one node replicates `media`, its neighbour does not, and both are
+    /// correct — so this reports the answering node alone. A control plane that
+    /// wants the fleet's picture asks every attached daemon and says which said
+    /// what.
+    Replication {
+        /// The request id.
+        id: u32,
+    },
     /// Liveness, answered with [`Up::Pong`].
     Ping,
     /// The answer to a [`Up::Ping`].
@@ -264,6 +298,15 @@ pub enum Up {
         id: u32,
         /// One row per `(issuer, subject)` pair, in the store's order.
         delegations: Vec<DelegationJson>,
+    },
+    /// What this node replicates, one row per replicated space.
+    Replication {
+        /// The request id.
+        id: u32,
+        /// The replicated spaces, in the store's order. Empty is an answer:
+        /// this node replicates nothing, which is different from not having
+        /// been asked.
+        spaces: Vec<ReplicaSpaceJson>,
     },
     /// A stream ended, having sent everything it was asked for.
     Done {
@@ -354,6 +397,55 @@ pub struct DelegationJson {
     pub note: Option<String>,
 }
 
+/// One replicated space, as this node reports it (`docs/REPLICATION.md` §8).
+///
+/// The counts are the store's, not a summary: `wanted` includes `unreachable`,
+/// because that is what the store means by it, and a reader that wants the
+/// backlog alone subtracts. Folding them here would put the two numbers this
+/// report exists for — a queue that is draining and a queue that is dead —
+/// behind one that cannot tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaSpaceJson {
+    /// The space's id.
+    pub space: String,
+    /// `tree` or `archive`.
+    pub policy: String,
+    /// The grace window a superseded root gets, in seconds. Reported under
+    /// `archive` too, where it is inert: nothing is ever scheduled.
+    pub grace_secs: i64,
+    /// The ceiling on held bytes, if the space has one.
+    pub budget: Option<u64>,
+    /// Objects pinned for this space, and the bytes they account for.
+    pub held: u64,
+    /// Bytes those objects account for.
+    pub held_bytes: u64,
+    /// Held objects with a scheduled release.
+    pub releasing: u64,
+    /// Bytes those objects account for.
+    pub releasing_bytes: u64,
+    /// Objects wanted and not yet held, `unreachable` included.
+    pub wanted: u64,
+    /// Bytes those objects would add.
+    pub wanted_bytes: u64,
+    /// Wanted objects no provider has answered for.
+    pub unreachable: u64,
+    /// Bytes those objects would add.
+    pub unreachable_bytes: u64,
+    /// Objects the tree has stopped naming that this node holds anyway,
+    /// because too few other origins advertise them (§4.3).
+    pub held_back: u64,
+    /// When the oldest outstanding want was first wanted, unix nanoseconds.
+    pub oldest_want: Option<i64>,
+    /// When the soonest scheduled release falls due, unix nanoseconds.
+    pub next_release: Option<i64>,
+    /// Whether releases are running at all. A paused view is the difference
+    /// between a replica that is behaving and one that is stuck, so it travels
+    /// as its own field rather than being inferred from the counts.
+    pub view_complete: bool,
+    /// Why they are paused, when they are.
+    pub view_reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +502,131 @@ mod tests {
         .unwrap();
         assert!(bare["delegations"][0]["not_after"].is_null());
         assert!(bare["delegations"][0]["note"].is_null());
+    }
+
+    /// A daemon serves under an older control plane, and refuses a version
+    /// neither end could have meant.
+    ///
+    /// The upgrade order in a real fleet is not chosen by anyone: nodes belong
+    /// to their operators, so a node may be newer than the control plane it
+    /// attaches to, or older. Both work, because this end only *answers* — a
+    /// lower settled version costs it nothing but questions it is not asked.
+    /// What must not happen is a settled version outside the range being taken
+    /// as agreement, since the frames that follow are then anyone's guess.
+    #[test]
+    fn a_daemon_serves_the_versions_it_still_speaks() {
+        assert!(settles_at(PROTOCOL_VERSION), "its own, the ordinary case");
+        assert!(
+            settles_at(MIN_PROTOCOL_VERSION),
+            "and the oldest it still serves — an older control plane is a \
+             control plane, not a fault"
+        );
+        assert!(
+            !settles_at(MIN_PROTOCOL_VERSION - 1),
+            "below the floor is a version this build has no frames for"
+        );
+        assert!(
+            !settles_at(PROTOCOL_VERSION + 1),
+            "and above its own is a control plane that will ask questions this \
+             daemon cannot decode — which ends the tunnel, so it must not attach"
+        );
+    }
+
+    /// The replication answer's field names are the contract, for the same
+    /// reason the delegations answer's are: the decoder is in another language
+    /// and reads them by name.
+    #[test]
+    fn the_replication_wire_layout_is_pinned() {
+        let frame = Up::Replication {
+            id: 7,
+            spaces: vec![ReplicaSpaceJson {
+                space: "media".into(),
+                policy: "tree".into(),
+                grace_secs: 2_592_000,
+                budget: Some(1 << 40),
+                held: 12,
+                held_bytes: 4096,
+                releasing: 2,
+                releasing_bytes: 512,
+                wanted: 5,
+                wanted_bytes: 900,
+                unreachable: 1,
+                unreachable_bytes: 100,
+                held_back: 3,
+                oldest_want: Some(1_700_000_000_000_000_000),
+                next_release: Some(1_800_000_000_000_000_000),
+                view_complete: false,
+                view_reason: Some("nas@x.example is bound but has published nothing".into()),
+            }],
+        };
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["t"], "replication");
+        assert_eq!(json["id"], 7);
+        let row = &json["spaces"][0];
+        assert_eq!(row["space"], "media");
+        assert_eq!(row["policy"], "tree");
+        assert_eq!(row["grace_secs"], 2_592_000);
+        assert_eq!(row["budget"], 1u64 << 40);
+        assert_eq!(row["held"], 12);
+        assert_eq!(row["held_bytes"], 4096);
+        assert_eq!(row["releasing"], 2);
+        assert_eq!(row["releasing_bytes"], 512);
+        assert_eq!(row["wanted"], 5);
+        assert_eq!(row["wanted_bytes"], 900);
+        assert_eq!(row["unreachable"], 1);
+        assert_eq!(row["unreachable_bytes"], 100);
+        assert_eq!(row["held_back"], 3);
+        assert_eq!(row["oldest_want"], 1_700_000_000_000_000_000i64);
+        assert_eq!(row["next_release"], 1_800_000_000_000_000_000i64);
+        assert_eq!(row["view_complete"], false);
+        assert_eq!(
+            row["view_reason"],
+            "nas@x.example is bound but has published nothing"
+        );
+
+        let ask: serde_json::Value = serde_json::to_value(Down::Replication { id: 7 }).unwrap();
+        assert_eq!(ask["t"], "replication");
+        assert_eq!(ask["id"], 7);
+
+        // The three optional fields travel as null rather than vanishing: the
+        // Gleam decoder reads them as nullable, and a missing key is a
+        // different shape from a null one.
+        let bare = serde_json::to_value(Up::Replication {
+            id: 1,
+            spaces: vec![ReplicaSpaceJson {
+                space: "docs".into(),
+                policy: "archive".into(),
+                grace_secs: 0,
+                budget: None,
+                held: 0,
+                held_bytes: 0,
+                releasing: 0,
+                releasing_bytes: 0,
+                wanted: 0,
+                wanted_bytes: 0,
+                unreachable: 0,
+                unreachable_bytes: 0,
+                held_back: 0,
+                oldest_want: None,
+                next_release: None,
+                view_complete: true,
+                view_reason: None,
+            }],
+        })
+        .unwrap();
+        assert!(bare["spaces"][0]["budget"].is_null());
+        assert!(bare["spaces"][0]["oldest_want"].is_null());
+        assert!(bare["spaces"][0]["next_release"].is_null());
+        assert!(bare["spaces"][0]["view_reason"].is_null());
+
+        // A node replicating nothing answers with an empty list, which must
+        // still be a list: the panel says "replicates nothing" from it.
+        let none = serde_json::to_value(Up::Replication {
+            id: 2,
+            spaces: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(none["spaces"], serde_json::json!([]));
     }
 
     /// The two contexts a device key signs under must not overlap: a head

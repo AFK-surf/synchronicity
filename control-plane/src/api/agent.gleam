@@ -13,8 +13,9 @@
 //// trail.
 ////
 //// Nothing in this module writes to a cluster. The frames it can encode ask
-//// for a listing, a version set, a resolution or a byte range; there is no
-//// opcode for anything else, which is where the read-only property lives.
+//// for a listing, a version set, a resolution, a byte range, who the cluster
+//// admits, or what a node replicates; there is no opcode for anything else,
+//// which is where the read-only property lives.
 
 import api/middleware.{now_unix}
 import gleam/bit_array
@@ -42,12 +43,64 @@ import util/id
 @external(erlang, "cp_crypto_ffi", "ed25519_verify_safe")
 fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 
-/// The tunnel protocol version this build speaks.
+/// The newest tunnel protocol version this build speaks.
 ///
-/// A mismatch is a refusal naming both versions, not a negotiation: protobuf
-/// keeps a field addition readable, but nothing makes a control plane that has
-/// not learnt a frame out of one that has.
-pub const protocol_version = 2
+/// v2 added the delegations query, v3 the replication one. Each is additive on
+/// the wire, and the number exists because additive is not the same as safe: a
+/// daemon that meets a frame it has not learnt cannot decode it, and drops the
+/// connection rather than answering. What the version buys is knowing which
+/// questions a given daemon can be asked at all.
+pub const protocol_version = 3
+
+/// The oldest version this build still serves.
+///
+/// An attach settles on the **daemon's** version when it falls in this range,
+/// rather than demanding it equal ours. A node whose operator has not upgraded
+/// keeps its tunnel and goes on answering everything its version defines; it
+/// is simply never asked a question that came later (see `speaks`). Refusing
+/// it outright would take the whole browse surface away from an org to add a
+/// panel, which is a bad trade for the org and no safer for anyone.
+///
+/// Two, not one: v1 predates the delegations query, and the delegations route
+/// picks a session without consulting its version. Nothing at v1 can attach
+/// today, so the floor records that rather than reopening it.
+pub const min_protocol_version = 2
+
+/// The version a question first appeared in.
+///
+/// Every question here is one some older daemon cannot decode, so this is the
+/// table that says which. It is a function of the question rather than a flag
+/// on the session, because a new question is added by extending this — and
+/// forgetting to is a dropped tunnel rather than a compile error, which is
+/// exactly the kind of mistake to make impossible to overlook.
+pub fn introduced_in(question: Question) -> Int {
+  case question {
+    Ls(..) | Stat(..) | Resolve(..) -> 1
+    Delegations -> 2
+    Replication -> 3
+  }
+}
+
+/// Whether an attached daemon is new enough to be asked this.
+pub fn speaks(session: Session, question: Question) -> Bool {
+  session.version >= introduced_in(question)
+}
+
+/// The version an attach settles on, given what the daemon claimed.
+///
+/// A daemon newer than this build settles *here*, at the newest set of frames
+/// both ends have — it is not turned away for knowing more. Refusing the newer
+/// end is the same mistake as refusing the older one, and the easier one to
+/// miss: it cannot fire until a bump ships to nodes before control planes,
+/// which is the ordinary order, since nodes belong to their operators.
+///
+/// Named rather than inlined at the one call site so a test can hold it to
+/// both ends. The floor is not applied here — being below it is a refusal, not
+/// something to settle at, and folding the two would silently admit a daemon
+/// whose frames this build no longer has.
+pub fn settled_version(claimed: Int) -> Int {
+  int.min(claimed, protocol_version)
+}
 
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
@@ -144,6 +197,12 @@ pub type Question {
   /// argument: delegations reach every member, so whichever node answers
   /// speaks for the whole network.
   Delegations
+  /// What the answering node replicates, and how far behind it is
+  /// (`docs/REPLICATION.md` §8). Takes no argument either, but for the
+  /// opposite reason to `Delegations`: replication is a per-node decision, so
+  /// this speaks for the node asked and no other — which is why the handler
+  /// asks every attached daemon and labels each answer.
+  Replication
 }
 
 /// What a question is answered with.
@@ -158,6 +217,49 @@ pub type Answer {
     holders: List(String),
   )
   Delegated(delegations: List(Delegation))
+  Replicating(spaces: List(ReplicaSpace))
+}
+
+/// One replicated space, as the node reports it (`docs/REPLICATION.md` §8).
+///
+/// The counts are the node's own and are carried through unfolded. `wanted`
+/// includes `unreachable`, because that is what the node means by it: objects
+/// no provider has answered for are not a backlog that is draining, they are
+/// versions that are probably already gone, and the difference is the whole
+/// reason to watch a replica. A field that added them together would hide the
+/// one number this panel exists to show.
+///
+/// `budget`, `oldest_want` and `next_release` read as `0` when the node sends
+/// null, the same way a delegation with no expiry does.
+pub type ReplicaSpace {
+  ReplicaSpace(
+    space: String,
+    /// `tree` or `archive`.
+    policy: String,
+    grace_secs: Int,
+    /// The ceiling on held bytes, or 0 for none.
+    budget: Int,
+    held: Int,
+    held_bytes: Int,
+    releasing: Int,
+    releasing_bytes: Int,
+    wanted: Int,
+    wanted_bytes: Int,
+    unreachable: Int,
+    unreachable_bytes: Int,
+    /// Objects the tree has stopped naming that the node holds anyway,
+    /// because too few other origins advertise them.
+    held_back: Int,
+    /// When the oldest outstanding want was first wanted, unix nanoseconds,
+    /// or 0 for none.
+    oldest_want: Int,
+    /// When the soonest scheduled release falls due, unix nanoseconds, or 0.
+    next_release: Int,
+    /// Whether releases are running at all. Paused is the difference between
+    /// a replica that is behaving and one that is stuck.
+    view_complete: Bool,
+    view_reason: String,
+  )
 }
 
 /// One delegated key, as the node reports it.
@@ -427,14 +529,185 @@ pub fn streams_per_user() -> Int {
 }
 
 /// Asks one attached daemon a question and waits for its answer.
+///
+/// The version gate lives here, in the only place a question reaches a socket,
+/// rather than in `ask_all` alone. A frame a daemon cannot decode ends its
+/// tunnel, so a caller that reached past the gate would take an operator's
+/// browse surface down by adding a feature — and it would compile, type-check
+/// and pass every test on a fleet that happened to be current.
 pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
-  let reply = process.new_subject()
-  process.send(session.inbox, Query(question, reply))
-  case process.receive(reply, query_timeout) {
-    Ok(answer) -> answer
-    Error(Nil) ->
-      Error(Refusal("unavailable", "the attached daemon did not answer in time"))
+  ask_within(session, question, query_timeout)
+}
+
+/// One session, through the same fanout — so the abandoned-subject problem
+/// `ask_all_within` documents is fixed for single questions too, rather than
+/// only for the one caller that happens to ask a fleet.
+fn ask_within(
+  session: Session,
+  question: Question,
+  budget: Int,
+) -> Result(Answer, Refusal) {
+  case ask_all_within([session], question, budget) {
+    [#(_, answer)] -> answer
+    _ ->
+      Error(Refusal("internal", "the fanout did not answer for this session"))
   }
+}
+
+/// Sends the question, or declines to — the gate and the socket in one place.
+///
+/// `None` means nothing was sent, and is what makes an outdated daemon cost no
+/// time at all: it never enters the waiting below.
+fn dispatch(
+  session: Session,
+  question: Question,
+) -> Option(Subject(Result(Answer, Refusal))) {
+  case speaks(session, question) {
+    False -> None
+    True -> {
+      let reply = process.new_subject()
+      process.send(session.inbox, Query(question, reply))
+      Some(reply)
+    }
+  }
+}
+
+/// Waits out whatever is left of the budget for one dispatched question.
+///
+/// A budget at or below zero still checks the mailbox and returns an answer
+/// already sitting in it — past the deadline nothing is waited for, but
+/// nothing already paid for is thrown away either.
+fn collect(
+  session: Session,
+  question: Question,
+  reply: Option(Subject(Result(Answer, Refusal))),
+  budget: Int,
+) -> Result(Answer, Refusal) {
+  case reply {
+    None -> Error(Refusal("outdated", outdated(session, question)))
+    Some(reply) ->
+      case process.receive(reply, int.max(budget, 0)) {
+        Ok(answer) -> answer
+        Error(Nil) ->
+          Error(Refusal(
+            "unavailable",
+            "the attached daemon did not answer in time",
+          ))
+      }
+  }
+}
+
+/// Asks every attached daemon the same question and collects what came back.
+///
+/// Every question goes out before any answer is waited for, so the daemons
+/// work in parallel and the waits overlap. Asking them one at a time with
+/// `ask` would lay a full `query_timeout` end to end per wedged daemon, and
+/// a fleet with a few of those turns one dashboard panel into a request
+/// measured in minutes.
+///
+/// **The bound is one deadline for the call, not a budget per node.** Dividing
+/// `query_timeout` by the number of sessions looks equivalent and is not: a
+/// per-node timeout is spent in sequence, so N wedged daemons cost N times it,
+/// and the floor that keeps a large fleet's per-node share usable is exactly
+/// what makes the total grow without limit. A deadline cannot do that — every
+/// question is already outstanding, so the last session waited on is waited on
+/// for whatever remains, and the call returns inside `query_timeout` whether
+/// the fleet is one node or three hundred.
+///
+/// It also means a session that costs nothing gives its time to the others.
+/// An outdated daemon is answered locally without a frame, and one whose
+/// answer is already in the mailbox returns at once — so a rollout where one
+/// upgraded node sits among ninety-nine old ones gives that node the whole
+/// window, rather than a hundredth of it for being outnumbered.
+///
+/// A daemon that refuses or falls silent comes back as its own `Error` rather
+/// than failing the call: the answer to "what does the fleet replicate" is
+/// per node, so one node that cannot say is a fact about that node and not a
+/// reason to withhold the others.
+pub fn ask_all(
+  sessions: List(Session),
+  question: Question,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  ask_all_within(sessions, question, query_timeout)
+}
+
+/// [`ask_all`] with the deadline named, so a test can bound a real fanout
+/// without waiting out the production one.
+///
+/// **The fanout runs in a process of its own, and that is not tidiness.** A
+/// question this call gives up on is still outstanding at the session, which
+/// will send into its reply subject later — the daemon's real answer, or the
+/// refusal `sweep_waiting` writes when the `waiting_lease` falls due. Nothing
+/// ever receives those: `process.receive` matches one subject's ref, and the
+/// caller has moved on. Under `mist` the caller is the *connection* actor, and
+/// the dashboard's poll keeps one alive for as long as a tab is open — so each
+/// abandoned question left a message in a mailbox that only ever grew, and
+/// every selective receive in that process, including the next poll's and any
+/// file browse sharing the socket, then scanned the pile. The cost was
+/// quadratic in how long the tab had been open.
+///
+/// Spawning makes the mailbox mortal. The child collects, sends one result
+/// back, and exits; a late answer arrives at a dead pid, which the VM
+/// discards. The wait here is deliberately looser than the child's own
+/// deadline, because timing out *here* abandons a subject in the caller —
+/// the very thing being fixed — so it has to stay pathological rather than
+/// routine.
+pub fn ask_all_within(
+  sessions: List(Session),
+  question: Question,
+  budget: Int,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  let done = process.new_subject()
+  process.spawn_unlinked(fn() {
+    process.send(done, fanout(sessions, question, budget))
+  })
+  case process.receive(done, budget + collect_slack) {
+    Ok(answers) -> answers
+    // The child is bounded by the same deadline and does nothing else, so
+    // reaching this means the scheduler stalled for `collect_slack` on top of
+    // it. Reported per session rather than raised: this panel's whole posture
+    // is that a node which could not be asked says so.
+    Error(Nil) ->
+      list.map(sessions, fn(session) {
+        #(
+          session,
+          Error(Refusal(
+            "unavailable",
+            "the control plane did not finish asking in time",
+          )),
+        )
+      })
+  }
+}
+
+/// How much longer than its own deadline the fanout is given to come back.
+const collect_slack = 2000
+
+fn fanout(
+  sessions: List(Session),
+  question: Question,
+  budget: Int,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  let deadline = monotonic_ms() + budget
+  let pending =
+    list.map(sessions, fn(session) { #(session, dispatch(session, question)) })
+  list.map(pending, fn(entry) {
+    let #(session, reply) = entry
+    #(session, collect(session, question, reply, deadline - monotonic_ms()))
+  })
+}
+
+/// Milliseconds from a monotonic source. Monotonic rather than wall-clock on
+/// purpose: a deadline a clock step could move is not a deadline.
+@external(erlang, "cp_sys_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
+
+fn outdated(session: Session, question: Question) -> String {
+  "this daemon speaks tunnel v"
+  <> int.to_string(session.version)
+  <> "; the question was added in v"
+  <> int.to_string(introduced_in(question))
+  <> " — upgrade the node to see this"
 }
 
 // -- the attach endpoint -----------------------------------------------------
@@ -557,6 +830,7 @@ fn incoming(
     Ok("versions"), Live(_) -> answered(state, body, versions_decoder())
     Ok("resolved"), Live(_) -> answered(state, body, resolved_decoder())
     Ok("delegations"), Live(_) -> answered(state, body, delegations_decoder())
+    Ok("replication"), Live(_) -> answered(state, body, replication_decoder())
     Ok("meta"), Live(_) -> streamed(state, body, meta_decoder())
     Ok("done"), Live(_) -> streamed(state, body, done_decoder())
     Ok("err"), Live(_) -> streamed(state, body, error_decoder())
@@ -575,14 +849,21 @@ fn hello(
   case json.parse(body, hello_decoder()) {
     Error(_) -> refuse(conn, "invalid", "malformed hello")
     Ok(claim) ->
-      case claim.version == protocol_version {
+      // Only the floor refuses. A daemon *newer* than this build settles at
+      // this build's version rather than being turned away: it speaks
+      // everything here speaks, and a node that upgraded before its control
+      // plane did would otherwise lose browse, reads and delegations to gain
+      // nothing. Refusing the newer end is the same mistake as refusing the
+      // older one, in the direction that is easier to miss because it cannot
+      // happen until the next bump.
+      case claim.version >= min_protocol_version {
         False ->
           refuse(
             conn,
             "version-mismatch",
             "this control plane speaks tunnel v"
-              <> int.to_string(protocol_version)
-              <> ", the daemon speaks v"
+              <> int.to_string(min_protocol_version)
+              <> " and later, the daemon speaks v"
               <> int.to_string(claim.version),
           )
         True -> {
@@ -643,7 +924,13 @@ fn proof(
               json.object([
                 #("t", json.string("attached")),
                 #("session", json.string(session.id)),
-                #("v", json.int(protocol_version)),
+                // The version settled on: the daemon's own where this build
+                // can meet it, this build's where the daemon is newer. Not the
+                // claim, and not a constant — a daemon built before the range
+                // existed compares this against what it sent, and one built
+                // after checks it against `settles_at`'s range, and settling
+                // is what both of those accept.
+                #("v", json.int(session.version)),
               ]),
             )
           mist.continue(Conn(..state, phase: Live(session)))
@@ -752,7 +1039,10 @@ fn lookup(
             origin: claim.origin,
             key_id: key_id,
             spaces: claim.spaces,
-            version: claim.version,
+            // The version *settled on*, not the one claimed. Clamping here
+            // rather than at each use is what keeps `speaks` and the attach
+            // echo agreeing about which questions this session can take.
+            version: settled_version(claim.version),
             attached_at: now_unix(),
             inbox: inbox,
           ))
@@ -1025,6 +1315,11 @@ fn question_json(id: Int, question: Question) -> Json {
         #("t", json.string("delegations")),
         #("id", json.int(id)),
       ])
+    Replication ->
+      json.object([
+        #("t", json.string("replication")),
+        #("id", json.int(id)),
+      ])
   }
 }
 
@@ -1136,6 +1431,51 @@ fn delegations_decoder() -> Decoder(#(Int, Answer)) {
     decode.list(delegation_decoder()),
   )
   decode.success(#(id, Delegated(delegations)))
+}
+
+fn replica_space_decoder() -> Decoder(ReplicaSpace) {
+  use space <- decode.field("space", decode.string)
+  use policy <- decode.field("policy", decode.string)
+  use grace_secs <- decode.optional_field("grace_secs", 0, nullable_int())
+  use budget <- decode.optional_field("budget", 0, nullable_int())
+  use held <- decode.field("held", decode.int)
+  use held_bytes <- decode.field("held_bytes", decode.int)
+  use releasing <- decode.field("releasing", decode.int)
+  use releasing_bytes <- decode.field("releasing_bytes", decode.int)
+  use wanted <- decode.field("wanted", decode.int)
+  use wanted_bytes <- decode.field("wanted_bytes", decode.int)
+  use unreachable <- decode.field("unreachable", decode.int)
+  use unreachable_bytes <- decode.field("unreachable_bytes", decode.int)
+  use held_back <- decode.field("held_back", decode.int)
+  use oldest_want <- decode.optional_field("oldest_want", 0, nullable_int())
+  use next_release <- decode.optional_field("next_release", 0, nullable_int())
+  use view_complete <- decode.field("view_complete", decode.bool)
+  use view_reason <- decode.optional_field("view_reason", "", nullable_string())
+  decode.success(ReplicaSpace(
+    space,
+    policy,
+    grace_secs,
+    budget,
+    held,
+    held_bytes,
+    releasing,
+    releasing_bytes,
+    wanted,
+    wanted_bytes,
+    unreachable,
+    unreachable_bytes,
+    held_back,
+    oldest_want,
+    next_release,
+    view_complete,
+    view_reason,
+  ))
+}
+
+fn replication_decoder() -> Decoder(#(Int, Answer)) {
+  use id <- decode.field("id", decode.int)
+  use spaces <- decode.field("spaces", decode.list(replica_space_decoder()))
+  decode.success(#(id, Replicating(spaces)))
 }
 
 fn meta_decoder() -> Decoder(#(Int, Event)) {

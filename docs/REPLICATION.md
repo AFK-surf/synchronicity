@@ -772,6 +772,50 @@ ordering its own work.
   (§3.2). The test is a node that replicates a space it does not index, running
   `space rm`, and no peer seeing a single tombstone.
 
+### 8.1 Where these are visible
+
+`space ls <id>` and `synch doctor` say all of it on the node itself, which is
+where an operator with a shell looks. The failure this section opens with — a
+replica that has been quietly unable to fetch for days — is the one nobody is
+looking at a shell for, so it is also reported to the control plane and drawn
+in the dashboard beside delegated trust.
+
+**Asked over the tunnel, not pushed, and asked of every attached node.**
+The daemon already opens a standing tunnel that the control plane asks
+questions down (`control-plane/README.md`, "Cloud browse"), so this is one more
+question on it: `Down::Replication` in, `Up::Replication` back, read-only like
+every other frame. Nothing is stored control-plane side — a stored count is
+stale the moment a fetch lands, and the tunnel is what makes storing it
+unnecessary.
+
+**A node too old for the question is not asked it, and does not lose its
+tunnel.** The frames are tagged, so a daemon that has not learnt this one
+cannot decode it, and a frame that does not decode ends the connection. That is
+what the protocol version is for: the attach settles on the *daemon's* version,
+clamped to the newest the control plane speaks, and each question records the
+version it appeared in. Only a daemon below the floor is refused — one *newer*
+than the control plane settles at the control plane's level rather than being
+turned away, since nodes are upgraded before control planes as often as after. An older node keeps everything its own version defines and is
+simply never sent this — reported as "does not report replication" rather than
+as a node replicating nothing. Taking an org's whole browse surface away to
+fill in one panel would be a bad trade for the org and no safer for anyone.
+
+The one structural difference from the delegations query is who may answer.
+A delegation is a `d:` record every member holds, so any attached node speaks
+for the cluster. **Replication is a per-node decision**: one node replicates
+`media`, its neighbour does not, and both are correct. So every attached daemon
+is asked and every answer carries the node that gave it — and a node that could
+not be asked is shown as exactly that, never folded in as a node replicating
+nothing. The two have identical counts and call for opposite actions.
+
+What the dashboard adds to the per-node numbers is the count the numbers cannot
+carry: **how many attached nodes replicate each space**. A space one node
+replicates keeps every superseded version in exactly one place, and read node
+by node it looks the same as a space three nodes hold. That is §4.3's floor
+question asked about the fleet rather than about a root, and it is answered
+from what was measured — a node that refused contributes nothing to the count,
+because silence is not evidence that it holds nothing.
+
 ## 9. Cost model
 
 The `tree` policy is what makes this arithmetic tractable, and the comparison

@@ -87,6 +87,31 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   holds. File bytes pass through this service's memory in bounded chunks and
   are never stored.
 
+  The same tunnel carries two questions that are not about files: who the
+  cluster admits on a delegation, and **what each node replicates**
+  (`docs/REPLICATION.md` §8.1). The second is asked of *every* attached daemon
+  rather than the first one, because replication is a decision each node makes
+  for itself — one node replicates `media`, its neighbour does not, and both
+  are correct — so each answer is labelled with the node that gave it, and a
+  node that could not be asked is reported as that rather than as a node
+  replicating nothing. Nothing is stored: a held-object count is stale the
+  moment a fetch lands, and the tunnel is what makes storing it unnecessary.
+
+  **The tunnel version is negotiated, not required to match.** An attach
+  settles on the daemon's version, clamped to the newest this build speaks, and
+  only a daemon below the floor (v2 today) is refused. Each question records
+  the version it appeared in, so a node whose operator has not upgraded keeps
+  its tunnel and everything its own version defines, and is never sent a frame
+  it could not decode — a frame that fails to decode ends a connection, which
+  is why the number exists at all. Such a node shows in the replication panel
+  as one that does not report it.
+
+  The clamp matters in the other direction too. Nodes belong to their
+  operators, so a node is often upgraded before the control plane it attaches
+  to; refusing it for knowing *more* would cost that org browse, reads and
+  delegations to protect against nothing. It settles at this build's version
+  and is asked what this build knows to ask.
+
   The record names **every node** of the deployment, one `v=synccp1 url=`
   each (`CP_ENDPOINTS` on the primary), and a daemon opens a tunnel to all of
   them. It has to: the registry of open tunnels is one process's memory, so a
