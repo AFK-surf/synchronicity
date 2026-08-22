@@ -113,9 +113,23 @@ pub async fn start(data_dir: &Path, args: impl IntoIterator<Item = OsString>) ->
         // half-started one holding the lifecycle lock would make the next
         // `daemon start` fail for a reason that is this call's fault.
         if std::time::Instant::now() >= deadline {
+            // Which of the two conditions was never met, before the child is
+            // killed and the answer becomes unobtainable. They fail for
+            // unrelated reasons and the difference decides where to look: a
+            // marker that never appeared is a child that did not reach its
+            // readiness signal, while a marker present and a socket that never
+            // answered means the daemon is serving somewhere this launcher is
+            // not looking — which is possible at all only because the endpoint
+            // name is computed independently by each process.
+            let marker = ready.belongs_to(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            return Err(startup_timeout(&log_path, log_start));
+            return Err(startup_timeout(
+                &log_path,
+                log_start,
+                marker,
+                &crate::control::transport::endpoint_name(data_dir),
+            ));
         }
 
         // Binding the listener is earlier than serving it: startup recovery
@@ -259,23 +273,22 @@ fn log_tail(path: &Path, current_start: u64) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn startup_timeout(log_path: &Path, log_start: u64) -> anyhow::Error {
+fn startup_timeout(log_path: &Path, log_start: u64, marker: bool, endpoint: &str) -> anyhow::Error {
     let detail = log_tail(log_path, log_start).unwrap_or_default();
     let detail = detail.trim();
     let secs = STARTUP_TIMEOUT.as_secs();
-    if detail.is_empty() {
-        anyhow::anyhow!(
-            "daemon did not answer on its control socket within {secs}s and has been stopped; \
-             see {} (it wrote nothing)",
-            log_path.display()
-        )
-    } else {
-        anyhow::anyhow!(
-            "daemon did not answer on its control socket within {secs}s and has been stopped; \
-             {} contains:\n{detail}",
-            log_path.display()
-        )
-    }
+    let reached = match marker {
+        true => "it signalled readiness, so it is running but not answering at",
+        false => "it never signalled readiness; this launcher was watching",
+    };
+    let detail = match detail.is_empty() {
+        true => "it wrote nothing to the log".to_string(),
+        false => format!("{} contains:\n{detail}", log_path.display()),
+    };
+    anyhow::anyhow!(
+        "daemon did not come up within {secs}s and has been stopped; \
+         {reached} {endpoint}; {detail}"
+    )
 }
 
 fn startup_exit(
