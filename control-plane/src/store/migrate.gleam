@@ -62,8 +62,22 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11]
 }
+
+/// V11: the browser every OAuth flow was started from.
+///
+/// The account-linking flow (`?link=1`) binds the linked identity to the
+/// start-time session's user. Storing the initiating browser's binding token
+/// hash here — the session cookie's token when there was a session, a fresh
+/// per-flow cookie's otherwise — lets the callback refuse a browser that is
+/// not the one that started the flow: a state/authorize URL handed to a
+/// victim must not complete in the victim's browser, with or without a
+/// session on either side. The hash is SHA-256 of the token, never the token
+/// itself.
+const v11 = "
+ALTER TABLE oauth_states ADD COLUMN binding_token_hash BLOB;
+"
 
 /// V10: API keys — the credential for a caller that is a program.
 ///

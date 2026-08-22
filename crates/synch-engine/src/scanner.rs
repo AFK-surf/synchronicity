@@ -772,11 +772,28 @@ impl Node {
         // is refused before anything is fetched. It reads the space row, so it
         // goes to the blocking pool like every other store read on an async
         // path (§10).
-        let target = {
+        let (target, escape) = {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
+            crate::blocking::offload(move || node.adoption_target_checked(&space_id, &path)).await?
         };
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
+        // The escape guard is taken again, immediately before the write it
+        // protects: a fetch stands between the first check and here, and the
+        // whole point of the guard is to describe the directory the write is
+        // about to land in (the mirror's own pattern, §7.2).
+        if let Some((root, rel)) = &escape {
+            let root = root.clone();
+            let rel = rel.clone();
+            crate::blocking::offload(move || {
+                if crate::mirror::escapes_via_symlink(&root, &rel) {
+                    return Err(EngineError::invalid(format!(
+                        "{rel} resolves through a symlinked directory and would leave the space"
+                    )));
+                }
+                Ok(())
+            })
+            .await?;
+        }
         self.materialize_blob(&range.root, range.size, target.clone())
             .await?;
         Ok(target)
@@ -1000,6 +1017,16 @@ impl Node {
     /// nothing would publish the adoption and the write would be a silent
     /// no-op with a filesystem side effect.
     pub(crate) fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
+        Ok(self.adoption_target_checked(space_id, path)?.0)
+    }
+
+    /// [`Self::adoption_target`], plus the escape-guard inputs the commit
+    /// re-verifies: the space's local root and the normalized relative path.
+    pub(crate) fn adoption_target_checked(
+        &self,
+        space_id: &str,
+        path: &str,
+    ) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
         let space = self
             .store()
             .space(space_id)?
@@ -1009,8 +1036,37 @@ impl Node {
                 "space {space_id} is detached and has no filesystem adoption target"
             ))
         })?;
-        target_within(Path::new(local_path), space_id, path)
+        target_within_checked(Path::new(local_path), space_id, path)
     }
+}
+
+/// [`Node::adoption_target`], plus the escape-guard inputs the commit
+/// re-verifies: the space's local root and the normalized relative path.
+///
+/// The checked half of [`target_within`] — same resolution, and the inputs
+/// that let a later step re-check the guard against the directory the write
+/// is about to land in.
+pub(crate) fn target_within_checked(
+    root: &Path,
+    space_id: &str,
+    path: &str,
+) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
+    let normalized = normalized_adoption_path(path)?;
+    // Lexical safety is still not enough. A space root is canonicalized when
+    // it is added but its *interior* never is, so a symlinked directory
+    // inside the space resolves through to wherever it points, and the write
+    // or the delete lands outside every space as whatever uid the daemon
+    // runs as. The mirror loop has always checked this; every other writer
+    // needs the same check, and a deletion needs it as much as a write does.
+    if crate::mirror::escapes_via_symlink(root, &normalized) {
+        return Err(EngineError::invalid(format!(
+            "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+        )));
+    }
+    Ok((
+        root.join(&normalized),
+        Some((root.to_path_buf(), normalized)),
+    ))
 }
 
 /// The guard itself, over a space root already in hand.
@@ -1103,6 +1159,18 @@ pub struct Adoption {
     /// gates immediately before it, and the review history of this branch is
     /// mostly the record of callers that did not.
     space: Option<SpaceWrite>,
+    /// The escape guard re-verified at commit (non-Unix): `(space root,
+    /// normalized relative path)`. `None` for writes that are not space-bound
+    /// (the mirror's materializations, detached staging).
+    #[cfg(not(unix))]
+    escape: Option<(PathBuf, String)>,
+    /// The directory the staging file and the target live in, resolved
+    /// component by component with `O_NOFOLLOW` at open, so the commit
+    /// rename resolves relative to it (Unix). A directory swapped for a
+    /// symlink — before the open or while the body streams — cannot redirect
+    /// a rename that never re-resolves a path.
+    #[cfg(unix)]
+    parent: Option<rustix::fd::OwnedFd>,
 }
 
 /// What a write into an indexed space needs to re-check before it lands.
@@ -1127,7 +1195,15 @@ impl Adoption {
     /// gates with it and re-takes them at `commit`.
     fn into_space(node: &Node, space_id: &str, path: &str) -> Result<Adoption> {
         node.ensure_adoptable(space_id, path)?;
-        let mut adoption = Adoption::open(node.adoption_target(space_id, path)?)?;
+        // The space-validated open: the target is resolved one component at a
+        // time with `O_NOFOLLOW` from the space root, so the staging file is
+        // created inside the directory the commit rename will resolve against
+        // — a directory swapped for a symlink cannot redirect either.
+        let (target, escape) = node.adoption_target_checked(space_id, path)?;
+        let mut adoption = match escape {
+            Some((root, rel)) => Adoption::in_space(&root, &rel)?,
+            None => Adoption::open(target)?,
+        };
         adoption.space = Some(SpaceWrite {
             node: node.clone(),
             space: space_id.to_string(),
@@ -1155,19 +1231,98 @@ impl Adoption {
         // completion reads it straight back to take the object's root before
         // the rename. `File::create` alone is write-only, and the read then
         // fails with `EBADF` on a file this very process is holding open.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&staging)?;
+        //
+        // Not world-readable: the staging file holds the in-flight bytes, and
+        // a local actor who can read them gets a copy of an upload before the
+        // rename publishes it.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&staging)?;
         Ok(Adoption {
             target,
             staging,
             file: Some(file),
             written: 0,
             space: None,
+            #[cfg(not(unix))]
+            escape: None,
+            #[cfg(unix)]
+            parent: None,
         })
+    }
+
+    /// Opens a write at `rel` under a space root, resolving the target's
+    /// parent directory one component at a time with `O_NOFOLLOW` (Unix).
+    ///
+    /// No component of the path is ever followed, so a directory swapped for
+    /// a symlink — by the local actor the open-time check exists to stop —
+    /// cannot redirect where the staging file is created or where the commit
+    /// rename lands: the rename resolves against the held directory, not
+    /// against anything a path can still mean. Missing parents are created,
+    /// like the path-based open.
+    #[cfg(unix)]
+    pub(crate) fn in_space(root: &Path, rel: &str) -> Result<Adoption> {
+        let parent = open_parent_no_follow(root, rel)?;
+        // The staging name has to be unique per write: two clients putting the
+        // same key at once must not share one file and interleave their bytes.
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let staging_name = format!(
+            ".{name}.{}.{}{PART_SUFFIX}",
+            std::process::id(),
+            synch_core::now_ns()
+        );
+        // Read *and* write: the payload is written here, and a multipart
+        // completion reads it straight back to take the object's root before
+        // the rename. `File::create` alone is write-only, and the read then
+        // fails with `EBADF` on a file this very process is holding open.
+        //
+        // Created relative to the pinned parent — a pre-placed symlink at the
+        // staging name is refused (`NOFOLLOW`) rather than followed — and not
+        // world-readable: the staging file holds the in-flight bytes, and a
+        // local actor who can read them gets a copy of an upload before the
+        // rename publishes it.
+        let file = rustix::fs::openat(
+            &parent,
+            &staging_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::TRUNC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits_retain(0o600),
+        )
+        .map_err(|e| {
+            EngineError::invalid(format!(
+                "could not create the staging file beside {}: {e}",
+                rel
+            ))
+        })?;
+        let staging = root.join(rel).with_file_name(&staging_name);
+        Ok(Adoption {
+            target: root.join(rel),
+            staging,
+            file: Some(std::fs::File::from(file)),
+            written: 0,
+            space: None,
+            #[cfg(not(unix))]
+            escape: None,
+            parent: Some(parent),
+        })
+    }
+
+    /// The non-Unix shape of [`Self::in_space`]: no directory handles to pin
+    /// with, so the escape guard is re-run in the same blocking step as the
+    /// rename the commit performs.
+    #[cfg(not(unix))]
+    pub(crate) fn in_space(root: &Path, rel: &str) -> Result<Adoption> {
+        let mut adoption = Adoption::open(root.join(rel))?;
+        adoption.escape = Some((root.to_path_buf(), rel.to_string()));
+        Ok(adoption)
     }
 
     /// Stages a write that starts out as a clone of a file already on disk
@@ -1400,10 +1555,124 @@ impl Adoption {
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&self.staging, &self.target)?;
+        self.rename_into_place()?;
         fsync_parent(&self.target);
         Ok(())
     }
+
+    /// The staging file is renamed over the target with no path
+    /// re-resolution (Unix): the target's parent directory was resolved
+    /// component by component with `O_NOFOLLOW` at open, so a directory
+    /// swapped for a symlink — before the open or while the body streamed —
+    /// cannot redirect the write. A write that was not opened against a
+    /// space root (the mirror's materializations) has nothing pinned and
+    /// keeps the plain rename, exactly as before; its own guard runs in the
+    /// same blocking step ([`crate::mirror`]).
+    #[cfg(unix)]
+    fn rename_into_place(&mut self) -> Result<()> {
+        match self.parent.take() {
+            Some(dir) => {
+                let staging = self.staging.file_name().ok_or_else(|| {
+                    EngineError::invalid("the staging path has no file name")
+                })?;
+                let target = self.target.file_name().ok_or_else(|| {
+                    EngineError::invalid("the target path has no file name")
+                })?;
+                rustix::fs::renameat(&dir, staging, &dir, target).map_err(|e| {
+                    EngineError::invalid(format!("rename into place failed: {e}"))
+                })?;
+            }
+            None => std::fs::rename(&self.staging, &self.target)?,
+        }
+        Ok(())
+    }
+
+    /// The staging file is renamed over the target after re-running the
+    /// escape guard in the same blocking step (non-Unix, where there are no
+    /// directory handles to pin with). The window a swapped parent could
+    /// exploit is the single rename, not the whole body stream.
+    #[cfg(not(unix))]
+    fn rename_into_place(&mut self) -> Result<()> {
+        if let Some((root, rel)) = &self.escape {
+            if crate::mirror::escapes_via_symlink(root, rel) {
+                return Err(EngineError::invalid(format!(
+                    "{} resolves through a symlinked directory and would leave the space",
+                    self.target.display()
+                )));
+            }
+        }
+        std::fs::rename(&self.staging, &self.target)?;
+        Ok(())
+    }
+}
+
+/// Resolves `rel`'s parent directory under `root`, one component at a time,
+/// opening each with `O_NOFOLLOW` and creating missing ones (Unix).
+///
+/// The resolution is the enforcement: no component is ever followed, so a
+/// symlink swapped in anywhere along the way — by the local actor with write
+/// access to the space — fails the open instead of redirecting it. The
+/// returned handle is what the staging file is created against and what the
+/// commit rename resolves against.
+#[cfg(unix)]
+fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> {
+    use rustix::fs::OFlags;
+    let mut dir = rustix::fs::open(
+        root,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| {
+        EngineError::invalid(format!(
+            "could not open the space root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    components.pop(); // the file name itself is not resolved, only its parents
+    for component in components {
+        let opened = rustix::fs::openat(
+            &dir,
+            component,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        match opened {
+            Ok(next) => dir = next,
+            Err(rustix::io::Errno::NOENT) => {
+                // The path-based open creates missing parents; so does this
+                // one, with the same component-by-component no-follow rules
+                // applying to everything after.
+                rustix::fs::mkdirat(
+                    &dir,
+                    component,
+                    rustix::fs::Mode::from_bits_retain(0o777),
+                )
+                .map_err(|e| {
+                    EngineError::invalid(format!(
+                        "could not create the write's parent directory {component}: {e}"
+                    ))
+                })?;
+                dir = rustix::fs::openat(
+                    &dir,
+                    component,
+                    OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|e| {
+                    EngineError::invalid(format!(
+                        "could not open the write's parent directory {component}: {e}"
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(EngineError::invalid(format!(
+                    "could not open the write's parent directory {component}: {e}"
+                )))
+            }
+        }
+    }
+    Ok(dir)
 }
 
 /// Flushes a directory entry — a rename or a create — to stable storage.
@@ -2052,6 +2321,59 @@ mod tests {
         }
         assert!(node.adoption_target("media", "../evil.txt").is_err());
         assert!(node.adoption_target("media", "/etc/passwd").is_err());
+        node.shutdown().await.unwrap();
+    }
+
+    /// The escape guard is not a one-shot check at open: a parent directory
+    /// swapped for a symlink while a body is in flight must not redirect the
+    /// commit outside the space (§9.4). On Linux the rename resolves against
+    /// the directory pinned at open; elsewhere the guard is re-run in the
+    /// same blocking step as the rename.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_swapped_parent_cannot_redirect_the_commit() {
+        let (_d, _space, node) = node_with_space().await;
+        let root = PathBuf::from(
+            node.store()
+                .space("media")
+                .unwrap()
+                .unwrap()
+                .local_path
+                .unwrap(),
+        );
+        let sub = root.join("sub");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Open the write while `sub` is a real directory, then replace it
+        // with a symlink pointing outside the space — the swap a local actor
+        // with write access to the space could perform between the open-time
+        // check and the commit rename. The staging file sits inside `sub`, so
+        // the actor clears it first (unlinking an in-flight staging file is
+        // within the same grant).
+        let adoption = node.open_adoption("media", "sub/escape.txt").unwrap();
+        for entry in std::fs::read_dir(&sub).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        std::fs::remove_dir(&sub).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+        let mut adoption = adoption;
+        adoption.write(b"the payload").unwrap();
+
+        let outcome = adoption.commit();
+        // The write must not land outside the space under any platform: Unix
+        // resolves the parent with `O_NOFOLLOW` at open and renames against
+        // the pinned directory (the staging name was unlinked, so the commit
+        // fails `ENOENT`); Windows re-runs the guard in the same blocking
+        // step as the rename and refuses.
+        assert!(
+            !outside.path().join("escape.txt").exists(),
+            "the commit must not land the object outside the space"
+        );
+        assert!(
+            outcome.is_err(),
+            "the redirected write must not commit as if nothing happened"
+        );
         node.shutdown().await.unwrap();
     }
 

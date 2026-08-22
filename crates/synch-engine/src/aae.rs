@@ -322,6 +322,17 @@ impl Node {
                 tracing::info!(expired, "dns bindings lapsed");
             }
         }
+        // A read scope that no grant stands behind is collapsed here rather
+        // than at adoption: the delegate it names is cut off at the
+        // connection gate the moment its binding dies, so no peer's
+        // declaration ever reaches it again (§3.2, §5.5). The clock is the
+        // only thing that can drive the derived views away — this is the
+        // same destructive move `adopt_scope` makes for a moved grant,
+        // applied to the one that expired.
+        contained(
+            "collapsing a grantless read scope",
+            self.store().collapse_grantless_scope(now),
+        );
         contained("expiring tombstones", self.expire_tombstones());
         // The catch-all for claims a replication sweep will not visit again:
         // a space removed with its pins kept still has releases that were
