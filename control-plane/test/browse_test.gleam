@@ -555,19 +555,138 @@ pub fn an_old_daemon_is_asked_only_what_its_version_defines_test() {
     > agent.introduced_in(agent.Delegations)
   assert agent.introduced_in(agent.Delegations)
     > agent.introduced_in(agent.Stat("media", "a"))
+
+  // A daemon *newer* than this build settles here rather than being refused,
+  // and is asked everything this build knows how to ask. The refusal in that
+  // direction is the one that cannot be caught by testing today's fleet: it
+  // does not fire until the next bump ships to nodes first, which is the
+  // ordinary case, since nodes belong to their operators.
+  assert agent.settled_version(agent.protocol_version + 4)
+    == agent.protocol_version
+  let newer =
+    agent.Session(
+      ..current,
+      version: agent.settled_version(agent.protocol_version + 4),
+    )
+  assert agent.speaks(newer, agent.Replication)
+
+  // Settling never invents a version either end lacks: at or below this
+  // build, the daemon's own number stands.
+  assert agent.settled_version(agent.protocol_version) == agent.protocol_version
+  assert agent.settled_version(agent.min_protocol_version)
+    == agent.min_protocol_version
 }
 
-/// Asking every daemon must not cost a full timeout per daemon: the questions
-/// go out together, so the budget is shared rather than laid end to end.
+/// Asking every daemon must not cost a full timeout per daemon.
+///
+/// The bound has to be measured on a real fanout rather than asserted about an
+/// arithmetic helper. A per-node budget passes any test of its own arithmetic
+/// and still spends N budgets in sequence, because each is handed to its own
+/// wait — which is a fact about the loop, not about the number, and only a
+/// clock around the whole call can see it.
+///
+/// Sessions built here have an inbox nobody serves, so every one of them is a
+/// daemon that never answers: the worst case, and the one that decides whether
+/// a dashboard panel returns or hangs.
 pub fn asking_a_fleet_does_not_multiply_the_wait_test() {
-  let one = agent.per_node_timeout(1)
-  // One daemon keeps the window it always had.
-  assert agent.per_node_timeout(0) == one
-  assert agent.per_node_timeout(4) == one / 4
-  // With a floor, so a large fleet still gives each node a wait worth having
-  // — bounded total beats an unbounded one, but not at the cost of a budget
-  // too short for any daemon to answer within.
-  assert agent.per_node_timeout(1000) == 1000
+  let budget = 400
+  let fleet =
+    list.index_map(list.repeat(Nil, 40), fn(_, n) {
+      session("node-" <> int.to_string(n), "n" <> int.to_string(n) <> "@x")
+    })
+
+  let started = monotonic_ms()
+  let answers = agent.ask_all_within(fleet, agent.Replication, budget)
+  let elapsed = monotonic_ms() - started
+
+  assert list.length(answers) == 40
+  // Laid end to end this would be 16 seconds. The deadline is what makes the
+  // fleet size stop mattering; the generous ceiling here is scheduling slack,
+  // not room for a second budget.
+  assert elapsed < budget * 2
+}
+
+/// A daemon that costs nothing must not take a share of the window.
+///
+/// This is the rollout the version range exists for: one upgraded node among
+/// many old ones. The old ones are answered locally without a frame, so if the
+/// window were divided by the session count the single node that *can* answer
+/// would get a hundredth of it and time out — and the panel would report the
+/// one node that was working as the one that failed.
+pub fn an_outdated_fleet_does_not_eat_the_asked_nodes_window_test() {
+  let budget = 400
+  let old =
+    list.index_map(list.repeat(Nil, 99), fn(_, n) {
+      let current =
+        session("old-" <> int.to_string(n), "o" <> int.to_string(n) <> "@x")
+      agent.Session(..current, version: 2)
+    })
+  let fleet = list.append(old, [session("new", "new@x")])
+
+  let started = monotonic_ms()
+  let answers = agent.ask_all_within(fleet, agent.Replication, budget)
+  let elapsed = monotonic_ms() - started
+
+  // The 99 are refused without a frame, and the one that was asked is wedged
+  // — so the call spends essentially the whole window on that one node.
+  assert elapsed >= budget * 3 / 4
+  let outdated =
+    list.filter(answers, fn(entry) {
+      case entry.1 {
+        Error(agent.Refusal("outdated", _)) -> True
+        _ -> False
+      }
+    })
+  assert list.length(outdated) == 99
+}
+
+@external(erlang, "cp_sys_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
+
+/// One node attached twice is still one node.
+///
+/// A daemon that redials after a blip joins before the registry reaps the
+/// half-open session, so for up to a minute the fleet holds two sessions for
+/// one origin. Counting both inflates the replica count in the direction that
+/// hides the warning — a single-copy space reads as two copies and the amber
+/// badge goes quiet — so the collapse happens before anything counts.
+pub fn one_node_attached_twice_counts_once_test() {
+  let stale =
+    browse_api.NodeReplication("nas", "nas@x.example", [], "unavailable", "…")
+  let live =
+    browse_api.NodeReplication(
+      "nas",
+      "nas@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+  let other =
+    browse_api.NodeReplication(
+      "laptop",
+      "laptop@x.example",
+      replicates(["media"]),
+      "",
+      "",
+    )
+
+  // The answer wins over the refusal whichever order they arrive in: a node
+  // one of whose sessions answered is a node that answered.
+  let assert [kept, _] = browse_api.one_row_per_node([stale, live, other])
+  assert kept.error == ""
+  let assert [kept, _] = browse_api.one_row_per_node([live, stale, other])
+  assert kept.error == ""
+
+  // The double-count that matters is two tunnels that both answer, which is
+  // what a redial during a poll looks like. One node, one replica.
+  let both = [live, live, other]
+  assert browse_api.replica_counts(browse_api.one_row_per_node(both))
+    == [#("media", 2)]
+  // Without the collapse this is the wrong number, and wrong the quiet way:
+  // `media` reads as three copies when two nodes hold it, so the amber
+  // single-copy badge would stay silent on a fleet of one replica plus a
+  // reconnect.
+  assert browse_api.replica_counts(both) == [#("media", 3)]
 }
 
 /// Reads are same-origin GETs with cookies and no CSRF token, so a hostile

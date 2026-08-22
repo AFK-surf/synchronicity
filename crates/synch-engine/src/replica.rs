@@ -553,7 +553,7 @@ impl Node {
             coverage: self
                 .store()
                 .replica_coverage(&holder, UNREACHABLE_ATTEMPTS)?,
-            oldest_want: self.store().oldest_want(&holder)?,
+            oldest_want: self.store().oldest_want(&holder, UNREACHABLE_ATTEMPTS)?,
             next_release: self.store().next_release(&holder)?,
             view: self.view_state()?,
             // Only meaningful where the policy releases at all. Under

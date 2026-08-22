@@ -791,9 +791,11 @@ unnecessary.
 **A node too old for the question is not asked it, and does not lose its
 tunnel.** The frames are tagged, so a daemon that has not learnt this one
 cannot decode it, and a frame that does not decode ends the connection. That is
-what the protocol version is for: the attach settles on the *daemon's* version
-within a range the control plane serves, and each question records the version
-it appeared in. An older node keeps everything its own version defines and is
+what the protocol version is for: the attach settles on the *daemon's* version,
+clamped to the newest the control plane speaks, and each question records the
+version it appeared in. Only a daemon below the floor is refused — one *newer*
+than the control plane settles at the control plane's level rather than being
+turned away, since nodes are upgraded before control planes as often as after. An older node keeps everything its own version defines and is
 simply never sent this — reported as "does not report replication" rather than
 as a node replicating nothing. Taking an org's whole browse surface away to
 fill in one panel would be a bad trade for the org and no safer for anyone.

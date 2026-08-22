@@ -86,6 +86,22 @@ pub fn speaks(session: Session, question: Question) -> Bool {
   session.version >= introduced_in(question)
 }
 
+/// The version an attach settles on, given what the daemon claimed.
+///
+/// A daemon newer than this build settles *here*, at the newest set of frames
+/// both ends have — it is not turned away for knowing more. Refusing the newer
+/// end is the same mistake as refusing the older one, and the easier one to
+/// miss: it cannot fire until a bump ships to nodes before control planes,
+/// which is the ordinary order, since nodes belong to their operators.
+///
+/// Named rather than inlined at the one call site so a test can hold it to
+/// both ends. The floor is not applied here — being below it is a refusal, not
+/// something to settle at, and folding the two would silently admit a daemon
+/// whose frames this build no longer has.
+pub fn settled_version(claimed: Int) -> Int {
+  int.min(claimed, protocol_version)
+}
+
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
 
@@ -513,13 +529,64 @@ pub fn streams_per_user() -> Int {
 }
 
 /// Asks one attached daemon a question and waits for its answer.
+///
+/// The version gate lives here, in the only place a question reaches a socket,
+/// rather than in `ask_all` alone. A frame a daemon cannot decode ends its
+/// tunnel, so a caller that reached past the gate would take an operator's
+/// browse surface down by adding a feature — and it would compile, type-check
+/// and pass every test on a fleet that happened to be current.
 pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
-  let reply = process.new_subject()
-  process.send(session.inbox, Query(question, reply))
-  case process.receive(reply, query_timeout) {
-    Ok(answer) -> answer
-    Error(Nil) ->
-      Error(Refusal("unavailable", "the attached daemon did not answer in time"))
+  ask_within(session, question, query_timeout)
+}
+
+fn ask_within(
+  session: Session,
+  question: Question,
+  budget: Int,
+) -> Result(Answer, Refusal) {
+  collect(session, question, dispatch(session, question), budget)
+}
+
+/// Sends the question, or declines to — the gate and the socket in one place.
+///
+/// `None` means nothing was sent, and is what makes an outdated daemon cost no
+/// time at all: it never enters the waiting below.
+fn dispatch(
+  session: Session,
+  question: Question,
+) -> Option(Subject(Result(Answer, Refusal))) {
+  case speaks(session, question) {
+    False -> None
+    True -> {
+      let reply = process.new_subject()
+      process.send(session.inbox, Query(question, reply))
+      Some(reply)
+    }
+  }
+}
+
+/// Waits out whatever is left of the budget for one dispatched question.
+///
+/// A budget at or below zero still checks the mailbox and returns an answer
+/// already sitting in it — past the deadline nothing is waited for, but
+/// nothing already paid for is thrown away either.
+fn collect(
+  session: Session,
+  question: Question,
+  reply: Option(Subject(Result(Answer, Refusal))),
+  budget: Int,
+) -> Result(Answer, Refusal) {
+  case reply {
+    None -> Error(Refusal("outdated", outdated(session, question)))
+    Some(reply) ->
+      case process.receive(reply, int.max(budget, 0)) {
+        Ok(answer) -> answer
+        Error(Nil) ->
+          Error(Refusal(
+            "unavailable",
+            "the attached daemon did not answer in time",
+          ))
+      }
   }
 }
 
@@ -531,49 +598,52 @@ pub fn ask(session: Session, question: Question) -> Result(Answer, Refusal) {
 /// a fleet with a few of those turns one dashboard panel into a request
 /// measured in minutes.
 ///
+/// **The bound is one deadline for the call, not a budget per node.** Dividing
+/// `query_timeout` by the number of sessions looks equivalent and is not: a
+/// per-node timeout is spent in sequence, so N wedged daemons cost N times it,
+/// and the floor that keeps a large fleet's per-node share usable is exactly
+/// what makes the total grow without limit. A deadline cannot do that — every
+/// question is already outstanding, so the last session waited on is waited on
+/// for whatever remains, and the call returns inside `query_timeout` whether
+/// the fleet is one node or three hundred.
+///
+/// It also means a session that costs nothing gives its time to the others.
+/// An outdated daemon is answered locally without a frame, and one whose
+/// answer is already in the mailbox returns at once — so a rollout where one
+/// upgraded node sits among ninety-nine old ones gives that node the whole
+/// window, rather than a hundredth of it for being outnumbered.
+///
 /// A daemon that refuses or falls silent comes back as its own `Error` rather
 /// than failing the call: the answer to "what does the fleet replicate" is
 /// per node, so one node that cannot say is a fact about that node and not a
 /// reason to withhold the others.
-///
-/// **A daemon too old for the question is never sent it.** It could not decode
-/// the frame, and a frame it cannot decode ends its tunnel — so asking would
-/// cost an operator their whole browse surface to fill in one cell. It answers
-/// `outdated` here instead, which is a fact about that node like any other
-/// refusal.
 pub fn ask_all(
   sessions: List(Session),
   question: Question,
 ) -> List(#(Session, Result(Answer, Refusal))) {
-  let budget = per_node_timeout(list.length(sessions))
+  ask_all_within(sessions, question, query_timeout)
+}
+
+/// [`ask_all`] with the deadline named, so a test can bound a real fanout
+/// without waiting out the production one.
+pub fn ask_all_within(
+  sessions: List(Session),
+  question: Question,
+  budget: Int,
+) -> List(#(Session, Result(Answer, Refusal))) {
+  let deadline = monotonic_ms() + budget
   let pending =
-    list.map(sessions, fn(session) {
-      case speaks(session, question) {
-        False -> #(session, None)
-        True -> {
-          let reply = process.new_subject()
-          process.send(session.inbox, Query(question, reply))
-          #(session, Some(reply))
-        }
-      }
-    })
+    list.map(sessions, fn(session) { #(session, dispatch(session, question)) })
   list.map(pending, fn(entry) {
     let #(session, reply) = entry
-    let answer = case reply {
-      None -> Error(Refusal("outdated", outdated(session, question)))
-      Some(reply) ->
-        case process.receive(reply, budget) {
-          Ok(answer) -> answer
-          Error(Nil) ->
-            Error(Refusal(
-              "unavailable",
-              "the attached daemon did not answer in time",
-            ))
-        }
-    }
-    #(session, answer)
+    #(session, collect(session, question, reply, deadline - monotonic_ms()))
   })
 }
+
+/// Milliseconds from a monotonic source. Monotonic rather than wall-clock on
+/// purpose: a deadline a clock step could move is not a deadline.
+@external(erlang, "cp_sys_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
 
 fn outdated(session: Session, question: Question) -> String {
   "this daemon speaks tunnel v"
@@ -581,21 +651,6 @@ fn outdated(session: Session, question: Question) -> String {
   <> "; the question was added in v"
   <> int.to_string(introduced_in(question))
   <> " — upgrade the node to see this"
-}
-
-/// How long each daemon gets when several are asked together.
-///
-/// One daemon keeps the whole window it has always had. Several share it, with
-/// a floor so a large fleet does not give each node a wait too short to be
-/// one. The sharing costs less than it looks: the questions went out first, so
-/// by the time the last session is waited on, its answer has usually been
-/// sitting in the mailbox for most of the budget already — and a receive on a
-/// message that has arrived returns at once.
-pub fn per_node_timeout(nodes: Int) -> Int {
-  case nodes <= 1 {
-    True -> query_timeout
-    False -> int.max(query_timeout / nodes, 1000)
-  }
 }
 
 // -- the attach endpoint -----------------------------------------------------
@@ -737,21 +792,21 @@ fn hello(
   case json.parse(body, hello_decoder()) {
     Error(_) -> refuse(conn, "invalid", "malformed hello")
     Ok(claim) ->
-      // A range rather than equality: the attach settles on the daemon's
-      // version, and an older one keeps every question its version defines.
-      case
-        claim.version >= min_protocol_version
-        && claim.version <= protocol_version
-      {
+      // Only the floor refuses. A daemon *newer* than this build settles at
+      // this build's version rather than being turned away: it speaks
+      // everything here speaks, and a node that upgraded before its control
+      // plane did would otherwise lose browse, reads and delegations to gain
+      // nothing. Refusing the newer end is the same mistake as refusing the
+      // older one, in the direction that is easier to miss because it cannot
+      // happen until the next bump.
+      case claim.version >= min_protocol_version {
         False ->
           refuse(
             conn,
             "version-mismatch",
             "this control plane speaks tunnel v"
               <> int.to_string(min_protocol_version)
-              <> " to v"
-              <> int.to_string(protocol_version)
-              <> ", the daemon speaks v"
+              <> " and later, the daemon speaks v"
               <> int.to_string(claim.version),
           )
         True -> {
@@ -925,7 +980,10 @@ fn lookup(
             origin: claim.origin,
             key_id: key_id,
             spaces: claim.spaces,
-            version: claim.version,
+            // The version *settled on*, not the one claimed. Clamping here
+            // rather than at each use is what keeps `speaks` and the attach
+            // echo agreeing about which questions this session can take.
+            version: settled_version(claim.version),
             attached_at: now_unix(),
             inbox: inbox,
           ))

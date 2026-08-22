@@ -175,6 +175,7 @@ pub fn replication(
       let nodes =
         agent.ask_all(sessions, agent.Replication)
         |> list.map(reported)
+        |> one_row_per_node
       ok_json(
         json.object([
           #("nodes", json.array(nodes, node_replication_json)),
@@ -210,6 +211,41 @@ fn reported(
         refusal.message,
       )
   }
+}
+
+/// Collapses several sessions of the same node into the one node they are.
+///
+/// A node is its origin; a session is one tunnel it happens to hold. The two
+/// come apart after a network blip — the daemon redials and joins before the
+/// registry's heartbeat reaps the half-open session, so for up to a minute one
+/// node is attached twice. Everything downstream reads this list as a fleet,
+/// and a duplicate is then a wrong number in the direction that hides the
+/// warning: a space held by one node that reconnected a moment ago counts two
+/// replicas, and the single-copy badge this panel exists for goes quiet.
+///
+/// An answer beats a refusal for the same origin, because a node one of whose
+/// sessions answered is a node that answered — the wedged tunnel is the stale
+/// one. Order is first-seen, so the fleet does not reshuffle between polls.
+pub fn one_row_per_node(nodes: List(NodeReplication)) -> List(NodeReplication) {
+  list.fold(nodes, [], fn(kept, node) {
+    case
+      list.find(kept, fn(seen: NodeReplication) { seen.origin == node.origin })
+    {
+      Error(Nil) -> list.append(kept, [node])
+      Ok(seen) ->
+        case seen.error, node.error {
+          "", _ -> kept
+          _, "" ->
+            list.map(kept, fn(row) {
+              case row.origin == node.origin {
+                True -> node
+                False -> row
+              }
+            })
+          _, _ -> kept
+        }
+    }
+  })
 }
 
 /// How many attached nodes replicate each space, in first-seen order.

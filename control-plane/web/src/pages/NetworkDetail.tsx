@@ -230,6 +230,13 @@ function ReplicationPanel({
     (error.code === 'no-device-attached' || error.code === 'browse-disabled')
 
   const replicating = data?.nodes.filter((n) => n.spaces.length > 0) ?? []
+  // Whether the fleet was measured at all. Every claim this panel makes about
+  // what the network does — the "nobody replicates anything" notice, the
+  // replica counts — is a claim about the nodes that answered, and saying it
+  // plainly about a fleet where some node did not is how a reader ends up
+  // acting on a number that was never taken.
+  const silent = data?.nodes.filter((n) => n.error !== '') ?? []
+  const measured = silent.length === 0
 
   return (
     <div>
@@ -245,13 +252,24 @@ function ReplicationPanel({
       {error && !unavailable && <ErrorNote error={error} />}
       {data && (
         <>
-          <SpaceCoverage spaces={data.spaces} />
+          <SpaceCoverage spaces={data.spaces} measured={measured} />
           {replicating.length === 0 && data.spaces.length === 0 && (
             <div className="rounded-lg border border-neutral-800 px-4 py-6 text-sm text-neutral-500">
-              No attached node replicates a space in this network. Turn it on
-              with <code className="text-neutral-400">synch space set</code>{' '}
-              <code className="text-neutral-400">--replicate tree</code> on a
-              node that should hold every version.
+              {measured ? (
+                <>
+                  No attached node replicates a space in this network. Turn it
+                  on with <code className="text-neutral-400">synch space set</code>{' '}
+                  <code className="text-neutral-400">--replicate tree</code> on
+                  a node that should hold every version.
+                </>
+              ) : (
+                <>
+                  No node that answered replicates a space in this network.{' '}
+                  {silent.length === data.nodes.length
+                    ? 'No attached node answered at all, so nothing here has been measured.'
+                    : `${silent.length} of ${data.nodes.length} attached nodes did not answer, so this is not the whole fleet.`}
+                </>
+              )}
             </div>
           )}
           {replicating.length > 0 && (
@@ -295,10 +313,19 @@ function ReplicationPanel({
 /// A space one node replicates keeps every superseded version in exactly one
 /// place. Read node by node that looks the same as a space three nodes hold,
 /// which is why it is called out here and not left to be counted by eye.
+///
+/// `measured` is whether every attached node answered. A count built from a
+/// partial fleet is a floor, not a total, and the amber single-copy badge is
+/// exactly the kind of claim someone acts on — three nodes replicate `media`,
+/// two time out, and an unqualified badge says the space has one copy. So the
+/// count is shown either way, and the alarm colour is not: an "at least" is
+/// worth reading, and an alarm raised by two timeouts is not.
 function SpaceCoverage({
   spaces,
+  measured,
 }: {
   spaces: { space: string; replicas: number }[]
+  measured: boolean
 }) {
   if (spaces.length === 0) return null
   return (
@@ -307,19 +334,24 @@ function SpaceCoverage({
         <span
           key={space}
           className={`rounded-md border px-3 py-1 text-sm ${
-            replicas === 1
+            replicas === 1 && measured
               ? 'border-amber-900/60 bg-amber-950/30 text-amber-200'
               : 'border-neutral-800 bg-neutral-900/50 text-neutral-300'
           }`}
           title={
-            replicas === 1
-              ? 'one attached node replicates this space, so its superseded versions exist in one place'
-              : `${replicas} attached nodes replicate this space`
+            measured
+              ? replicas === 1
+                ? 'one attached node replicates this space, so its superseded versions exist in one place'
+                : `${replicas} attached nodes replicate this space`
+              : `at least ${replicas} of the attached nodes replicate this space; some did not answer, so the real number may be higher`
           }
         >
           <span className="font-mono">{space}</span>{' '}
           <span className="text-neutral-500">
-            {replicas === 1 ? '1 replica' : `${replicas} replicas`}
+            {measured ? '' : '≥'}
+            {replicas === 1 && measured
+              ? '1 replica'
+              : `${replicas} replica${replicas === 1 ? '' : 's'}`}
           </span>
         </span>
       ))}
@@ -412,26 +444,39 @@ function SpaceRow({
   )
 }
 
-/// The nodes that did not answer, and why.
+/// Every attached node the table above does not have a row for, and why.
 ///
 /// Listed rather than dropped: a daemon that could not say what it replicates
 /// leaves a hole in every count above, and a panel that quietly rendered the
 /// rest would be reporting a smaller fleet as though it were the whole one.
 ///
-/// `outdated` reads differently from the rest and is worded so. A node running
-/// a tunnel version older than the replication query was never asked — asking
-/// would have ended its tunnel — so nothing is wrong with it beyond its age,
-/// and the fix is an upgrade rather than an investigation.
+/// Three cases, and they are not the same fact:
+///
+/// - **did not answer** — the tunnel is up and the daemon went quiet or
+///   refused. Its holdings are unknown, and every count above is short by them.
+/// - **does not report replication** — the node speaks a tunnel version older
+///   than the query, so it was never asked; asking would have ended its
+///   tunnel. Nothing is wrong with it beyond its age.
+/// - **replicates nothing** — it answered, and the answer was an empty list.
+///   That is a measurement, not a gap, and it is the one case here that leaves
+///   the counts above complete. The wire format goes to some trouble to keep
+///   "answered, holds nothing" distinguishable from "did not answer"; dropping
+///   the node from the panel entirely would spend that distinction on nothing.
 function Unanswered({ nodes }: { nodes: NodeReplication[] }) {
-  const silent = nodes.filter((node) => node.error !== '')
-  if (silent.length === 0) return null
+  const listed = nodes.filter(
+    (node) => node.error !== '' || node.spaces.length === 0,
+  )
+  if (listed.length === 0) return null
   return (
     <ul className="mt-2 space-y-1 text-xs text-neutral-500">
-      {silent.map((node) => (
+      {listed.map((node) => (
         <li key={node.origin}>
           <span className="text-neutral-400">{node.device}</span>{' '}
-          {node.error === 'outdated' ? 'does not report replication' : 'did not answer'}
-          : {node.message || node.error}
+          {node.error === ''
+            ? 'replicates nothing'
+            : node.error === 'outdated'
+              ? `does not report replication: ${node.message || node.error}`
+              : `did not answer: ${node.message || node.error}`}
         </li>
       ))}
     </ul>

@@ -1254,7 +1254,9 @@ async fn replication(node: &Node, id: u32) -> Result<Up> {
                         .held_back_by_replication_floor(&holder, floor)?,
                     false => 0,
                 },
-                oldest_want: node.store().oldest_want(&holder)?,
+                oldest_want: node
+                    .store()
+                    .oldest_want(&holder, crate::replica::UNREACHABLE_ATTEMPTS)?,
                 next_release: node.store().next_release(&holder)?,
                 view_complete: view.is_complete(),
                 view_reason: view.reason().map(str::to_string),

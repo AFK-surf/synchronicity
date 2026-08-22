@@ -612,13 +612,23 @@ impl Store {
         Ok(coverage)
     }
 
-    /// The oldest want one holder has, for "oldest 4m ago".
-    pub fn oldest_want(&self, holder: &PinHolder) -> Result<Option<i64>> {
+    /// The oldest want one holder is still attempting, for "oldest 4m ago".
+    ///
+    /// Wants that have gone unreachable are excluded, by the same threshold
+    /// `replica_coverage` counts them with. Both renderers show this age beside
+    /// the backlog, which is `wanted - unreachable` — so an unfiltered minimum
+    /// puts an age next to a count that deliberately excludes the row the age
+    /// came from. A space with four abandoned wants from two months ago and one
+    /// queued this morning would read "1 object, oldest 60d ago", which is the
+    /// reading that sends someone looking for a stall that is not there. The
+    /// unreachable column is where those rows are accounted for.
+    pub fn oldest_want(&self, holder: &PinHolder, unreachable_after: i64) -> Result<Option<i64>> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT MIN(first_wanted) FROM replica_want WHERE holder = ?1",
-                params![holder.render()],
+                "SELECT MIN(first_wanted) FROM replica_want
+                  WHERE holder = ?1 AND attempts < ?2",
+                params![holder.render(), unreachable_after],
                 |row| row.get::<_, Option<i64>>(0),
             )
             .optional()?
