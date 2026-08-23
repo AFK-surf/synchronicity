@@ -446,8 +446,13 @@ fn key_of(cli: &Cli) -> String {
 /// rest of this test binary with it, and under `RLIMIT_STACK` rather than a
 /// sized thread, because it is the *main* thread's stack that differs between
 /// platforms and only the kernel sets that one.
+///
+/// Linux only. Darwin refuses to shrink `RLIMIT_STACK` at all — `setrlimit`
+/// answers `EINVAL` — so there is no way to ask a macOS process to start with
+/// a smaller main stack than it was given. One platform that can pose the
+/// question is enough for the answer to be checked on every push.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn the_cli_parses_within_the_smallest_main_thread_stack_we_ship_on() {
     use std::os::unix::process::CommandExt;
 
