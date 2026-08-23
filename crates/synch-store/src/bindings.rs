@@ -826,9 +826,13 @@ impl Store {
     pub fn collapse_grantless_scope(&self, now: i64) -> Result<bool> {
         let grant = self.own_grant(now)?;
         match (self.local_scope()?, grant) {
-            (Some(spaces), grant) if spaces != grant.clone().unwrap_or_default() => {
-                self.set_read_scope(grant.as_deref())
-            }
+            // A live grant is the authoritative scope: a grant materialized
+            // since the last pass widens, one that shrank narrows.
+            (Some(spaces), Some(grant)) if spaces != grant => self.set_read_scope(Some(&grant)),
+            // No grant left: a confined scope collapses to the empty one —
+            // `m:self` and the `d:` namespace, no file data — not to `None`,
+            // which would read as unrestricted.
+            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope(Some(&[])),
             _ => Ok(false),
         }
     }

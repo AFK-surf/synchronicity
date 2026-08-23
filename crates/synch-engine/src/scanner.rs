@@ -1636,12 +1636,9 @@ impl Adoption {
                     .staging
                     .file_name()
                     .ok_or_else(|| EngineError::invalid("the staging path has no file name"))?;
-                let target = self
-                    .target
-                    .file_name()
-                    .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+                let target = self.target.clone();
                 drop(file);
-                nt::rename_into(&dir, &staging.to_string_lossy(), &target.to_string_lossy())?;
+                nt::rename_into(&dir, &staging.to_string_lossy(), &target)?;
             }
             None => {
                 drop(file);
@@ -1963,24 +1960,30 @@ mod nt {
         Ok(std::fs::File::from(handle))
     }
 
-    /// Renames the staging file to `target` inside `dir` — the
-    /// handle-relative rename no swapped junction can redirect.
+    /// Renames the staging file to `target` — the full-path form of the
+    /// rename every rename implementation uses (cygwin, the Explorer
+    /// recipes), followed by a containment check: if the name resolved
+    /// through a junction swapped in by a local actor, the file's actual
+    /// location differs from the intended one, and the file is removed
+    /// there and the write fails closed instead of silently landing outside
+    /// the space.
     ///
     /// The file is reopened by name first, with the minimal access the
-    /// rename requires (`DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, the
-    /// Explorer pattern): the payload handle was opened for read/write, and
-    /// the rename's own access check is against the handle it is given.
-    pub fn rename_into(dir: &OwnedHandle, staging: &str, target: &str) -> Result<()> {
+    /// rename requires (`DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`): the
+    /// payload handle was opened for read/write, and the rename's own access
+    /// check is against the handle it is given.
+    pub fn rename_into(dir: &OwnedHandle, staging: &str, target: &std::path::Path) -> Result<()> {
         let reopened = reopen_for_delete(dir, staging)?;
-        let wide: Vec<u16> = target.encode_utf16().collect();
+        let wide: Vec<u16> = root_wide(target);
         // FILE_RENAME_INFO, built by hand because its FileName is inline:
         // Flags(4) pad(4) RootDirectory(8) FileNameLength(4) pad(4) FileName.
+        // `RootDirectory` is null: the name is the full NT path, which is the
+        // form the kernel accepts reliably for a cross-checked rename.
         let header = 24usize;
         let mut buf = vec![0u8; header + wide.len() * 2];
         unsafe {
             let p = buf.as_mut_ptr();
             *(p as *mut u32) = 0;
-            *(p.add(8) as *mut HANDLE) = dir.as_raw_handle() as HANDLE;
             *(p.add(16) as *mut u32) = (wide.len() * 2) as u32;
             core::ptr::copy_nonoverlapping(wide.as_ptr(), p.add(header) as *mut u16, wide.len());
         }
@@ -2002,7 +2005,60 @@ mod nt {
                 "rename into place failed: NTSTATUS {status:#x}"
             )));
         }
-        Ok(())
+        // The containment check: the file must now be at the intended path.
+        // A junction swapped in by a local actor resolves the full path
+        // elsewhere, and the file is removed there rather than left behind
+        // outside the space.
+        match final_path(&reopened) {
+            Ok(actual) if paths_equal(&actual, &wide) => Ok(()),
+            Ok(actual) => {
+                let actual = String::from_utf16_lossy(&actual);
+                let _ = std::fs::remove_file(&actual);
+                Err(EngineError::invalid(format!(
+                    "the rename resolved through a swapped junction to {actual} and was \
+                     removed; the write failed closed"
+                )))
+            }
+            Err(status) => Err(EngineError::invalid(format!(
+                "could not verify the rename's landing: NTSTATUS {status:#x}"
+            ))),
+        }
+    }
+
+    /// The normalized final path of an open handle, as UTF-16 (the
+    /// `\\?\`-prefixed form), or the failure status.
+    fn final_path(handle: &OwnedHandle) -> std::result::Result<Vec<u16>, NTSTATUS> {
+        let mut buf = vec![0u16; 4096];
+        let len = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
+                handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                windows_sys::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED,
+            )
+        };
+        if len == 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as NTSTATUS);
+        }
+        buf.truncate(len as usize);
+        Ok(buf)
+    }
+
+    /// Whether the handle's final path is the intended `\\?\`-prefixed
+    /// target (case-insensitively: the file system is).
+    fn paths_equal(actual: &[u16], expected: &[u16]) -> bool {
+        fn fold(c: u16) -> u16 {
+            if (0x61..=0x7a).contains(&c) {
+                c - 0x20
+            } else {
+                c
+            }
+        }
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected.iter())
+                .all(|(a, b)| fold(*a) == fold(*b))
     }
 
     /// Reopens `name` inside `dir` with the access a rename needs: the
