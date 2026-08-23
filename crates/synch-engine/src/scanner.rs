@@ -1711,14 +1711,10 @@ fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> 
 /// directly against ntdll; their ABI is stable and documented (ntifs.h).
 #[cfg(windows)]
 mod nt {
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, NTSTATUS};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, OPEN_EXISTING,
-    };
+    use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 
     use crate::error::{EngineError, Result};
 
@@ -1796,26 +1792,19 @@ mod nt {
         // entry being a junction is refused rather than followed. Its
         // ancestors lie outside the space, where the threat model grants a
         // local actor nothing.
-        let wide: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                DIR_ACCESS,
-                FILE_SHARE_ALL,
-                std::ptr::null_mut(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(EngineError::invalid(format!(
-                "could not open the space root {}: {}",
-                root.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mut dir = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        let mut dir = open_relative(
+            &root_wide(root),
+            None,
+            DIR_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
+                "could not open the space root {}: NTSTATUS {status:#x}",
+                root.display()
+            ))
+        })?;
         let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
         components.pop(); // the file name itself is not resolved, only its parents
         for component in components {
@@ -1843,22 +1832,45 @@ mod nt {
         Ok(dir)
     }
 
-    /// Opens or creates `name` inside `dir` as a directory handle, never
-    /// following a reparse point.
-    fn create_relative(
-        dir: &OwnedHandle,
-        name: &str,
+    /// The Win32 path `root` as an absolute NT path (`\??\`-prefixed), for
+    /// the one open that has no parent handle to be relative to.
+    fn root_wide(root: &std::path::Path) -> Vec<u16> {
+        let text = root.as_os_str().to_string_lossy();
+        let mut out: Vec<u16> = Vec::new();
+        match text.strip_prefix(r"\\") {
+            // UNC: `\\server\share\...` -> `\??\UNC\server\share\...`.
+            Some(rest) => {
+                out.extend_from_slice(r"\??\UNC\".encode_utf16().collect::<Vec<_>>().as_slice());
+                out.extend(rest.encode_utf16());
+            }
+            None => {
+                out.extend_from_slice(r"\??\".encode_utf16().collect::<Vec<_>>().as_slice());
+                out.extend(text.encode_utf16());
+            }
+        }
+        out
+    }
+
+    /// Opens or creates `name` — relative to `root` when it is set, an
+    /// absolute NT path otherwise — with `NtCreateFile`.
+    ///
+    /// Directories are opened with `FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`
+    /// so a junction is never followed.
+    fn open_relative(
+        name: &[u16],
+        root: Option<&OwnedHandle>,
+        access: u32,
         disposition: u32,
+        create_options: u32,
     ) -> std::result::Result<OwnedHandle, NTSTATUS> {
-        let wide: Vec<u16> = name.encode_utf16().collect();
         let mut unicode = UNICODE_STRING {
-            length: (wide.len() * 2) as u16,
-            maximum_length: (wide.len() * 2) as u16,
-            buffer: wide.as_ptr() as *mut u16,
+            length: (name.len() * 2) as u16,
+            maximum_length: (name.len() * 2) as u16,
+            buffer: name.as_ptr() as *mut u16,
         };
         let mut attributes = OBJECT_ATTRIBUTES {
             length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            root_directory: dir.as_raw_handle() as HANDLE,
+            root_directory: root.map_or(std::ptr::null_mut(), |h| h.as_raw_handle() as HANDLE),
             object_name: &unicode,
             attributes: OBJ_CASE_INSENSITIVE,
             security_descriptor: std::ptr::null_mut(),
@@ -1872,14 +1884,14 @@ mod nt {
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                DIR_ACCESS,
+                access,
                 &attributes,
                 &mut status_block,
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
                 FILE_SHARE_ALL,
                 disposition,
-                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                create_options,
                 std::ptr::null_mut(),
                 0,
             )
@@ -1890,55 +1902,44 @@ mod nt {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 
+    /// Opens or creates `name` inside `dir` as a directory handle, never
+    /// following a reparse point.
+    fn create_relative(
+        dir: &OwnedHandle,
+        name: &str,
+        disposition: u32,
+    ) -> std::result::Result<OwnedHandle, NTSTATUS> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        open_relative(
+            &wide,
+            Some(dir),
+            DIR_ACCESS,
+            disposition,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    }
+
     /// Creates the staging file inside `dir`, never following a reparse
     /// point at the name (a pre-placed junction is opened as itself and
     /// overwritten in place, never followed).
     pub fn create_staging(dir: &OwnedHandle, name: &str) -> Result<std::fs::File> {
         let wide: Vec<u16> = name.encode_utf16().collect();
-        let mut unicode = UNICODE_STRING {
-            length: (wide.len() * 2) as u16,
-            maximum_length: (wide.len() * 2) as u16,
-            buffer: wide.as_ptr() as *mut u16,
-        };
-        let mut attributes = OBJECT_ATTRIBUTES {
-            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            root_directory: dir.as_raw_handle() as HANDLE,
-            object_name: &unicode,
-            attributes: OBJ_CASE_INSENSITIVE,
-            security_descriptor: std::ptr::null_mut(),
-            security_quality_of_service: std::ptr::null_mut(),
-        };
-        let mut handle: HANDLE = std::ptr::null_mut();
-        let mut status_block = IO_STATUS_BLOCK {
-            status: 0,
-            information: 0,
-        };
         // FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE: read *and* write,
         // because the payload is written here and a multipart completion
-        // reads it straight back before the rename — and DELETE, because the
-        // commit renames the open file and `FileRenameInformation` needs it
-        // on the file handle.
-        let status = unsafe {
-            NtCreateFile(
-                &mut handle,
-                0x0012_0089 | 0x0012_0116 | 0x0001_0000,
-                &attributes,
-                &mut status_block,
-                std::ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_ALL,
-                FILE_OVERWRITE_IF,
-                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != STATUS_SUCCESS {
-            return Err(EngineError::invalid(format!(
+        // reads it straight back before the rename.
+        let handle = open_relative(
+            &wide,
+            Some(dir),
+            0x0012_0089 | 0x0012_0116 | 0x0001_0000,
+            FILE_OVERWRITE_IF,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
                 "could not create the staging file beside {name}: NTSTATUS {status:#x}"
-            )));
-        }
-        Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+            ))
+        })?;
+        Ok(unsafe { std::fs::File::from_raw_handle(handle.as_raw_handle() as RawHandle) })
     }
 
     /// Renames the staging file to `target` inside `dir` — the
@@ -1983,51 +1984,25 @@ mod nt {
         Ok(())
     }
 
-    /// Reopens `name` inside `dir` with the access a rename needs, never
-    /// following a reparse point at the name.
+    /// Reopens `name` inside `dir` with the access a rename needs: the
+    /// minimal `DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, with the
+    /// backup-intent flag the rename recipes open with — the payload handle
+    /// was opened for read/write, and the rename's own access check is
+    /// against the handle it is given.
     fn reopen_for_delete(dir: &OwnedHandle, name: &str) -> Result<OwnedHandle> {
         let wide: Vec<u16> = name.encode_utf16().collect();
-        let mut unicode = UNICODE_STRING {
-            length: (wide.len() * 2) as u16,
-            maximum_length: (wide.len() * 2) as u16,
-            buffer: wide.as_ptr() as *mut u16,
-        };
-        let mut attributes = OBJECT_ATTRIBUTES {
-            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            root_directory: dir.as_raw_handle() as HANDLE,
-            object_name: &unicode,
-            attributes: OBJ_CASE_INSENSITIVE,
-            security_descriptor: std::ptr::null_mut(),
-            security_quality_of_service: std::ptr::null_mut(),
-        };
-        let mut handle: HANDLE = std::ptr::null_mut();
-        let mut status_block = IO_STATUS_BLOCK {
-            status: 0,
-            information: 0,
-        };
-        // DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, with the backup-intent
-        // flag the rename recipes open with.
-        let status = unsafe {
-            NtCreateFile(
-                &mut handle,
-                0x0001_0000 | 0x0000_0080 | 0x0010_0000,
-                &attributes,
-                &mut status_block,
-                std::ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_ALL,
-                FILE_OPEN,
-                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != STATUS_SUCCESS {
-            return Err(EngineError::invalid(format!(
+        open_relative(
+            &wide,
+            Some(dir),
+            0x0001_0000 | 0x0000_0080 | 0x0010_0000,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
                 "could not reopen the staging file for the rename: NTSTATUS {status:#x}"
-            )));
-        }
-        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+            ))
+        })
     }
 }
 
