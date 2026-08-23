@@ -8,8 +8,8 @@
 //! the control uni-stream, and the decision to let a stream live as long as it
 //! likes.
 //!
-//! That last one is why this ALPN does not reuse [`serve_connection`] the way
-//! the other two do. Their connection loop bounds a stream at two minutes and a
+//! That last one is why this ALPN does not reuse `serve::serve_connection` the
+//! way the other two do. Their connection loop bounds a stream at two minutes and a
 //! connection at eight in flight, and both are right for a request/response
 //! protocol and wrong here: a socket that proxies is *supposed* to be
 //! long-lived, and its concurrency bound is the socket's own armed

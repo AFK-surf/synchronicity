@@ -1,9 +1,11 @@
 //! The guest-visible ABI: error codes, poll flags, struct layouts and bounds.
 //!
-//! Everything here is duplicated in `sdk/synch.h`, and
-//! [`the_header_and_the_abi_agree`](crate::sdk::tests) is what keeps the two
-//! from drifting: the header is the guest's only view of these numbers, and a
-//! guest compiled against a stale one gets wrong answers rather than errors.
+//! Everything here is duplicated in `sdk/synch.h`, and `sdk`'s
+//! `the_header_and_the_abi_agree` test is what keeps the two from drifting:
+//! the header is the guest's only view of these numbers, and a guest compiled
+//! against a stale one gets wrong answers rather than errors. (Named rather
+//! than linked: a `#[cfg(test)]` item is not in the documented crate, so a
+//! link to one is a link rustdoc cannot resolve.)
 
 /// Negative returns. Every helper that can fail returns one of these.
 ///

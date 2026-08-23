@@ -647,7 +647,10 @@ fn h_poll(
     // own business, and re-reading would make the reply describe a request
     // nobody made.
     let mut watch = Vec::with_capacity(n as usize);
-    for chunk in raw.chunks_exact(POLLFD_SIZE as usize) {
+    // The remainder is discarded rather than refused: the length was checked
+    // against `n * POLLFD_SIZE` when it was read, so there is never one.
+    let (frames, _) = raw.as_chunks::<{ POLLFD_SIZE as usize }>();
+    for chunk in frames {
         let handle = i64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes"));
         let events = u32::from_le_bytes(chunk[8..12].try_into().expect("4 bytes"));
         if events & !poll::ALL != 0 {
@@ -705,7 +708,7 @@ fn h_poll(
         }
         move |scope: &HelperScope| {
             write_revents(scope, fds_ptr, &posted, &watch_for_task);
-            Ok(count as u64)
+            Ok(count)
         }
     });
     ret(0)
