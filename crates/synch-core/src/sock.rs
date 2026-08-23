@@ -1,0 +1,460 @@
+//! The `sync/sock/1` wire schema (`docs/SOCKETS.md` §4).
+//!
+//! One QUIC connection per (caller, callee) pair; one bidirectional stream per
+//! invocation. Each stream opens with a length-framed [`SockOpen`], is answered
+//! with a length-framed [`SockOpened`], and then carries **opaque bytes with no
+//! framing at all** in both directions until FIN.
+//!
+//! The payload is unframed deliberately. A trailer carrying the invocation's
+//! exit status would put a length prefix on every proxied byte for the sake of
+//! a value that arrives once; a QUIC `RESET_STREAM` would carry it for free but
+//! discards data the peer has not read, so a program that writes a final
+//! response and returns would race its own output away. The status therefore
+//! rides a per-connection control uni-stream ([`SockClosed`]) and the data
+//! stream always closes cleanly.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{hash::Hash, origin::OriginId};
+
+/// ALPN for socket invocation (`docs/SOCKETS.md` §4).
+pub const ALPN_SOCK: &[u8] = b"sync/sock/1";
+
+/// Protocol version carried in [`SockOpen::v`].
+///
+/// Checked before anything else in the frame is trusted. Like `Hello`'s
+/// version on the metadata ALPN, a peer on another version is refused rather
+/// than negotiated with.
+pub const SOCK_PROTO_VERSION: u8 = 1;
+
+/// The most metadata pairs one [`SockOpen`] may carry.
+pub const MAX_OPEN_META_PAIRS: usize = 16;
+
+/// The most bytes [`SockOpen::meta`] may occupy, keys and values summed.
+pub const MAX_OPEN_META_BYTES: usize = 4096;
+
+/// The largest accepted `Open` frame, in bytes (`docs/SOCKETS.md` §10).
+///
+/// Derived rather than chosen, for the reason
+/// [`MAX_BATCH_PATH_BYTES`](crate::MAX_BATCH_PATH_BYTES) is: a cap below what a
+/// legal frame can carry is a wedge, not a guard. The resolver is deterministic,
+/// so an over-cap `Open` is over it on every retry and the caller can never
+/// reach that socket at all. The slack covers the origin (a named one carries a
+/// name and a domain), the space, and postcard's length varints.
+///
+/// Enforced by the framing layer *before* the decode, so nothing inside this
+/// module ever sees an allocation it did not bound.
+pub const MAX_OPEN_FRAME_LEN: usize = crate::MAX_KEY_LEN + MAX_OPEN_META_BYTES + 1024;
+
+/// The most bytes a [`SockOpened::Refused`] message may carry.
+pub const MAX_REFUSE_MESSAGE_LEN: usize = 512;
+
+/// Opens one invocation. The caller's whole influence over what runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SockOpen {
+    /// Protocol version; must be [`SOCK_PROTO_VERSION`].
+    pub v: u8,
+    /// The origin whose tree the socket is to be resolved in.
+    ///
+    /// Must be the callee's *own* origin. Carrying it — rather than letting the
+    /// callee assume "me" — is what makes a relayed or replayed `Open`
+    /// undeliverable anywhere but where it was addressed.
+    pub origin: OriginId,
+    /// The space the socket lives in.
+    pub space: String,
+    /// The socket's path within that space.
+    pub path: String,
+    /// Caller-supplied metadata, readable by the program via `sy_conn_meta`.
+    ///
+    /// **Untrusted.** It is whatever the caller typed after `--meta`, and the
+    /// only reason it is in the protocol at all is that a program that wants a
+    /// hint from its caller should get one through a bounded, named channel
+    /// rather than by parsing the first line of the payload.
+    #[serde(deserialize_with = "bounded_meta")]
+    pub meta: Vec<(String, String)>,
+}
+
+/// Why a [`SockOpen`] was refused.
+///
+/// Appended to, never reordered: postcard numbers variants by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefuseCode {
+    /// No entry at that path in the callee's own trie.
+    NoSuchPath,
+    /// There is an entry, but its kind is not [`Socket`](crate::EntryKind::Socket).
+    NotASocket,
+    /// Declared but not armed, or armed at a root the bytes no longer have.
+    NotArmed,
+    /// The caller is not a member, or the space is not one it may read.
+    Unauthorized,
+    /// The caller is a delegate and this space is outside its list (§3.5).
+    SpaceNotDelegated,
+    /// The socket is at its concurrency cap.
+    Busy,
+    /// The object does not load, link or compile.
+    ProgramInvalid,
+    /// The callee has no eBPF runtime on this platform.
+    Unsupported,
+}
+
+impl RefuseCode {
+    /// A short, stable machine-readable name, for logs and `synch connect`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefuseCode::NoSuchPath => "no-such-path",
+            RefuseCode::NotASocket => "not-a-socket",
+            RefuseCode::NotArmed => "not-armed",
+            RefuseCode::Unauthorized => "unauthorized",
+            RefuseCode::SpaceNotDelegated => "space-not-delegated",
+            RefuseCode::Busy => "busy",
+            RefuseCode::ProgramInvalid => "program-invalid",
+            RefuseCode::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// The callee's answer to a [`SockOpen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SockOpened {
+    /// Accepted; raw bytes follow in both directions.
+    Ok {
+        /// The content root actually running.
+        ///
+        /// Echoed so the caller can audit what it reached: with arming keyed by
+        /// content root, "which program answered me?" has an exact answer and
+        /// the protocol may as well give it.
+        program: Hash,
+        /// The callee's id for this invocation, as `synch socket ps` prints it.
+        invocation: u64,
+    },
+    /// Refused; the stream carries nothing further.
+    Refused {
+        /// Why.
+        code: RefuseCode,
+        /// A human-readable elaboration, bounded at [`MAX_REFUSE_MESSAGE_LEN`].
+        #[serde(deserialize_with = "bounded_message")]
+        message: String,
+    },
+}
+
+/// How an invocation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SockStatus {
+    /// The program returned this value.
+    Ok(i64),
+    /// The program faulted and was contained.
+    Fault(FaultKind),
+    /// `synch socket kill`.
+    Killed,
+    /// The daemon is shutting down.
+    Shutdown,
+    /// The idle deadline expired with no readiness and no progress.
+    Deadline,
+}
+
+impl SockStatus {
+    /// The process exit code `synch connect` reports for this status.
+    ///
+    /// A clean return is the program's own value, truncated to a byte the way
+    /// every other exit status is. Everything else is a distinct code above the
+    /// range a shell reads as "the command ran and said no".
+    pub fn exit_code(self) -> i32 {
+        match self {
+            SockStatus::Ok(n) => (n & 0xff) as i32,
+            SockStatus::Fault(_) => 70,
+            SockStatus::Killed => 71,
+            SockStatus::Shutdown => 72,
+            SockStatus::Deadline => 73,
+        }
+    }
+}
+
+/// What kind of fault ended an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FaultKind {
+    /// A guest memory access landed in a guard region.
+    Memory,
+    /// A helper refused, and the runtime could not continue.
+    Helper,
+    /// The program could not be loaded, linked or compiled.
+    Load,
+    /// A documented per-invocation bound was exceeded.
+    Limit,
+}
+
+/// A completed invocation, pushed on the connection's control uni-stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SockClosed {
+    /// The QUIC stream id the invocation ran on.
+    pub stream_id: u64,
+    /// How it ended.
+    pub status: SockStatus,
+}
+
+/// Why a [`SockOpen`] was rejected before it reached any policy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenError {
+    /// The protocol version is not one this build speaks.
+    #[error("socket protocol version {0}, not the {SOCK_PROTO_VERSION} this build speaks")]
+    Version(u8),
+    /// The space name is not a legal one.
+    #[error("invalid space name: {0}")]
+    Space(String),
+    /// The path is not a legal relative path.
+    #[error("invalid path: {0}")]
+    Path(String),
+    /// The metadata exceeds its documented bounds.
+    #[error("metadata exceeds its bounds: {0}")]
+    Meta(&'static str),
+}
+
+impl SockOpen {
+    /// Builds an `Open` for a socket on `origin`.
+    pub fn new(
+        origin: OriginId,
+        space: impl Into<String>,
+        path: impl Into<String>,
+        meta: Vec<(String, String)>,
+    ) -> Self {
+        SockOpen {
+            v: SOCK_PROTO_VERSION,
+            origin,
+            space: space.into(),
+            path: path.into(),
+            meta,
+        }
+    }
+
+    /// Checks everything about this frame that can be checked without knowing
+    /// anything about the node it arrived at.
+    ///
+    /// Deliberately separate from the policy checks in `synch-net`: this is the
+    /// syntactic gate, and it runs first so that a malformed frame never
+    /// reaches code that would have to reason about a path with `..` in it.
+    pub fn validate(&self) -> Result<(), OpenError> {
+        if self.v != SOCK_PROTO_VERSION {
+            return Err(OpenError::Version(self.v));
+        }
+        crate::record::validate_space(&self.space)
+            .map_err(|e| OpenError::Space(format!("{e}")))?;
+        crate::path::normalize_path(&self.path).map_err(|e| OpenError::Path(format!("{e}")))?;
+        if self.meta.len() > MAX_OPEN_META_PAIRS {
+            return Err(OpenError::Meta("too many pairs"));
+        }
+        let bytes: usize = self.meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if bytes > MAX_OPEN_META_BYTES {
+            return Err(OpenError::Meta("too many bytes"));
+        }
+        Ok(())
+    }
+
+    /// The value of a metadata key, if the caller sent one.
+    ///
+    /// First match wins: the list is the caller's to build, so it may hold the
+    /// same key twice, and a program asking for one value must get exactly one.
+    pub fn meta_get(&self, key: &str) -> Option<&str> {
+        self.meta
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Decodes [`SockOpen::meta`] under [`MAX_OPEN_META_PAIRS`].
+///
+/// Applied *during* the decode, like `AdState`'s span cap: a `Vec` that has
+/// already been deserialized has already cost what the bound was meant to deny.
+/// Pairs past the cap are read and dropped so the rest of the frame still
+/// decodes — the frame is bounded at [`MAX_OPEN_FRAME_LEN`] by the caller, so
+/// what is being dropped is small by construction and dropping it keeps a
+/// clumsy client's connection working rather than failing it at the handshake.
+fn bounded_meta<'de, D>(deserializer: D) -> std::result::Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<(String, String)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {MAX_OPEN_META_PAIRS} metadata pairs")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = Vec::with_capacity(
+                seq.size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_OPEN_META_PAIRS),
+            );
+            while let Some(pair) = seq.next_element::<(String, String)>()? {
+                if out.len() < MAX_OPEN_META_PAIRS {
+                    out.push(pair);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
+}
+
+/// Decodes a refusal message under [`MAX_REFUSE_MESSAGE_LEN`], truncating on a
+/// character boundary rather than failing: a refusal that cannot be read is
+/// worse than one that is cut short.
+fn bounded_message<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut s = String::deserialize(deserializer)?;
+    if s.len() > MAX_REFUSE_MESSAGE_LEN {
+        let mut end = MAX_REFUSE_MESSAGE_LEN;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin() -> OriginId {
+        OriginId::named("nas", "cluster.example.com").unwrap()
+    }
+
+    fn open() -> SockOpen {
+        SockOpen::new(origin(), "code", "git.sock", vec![])
+    }
+
+    #[test]
+    fn round_trips() {
+        for msg in [
+            open(),
+            SockOpen::new(
+                origin(),
+                "code",
+                "a/b/c.sock",
+                vec![("user".into(), "zoe".into())],
+            ),
+        ] {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(postcard::from_bytes::<SockOpen>(&bytes).unwrap(), msg);
+        }
+
+        for msg in [
+            SockOpened::Ok {
+                program: Hash::new(b"elf"),
+                invocation: 7,
+            },
+            SockOpened::Refused {
+                code: RefuseCode::NotArmed,
+                message: "armed at 9f86, tree has aa11".into(),
+            },
+        ] {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(postcard::from_bytes::<SockOpened>(&bytes).unwrap(), msg);
+        }
+
+        for status in [
+            SockStatus::Ok(0),
+            SockStatus::Ok(-1),
+            SockStatus::Fault(FaultKind::Memory),
+            SockStatus::Killed,
+            SockStatus::Shutdown,
+            SockStatus::Deadline,
+        ] {
+            let msg = SockClosed {
+                stream_id: 12,
+                status,
+            };
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            assert_eq!(postcard::from_bytes::<SockClosed>(&bytes).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn a_legal_open_fits_the_frame_bound() {
+        // No honest caller can build a frame its peer refuses: the largest
+        // legal `Open` has to fit, or the bound is a wedge rather than a guard.
+        let meta = (0..MAX_OPEN_META_PAIRS)
+            .map(|i| {
+                let half = MAX_OPEN_META_BYTES / MAX_OPEN_META_PAIRS / 2;
+                (format!("{i:0half$}", half = half), "v".repeat(half))
+            })
+            .collect();
+        let big = SockOpen::new(origin(), "code", "x".repeat(crate::MAX_KEY_LEN - 8), meta);
+        big.validate().unwrap();
+        assert!(
+            postcard::to_stdvec(&big).unwrap().len() <= MAX_OPEN_FRAME_LEN,
+            "the largest legal Open does not fit MAX_OPEN_FRAME_LEN"
+        );
+    }
+
+    #[test]
+    fn validation_refuses_what_the_resolver_must_never_see() {
+        let mut o = open();
+        o.v = SOCK_PROTO_VERSION + 1;
+        assert!(matches!(o.validate(), Err(OpenError::Version(_))));
+
+        let mut o = open();
+        o.path = "../../etc/passwd".into();
+        assert!(matches!(o.validate(), Err(OpenError::Path(_))));
+
+        // A space name may hold a space character — `validate_space` bars only
+        // the empty string, `/`, control characters and over-length. The one
+        // that matters here is `/`, which would otherwise let a caller reach
+        // out of the space it named and into the key of another.
+        let mut o = open();
+        o.space = "code/../secrets".into();
+        assert!(matches!(o.validate(), Err(OpenError::Space(_))));
+
+        let mut o = open();
+        o.meta = vec![("k".into(), "v".repeat(MAX_OPEN_META_BYTES))];
+        assert!(matches!(o.validate(), Err(OpenError::Meta(_))));
+    }
+
+    #[test]
+    fn oversized_meta_is_dropped_during_the_decode() {
+        // Built by hand rather than through `SockOpen`, because `validate`
+        // refuses it — the point is that the *decoder* bounds the allocation
+        // before any validation runs.
+        #[derive(Serialize)]
+        struct Unbounded {
+            v: u8,
+            origin: OriginId,
+            space: String,
+            path: String,
+            meta: Vec<(String, String)>,
+        }
+        let bytes = postcard::to_stdvec(&Unbounded {
+            v: SOCK_PROTO_VERSION,
+            origin: origin(),
+            space: "code".into(),
+            path: "git.sock".into(),
+            meta: (0..MAX_OPEN_META_PAIRS * 4)
+                .map(|i| (format!("k{i}"), String::new()))
+                .collect(),
+        })
+        .unwrap();
+        let decoded: SockOpen = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.meta.len(), MAX_OPEN_META_PAIRS);
+    }
+
+    #[test]
+    fn a_status_exit_code_distinguishes_the_program_from_the_runtime() {
+        assert_eq!(SockStatus::Ok(0).exit_code(), 0);
+        assert_eq!(SockStatus::Ok(3).exit_code(), 3);
+        assert_eq!(SockStatus::Ok(-1).exit_code(), 255);
+        assert_eq!(SockStatus::Fault(FaultKind::Memory).exit_code(), 70);
+        assert_ne!(
+            SockStatus::Killed.exit_code(),
+            SockStatus::Shutdown.exit_code()
+        );
+    }
+}

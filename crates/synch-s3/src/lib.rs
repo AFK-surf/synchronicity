@@ -35,7 +35,6 @@ use axum::{
     Router,
 };
 use synch_cli::control::{EntryInfo, UploadRef};
-use synch_core::EntryKind;
 
 use crate::{
     auth::{AuthMode, SignedRequest, UNSIGNED_PAYLOAD},
@@ -686,12 +685,19 @@ async fn list_objects(
     // entirely of skipped rows still hands back a token that moves.
     let mut cursor = None;
     for row in &listing {
-        // Only a regular file is an S3 object. A directory marker and a
-        // tombstone are obviously not, and neither is a symlink: its version
+        // Only a content-bearing entry is an S3 object. A directory marker and
+        // a tombstone are obviously not, and neither is a symlink: its version
         // identity is its target, not content (§8), so it has no object root
         // to be an ETag and no bytes to serve. Listing one would advertise a
         // key whose GET can only fail.
-        if row.kind != EntryKind::File {
+        //
+        // A socket is content-bearing and so is served like the file it is on
+        // disk (`docs/SOCKETS.md` §2.2). Hiding it here would make the gateway
+        // the one surface that disagrees with `synch cat`, a mirror and a fill
+        // about a path that has a root and bytes — and it would hide it from
+        // the operator without hiding it from anyone else, since every member
+        // already reads those bytes out of the tree.
+        if !row.kind.has_content() {
             cursor = Some(row.path.clone());
             continue;
         }
@@ -753,7 +759,7 @@ async fn get_object(
         .map_err(|e| e.with_key(key))?;
     // Whatever a listing leaves out, a direct read leaves out too, or the
     // gateway would answer for keys it will not admit to having.
-    if entry.kind != EntryKind::File {
+    if !entry.kind.has_content() {
         return Err(S3Error::no_such_key(key));
     }
 

@@ -331,6 +331,7 @@ fn kind_to_pb(kind: EntryKind) -> pb::EntryKind {
         EntryKind::Dir => pb::EntryKind::Dir,
         EntryKind::Symlink => pb::EntryKind::Symlink,
         EntryKind::Tombstone => pb::EntryKind::Tombstone,
+        EntryKind::Socket => pb::EntryKind::Socket,
     }
 }
 
@@ -340,6 +341,7 @@ fn kind_from_pb(kind: pb::EntryKind) -> Result<EntryKind, ControlError> {
         pb::EntryKind::Dir => EntryKind::Dir,
         pb::EntryKind::Symlink => EntryKind::Symlink,
         pb::EntryKind::Tombstone => EntryKind::Tombstone,
+        pb::EntryKind::Socket => EntryKind::Socket,
         pb::EntryKind::Unspecified => {
             return Err(ControlError::internal(
                 "the daemon sent an entry with no kind",

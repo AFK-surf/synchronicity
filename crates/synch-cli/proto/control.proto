@@ -501,6 +501,9 @@ enum EntryKind {
   ENTRY_KIND_DIR = 2;
   ENTRY_KIND_SYMLINK = 3;
   ENTRY_KIND_TOMBSTONE = 4;
+  // Content is an eBPF ELF object this origin will execute for a peer that
+  // connects to it (`docs/SOCKETS.md` §2).
+  ENTRY_KIND_SOCKET = 5;
 }
 
 // One entry of the unified tree (§8).

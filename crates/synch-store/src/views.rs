@@ -85,6 +85,7 @@ fn kind_to_int(kind: EntryKind) -> i64 {
         EntryKind::Dir => 1,
         EntryKind::Symlink => 2,
         EntryKind::Tombstone => 3,
+        EntryKind::Socket => 4,
     }
 }
 
@@ -94,6 +95,7 @@ fn kind_from_int(value: i64) -> Result<EntryKind> {
         1 => EntryKind::Dir,
         2 => EntryKind::Symlink,
         3 => EntryKind::Tombstone,
+        4 => EntryKind::Socket,
         other => return Err(StoreError::column("entries.kind", other.to_string())),
     })
 }

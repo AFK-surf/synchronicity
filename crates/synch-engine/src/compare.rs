@@ -91,15 +91,24 @@ impl CompareReport {
 /// The content identity of a file-like entry: what makes two versions "the same
 /// file". A regular file is its content root; a symlink is its target (§8). A
 /// directory marker and a tombstone are not file-like and never enter the map.
+///
+/// A socket is its content root *and* the fact that it is a socket
+/// (`docs/SOCKETS.md` §11). Folding it into `File` would make one origin's
+/// socket and another's plain file over the same ELF the same version, and they
+/// are not: one of those origins will execute those bytes for a peer that
+/// connects, and the other will hand them over as a file. Two origins agree
+/// about a socket only if they agree that it *is* one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Identity {
     File(Hash),
+    Socket(Hash),
     Symlink(String),
 }
 
 fn identity(row: &EntryRow) -> Option<Identity> {
     match row.kind {
         EntryKind::File => row.content.map(Identity::File),
+        EntryKind::Socket => row.content.map(Identity::Socket),
         EntryKind::Symlink => row.symlink_target.clone().map(Identity::Symlink),
         EntryKind::Dir | EntryKind::Tombstone => None,
     }

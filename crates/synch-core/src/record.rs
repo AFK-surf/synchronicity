@@ -50,6 +50,31 @@ pub enum EntryKind {
     Symlink,
     /// A deletion marker retained for interpretation (§4.2).
     Tombstone,
+    /// A socket: content is an eBPF ELF object this origin will execute for a
+    /// peer that connects to it (`docs/SOCKETS.md` §2).
+    ///
+    /// Appended, because postcard numbers enum variants by position and the
+    /// four above it are already on every wire in every cluster. A build that
+    /// predates this variant fails to decode the record, which fails that
+    /// origin and no other (§12) — unavoidable for any new kind, and the
+    /// reason the rollout order is upgrade, then declare.
+    ///
+    /// The kind is this origin's assertion about its own copy, like
+    /// `unix_mode` and unlike content: it comes from a local declaration and is
+    /// never adopted from a peer, so taking someone's socket takes its bytes
+    /// and not its socket-ness (`docs/SOCKETS.md` §2.2).
+    Socket,
+}
+
+impl EntryKind {
+    /// True if this kind carries content addressed by a BLAKE3 root.
+    ///
+    /// [`EntryKind::Socket`] does, which is what makes the ELF an ordinary CAS
+    /// object: replicated, fetched, verified per 16 KiB group, and pinnable
+    /// like anything else.
+    pub fn has_content(self) -> bool {
+        matches!(self, EntryKind::File | EntryKind::Socket)
+    }
 }
 
 /// The hash-tree format an object was chunked with. Fixed per object.
@@ -140,9 +165,22 @@ impl FileEntry {
         }
     }
 
+    /// Builds a socket entry over an already-hashed ELF object.
+    pub fn socket(size: u64, mtime_ns: i64, content: Hash, seq: u64) -> Self {
+        FileEntry {
+            kind: EntryKind::Socket,
+            ..FileEntry::file(size, mtime_ns, content, seq)
+        }
+    }
+
     /// True if this entry marks a deletion.
     pub fn is_tombstone(&self) -> bool {
         self.kind == EntryKind::Tombstone
+    }
+
+    /// True if this entry is a socket (`docs/SOCKETS.md` §2).
+    pub fn is_socket(&self) -> bool {
+        self.kind == EntryKind::Socket
     }
 }
 
