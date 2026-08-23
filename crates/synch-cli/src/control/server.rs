@@ -461,6 +461,7 @@ impl Control for ControlService {
     type ListStream = Items<pb::Entry>;
     type ReadStream = Items<pb::Chunk>;
     type PutStream = Items<pb::Written>;
+    type OpenSocketStream = Items<pb::ConnectResponse>;
 
     async fn run(
         &self,
@@ -614,6 +615,79 @@ impl Control for ControlService {
     /// otherwise accept the upload, write it into the space, and lose it
     /// (§3.4). Taking it before the response opens is what lets the refusal
     /// reach a client that has not started streaming yet.
+    /// Bridges a control stream to a socket invocation on another node.
+    ///
+    /// The daemon owns the only iroh endpoint (§9.1), so this is the whole
+    /// reason the call exists: the CLI cannot dial for itself. Nothing here
+    /// interprets the bytes — this end is a pipe, and the far end is where a
+    /// program runs.
+    async fn open_socket(
+        &self,
+        request: Request<Streaming<pb::ConnectRequest>>,
+    ) -> Result<Response<Self::OpenSocketStream>, Status> {
+        let mut incoming = request.into_inner();
+        let open = match incoming.message().await?.and_then(|first| first.kind) {
+            Some(pb::connect_request::Kind::Open(open)) => open,
+            _ => {
+                return Err(ControlError::invalid(
+                    "a socket connection opens with the path it is for",
+                )
+                .into())
+            }
+        };
+
+        let reference: synch_engine::EntryRef = open
+            .reference
+            .parse()
+            .map_err(|e| ControlError::invalid(format!("{e}")))?;
+        // Origin-qualified, always. A socket is served by the node that
+        // published it, so there is nothing to select between — and `newest`
+        // would let any member's mtime decide whose program answers.
+        let Some(origin) = reference.origin.clone() else {
+            return Err(ControlError::invalid(format!(
+                "`{}` names no origin; connecting takes `<origin>:<space>/<path>`",
+                open.reference
+            ))
+            .into());
+        };
+        let (space, path) = match reference.path.split_once('/') {
+            Some((_, rest)) if !rest.is_empty() => (reference.space.clone(), rest.to_string()),
+            _ => match reference.path.is_empty() {
+                true => {
+                    return Err(ControlError::invalid(
+                        "a socket reference is `<origin>:<space>/<path>`",
+                    )
+                    .into())
+                }
+                false => (reference.space.clone(), reference.path.clone()),
+            },
+        };
+        let meta: Vec<(String, String)> = open
+            .meta
+            .into_iter()
+            .map(|pair| (pair.key, pair.value))
+            .collect();
+
+        let node = self.served.node()?.clone();
+        let connection = node
+            .connect_socket(&origin, &space, &path, meta)
+            .await
+            .map_err(ControlError::from)?;
+
+        let (tx, rx) = mpsc::channel(8);
+        let mut stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                outcome = bridge_socket(connection, incoming, &tx) => outcome,
+                _ = stopping.recv() => Err(stopped()),
+            };
+            if let Err(e) = outcome {
+                let _ = tx.send(Err(e.into())).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn put(
         &self,
         request: Request<Streaming<pb::PutRequest>>,
@@ -1119,6 +1193,123 @@ fn domain_set_advice(domain: &str, node_id: NodeId, delegate: bool) -> Vec<Strin
             .replace("{domain}", domain),
         "`synch domain clear` returns this node to its device key as its name".into(),
     ]
+}
+
+/// Pumps bytes between one control stream and one socket invocation.
+///
+/// Three independent directions, and each has to be able to finish on its own:
+/// the caller's bytes going out, the program's bytes coming back, and the
+/// invocation's exit status arriving on the connection's control stream after
+/// both. Sequencing any two of them would deadlock the protocols that do not
+/// take turns.
+async fn bridge_socket(
+    connection: synch_engine::sockets::SocketConnection,
+    mut incoming: Streaming<pb::ConnectRequest>,
+    tx: &mpsc::Sender<Result<pb::ConnectResponse, Status>>,
+) -> Result<(), ControlError> {
+    let synch_engine::sockets::SocketConnection {
+        client: _client,
+        mut control,
+        stream,
+    } = connection;
+    let synch_net::sock::SockStream {
+        program,
+        invocation,
+        mut send,
+        mut recv,
+    } = stream;
+
+    tx.send(Ok(pb::ConnectResponse {
+        kind: Some(pb::connect_response::Kind::Opened(pb::ConnectOpened {
+            program: program.as_bytes().to_vec(),
+            invocation,
+        })),
+    }))
+    .await
+    .map_err(|_| ControlError::internal("the caller went away"))?;
+
+    let uplink = tokio::spawn(async move {
+        while let Ok(Some(message)) = incoming.message().await {
+            match message.kind {
+                Some(pb::connect_request::Kind::Data(bytes)) => {
+                    if tokio::io::AsyncWriteExt::write_all(&mut send, &bytes)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // A half-close, not a hang-up: the program may still have a
+                // reply to write.
+                Some(pb::connect_request::Kind::Fin(_)) => break,
+                _ => {}
+            }
+        }
+        let _ = send.finish();
+    });
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match recv.read(&mut buf).await {
+            // `None` is the stream's FIN; `Some(0)` cannot happen for a
+            // non-empty buffer, but reading it as an EOF would spin.
+            Ok(None) | Ok(Some(0)) | Err(_) => break,
+            Ok(Some(n)) => {
+                let message = pb::ConnectResponse {
+                    kind: Some(pb::connect_response::Kind::Data(buf[..n].to_vec())),
+                };
+                if tx.send(Ok(message)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    uplink.abort();
+
+    // The status rides its own uni-stream, so it can only be read once the
+    // data stream is done — which is exactly when it is worth reading.
+    let closed = synch_net::frame::read_frame::<synch_core::SockClosed>(&mut control).await;
+    let (exit_code, status) = match closed {
+        Ok(closed) => (closed.status.exit_code(), format!("{:?}", closed.status)),
+        // A caller that never learns the status still learns the stream ended,
+        // which is the honest thing to report rather than inventing a zero.
+        Err(_) => (0, String::new()),
+    };
+    tx.send(Ok(pb::ConnectResponse {
+        kind: Some(pb::connect_response::Kind::Closed(pb::ConnectClosed {
+            exit_code,
+            status,
+        })),
+    }))
+    .await
+    .map_err(|_| ControlError::internal("the caller went away"))?;
+    Ok(())
+}
+
+/// Splits a `<space>/<path>` socket target.
+///
+/// Origin-qualified references are refused rather than ignored: a socket a
+/// node declares is one of *its own*, and `nas:code/git.sock` here would be
+/// asking this node to declare something about somebody else's tree.
+fn split_socket_target(target: &str) -> Result<(String, String), ControlError> {
+    if target.contains(':') {
+        return Err(ControlError::new(
+            ErrorCode::Invalid,
+            format!(
+                "`{target}` names another origin; a socket is declared on the node that \
+                 publishes it, so this takes `<space>/<path>`"
+            ),
+        ));
+    }
+    match target.split_once('/') {
+        Some((space, path)) if !space.is_empty() && !path.is_empty() => {
+            Ok((space.to_string(), path.to_string()))
+        }
+        _ => Err(ControlError::new(
+            ErrorCode::Invalid,
+            format!("`{target}` is not `<space>/<path>`"),
+        )),
+    }
 }
 
 /// Serves one CLI subcommand.
@@ -2407,6 +2598,170 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 for (path, reason) in &report.skipped {
                     out.progress(format!("  skipped {path}: {reason}")).await?;
                 }
+            }
+        }
+
+        // ---- sockets (`docs/SOCKETS.md`) ----------------------------------
+        Command::SocketAdd(pb::SocketAdd {
+            target,
+            config,
+            allow_egress,
+            allow_tree_read,
+            max_streams,
+            auto,
+            note,
+        }) => {
+            let (space, path) = split_socket_target(&target)?;
+            let row = synch_store::SocketRow {
+                space: space.clone(),
+                path: path.clone(),
+                config: config
+                    .iter()
+                    .map(|pair| match pair.split_once('=') {
+                        Some((k, v)) => (k.trim().to_string(), v.to_string()),
+                        None => (pair.clone(), String::new()),
+                    })
+                    .collect(),
+                allow_egress,
+                allow_tree_read,
+                max_streams: (max_streams > 0).then_some(max_streams),
+                auto,
+                note,
+                added_at: synch_core::now_ns(),
+            };
+            let node = node.clone();
+            let declared = row.clone();
+            read(&node, move |n| Ok(n.socket_add(&declared)?)).await?;
+            out.line(format!("declared {space}/{path}")).await?;
+            if !synch_sock::SUPPORTED {
+                out.line(
+                    "note: this build serves no sockets — async-ebpf supports Linux and \
+                     OpenBSD on x86-64 and arm64. The entry will publish and replicate; \
+                     a peer connecting to it is refused."
+                        .to_string(),
+                )
+                .await?;
+            }
+            out.line("next: `synch scan`, then `synch socket arm` to approve it".to_string())
+                .await?;
+            if row.auto {
+                out.line(
+                    "warning: --auto re-arms on every content change. Correct for a path \
+                     you are the only writer of; wrong for any path an S3 key, a fill or \
+                     a take can reach."
+                        .to_string(),
+                )
+                .await?;
+            }
+        }
+
+        Command::SocketArm(pb::SocketArm { target }) => {
+            let (space, path) = split_socket_target(&target)?;
+            let (root, declared) = node
+                .socket_arm(&space, &path)
+                .await
+                .map_err(ControlError::from)?;
+            out.line(format!("armed {space}/{path}")).await?;
+            out.line(format!("  program  {}", root.to_hex())).await?;
+            let rendered = declared.render();
+            if rendered.is_empty() {
+                out.line("  declares nothing — it reaches nothing and reads nothing".to_string())
+                    .await?;
+            } else {
+                for line in rendered.lines() {
+                    out.line(format!("  declares {line}")).await?;
+                }
+            }
+        }
+
+        Command::SocketDisarm(pb::SocketDisarm { target }) => {
+            let (space, path) = split_socket_target(&target)?;
+            let node = node.clone();
+            let (s, p) = (space.clone(), path.clone());
+            if !read(&node, move |n| Ok(n.socket_disarm(&s, &p)?)).await? {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("{space}/{path} was not armed"),
+                ));
+            }
+            out.line(format!(
+                "disarmed {space}/{path} — still published, will not run"
+            ))
+            .await?;
+        }
+
+        Command::SocketRm(pb::SocketRm { target }) => {
+            let (space, path) = split_socket_target(&target)?;
+            let node = node.clone();
+            let (s, p) = (space.clone(), path.clone());
+            if !read(&node, move |n| Ok(n.socket_rm(&s, &p)?)).await? {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("{space}/{path} is not a declared socket"),
+                ));
+            }
+            out.line(format!(
+                "undeclared {space}/{path} — the next scan republishes it as a file"
+            ))
+            .await?;
+        }
+
+        Command::SocketLs(pb::SocketLs { space, long }) => {
+            let filter = (!space.is_empty()).then_some(space);
+            let node_for_read = node.clone();
+            let sockets =
+                read(&node_for_read, move |n| Ok(n.socket_ls(filter.as_deref())?)).await?;
+            if sockets.is_empty() {
+                out.line("no sockets declared".to_string()).await?;
+            }
+            for state in sockets {
+                let qualified = state.declaration.qualified();
+                // What the tree names right now, which is what an arming record
+                // has to match for anything to run.
+                let resolved = {
+                    let node = node.clone();
+                    let (s, p) = (
+                        state.declaration.space.clone(),
+                        state.declaration.path.clone(),
+                    );
+                    read(&node, move |n| Ok(n.resolve_socket(&s, &p)?)).await?
+                };
+                let status = match (&resolved, &state.arm) {
+                    (None, _) => "unpublished".to_string(),
+                    (Some(r), Some(arm)) if arm.root == r.root => "armed".to_string(),
+                    (Some(_), Some(_)) => "disarmed (content changed)".to_string(),
+                    (Some(_), None) => "never armed".to_string(),
+                };
+                let auto = if state.declaration.auto { "  auto" } else { "" };
+                out.line(format!("{qualified:<40}  {status}{auto}")).await?;
+                if long {
+                    if let Some(r) = &resolved {
+                        out.line(format!("    tree     {}", r.root.to_hex()))
+                            .await?;
+                    }
+                    if let Some(arm) = &state.arm {
+                        out.line(format!("    armed    {}", arm.root.to_hex()))
+                            .await?;
+                        for line in arm.declared.lines() {
+                            out.line(format!("    declares {line}")).await?;
+                        }
+                    }
+                    for rule in &state.declaration.allow_egress {
+                        out.line(format!("    allowed  egress {rule}")).await?;
+                    }
+                    for prefix in &state.declaration.allow_tree_read {
+                        out.line(format!("    allowed  tree-read {prefix}")).await?;
+                    }
+                    if let Some(n) = state.declaration.max_streams {
+                        out.line(format!("    allowed  max-streams {n}")).await?;
+                    }
+                }
+            }
+        }
+
+        Command::SocketSdk(pb::SocketSdk {}) => {
+            for line in synch_sock::sdk::HEADER.lines() {
+                out.line(line.to_string()).await?;
             }
         }
 

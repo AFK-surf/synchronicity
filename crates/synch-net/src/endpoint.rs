@@ -464,6 +464,25 @@ impl Net {
         Ok(BlobClient::new(self.connect(addr, ALPN_BLOB).await?))
     }
 
+    /// Connects to a peer on the socket ALPN.
+    ///
+    /// Not session-reusing, unlike the other two. A socket connection carries
+    /// long-lived streams whose lifetime is the caller's business, and handing
+    /// two unrelated `synch connect` invocations the same QUIC connection would
+    /// make one of them able to close the other's.
+    pub async fn connect_sock(
+        &self,
+        addr: impl Into<EndpointAddr>,
+    ) -> Result<crate::sock::SockClient, NetError> {
+        let addr = addr.into();
+        let connection = self
+            .endpoint()
+            .connect(addr, synch_core::ALPN_SOCK)
+            .await
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        Ok(crate::sock::SockClient::new(connection))
+    }
+
     async fn connect(
         &self,
         addr: impl Into<EndpointAddr>,

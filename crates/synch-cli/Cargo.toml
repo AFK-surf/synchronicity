@@ -29,6 +29,7 @@ synch-engine.workspace = true
 synch-mpt.workspace = true
 synch-net.workspace = true
 synch-store.workspace = true
+synch-sock.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -49,6 +50,7 @@ blake3.workspace = true
 # simulated zone/log harness.
 synch-net = { workspace = true, features = ["sim"] }
 synch-store.workspace = true
+synch-sock.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]

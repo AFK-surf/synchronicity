@@ -454,6 +454,39 @@ pub enum Command {
         #[command(subcommand)]
         command: MirrorCommand,
     },
+    /// Declare, arm and inspect this node's sockets (`docs/SOCKETS.md`).
+    Socket {
+        /// The socket subcommand.
+        #[command(subcommand)]
+        command: SocketCommand,
+    },
+    /// Connect to a socket on another node, over stdio or a local listener.
+    ///
+    /// The connecting side executes nothing: it names a path, and everything
+    /// that decides what runs is state the far node already holds.
+    Connect {
+        /// `<origin>:<space>/<path>` — origin-qualified, always.
+        ///
+        /// There is no version policy here. A socket is served by the node that
+        /// published it, so there is nothing to select between: `newest` would
+        /// let any member's mtime decide whose program answers.
+        reference: String,
+        /// `k=v` metadata the program can read with `sy_conn_meta`. Untrusted
+        /// by the program, which is told so.
+        #[arg(long = "meta", value_name = "K=V")]
+        meta: Vec<String>,
+        /// Listen on `ADDR:PORT` and open one invocation per accepted
+        /// connection, instead of piping stdio.
+        ///
+        /// The listener lives in this process, not the daemon: closing this
+        /// command ends the exposure, and the daemon never holds a listening
+        /// socket it was not configured with.
+        #[arg(long, value_name = "ADDR:PORT")]
+        listen: Option<String>,
+        /// With --listen, serve one connection and exit.
+        #[arg(long, requires = "listen")]
+        once: bool,
+    },
     /// Keep content in the local store regardless of policy.
     Pin {
         /// The pin subcommand.
@@ -755,6 +788,70 @@ pub enum MirrorCommand {
     Ls,
     /// Bring every mirror up to date now.
     Sync,
+}
+
+/// `synch socket ...`
+#[derive(Debug, Subcommand)]
+pub enum SocketCommand {
+    /// Declare a path in one of this node's spaces to be a socket.
+    ///
+    /// Declaring is not arming. It makes the scanner publish the path as a
+    /// socket; `synch socket arm` is where the program's own declaration is
+    /// printed and approved.
+    Add {
+        /// `<space>/<path>`.
+        target: String,
+        /// `k=v`, readable by the program through `sy_config_get`.
+        #[arg(long = "config", value_name = "K=V")]
+        config: Vec<String>,
+        /// A destination the program may reach: `host` or `host:port`.
+        ///
+        /// The runtime enforces the intersection of this and what the program
+        /// declared, so a destination only one side names is denied.
+        #[arg(long = "allow-egress", value_name = "HOST[:PORT]")]
+        allow_egress: Vec<String>,
+        /// A path prefix the program may read from other origins' views.
+        #[arg(long = "allow-tree-read", value_name = "PREFIX")]
+        allow_tree_read: Vec<String>,
+        /// A concurrency cap for this socket.
+        #[arg(long, value_name = "N")]
+        max_streams: Option<u32>,
+        /// Re-arm on every content change, without asking.
+        ///
+        /// Correct for a path you are the only writer of, and wrong for any
+        /// path an S3 key, a fill or a take can reach — those are all ways
+        /// bytes you did not write become bytes this node publishes.
+        #[arg(long)]
+        auto: bool,
+        /// A note, for `synch socket ls`.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Approve the bytes a declared socket currently has.
+    Arm {
+        /// `<space>/<path>`.
+        target: String,
+    },
+    /// Withdraw an approval, leaving the socket published.
+    Disarm {
+        /// `<space>/<path>`.
+        target: String,
+    },
+    /// Undeclare a path; the next scan republishes it as an ordinary file.
+    Rm {
+        /// `<space>/<path>`.
+        target: String,
+    },
+    /// List this node's declared sockets.
+    Ls {
+        /// Only this space.
+        space: Option<String>,
+        /// Show the armed root, what the program declared, and the policy.
+        #[arg(short, long)]
+        long: bool,
+    },
+    /// Print the C SDK header a socket program is compiled against.
+    Sdk,
 }
 
 /// `synch pin ...`

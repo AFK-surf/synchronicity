@@ -17,7 +17,8 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 use crate::{
     cli::{
         CasBackendArg, CasCommand, Cli, CloudCommand, Command, DaemonCommand, DelegateCommand,
-        DomainCommand, KeyCommand, MirrorCommand, PinCommand, SpaceCommand, TrustCommand,
+        DomainCommand, KeyCommand, MirrorCommand, PinCommand, SocketCommand, SpaceCommand,
+        TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -209,6 +210,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Cas {
             command: CasCommand::Migrate { to },
         } => migrate_cas(&cli, &data_dir, *to).await,
+        // Not a `Run` command: it is a bidirectional byte pipe, and rendering
+        // it as lines of text would be rendering somebody else's protocol.
+        Command::Connect {
+            reference,
+            meta,
+            listen,
+            once,
+        } => crate::connect::run(&data_dir, reference, meta, listen.as_deref(), *once).await,
         _ => {
             let command = to_command(&cli)?;
             deliver(&data_dir, &cli, command).await
@@ -617,6 +626,7 @@ fn build_migration_backend(
 fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
+        Command::Connect { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),
@@ -765,6 +775,40 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             }),
             MirrorCommand::Ls => Cmd::MirrorLs(pb::MirrorLs {}),
             MirrorCommand::Sync => Cmd::MirrorSync(pb::MirrorSync {}),
+        },
+
+        Command::Socket { command } => match command {
+            SocketCommand::Add {
+                target,
+                config,
+                allow_egress,
+                allow_tree_read,
+                max_streams,
+                auto,
+                note,
+            } => Cmd::SocketAdd(pb::SocketAdd {
+                target: target.clone(),
+                config: config.clone(),
+                allow_egress: allow_egress.clone(),
+                allow_tree_read: allow_tree_read.clone(),
+                max_streams: max_streams.unwrap_or(0),
+                auto: *auto,
+                note: note.clone().unwrap_or_default(),
+            }),
+            SocketCommand::Arm { target } => Cmd::SocketArm(pb::SocketArm {
+                target: target.clone(),
+            }),
+            SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
+                target: target.clone(),
+            }),
+            SocketCommand::Rm { target } => Cmd::SocketRm(pb::SocketRm {
+                target: target.clone(),
+            }),
+            SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
+                space: space.clone().unwrap_or_default(),
+                long: *long,
+            }),
+            SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
         },
 
         Command::Pin { command } => match command {

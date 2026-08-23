@@ -14,6 +14,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod connect;
 pub mod control;
 pub mod daemon;
 pub mod render;

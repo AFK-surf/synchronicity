@@ -4877,6 +4877,7 @@ dependencies = [
  "synch-engine",
  "synch-mpt",
  "synch-net",
+ "synch-sock",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",
