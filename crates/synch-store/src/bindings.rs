@@ -811,21 +811,23 @@ impl Store {
         })
     }
 
-    /// Collapses the read scope to the empty one when no live grant stands
-    /// behind it, and returns whether it moved (§5.5).
+    /// Realigns the read scope with the live grant, and returns whether it
+    /// moved (§5.5).
     ///
     /// The delegate a lapsed grant named is cut off at the connection gate
     /// the moment its binding dies — no peer's declaration ever reaches it
     /// again — so the maintenance pass is where the clock drives the derived
     /// views away: the same destructive move `adopt_scope` makes for a moved
-    /// grant, applied to the one that expired. A fresh node (no grant, no
-    /// confined scope) and a bootstrapping delegate whose scope was adopted
-    /// but whose `d:` record is still in flight are both left alone: the
-    /// bootstrap materializes the grant within the same exchange.
+    /// grant, applied to the one that expired. A grant that expires wholly
+    /// collapses the scope to the empty one; one that expires among several
+    /// narrows the scope to the grants that remain; a grant materialized
+    /// since the last pass widens it. A fresh node (no grant, no confined
+    /// scope) is left alone.
     pub fn collapse_grantless_scope(&self, now: i64) -> Result<bool> {
-        match self.local_scope()? {
-            Some(spaces) if !spaces.is_empty() && self.own_grant(now)?.is_none() => {
-                self.set_read_scope(Some(&[]))
+        let grant = self.own_grant(now)?;
+        match (self.local_scope()?, grant) {
+            (Some(spaces), grant) if spaces != grant.clone().unwrap_or_default() => {
+                self.set_read_scope(grant.as_deref())
             }
             _ => Ok(false),
         }

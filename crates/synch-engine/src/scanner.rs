@@ -1398,29 +1398,27 @@ impl Adoption {
 
     /// Fills the staging file from `source`, sharing its extents if it can.
     fn clone_from(&mut self, source: &Path) -> Result<CloneKind> {
-        let file = self
+        let mut file = self
             .file
-            .as_ref()
+            .take()
             .ok_or_else(|| EngineError::invalid("a fresh staging file has no handle"))?;
-        match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
-            Ok(()) => return Ok(CloneKind::Reflink),
+        match std::fs::File::open(source).and_then(|src| reflink_file(&src, &file)) {
+            Ok(()) => {
+                self.file = Some(file);
+                return Ok(CloneKind::Reflink);
+            }
             Err(e) => {
                 tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
             }
         }
-        // The staging file exists and is empty; `fs::copy` wants to create its
-        // own, so the handle is dropped for the duration and reopened after.
-        self.file = None;
-        let copied = std::fs::copy(source, &self.staging);
-        self.file = Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&self.staging)?,
-        );
-        copied?;
+        // The fallback copies through the open handle rather than by path:
+        // the staging file was created relative to the directory pinned at
+        // open, and writing through the handle keeps it there — a path-based
+        // copy would re-resolve the staging path through whatever the tree
+        // looks like now.
+        let mut src = std::fs::File::open(source)?;
+        std::io::copy(&mut src, &mut file)?;
+        self.file = Some(file);
         Ok(CloneKind::Copy)
     }
 
@@ -1849,20 +1847,26 @@ mod nt {
 
     /// The Win32 path `root` as an absolute NT path (`\??\`-prefixed), for
     /// the one open that has no parent handle to be relative to.
+    ///
+    /// The space root is stored canonicalized, which on Windows is the
+    /// `\\?\`-prefixed extended-length form — and it may equally arrive as a
+    /// plain drive or UNC path — so all four shapes are mapped:
+    /// `\\?\C:\...` and `C:\...` to `\??\C:\...`, `\\?\UNC\s\sh\...` and
+    /// `\\s\sh\...` to `\??\UNC\s\sh\...`.
     fn root_wide(root: &std::path::Path) -> Vec<u16> {
         let text = root.as_os_str().to_string_lossy();
         let mut out: Vec<u16> = Vec::new();
-        match text.strip_prefix(r"\\") {
-            // UNC: `\\server\share\...` -> `\??\UNC\server\share\...`.
-            Some(rest) => {
-                out.extend_from_slice(r"\??\UNC\".encode_utf16().collect::<Vec<_>>().as_slice());
-                out.extend(rest.encode_utf16());
-            }
-            None => {
-                out.extend_from_slice(r"\??\".encode_utf16().collect::<Vec<_>>().as_slice());
-                out.extend(text.encode_utf16());
-            }
-        }
+        let (prefix, rest) = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            (r"\??\UNC\", rest)
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            (r"\??\", rest)
+        } else if let Some(rest) = text.strip_prefix(r"\\") {
+            (r"\??\UNC\", rest)
+        } else {
+            (r"\??\", text.as_ref())
+        };
+        out.extend_from_slice(prefix.encode_utf16().collect::<Vec<_>>().as_slice());
+        out.extend(rest.encode_utf16());
         out
     }
 
@@ -1942,6 +1946,8 @@ mod nt {
         // FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE: read *and* write,
         // because the payload is written here and a multipart completion
         // reads it straight back before the rename.
+        // `File::from` takes the handle over from the `OwnedHandle` — one
+        // owner, one close.
         let handle = open_relative(
             &wide,
             Some(dir),
@@ -1954,7 +1960,7 @@ mod nt {
                 "could not create the staging file beside {name}: NTSTATUS {status:#x}"
             ))
         })?;
-        Ok(unsafe { std::fs::File::from_raw_handle(handle.as_raw_handle() as RawHandle) })
+        Ok(std::fs::File::from(handle))
     }
 
     /// Renames the staging file to `target` inside `dir` — the
@@ -2011,7 +2017,10 @@ mod nt {
             Some(dir),
             0x0001_0000 | 0x0000_0080 | 0x0010_0000,
             FILE_OPEN,
-            FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
+            // Never follow a reparse point at the staging name: a local actor
+            // who swapped the staging entry for a junction must not redirect
+            // the rename to whatever it points at.
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
         )
         .map_err(|status| {
             EngineError::invalid(format!(
