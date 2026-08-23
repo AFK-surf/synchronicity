@@ -1996,7 +1996,7 @@ mod nt {
         let opened = open_relative(
             &name_wide,
             Some(dir),
-            0x0000_0080, // FILE_READ_ATTRIBUTES
+            0x0000_0080 | 0x0010_0000, // FILE_READ_ATTRIBUTES | SYNCHRONIZE
             FILE_OPEN,
             FILE_SYNCHRONOUS_IO_NONALERT,
         )
