@@ -45,6 +45,8 @@ protox.workspace = true
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
+# For the one test that has to shrink a child process's stack.
+libc = "0.2"
 blake3.workspace = true
 # `sim` marks a test build: it carries the pre-main TLS provider install
 # test binaries need since the aws-lc-rs move (crate::tls), and the

@@ -431,3 +431,54 @@ fn key_of(cli: &Cli) -> String {
         .expect("a key")
         .to_string()
 }
+
+/// The command surface must parse inside the smallest main-thread stack any
+/// platform we ship on gives a process.
+///
+/// clap's derived parser is one builder chain per subcommand, in a single frame
+/// with nothing inlined in a debug build, and it grew past a megabyte when the
+/// `socket` subcommand landed. Linux gives the main thread eight megabytes and
+/// noticed nothing; Windows gives it one, and every `synch` invocation aborted
+/// before the program had done anything — including `--version`.
+///
+/// So the condition is reproduced here rather than left to the Windows job to
+/// find. In a subprocess, because a stack overflow aborts and would take the
+/// rest of this test binary with it, and under `RLIMIT_STACK` rather than a
+/// sized thread, because it is the *main* thread's stack that differs between
+/// platforms and only the kernel sets that one.
+#[test]
+#[cfg(unix)]
+fn the_cli_parses_within_the_smallest_main_thread_stack_we_ship_on() {
+    use std::os::unix::process::CommandExt;
+
+    // What Windows gives a process by default.
+    const WINDOWS_DEFAULT: u64 = 1024 * 1024;
+
+    let mut command = Command::new(synch_bin());
+    command
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: `setrlimit` is async-signal-safe, which is the bar for a
+    // `pre_exec` closure in the forked child.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: WINDOWS_DEFAULT,
+                rlim_max: WINDOWS_DEFAULT,
+            };
+            if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command.output().expect("synch binary runs");
+    assert!(
+        output.status.success(),
+        "`synch --version` did not survive a {WINDOWS_DEFAULT}-byte main stack — \
+         which is what Windows gives it:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

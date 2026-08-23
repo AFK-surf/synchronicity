@@ -4880,6 +4880,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-base",
+ "libc",
  "prost",
  "protox",
  "synch-cc",
