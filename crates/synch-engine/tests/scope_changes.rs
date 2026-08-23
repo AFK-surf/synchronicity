@@ -366,8 +366,12 @@ async fn a_delegate_promoted_to_a_full_member_replicates_everything() {
     );
 
     // The operator promotes the delegate: a rooted binding for its key, and
-    // the delegation revoked in the same head.
+    // the delegation revoked in the same head. The delegate's own resolver
+    // materializes the promotion the same way — a rooted binding for its own
+    // key in the issuer's origin — which is the local evidence a later
+    // `Unrestricted` declaration is checked against (§5.5).
     trust_static(&issuer.store, &delegate.origin, &delegate.key());
+    trust_static(&delegate.store, &issuer.origin, &delegate.key());
     issuer.publish_removing(
         2,
         &[("photos", "b.jpg", b"another file")],
@@ -597,7 +601,9 @@ async fn a_round_through_a_wider_peer_keeps_the_delegating_origin_replicating() 
     work.publish(2, &[("reports", "q4.pdf", b"more")], &[]);
     home_syncer.sync_with(&home_to_work).await.unwrap();
 
-    // The laptop's next rounds happen to pick `home`, which declares no scope.
+    // The laptop's next rounds happen to pick `home`, which declares the
+    // same confined scope the issuer does (it replicated the `d:` record)
+    // — and which a wider or emptier declaration could not move either.
     let to_home = laptop
         .net
         .connect_mpt(home.net.direct_addr())
@@ -617,5 +623,145 @@ async fn a_round_through_a_wider_peer_keeps_the_delegating_origin_replicating() 
         laptop.entries(&work.origin, "reports"),
         2,
         "and its new record must materialize"
+    );
+}
+
+/// **F1g — a round through a peer that never saw the grant does not widen.**
+///
+/// The peer holds the delegating origin's trie complete at a head from
+/// *before* the `d:` record existed, and a rooted binding for the laptop —
+/// so it declares `Unrestricted`, the old encoding's `None`, which the
+/// laptop used to adopt wholesale as "the whole keyspace". The round still
+/// passes the issuer-trie guard (the peer does advertise a complete head of
+/// the issuer), so only the grant-derived scope can stop the widening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_through_a_peer_that_never_saw_the_grant_does_not_widen() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let work = Node::spawn(Some("work")).await;
+    let stale = Node::spawn(Some("stale")).await;
+    let laptop = Node::spawn(None).await;
+
+    trust_static(&laptop.store, &work.origin, &work.key());
+    trust_static(&laptop.store, &stale.origin, &stale.key());
+    trust_static(&stale.store, &work.origin, &work.key());
+    // The reciprocal bindings the connection gate needs: stale may dial work
+    // (it replicates it in full) and the laptop may dial stale.
+    trust_static(&work.store, &stale.origin, &stale.key());
+    trust_static(&stale.store, &laptop.origin, &laptop.key());
+
+    // Work publishes before delegating; the stale peer replicates that head.
+    work.publish(
+        1,
+        &[
+            ("reports", "q3.pdf", b"delegated"),
+            ("secrets", "keys.txt", b"withheld"),
+        ],
+        &[],
+    );
+    let stale_syncer = Syncer::new(stale.store.clone());
+    let stale_to_work = stale.net.connect_mpt(work.net.direct_addr()).await.unwrap();
+    stale_syncer.sync_with(&stale_to_work).await.unwrap();
+
+    // The grant arrives in the next head; the laptop replicates under it.
+    work.publish(
+        2,
+        &[("reports", "q4.pdf", b"more")],
+        &[delegation(&laptop.key(), &["reports"])],
+    );
+    let syncer = Syncer::new(laptop.store.clone());
+    let to_work = laptop
+        .net
+        .connect_mpt(work.net.direct_addr())
+        .await
+        .unwrap();
+    syncer.sync_with(&to_work).await.unwrap();
+    assert_eq!(
+        laptop.store.local_scope().unwrap(),
+        Some(vec!["reports".to_string()])
+    );
+
+    // The laptop's next rounds happen to pick the stale peer, which still
+    // holds only the pre-delegation head and declares `Unrestricted`.
+    let to_stale = laptop
+        .net
+        .connect_mpt(stale.net.direct_addr())
+        .await
+        .unwrap();
+    rounds(&syncer, &to_stale, "stale", 3).await;
+
+    assert_eq!(
+        laptop.store.local_scope().unwrap(),
+        Some(vec!["reports".to_string()]),
+        "a peer that never saw the grant must not widen the delegate"
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "reports"),
+        2,
+        "the granted records stay materialized"
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "secrets"),
+        0,
+        "and the withheld ones stay out"
+    );
+}
+
+/// **F1h — a delegation whose grant expired collapses the scope to nothing.**
+///
+/// The moment the `d:` record's `not_after` passes, both sides' bindings
+/// lapse: the issuer stops serving the delegate at the connection gate, so
+/// no peer's declaration ever reaches it again — the maintenance pass is
+/// the only thing that can drive the derived views away. The collapsed
+/// scope is the empty one (`m:self` and the `d:` namespace, no file data);
+/// a grant can only come back through a fresh materialized `d:` record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_delegation_collapses_the_read_scope_to_nothing() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    // A grant that expires three seconds from now: long enough for the
+    // bootstrap sync, short enough to lapse inside the test.
+    let record = synch_core::Delegation {
+        v: synch_core::RECORD_VERSION,
+        spaces: vec!["photos".to_string()],
+        not_after: now_ns() + 3_000_000_000,
+        note: None,
+    };
+    let extra = vec![(
+        delegation_key(&delegate.key()),
+        postcard::to_stdvec(&record).unwrap(),
+    )];
+    issuer.publish(1, &[("photos", "a.jpg", b"the granted bytes")], &extra);
+
+    let syncer = Syncer::new(delegate.store.clone());
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    syncer.sync_with(&client).await.unwrap();
+    assert_eq!(
+        delegate.store.local_scope().unwrap(),
+        Some(vec!["photos".to_string()])
+    );
+
+    // The grant lapses. The issuer's binding lapsed with it, so the delegate
+    // is cut off at the connection gate and never hears from a peer again;
+    // the maintenance pass collapses the grantless scope.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let collapsed = delegate.store.collapse_grantless_scope(now_ns()).unwrap();
+    assert!(collapsed, "the grantless scope must move");
+
+    assert_eq!(
+        delegate.store.local_scope().unwrap(),
+        Some(Vec::<String>::new()),
+        "an expired delegation collapses the read scope to the empty one"
+    );
+    assert_eq!(
+        delegate.entries(&issuer.origin, "photos"),
+        0,
+        "the expired spaces leave the derived views"
     );
 }

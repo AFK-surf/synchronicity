@@ -772,13 +772,47 @@ impl Node {
         // is refused before anything is fetched. It reads the space row, so it
         // goes to the blocking pool like every other store read on an async
         // path (§10).
-        let target = {
+        {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
-        };
+            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?;
+        }
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        self.materialize_blob(&range.root, range.size, target.clone())
+        // The write lands through the space-validated adoption: the target's
+        // parent directory is resolved component by component at open and the
+        // payload is cloned into the staging file it pinned, so a directory
+        // swapped for a symlink by the fetch standing between the first check
+        // and here cannot redirect the write outside the space (§7.2, §9.4).
+        //
+        // The object materializes into a daemon-owned staging file first —
+        // the data dir is not attacker-writable — then the adoption clones it
+        // into the pinned directory (`FICLONE` where the filesystem shares
+        // extents, a copy elsewhere). Everything after the fetch is store
+        // reads and file I/O, so it goes to the blocking pool like the fetch's
+        // own halves (§10).
+        let staged = {
+            let node = self.clone();
+            crate::blocking::offload(move || {
+                Ok(node.store().staging_dir().join(format!(
+                    "take-{}-{}.payload",
+                    std::process::id(),
+                    now_ns()
+                )))
+            })
+            .await?
+        };
+        self.materialize_blob(&range.root, range.size, staged.clone())
             .await?;
+        let target = {
+            let (node, space_id, path, staged) =
+                (self.clone(), space_id.to_string(), path.to_string(), staged);
+            crate::blocking::offload(move || {
+                let mut adoption = Adoption::into_space(&node, &space_id, &path)?;
+                adoption.clone_from(&staged)?;
+                let _ = std::fs::remove_file(&staged);
+                adoption.commit()
+            })
+            .await?
+        };
         Ok(target)
     }
 
@@ -1000,6 +1034,16 @@ impl Node {
     /// nothing would publish the adoption and the write would be a silent
     /// no-op with a filesystem side effect.
     pub(crate) fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
+        Ok(self.adoption_target_checked(space_id, path)?.0)
+    }
+
+    /// [`Self::adoption_target`], plus the escape-guard inputs the commit
+    /// re-verifies: the space's local root and the normalized relative path.
+    pub(crate) fn adoption_target_checked(
+        &self,
+        space_id: &str,
+        path: &str,
+    ) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
         let space = self
             .store()
             .space(space_id)?
@@ -1009,8 +1053,37 @@ impl Node {
                 "space {space_id} is detached and has no filesystem adoption target"
             ))
         })?;
-        target_within(Path::new(local_path), space_id, path)
+        target_within_checked(Path::new(local_path), space_id, path)
     }
+}
+
+/// [`Node::adoption_target`], plus the escape-guard inputs the commit
+/// re-verifies: the space's local root and the normalized relative path.
+///
+/// The checked half of [`target_within`] — same resolution, and the inputs
+/// that let a later step re-check the guard against the directory the write
+/// is about to land in.
+pub(crate) fn target_within_checked(
+    root: &Path,
+    space_id: &str,
+    path: &str,
+) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
+    let normalized = normalized_adoption_path(path)?;
+    // Lexical safety is still not enough. A space root is canonicalized when
+    // it is added but its *interior* never is, so a symlinked directory
+    // inside the space resolves through to wherever it points, and the write
+    // or the delete lands outside every space as whatever uid the daemon
+    // runs as. The mirror loop has always checked this; every other writer
+    // needs the same check, and a deletion needs it as much as a write does.
+    if crate::mirror::escapes_via_symlink(root, &normalized) {
+        return Err(EngineError::invalid(format!(
+            "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+        )));
+    }
+    Ok((
+        root.join(&normalized),
+        Some((root.to_path_buf(), normalized)),
+    ))
 }
 
 /// The guard itself, over a space root already in hand.
@@ -1103,6 +1176,24 @@ pub struct Adoption {
     /// gates immediately before it, and the review history of this branch is
     /// mostly the record of callers that did not.
     space: Option<SpaceWrite>,
+    /// The directory the staging file and the target live in, resolved
+    /// component by component at open — `O_NOFOLLOW` on Unix, a rooted
+    /// `NtCreateFile` chain with `FILE_OPEN_REPARSE_POINT` on Windows — so
+    /// the commit rename resolves relative to it. A directory swapped for a
+    /// symlink or junction — before the open or while the body streams —
+    /// cannot redirect a rename that never re-resolves a path.
+    #[cfg(unix)]
+    parent: Option<rustix::fd::OwnedFd>,
+    /// The space root this write was pinned against (Unix), so the commit can
+    /// re-walk the intended path after the rename and confirm the object is
+    /// there — a pinned parent directory that a local actor *renamed* (rather
+    /// than replaced with a symlink) mid-stream would otherwise take the
+    /// commit with it, landing the object where the rename was, not where the
+    /// key says it is.
+    #[cfg(unix)]
+    root: Option<std::path::PathBuf>,
+    #[cfg(windows)]
+    parent: Option<std::os::windows::io::OwnedHandle>,
 }
 
 /// What a write into an indexed space needs to re-check before it lands.
@@ -1127,7 +1218,15 @@ impl Adoption {
     /// gates with it and re-takes them at `commit`.
     fn into_space(node: &Node, space_id: &str, path: &str) -> Result<Adoption> {
         node.ensure_adoptable(space_id, path)?;
-        let mut adoption = Adoption::open(node.adoption_target(space_id, path)?)?;
+        // The space-validated open: the target is resolved one component at a
+        // time with `O_NOFOLLOW` from the space root, so the staging file is
+        // created inside the directory the commit rename will resolve against
+        // — a directory swapped for a symlink cannot redirect either.
+        let (target, escape) = node.adoption_target_checked(space_id, path)?;
+        let mut adoption = match escape {
+            Some((root, rel)) => Adoption::in_space(&root, &rel)?,
+            None => Adoption::open(target)?,
+        };
         adoption.space = Some(SpaceWrite {
             node: node.clone(),
             space: space_id.to_string(),
@@ -1155,18 +1254,126 @@ impl Adoption {
         // completion reads it straight back to take the object's root before
         // the rename. `File::create` alone is write-only, and the read then
         // fails with `EBADF` on a file this very process is holding open.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&staging)?;
+        //
+        // Not world-readable: the staging file holds the in-flight bytes, and
+        // a local actor who can read them gets a copy of an upload before the
+        // rename publishes it.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&staging)?;
         Ok(Adoption {
             target,
             staging,
             file: Some(file),
             written: 0,
             space: None,
+            #[cfg(unix)]
+            parent: None,
+            #[cfg(unix)]
+            root: None,
+            #[cfg(windows)]
+            parent: None,
+        })
+    }
+
+    /// Opens a write at `rel` under a space root, resolving the target's
+    /// parent directory one component at a time with `O_NOFOLLOW` (Unix).
+    ///
+    /// No component of the path is ever followed, so a directory swapped for
+    /// a symlink — by the local actor the open-time check exists to stop —
+    /// cannot redirect where the staging file is created or where the commit
+    /// rename lands: the rename resolves against the held directory, not
+    /// against anything a path can still mean. Missing parents are created,
+    /// like the path-based open.
+    #[cfg(unix)]
+    pub(crate) fn in_space(root: &Path, rel: &str) -> Result<Adoption> {
+        let parent = open_parent_no_follow(root, rel)?;
+        // The staging name has to be unique per write: two clients putting the
+        // same key at once must not share one file and interleave their bytes.
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let staging_name = format!(
+            ".{name}.{}.{}{PART_SUFFIX}",
+            std::process::id(),
+            synch_core::now_ns()
+        );
+        // Read *and* write: the payload is written here, and a multipart
+        // completion reads it straight back to take the object's root before
+        // the rename. `File::create` alone is write-only, and the read then
+        // fails with `EBADF` on a file this very process is holding open.
+        //
+        // Created relative to the pinned parent — a pre-placed symlink at the
+        // staging name is refused (`NOFOLLOW`) rather than followed — and not
+        // world-readable: the staging file holds the in-flight bytes, and a
+        // local actor who can read them gets a copy of an upload before the
+        // rename publishes it.
+        let file = rustix::fs::openat(
+            &parent,
+            &staging_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::TRUNC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits_retain(0o600),
+        )
+        .map_err(|e| {
+            EngineError::invalid(format!(
+                "could not create the staging file beside {}: {e}",
+                rel
+            ))
+        })?;
+        let staging = root.join(rel).with_file_name(&staging_name);
+        Ok(Adoption {
+            target: root.join(rel),
+            staging,
+            file: Some(std::fs::File::from(file)),
+            written: 0,
+            space: None,
+            parent: Some(parent),
+            root: Some(root.to_path_buf()),
+        })
+    }
+
+    /// The Windows shape of [`Self::in_space`]: the parent directory is
+    /// resolved with a rooted `NtCreateFile` chain, one component at a time
+    /// with `FILE_OPEN_REPARSE_POINT`, so a junction is never followed; the
+    /// staging file is created relative to the resolved parent, and the
+    /// commit renames the staging file relative to that same parent. No path
+    /// is re-resolved by the commit, so a directory swapped for a junction
+    /// while the body streamed cannot redirect the write outside the space.
+    ///
+    /// On Windows the *protocol* separator `/` and the *platform* separator
+    /// `\` are both treated as separators, so a key such as `a\b` pins `a`
+    /// rather than being handed to `NtCreateFile` as one opaque component
+    /// that its own path parsing would then walk through.
+    #[cfg(windows)]
+    pub(crate) fn in_space(root: &Path, rel: &str) -> Result<Adoption> {
+        let parent = nt::open_parent_no_follow(root, rel)?;
+        // The staging name has to be unique per write: two clients putting the
+        // same key at once must not share one file and interleave their bytes.
+        let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+        let staging_name = format!(
+            ".{name}.{}.{}{PART_SUFFIX}",
+            std::process::id(),
+            synch_core::now_ns()
+        );
+        // Created relative to the pinned parent — a pre-placed reparse point
+        // at the staging name is opened as itself (`OPEN_REPARSE_POINT`)
+        // rather than followed, and overwritten in place.
+        let file = nt::create_staging(&parent, &staging_name)?;
+        let staging = root.join(rel).with_file_name(&staging_name);
+        Ok(Adoption {
+            target: root.join(rel),
+            staging,
+            file: Some(file),
+            written: 0,
+            space: None,
+            parent: Some(parent),
         })
     }
 
@@ -1207,29 +1414,27 @@ impl Adoption {
 
     /// Fills the staging file from `source`, sharing its extents if it can.
     fn clone_from(&mut self, source: &Path) -> Result<CloneKind> {
-        let file = self
+        let mut file = self
             .file
-            .as_ref()
+            .take()
             .ok_or_else(|| EngineError::invalid("a fresh staging file has no handle"))?;
-        match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
-            Ok(()) => return Ok(CloneKind::Reflink),
+        match std::fs::File::open(source).and_then(|src| reflink_file(&src, &file)) {
+            Ok(()) => {
+                self.file = Some(file);
+                return Ok(CloneKind::Reflink);
+            }
             Err(e) => {
                 tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
             }
         }
-        // The staging file exists and is empty; `fs::copy` wants to create its
-        // own, so the handle is dropped for the duration and reopened after.
-        self.file = None;
-        let copied = std::fs::copy(source, &self.staging);
-        self.file = Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&self.staging)?,
-        );
-        copied?;
+        // The fallback copies through the open handle rather than by path:
+        // the staging file was created relative to the directory pinned at
+        // open, and writing through the handle keeps it there — a path-based
+        // copy would re-resolve the staging path through whatever the tree
+        // looks like now.
+        let mut src = std::fs::File::open(source)?;
+        std::io::copy(&mut src, &mut file)?;
+        self.file = Some(file);
         Ok(CloneKind::Copy)
     }
 
@@ -1399,10 +1604,609 @@ impl Adoption {
             .take()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.sync_all()?;
-        drop(file);
-        std::fs::rename(&self.staging, &self.target)?;
+        self.rename_into_place(file)?;
         fsync_parent(&self.target);
         Ok(())
+    }
+
+    /// The staging file is renamed over the target with no path
+    /// re-resolution (Unix): the target's parent directory was resolved
+    /// component by component with `O_NOFOLLOW` at open, so a directory
+    /// swapped for a symlink — before the open or while the body streamed —
+    /// cannot redirect the write. A write that was not opened against a
+    /// space root (the mirror's materializations) has nothing pinned and
+    /// keeps the plain rename, exactly as before; its own guard runs in the
+    /// same blocking step ([`crate::mirror`]).
+    #[cfg(unix)]
+    fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
+        match self.parent.take() {
+            Some(dir) => {
+                let staging = self
+                    .staging
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the staging path has no file name"))?;
+                let target = self
+                    .target
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+                // The staging file's identity, taken while the handle is
+                // live: the verification below compares it against what now
+                // sits at the intended target.
+                let staged = rustix::fs::fstat(&file).map_err(|e| {
+                    EngineError::invalid(format!("could not stat the staging file: {e}"))
+                })?;
+                rustix::fs::renameat(&dir, staging, &dir, target)
+                    .map_err(|e| EngineError::invalid(format!("rename into place failed: {e}")))?;
+                // The pinned directory pins an inode, not a place in the
+                // tree: a local actor who *renames* the parent directory
+                // (staging file still inside) to a location outside the
+                // space while the body streams takes the commit along with
+                // it — `renameat` succeeds inside the moved directory and
+                // the write would report the old in-space target. Verify the
+                // object is where the key says it is, and remove it through
+                // the pinned parent when it is not.
+                self.verify_landing(&dir, &staged)?;
+            }
+            None => std::fs::rename(&self.staging, &self.target)?,
+        }
+        Ok(())
+    }
+
+    /// After the commit rename, confirms the object is at the intended
+    /// target by re-resolving the target's parent from the space root with
+    /// the same `O_NOFOLLOW` walk and comparing `dev:ino` with the staging
+    /// file's identity — a parent directory moved out from under the write
+    /// resolves to nothing (or to a symlink, which the walk refuses), and
+    /// the object is removed where the moved directory actually is and the
+    /// commit fails closed. Only reached for writes pinned against a space
+    /// root.
+    #[cfg(unix)]
+    fn verify_landing(&self, dir: &rustix::fd::OwnedFd, staged: &rustix::fs::Stat) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let rel = self
+            .target
+            .strip_prefix(root)
+            .map_err(|_| EngineError::invalid("the commit target is not under the space root"))?;
+        let rel = rel.to_str().ok_or_else(|| {
+            EngineError::invalid("the commit target is not valid UTF-8 (space paths are)")
+        })?;
+        // Re-resolving with the open-time walk, including its create-missing-
+        // parents behavior: a parent the actor moved away comes back as an
+        // empty directory chain, which then has no object to show. A symlink
+        // in the intended path fails the walk — the open-time resolver
+        // refuses symlinks — which is a mismatch too, not an error to
+        // propagate: the object needs removing either way.
+        let target = self
+            .target
+            .file_name()
+            .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+        let matched = match open_parent_no_follow(root, rel) {
+            Ok(rewalked) => {
+                match rustix::fs::statat(&rewalked, target, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    // The renamed file is the staging file — `rename`
+                    // preserves the inode — so a matching `dev:ino` means
+                    // the object sits at the intended target, inside the
+                    // space.
+                    Ok(landed) => landed.st_dev == staged.st_dev && landed.st_ino == staged.st_ino,
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
+        };
+        if matched {
+            return Ok(());
+        }
+        // The object is where the moved directory is, not where the key says
+        // it is: remove it through the pinned parent (the `renameat` above
+        // used the same handle, so this finds it) and fail closed.
+        let _ = rustix::fs::unlinkat(dir, target, rustix::fs::AtFlags::empty());
+        Err(EngineError::invalid(
+            "the write's parent directory was moved while the body streamed; \
+             the object was removed and the write failed closed",
+        ))
+    }
+
+    /// The staging file is renamed over the target (Windows): `MoveFileExW`
+    /// with the full paths, followed by the containment check that verifies
+    /// the file that landed is the staging file itself, still at the
+    /// intended name inside the pinned directory — so a directory swapped
+    /// for a junction — before the open or while the body streamed — cannot
+    /// silently redirect the write outside the space, and a redirected
+    /// payload is removed wherever it actually landed. A write that was not
+    /// opened against a space root keeps the plain rename, exactly as
+    /// before.
+    #[cfg(windows)]
+    fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
+        match self.parent.take() {
+            Some(dir) => {
+                let staging = self.staging.clone();
+                let target = self.target.clone();
+                // The staging handle stays open through the move: after it,
+                // it refers to the moved file wherever it landed, which is
+                // what the containment check compares against — and what
+                // delete-on-close removes when the check fails.
+                nt::rename_into(&dir, &file, &staging, &target)?;
+                drop(file);
+            }
+            None => {
+                drop(file);
+                std::fs::rename(&self.staging, &self.target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolves `rel`'s parent directory under `root`, one component at a time,
+/// opening each with `O_NOFOLLOW` and creating missing ones (Unix).
+///
+/// The resolution is the enforcement: no component is ever followed, so a
+/// symlink swapped in anywhere along the way — by the local actor with write
+/// access to the space — fails the open instead of redirecting it. The
+/// returned handle is what the staging file is created against and what the
+/// commit rename resolves against.
+#[cfg(unix)]
+fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> {
+    use rustix::fs::OFlags;
+    let mut dir = rustix::fs::open(
+        root,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| {
+        EngineError::invalid(format!(
+            "could not open the space root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    components.pop(); // the file name itself is not resolved, only its parents
+    for component in components {
+        let opened = rustix::fs::openat(
+            &dir,
+            component,
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        match opened {
+            Ok(next) => dir = next,
+            Err(rustix::io::Errno::NOENT) => {
+                // The path-based open creates missing parents; so does this
+                // one, with the same component-by-component no-follow rules
+                // applying to everything after.
+                rustix::fs::mkdirat(&dir, component, rustix::fs::Mode::from_bits_retain(0o777))
+                    .map_err(|e| {
+                        EngineError::invalid(format!(
+                            "could not create the write's parent directory {component}: {e}"
+                        ))
+                    })?;
+                dir = rustix::fs::openat(
+                    &dir,
+                    component,
+                    OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|e| {
+                    EngineError::invalid(format!(
+                        "could not open the write's parent directory {component}: {e}"
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(EngineError::invalid(format!(
+                    "could not open the write's parent directory {component}: {e}"
+                )))
+            }
+        }
+    }
+    Ok(dir)
+}
+
+/// The Windows half of the pinned write: rooted, handle-relative directory
+/// resolution and rename (see [`Adoption::in_space`]).
+///
+/// The user-mode NT functions windows-sys does not carry are declared
+/// directly against ntdll; their ABI is stable and documented (ntifs.h).
+#[cfg(windows)]
+mod nt {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+    use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+
+    use crate::error::{EngineError, Result};
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *const OBJECT_ATTRIBUTES,
+            io_status_block: *mut IO_STATUS_BLOCK,
+            allocation_size: *const i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut core::ffi::c_void,
+            ea_length: u32,
+        ) -> NTSTATUS;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut IO_STATUS_BLOCK,
+            file_information: *const core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> NTSTATUS;
+    }
+
+    #[repr(C)]
+    struct UNICODE_STRING {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct OBJECT_ATTRIBUTES {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *const UNICODE_STRING,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IO_STATUS_BLOCK {
+        status: usize,
+        information: usize,
+    }
+
+    /// `FILE_DISPOSITION_INFORMATION` (ntifs.h): mark a file delete-on-close,
+    /// so the last handle close removes it wherever it actually is — no path
+    /// re-resolution needed to clean up a payload the move redirected.
+    #[repr(C)]
+    struct FILE_DISPOSITION_INFORMATION {
+        delete_file: u8, // BOOLEAN
+    }
+
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const STATUS_SUCCESS: NTSTATUS = 0;
+    const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034u32 as i32;
+    // FileInformationClass values for NtSetInformationFile.
+    const FILE_DISPOSITION_INFORMATION: u32 = 13;
+    // List/read a directory, add files and subdirectories to it, delete
+    // children (what a rename through the root directory needs), and
+    // synchronize on the handle — what the resolution, the staging-file
+    // creation and the commit rename below need.
+    const DIR_ACCESS: u32 =
+        0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0040 | 0x0000_0080 | 0x0010_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
+    /// Resolves `rel`'s parent directory under `root`, one component at a
+    /// time, never following a reparse point; missing components are
+    /// created. The returned handle is what the staging file is created
+    /// against and what the commit rename resolves against.
+    ///
+    /// Both `/` and `\` are separators: the protocol path language knows only
+    /// `/`, but `NtCreateFile` splits on both, so a component containing `\`
+    /// would otherwise be walked by the kernel through components this walk
+    /// never pinned — a junction hiding in one of them could redirect the
+    /// staging file outside the space.
+    pub(super) fn open_parent_no_follow(root: &std::path::Path, rel: &str) -> Result<OwnedHandle> {
+        // The space root itself: opened with `OPEN_REPARSE_POINT` so its own
+        // entry being a junction is refused rather than followed. Its
+        // ancestors lie outside the space, where the threat model grants a
+        // local actor nothing.
+        let mut dir = open_relative(
+            &root_wide(root),
+            None,
+            DIR_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
+                "could not open the space root {}: NTSTATUS {status:#x}",
+                root.display()
+            ))
+        })?;
+        let mut components: Vec<&str> = rel.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+        components.pop(); // the file name itself is not resolved, only its parents
+        for component in components {
+            let next = match create_relative(&dir, component, FILE_OPEN) {
+                Ok(next) => next,
+                Err(status) if status == STATUS_OBJECT_NAME_NOT_FOUND => {
+                    // The path-based open creates missing parents; so does
+                    // this one (`FILE_CREATE` opens the new directory).
+                    create_relative(&dir, component, FILE_CREATE).map_err(|status| {
+                        EngineError::invalid(format!(
+                            "could not create the write's parent directory {component}: \
+                             NTSTATUS {status:#x}"
+                        ))
+                    })?
+                }
+                Err(status) => {
+                    return Err(EngineError::invalid(format!(
+                        "could not open the write's parent directory {component}: \
+                         NTSTATUS {status:#x}"
+                    )))
+                }
+            };
+            dir = next;
+        }
+        Ok(dir)
+    }
+
+    /// The path as a null-terminated Win32 string, for the Win32 APIs — the
+    /// `\\?\` extended form as stored, which they accept verbatim.
+    fn win32_wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// The Win32 path `root` as an absolute NT path (`\??\`-prefixed), for
+    /// the one open that has no parent handle to be relative to.
+    ///
+    /// The space root is stored canonicalized, which on Windows is the
+    /// `\\?\`-prefixed extended-length form — and it may equally arrive as a
+    /// plain drive or UNC path — so all four shapes are mapped:
+    /// `\\?\C:\...` and `C:\...` to `\??\C:\...`, `\\?\UNC\s\sh\...` and
+    /// `\\s\sh\...` to `\??\UNC\s\sh\...`.
+    fn root_wide(root: &std::path::Path) -> Vec<u16> {
+        let text = root.as_os_str().to_string_lossy();
+        let mut out: Vec<u16> = Vec::new();
+        let (prefix, rest) = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            (r"\??\UNC\", rest)
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            (r"\??\", rest)
+        } else if let Some(rest) = text.strip_prefix(r"\\") {
+            (r"\??\UNC\", rest)
+        } else {
+            (r"\??\", text.as_ref())
+        };
+        out.extend_from_slice(prefix.encode_utf16().collect::<Vec<_>>().as_slice());
+        out.extend(rest.encode_utf16());
+        out
+    }
+
+    /// Opens or creates `name` — relative to `root` when it is set, an
+    /// absolute NT path otherwise — with `NtCreateFile`.
+    ///
+    /// Directories are opened with `FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`
+    /// so a junction is never followed.
+    fn open_relative(
+        name: &[u16],
+        root: Option<&OwnedHandle>,
+        access: u32,
+        disposition: u32,
+        create_options: u32,
+    ) -> std::result::Result<OwnedHandle, NTSTATUS> {
+        let unicode = UNICODE_STRING {
+            length: (name.len() * 2) as u16,
+            maximum_length: (name.len() * 2) as u16,
+            buffer: name.as_ptr() as *mut u16,
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            root_directory: root.map_or(std::ptr::null_mut(), |h| h.as_raw_handle() as HANDLE),
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                disposition,
+                create_options,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+    }
+
+    /// Opens or creates `name` inside `dir` as a directory handle, never
+    /// following a reparse point.
+    fn create_relative(
+        dir: &OwnedHandle,
+        name: &str,
+        disposition: u32,
+    ) -> std::result::Result<OwnedHandle, NTSTATUS> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        open_relative(
+            &wide,
+            Some(dir),
+            DIR_ACCESS,
+            disposition,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    }
+
+    /// Creates the staging file inside `dir`, never following a reparse
+    /// point at the name (a pre-placed junction is opened as itself and
+    /// overwritten in place, never followed).
+    pub(super) fn create_staging(dir: &OwnedHandle, name: &str) -> Result<std::fs::File> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        // FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE: read *and* write,
+        // because the payload is written here and a multipart completion
+        // reads it straight back before the rename.
+        // `File::from` takes the handle over from the `OwnedHandle` — one
+        // owner, one close.
+        let handle = open_relative(
+            &wide,
+            Some(dir),
+            0x0012_0089 | 0x0012_0116 | 0x0001_0000,
+            FILE_OVERWRITE_IF,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
+                "could not create the staging file beside {name}: NTSTATUS {status:#x}"
+            ))
+        })?;
+        Ok(std::fs::File::from(handle))
+    }
+
+    /// Renames the staging file to `target` — `MoveFileExW`, the same API
+    /// `std::fs::rename` uses on Windows — followed by a containment check:
+    /// the file that now sits at the intended name must *be* the staging
+    /// file, identified by volume and file index (`GetFileInformationByHandle`),
+    /// which no pathname spelling — case sensitivity, a junction target's
+    /// name — can confound. If the move resolved through a junction swapped
+    /// in by a local actor, the file's actual location differs from the
+    /// intended one; the staging handle still refers to it wherever it is,
+    /// so it is marked delete-on-close there and the write fails closed
+    /// instead of silently landing outside the space.
+    pub(super) fn rename_into(
+        dir: &OwnedHandle,
+        file: &std::fs::File,
+        staging: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<()> {
+        let staging_wide = win32_wide(staging);
+        let target_wide = win32_wide(target);
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                staging_wide.as_ptr(),
+                target_wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING,
+            )
+        };
+        if ok == 0 {
+            // The move could not resolve the staging path — a parent moved
+            // out from under the write by a local actor being the dangerous
+            // case — and the staging handle refers to the payload wherever
+            // it is: mark it delete-on-close so the last close removes it
+            // there, and fail closed.
+            delete_on_close(file);
+            return Err(EngineError::invalid(format!(
+                "rename into place failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let name = target
+            .file_name()
+            .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+        let name_wide: Vec<u16> = name.to_string_lossy().encode_utf16().collect();
+        // The file at the intended name, resolved relative to the pinned
+        // directory — no path is re-resolved. `OPEN_REPARSE_POINT`: a
+        // junction swapped in at the name after the move is opened as
+        // itself, never followed, so it cannot pass the identity check by
+        // pointing back at the payload wherever it landed.
+        let opened = open_relative(
+            &name_wide,
+            Some(dir),
+            0x0000_0080 | 0x0010_0000, // FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        );
+        let contained = match opened {
+            Ok(check) => same_file(&check, file),
+            Err(_) => false,
+        };
+        if contained {
+            return Ok(());
+        }
+        // The move landed somewhere else (or the intended name now holds a
+        // different file): the staging handle refers to the payload wherever
+        // it is — mark it delete-on-close so the last handle close removes
+        // it there, no path re-resolution involved, and fail closed.
+        delete_on_close(file);
+        let actual = final_path(file)
+            .map(|p| String::from_utf16_lossy(&p))
+            .unwrap_or_else(|_| "an unknown location".into());
+        Err(EngineError::invalid(format!(
+            "the rename resolved through a swapped junction to {actual} and was marked for \
+             deletion; the write failed closed"
+        )))
+    }
+
+    /// Whether two open handles refer to the same file on the same volume —
+    /// the file identity, which pathname spelling cannot affect.
+    fn same_file(a: &std::os::windows::io::OwnedHandle, b: &std::fs::File) -> bool {
+        let mut info_a =
+            windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+        let mut info_b =
+            windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                a.as_raw_handle() as HANDLE,
+                &mut info_a,
+            ) != 0
+                && windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                    b.as_raw_handle() as HANDLE,
+                    &mut info_b,
+                ) != 0
+        };
+        ok && info_a.dwVolumeSerialNumber == info_b.dwVolumeSerialNumber
+            && info_a.nFileIndexHigh == info_b.nFileIndexHigh
+            && info_a.nFileIndexLow == info_b.nFileIndexLow
+    }
+
+    /// Marks `file` delete-on-close: the last handle close removes it
+    /// wherever it is on disk, without re-resolving any path.
+    fn delete_on_close(file: &std::fs::File) {
+        let mut info = FILE_DISPOSITION_INFORMATION { delete_file: 1 };
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as HANDLE,
+                &mut status_block,
+                (&mut info as *mut FILE_DISPOSITION_INFORMATION).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                FILE_DISPOSITION_INFORMATION,
+            )
+        };
+        debug_assert_eq!(status, STATUS_SUCCESS);
+    }
+
+    /// The normalized final path of an open handle, as UTF-16 (the
+    /// `\\?\`-prefixed form), or the failure status. Used for diagnostics
+    /// only — the containment verdict is the file identity ([`same_file`]),
+    /// never a pathname comparison.
+    fn final_path(file: &std::fs::File) -> std::result::Result<Vec<u16>, NTSTATUS> {
+        let mut buf = vec![0u16; 4096];
+        let len = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
+                file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                windows_sys::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED,
+            )
+        };
+        if len == 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as NTSTATUS);
+        }
+        buf.truncate(len as usize);
+        Ok(buf)
     }
 }
 
@@ -2052,6 +2856,141 @@ mod tests {
         }
         assert!(node.adoption_target("media", "../evil.txt").is_err());
         assert!(node.adoption_target("media", "/etc/passwd").is_err());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A key with a platform separator inside it (`a\b`) must pin `a` like
+    /// `a/b` does — the kernel's `NtCreateFile` splits on both separators,
+    /// so a component containing `\` handed to it whole would be walked
+    /// through components the pinning walk never resolved. Writing
+    /// `sub\evil.txt` must land at `root/sub/evil.txt` and refuse a junction
+    /// at `sub`, exactly like the `/` form.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_backslash_key_is_pinned_like_a_slash_key() {
+        let (_d, _space, node) = node_with_space().await;
+        let root = PathBuf::from(
+            node.store()
+                .space("media")
+                .unwrap()
+                .unwrap()
+                .local_path
+                .unwrap(),
+        );
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // A junction at `sub` must be refused rather than followed: `sub` is
+        // a real directory, so the write lands at the intended path. (The
+        // junction case itself is covered by `a_swapped_parent_cannot_
+        // redirect_the_commit` on Unix; the Windows CI runs the escape
+        // matrix above.)
+        let mut adoption = node.open_adoption("media", r"sub\evil.txt").unwrap();
+        adoption.write(b"the payload").unwrap();
+        adoption.commit().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("sub").join("evil.txt")).unwrap(),
+            b"the payload"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// The escape guard is not a one-shot check at open: a parent directory
+    /// swapped for a symlink while a body is in flight must not redirect the
+    /// commit outside the space (§9.4). On Linux the rename resolves against
+    /// the directory pinned at open; elsewhere the guard is re-run in the
+    /// same blocking step as the rename.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_swapped_parent_cannot_redirect_the_commit() {
+        let (_d, _space, node) = node_with_space().await;
+        let root = PathBuf::from(
+            node.store()
+                .space("media")
+                .unwrap()
+                .unwrap()
+                .local_path
+                .unwrap(),
+        );
+        let sub = root.join("sub");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Open the write while `sub` is a real directory, then replace it
+        // with a symlink pointing outside the space — the swap a local actor
+        // with write access to the space could perform between the open-time
+        // check and the commit rename. The staging file sits inside `sub`, so
+        // the actor clears it first (unlinking an in-flight staging file is
+        // within the same grant).
+        let adoption = node.open_adoption("media", "sub/escape.txt").unwrap();
+        for entry in std::fs::read_dir(&sub).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        std::fs::remove_dir(&sub).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+        let mut adoption = adoption;
+        adoption.write(b"the payload").unwrap();
+
+        let outcome = adoption.commit();
+        // The write must not land outside the space under any platform: Unix
+        // resolves the parent with `O_NOFOLLOW` at open and renames against
+        // the pinned directory (the staging name was unlinked, so the commit
+        // fails `ENOENT`); Windows re-runs the guard in the same blocking
+        // step as the rename and refuses.
+        assert!(
+            !outside.path().join("escape.txt").exists(),
+            "the commit must not land the object outside the space"
+        );
+        assert!(
+            outcome.is_err(),
+            "the redirected write must not commit as if nothing happened"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// The pinned directory pins an inode, not a place in the tree: a parent
+    /// directory *renamed* — staging file still inside — to another location
+    /// while the body streams takes the commit's `renameat` along with it.
+    /// The post-commit verification must notice the object is not at the
+    /// intended path, remove it where the moved directory actually is, and
+    /// fail the write (§9.4).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_parent_renamed_mid_stream_cannot_redirect_the_commit() {
+        let (_d, _space, node) = node_with_space().await;
+        let root = PathBuf::from(
+            node.store()
+                .space("media")
+                .unwrap()
+                .unwrap()
+                .local_path
+                .unwrap(),
+        );
+        let sub = root.join("sub");
+        let moved = root.join("moved");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Open the write while `sub` is a real directory, then rename the
+        // whole directory — nonempty: the staging file is inside it — to
+        // another location while the body streams, as a local actor with
+        // write access to the space could.
+        let mut adoption = node.open_adoption("media", "sub/escape.txt").unwrap();
+        std::fs::rename(&sub, &moved).unwrap();
+        adoption.write(b"the payload").unwrap();
+
+        let outcome = adoption.commit();
+        assert!(
+            outcome.is_err(),
+            "a commit whose parent moved mid-stream must not succeed"
+        );
+        assert!(
+            !moved.join("escape.txt").exists(),
+            "the object must be removed from where the moved directory took it"
+        );
+        assert!(
+            !sub.join("escape.txt").exists(),
+            "and nothing may appear at the intended path either"
+        );
         node.shutdown().await.unwrap();
     }
 

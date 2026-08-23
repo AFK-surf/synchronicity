@@ -173,6 +173,7 @@ pub fn oauth_state_single_use_test() {
       "http://cp.test/auth/callback/google",
       None,
       None,
+      None,
       100,
     )
   assert string.starts_with(url, "https://auth.example/authorize?")
@@ -192,6 +193,7 @@ pub fn oauth_state_single_use_test() {
       conn,
       provider,
       "http://cp.test/auth/callback/google",
+      None,
       None,
       None,
       100,

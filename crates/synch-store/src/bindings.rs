@@ -611,6 +611,39 @@ impl Store {
         Ok(self.config("local_scope")?.map(|text| decode_spaces(&text)))
     }
 
+    /// The device keys this node holds, for matching delegation records
+    /// against (§3.5): its own origin's key, and every `device_keys` row,
+    /// because a record naming a key mid-rotation still confines the node
+    /// holding it.
+    fn own_keys(&self) -> Result<Vec<NodeId>> {
+        Ok(self
+            .self_origin()?
+            .as_ref()
+            .and_then(|o| o.as_key().copied())
+            .into_iter()
+            .chain(self.device_keys()?.into_iter().map(|k| k.node_id))
+            .collect())
+    }
+
+    /// True when this node holds a live *rooted* binding for one of its own
+    /// keys in an origin other than its own (§5.5).
+    ///
+    /// This is the locally materialized shape of a promotion: the issuer's
+    /// zone names the key as a full member, and the resolver wrote that down
+    /// as a rooted binding. It is what lets the delegate tell "promoted"
+    /// from "grant lapsed next to an operator's local `trust add`" — a peer
+    /// declaration alone cannot, because any rooted binding produces the
+    /// same `Unrestricted` wire value.
+    pub fn own_rooted_in_foreign_origin(&self, now: i64) -> Result<bool> {
+        let own = self.own_keys()?;
+        let self_origin = self.self_origin()?;
+        Ok(self.live_bindings(now)?.into_iter().any(|b| {
+            b.is_rooted()
+                && own.contains(&b.node_id)
+                && self_origin.as_ref().is_none_or(|o| o != &b.origin)
+        }))
+    }
+
     /// The origins that have delegated to *this* node (§3.5); empty if it is
     /// not a delegate.
     ///
@@ -618,19 +651,38 @@ impl Store {
     /// node's — its origin's, and every `device_keys` row, because a record
     /// naming a key mid-rotation still confines the node holding it.
     pub fn own_issuers(&self, now: i64) -> Result<Vec<OriginId>> {
-        let own: Vec<NodeId> = self
-            .self_origin()?
-            .as_ref()
-            .and_then(|o| o.as_key().copied())
-            .into_iter()
-            .chain(self.device_keys()?.into_iter().map(|k| k.node_id))
-            .collect();
+        let own = self.own_keys()?;
         Ok(self
             .live_bindings(now)?
             .into_iter()
             .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
             .filter_map(|b| b.issuer)
             .collect())
+    }
+
+    /// The spaces this node's own live delegations grant it, or `None` when
+    /// no live `d:` record names it (§5.5).
+    ///
+    /// The read scope is derived from this rather than from a peer's
+    /// declaration: the grant is the record every member reads identically
+    /// out of the issuer's trie, so a node's view of itself cannot depend on
+    /// which peer it happens to be talking to — and a peer's word can never
+    /// widen it. `None` covers both the never-a-delegate and the revoked
+    /// states; the caller tells them apart by what it already holds.
+    pub fn own_grant(&self, now: i64) -> Result<Option<Vec<String>>> {
+        let own = self.own_keys()?;
+        let mut spaces: Vec<String> = self
+            .live_bindings(now)?
+            .into_iter()
+            .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+            .flat_map(|b| b.spaces.clone())
+            .collect();
+        if spaces.is_empty() {
+            return Ok(None);
+        }
+        spaces.sort();
+        spaces.dedup();
+        Ok(Some(spaces))
     }
 
     /// Why this node must not pull metadata from `peer`, or `None` if it may
@@ -757,6 +809,32 @@ impl Store {
             }
             Ok(true)
         })
+    }
+
+    /// Realigns the read scope with the live grant, and returns whether it
+    /// moved (§5.5).
+    ///
+    /// The delegate a lapsed grant named is cut off at the connection gate
+    /// the moment its binding dies — no peer's declaration ever reaches it
+    /// again — so the maintenance pass is where the clock drives the derived
+    /// views away: the same destructive move `adopt_scope` makes for a moved
+    /// grant, applied to the one that expired. A grant that expires wholly
+    /// collapses the scope to the empty one; one that expires among several
+    /// narrows the scope to the grants that remain; a grant materialized
+    /// since the last pass widens it. A fresh node (no grant, no confined
+    /// scope) is left alone.
+    pub fn collapse_grantless_scope(&self, now: i64) -> Result<bool> {
+        let grant = self.own_grant(now)?;
+        match (self.local_scope()?, grant) {
+            // A live grant is the authoritative scope: a grant materialized
+            // since the last pass widens, one that shrank narrows.
+            (Some(spaces), Some(grant)) if spaces != grant => self.set_read_scope(Some(&grant)),
+            // No grant left: a confined scope collapses to the empty one —
+            // `m:self` and the `d:` namespace, no file data — not to `None`,
+            // which would read as unrestricted.
+            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope(Some(&[])),
+            _ => Ok(false),
+        }
     }
 
     /// The scope one origin's leaves may be materialized under.

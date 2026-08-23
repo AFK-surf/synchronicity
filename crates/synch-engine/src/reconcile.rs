@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use synch_core::{now_ns, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
+use synch_core::{now_ns, DeclaredScope, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
 use synch_mpt::{Scope, Trie, TrieNode};
 use synch_store::{PublishScope, Slot, Store};
 
@@ -194,7 +194,7 @@ const MAX_REFUSED_HEADS: usize = 1024;
 /// those on the blocking pool — the exchange itself then needs no store at all.
 struct Advertisement {
     summaries: Vec<HeadSummary>,
-    declared: Option<Vec<String>>,
+    declared: DeclaredScope,
     servable: Vec<SignedHead>,
 }
 
@@ -1090,10 +1090,7 @@ impl Syncer {
             let scope = exchange.scope.clone();
             let summaries = exchange.summaries.clone();
             let peer = client.remote_id();
-            crate::blocking::offload(move || {
-                syncer.adopt_scope(peer, scope.as_deref(), &summaries)
-            })
-            .await?;
+            crate::blocking::offload(move || syncer.adopt_scope(peer, &scope, &summaries)).await?;
         }
         {
             let syncer = self.clone();
@@ -1194,22 +1191,17 @@ impl Syncer {
     ///
     /// A store read, so it is only ever called from a blocking scope.
     ///
-    /// `Untrusted` declares nothing rather than an empty list, and the
-    /// difference is the whole point of the distinction. A declaration is not a
-    /// grant — every responder enforces its own scope on every request — so its
-    /// only effect is on how far the *reader* narrows itself. Sending the empty
-    /// list to a peer this node has momentarily lost the binding for tells a
-    /// full member to read nothing, and it remembers that: `set_read_scope`
-    /// outlives the exchange, so one lapsed binding on one side stops the other
-    /// materializing every foreign origin until something declares otherwise.
-    ///
-    /// Declaring nothing is safe in the direction that matters: the peer keeps
-    /// its own view, and every request it then makes is refused by the gate that
-    /// actually decides (`scope_for_key`), which reads the same lapsed binding.
-    fn declared_scope(&self, peer: synch_core::NodeId) -> Result<Option<Vec<String>>> {
+    /// A declaration is not a grant — every responder enforces its own scope on
+    /// every request — so its only effect is on how far the *reader* narrows
+    /// itself. The three-valued shape is deliberate: a peer whose binding has
+    /// momentarily lapsed must not be told the same thing as one promoted to a
+    /// full member, because the reader decides what to do with its own grant
+    /// from exactly that difference.
+    fn declared_scope(&self, peer: synch_core::NodeId) -> Result<DeclaredScope> {
         Ok(match self.store.publish_scope_of_key(&peer, now_ns())? {
-            synch_store::PublishScope::Untrusted | synch_store::PublishScope::Unrestricted => None,
-            synch_store::PublishScope::Confined(spaces) => Some(spaces),
+            synch_store::PublishScope::Untrusted => DeclaredScope::Untrusted,
+            synch_store::PublishScope::Unrestricted => DeclaredScope::Unrestricted,
+            synch_store::PublishScope::Confined(spaces) => DeclaredScope::Confined(spaces),
         })
     }
 
@@ -1221,10 +1213,32 @@ impl Syncer {
     /// the memo goes with it. It is keyed by scope as well as root, so nothing
     /// stale can be read back — this only avoids a table of answers nobody
     /// will ask for again.
+    ///
+    /// A declaration is only ever a bootstrap: once this node's own grant is
+    /// materialized — its `d:` record, which the walk under any scope always
+    /// includes — the read scope is that grant, and nothing a peer says is
+    /// remembered (§5.5). A declaration can therefore never widen what this
+    /// node may read:
+    ///
+    /// - a live grant makes the grant authoritative, whatever the peer says:
+    ///   a peer one head behind the `d:` record, or one whose binding for this
+    ///   node has lapsed, sees no delegation and would otherwise widen the
+    ///   delegate back to the whole keyspace;
+    /// - with no grant, a `Confined` declaration is the bootstrap — the only
+    ///   legitimate way to learn the grant, since the trie it lives in cannot
+    ///   be read before the scope is known;
+    /// - `Unrestricted` with no grant is a promotion to a full member — but
+    ///   only one this node can vouch for itself (a rooted binding for its
+    ///   own key in a foreign origin, the shape a promotion's zone record
+    ///   leaves): any operator's local `trust add` produces the same wire
+    ///   value, and a lapsed grant must not be widened back by it;
+    /// - `Untrusted` with no grant collapses a dead grant (revocation) to the
+    ///   empty scope — `m:self` and the `d:` namespace, no file data — and
+    ///   leaves a fresh node's default `None` alone.
     fn adopt_scope(
         &self,
         peer: synch_core::NodeId,
-        scope: Option<&[String]>,
+        declared: &DeclaredScope,
         summaries: &[synch_core::HeadSummary],
     ) -> Result<()> {
         // And only a peer that holds the trie the grant is published in. A
@@ -1268,7 +1282,7 @@ impl Syncer {
             .into_iter()
             .any(|b| b.node_id == peer && b.is_rooted());
         if !rooted {
-            if scope.is_some() {
+            if *declared != DeclaredScope::Untrusted {
                 tracing::debug!(
                     peer = %peer.fmt_short(),
                     "ignoring a read scope declared by a peer this node has no rooted binding for"
@@ -1276,12 +1290,58 @@ impl Syncer {
             }
             return Ok(());
         }
+        // The effective scope, from the node's own grant and the peer's
+        // declaration — the declaration can only narrow, never widen:
+        // `own_grant` is the `d:` record this node materialized itself, so it
+        // is the freshest truth it holds, and a declaration from a peer whose
+        // view is stale (or hostile) must not reach past it.
+        let own = self.store.own_grant(now_ns())?;
+        let current = self.store.local_scope()?;
+        // A promotion this node can vouch for itself: a rooted binding for
+        // its own key in a foreign origin, the shape a promotion's zone
+        // record leaves in this node's resolver.
+        let promoted = self.store.own_rooted_in_foreign_origin(now_ns())?;
+        let effective: Option<Vec<String>> = match (own, declared) {
+            // The grant is authoritative; a declaration cannot widen it.
+            (Some(grant), _) => Some(grant),
+            // Bootstrap: no grant materialized yet, and a peer that holds one
+            // tells us what the walk is about to find in the trie.
+            (None, DeclaredScope::Confined(spaces)) if current.is_none() => Some(spaces.clone()),
+            // A dead grant must not be re-adopted from a stale declaration;
+            // only a materialized re-grant (a fresh `d:` record, which the
+            // walk always includes) may widen the collapsed scope.
+            (None, DeclaredScope::Confined(_)) => return Ok(()),
+            // Promotion: the peer holds a rooted binding for this node. Only
+            // a binding this node itself materialized may widen it — any
+            // operator's local `trust add` produces the same wire value, and
+            // a delegate whose grant lapsed must not be widened back to the
+            // whole keyspace by one stale rooted view (§5.5).
+            (None, DeclaredScope::Unrestricted) if promoted => None,
+            // Not promoted: the no-binding case. A scope that was confined
+            // collapses to the empty scope — `m:self` and the `d:` namespace,
+            // no file data — while a fresh node's default `None` stays put:
+            // a fresh node is not a delegate until it has replicated the
+            // trie the granting record lives in, and a key-identified node
+            // may equally be an ordinary peer replicating a rooted member in
+            // full (the bootstrap, §5.5).
+            (None, DeclaredScope::Unrestricted)
+                if current.as_ref().is_some_and(|s| !s.is_empty()) =>
+            {
+                Some(Vec::new())
+            }
+            (None, DeclaredScope::Unrestricted) => return Ok(()),
+            // Revocation: the peer holds no binding at all.
+            (None, DeclaredScope::Untrusted) if current.as_ref().is_some_and(|s| !s.is_empty()) => {
+                Some(Vec::new())
+            }
+            (None, DeclaredScope::Untrusted) => return Ok(()),
+        };
         // The one path that moves the scope, and destructive by design (§5.5):
         // everything derived under the old one answers a question nobody is
         // asking any more, and no diff reconciles it.
-        if self.store.set_read_scope(scope)? {
+        if self.store.set_read_scope(effective.as_deref())? {
             tracing::info!(
-                spaces = ?scope,
+                spaces = ?effective,
                 "the read scope moved: every foreign origin will be refetched and rebuilt under it"
             );
             for wake in [&self.on_change, &self.on_replica].into_iter().flatten() {
@@ -1355,8 +1415,7 @@ impl Syncer {
             let scope = theirs.scope.clone();
             let peer = client.remote_id();
             let seen = theirs.summaries.clone();
-            crate::blocking::offload(move || syncer.adopt_scope(peer, scope.as_deref(), &seen))
-                .await?;
+            crate::blocking::offload(move || syncer.adopt_scope(peer, &scope, &seen)).await?;
         }
 
         // Every exchange is also an observation of what peers hold for our own

@@ -13,8 +13,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
-    MAX_BATCH_PATH_BYTES, MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
+    now_ns, BlobAd, DeclaredScope, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead,
+    MAX_BATCH, MAX_BATCH_PATH_BYTES, MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
 };
 use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Store;
@@ -208,14 +208,18 @@ impl MptProtocol {
                     let summaries = sink.local_summaries()?;
                     // What this node will serve that peer, so a delegated one
                     // can learn the scope it is about to walk under (§5.5).
-                    // Untrusted declares nothing, exactly as the dialing side
-                    // does: an empty list would tell a peer whose binding has
-                    // momentarily lapsed to narrow itself to nothing, and it
-                    // would remember that long after the binding came back.
+                    // The three-valued shape is the declaration, not a
+                    // narrowing of it: collapsing `Untrusted` and
+                    // `Unrestricted` into one "nothing" would tell a peer
+                    // whose grant was revoked the same thing as one promoted
+                    // to a full member, and the reader could not tell the two
+                    // apart.
                     let scope = match store.publish_scope_of_key(&peer, now_ns())? {
-                        synch_store::PublishScope::Untrusted
-                        | synch_store::PublishScope::Unrestricted => None,
-                        synch_store::PublishScope::Confined(spaces) => Some(spaces),
+                        synch_store::PublishScope::Untrusted => DeclaredScope::Untrusted,
+                        synch_store::PublishScope::Unrestricted => DeclaredScope::Unrestricted,
+                        synch_store::PublishScope::Confined(spaces) => {
+                            DeclaredScope::Confined(spaces)
+                        }
                     };
                     Ok((summaries, scope))
                 })
@@ -703,8 +707,8 @@ pub struct HeadExchange {
     pub pushed: usize,
     /// The signed heads the peer sent in response to our want list.
     pub received: Vec<SignedHead>,
-    /// The spaces the peer says it will serve us, or `None` for everything.
-    pub scope: Option<Vec<String>>,
+    /// What the peer says it will serve us (§5.5).
+    pub scope: DeclaredScope,
 }
 
 /// A client for the `sync/mpt/1` ALPN, over one established connection.
@@ -749,7 +753,7 @@ impl MptClient {
     pub async fn head_exchange<F>(
         &self,
         ours: Vec<HeadSummary>,
-        declared: Option<Vec<String>>,
+        declared: DeclaredScope,
         decide: F,
     ) -> Result<HeadExchange, NetError>
     where
@@ -1055,7 +1059,10 @@ mod tests {
             stalled!("get_bindings", client.get_bindings(&origin)),
             stalled!(
                 "head_exchange",
-                client.head_exchange(Vec::new(), None, |_| (Vec::new(), Vec::new()))
+                client.head_exchange(Vec::new(), DeclaredScope::Untrusted, |_| (
+                    Vec::new(),
+                    Vec::new()
+                ))
             ),
         ];
         for (what, outcome) in stalled {
@@ -1166,7 +1173,9 @@ mod tests {
             .connect_mpt(server.direct_addr())
             .await
             .unwrap()
-            .head_exchange(Vec::new(), None, move |_| (pushed, vec![served.clone()]))
+            .head_exchange(Vec::new(), DeclaredScope::Untrusted, move |_| {
+                (pushed, vec![served.clone()])
+            })
             .await
             .expect("the exchange completes");
 

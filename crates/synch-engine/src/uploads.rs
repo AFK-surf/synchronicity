@@ -426,6 +426,11 @@ impl Node {
             let (node, space_owned, path_owned) =
                 (self.clone(), space.to_string(), path.to_string());
             let assembled = crate::blocking::offload(move || {
+                // The space-validated open: the escape check runs at open and
+                // the commit rename resolves against the directory pinned
+                // then (or re-checks the guard, where there are no directory
+                // handles), so the assembly streaming in between cannot be
+                // redirected outside the space.
                 let mut adoption = if detached {
                     Adoption::at(&assembled_target)?
                 } else {
