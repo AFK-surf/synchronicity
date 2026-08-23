@@ -1987,8 +1987,9 @@ mod nt {
         // The containment check: the file must now be at the intended path.
         // A junction swapped in by a local actor resolves the move elsewhere,
         // and the file is removed there rather than left behind outside the
-        // space.
-        let intended = root_wide(target);
+        // space. The intended path is the stored Win32 form (the `\\?\`
+        // extended path, exactly what GetFinalPathNameByHandle returns).
+        let intended: Vec<u16> = target.as_os_str().encode_wide().collect();
         let name = target
             .file_name()
             .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
