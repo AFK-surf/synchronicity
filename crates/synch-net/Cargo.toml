@@ -39,6 +39,9 @@ serde_json.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
 synch-store.workspace = true
+synch-sock.workspace = true
+
+async-trait.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

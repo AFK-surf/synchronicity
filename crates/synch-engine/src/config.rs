@@ -18,6 +18,14 @@ pub fn default_data_dir() -> Result<PathBuf> {
 pub struct NodeConfig {
     /// The data directory holding the database and the CAS.
     pub data_dir: PathBuf,
+    /// How many socket worker threads to run (`docs/SOCKETS.md` §5.1).
+    ///
+    /// Dedicated OS threads, because async-ebpf's `Program` is neither `Send`
+    /// nor `Sync` — a guest suspends inside a signal handler — so an
+    /// invocation is placed on a worker and stays there. Zero is rounded up to
+    /// one by the pool: a pool that exists and can run nothing would surface as
+    /// a hang rather than an error.
+    pub socket_workers: usize,
     /// OpenDAL cloud CAS settings. `None` selects the local filesystem CAS.
     pub cloud: Option<synch_store::cloud::CloudConfig>,
     /// How the endpoint is bound.
@@ -128,6 +136,9 @@ impl NodeConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         NodeConfig {
             data_dir: data_dir.into(),
+            socket_workers: std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(1),
             cloud: None,
             net: NetOptions::default(),
             aae_interval: Duration::from_secs(30),

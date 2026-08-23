@@ -236,6 +236,56 @@ impl Store {
         self.transaction(|txn| txn.arm_socket(space, path, root, declared, armed_at))
     }
 
+    /// What a device key may reach over `sync/sock/1`, and who it speaks for.
+    ///
+    /// Three answers, and the caller acts differently on each:
+    ///
+    /// * `None` — no live binding. Not a peer at all; refused at accept, and
+    ///   refused again here because a binding can lapse mid-connection.
+    /// * `Some((origin, None))` — a rooted member, unrestricted by construction.
+    /// * `Some((origin, Some(spaces)))` — a delegate, and the spaces its live
+    ///   delegations name.
+    ///
+    /// Deliberately its own query rather than a reuse of
+    /// [`scope_for_key`](Store::scope_for_key), which answers in trie-key
+    /// prefixes. A socket needs space *names* — to compare against the `Open`,
+    /// and to hand `sy_peer_has_space` something a program can ask about — and
+    /// deriving names back out of prefixes would be reconstructing what this
+    /// read already has.
+    pub fn socket_scope_for_key(
+        &self,
+        node_id: &synch_core::NodeId,
+        now: i64,
+    ) -> Result<Option<(synch_core::OriginId, Option<Vec<String>>)>> {
+        let live: Vec<crate::bindings::Binding> = self
+            .live_bindings(now)?
+            .into_iter()
+            .filter(|b| &b.node_id == node_id)
+            .collect();
+        let Some(first) = live.first() else {
+            return Ok(None);
+        };
+        // A key bound to several origins speaks for the rooted one where there
+        // is one: that is the binding that makes it unrestricted, and picking
+        // a delegated origin beside it would name the caller by the narrower
+        // grant while treating it as the wider one.
+        let origin = live
+            .iter()
+            .find(|b| b.is_rooted())
+            .unwrap_or(first)
+            .origin
+            .clone();
+        if live.iter().any(|b| b.is_rooted()) {
+            return Ok(Some((origin, None)));
+        }
+        // Two rooted origins may delegate the same key independently, so their
+        // grants add rather than conflict.
+        let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
+        spaces.sort();
+        spaces.dedup();
+        Ok(Some((origin, Some(spaces))))
+    }
+
     /// Withdraws an approval, leaving the declaration standing.
     pub fn disarm_socket(&self, space: &str, path: &str) -> Result<bool> {
         let n = self.conn().execute(

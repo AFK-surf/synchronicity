@@ -118,6 +118,14 @@ pub struct NetOptions {
     /// answers on a public address, where the gain is real: peers dial it
     /// straight, without a relay round trip. Ignored unless `dht`.
     pub dht_publish_direct_addrs: bool,
+    /// The socket service, mounted as `sync/sock/1` when present
+    /// (`docs/SOCKETS.md` §4).
+    ///
+    /// Absent means the ALPN is not offered at all, which is the right shape
+    /// for a node that serves no sockets: a peer's dial fails at ALPN
+    /// negotiation rather than after a handshake and a refusal, and a build
+    /// with no eBPF runtime never advertises something it cannot do.
+    pub sockets: Option<Arc<dyn crate::sock::SocketService>>,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -146,6 +154,7 @@ impl NetOptions {
             dht_publish_direct_addrs: false,
             on_unknown_key: None,
             heads: None,
+            sockets: None,
         }
     }
 }
@@ -322,7 +331,13 @@ impl Net {
                 .map_err(|e| NetError::Endpoint(e.to_string()))?;
         }
         let endpoint = builder
-            .alpns(vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()])
+            .alpns({
+                let mut alpns = vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()];
+                if options.sockets.is_some() {
+                    alpns.push(synch_core::ALPN_SOCK.to_vec());
+                }
+                alpns
+            })
             .bind()
             .await
             .map_err(|e| {
@@ -358,8 +373,16 @@ impl Net {
                     }),
                 )
                 .on_unknown_key(options.on_unknown_key.clone()),
-            )
-            .spawn();
+            );
+        let router = match options.sockets.clone() {
+            Some(service) => router.accept(
+                synch_core::ALPN_SOCK,
+                crate::sock::SockProtocol::new(store.clone(), service)
+                    .on_unknown_key(options.on_unknown_key.clone()),
+            ),
+            None => router,
+        };
+        let router = router.spawn();
 
         Ok(Net {
             router,

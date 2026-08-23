@@ -53,6 +53,17 @@ pub struct Node {
     inner: Arc<NodeInner>,
 }
 
+/// A non-owning handle onto a [`Node`]. See [`Node::downgrade`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WeakNode(std::sync::Weak<NodeInner>);
+
+impl WeakNode {
+    /// The node, if it is still open.
+    pub(crate) fn upgrade(&self) -> Option<Node> {
+        self.0.upgrade().map(|inner| Node { inner })
+    }
+}
+
 #[derive(Debug)]
 struct NodeInner {
     store: Arc<Store>,
@@ -90,6 +101,13 @@ struct NodeInner {
     /// skip re-hashing every file it has already written or read
     /// (`docs/DELTA-SYNC.md` §3.5).
     mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
+    /// The socket worker pool, or `None` where this build has no eBPF runtime
+    /// (`docs/SOCKETS.md` §5.1).
+    ///
+    /// Started with the node rather than lazily on the first connection: it
+    /// installs process-wide SIGUSR1 and SIGSEGV handlers, and that is a thing
+    /// to do while starting up rather than while serving.
+    sockets: Option<crate::sockets::SocketPool>,
     /// When each configured membership domain is next due for re-resolution,
     /// and when it was last attempted (§3.2, §3.4).
     dns: std::sync::Mutex<std::collections::HashMap<String, crate::membership::DomainSchedule>>,
@@ -680,6 +698,17 @@ impl Node {
             _ => Arc::new(synch_store::backend::LocalFs::new(store.clone())),
         };
         config.net.cas = Some(cas.clone());
+        // Mounted only where there is a runtime to serve it: a peer's dial then
+        // fails at ALPN negotiation rather than after a handshake and a
+        // refusal, and a build that cannot run a program never advertises that
+        // it can (`docs/SOCKETS.md` §5.1).
+        let socket_workers = config.socket_workers;
+        let socket_pool =
+            crate::sockets::SocketPool::start(socket_workers, crate::sockets::default_limits());
+        let dispatch = crate::sockets::SocketDispatch::new();
+        if socket_pool.is_some() {
+            config.net.sockets = Some(Arc::new(dispatch.clone()));
+        }
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
@@ -696,6 +725,7 @@ impl Node {
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
+                sockets: socket_pool,
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
@@ -708,6 +738,12 @@ impl Node {
                 cloud: std::sync::Mutex::new(Default::default()),
             }),
         };
+        // The handler was mounted on the endpoint before the node existed;
+        // this is where it learns what it dispatches to. Done before anything
+        // else that can await, so the window in which a connection finds it
+        // unbound is as short as construction allows.
+        dispatch.bind(&node);
+
         // A batch that was still buffered when the process died was never
         // published, and the scanner would skip those files forever (§7.1).
         // Opening is where that is noticed and undone — one trie lookup per
@@ -725,6 +761,18 @@ impl Node {
         Ok(node)
     }
 
+    /// A non-owning handle onto this node.
+    ///
+    /// What the socket dispatcher holds. It cannot hold a `Node`: the node owns
+    /// the endpoint, the endpoint's router owns the socket protocol handler,
+    /// and the handler owns the dispatcher — so a strong reference there is a
+    /// cycle, and every node ever opened would stay alive with its database
+    /// open. That is not a leak you notice until something reopens the same
+    /// data directory.
+    pub(crate) fn downgrade(&self) -> WeakNode {
+        WeakNode(Arc::downgrade(&self.inner))
+    }
+
     /// The metadata and content store.
     pub fn store(&self) -> &Arc<Store> {
         &self.inner.store
@@ -733,6 +781,45 @@ impl Node {
     /// The configured async CAS backend.
     pub fn cas_backend(&self) -> &Arc<dyn synch_store::backend::CasBackend> {
         &self.inner.cas
+    }
+
+    /// The socket worker pool, or `None` where this build serves no sockets.
+    pub(crate) fn socket_workers(&self) -> Option<&crate::sockets::SocketPool> {
+        self.inner.sockets.as_ref()
+    }
+
+    /// The limits every socket invocation on this node runs under.
+    pub(crate) fn socket_limits(&self) -> synch_sock::Limits {
+        match &self.inner.sockets {
+            Some(pool) => pool.limits(),
+            None => crate::sockets::default_limits(),
+        }
+    }
+
+    /// The next invocation id, as `synch socket ps` prints it.
+    pub(crate) fn next_socket_id(&self) -> u64 {
+        self.inner
+            .sockets
+            .as_ref()
+            .map(|p| p.next_id())
+            .unwrap_or(0)
+    }
+
+    /// Drops everything one socket's map held.
+    pub(crate) fn clear_socket_map(&self, socket: &str) {
+        if let Some(pool) = &self.inner.sockets {
+            pool.clear_map(socket);
+        }
+    }
+
+    /// Runs a program's declaration hook, off the runtime.
+    ///
+    /// Offloaded because it JIT-compiles: the hook itself does nothing, but
+    /// forcing compilation early is half the point of running it, and that is
+    /// real CPU on a thread the reactor is not waiting for.
+    pub(crate) fn declare_program(&self, elf: &[u8]) -> Result<synch_core::Declaration> {
+        let host: Arc<dyn synch_sock::SocketHost> = Arc::new(crate::sockets::NoTree);
+        crate::sockets::declare_blocking(elf, host)
     }
 
     /// The batch between staging and one signed root (§7.1).

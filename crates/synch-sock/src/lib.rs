@@ -157,6 +157,64 @@ pub struct ObjectInfo {
     pub kind: u32,
 }
 
+/// A resolved, authorized invocation that has not been given its stream yet.
+///
+/// The split exists because the two halves happen in different places. The
+/// network layer resolves and authorizes an `Open` *before* it answers it —
+/// the reply says which content root is about to run — and only then does the
+/// stream it is holding become the guest's `SY_SELF`. Carrying an admission
+/// between those two moments keeps the network layer from having to know what
+/// an invocation is made of.
+pub struct Admission {
+    /// The ELF object to run — read from *this node's own* CAS.
+    pub program: Arc<Vec<u8>>,
+    /// Its content root, which is what was armed.
+    pub program_root: Hash,
+    /// Which socket this is.
+    pub socket: SocketId,
+    /// Who is calling, as the handshake established it.
+    pub peer: PeerIdentity,
+    /// What this invocation may do.
+    pub policy: EffectivePolicy,
+    /// The caller's `--meta`. Untrusted.
+    pub meta: Vec<(String, String)>,
+    /// This node's own origin, for `sy_self_origin`.
+    pub self_origin: OriginId,
+    /// The tree, for the `sy_open` family.
+    pub host: Arc<dyn SocketHost>,
+    /// The invocation id, as `synch socket ps` prints it.
+    pub id: u64,
+}
+
+impl Admission {
+    /// Attaches the stream the guest will see as `SY_SELF`.
+    pub fn with_stream(self, stream: DuplexStream) -> Invocation {
+        Invocation {
+            program: self.program,
+            program_root: self.program_root,
+            socket: self.socket,
+            peer: self.peer,
+            policy: self.policy,
+            meta: self.meta,
+            stream,
+            self_origin: self.self_origin,
+            host: self.host,
+            id: self.id,
+        }
+    }
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admission")
+            .field("id", &self.id)
+            .field("socket", &self.socket)
+            .field("program_root", &self.program_root)
+            .field("peer", &self.peer.origin)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One incoming stream, ready to become an invocation.
 pub struct Invocation {
     /// The ELF object to run — read from *this node's own* CAS.

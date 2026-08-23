@@ -379,9 +379,23 @@ impl Node {
             .and_then(|e| e.content);
         // `prev` records one-step lineage so a UI can tell "adopted theirs on
         // top of X" from "changed independently" (§8).
-        let mut entry = FileEntry::file(size, mtime_ns, content, seq);
+        // The kind comes from a *local* declaration, never from a peer
+        // (`docs/SOCKETS.md` §2.2). That is what makes `synch take` of
+        // someone's socket adopt its bytes and not its socket-ness: this node
+        // publishes what it has declared, and it has declared nothing about a
+        // path it merely received.
+        let declared_socket = self.store().is_declared_socket(space_id, rel)?;
+        let mut entry = if declared_socket {
+            FileEntry::socket(size, mtime_ns, content, seq)
+        } else {
+            FileEntry::file(size, mtime_ns, content, seq)
+        };
         entry.prev = previous.filter(|p| *p != content);
         entry.unix_mode = unix_mode(&metadata);
+
+        if declared_socket {
+            self.follow_socket_content(space_id, rel, &content)?;
+        }
 
         report.staged.push((
             file_key(space_id, rel)?,

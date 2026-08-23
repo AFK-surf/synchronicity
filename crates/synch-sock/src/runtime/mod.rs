@@ -427,6 +427,22 @@ fn classify(message: &str) -> FaultKind {
 /// compile would otherwise surface that on the first stream that reaches the
 /// bad path — a long way from the operator who armed it.
 pub fn declare(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declaration, SockError> {
+    // Its own thread, for two reasons that point the same way. A `Program` is
+    // pinned to the thread that loaded it, so a declaration run needs a thread
+    // it can have to itself; and the runtime it needs cannot be *dropped*
+    // inside an async context, which is where an arm or a scan calls this from.
+    // A thread costs nothing here: this runs when an operator arms a socket,
+    // not when a peer connects.
+    let elf = elf.to_vec();
+    std::thread::Builder::new()
+        .name("synch-sock-declare".into())
+        .spawn(move || declare_here(&elf, host))
+        .map_err(|e| SockError::Load(e.to_string()))?
+        .join()
+        .map_err(|_| SockError::Fault("the declaration hook panicked".into()))?
+}
+
+fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declaration, SockError> {
     let global = global_env();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

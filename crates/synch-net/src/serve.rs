@@ -129,7 +129,7 @@ where
 /// A failure to reach the store is not a grant: anything but a definite `true`
 /// closes the connection, which is the same fail-closed reading the inline
 /// version had.
-async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
+pub(crate) async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
     let store = store.clone();
     let remote = *remote;
     let answer: Result<bool, crate::error::NetError> =
