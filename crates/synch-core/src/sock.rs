@@ -235,8 +235,7 @@ impl SockOpen {
         if self.v != SOCK_PROTO_VERSION {
             return Err(OpenError::Version(self.v));
         }
-        crate::record::validate_space(&self.space)
-            .map_err(|e| OpenError::Space(format!("{e}")))?;
+        crate::record::validate_space(&self.space).map_err(|e| OpenError::Space(format!("{e}")))?;
         crate::path::normalize_path(&self.path).map_err(|e| OpenError::Path(format!("{e}")))?;
         if self.meta.len() > MAX_OPEN_META_PAIRS {
             return Err(OpenError::Meta("too many pairs"));
@@ -257,6 +256,144 @@ impl SockOpen {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The most destinations one program may declare.
+pub const MAX_DECLARED_EGRESS: usize = 32;
+
+/// The most tree-read prefixes one program may declare.
+pub const MAX_DECLARED_TREE_READS: usize = 32;
+
+/// What a program's `synchronicity.init` hook said about itself
+/// (`docs/SOCKETS.md` §3.1).
+///
+/// The point of the hook is that an approval which says only "these bytes are
+/// fine" asks the operator to read eBPF. This is the list they are shown
+/// instead. It is compiled into the object, so editing it changes the content
+/// root, which disarms the socket: a program cannot widen its own reach
+/// without a fresh approval.
+///
+/// Runtime policy is the **intersection** of this and the operator's own list.
+/// Neither side can widen it alone, and egress that nobody declared is denied —
+/// which is the same answer as egress nobody allowed, and the right one either
+/// way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declaration {
+    /// A human name, for `synch socket ls` and `synch socket ps`.
+    pub name: String,
+    /// Destinations, as `host` or `host:port`. A bare host is any port on it.
+    pub egress: Vec<String>,
+    /// Path prefixes the program intends to read from other origins' views.
+    pub tree_reads: Vec<String>,
+    /// A self-imposed concurrency cap, intersected with the operator's.
+    pub max_streams: Option<u32>,
+}
+
+impl Declaration {
+    /// Renders the declaration as the stable text an approval is stored as.
+    ///
+    /// Line-oriented and sorted within each kind, so two runs of the same hook
+    /// produce the same text and `synch socket ls` can diff what was approved
+    /// against what is claimed now without the diff being an artifact of
+    /// ordering.
+    pub fn render(&self) -> String {
+        let mut out = Vec::new();
+        if !self.name.is_empty() {
+            out.push(format!("name {}", self.name));
+        }
+        let mut egress = self.egress.clone();
+        egress.sort();
+        egress.dedup();
+        for host in egress {
+            out.push(format!("egress {host}"));
+        }
+        let mut reads = self.tree_reads.clone();
+        reads.sort();
+        reads.dedup();
+        for prefix in reads {
+            out.push(format!("tree-read {prefix}"));
+        }
+        if let Some(n) = self.max_streams {
+            out.push(format!("max-streams {n}"));
+        }
+        out.join("\n")
+    }
+
+    /// Parses what [`Declaration::render`] wrote.
+    ///
+    /// Unknown directives are kept out of the parsed result rather than
+    /// refused: an approval stored by a later build must still be *readable* by
+    /// this one, and what it cannot understand it must not silently treat as
+    /// permission.
+    pub fn parse(text: &str) -> Declaration {
+        let mut out = Declaration::default();
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match line.split_once(' ') {
+                Some(("name", v)) => out.name = v.to_string(),
+                Some(("egress", v)) if out.egress.len() < MAX_DECLARED_EGRESS => {
+                    out.egress.push(v.to_string())
+                }
+                Some(("tree-read", v)) if out.tree_reads.len() < MAX_DECLARED_TREE_READS => {
+                    out.tree_reads.push(v.to_string())
+                }
+                Some(("max-streams", v)) => out.max_streams = v.parse().ok(),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Whether the program declared an intent to reach `host` on `port`.
+    pub fn egress_declared(&self, host: &str, port: u16) -> bool {
+        self.egress
+            .iter()
+            .any(|rule| egress_rule_matches(rule, host, port))
+    }
+
+    /// Whether the program declared an intent to read `path`.
+    pub fn tree_read_declared(&self, path: &str) -> bool {
+        self.tree_reads
+            .iter()
+            .any(|prefix| path_prefix_matches(prefix, path))
+    }
+}
+
+/// True if an `allow-egress` or `declare-egress` rule admits `host:port`.
+///
+/// A rule is `host` or `host:port`. Host comparison is ASCII-case-insensitive
+/// because DNS is, and exact otherwise: no wildcards, no suffix matching. A
+/// rule admitting `*.internal` would be a rule whose blast radius changes when
+/// somebody else registers a name, and these lists are short by construction.
+pub fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
+    // Split from the right, and only when what follows is digits: an IPv6
+    // literal is written `[::1]:9418`, and splitting from the left would cut it
+    // at the first colon of the address itself.
+    let (rule_host, rule_port) = match rule.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) => {
+            (h, p.parse::<u16>().ok())
+        }
+        _ => (rule, None),
+    };
+    let strip = |s: &str| s.trim_matches(['[', ']']).to_string();
+    strip(rule_host).eq_ignore_ascii_case(&strip(host))
+        && rule_port.is_none_or(|declared| declared == port)
+}
+
+/// True if a tree-read prefix admits `path`.
+///
+/// Boundary-aware: `code` admits `code` and `code/x`, and does not admit
+/// `codex/secret`. A plain `starts_with` would, which is the difference between
+/// naming a directory and naming a string.
+pub fn path_prefix_matches(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -285,11 +422,7 @@ where
         where
             A: serde::de::SeqAccess<'de>,
         {
-            let mut out = Vec::with_capacity(
-                seq.size_hint()
-                    .unwrap_or(0)
-                    .min(MAX_OPEN_META_PAIRS),
-            );
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_OPEN_META_PAIRS));
             while let Some(pair) = seq.next_element::<(String, String)>()? {
                 if out.len() < MAX_OPEN_META_PAIRS {
                     out.push(pair);
@@ -444,6 +577,98 @@ mod tests {
         .unwrap();
         let decoded: SockOpen = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.meta.len(), MAX_OPEN_META_PAIRS);
+    }
+
+    #[test]
+    fn egress_rules_match_host_and_port_exactly() {
+        assert!(egress_rule_matches(
+            "git.internal:9418",
+            "git.internal",
+            9418
+        ));
+        assert!(
+            !egress_rule_matches("git.internal:9418", "git.internal", 22),
+            "a declared port was ignored"
+        );
+        // A bare host allows any port on it.
+        assert!(egress_rule_matches(
+            "cache.internal",
+            "cache.internal",
+            6379
+        ));
+        assert!(
+            egress_rule_matches("CACHE.INTERNAL", "cache.internal", 80),
+            "DNS is case-insensitive and this comparison is not"
+        );
+        // No suffix matching: a rule whose reach changes when somebody else
+        // registers a name is not a rule.
+        assert!(!egress_rule_matches(
+            "git.internal",
+            "evil-git.internal",
+            80
+        ));
+        assert!(!egress_rule_matches(
+            "git.internal",
+            "git.internal.evil",
+            80
+        ));
+    }
+
+    #[test]
+    fn an_ipv6_literal_rule_is_not_cut_at_its_first_colon() {
+        assert!(egress_rule_matches("[::1]:9418", "::1", 9418));
+        assert!(!egress_rule_matches("[::1]:9418", "::1", 9419));
+        assert!(egress_rule_matches("[fe80::1]", "fe80::1", 443));
+    }
+
+    #[test]
+    fn tree_read_prefixes_stop_at_a_path_boundary() {
+        assert!(path_prefix_matches("code/pub", "code/pub"));
+        assert!(path_prefix_matches("code/pub", "code/pub/readme"));
+        assert!(
+            !path_prefix_matches("code/pub", "code/public-secrets"),
+            "a prefix matched across a path boundary"
+        );
+        assert!(!path_prefix_matches("code/pub", "code"));
+    }
+
+    #[test]
+    fn a_declaration_round_trips_through_its_stored_text() {
+        let d = Declaration {
+            name: "git-http".into(),
+            egress: vec!["git.internal:9418".into(), "cache.internal".into()],
+            tree_reads: vec!["code".into()],
+            max_streams: Some(32),
+        };
+        let parsed = Declaration::parse(&d.render());
+        // `render` sorts, so compare against a sorted original rather than
+        // asserting an ordering the renderer deliberately does not preserve.
+        let mut expected = d.clone();
+        expected.egress.sort();
+        assert_eq!(parsed, expected);
+        assert_eq!(
+            parsed.render(),
+            d.render(),
+            "rendering is not stable across a round trip"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directive_is_not_read_as_permission() {
+        // An approval written by a later build must stay readable, and what
+        // this build cannot understand it must not treat as a grant.
+        let parsed = Declaration::parse("name x\nudp-egress anywhere:53\negress git:9418");
+        assert_eq!(parsed.egress, vec!["git:9418".to_string()]);
+        assert!(!parsed.egress_declared("anywhere", 53));
+    }
+
+    #[test]
+    fn a_declaration_cannot_grow_past_its_bounds_through_its_text() {
+        let text = (0..MAX_DECLARED_EGRESS * 4)
+            .map(|i| format!("egress h{i}.example:80"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(Declaration::parse(&text).egress.len(), MAX_DECLARED_EGRESS);
     }
 
     #[test]

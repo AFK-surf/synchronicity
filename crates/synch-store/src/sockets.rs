@@ -96,14 +96,14 @@ impl SocketRow {
     pub fn egress_allowed(&self, host: &str, port: u16) -> bool {
         self.allow_egress
             .iter()
-            .any(|rule| egress_rule_matches(rule, host, port))
+            .any(|rule| synch_core::sock::egress_rule_matches(rule, host, port))
     }
 
     /// Whether this declaration permits reading `path` from another origin.
     pub fn tree_read_allowed(&self, path: &str) -> bool {
         self.allow_tree_read
             .iter()
-            .any(|prefix| path_prefix_matches(prefix, path))
+            .any(|prefix| synch_core::sock::path_prefix_matches(prefix, path))
     }
 
     /// The value of a config key, if the operator set one.
@@ -112,42 +112,6 @@ impl SocketRow {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
-    }
-}
-
-/// True if an `allow-egress` rule admits `host:port`.
-///
-/// A rule is `host` or `host:port`. Host comparison is ASCII-case-insensitive
-/// because DNS is, and exact otherwise: no wildcards, no suffix matching. A
-/// rule that admitted `*.internal` would be a rule whose blast radius changes
-/// when somebody else registers a name, and the list is short by construction.
-fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
-    // Split from the right: an IPv6 literal is written `[::1]:9418`, and
-    // splitting from the left would cut it at the first colon of the address.
-    let (rule_host, rule_port) = match rule.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h, p.parse::<u16>().ok())
-        }
-        _ => (rule, None),
-    };
-    let host_matches = rule_host.trim_matches(['[', ']']).eq_ignore_ascii_case(host.trim_matches(['[', ']']));
-    host_matches && rule_port.is_none_or(|p| p == port)
-}
-
-/// True if a `allow-tree-read` prefix admits `path`.
-///
-/// Boundary-aware: `code` admits `code/x` and `code` itself, and does not admit
-/// `codex/secret`. A plain `starts_with` would, which is the difference between
-/// naming a directory and naming a string.
-fn path_prefix_matches(prefix: &str, path: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    match path.strip_prefix(prefix) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/'),
-        None => false,
     }
 }
 
@@ -356,13 +320,7 @@ impl Txn<'_> {
                root = excluded.root,
                declared = excluded.declared,
                armed_at = excluded.armed_at",
-            params![
-                space,
-                path,
-                root.as_bytes().to_vec(),
-                declared,
-                armed_at
-            ],
+            params![space, path, root.as_bytes().to_vec(), declared, armed_at],
         )?;
         Ok(())
     }
@@ -547,7 +505,10 @@ mod tests {
         assert!(!r.egress_allowed("git.internal", 22), "a port was ignored");
         // A bare host allows any port on it.
         assert!(r.egress_allowed("cache.internal", 6379));
-        assert!(r.egress_allowed("CACHE.INTERNAL", 80), "DNS is case-insensitive");
+        assert!(
+            r.egress_allowed("CACHE.INTERNAL", 80),
+            "DNS is case-insensitive"
+        );
         // No suffix matching: a rule whose reach changes when somebody else
         // registers a name is not a rule.
         assert!(!r.egress_allowed("evil-git.internal", 9418));
