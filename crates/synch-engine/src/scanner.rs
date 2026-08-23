@@ -1774,10 +1774,12 @@ mod nt {
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     const STATUS_SUCCESS: NTSTATUS = 0;
     const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034u32 as i32;
-    // List/read a directory, add files and subdirectories to it, and
-    // synchronize on the handle — what the resolution and the staging-file
-    // creation below need.
-    const DIR_ACCESS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0080 | 0x0010_0000;
+    // List/read a directory, add files and subdirectories to it, delete
+    // children (what a rename through the root directory needs), and
+    // synchronize on the handle — what the resolution, the staging-file
+    // creation and the commit rename below need.
+    const DIR_ACCESS: u32 =
+        0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0040 | 0x0000_0080 | 0x0010_0000;
     const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
     /// Resolves `rel`'s parent directory under `root`, one component at a
@@ -1906,13 +1908,15 @@ mod nt {
             status: 0,
             information: 0,
         };
-        // FILE_GENERIC_READ | FILE_GENERIC_WRITE: read *and* write, because
-        // the payload is written here and a multipart completion reads it
-        // straight back before the rename.
+        // FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE: read *and* write,
+        // because the payload is written here and a multipart completion
+        // reads it straight back before the rename — and DELETE, because the
+        // commit renames the open file and `FileRenameInformation` needs it
+        // on the file handle.
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                0x0012_0089 | 0x0012_0116,
+                0x0012_0089 | 0x0012_0116 | 0x0001_0000,
                 &attributes,
                 &mut status_block,
                 std::ptr::null(),
