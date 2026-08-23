@@ -772,10 +772,10 @@ impl Node {
         // is refused before anything is fetched. It reads the space row, so it
         // goes to the blocking pool like every other store read on an async
         // path (§10).
-        let target = {
+        {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
-        };
+            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?;
+        }
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
         // The write lands through the space-validated adoption: the target's
         // parent directory is resolved component by component at open and the
@@ -786,18 +786,33 @@ impl Node {
         // The object materializes into a daemon-owned staging file first —
         // the data dir is not attacker-writable — then the adoption clones it
         // into the pinned directory (`FICLONE` where the filesystem shares
-        // extents, a copy elsewhere).
-        let staged = self.store().staging_dir().join(format!(
-            "take-{}-{}.payload",
-            std::process::id(),
-            now_ns()
-        ));
+        // extents, a copy elsewhere). Everything after the fetch is store
+        // reads and file I/O, so it goes to the blocking pool like the fetch's
+        // own halves (§10).
+        let staged = {
+            let node = self.clone();
+            crate::blocking::offload(move || {
+                Ok(node.store().staging_dir().join(format!(
+                    "take-{}-{}.payload",
+                    std::process::id(),
+                    now_ns()
+                )))
+            })
+            .await?
+        };
         self.materialize_blob(&range.root, range.size, staged.clone())
             .await?;
-        let mut adoption = Adoption::into_space(self, space_id, path)?;
-        adoption.clone_from(&staged)?;
-        let _ = std::fs::remove_file(&staged);
-        adoption.commit()?;
+        let target = {
+            let (node, space_id, path, staged) =
+                (self.clone(), space_id.to_string(), path.to_string(), staged);
+            crate::blocking::offload(move || {
+                let mut adoption = Adoption::into_space(&node, &space_id, &path)?;
+                adoption.clone_from(&staged)?;
+                let _ = std::fs::remove_file(&staged);
+                adoption.commit()
+            })
+            .await?
+        };
         Ok(target)
     }
 
