@@ -1619,11 +1619,16 @@ impl Adoption {
     fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
         match self.parent.take() {
             Some(dir) => {
+                let staging = self
+                    .staging
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the staging path has no file name"))?;
                 let target = self
                     .target
                     .file_name()
                     .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
-                nt::rename_into(&dir, &file, &target.to_string_lossy())?;
+                drop(file);
+                nt::rename_into(&dir, &staging.to_string_lossy(), &target.to_string_lossy())?;
             }
             None => {
                 drop(file);
@@ -1936,10 +1941,16 @@ mod nt {
         Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
     }
 
-    /// Renames the open staging `file` to `name` inside `dir` — the
+    /// Renames the staging file to `target` inside `dir` — the
     /// handle-relative rename no swapped junction can redirect.
-    pub fn rename_into(dir: &OwnedHandle, file: &std::fs::File, name: &str) -> Result<()> {
-        let wide: Vec<u16> = name.encode_utf16().collect();
+    ///
+    /// The file is reopened by name first, with the minimal access the
+    /// rename requires (`DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, the
+    /// Explorer pattern): the payload handle was opened for read/write, and
+    /// the rename's own access check is against the handle it is given.
+    pub fn rename_into(dir: &OwnedHandle, staging: &str, target: &str) -> Result<()> {
+        let reopened = reopen_for_delete(dir, staging)?;
+        let wide: Vec<u16> = target.encode_utf16().collect();
         // FILE_RENAME_INFO, built by hand because its FileName is inline:
         // Flags(4) pad(4) RootDirectory(8) FileNameLength(4) pad(4) FileName.
         let header = 24usize;
@@ -1957,7 +1968,7 @@ mod nt {
         };
         let status = unsafe {
             NtSetInformationFile(
-                file.as_raw_handle() as HANDLE,
+                reopened.as_raw_handle() as HANDLE,
                 &mut status_block,
                 buf.as_ptr() as *const core::ffi::c_void,
                 buf.len() as u32,
@@ -1970,6 +1981,53 @@ mod nt {
             )));
         }
         Ok(())
+    }
+
+    /// Reopens `name` inside `dir` with the access a rename needs, never
+    /// following a reparse point at the name.
+    fn reopen_for_delete(dir: &OwnedHandle, name: &str) -> Result<OwnedHandle> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let mut unicode = UNICODE_STRING {
+            length: (wide.len() * 2) as u16,
+            maximum_length: (wide.len() * 2) as u16,
+            buffer: wide.as_ptr() as *mut u16,
+        };
+        let mut attributes = OBJECT_ATTRIBUTES {
+            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            root_directory: dir.as_raw_handle() as HANDLE,
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        // DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, with the backup-intent
+        // flag the rename recipes open with.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                0x0001_0000 | 0x0000_0080 | 0x0010_0000,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                FILE_OPEN,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(EngineError::invalid(format!(
+                "could not reopen the staging file for the rename: NTSTATUS {status:#x}"
+            )));
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 }
 
