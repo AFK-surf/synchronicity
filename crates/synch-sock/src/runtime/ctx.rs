@@ -91,6 +91,13 @@ pub(crate) struct Inner {
     pub(crate) maps: Arc<SocketMaps>,
     pub(crate) limits: Limits,
     pub(crate) started: Instant,
+    /// When this invocation is considered idle.
+    ///
+    /// Pushed forward by [`Inner::made_progress`] whenever bytes move or a
+    /// handle becomes ready, which is what makes it an *idle* deadline rather
+    /// than a total wall-clock cap. There is deliberately no total cap: a
+    /// socket that proxies is supposed to be long-lived, and its CPU is
+    /// bounded by the timeslicer instead (`docs/SOCKETS.md` §10).
     pub(crate) deadline: Cell<Instant>,
     pub(crate) program_root: Hash,
     pub(crate) id: u64,
@@ -204,6 +211,17 @@ impl Inner {
             }
             None => false,
         }
+    }
+
+    /// Notes that something happened, and pushes the idle deadline out.
+    ///
+    /// Called from the places progress is observable: bytes copied in or out,
+    /// and a poll that came back with a handle ready. A program blocked on a
+    /// slow upstream is not idle, and one that has been parked in `sy_poll`
+    /// for five minutes with nothing happening is.
+    pub(crate) fn made_progress(&self) {
+        self.deadline
+            .set(Instant::now() + self.limits.idle_deadline);
     }
 
     /// Charges host-side bytes against this invocation's footprint.

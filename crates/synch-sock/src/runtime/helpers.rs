@@ -412,6 +412,7 @@ fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) 
     if n <= 0 {
         return ret(n);
     }
+    with(scope, |inner| inner.made_progress())?;
     let Ok(mut region) = scope.user_memory_mut(ptr, n as u64) else {
         return ret(errno::EINVAL);
     };
@@ -434,7 +435,11 @@ fn h_write(
     let Some(ep) = with(scope, |inner| inner.endpoint(handle as i64))? else {
         return ret(errno::EBADF);
     };
-    ret(ep.write(&data))
+    let n = ep.write(&data);
+    if n > 0 {
+        with(scope, |inner| inner.made_progress())?;
+    }
+    ret(n)
 }
 
 fn h_readable(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
@@ -638,6 +643,7 @@ fn h_poll(
 
     let epoch = inner.ready.epoch();
     if let Some(count) = ready_now(&inner, &watch) {
+        inner.made_progress();
         return finish_poll(scope, fds_ptr, &inner, &watch, count);
     }
     // Nothing can ever become ready, so waiting is waiting for nothing. Told
@@ -666,6 +672,9 @@ fn h_poll(
             }
         }
         let count = ready_now(&posted, &watch_for_task).unwrap_or(0);
+        if count > 0 {
+            posted.made_progress();
+        }
         move |scope: &HelperScope| {
             write_revents(scope, fds_ptr, &posted, &watch_for_task);
             Ok(count as u64)

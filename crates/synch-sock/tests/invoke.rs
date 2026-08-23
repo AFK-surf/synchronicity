@@ -147,6 +147,13 @@ impl Harness {
         }
     }
 
+    fn with_limits(limits: Limits) -> Harness {
+        Harness {
+            pool: WorkerHandle::start(1, limits),
+            tree: Arc::new(FakeTree::default()),
+        }
+    }
+
     fn with_tree(files: &[(&str, &str)]) -> Harness {
         let mut tree = FakeTree::default();
         for (name, body) in files {
@@ -603,4 +610,188 @@ fn a_program_with_no_stream_entrypoint_is_refused_at_arm_time() {
         matches!(out, Err(synch_sock::SockError::NoEntrypoint)),
         "expected NoEntrypoint, got {out:?}"
     );
+}
+
+const WAIT_FOREVER: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* A negative timeout means "until something happens". Nothing ever will:
+     the caller sends nothing and never hangs up. */
+  struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+  sy_s64 n = sy_poll(fds, 1, -1);
+  return n == 0 ? 42 : 1;
+}
+"#;
+
+#[tokio::test]
+async fn a_wait_with_nothing_happening_ends_at_the_idle_deadline() {
+    if !have_clang() {
+        eprintln!("skipping: no clang with a BPF target");
+        return;
+    }
+    let elf = compile(WAIT_FOREVER).expect("the fixture compiles");
+    let harness = Harness::with_limits(Limits {
+        idle_deadline: std::time::Duration::from_millis(300),
+        ..Limits::default()
+    });
+
+    // A stream that stays open and silent: the guest's only handle can still
+    // become ready in principle, so `all_quiet` does not short-circuit it and
+    // the deadline is the only thing that ends the wait.
+    let (mine, theirs) = tokio::io::duplex(1024);
+    let (r, w) = tokio::io::split(theirs);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(r, w),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.pool.run(invocation),
+    )
+    .await
+    .expect("the idle deadline did not end an infinite wait")
+    .expect("the program ran");
+    drop(mine);
+
+    assert_eq!(
+        outcome.status,
+        SockStatus::Ok(42),
+        "the wait should have come back as a timeout, not as readiness"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "the wait returned before the deadline it was clamped to"
+    );
+}
+
+const CHATTY: &str = r#"
+#include <synch.h>
+
+/* Reads for longer than one idle deadline, a little at a time. A total
+   wall-clock cap would kill this; an idle deadline must not. */
+SY_ENTRY sy_s64 entry(void) {
+  char buf[64];
+  sy_s64 total = 0;
+  struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+  for (;;) {
+    if (sy_poll(fds, 1, 5000) <= 0) return -1;
+    sy_s64 n = sy_read(SY_SELF, buf, sizeof buf);
+    if (n == 0) break;
+    if (n < 0) { if (n == SY_EAGAIN) continue; return n; }
+    total += n;
+  }
+  sy_shutdown(SY_SELF);
+  return total;
+}
+"#;
+
+#[tokio::test]
+async fn steady_progress_keeps_an_invocation_alive_past_the_idle_deadline() {
+    if !have_clang() {
+        eprintln!("skipping: no clang with a BPF target");
+        return;
+    }
+    let elf = compile(CHATTY).expect("the fixture compiles");
+    // Short enough that a *total* cap would fire well before the exchange ends.
+    let harness = Harness::with_limits(Limits {
+        idle_deadline: std::time::Duration::from_millis(200),
+        ..Limits::default()
+    });
+
+    let (mine, theirs) = tokio::io::duplex(4096);
+    let (their_r, their_w) = tokio::io::split(theirs);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(their_r, their_w),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+
+    let driver = tokio::spawn(async move {
+        let mut mine = mine;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            mine.write_all(b"tick").await.unwrap();
+        }
+        mine.shutdown().await.unwrap();
+        // Held open so the guest sees an EOF rather than a reset.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        harness.pool.run(invocation),
+    )
+    .await
+    .expect("a steadily-fed invocation was killed by a deadline")
+    .expect("the program ran");
+    driver.await.unwrap();
+
+    assert_eq!(
+        outcome.status,
+        SockStatus::Ok(40),
+        "every byte should have arrived: an idle deadline is not a total cap"
+    );
+}
+
+/// The worked example from `docs/SOCKETS.md` §8, extracted from the document.
+///
+/// A design document's example is the first thing anybody writes a socket from,
+/// and an example that does not compile teaches the reader that the document is
+/// approximate. Extracted rather than copied, so the two cannot drift.
+fn documented_example() -> Option<String> {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/SOCKETS.md"
+    ))
+    .ok()?;
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in doc.lines() {
+        match (&mut current, line.trim_end()) {
+            (None, "```c") => current = Some(Vec::new()),
+            (Some(body), "```") => {
+                blocks.push(body.join("\n"));
+                current = None;
+            }
+            (Some(body), line) => body.push(line),
+            (None, _) => {}
+        }
+    }
+    // The one that is a whole program, rather than the header excerpt in §7
+    // that merely *defines* those macros.
+    blocks
+        .into_iter()
+        .find(|b| b.contains("SY_ENTRY sy_s64 entry(void)"))
+}
+
+#[test]
+fn the_documented_example_compiles_against_the_shipped_header() {
+    if !have_clang() {
+        eprintln!("skipping: no clang with a BPF target");
+        return;
+    }
+    let source = documented_example().expect("docs/SOCKETS.md §8 has a complete example");
+    assert!(
+        source.contains("sy_pump"),
+        "the example should use the header's pump rather than open-coding it"
+    );
+    // `compile` panics with clang's own diagnostics if the example is wrong,
+    // which is exactly the failure worth having.
+    let elf = compile(&source).expect("the documented example compiles");
+
+    // And it is a program the runtime will actually accept: both sections
+    // present, and the declaration hook says what the document says it says.
+    let declared = synch_sock::declare(&elf, Arc::new(FakeTree::default()))
+        .expect("the documented example loads and declares");
+    assert_eq!(declared.name, "git-http");
+    assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
+    assert_eq!(declared.max_streams, Some(32));
 }

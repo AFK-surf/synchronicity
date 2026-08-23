@@ -1,8 +1,14 @@
 # Sockets
 
-Status: **proposed**, being built. This document describes the design; where the
-implementation has landed it describes the built thing, and §12 records what is
-not built yet.
+Status: **implemented**, except the live-invocation surface — `synch socket ps`,
+`kill` and `log` — which §12 records as not built. Everything else here
+describes the built thing: the record kind, the arming tables, the
+`sync/sock/1` protocol, the host API and its runtime, the scanner's publishing
+rule, and the command surface.
+
+Checked against the tree it landed in. Where the built thing differs from an
+earlier draft of this design, this document has been corrected to describe the
+built thing, and says so at each point.
 
 A **socket** is a file in a node's published tree whose content is an eBPF ELF
 object. A peer runs `synch connect nas:code/git.sock`; the connection lands on
@@ -150,8 +156,9 @@ gates stand between a published socket entry and an invocation:
 `synch socket add --auto` follows the file: it re-arms on every content change
 and skips the second gate forever. It is correct for a path you are the only
 writer of and wrong for any path an S3 key, a fill or a take can reach. `synch
-doctor` lists every `--auto` socket, because that list is the honest answer to
-"what can execute here?".
+socket ls` marks every `--auto` socket, because that list is the honest answer
+to "what can execute here?", and `synch socket add` says what `--auto` costs at
+the moment it is asked for.
 
 ### 3.1 The init hook is what makes arming meaningful
 
@@ -284,8 +291,9 @@ the daemon's threading directly.
   placement decision, not a scheduling one: there is no work stealing, by
   construction.
 - A worker whose preemption watcher has failed refuses to start further runs
-  (async-ebpf checks this itself) and is reported by `synch doctor`. The daemon
-  does not silently fall back to running uninterruptible guests.
+  (async-ebpf checks this itself). The daemon does not silently fall back to
+  running uninterruptible guests. Surfacing the degraded worker count to an
+  operator is not built.
 
 ## 6. Memory and state
 
@@ -299,6 +307,13 @@ read-only and *all* stores are confined to the stack.
 So the guest has **32 KiB of stack** (eight local-call frames of 4 KiB, plus
 512 bytes of calldata), **no heap**, and **no mutable globals**. Everything that
 outlives a helper call lives host-side:
+
+The number that binds in practice is the **4 KiB frame**, not the 32 KiB total.
+One function's locals must fit in one frame, so a `char[4096]` buffer does not
+compile even though the stack is eight times that: it fills the frame and
+leaves no room for the handles and counters beside it. Programs are also
+compiled with `-mllvm -bpf-stack-size=4096`, because LLVM's default BPF frame
+is 512 bytes and nothing useful fits in that.
 
 | Table | Scope | Bound |
 | --- | --- | --- |
@@ -473,19 +488,6 @@ SY_INIT_ENTRY sy_s64 declare(void) {
   return 0;
 }
 
-static sy_s64 pump(sy_s64 from, sy_s64 to, char *buf, sy_u64 cap) {
-  sy_s64 n = sy_read(from, buf, cap);
-  if (n <= 0) return n;                     /* 0 = EOF, negative = EAGAIN or error */
-  sy_s64 off = 0;
-  while (off < n) {                          /* a short write is backpressure */
-    sy_s64 w = sy_write(to, buf + off, n - off);
-    if (w == SY_EAGAIN) break;               /* leave the rest; poll brings us back */
-    if (w < 0) return w;
-    off += w;
-  }
-  return off;
-}
-
 SY_ENTRY sy_s64 entry(void) {
   /* 1. Authorization is the handshake. Nothing here parses caller input. */
   if (!sy_peer_has_space(SY_STR("code"))) {
@@ -511,28 +513,47 @@ SY_ENTRY sy_s64 entry(void) {
 
   struct sy_pollfd fds[2] = {
     { SY_SELF, SY_POLL_IN, 0 },
-    { up,      SY_POLL_IN | SY_POLL_OUT, 0 },
+    { up,      SY_POLL_IN, 0 },
   };
-  char buf[4096];                            /* on a 32 KiB stack */
+  /* The binding limit is the *frame*, not the stack: 4 KiB per function, of
+     which `who`, `key` and `fds` have already taken a little. A `char[4096]`
+     here does not compile. */
+  char buf[2048];
 
-  for (;;) {
+  /* Each direction ends on its own. A loop that stopped the moment either
+     side hung up would cut off the reply to the last request it forwarded,
+     which is the single most common way to get this wrong. */
+  int upstream_done = 0, caller_done = 0;
+  while (!(upstream_done && caller_done)) {
     if (sy_poll(fds, 2, 30000) <= 0) break;  /* 0 = 30s idle; negative = deadline */
 
-    if (fds[0].revents & SY_POLL_IN)
-      if (pump(SY_SELF, up, buf, sizeof buf) == 0) { sy_shutdown(up); fds[0].events = 0; }
-    if (fds[1].revents & SY_POLL_IN)
-      if (pump(up, SY_SELF, buf, sizeof buf) == 0) { sy_shutdown(SY_SELF); break; }
-
-    if ((fds[0].revents | fds[1].revents) & (SY_POLL_ERR | SY_POLL_HUP)) break;
-
-    fds[0].events = SY_POLL_IN | (sy_readable(up)      ? SY_POLL_OUT : 0);
-    fds[1].events = SY_POLL_IN | (sy_readable(SY_SELF) ? SY_POLL_OUT : 0);
+    if (fds[0].revents & SY_POLL_IN) {
+      sy_s64 n = sy_pump(SY_SELF, up, buf, sizeof buf);
+      if (n == 0) { sy_shutdown(up); caller_done = 1; fds[0].events = 0; }
+      else if (n < 0 && n != SY_EAGAIN) break;
+    }
+    if (fds[1].revents & SY_POLL_IN) {
+      sy_s64 n = sy_pump(up, SY_SELF, buf, sizeof buf);
+      if (n == 0) { sy_shutdown(SY_SELF); upstream_done = 1; fds[1].events = 0; }
+      else if (n < 0 && n != SY_EAGAIN) break;
+    }
+    if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) break;
   }
 
   sy_close(up);
   return 0;                                  /* → Closed{ Ok(0) } */
 }
 ```
+
+`sy_pump` is in the header: it reads once, writes what it can, and leaves any
+remainder for the next poll rather than dropping it. A short write is
+backpressure, not failure, and writing that loop by hand is where the second
+most common mistake lives.
+
+The `HUP` bit is reported only once an endpoint's buffer has drained, which is
+what makes the loop above safe: a peer that half-closes after sending a request
+is `SY_POLL_IN` with data waiting, not `SY_POLL_HUP`, so a program that breaks
+on `HUP` still gets to read what it was sent.
 
 Forty lines, no heap, no globals, one upstream, and an access-control rule that
 a caller cannot lie its way past. The pieces this design exists to provide are
@@ -552,16 +573,23 @@ synch socket arm <space>/<path> [--root <hex>]        approve the current bytes,
 synch socket disarm <space>/<path>                    keep publishing it, stop running it
 synch socket rm <space>/<path>                        republish as an ordinary file
 synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
-synch socket ps [<space>/<path>]                      live invocations: peer, age, bytes,
-                                                      cpu, endpoints, labels, counters
-synch socket kill <invocation-id>                     end one; the stream closes Killed
-synch socket log <space>/<path> [-f]                  what its sy_log calls said
+synch socket sdk                                      print the C SDK header, from the
+                                                      build that defines the ABI
 
 synch connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
               [--meta k=v]…                           stream → stdout, exit code from
-              [--listen <addr:port> | unix:<path>]    Closed{status}
-              [--once] [--retry]
+              [--listen <addr:port>] [--once]         Closed{status}
 ```
+
+`synch socket ls -l` prints, per socket, what the tree currently names, what
+was armed, and what the program declared when it was armed — so "the bytes
+changed and nobody re-approved them" is visible as a difference between two
+lines rather than inferred.
+
+`synch socket sdk` prints the header from the binary that defines the ABI.
+A header on disk beside the binary is one that can be older than the binary,
+and the numbers in it are the guest's only view of the ABI: a guest compiled
+against a stale one gets wrong answers rather than errors.
 
 ### 9.1 Where the listener runs
 
@@ -593,7 +621,7 @@ own.
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
-| Idle deadline | 300 s | No readiness and no progress. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. |
+| Idle deadline | 300 s | Measured from the last *progress* — bytes copied in or out, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
 | Socket map | 4096 keys / 1 MiB | Per socket. TTL then LRU; a full map fails `sy_map_set` rather than evicting silently. |
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
 | Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |
@@ -602,12 +630,12 @@ own.
 | --- | --- | --- |
 | Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
-| Faults on ≥ 8 of the last 16 invocations | — | The socket auto-disarms and says why. |
-| JIT or link failure | refused | `Refused{ProgramInvalid}`, and the socket auto-disarms. async-ebpf compiles functions lazily, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore does a dry run to force compilation early. |
+| Faults on ≥ 8 of the last 16 invocations | — | *Not built.* The thresholds are written down and nothing counts against them yet — see §12. |
+| JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |
 | Bytes changed under an armed socket | refused | `Refused{NotArmed}` naming both roots. In-flight invocations keep their root. |
 | Egress to an unarmed destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
-| Preemption watcher failed | refused | That worker refuses new runs. `synch doctor` reports the degraded worker count. |
+| Preemption watcher failed | refused | That worker refuses new runs — async-ebpf checks this itself rather than risk a guest that cannot be interrupted. Surfacing the degraded worker count in `synch doctor` is not built. |
 
 ## 11. What this changes in the existing design
 
@@ -624,8 +652,7 @@ own.
   scopes correctly ("a record this node cannot apply fails its own origin and no
   other"), but it does mean one socket entry stalls the publisher's whole head
   on old peers. That is unavoidable for any new kind and is the reason the
-  rollout order is: upgrade, then declare. `synch doctor` names peers running a
-  version that cannot read a socket entry.
+  rollout order is: upgrade, then declare.
 - **§4.1, redaction boundary.** The new record type is checked against the prefix
   rule, as §4.1 requires. It passes without a new rule because it is not a new
   record type: it is a field on `f:`, entirely inside the space prefix a
@@ -634,8 +661,9 @@ own.
   publish rights. It now also grants the ability to *invoke* programs the callee
   has armed. The security section should say that plainly, alongside the
   mitigations: the callee chose and armed every program, the caller supplies no
-  code, egress is declared and approved in advance, and `synch doctor` lists
-  every armed socket and every `--auto` one.
+  code, and egress is declared and approved in advance. `synch socket ls -l`
+  lists every armed socket and what it was armed for; surfacing the same in
+  `synch doctor` is not built.
 - **§11, crate layout.** A new `synch-sock` crate holds the helper table, the
   endpoint and reactor machinery, the program cache and the arming logic; it
   depends on `async-ebpf` and is gated to the platforms that crate supports.
@@ -665,6 +693,18 @@ Not in this design:
 - **Running a peer's program**, under any flag, at any trust level. This is the
   rule the whole design is built on.
 - **Serving sockets on macOS or Windows**, until async-ebpf runs there.
+
+Not built yet, and named in the status line:
+
+- **`synch socket ps`, `kill` and `log`.** Watching live invocations needs a
+  registry of them, which the runtime does not keep: an invocation is placed on
+  a worker and known to that worker, and nothing above collects them. The parts
+  that would feed it are built and unused — `sy_label_set` and `sy_metric_add`
+  come back in the invocation's outcome, and the cancellation channel that
+  `kill` would pull is what a daemon shutdown already uses.
+- **Fault quarantine.** The thresholds are written down (`FAULT_QUARANTINE`,
+  `FAULT_WINDOW`) and nothing counts against them yet, for the same reason: it
+  needs the per-socket history that the same registry would hold.
 
 Worth building next:
 

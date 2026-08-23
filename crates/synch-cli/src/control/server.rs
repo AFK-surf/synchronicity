@@ -636,32 +636,7 @@ impl Control for ControlService {
             }
         };
 
-        let reference: synch_engine::EntryRef = open
-            .reference
-            .parse()
-            .map_err(|e| ControlError::invalid(format!("{e}")))?;
-        // Origin-qualified, always. A socket is served by the node that
-        // published it, so there is nothing to select between — and `newest`
-        // would let any member's mtime decide whose program answers.
-        let Some(origin) = reference.origin.clone() else {
-            return Err(ControlError::invalid(format!(
-                "`{}` names no origin; connecting takes `<origin>:<space>/<path>`",
-                open.reference
-            ))
-            .into());
-        };
-        let (space, path) = match reference.path.split_once('/') {
-            Some((_, rest)) if !rest.is_empty() => (reference.space.clone(), rest.to_string()),
-            _ => match reference.path.is_empty() {
-                true => {
-                    return Err(ControlError::invalid(
-                        "a socket reference is `<origin>:<space>/<path>`",
-                    )
-                    .into())
-                }
-                false => (reference.space.clone(), reference.path.clone()),
-            },
-        };
+        let (origin, space, path) = socket_reference(&open.reference)?;
         let meta: Vec<(String, String)> = open
             .meta
             .into_iter()
@@ -1193,6 +1168,31 @@ fn domain_set_advice(domain: &str, node_id: NodeId, delegate: bool) -> Vec<Strin
             .replace("{domain}", domain),
         "`synch domain clear` returns this node to its device key as its name".into(),
     ]
+}
+
+/// Splits a `<origin>:<space>/<path>` socket reference.
+///
+/// Origin-qualified, always. A socket is served by the node that published it,
+/// so there is nothing to select between — and `newest` would let any member's
+/// `mtime_ns` decide whose program answers.
+fn socket_reference(text: &str) -> Result<(synch_core::OriginId, String, String), ControlError> {
+    let reference: synch_engine::EntryRef = text
+        .parse()
+        .map_err(|e| ControlError::invalid(format!("{e}")))?;
+    let Some(origin) = reference.origin else {
+        return Err(ControlError::invalid(format!(
+            "`{text}` names no origin; connecting takes `<origin>:<space>/<path>`"
+        )));
+    };
+    // `EntryRef` has already split the space from the path. Splitting the path
+    // again would drop its first component and quietly resolve a nested socket
+    // to the wrong one, which is a bug that looks like a working connection.
+    if reference.path.is_empty() {
+        return Err(ControlError::invalid(format!(
+            "`{text}` names a space root; a socket reference is `<origin>:<space>/<path>`"
+        )));
+    }
+    Ok((origin, reference.space, reference.path))
 }
 
 /// Pumps bytes between one control stream and one socket invocation.
@@ -3686,4 +3686,32 @@ async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), Cont
         ControlError::invalid(format!("{text} selects a version with no content to pin"))
     })?;
     Ok((root, Some(entry.size)))
+}
+
+#[cfg(test)]
+mod socket_reference_tests {
+    use super::socket_reference;
+
+    #[test]
+    fn a_nested_path_keeps_every_component() {
+        // The regression this exists for: `EntryRef` has already split the
+        // space off, and splitting the path a second time silently resolved
+        // `code/a/b/c.sock` as `b/c.sock` — a different socket, or none.
+        let (origin, space, path) =
+            socket_reference("nas@cluster.example:code/a/b/c.sock").unwrap();
+        assert_eq!(origin.canonical(), "nas@cluster.example");
+        assert_eq!(space, "code");
+        assert_eq!(path, "a/b/c.sock");
+
+        let (_, space, path) = socket_reference("nas@cluster.example:code/git.sock").unwrap();
+        assert_eq!((space.as_str(), path.as_str()), ("code", "git.sock"));
+    }
+
+    #[test]
+    fn a_reference_must_name_an_origin_and_a_path() {
+        // Unqualified: there is no policy to select a socket with.
+        assert!(socket_reference("code/git.sock").is_err());
+        // A space root names no socket.
+        assert!(socket_reference("nas@cluster.example:code").is_err());
+    }
 }
