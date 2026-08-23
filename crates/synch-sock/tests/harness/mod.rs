@@ -285,8 +285,16 @@ pub async fn exchange(
     let mut mine = mine;
     let input = input.to_vec();
     let driver = tokio::spawn(async move {
-        mine.write_all(&input).await.unwrap();
-        mine.shutdown().await.unwrap();
+        // A broken pipe here is a program that finished before the caller had
+        // stopped talking, which is a normal end and several of these examples
+        // do it on purpose: a proxy whose upstream closed, a gate that refused,
+        // a path validator that read one line and said no. The invocation and
+        // this side run concurrently, so which of them gets there first is a
+        // race, and treating the loss of that race as a test failure is how a
+        // suite gets a flake in it. What was actually asked for is asserted on
+        // the *reply*, below.
+        let _ = mine.write_all(&input).await;
+        let _ = mine.shutdown().await;
         let mut out = Vec::new();
         mine.read_to_end(&mut out).await.unwrap();
         out
@@ -322,8 +330,11 @@ pub async fn converse(
 
     let (mut reader, mut writer) = tokio::io::split(mine);
     let sending = tokio::spawn(async move {
-        writer.write_all(&input).await.unwrap();
-        writer.shutdown().await.unwrap();
+        // Tolerated for the same reason as in `exchange`, and it costs nothing
+        // here either: a caller that could not send all of it gets less back,
+        // and less back is what the payload comparison is looking for.
+        let _ = writer.write_all(&input).await;
+        let _ = writer.shutdown().await;
     });
     let receiving = tokio::spawn(async move {
         let mut out = Vec::new();
