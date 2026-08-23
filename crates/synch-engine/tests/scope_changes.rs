@@ -513,17 +513,26 @@ async fn a_delegates_scope_is_the_same_whatever_order_it_meets_its_peers_in() {
             seen.push(scope);
         }
         // The first round is the bootstrap — a delegate holds no grant until it
-        // has replicated the trie the granting record lives in, so `None` there
-        // is the honest answer and not a scope. From the moment it is known,
-        // nothing a peer says may move it: it is read out of the trie, and the
-        // trie is the same either way.
+        // has replicated the trie the granting record lives in, so the empty
+        // scope there is the honest answer and not a scope. From the moment a
+        // non-empty scope is known, nothing a peer says may move it: it is read
+        // out of the trie, and the trie is the same either way.
+        let known: Vec<&Option<Vec<String>>> = seen[1..]
+            .iter()
+            .filter(|scope| scope.as_ref().is_some_and(|s| !s.is_empty()))
+            .collect();
         assert!(
-            seen[1..].iter().all(|scope| scope == &seen[1]),
-            "a peer's declaration moved this node's scope once it knew it: {seen:?}"
+            !known.is_empty(),
+            "the grant must become known: {seen:?}"
         );
         assert!(
-            seen[1].is_some(),
-            "the grant must be known after the first round: {seen:?}"
+            known.iter().all(|scope| *scope == known[0]),
+            "a peer's declaration moved this node's scope once it knew it: {seen:?}"
+        );
+        assert_eq!(
+            known[0].as_ref().unwrap(),
+            &vec!["reports".to_string()],
+            "the grant is the delegation's spaces: {seen:?}"
         );
         settled.push((
             laptop.store.local_scope().unwrap(),
@@ -763,5 +772,87 @@ async fn an_expired_delegation_collapses_the_read_scope_to_nothing() {
         delegate.entries(&issuer.origin, "photos"),
         0,
         "the expired spaces leave the derived views"
+    );
+}
+
+/// **F1i — a fresh delegate bootstraps under the empty scope, not a stale
+/// peer's whole keyspace.**
+///
+/// Before its grant is materialized, a key-identified node (the shape a
+/// delegation may bind) has no way to know what it is entitled to — so it
+/// starts with the empty scope (`m:self` and the `d:` namespace, no file
+/// data) and its first walks pull only the records that define its grant. A
+/// rooted peer that never saw the grant declares `Unrestricted`; the
+/// bootstrap must not turn that into a full walk of everything the peer
+/// serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_delegate_bootstraps_under_the_empty_scope() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let work = Node::spawn(Some("work")).await;
+    let stale = Node::spawn(Some("stale")).await;
+    let laptop = Node::spawn(None).await;
+
+    trust_static(&laptop.store, &work.origin, &work.key());
+    trust_static(&laptop.store, &stale.origin, &stale.key());
+    trust_static(&stale.store, &laptop.origin, &laptop.key());
+    trust_static(&work.store, &stale.origin, &stale.key());
+
+    work.publish(
+        1,
+        &[
+            ("reports", "q3.pdf", b"delegated"),
+            ("secrets", "keys.txt", b"withheld"),
+        ],
+        &[delegation(&laptop.key(), &["reports"])],
+    );
+
+    // The laptop's first rounds happen to pick the rooted peer that never
+    // saw the grant: it declares `Unrestricted`, and the bootstrap must not
+    // widen to its whole keyspace.
+    let syncer = Syncer::new(laptop.store.clone());
+    let to_stale = laptop
+        .net
+        .connect_mpt(stale.net.direct_addr())
+        .await
+        .unwrap();
+    rounds(&syncer, &to_stale, "stale", 2).await;
+
+    assert_eq!(
+        laptop.store.local_scope().unwrap(),
+        Some(Vec::<String>::new()),
+        "the bootstrap scope is the empty one, not the peer's keyspace"
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "secrets"),
+        0,
+        "nothing outside the grant is pulled during the bootstrap"
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "reports"),
+        0,
+        "and the grant itself is not yet known"
+    );
+
+    // The delegating origin is reachable after all: the grant materializes
+    // out of its trie and the scope follows.
+    let to_work = laptop
+        .net
+        .connect_mpt(work.net.direct_addr())
+        .await
+        .unwrap();
+    rounds(&syncer, &to_work, "work", 3).await;
+    assert_eq!(
+        laptop.store.local_scope().unwrap(),
+        Some(vec!["reports".to_string()])
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "reports"),
+        1,
+        "the granted record materializes once the grant is known"
+    );
+    assert_eq!(
+        laptop.entries(&work.origin, "secrets"),
+        0,
+        "and the withheld one stays out"
     );
 }

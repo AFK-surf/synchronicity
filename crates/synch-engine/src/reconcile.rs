@@ -1301,6 +1301,17 @@ impl Syncer {
         // its own key in a foreign origin, the shape a promotion's zone
         // record leaves in this node's resolver.
         let promoted = self.store.own_rooted_in_foreign_origin(now_ns())?;
+        // A key-identified node is the shape a delegation may bind, so with
+        // no grant materialized yet it bootstraps under the empty scope —
+        // `m:self` and the `d:` namespace, no file data — and its first walk
+        // pulls only the records that define its grant. A *named* node is a
+        // full member by construction and stays unrestricted.
+        let key_shaped = self
+            .store
+            .self_origin()?
+            .as_ref()
+            .and_then(|o| o.as_key())
+            .is_some();
         let effective: Option<Vec<String>> = match (own, declared) {
             // The grant is authoritative; a declaration cannot widen it.
             (Some(grant), _) => Some(grant),
@@ -1319,16 +1330,23 @@ impl Syncer {
             (None, DeclaredScope::Unrestricted) if promoted => None,
             // Not promoted: the no-binding case. A scope that was confined
             // collapses to the empty scope — `m:self` and the `d:` namespace,
-            // no file data — while a fresh node's default `None` stays put.
-            (None, DeclaredScope::Unrestricted) => {
-                if current.as_ref().is_some_and(|s| !s.is_empty()) {
-                    Some(Vec::new())
-                } else {
-                    return Ok(());
-                }
+            // no file data — and a fresh key-identified node bootstraps under
+            // that same empty scope rather than under whatever a stale peer
+            // declares (a fresh named node's default `None` stays put).
+            (None, DeclaredScope::Unrestricted)
+                if current.as_ref().is_some_and(|s| !s.is_empty()) =>
+            {
+                Some(Vec::new())
             }
+            (None, DeclaredScope::Unrestricted) if key_shaped && current.is_none() => {
+                Some(Vec::new())
+            }
+            (None, DeclaredScope::Unrestricted) => return Ok(()),
             // Revocation: the peer holds no binding at all.
             (None, DeclaredScope::Untrusted) if current.as_ref().is_some_and(|s| !s.is_empty()) => {
+                Some(Vec::new())
+            }
+            (None, DeclaredScope::Untrusted) if key_shaped && current.is_none() => {
                 Some(Vec::new())
             }
             (None, DeclaredScope::Untrusted) => return Ok(()),

@@ -772,30 +772,32 @@ impl Node {
         // is refused before anything is fetched. It reads the space row, so it
         // goes to the blocking pool like every other store read on an async
         // path (§10).
-        let (target, escape) = {
+        let target = {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target_checked(&space_id, &path)).await?
+            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
         };
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        // The escape guard is taken again, immediately before the write it
-        // protects: a fetch stands between the first check and here, and the
-        // whole point of the guard is to describe the directory the write is
-        // about to land in (the mirror's own pattern, §7.2).
-        if let Some((root, rel)) = &escape {
-            let root = root.clone();
-            let rel = rel.clone();
-            crate::blocking::offload(move || {
-                if crate::mirror::escapes_via_symlink(&root, &rel) {
-                    return Err(EngineError::invalid(format!(
-                        "{rel} resolves through a symlinked directory and would leave the space"
-                    )));
-                }
-                Ok(())
-            })
+        // The write lands through the space-validated adoption: the target's
+        // parent directory is resolved component by component at open and the
+        // payload is cloned into the staging file it pinned, so a directory
+        // swapped for a symlink by the fetch standing between the first check
+        // and here cannot redirect the write outside the space (§7.2, §9.4).
+        //
+        // The object materializes into a daemon-owned staging file first —
+        // the data dir is not attacker-writable — then the adoption clones it
+        // into the pinned directory (`FICLONE` where the filesystem shares
+        // extents, a copy elsewhere).
+        let staged = self.store().staging_dir().join(format!(
+            "take-{}-{}.payload",
+            std::process::id(),
+            now_ns()
+        ));
+        self.materialize_blob(&range.root, range.size, staged.clone())
             .await?;
-        }
-        self.materialize_blob(&range.root, range.size, target.clone())
-            .await?;
+        let mut adoption = Adoption::into_space(self, space_id, path)?;
+        adoption.clone_from(&staged)?;
+        let _ = std::fs::remove_file(&staged);
+        adoption.commit()?;
         Ok(target)
     }
 
