@@ -808,6 +808,15 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 space: space.clone().unwrap_or_default(),
                 long: *long,
             }),
+            SocketCommand::Ps { target } => Cmd::SocketPs(pb::SocketPs {
+                target: target.clone().unwrap_or_default(),
+            }),
+            SocketCommand::Kill { invocation } => Cmd::SocketKill(pb::SocketKill {
+                invocation: *invocation,
+            }),
+            SocketCommand::Log { target } => Cmd::SocketLog(pb::SocketLog {
+                target: target.clone(),
+            }),
             SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
         },
 

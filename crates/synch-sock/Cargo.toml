@@ -34,7 +34,7 @@ tracing.workspace = true
 # `synch connect` works everywhere because the connecting side executes nothing
 # (`docs/SOCKETS.md` §1).
 [target.'cfg(all(any(target_os = "linux", target_os = "openbsd"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-async-ebpf = "0.4.0-alpha.7"
+async-ebpf = "0.4.0-alpha.8"
 rand = "0.8"
 
 [dev-dependencies]

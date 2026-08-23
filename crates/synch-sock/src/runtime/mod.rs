@@ -124,6 +124,7 @@ pub struct Worker {
 pub struct WorkerHandle {
     workers: Arc<Vec<Worker>>,
     maps: Arc<SocketMaps>,
+    registry: Arc<crate::registry::Registry>,
     limits: Limits,
     next_id: Arc<AtomicU64>,
 }
@@ -139,15 +140,30 @@ impl WorkerHandle {
         // before the handlers that contain its faults are in place.
         let global = global_env();
         let maps = SocketMaps::new();
+        let registry = crate::registry::Registry::new();
         let workers = (0..count)
-            .map(|index| Worker::spawn(index, global, limits.clone(), maps.clone()))
+            .map(|index| {
+                Worker::spawn(
+                    index,
+                    global,
+                    limits.clone(),
+                    maps.clone(),
+                    registry.clone(),
+                )
+            })
             .collect();
         WorkerHandle {
             workers: Arc::new(workers),
             maps,
+            registry,
             limits,
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// What is running right now, and what it has just been saying.
+    pub fn registry(&self) -> &Arc<crate::registry::Registry> {
+        &self.registry
     }
 
     /// The next invocation id, as `synch socket ps` prints it.
@@ -160,9 +176,16 @@ impl WorkerHandle {
         &self.limits
     }
 
-    /// Drops everything a socket's map held — what re-arming does.
+    /// Drops everything one socket held that a re-arm should not inherit: its
+    /// map, its remembered log lines, and its fault history.
+    ///
+    /// A re-arm is a different program. A session table, a log tail and a
+    /// record of failures minted by the old one are not state the new one
+    /// agreed to inherit — and leaving the fault history in place would
+    /// quarantine a fixed program on the strength of the broken one's record.
     pub fn clear_map(&self, socket: &str) {
         self.maps.clear(socket);
+        self.registry.forget(socket);
     }
 
     /// Runs one invocation on the least-loaded worker.
@@ -170,7 +193,12 @@ impl WorkerHandle {
     /// Placement, not scheduling: the stream stays where it lands. There is no
     /// work stealing, by construction — see this module's header.
     pub async fn run(&self, invocation: Invocation) -> Result<Outcome, SockError> {
-        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        // The registry holds the sender, so `synch socket kill` can reach an
+        // invocation nobody else has a handle to.
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        if invocation.slot.is_some() {
+            self.registry.attach_cancel(invocation.id, cancel_tx);
+        }
         self.run_cancellable(invocation, cancel_rx).await
     }
 
@@ -207,7 +235,13 @@ impl WorkerHandle {
 }
 
 impl Worker {
-    fn spawn(index: usize, global: GlobalEnv, limits: Limits, maps: Arc<SocketMaps>) -> Worker {
+    fn spawn(
+        index: usize,
+        global: GlobalEnv,
+        limits: Limits,
+        maps: Arc<SocketMaps>,
+        registry: Arc<crate::registry::Registry>,
+    ) -> Worker {
         let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
         let load = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new()
@@ -239,6 +273,7 @@ impl Worker {
                             thread_env,
                             &limits,
                             &maps,
+                            &registry,
                             job.invocation,
                             job.cancel,
                         )
@@ -275,14 +310,19 @@ fn program_for(
 }
 
 /// Builds the invocation state and runs the guest.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "everything a worker needs to run one invocation, and every one of               them is per-worker state a struct would only rename"
+)]
 async fn run_job(
     loader: &ProgramLoader,
     cache: &RefCell<HashMap<Hash, Rc<Program>>>,
     thread_env: ThreadEnv,
     limits: &Limits,
     maps: &Arc<SocketMaps>,
+    registry: &Arc<crate::registry::Registry>,
     invocation: Invocation,
-    mut cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<()>,
 ) -> Result<Outcome, SockError> {
     let program = program_for(
         loader,
@@ -325,8 +365,15 @@ async fn run_job(
         egress_open: Cell::new(0),
         init_mode: false,
         declaration: RefCell::new(Declaration::default()),
+        live: invocation
+            .slot
+            .as_ref()
+            .map(|slot| slot.stats())
+            .unwrap_or_default(),
+        registry: Some(registry.clone()),
     });
     debug_assert_eq!(SY_SELF, 0, "SY_SELF must be the first slot");
+    inner.publish_handles();
 
     let mut ctx = Ctx {
         inner: inner.clone(),
@@ -335,6 +382,17 @@ async fn run_job(
     let preemption = PreemptionEnabled::new(thread_env);
 
     let mut resources: [&mut dyn std::any::Any; 1] = [&mut ctx];
+    // A *dropped* sender means nobody holds a way to cancel this invocation —
+    // not that somebody just cancelled it. Reading the two the same way is how
+    // a missing registry entry turns into every invocation being killed the
+    // instant it starts, which is a failure that looks like the network.
+    let cancelled = async move {
+        if cancel.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(cancelled);
+
     let status = {
         let run = program.run(
             &timeslice,
@@ -360,7 +418,7 @@ async fn run_job(
             // A kill or a shutdown: the guest is dropped where it stands, which
             // is safe because everything it can hold is host-side and owned by
             // `inner`.
-            _ = &mut cancel => SockStatus::Killed,
+            _ = &mut cancelled => SockStatus::Killed,
         }
     };
 
@@ -377,6 +435,14 @@ async fn run_job(
     for handle in 0..open_handles {
         inner.remove(handle);
     }
+
+    // Held until here on purpose: the slot is what the concurrency cap counts,
+    // and giving it back before the invocation has finished would let the cap
+    // be exceeded by exactly the number of invocations that are shutting down.
+    if let Some(slot) = &invocation.slot {
+        registry.record_outcome(slot.socket(), matches!(status, SockStatus::Fault(_)));
+    }
+    drop(invocation.slot);
 
     let (bytes_in, bytes_out) = (self_ep.bytes_in.get(), self_ep.bytes_out.get());
     let metrics = inner.metrics.borrow().clone();
@@ -497,6 +563,11 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         egress_open: Cell::new(0),
         init_mode: true,
         declaration: RefCell::new(Declaration::default()),
+        live: Default::default(),
+        // No registry: a declaration run is not an invocation, and what its
+        // hook logs belongs to the operator who asked for it rather than to a
+        // socket's tail.
+        registry: None,
     });
     let mut ctx = Ctx {
         inner: inner.clone(),

@@ -116,6 +116,14 @@ pub(crate) struct Inner {
     /// is nothing for it to reach even if the check were missed.
     pub(crate) init_mode: bool,
     pub(crate) declaration: RefCell<Declaration>,
+
+    /// Counters an operator reads while this is running.
+    ///
+    /// Written here on the worker thread and read by `synch socket ps` from
+    /// another, which is why they are atomics rather than more `Cell`s.
+    pub(crate) live: Arc<crate::registry::LiveStats>,
+    /// Where `sy_log` lines are remembered for `synch socket log`.
+    pub(crate) registry: Option<Arc<crate::registry::Registry>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -240,17 +248,29 @@ impl Inner {
             .set(self.footprint.get().saturating_sub(bytes));
     }
 
+    /// Publishes the handle count, which only changes when the table does.
+    pub(crate) fn publish_handles(&self) {
+        let held = self.slots.borrow().iter().flatten().count() as u64;
+        self.live
+            .handles
+            .store(held, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Records a metric bump.
     pub(crate) fn metric(&self, name: &str, delta: i64) -> i64 {
         let mut metrics = self.metrics.borrow_mut();
         if let Some(slot) = metrics.iter_mut().find(|(n, _)| n == name) {
             slot.1 = slot.1.saturating_add(delta);
+            drop(metrics);
+            self.live.set_metrics(self.metrics.borrow().clone());
             return 0;
         }
         if metrics.len() >= MAX_METRIC_NAMES {
             return errno::ELIMIT;
         }
         metrics.push((name.to_string(), delta));
+        drop(metrics);
+        self.live.set_metrics(self.metrics.borrow().clone());
         0
     }
 
@@ -259,12 +279,16 @@ impl Inner {
         let mut labels = self.labels.borrow_mut();
         if let Some(slot) = labels.iter_mut().find(|(k, _)| k == key) {
             slot.1 = value.to_string();
+            drop(labels);
+            self.live.set_labels(self.labels.borrow().clone());
             return 0;
         }
         if labels.len() >= MAX_LABELS {
             return errno::ELIMIT;
         }
         labels.push((key.to_string(), value.to_string()));
+        drop(labels);
+        self.live.set_labels(self.labels.borrow().clone());
         0
     }
 
@@ -276,11 +300,28 @@ impl Inner {
         }
         let line = sanitize(&buf);
         buf.clear();
+        self.remember_log(&line);
+    }
+
+    /// Emits one log line: to the daemon's log, and to the socket's tail.
+    ///
+    /// Both, because they answer different questions. The daemon's log is the
+    /// history an operator's tooling already points at; the tail is what
+    /// `synch socket log` can show without asking them to go and find it.
+    pub(crate) fn remember_log(&self, line: &str) {
         tracing::info!(
             socket = %self.socket.qualified(),
             invocation = self.id,
             "{line}"
         );
+        if let Some(registry) = &self.registry {
+            registry.log_line(
+                &self.socket.qualified(),
+                self.id,
+                synch_core::now_ns(),
+                line.to_string(),
+            );
+        }
     }
 
     /// True if every endpoint has closed, failed, or hung up.

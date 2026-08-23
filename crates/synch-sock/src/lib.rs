@@ -32,6 +32,7 @@
 pub mod abi;
 pub mod limits;
 pub mod policy;
+pub mod registry;
 pub mod sdk;
 pub mod stream;
 
@@ -53,6 +54,7 @@ use synch_core::{Hash, NodeId, OriginId, SockStatus};
 
 pub use limits::Limits;
 pub use policy::{EffectivePolicy, PeerIdentity, SocketId};
+pub use registry::{InvocationInfo, LiveStats, LogLine, Registry, SlotGuard};
 pub use stream::DuplexStream;
 
 /// Whether this build has an eBPF runtime, and can therefore *serve* sockets.
@@ -184,6 +186,13 @@ pub struct Admission {
     pub host: Arc<dyn SocketHost>,
     /// The invocation id, as `synch socket ps` prints it.
     pub id: u64,
+    /// This invocation's place in the registry.
+    ///
+    /// `None` only where nothing is watching — a test harness. In the daemon
+    /// it is taken at admission and held until the invocation ends, which is
+    /// what makes the concurrency cap hold across the window between answering
+    /// `Opened` and the first instruction running.
+    pub slot: Option<SlotGuard>,
 }
 
 impl Admission {
@@ -200,6 +209,7 @@ impl Admission {
             self_origin: self.self_origin,
             host: self.host,
             id: self.id,
+            slot: self.slot,
         }
     }
 }
@@ -237,6 +247,8 @@ pub struct Invocation {
     pub host: Arc<dyn SocketHost>,
     /// The invocation id, as `synch socket ps` prints it.
     pub id: u64,
+    /// This invocation's place in the registry. See [`Admission::slot`].
+    pub slot: Option<SlotGuard>,
 }
 
 impl std::fmt::Debug for Invocation {

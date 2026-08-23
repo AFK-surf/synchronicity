@@ -195,11 +195,12 @@ fn h_log(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Res
             if byte == b'\n' || buf.len() >= MAX_LOG_LINE {
                 let line = crate::runtime::ctx::sanitize(&buf);
                 buf.clear();
-                tracing::info!(
-                    socket = %inner.socket.qualified(),
-                    invocation = inner.id,
-                    "{line}"
-                );
+                // Dropped before the emit: `remember_log` reaches the registry,
+                // and holding the buffer's borrow across it is a borrow held
+                // across a lock for no reason.
+                drop(buf);
+                inner.remember_log(&line);
+                buf = inner.log_buf.borrow_mut();
                 if byte == b'\n' {
                     continue;
                 }
@@ -412,7 +413,15 @@ fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) 
     if n <= 0 {
         return ret(n);
     }
-    with(scope, |inner| inner.made_progress())?;
+    with(scope, |inner| {
+        inner.made_progress();
+        if handle as i64 == SY_SELF {
+            inner
+                .live
+                .bytes_in
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    })?;
     let Ok(mut region) = scope.user_memory_mut(ptr, n as u64) else {
         return ret(errno::EINVAL);
     };
@@ -437,7 +446,18 @@ fn h_write(
     };
     let n = ep.write(&data);
     if n > 0 {
-        with(scope, |inner| inner.made_progress())?;
+        with(scope, |inner| {
+            inner.made_progress();
+            // Only the caller's stream is counted: a proxy moves the same bytes
+            // on both sides, and reporting the sum would say a socket did twice
+            // the work it did.
+            if handle as i64 == SY_SELF {
+                inner
+                    .live
+                    .bytes_out
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        })?;
     }
     ret(n)
 }
@@ -468,7 +488,9 @@ fn h_shutdown(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) 
 
 fn h_close(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
     with(scope, |inner| {
-        if inner.remove(handle as i64) {
+        let removed = inner.remove(handle as i64);
+        inner.publish_handles();
+        if removed {
             0
         } else {
             errno::EBADF
@@ -533,6 +555,7 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
         Err(e) => return e,
     };
     inner.egress_open.set(inner.egress_open.get() + 1);
+    inner.publish_handles();
     tokio::task::spawn_local(connect_task(ep, host, port));
     handle
 }
@@ -640,6 +663,11 @@ fn h_poll(
     } else {
         Duration::from_millis(timeout_ms as u64).min(until_deadline)
     };
+
+    inner
+        .live
+        .polls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let epoch = inner.ready.epoch();
     if let Some(count) = ready_now(&inner, &watch) {

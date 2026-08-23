@@ -2759,6 +2759,69 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::SocketPs(pb::SocketPs { target }) => {
+            let filter = match target.is_empty() {
+                true => None,
+                false => {
+                    let (space, path) = split_socket_target(&target)?;
+                    Some(format!("{space}/{path}"))
+                }
+            };
+            let running = node.socket_ps(filter.as_deref());
+            if running.is_empty() {
+                out.line("no invocations running".to_string()).await?;
+            }
+            for info in running {
+                out.line(format!(
+                    "{:<8} {:<34} {:<28} {:>7} {:>10} {:>10} {:>4}",
+                    info.id,
+                    info.socket,
+                    info.peer,
+                    render::duration(info.age.as_secs() as i64),
+                    info.bytes_in,
+                    info.bytes_out,
+                    info.handles,
+                ))
+                .await?;
+                // Only what the program chose to say about itself. An
+                // invocation that set nothing prints one line.
+                for (key, value) in &info.labels {
+                    out.line(format!("    {key}={value}")).await?;
+                }
+                for (name, value) in &info.metrics {
+                    out.line(format!("    {name} {value}")).await?;
+                }
+            }
+        }
+
+        Command::SocketKill(pb::SocketKill { invocation }) => {
+            if !node.socket_kill(invocation) {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("no invocation {invocation} is running here"),
+                ));
+            }
+            out.line(format!("killed {invocation}")).await?;
+        }
+
+        Command::SocketLog(pb::SocketLog { target }) => {
+            let (space, path) = split_socket_target(&target)?;
+            let lines = node.socket_log(&space, &path);
+            if lines.is_empty() {
+                out.line(format!("{space}/{path} has said nothing recently"))
+                    .await?;
+            }
+            for line in lines {
+                out.line(format!(
+                    "{} {:<8} {}",
+                    render::ago(line.at),
+                    line.invocation,
+                    line.text
+                ))
+                .await?;
+            }
+        }
+
         Command::SocketSdk(pb::SocketSdk {}) => {
             for line in synch_sock::sdk::HEADER.lines() {
                 out.line(line.to_string()).await?;

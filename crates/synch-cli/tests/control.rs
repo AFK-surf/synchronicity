@@ -1895,3 +1895,60 @@ async fn the_sdk_header_is_served_by_the_daemon_that_defines_it() {
 
     daemon.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_live_surface_answers_when_nothing_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    lines(
+        dir.path(),
+        space_add("code", space.path().to_str().unwrap()),
+    )
+    .await;
+    lines(dir.path(), socket_add("code/git.sock")).await;
+
+    // An empty answer is an answer, and saying so beats printing nothing and
+    // leaving an operator wondering whether the command worked.
+    let out = lines(
+        dir.path(),
+        Command::SocketPs(pb::SocketPs {
+            target: String::new(),
+        }),
+    )
+    .await;
+    assert!(out.contains("no invocations running"), "{out}");
+
+    let out = lines(
+        dir.path(),
+        Command::SocketLog(pb::SocketLog {
+            target: "code/git.sock".into(),
+        }),
+    )
+    .await;
+    assert!(out.contains("said nothing recently"), "{out}");
+
+    // Killing something that is not there is a not-found, not a silent success.
+    assert_eq!(
+        failure(
+            dir.path(),
+            Command::SocketKill(pb::SocketKill { invocation: 99 })
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+
+    // `ps` for one socket takes the same target shape everything else does.
+    assert_eq!(
+        failure(
+            dir.path(),
+            Command::SocketPs(pb::SocketPs {
+                target: "nas@cluster.example:code/git.sock".into(),
+            })
+        )
+        .await,
+        ErrorCode::Invalid
+    );
+
+    daemon.shutdown().await;
+}

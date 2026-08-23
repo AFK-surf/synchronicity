@@ -805,6 +805,26 @@ impl Node {
             .unwrap_or(0)
     }
 
+    /// Takes a concurrency slot for one invocation, or reports the socket full.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a pass-through to the registry, whose arguments are the facts                   a live-invocation entry is made of"
+    )]
+    pub(crate) fn reserve_socket_slot(
+        &self,
+        id: u64,
+        socket: &str,
+        peer: &str,
+        peer_key: synch_core::NodeId,
+        program: synch_core::Hash,
+        max_streams: usize,
+    ) -> Option<synch_sock::SlotGuard> {
+        self.inner
+            .sockets
+            .as_ref()?
+            .reserve(id, socket, peer, peer_key, program, max_streams)
+    }
+
     /// Drops everything one socket's map held.
     pub(crate) fn clear_socket_map(&self, socket: &str) {
         if let Some(pool) = &self.inner.sockets {

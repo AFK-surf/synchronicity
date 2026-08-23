@@ -226,6 +226,12 @@ message Command {
     SocketLs socket_ls = 51;
     // `synch socket sdk`
     SocketSdk socket_sdk = 52;
+    // `synch socket ps [<space>/<path>]`
+    SocketPs socket_ps = 53;
+    // `synch socket kill <invocation>`
+    SocketKill socket_kill = 54;
+    // `synch socket log <space>/<path>`
+    SocketLog socket_log = 55;
   }
 }
 
@@ -859,6 +865,21 @@ message SocketLs {
 }
 
 message SocketSdk {}
+
+message SocketPs {
+  // Empty lists every socket's invocations.
+  string target = 1;
+}
+
+message SocketKill {
+  // The invocation id `synch socket ps` printed.
+  uint64 invocation = 1;
+}
+
+message SocketLog {
+  // `<space>/<path>`.
+  string target = 1;
+}
 
 // One `synch connect` message.
 message ConnectRequest {

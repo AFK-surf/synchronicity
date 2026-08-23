@@ -850,6 +850,25 @@ pub enum SocketCommand {
         #[arg(short, long)]
         long: bool,
     },
+    /// Show the invocations running right now.
+    Ps {
+        /// Only this socket, as `<space>/<path>`.
+        target: Option<String>,
+    },
+    /// End one running invocation.
+    ///
+    /// The caller's stream closes with `Killed`. What the program had already
+    /// written still reaches them: a kill ends the invocation, it does not
+    /// unsay what it said.
+    Kill {
+        /// The invocation id `synch socket ps` printed.
+        invocation: u64,
+    },
+    /// Show what a socket's programs have written with `sy_log`.
+    Log {
+        /// `<space>/<path>`.
+        target: String,
+    },
     /// Print the C SDK header a socket program is compiled against.
     Sdk,
 }

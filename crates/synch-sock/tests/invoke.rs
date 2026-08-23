@@ -147,6 +147,31 @@ impl Harness {
         }
     }
 
+    /// An invocation that takes a real registry slot, as the daemon's does.
+    fn admitted(
+        &self,
+        elf: &[u8],
+        stream: DuplexStream,
+        registry: &Arc<synch_sock::Registry>,
+        max_streams: usize,
+    ) -> Option<Invocation> {
+        let id = self.pool.next_id();
+        let slot = registry.reserve(
+            id,
+            "code/test.sock",
+            "laptop@cluster.example",
+            NodeId::from_bytes(&synch_sock::policy::NOBODY).unwrap(),
+            Hash::new(elf),
+            max_streams,
+            std::time::Instant::now(),
+        )?;
+        let mut invocation =
+            self.invocation(elf, stream, EffectivePolicy::default(), peer(None), vec![]);
+        invocation.id = id;
+        invocation.slot = Some(slot);
+        Some(invocation)
+    }
+
     fn with_limits(limits: Limits) -> Harness {
         Harness {
             pool: WorkerHandle::start(1, limits),
@@ -185,6 +210,7 @@ impl Harness {
             self_origin: OriginId::named("nas", "cluster.example").unwrap(),
             host: self.tree.clone(),
             id: self.pool.next_id(),
+            slot: None,
         }
     }
 }
@@ -794,4 +820,151 @@ fn the_documented_example_compiles_against_the_shipped_header() {
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
     assert_eq!(declared.max_streams, Some(32));
+}
+
+const HOLD_OPEN: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_label_set(SY_STR("phase"), SY_STR("waiting"));
+  sy_metric_add(SY_STR("started"), 1);
+  char buf[64];
+  struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+  for (;;) {
+    if (sy_poll(fds, 1, 10000) <= 0) break;
+    sy_s64 n = sy_read(SY_SELF, buf, sizeof buf);
+    if (n == 0) break;
+    if (n < 0) { if (n == SY_EAGAIN) continue; break; }
+    sy_write(SY_SELF, buf, (sy_u64)n);
+  }
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_registry_shows_a_running_invocation_and_caps_how_many_there_are() {
+    if !have_clang() {
+        eprintln!("skipping: no clang with a BPF target");
+        return;
+    }
+    let elf = compile(HOLD_OPEN).expect("the fixture compiles");
+    let harness = Harness::new();
+    // The pool's own registry, as the daemon uses: the slot and the cancel
+    // channel have to be in the same one for a kill to reach anything.
+    let registry = harness.pool.registry().clone();
+
+    // One slot, and it is taken.
+    let (mut mine, theirs) = tokio::io::duplex(4096);
+    let (r, w) = tokio::io::split(theirs);
+    let first = harness
+        .admitted(&elf, DuplexStream::new(r, w), &registry, 1)
+        .expect("the first invocation is admitted");
+    let id = first.id;
+
+    let pool = harness.pool.clone();
+    let running = tokio::spawn(async move { pool.run(first).await });
+
+    // A second admission is refused while the first holds the only slot. This
+    // is the cap that `Refused{Busy}` exists for, and before the registry it
+    // was never checked anywhere.
+    let (_spare, other) = tokio::io::duplex(64);
+    let (r2, w2) = tokio::io::split(other);
+    assert!(
+        harness
+            .admitted(&elf, DuplexStream::new(r2, w2), &registry, 1)
+            .is_none(),
+        "the concurrency cap admitted a second invocation"
+    );
+
+    // Drive it, so there is something to see.
+    mine.write_all(b"hello").await.unwrap();
+    let mut echoed = [0u8; 5];
+    mine.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"hello");
+
+    let seen = registry.snapshot(None, std::time::Instant::now());
+    assert_eq!(
+        seen.len(),
+        1,
+        "the running invocation is not in the registry"
+    );
+    assert_eq!(seen[0].id, id);
+    assert_eq!(seen[0].bytes_in, 5);
+    assert_eq!(seen[0].bytes_out, 5);
+    assert_eq!(seen[0].handles, 1, "SY_SELF is the only handle it holds");
+    assert!(seen[0].polls > 0);
+    assert_eq!(
+        seen[0].labels,
+        vec![("phase".to_string(), "waiting".to_string())]
+    );
+    assert_eq!(seen[0].metrics, vec![("started".to_string(), 1)]);
+
+    // A kill reaches it, and the slot comes back.
+    assert!(registry.kill(id), "the kill found no invocation");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("the killed invocation did not end")
+        .unwrap()
+        .expect("the program ran");
+    assert_eq!(outcome.status, SockStatus::Killed);
+
+    assert!(
+        registry
+            .snapshot(None, std::time::Instant::now())
+            .is_empty(),
+        "a finished invocation stayed in the registry"
+    );
+    let (_a, b) = tokio::io::duplex(64);
+    let (r3, w3) = tokio::io::split(b);
+    assert!(
+        harness
+            .admitted(&elf, DuplexStream::new(r3, w3), &registry, 1)
+            .is_some(),
+        "the slot was not given back"
+    );
+}
+
+const TALKATIVE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_log(SY_STR("first line\n"));
+  sy_log(SY_STR("second line\n"));
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn what_a_program_logs_is_kept_for_its_socket() {
+    if !have_clang() {
+        eprintln!("skipping: no clang with a BPF target");
+        return;
+    }
+    let elf = compile(TALKATIVE).expect("the fixture compiles");
+    let harness = Harness::new();
+    let registry = harness.pool.registry().clone();
+
+    let (mine, theirs) = tokio::io::duplex(1024);
+    drop(mine);
+    let (r, w) = tokio::io::split(theirs);
+    let mut invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(r, w),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    invocation.socket = SocketId::new("code", "talkative.sock");
+    harness.pool.run(invocation).await.expect("the program ran");
+
+    let lines = registry.logs("code/talkative.sock");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0].text, "first line");
+    assert_eq!(lines[1].text, "second line");
+    assert!(
+        registry.logs("code/other.sock").is_empty(),
+        "log lines leaked between sockets"
+    );
 }

@@ -1,10 +1,11 @@
 # Sockets
 
-Status: **implemented**, except the live-invocation surface — `synch socket ps`,
-`kill` and `log` — which §12 records as not built. Everything else here
-describes the built thing: the record kind, the arming tables, the
-`sync/sock/1` protocol, the host API and its runtime, the scanner's publishing
-rule, and the command surface.
+Status: **implemented**. Everything here describes the built thing: the record
+kind, the arming tables, the `sync/sock/1` protocol, the host API and its
+runtime, the scanner's publishing rule, the live-invocation registry, and the
+command surface. The one thing named here and not built is `synch doctor`
+reporting on sockets — the same facts are in `synch socket ls -l` and
+`synch socket ps`, and each place below says so.
 
 Checked against the tree it landed in. Where the built thing differs from an
 earlier draft of this design, this document has been corrected to describe the
@@ -573,6 +574,10 @@ synch socket arm <space>/<path> [--root <hex>]        approve the current bytes,
 synch socket disarm <space>/<path>                    keep publishing it, stop running it
 synch socket rm <space>/<path>                        republish as an ordinary file
 synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
+synch socket ps [<space>/<path>]                      live invocations: peer, age, bytes,
+                                                      handles, labels, counters
+synch socket kill <invocation>                        end one; the stream closes Killed
+synch socket log <space>/<path>                       what its sy_log calls said
 synch socket sdk                                      print the C SDK header, from the
                                                       build that defines the ABI
 
@@ -585,6 +590,12 @@ synch connect <origin>:<space>/<path>                 stdio by default: stdin �
 was armed, and what the program declared when it was armed — so "the bytes
 changed and nobody re-approved them" is visible as a difference between two
 lines rather than inferred.
+
+`synch socket ps` reads the registry, which is what `kill` pulls, what the
+concurrency cap counts, and what `log` keeps a tail in. It holds nothing
+durable: a restart has no live invocations by definition, and recent log lines
+and fault history are working state rather than a record — what a socket did is
+what it wrote to whatever it was talking to.
 
 `synch socket sdk` prints the header from the binary that defines the ABI.
 A header on disk beside the binary is one that can be older than the binary,
@@ -630,12 +641,13 @@ own.
 | --- | --- | --- |
 | Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
-| Faults on ≥ 8 of the last 16 invocations | — | *Not built.* The thresholds are written down and nothing counts against them yet — see §12. |
+| Faults on ≥ 8 of the last 16 invocations | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
 | JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |
 | Bytes changed under an armed socket | refused | `Refused{NotArmed}` naming both roots. In-flight invocations keep their root. |
 | Egress to an unarmed destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
 | Preemption watcher failed | refused | That worker refuses new runs — async-ebpf checks this itself rather than risk a guest that cannot be interrupted. Surfacing the degraded worker count in `synch doctor` is not built. |
+| A socket is at its concurrency cap | refused | `Refused{Busy}` naming the cap. The slot is taken at *admission* and released when the invocation ends or the admission is dropped, so a caller that opens streams and never uses them cannot walk through the cap. |
 
 ## 11. What this changes in the existing design
 
@@ -693,18 +705,6 @@ Not in this design:
 - **Running a peer's program**, under any flag, at any trust level. This is the
   rule the whole design is built on.
 - **Serving sockets on macOS or Windows**, until async-ebpf runs there.
-
-Not built yet, and named in the status line:
-
-- **`synch socket ps`, `kill` and `log`.** Watching live invocations needs a
-  registry of them, which the runtime does not keep: an invocation is placed on
-  a worker and known to that worker, and nothing above collects them. The parts
-  that would feed it are built and unused — `sy_label_set` and `sy_metric_add`
-  come back in the invocation's outcome, and the cancellation channel that
-  `kill` would pull is what a daemon shutdown already uses.
-- **Fault quarantine.** The thresholds are written down (`FAULT_QUARANTINE`,
-  `FAULT_WINDOW`) and nothing counts against them yet, for the same reason: it
-  needs the per-socket history that the same registry would hold.
 
 Worth building next:
 

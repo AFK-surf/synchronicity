@@ -261,6 +261,31 @@ impl Node {
         };
 
         let policy = self.socket_policy(&resolved.state);
+        let qualified = format!("{}/{}", open.space, open.path);
+        let id = self.next_socket_id();
+
+        // The concurrency cap, finally enforced somewhere it can be: the
+        // registry counts what is running and hands back a slot or refuses.
+        // Taken here rather than when the guest starts, because the window
+        // between answering `Opened` and the first instruction running is one
+        // the caller controls.
+        let slot = self.reserve_socket_slot(
+            id,
+            &qualified,
+            &origin.canonical(),
+            peer,
+            resolved.root,
+            policy.max_streams,
+        );
+        let Some(slot) = slot else {
+            return Err((
+                RefuseCode::Busy,
+                format!(
+                    "{qualified} is at its limit of {} concurrent invocations",
+                    policy.max_streams
+                ),
+            ));
+        };
 
         Ok(Admission {
             program: Arc::new(program),
@@ -280,21 +305,71 @@ impl Node {
                 node: self.clone(),
                 own_origin: self.origin().clone(),
             }),
-            id: self.next_socket_id(),
+            id,
+            slot: Some(slot),
         })
     }
 
     /// Runs an admitted invocation.
     pub async fn run_socket(&self, admission: Admission, stream: DuplexStream) -> SockStatus {
+        let socket = admission.socket.clone();
+        let Some(pool) = self.socket_workers() else {
+            return SockStatus::Shutdown;
+        };
+        let status = match pool.run(admission.with_stream(stream)).await {
+            Ok(outcome) => outcome.status,
+            Err(e) => {
+                tracing::warn!("socket invocation failed: {e}");
+                SockStatus::Fault(synch_core::FaultKind::Load)
+            }
+        };
+        // The pool has already recorded this outcome against the socket's
+        // fault history; what it cannot do is disarm, which is a store write.
+        if pool.should_quarantine(&socket.qualified()) {
+            self.quarantine_socket(&socket.space, &socket.path);
+        }
+        status
+    }
+
+    /// Disarms a socket that has been faulting on most of what it is asked.
+    ///
+    /// A program that cannot run is not left accepting connections: every
+    /// caller gets a reset instead of an answer, and the operator finds out
+    /// from their users. Disarmed rather than undeclared — the declaration and
+    /// its policy are the operator's and survive; what is withdrawn is the
+    /// approval of *these bytes*, which have proved they do not work.
+    fn quarantine_socket(&self, space: &str, path: &str) {
+        match self.store().disarm_socket(space, path) {
+            Ok(true) => tracing::error!(
+                socket = format!("{space}/{path}"),
+                "socket disarmed: it faulted on most of its recent invocations.                  Fix the program and `synch socket arm` it again."
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                socket = format!("{space}/{path}"),
+                "could not disarm a faulting socket: {e}"
+            ),
+        }
+    }
+
+    /// Every invocation running right now, optionally for one socket.
+    pub fn socket_ps(&self, socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
         match self.socket_workers() {
-            Some(pool) => match pool.run(admission.with_stream(stream)).await {
-                Ok(outcome) => outcome.status,
-                Err(e) => {
-                    tracing::warn!("socket invocation failed: {e}");
-                    SockStatus::Fault(synch_core::FaultKind::Load)
-                }
-            },
-            None => SockStatus::Shutdown,
+            Some(pool) => pool.snapshot(socket),
+            None => Vec::new(),
+        }
+    }
+
+    /// Ends one invocation, reporting whether there was one to end.
+    pub fn socket_kill(&self, id: u64) -> bool {
+        self.socket_workers().is_some_and(|pool| pool.kill(id))
+    }
+
+    /// What one socket's programs have written recently.
+    pub fn socket_log(&self, space: &str, path: &str) -> Vec<synch_sock::LogLine> {
+        match self.socket_workers() {
+            Some(pool) => pool.logs(&format!("{space}/{path}")),
+            None => Vec::new(),
         }
     }
 }
@@ -543,6 +618,55 @@ mod pool {
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
             self.0.run(invocation).await
         }
+
+        /// Takes a concurrency slot, or reports the socket full.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "a pass-through to `Registry::reserve`, whose arguments are                       the facts an entry is made of"
+        )]
+        pub fn reserve(
+            &self,
+            id: u64,
+            socket: &str,
+            peer: &str,
+            peer_key: synch_core::NodeId,
+            program: Hash,
+            max_streams: usize,
+        ) -> Option<synch_sock::SlotGuard> {
+            self.0.registry().reserve(
+                id,
+                socket,
+                peer,
+                peer_key,
+                program,
+                max_streams,
+                std::time::Instant::now(),
+            )
+        }
+
+        /// Whether a socket has been faulting enough to be disarmed.
+        pub fn should_quarantine(&self, socket: &str) -> bool {
+            // The pool recorded the outcome as the invocation ended; this only
+            // reads the verdict it reached.
+            self.0.registry().take_quarantine(socket)
+        }
+
+        /// Everything running.
+        pub fn snapshot(&self, socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
+            self.0
+                .registry()
+                .snapshot(socket, std::time::Instant::now())
+        }
+
+        /// Ends one invocation.
+        pub fn kill(&self, id: u64) -> bool {
+            self.0.registry().kill(id)
+        }
+
+        /// One socket's recent log lines.
+        pub fn logs(&self, socket: &str) -> Vec<synch_sock::LogLine> {
+            self.0.registry().logs(socket)
+        }
     }
 
     /// Runs a program's declaration hook.
@@ -591,6 +715,43 @@ mod pool {
             _invocation: synch_sock::Invocation,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
             Err(synch_sock::SockError::Unsupported)
+        }
+
+        /// Unreachable: admission refuses before it reaches this.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "matches the shape of the implementation it stands in for"
+        )]
+        pub fn reserve(
+            &self,
+            _id: u64,
+            _socket: &str,
+            _peer: &str,
+            _peer_key: synch_core::NodeId,
+            _program: Hash,
+            _max_streams: usize,
+        ) -> Option<synch_sock::SlotGuard> {
+            None
+        }
+
+        /// Nothing runs, so nothing faults.
+        pub fn should_quarantine(&self, _socket: &str) -> bool {
+            false
+        }
+
+        /// Nothing runs here.
+        pub fn snapshot(&self, _socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
+            Vec::new()
+        }
+
+        /// Nothing runs here.
+        pub fn kill(&self, _id: u64) -> bool {
+            false
+        }
+
+        /// Nothing runs here.
+        pub fn logs(&self, _socket: &str) -> Vec<synch_sock::LogLine> {
+            Vec::new()
         }
     }
 
