@@ -1622,23 +1622,21 @@ impl Adoption {
         Ok(())
     }
 
-    /// The staging file is renamed over the target relative to the pinned
-    /// parent directory (Windows): `NtSetInformationFile` renames the open
-    /// staging file with the parent handle as the root, so a directory
-    /// swapped for a junction — before the open or while the body streamed —
-    /// cannot redirect the write. A write that was not opened against a
-    /// space root keeps the plain rename, exactly as before.
+    /// The staging file is renamed over the target (Windows): `MoveFileExW`
+    /// with the full paths, followed by the containment check that verifies
+    /// the file landed at the intended path — so a directory swapped for a
+    /// junction — before the open or while the body streamed — cannot
+    /// silently redirect the write outside the space. A write that was not
+    /// opened against a space root keeps the plain rename, exactly as
+    /// before.
     #[cfg(windows)]
     fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
         match self.parent.take() {
             Some(dir) => {
-                let staging = self
-                    .staging
-                    .file_name()
-                    .ok_or_else(|| EngineError::invalid("the staging path has no file name"))?;
+                let staging = self.staging.clone();
                 let target = self.target.clone();
                 drop(file);
-                nt::rename_into(&dir, &staging.to_string_lossy(), &target)?;
+                nt::rename_into(&dir, &staging, &target)?;
             }
             None => {
                 drop(file);
@@ -1721,6 +1719,7 @@ fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> 
 /// directly against ntdll; their ABI is stable and documented (ntifs.h).
 #[cfg(windows)]
 mod nt {
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
     use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
@@ -1742,13 +1741,6 @@ mod nt {
             create_options: u32,
             ea_buffer: *mut core::ffi::c_void,
             ea_length: u32,
-        ) -> NTSTATUS;
-        fn NtSetInformationFile(
-            file_handle: HANDLE,
-            io_status_block: *mut IO_STATUS_BLOCK,
-            file_information: *const core::ffi::c_void,
-            length: u32,
-            file_information_class: u32,
         ) -> NTSTATUS;
     }
 
@@ -1781,7 +1773,6 @@ mod nt {
     const FILE_OPEN: u32 = 0x0000_0001;
     const FILE_CREATE: u32 = 0x0000_0002;
     const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
-    const FILE_RENAME_INFORMATION: u32 = 10;
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     const STATUS_SUCCESS: NTSTATUS = 0;
     const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034u32 as i32;
@@ -1840,6 +1831,12 @@ mod nt {
             dir = next;
         }
         Ok(dir)
+    }
+
+    /// The path as a null-terminated Win32 string, for the Win32 APIs — the
+    /// `\\?\` extended form as stored, which they accept verbatim.
+    fn win32_wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
     /// The Win32 path `root` as an absolute NT path (`\??\`-prefixed), for
@@ -1960,57 +1957,56 @@ mod nt {
         Ok(std::fs::File::from(handle))
     }
 
-    /// Renames the staging file to `target` — the full-path form of the
-    /// rename every rename implementation uses (cygwin, the Explorer
-    /// recipes), followed by a containment check: if the name resolved
-    /// through a junction swapped in by a local actor, the file's actual
-    /// location differs from the intended one, and the file is removed
-    /// there and the write fails closed instead of silently landing outside
-    /// the space.
-    ///
-    /// The file is reopened by name first, with the minimal access the
-    /// rename requires (`DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`): the
-    /// payload handle was opened for read/write, and the rename's own access
-    /// check is against the handle it is given.
-    pub fn rename_into(dir: &OwnedHandle, staging: &str, target: &std::path::Path) -> Result<()> {
-        let reopened = reopen_for_delete(dir, staging)?;
-        let wide: Vec<u16> = root_wide(target);
-        // FILE_RENAME_INFO, built by hand because its FileName is inline:
-        // Flags(4) pad(4) RootDirectory(8) FileNameLength(4) pad(4) FileName.
-        // `RootDirectory` is null: the name is the full NT path, which is the
-        // form the kernel accepts reliably for a cross-checked rename.
-        let header = 24usize;
-        let mut buf = vec![0u8; header + wide.len() * 2];
-        unsafe {
-            let p = buf.as_mut_ptr();
-            *(p as *mut u32) = 0;
-            *(p.add(16) as *mut u32) = (wide.len() * 2) as u32;
-            core::ptr::copy_nonoverlapping(wide.as_ptr(), p.add(header) as *mut u16, wide.len());
-        }
-        let mut status_block = IO_STATUS_BLOCK {
-            status: 0,
-            information: 0,
-        };
-        let status = unsafe {
-            NtSetInformationFile(
-                reopened.as_raw_handle() as HANDLE,
-                &mut status_block,
-                buf.as_ptr() as *const core::ffi::c_void,
-                buf.len() as u32,
-                FILE_RENAME_INFORMATION,
+    /// Renames the staging file to `target` — `MoveFileExW`, the same API
+    /// `std::fs::rename` uses on Windows — followed by a containment check:
+    /// if the move
+    /// resolved through a junction swapped in by a local actor, the file's
+    /// actual location differs from the intended one, and the file is
+    /// removed there and the write fails closed instead of silently landing
+    /// outside the space.
+    pub fn rename_into(
+        dir: &OwnedHandle,
+        staging: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Result<()> {
+        let staging_wide = win32_wide(staging);
+        let target_wide = win32_wide(target);
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                staging_wide.as_ptr(),
+                target_wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING,
             )
         };
-        if status != STATUS_SUCCESS {
+        if ok == 0 {
             return Err(EngineError::invalid(format!(
-                "rename into place failed: NTSTATUS {status:#x}"
+                "rename into place failed: {}",
+                std::io::Error::last_os_error()
             )));
         }
         // The containment check: the file must now be at the intended path.
-        // A junction swapped in by a local actor resolves the full path
-        // elsewhere, and the file is removed there rather than left behind
-        // outside the space.
-        match final_path(&reopened) {
-            Ok(actual) if paths_equal(&actual, &wide) => Ok(()),
+        // A junction swapped in by a local actor resolves the move elsewhere,
+        // and the file is removed there rather than left behind outside the
+        // space.
+        let intended = root_wide(target);
+        let name = target
+            .file_name()
+            .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+        let name_wide: Vec<u16> = name.to_string_lossy().encode_utf16().collect();
+        let opened = open_relative(
+            &name_wide,
+            Some(dir),
+            0x0000_0080, // FILE_READ_ATTRIBUTES
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+        .map_err(|status| {
+            EngineError::invalid(format!(
+                "the renamed file is not at the intended path: NTSTATUS {status:#x}"
+            ))
+        })?;
+        match final_path(&opened) {
+            Ok(actual) if paths_equal(&actual, &intended) => Ok(()),
             Ok(actual) => {
                 let actual = String::from_utf16_lossy(&actual);
                 let _ = std::fs::remove_file(&actual);
@@ -2059,30 +2055,6 @@ mod nt {
                 .iter()
                 .zip(expected.iter())
                 .all(|(a, b)| fold(*a) == fold(*b))
-    }
-
-    /// Reopens `name` inside `dir` with the access a rename needs: the
-    /// minimal `DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, with the
-    /// backup-intent flag the rename recipes open with — the payload handle
-    /// was opened for read/write, and the rename's own access check is
-    /// against the handle it is given.
-    fn reopen_for_delete(dir: &OwnedHandle, name: &str) -> Result<OwnedHandle> {
-        let wide: Vec<u16> = name.encode_utf16().collect();
-        open_relative(
-            &wide,
-            Some(dir),
-            0x0001_0000 | 0x0000_0080 | 0x0010_0000,
-            FILE_OPEN,
-            // Never follow a reparse point at the staging name: a local actor
-            // who swapped the staging entry for a junction must not redirect
-            // the rename to whatever it points at.
-            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | 0x0000_4000,
-        )
-        .map_err(|status| {
-            EngineError::invalid(format!(
-                "could not reopen the staging file for the rename: NTSTATUS {status:#x}"
-            ))
-        })
     }
 }
 
