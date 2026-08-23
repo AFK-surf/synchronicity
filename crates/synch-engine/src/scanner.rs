@@ -1161,18 +1161,16 @@ pub struct Adoption {
     /// gates immediately before it, and the review history of this branch is
     /// mostly the record of callers that did not.
     space: Option<SpaceWrite>,
-    /// The escape guard re-verified at commit (non-Unix): `(space root,
-    /// normalized relative path)`. `None` for writes that are not space-bound
-    /// (the mirror's materializations, detached staging).
-    #[cfg(not(unix))]
-    escape: Option<(PathBuf, String)>,
     /// The directory the staging file and the target live in, resolved
-    /// component by component with `O_NOFOLLOW` at open, so the commit
-    /// rename resolves relative to it (Unix). A directory swapped for a
-    /// symlink — before the open or while the body streams — cannot redirect
-    /// a rename that never re-resolves a path.
+    /// component by component at open — `O_NOFOLLOW` on Unix, a rooted
+    /// `NtCreateFile` chain with `FILE_OPEN_REPARSE_POINT` on Windows — so
+    /// the commit rename resolves relative to it. A directory swapped for a
+    /// symlink or junction — before the open or while the body streams —
+    /// cannot redirect a rename that never re-resolves a path.
     #[cfg(unix)]
     parent: Option<rustix::fd::OwnedFd>,
+    #[cfg(windows)]
+    parent: Option<std::os::windows::io::OwnedHandle>,
 }
 
 /// What a write into an indexed space needs to re-check before it lands.
@@ -1251,9 +1249,9 @@ impl Adoption {
             file: Some(file),
             written: 0,
             space: None,
-            #[cfg(not(unix))]
-            escape: None,
             #[cfg(unix)]
+            parent: None,
+            #[cfg(windows)]
             parent: None,
         })
     }
@@ -1311,20 +1309,41 @@ impl Adoption {
             file: Some(std::fs::File::from(file)),
             written: 0,
             space: None,
-            #[cfg(not(unix))]
-            escape: None,
             parent: Some(parent),
         })
     }
 
-    /// The non-Unix shape of [`Self::in_space`]: no directory handles to pin
-    /// with, so the escape guard is re-run in the same blocking step as the
-    /// rename the commit performs.
-    #[cfg(not(unix))]
+    /// The Windows shape of [`Self::in_space`]: the parent directory is
+    /// resolved with a rooted `NtCreateFile` chain, one component at a time
+    /// with `FILE_OPEN_REPARSE_POINT`, so a junction is never followed; the
+    /// staging file is created relative to the resolved parent, and the
+    /// commit renames the staging file relative to that same parent. No path
+    /// is re-resolved by the commit, so a directory swapped for a junction
+    /// while the body streamed cannot redirect the write outside the space.
+    #[cfg(windows)]
     pub(crate) fn in_space(root: &Path, rel: &str) -> Result<Adoption> {
-        let mut adoption = Adoption::open(root.join(rel))?;
-        adoption.escape = Some((root.to_path_buf(), rel.to_string()));
-        Ok(adoption)
+        let parent = nt::open_parent_no_follow(root, rel)?;
+        // The staging name has to be unique per write: two clients putting the
+        // same key at once must not share one file and interleave their bytes.
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let staging_name = format!(
+            ".{name}.{}.{}{PART_SUFFIX}",
+            std::process::id(),
+            synch_core::now_ns()
+        );
+        // Created relative to the pinned parent — a pre-placed reparse point
+        // at the staging name is opened as itself (`OPEN_REPARSE_POINT`)
+        // rather than followed, and overwritten in place.
+        let file = nt::create_staging(&parent, &staging_name)?;
+        let staging = root.join(rel).with_file_name(&staging_name);
+        Ok(Adoption {
+            target: root.join(rel),
+            staging,
+            file: Some(file),
+            written: 0,
+            space: None,
+            parent: Some(parent),
+        })
     }
 
     /// Stages a write that starts out as a clone of a file already on disk
@@ -1556,8 +1575,7 @@ impl Adoption {
             .take()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.sync_all()?;
-        drop(file);
-        self.rename_into_place()?;
+        self.rename_into_place(file)?;
         fsync_parent(&self.target);
         Ok(())
     }
@@ -1571,7 +1589,8 @@ impl Adoption {
     /// keeps the plain rename, exactly as before; its own guard runs in the
     /// same blocking step ([`crate::mirror`]).
     #[cfg(unix)]
-    fn rename_into_place(&mut self) -> Result<()> {
+    fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
+        drop(file);
         match self.parent.take() {
             Some(dir) => {
                 let staging = self
@@ -1590,21 +1609,27 @@ impl Adoption {
         Ok(())
     }
 
-    /// The staging file is renamed over the target after re-running the
-    /// escape guard in the same blocking step (non-Unix, where there are no
-    /// directory handles to pin with). The window a swapped parent could
-    /// exploit is the single rename, not the whole body stream.
-    #[cfg(not(unix))]
-    fn rename_into_place(&mut self) -> Result<()> {
-        if let Some((root, rel)) = &self.escape {
-            if crate::mirror::escapes_via_symlink(root, rel) {
-                return Err(EngineError::invalid(format!(
-                    "{} resolves through a symlinked directory and would leave the space",
-                    self.target.display()
-                )));
+    /// The staging file is renamed over the target relative to the pinned
+    /// parent directory (Windows): `NtSetInformationFile` renames the open
+    /// staging file with the parent handle as the root, so a directory
+    /// swapped for a junction — before the open or while the body streamed —
+    /// cannot redirect the write. A write that was not opened against a
+    /// space root keeps the plain rename, exactly as before.
+    #[cfg(windows)]
+    fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
+        match self.parent.take() {
+            Some(dir) => {
+                let target = self
+                    .target
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+                nt::rename_into(&dir, &file, &target.to_string_lossy())?;
+            }
+            None => {
+                drop(file);
+                std::fs::rename(&self.staging, &self.target)?;
             }
         }
-        std::fs::rename(&self.staging, &self.target)?;
         Ok(())
     }
 }
@@ -1672,6 +1697,276 @@ fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> 
         }
     }
     Ok(dir)
+}
+
+/// The Windows half of the pinned write: rooted, handle-relative directory
+/// resolution and rename (see [`Adoption::in_space`]).
+///
+/// The user-mode NT functions windows-sys does not carry are declared
+/// directly against ntdll; their ABI is stable and documented (ntifs.h).
+#[cfg(windows)]
+mod nt {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, NTSTATUS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, OPEN_EXISTING,
+    };
+
+    use crate::error::{EngineError, Result};
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE,
+            desired_access: u32,
+            object_attributes: *const OBJECT_ATTRIBUTES,
+            io_status_block: *mut IO_STATUS_BLOCK,
+            allocation_size: *const i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut core::ffi::c_void,
+            ea_length: u32,
+        ) -> NTSTATUS;
+        fn NtSetInformationFile(
+            file_handle: HANDLE,
+            io_status_block: *mut IO_STATUS_BLOCK,
+            file_information: *const core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> NTSTATUS;
+    }
+
+    #[repr(C)]
+    struct UNICODE_STRING {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct OBJECT_ATTRIBUTES {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *const UNICODE_STRING,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IO_STATUS_BLOCK {
+        status: usize,
+        information: usize,
+    }
+
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
+    const FILE_RENAME_INFORMATION: u32 = 10;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const STATUS_SUCCESS: NTSTATUS = 0;
+    const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034u32 as i32;
+    // List/read a directory, add files and subdirectories to it, and
+    // synchronize on the handle — what the resolution and the staging-file
+    // creation below need.
+    const DIR_ACCESS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0080 | 0x0010_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
+    /// Resolves `rel`'s parent directory under `root`, one component at a
+    /// time, never following a reparse point; missing components are
+    /// created. The returned handle is what the staging file is created
+    /// against and what the commit rename resolves against.
+    pub fn open_parent_no_follow(root: &std::path::Path, rel: &str) -> Result<OwnedHandle> {
+        // The space root itself: opened with `OPEN_REPARSE_POINT` so its own
+        // entry being a junction is refused rather than followed. Its
+        // ancestors lie outside the space, where the threat model grants a
+        // local actor nothing.
+        let wide: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DIR_ACCESS,
+                FILE_SHARE_ALL,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(EngineError::invalid(format!(
+                "could not open the space root {}: {}",
+                root.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut dir = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+        components.pop(); // the file name itself is not resolved, only its parents
+        for component in components {
+            let next = match create_relative(&dir, component, FILE_OPEN) {
+                Ok(next) => next,
+                Err(status) if status == STATUS_OBJECT_NAME_NOT_FOUND => {
+                    // The path-based open creates missing parents; so does
+                    // this one (`FILE_CREATE` opens the new directory).
+                    create_relative(&dir, component, FILE_CREATE).map_err(|status| {
+                        EngineError::invalid(format!(
+                            "could not create the write's parent directory {component}: \
+                             NTSTATUS {status:#x}"
+                        ))
+                    })?
+                }
+                Err(status) => {
+                    return Err(EngineError::invalid(format!(
+                        "could not open the write's parent directory {component}: \
+                         NTSTATUS {status:#x}"
+                    )))
+                }
+            };
+            dir = next;
+        }
+        Ok(dir)
+    }
+
+    /// Opens or creates `name` inside `dir` as a directory handle, never
+    /// following a reparse point.
+    fn create_relative(
+        dir: &OwnedHandle,
+        name: &str,
+        disposition: u32,
+    ) -> std::result::Result<OwnedHandle, NTSTATUS> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let mut unicode = UNICODE_STRING {
+            length: (wide.len() * 2) as u16,
+            maximum_length: (wide.len() * 2) as u16,
+            buffer: wide.as_ptr() as *mut u16,
+        };
+        let mut attributes = OBJECT_ATTRIBUTES {
+            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            root_directory: dir.as_raw_handle() as HANDLE,
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                DIR_ACCESS,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                disposition,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+    }
+
+    /// Creates the staging file inside `dir`, never following a reparse
+    /// point at the name (a pre-placed junction is opened as itself and
+    /// overwritten in place, never followed).
+    pub fn create_staging(dir: &OwnedHandle, name: &str) -> Result<std::fs::File> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let mut unicode = UNICODE_STRING {
+            length: (wide.len() * 2) as u16,
+            maximum_length: (wide.len() * 2) as u16,
+            buffer: wide.as_ptr() as *mut u16,
+        };
+        let mut attributes = OBJECT_ATTRIBUTES {
+            length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            root_directory: dir.as_raw_handle() as HANDLE,
+            object_name: &unicode,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        // FILE_GENERIC_READ | FILE_GENERIC_WRITE: read *and* write, because
+        // the payload is written here and a multipart completion reads it
+        // straight back before the rename.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                0x0012_0089 | 0x0012_0116,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_ALL,
+                FILE_OVERWRITE_IF,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(EngineError::invalid(format!(
+                "could not create the staging file beside {name}: NTSTATUS {status:#x}"
+            )));
+        }
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+    }
+
+    /// Renames the open staging `file` to `name` inside `dir` — the
+    /// handle-relative rename no swapped junction can redirect.
+    pub fn rename_into(dir: &OwnedHandle, file: &std::fs::File, name: &str) -> Result<()> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        // FILE_RENAME_INFO, built by hand because its FileName is inline:
+        // Flags(4) pad(4) RootDirectory(8) FileNameLength(4) pad(4) FileName.
+        let header = 24usize;
+        let mut buf = vec![0u8; header + wide.len() * 2];
+        unsafe {
+            let p = buf.as_mut_ptr();
+            *(p as *mut u32) = 0;
+            *(p.add(8) as *mut HANDLE) = dir.as_raw_handle() as HANDLE;
+            *(p.add(16) as *mut u32) = (wide.len() * 2) as u32;
+            core::ptr::copy_nonoverlapping(wide.as_ptr(), p.add(header) as *mut u16, wide.len());
+        }
+        let mut status_block = IO_STATUS_BLOCK {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as HANDLE,
+                &mut status_block,
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len() as u32,
+                FILE_RENAME_INFORMATION,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(EngineError::invalid(format!(
+                "rename into place failed: NTSTATUS {status:#x}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Flushes a directory entry — a rename or a create — to stable storage.

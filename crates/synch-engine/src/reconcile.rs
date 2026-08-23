@@ -1346,9 +1346,7 @@ impl Syncer {
             (None, DeclaredScope::Untrusted) if current.as_ref().is_some_and(|s| !s.is_empty()) => {
                 Some(Vec::new())
             }
-            (None, DeclaredScope::Untrusted) if key_shaped && current.is_none() => {
-                Some(Vec::new())
-            }
+            (None, DeclaredScope::Untrusted) if key_shaped && current.is_none() => Some(Vec::new()),
             (None, DeclaredScope::Untrusted) => return Ok(()),
         };
         // The one path that moves the scope, and destructive by design (§5.5):

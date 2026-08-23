@@ -521,10 +521,7 @@ async fn a_delegates_scope_is_the_same_whatever_order_it_meets_its_peers_in() {
             .iter()
             .filter(|scope| scope.as_ref().is_some_and(|s| !s.is_empty()))
             .collect();
-        assert!(
-            !known.is_empty(),
-            "the grant must become known: {seen:?}"
-        );
+        assert!(!known.is_empty(), "the grant must become known: {seen:?}");
         assert!(
             known.iter().all(|scope| *scope == known[0]),
             "a peer's declaration moved this node's scope once it knew it: {seen:?}"
