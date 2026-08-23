@@ -1,0 +1,115 @@
+/* tcp-proxy — one upstream, reachable through the cluster and nowhere else.
+ *
+ *   synch socket build examples/tcp-proxy.c -o tcp-proxy.o
+ *   synch socket add code/git.sock --allow-egress git.internal:9418
+ *   synch socket arm code/git.sock        # prints the declarations, asks
+ *   synch connect nas:code/git.sock --tcp 127.0.0.1:9418
+ *
+ * The upstream is a compile-time constant because it is a *declaration*: the
+ * init hook runs at arm time, with no config and nothing to reach, and what it
+ * names is what the operator is shown and asked to approve. Overriding it is a
+ * rebuild — `synch socket build --define UPSTREAM_PORT=9419 …` — and a rearm,
+ * which is the point. A destination that could change without another approval
+ * would not be a destination anybody approved.
+ */
+
+#include <synch.h>
+
+#ifndef UPSTREAM_HOST
+#define UPSTREAM_HOST "git.internal"
+#endif
+#ifndef UPSTREAM_PORT
+#define UPSTREAM_PORT 9418
+#endif
+
+/* Connections one caller may open in a minute. Keyed by device key, so it
+   follows the caller through an origin rename. */
+#define PER_PEER_PER_MINUTE 60
+
+SY_INIT_ENTRY sy_s64 declare(void) {
+  sy_declare_name(SY_STR("tcp-proxy"));
+  /* The whole of what this program may reach. The runtime enforces the
+     intersection of this with the operator's `--allow-egress`, so neither side
+     can widen it alone, and a port named here is not a host granted. */
+  sy_declare_egress(SY_STR(UPSTREAM_HOST), UPSTREAM_PORT);
+  sy_declare_max_streams(32);
+  return 0;
+}
+
+SY_ENTRY sy_s64 entry(void) {
+  /* Authorization is the handshake. Nothing below parses caller input to
+     decide who they are, because there is nothing they could send that would
+     be better evidence than what iroh already proved. */
+  if (!sy_peer_has_space(SY_STR("code"))) {
+    sy_log(SY_STR("refused: caller is not delegated `code`\n"));
+    return 1;
+  }
+
+  sy_u8 device[32];
+  sy_peer_device_key(device);
+  if (sy_rate_limit(device, sizeof device, PER_PEER_PER_MINUTE, 60000) < 0) {
+    sy_metric_add(SY_STR("throttled"), 1);
+    return 2;
+  }
+
+  char peer[128];
+  sy_peer_origin(peer, sizeof peer);
+  sy_label_set(SY_STR("peer"), peer, sy_strlen(peer));
+
+  /* Returns immediately, still connecting. Both the name and the address it
+     resolves to are checked, so a name that resolves back at this node is
+     refused where the address would have been. */
+  sy_s64 up = sy_tcp_connect(SY_STR(UPSTREAM_HOST), UPSTREAM_PORT);
+  if (up < 0) {
+    sy_metric_add(SY_STR("connect-failed"), 1);
+    return 3;
+  }
+
+  /* One buffer and one pump per direction: they fill and drain independently,
+     and sharing either would make one direction's backpressure the other's. */
+  char upward[1536], downward[1536];
+  struct sy_pump to_upstream = SY_PUMP_INIT, to_caller = SY_PUMP_INIT;
+  int caller_done = 0, upstream_done = 0;
+
+  while (!(caller_done && upstream_done)) {
+    struct sy_pollfd fds[2] = {{SY_SELF, 0, 0}, {up, 0, 0}};
+    if (!caller_done) {
+      if (sy_pump_blocked(&to_upstream)) fds[1].events |= SY_POLL_OUT;
+      else fds[0].events |= SY_POLL_IN;
+    }
+    if (!upstream_done) {
+      if (sy_pump_blocked(&to_caller)) fds[0].events |= SY_POLL_OUT;
+      else fds[1].events |= SY_POLL_IN;
+    }
+
+    if (sy_poll(fds, 2, 30000) <= 0) break;
+
+    /* Each direction ends on its own. A loop that stopped the moment either
+       side hung up would cut off the reply to the last request it forwarded,
+       which is the single most common way to get this wrong. */
+    if (!caller_done) {
+      sy_s64 n = sy_pump(SY_SELF, up, upward, sizeof upward, &to_upstream);
+      if (n == 0) {
+        sy_shutdown(up);
+        caller_done = 1;
+      } else if (n < 0 && n != SY_EAGAIN) {
+        break;
+      }
+    }
+    if (!upstream_done) {
+      sy_s64 n = sy_pump(up, SY_SELF, downward, sizeof downward, &to_caller);
+      if (n == 0) {
+        sy_shutdown(SY_SELF);
+        upstream_done = 1;
+      } else if (n < 0 && n != SY_EAGAIN) {
+        break;
+      }
+    }
+
+    if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) break;
+  }
+
+  sy_close(up);
+  sy_shutdown(SY_SELF);
+  return 0;
+}

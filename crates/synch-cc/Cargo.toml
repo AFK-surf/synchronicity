@@ -1,0 +1,23 @@
+[package]
+name = "synch-cc"
+description = "The embedded C-to-eBPF compiler: tinycc, built into the binary, so writing a socket needs no toolchain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+# The vendored compiler is fetched into OUT_DIR at build time; nothing under
+# it belongs in a package.
+exclude = ["/tinycc"]
+
+[lints]
+workspace = true
+
+[dependencies]
+tempfile.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cc = "1"

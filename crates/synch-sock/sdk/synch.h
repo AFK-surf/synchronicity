@@ -1,9 +1,13 @@
-/* synchronicity socket SDK — `synch --dump-sdk > synch.h`
+/* synchronicity socket SDK — `synch socket sdk > synch.h`
  *
  * A socket is a file in a node's published tree whose content is an eBPF ELF
  * object. The node that published it runs it, once per incoming stream, for a
  * peer that connects with `synch connect <origin>:<space>/<path>`. See
  * `docs/SOCKETS.md`.
+ *
+ * `synch socket build prog.c -o prog.o` compiles against this header with the
+ * compiler built into the binary, so nothing has to be installed first. Worked
+ * examples are in `crates/synch-sock/examples/`.
  *
  * Three things about the machine you are writing for, because they are not the
  * machine you are used to:
@@ -238,24 +242,120 @@ extern sy_s64 sy_declare_egress(const char *host, sy_u64 host_len, sy_u64 port);
 extern sy_s64 sy_declare_tree_read(const char *prefix, sy_u64 prefix_len);
 extern sy_s64 sy_declare_max_streams(sy_u64 n);
 
+/* ---- what the compiler calls whether you write it or not ---------------- */
+
+/* A struct initializer, an array assignment or a large local is enough to make
+ * a C compiler emit a call to `memset` or `memcpy`. There is no libc here to
+ * resolve one, and an unresolved symbol is a program that fails to *link* — at
+ * arm time, on somebody else's node, a long way from the line that caused it.
+ * So the SDK supplies them, forwarding to the host helpers.
+ *
+ * `memmove` is `sy_memcpy` because the host copies through a buffer of its own
+ * before writing, which makes every one of these overlap-safe already. */
+SY_MAYBE_UNUSED static void *memset(void *dst, int c, unsigned long n) {
+  return sy_memset(dst, c, (sy_u64)n);
+}
+SY_MAYBE_UNUSED static void *memcpy(void *dst, const void *src,
+                                    unsigned long n) {
+  return sy_memcpy(dst, src, (sy_u64)n);
+}
+SY_MAYBE_UNUSED static void *memmove(void *dst, const void *src,
+                                     unsigned long n) {
+  return sy_memcpy(dst, src, (sy_u64)n);
+}
+
 /* ---- convenience -------------------------------------------------------- */
 
-/* Copies `from` to `to` until one of them stops taking bytes. Returns bytes
- * moved, 0 at EOF on `from`, or a negative error. The shape almost every
- * proxying socket wants, written once so it is written right: a short write
- * leaves the remainder for the next poll rather than dropping it. */
+/* Writes all of `buf`, waiting for room as often as it takes. Returns `len`,
+ * SY_ETIMEDOUT if `timeout_ms` passes with no room, or a negative error.
+ *
+ * The counterpart to `sy_pump`, for a program whose reply is a message rather
+ * than a stream. A short write is backpressure to be threaded through the
+ * event loop only when the program has something else to do meanwhile; when
+ * the whole job is "say this", waiting here is the honest way to wait. Do not
+ * reach for it in a proxy: blocking one direction on the other's window is a
+ * deadlock waiting for a large enough payload. */
+SY_MAYBE_UNUSED static sy_s64 sy_write_all(sy_s64 handle, const void *buf,
+                                           sy_u64 len, sy_s64 timeout_ms) {
+  const char *p = (const char *)buf;
+  sy_u64 off = 0;
+  while (off < len) {
+    sy_s64 w = sy_write(handle, p + off, len - off);
+    if (w == SY_EAGAIN) {
+      struct sy_pollfd fds[1] = {{handle, SY_POLL_OUT, 0}};
+      sy_s64 r = sy_poll(fds, 1, timeout_ms);
+      if (r < 0) return r;
+      if (r == 0) return SY_ETIMEDOUT;
+      continue;
+    }
+    if (w < 0) return w;
+    off += (sy_u64)w;
+  }
+  return (sy_s64)len;
+}
+
+/* Writes `value` in decimal into `out`, returning how many bytes it wrote or
+ * SY_EINVAL if `cap` was too small. Nothing here is `snprintf`, and a
+ * Content-Length, a counter or an id has to be spelled somehow. */
+SY_MAYBE_UNUSED static sy_s64 sy_utoa(sy_u64 value, char *out, sy_u64 cap) {
+  char digits[20];
+  sy_u64 n = 0;
+  do {
+    digits[n++] = (char)('0' + (int)(value % 10));
+    value /= 10;
+  } while (value);
+  if (n > cap) return SY_EINVAL;
+  for (sy_u64 i = 0; i < n; i++) out[i] = digits[n - 1 - i];
+  return (sy_s64)n;
+}
+
+/* Carries a short write across polls. Zero-initialise it — `struct sy_pump st
+ * = SY_PUMP_INIT;` — and give each direction its own, alongside its buffer. */
+struct sy_pump {
+  sy_u64 len; /* bytes of the buffer that hold data */
+  sy_u64 off; /* how many of those have been written */
+};
+
+#define SY_PUMP_INIT { 0, 0 }
+
+/* 1 while a short write's remainder is still waiting to go out. Poll `to` for
+ * SY_POLL_OUT while this is true, rather than `from` for SY_POLL_IN: reading
+ * more would have nowhere to put it. */
+SY_MAYBE_UNUSED static int sy_pump_blocked(const struct sy_pump *st) {
+  return st->off < st->len;
+}
+
+/* Moves one buffer's worth from `from` to `to`. Returns the bytes read, 0 at a
+ * clean EOF on `from`, SY_EAGAIN when it could make no progress, or a negative
+ * error.
+ *
+ * The shape almost every proxying socket wants, written once so it is written
+ * right. A short write is backpressure, not failure, and the remainder stays in
+ * `buf` under `st` until the next call can place it — which is why `st` and
+ * `buf` must be the same pair every time, and why nothing is read while
+ * anything is pending. Dropping that remainder is the quiet way to corrupt
+ * whatever is being proxied, and it is invisible until the payload is large
+ * enough to fill the far side's window. */
 SY_MAYBE_UNUSED static sy_s64 sy_pump(sy_s64 from, sy_s64 to, char *buf,
-                                      sy_u64 cap) {
+                                      sy_u64 cap, struct sy_pump *st) {
+  while (st->off < st->len) {
+    sy_s64 w = sy_write(to, buf + st->off, st->len - st->off);
+    if (w == SY_EAGAIN) return SY_EAGAIN;
+    if (w < 0) return w;
+    st->off += (sy_u64)w;
+  }
+  st->len = st->off = 0;
+
   sy_s64 n = sy_read(from, buf, cap);
   if (n <= 0) return n;
-  sy_s64 off = 0;
-  while (off < n) {
-    sy_s64 w = sy_write(to, buf + off, (sy_u64)(n - off));
+  st->len = (sy_u64)n;
+  while (st->off < st->len) {
+    sy_s64 w = sy_write(to, buf + st->off, st->len - st->off);
     if (w == SY_EAGAIN) break;
     if (w < 0) return w;
-    off += w;
+    st->off += (sy_u64)w;
   }
-  return off;
+  return n;
 }
 
 #endif /* SYNCHRONICITY_SDK_SYNCH_H */

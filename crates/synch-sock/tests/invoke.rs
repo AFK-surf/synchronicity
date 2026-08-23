@@ -1,248 +1,28 @@
 //! End-to-end: a C program compiled to eBPF, run against a real stream.
 //!
-//! These tests need `clang` with a BPF target. Where it is absent they skip
-//! rather than fail — a machine without the toolchain cannot say anything about
-//! whether the runtime works, and a red test that means "no compiler" trains
-//! people to ignore red tests.
+//! The fixtures here are written to provoke the runtime — a program that
+//! spins, a program that faults, a program that waits for something that never
+//! comes. The programs anybody would actually write live in `examples/` and are
+//! exercised by `examples.rs`.
+//!
+//! Nothing skips. These used to need a clang with a BPF backend and skipped
+//! where there was none, which meant they had never run on macOS at all;
+//! `synch-cc` compiles them now, and clang is used only where the question is
+//! specifically whether the runtime loads somebody else's object.
 
 #![cfg(all(
-    any(target_os = "linux", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 
-use std::{process::Command, sync::Arc};
+mod harness;
 
-use synch_core::{FaultKind, Hash, NodeId, OriginId, SockStatus};
-use synch_sock::{
-    DuplexStream, EffectivePolicy, HostError, Invocation, Limits, ObjectInfo, PeerIdentity,
-    SocketHost, SocketId, WorkerHandle,
-};
+use std::sync::Arc;
+
+use harness::{compile, exchange, peer, Harness};
+use synch_core::{FaultKind, SockStatus};
+use synch_sock::{DuplexStream, EffectivePolicy, Limits, SocketId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// Compiles C to an eBPF object, or returns `None` when there is no toolchain.
-fn compile(source: &str) -> Option<Vec<u8>> {
-    let dir = tempdir()?;
-    let src = dir.join("prog.c");
-    let obj = dir.join("prog.o");
-    std::fs::write(&src, source).ok()?;
-    let out = Command::new("clang")
-        .args(["-target", "bpf", "-O2", "-g0"])
-        // The guest gets 4 KiB per local call frame; the default BPF stack
-        // size is 512, and a program with a 4 KiB buffer will not compile
-        // without this.
-        .args(["-mllvm", "-bpf-stack-size=4096"])
-        .arg("-I")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/sdk"))
-        .arg("-c")
-        .arg(&src)
-        .arg("-o")
-        .arg(&obj)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        // A compiler that is present and rejects the fixture is a real failure,
-        // and saying so beats skipping.
-        panic!(
-            "clang rejected the fixture:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    std::fs::read(&obj).ok()
-}
-
-fn tempdir() -> Option<std::path::PathBuf> {
-    let base = std::env::temp_dir().join(format!(
-        "synch-sock-test-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&base).ok()?;
-    Some(base)
-}
-
-fn have_clang() -> bool {
-    Command::new("clang")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// A tree with a couple of files in it.
-#[derive(Default)]
-struct FakeTree {
-    files: std::collections::HashMap<String, Vec<u8>>,
-}
-
-#[async_trait::async_trait]
-impl SocketHost for FakeTree {
-    fn open(&self, _origin: Option<&str>, path: &str) -> Result<ObjectInfo, HostError> {
-        let bytes = self.files.get(path).ok_or(HostError::NotFound)?;
-        Ok(ObjectInfo {
-            root: Hash::new(bytes),
-            size: bytes.len() as u64,
-            mtime_ns: 42,
-            mode: 0o644,
-            kind: 0,
-        })
-    }
-
-    fn open_root(&self, root: &Hash) -> Result<ObjectInfo, HostError> {
-        let bytes = self
-            .files
-            .values()
-            .find(|b| Hash::new(b) == *root)
-            .ok_or(HostError::NotFound)?;
-        Ok(ObjectInfo {
-            root: *root,
-            size: bytes.len() as u64,
-            mtime_ns: 42,
-            mode: 0o644,
-            kind: 0,
-        })
-    }
-
-    fn list(&self, prefix: &str) -> Result<Vec<String>, HostError> {
-        let mut names: Vec<String> = self
-            .files
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        names.sort();
-        Ok(names)
-    }
-
-    async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {
-        let bytes = self
-            .files
-            .values()
-            .find(|b| Hash::new(b) == root)
-            .ok_or(HostError::NotFound)?;
-        let start = (offset as usize).min(bytes.len());
-        let end = (start + len as usize).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
-    }
-}
-
-fn peer(spaces: Option<Vec<String>>) -> PeerIdentity {
-    PeerIdentity {
-        origin: OriginId::named("laptop", "cluster.example").unwrap(),
-        device_key: NodeId::from_bytes(&synch_sock::policy::NOBODY).unwrap(),
-        spaces,
-        addr: "198.51.100.7:44321".into(),
-        stream_index: 0,
-    }
-}
-
-struct Harness {
-    pool: WorkerHandle,
-    tree: Arc<FakeTree>,
-}
-
-impl Harness {
-    fn new() -> Harness {
-        Harness {
-            pool: WorkerHandle::start(1, Limits::default()),
-            tree: Arc::new(FakeTree::default()),
-        }
-    }
-
-    /// An invocation that takes a real registry slot, as the daemon's does.
-    fn admitted(
-        &self,
-        elf: &[u8],
-        stream: DuplexStream,
-        registry: &Arc<synch_sock::Registry>,
-        max_streams: usize,
-    ) -> Option<Invocation> {
-        let id = self.pool.next_id();
-        let slot = registry.reserve(
-            id,
-            "code/test.sock",
-            "laptop@cluster.example",
-            NodeId::from_bytes(&synch_sock::policy::NOBODY).unwrap(),
-            Hash::new(elf),
-            max_streams,
-            std::time::Instant::now(),
-        )?;
-        let mut invocation =
-            self.invocation(elf, stream, EffectivePolicy::default(), peer(None), vec![]);
-        invocation.id = id;
-        invocation.slot = Some(slot);
-        Some(invocation)
-    }
-
-    fn with_limits(limits: Limits) -> Harness {
-        Harness {
-            pool: WorkerHandle::start(1, limits),
-            tree: Arc::new(FakeTree::default()),
-        }
-    }
-
-    fn with_tree(files: &[(&str, &str)]) -> Harness {
-        let mut tree = FakeTree::default();
-        for (name, body) in files {
-            tree.files
-                .insert(name.to_string(), body.as_bytes().to_vec());
-        }
-        Harness {
-            pool: WorkerHandle::start(1, Limits::default()),
-            tree: Arc::new(tree),
-        }
-    }
-
-    fn invocation(
-        &self,
-        elf: &[u8],
-        stream: DuplexStream,
-        policy: EffectivePolicy,
-        peer: PeerIdentity,
-        meta: Vec<(String, String)>,
-    ) -> Invocation {
-        Invocation {
-            program: Arc::new(elf.to_vec()),
-            program_root: Hash::new(elf),
-            socket: SocketId::new("code", "test.sock"),
-            peer,
-            policy,
-            meta,
-            stream,
-            self_origin: OriginId::named("nas", "cluster.example").unwrap(),
-            host: self.tree.clone(),
-            id: self.pool.next_id(),
-            slot: None,
-        }
-    }
-}
-
-/// Runs a program against an in-memory stream, returning what it wrote back.
-async fn exchange(
-    harness: &Harness,
-    elf: &[u8],
-    input: &[u8],
-    policy: EffectivePolicy,
-    peer: PeerIdentity,
-    meta: Vec<(String, String)>,
-) -> (SockStatus, Vec<u8>) {
-    let (mine, theirs) = tokio::io::duplex(64 * 1024);
-    let (their_r, their_w) = tokio::io::split(theirs);
-    let invocation =
-        harness.invocation(elf, DuplexStream::new(their_r, their_w), policy, peer, meta);
-
-    let mut mine = mine;
-    let input = input.to_vec();
-    let driver = tokio::spawn(async move {
-        mine.write_all(&input).await.unwrap();
-        mine.shutdown().await.unwrap();
-        let mut out = Vec::new();
-        mine.read_to_end(&mut out).await.unwrap();
-        out
-    });
-
-    let outcome = harness.pool.run(invocation).await.expect("the program ran");
-    let out = driver.await.unwrap();
-    (outcome.status, out)
-}
 
 const ECHO: &str = r#"
 #include <synch.h>
@@ -273,11 +53,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn a_program_echoes_a_stream_and_returns_cleanly() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(ECHO).expect("the fixture compiles");
+    let elf = compile(ECHO, "echo.c");
     let harness = Harness::new();
     let (status, out) = exchange(
         &harness,
@@ -325,11 +101,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn identity_comes_from_the_handshake_and_metadata_is_only_a_hint() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(IDENTITY).expect("the fixture compiles");
+    let elf = compile(IDENTITY, "identity.c");
     let harness = Harness::new();
 
     // A rooted member reads every space by construction.
@@ -396,11 +168,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn egress_outside_the_armed_intersection_is_refused() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(EGRESS).expect("the fixture compiles");
+    let elf = compile(EGRESS, "egress.c");
     let harness = Harness::new();
     let (status, out) = exchange(
         &harness,
@@ -441,11 +209,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn a_program_reads_its_own_nodes_tree() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(TREE).expect("the fixture compiles");
+    let elf = compile(TREE, "tree.c");
     let harness = Harness::with_tree(&[("code/readme", "the tree, read from inside")]);
     let (status, out) = exchange(
         &harness,
@@ -473,11 +237,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_spinning_program_is_preempted_rather_than_holding_its_worker() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(SPIN).expect("the fixture compiles");
+    let elf = compile(SPIN, "spin.c");
     let harness = Harness::new();
     let (mine, theirs) = tokio::io::duplex(1024);
     drop(mine);
@@ -522,12 +282,8 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn a_fault_is_contained_and_the_worker_survives_it() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let faulting = compile(FAULT).expect("the fixture compiles");
-    let echo = compile(ECHO).expect("the fixture compiles");
+    let faulting = compile(FAULT, "fault.c");
+    let echo = compile(ECHO, "echo.c");
     let harness = Harness::new();
 
     let (status, _) = exchange(
@@ -582,12 +338,9 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[test]
 fn the_init_hook_declares_and_cannot_reach_anything() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(DECLARE).expect("the fixture compiles");
-    let declared = synch_sock::declare(&elf, Arc::new(FakeTree::default())).expect("the hook ran");
+    let elf = compile(DECLARE, "declare.c");
+    let declared =
+        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook ran");
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
     assert_eq!(declared.tree_reads, vec!["code".to_string()]);
@@ -596,11 +349,7 @@ fn the_init_hook_declares_and_cannot_reach_anything() {
 
 #[tokio::test]
 async fn a_declaration_helper_is_refused_outside_the_init_hook() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(DECLARE).expect("the fixture compiles");
+    let elf = compile(DECLARE, "declare.c");
     let harness = Harness::new();
     let (status, _) = exchange(
         &harness,
@@ -620,18 +369,14 @@ async fn a_declaration_helper_is_refused_outside_the_init_hook() {
 
 #[test]
 fn a_program_with_no_stream_entrypoint_is_refused_at_arm_time() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
     let elf = compile(
         r#"
         #include <synch.h>
         SY_INIT_ENTRY sy_s64 declare(void) { return 0; }
         "#,
-    )
-    .expect("the fixture compiles");
-    let out = synch_sock::declare(&elf, Arc::new(FakeTree::default()));
+        "init-only.c",
+    );
+    let out = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()));
     assert!(
         matches!(out, Err(synch_sock::SockError::NoEntrypoint)),
         "expected NoEntrypoint, got {out:?}"
@@ -652,11 +397,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn a_wait_with_nothing_happening_ends_at_the_idle_deadline() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(WAIT_FOREVER).expect("the fixture compiles");
+    let elf = compile(WAIT_FOREVER, "wait-forever.c");
     let harness = Harness::with_limits(Limits {
         idle_deadline: std::time::Duration::from_millis(300),
         ..Limits::default()
@@ -719,11 +460,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn steady_progress_keeps_an_invocation_alive_past_the_idle_deadline() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(CHATTY).expect("the fixture compiles");
+    let elf = compile(CHATTY, "chatty.c");
     // Short enough that a *total* cap would fire well before the exchange ends.
     let harness = Harness::with_limits(Limits {
         idle_deadline: std::time::Duration::from_millis(200),
@@ -800,22 +537,18 @@ fn documented_example() -> Option<String> {
 
 #[test]
 fn the_documented_example_compiles_against_the_shipped_header() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
     let source = documented_example().expect("docs/SOCKETS.md §8 has a complete example");
     assert!(
         source.contains("sy_pump"),
         "the example should use the header's pump rather than open-coding it"
     );
-    // `compile` panics with clang's own diagnostics if the example is wrong,
-    // which is exactly the failure worth having.
-    let elf = compile(&source).expect("the documented example compiles");
+    // `compile` panics with the compiler's own diagnostics if the example is
+    // wrong, which is exactly the failure worth having.
+    let elf = compile(&source, "documented.c");
 
     // And it is a program the runtime will actually accept: both sections
     // present, and the declaration hook says what the document says it says.
-    let declared = synch_sock::declare(&elf, Arc::new(FakeTree::default()))
+    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
         .expect("the documented example loads and declares");
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
@@ -844,11 +577,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_registry_shows_a_running_invocation_and_caps_how_many_there_are() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(HOLD_OPEN).expect("the fixture compiles");
+    let elf = compile(HOLD_OPEN, "hold-open.c");
     let harness = Harness::new();
     // The pool's own registry, as the daemon uses: the slot and the cancel
     // channel have to be in the same one for a kill to reach anything.
@@ -938,11 +667,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn what_a_program_logs_is_kept_for_its_socket() {
-    if !have_clang() {
-        eprintln!("skipping: no clang with a BPF target");
-        return;
-    }
-    let elf = compile(TALKATIVE).expect("the fixture compiles");
+    let elf = compile(TALKATIVE, "talkative.c");
     let harness = Harness::new();
     let registry = harness.pool.registry().clone();
 
@@ -967,4 +692,112 @@ async fn what_a_program_logs_is_kept_for_its_socket() {
         registry.logs("code/other.sock").is_empty(),
         "log lines leaked between sockets"
     );
+}
+
+const SHORT_BUFFER: &str = r#"
+#include <synch.h>
+
+/* Every buffer here sits in the top of the frame, where fewer than a chunk's
+   worth of bytes follow it. */
+SY_ENTRY sy_s64 entry(void) {
+  char small[16];
+  sy_s64 n = sy_peer_origin(small, sizeof small);   /* truncated on purpose */
+  if (n != 22) return -1;              /* snprintf semantics: what it needed */
+  if (sy_strlen(small) != 15) return -2;         /* 16 bytes, one of them NUL */
+
+  char tiny[8];
+  tiny[0] = 'a'; tiny[1] = 'b'; tiny[2] = 0;
+  if (sy_strlen(tiny) != 2) return -3;
+
+  /* And a literal, which lives in the data section rather than the stack and
+     is measured the same way — `SY_STR` is `sy_strlen` under the macro. */
+  sy_write(SY_SELF, SY_STR("ok"));
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+/// `sy_strlen` used to answer 0 for a string with less than one scan chunk of
+/// readable memory after it — which is every buffer near the top of a frame,
+/// and therefore most short buffers a program declares. It answered *silently*:
+/// a program with `sy_write(h, buf, sy_strlen(buf))` in it wrote nothing.
+#[tokio::test]
+async fn a_string_near_the_end_of_its_region_still_has_a_length() {
+    let elf = compile(SHORT_BUFFER, "short-buffer.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(out, b"ok");
+}
+
+const LATE_READ: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* Read the caller's request to its end first, so the inbound stream is at
+     EOF before the tree read starts — the ordinary shape of a request/response
+     socket, and the one that used to break. */
+  char scratch[64];
+  for (;;) {
+    struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+    if (sy_poll(fds, 1, 5000) <= 0) break;
+    sy_s64 n = sy_read(SY_SELF, scratch, sizeof scratch);
+    if (n == SY_EAGAIN) continue;
+    if (n <= 0) break;
+  }
+
+  sy_s64 obj = sy_open(SY_STR("code/readme"));
+  if (obj < 0) return obj;
+  char buf[128];
+  for (;;) {
+    sy_s64 n = sy_pread(obj, buf, sizeof buf, 0);
+    if (n == SY_EAGAIN) {
+      struct sy_pollfd fds[1] = { { obj, SY_POLL_IN, 0 } };
+      if (sy_poll(fds, 1, 5000) <= 0) return -1;
+      continue;
+    }
+    if (n < 0) return n;
+    sy_write(SY_SELF, buf, (sy_u64)n);
+    break;
+  }
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+/// A fetch in flight is not "nothing can happen".
+///
+/// `sy_poll` short-circuits when every handle is finished, which is what stops
+/// a program waiting out its deadline for a peer that has gone. An object with
+/// a read outstanding was counted as finished, so a socket that read the tree
+/// *after* its caller had stopped talking — a request/response socket, in other
+/// words — was told its pending read would never land.
+#[tokio::test]
+async fn a_tree_read_outlives_the_caller_that_asked_for_it() {
+    let elf = compile(LATE_READ, "late-read.c");
+    let harness = Harness::with_tree(&[("code/readme", "read after the question ended")]);
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"please\n",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"read after the question ended");
 }

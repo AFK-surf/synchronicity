@@ -1,0 +1,481 @@
+//! The programs in `examples/`, compiled and run.
+//!
+//! An example is documentation that claims to work, which makes it the kind of
+//! documentation that quietly stops working. These compile every `.c` in that
+//! directory — so a new one is covered the moment it lands — and then run each
+//! of them against a real stream and check what came back, because "it
+//! compiles" is not the claim an example makes.
+
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+
+mod harness;
+
+use std::{path::PathBuf, sync::Arc};
+
+use harness::{compile_with_clang, converse, exchange, peer, sdk, Harness};
+use synch_core::SockStatus;
+use synch_sock::{EffectivePolicy, Limits};
+
+fn examples_dir() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"))
+}
+
+fn source(name: &str) -> String {
+    let path = examples_dir().join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn build(name: &str) -> Vec<u8> {
+    build_with(name, &[])
+}
+
+fn build_with(name: &str, defines: &[(&str, &str)]) -> Vec<u8> {
+    synch_cc::compile(&source(name), name, &sdk(), defines)
+        .unwrap_or_else(|e| panic!("examples/{name} does not compile:\n{e}"))
+}
+
+/// Everything in `examples/`, so nothing can be added and left uncovered.
+fn every_example() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(examples_dir())
+        .expect("the examples directory is there")
+        .filter_map(|entry| {
+            let path = entry.expect("a readable entry").path();
+            (path.extension()? == "c").then(|| path.file_name()?.to_str().map(str::to_string))?
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every example loads, declares a name, and has a stream entrypoint.
+///
+/// The floor under the specific tests below: whatever else an example does, it
+/// is a program the runtime will accept and an operator can read a declaration
+/// out of at arm time.
+#[test]
+fn every_example_compiles_loads_and_declares_itself() {
+    let names = every_example();
+    assert!(
+        names.len() >= 5,
+        "the examples directory has thinned out: {names:?}"
+    );
+    for name in &names {
+        let elf = build(name);
+        let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+            .unwrap_or_else(|e| panic!("examples/{name} does not load: {e}"));
+        assert!(
+            !declared.name.is_empty(),
+            "examples/{name} declares no name, so `synch socket arm` has nothing to show"
+        );
+        assert!(
+            declared.max_streams.is_some(),
+            "examples/{name} declares no concurrency cap"
+        );
+    }
+}
+
+#[tokio::test]
+async fn echo_returns_what_it_was_sent_and_counts_it() {
+    let elf = build("echo.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"hello sockets",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(out, b"hello sockets");
+    assert_eq!(status, SockStatus::Ok(13), "the exit status counts bytes");
+}
+
+/// The regression the pump's cursor exists for.
+///
+/// A payload larger than the far side's window forces short writes. A pump
+/// that returned "wrote some of it" and read again would lose the remainder —
+/// silently, and only under exactly this condition, which is why it survived
+/// review. Here the whole payload has to come back, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_reader_costs_throughput_and_not_bytes() {
+    let elf = build("echo.c");
+    // Small enough that the guest's writes go short long before the payload
+    // has been sent.
+    let harness = Harness::with_tree_and_limits(
+        &[],
+        Limits {
+            ring_bytes: 4096,
+            ..Limits::default()
+        },
+    );
+
+    let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let (status, out) = converse(&harness, &elf, payload.clone(), 8192).await;
+    assert_eq!(
+        out.len(),
+        payload.len(),
+        "the pump dropped {} bytes under backpressure",
+        payload.len() as i64 - out.len() as i64
+    );
+    assert_eq!(out, payload, "the bytes came back reordered or corrupted");
+    assert_eq!(status, SockStatus::Ok(payload.len() as i64));
+}
+
+#[tokio::test]
+async fn whoami_reports_the_handshake_and_labels_the_caller_s_own_claims() {
+    let elf = build("whoami.c");
+    let harness = Harness::new();
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![("tag".into(), "laptop".into())],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("peer-origin:  laptop@cluster.example"),
+        "{text}"
+    );
+    assert!(text.contains("peer-kind:    member"), "{text}");
+    assert!(text.contains("reads `code`: yes"), "{text}");
+    assert!(text.contains("this-node:    nas@cluster.example"), "{text}");
+    assert!(text.contains("this-socket:  code/test.sock"), "{text}");
+    // The device key, hex-encoded: 64 characters and no `sy_peer_device_key`
+    // shortcut through the caller's own text.
+    assert!(
+        text.contains(&hex::encode(synch_sock::policy::NOBODY)),
+        "{text}"
+    );
+    assert!(text.contains("claimed tag:  laptop"), "{text}");
+
+    // A delegate is told it is one, and a space it does not hold is a `no`
+    // whatever it says in its metadata.
+    let (_, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(Some(vec!["photos".into()])),
+        vec![("spaces".into(), "code".into())],
+    )
+    .await;
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("peer-kind:    delegate"), "{text}");
+    assert!(text.contains("reads `code`: no"), "{text}");
+    // Nothing was sent under `tag`, so nothing is printed under it.
+    assert!(!text.contains("claimed tag:"), "{text}");
+}
+
+#[tokio::test]
+async fn tree_cat_serves_the_directory_it_chose_and_nothing_above_it() {
+    let elf = build("tree-cat.c");
+    let harness = Harness::with_tree(&[
+        ("code/pub/readme", "the tree, read from inside"),
+        ("code/private/keys", "not this one"),
+    ]);
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"readme\n",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"the tree, read from inside");
+
+    // The traversal the validation exists for. It never reaches `sy_open`.
+    for attempt in ["../private/keys\n", "..\n", "sub/dir\n", "\n"] {
+        let (status, out) = exchange(
+            &harness,
+            &elf,
+            attempt.as_bytes(),
+            EffectivePolicy::default(),
+            peer(None),
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            status,
+            SockStatus::Ok(2),
+            "{attempt:?} was not refused as a name"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).starts_with("usage:"),
+            "{attempt:?} produced {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // A well-formed name for a file that is not there.
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"absent\n",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(3));
+    assert_eq!(out, b"no such file\n");
+}
+
+#[tokio::test]
+async fn http_status_answers_http_and_counts_across_invocations() {
+    let elf = build("http-status.c");
+    let harness = Harness::new();
+
+    let request = b"GET / HTTP/1.1\r\nHost: nas\r\n\r\n";
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        request,
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .expect("a blank line ends the head");
+    let declared: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .expect("a Content-Length")
+        .trim()
+        .parse()
+        .expect("a number");
+    assert_eq!(
+        declared,
+        body.len(),
+        "the declared length is not the body's: {body:?}"
+    );
+    assert!(body.contains("node      nas@cluster.example"), "{body}");
+    assert!(
+        body.contains("peer      laptop@cluster.example (member)"),
+        "{body}"
+    );
+    assert!(body.contains("requests  1"), "{body}");
+
+    // The map outlives the invocation that wrote it, which is the whole
+    // difference between socket state and program state.
+    let (_, out) = exchange(
+        &harness,
+        &elf,
+        request,
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert!(
+        String::from_utf8_lossy(&out).contains("requests  2"),
+        "the counter did not survive the first invocation"
+    );
+}
+
+#[tokio::test]
+async fn token_gate_lets_the_right_secret_through_and_nothing_else() {
+    let elf = build("token-gate.c");
+    let harness = Harness::new();
+    let configured = |token: &str| EffectivePolicy {
+        config: vec![("token".into(), token.into())],
+        ..EffectivePolicy::default()
+    };
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"hunter2\n",
+        configured("hunter2"),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"ok\n");
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"hunter3\n",
+        configured("hunter2"),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(4));
+    assert_eq!(out, b"denied\n");
+
+    // A prefix of the secret is not the secret: the length is checked before
+    // the constant-time compare, which needs one count of bytes.
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"hunter\n",
+        configured("hunter2"),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(4));
+
+    // No `token` in the config is a refusal, not an open door.
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"anything\n",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(1));
+    assert_eq!(out, b"misconfigured\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
+    // A real listener, and the port it landed on becomes the constant the
+    // example declares — which is what `#ifndef` and `--define` are for.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().unwrap().port();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut seen = Vec::new();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        socket.read_to_end(&mut seen).await.expect("the request");
+        socket
+            .write_all(format!("upstream saw {}", seen.len()).as_bytes())
+            .await
+            .expect("the reply");
+        socket.shutdown().await.expect("a clean close");
+        seen
+    });
+
+    let elf = build_with(
+        "tcp-proxy.c",
+        &[
+            ("UPSTREAM_HOST", "\"127.0.0.1\""),
+            ("UPSTREAM_PORT", &port.to_string()),
+        ],
+    );
+
+    let declared =
+        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the proxy loads");
+    assert_eq!(
+        declared.egress,
+        vec![format!("127.0.0.1:{port}")],
+        "the declaration is what the operator approves, so it has to say the target"
+    );
+
+    let harness = Harness::new();
+    // The operator's half of the intersection. A literal address is the one
+    // way a rule may name something in a range a *name* must never reach.
+    let allowed = EffectivePolicy {
+        egress: vec![format!("127.0.0.1:{port}")],
+        max_streams: 32,
+        ..EffectivePolicy::default()
+    };
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"GET /info/refs\n",
+        allowed.clone(),
+        peer(Some(vec!["code".into()])),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"upstream saw 15");
+    assert_eq!(upstream.await.unwrap(), b"GET /info/refs\n");
+
+    // A caller without `code` never gets as far as the connect.
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"GET /info/refs\n",
+        allowed,
+        peer(Some(vec!["photos".into()])),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(1));
+    assert!(out.is_empty(), "a refused caller was told something");
+}
+
+/// The upstream this program declared is the only one it can reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_proxy_cannot_reach_an_upstream_the_operator_did_not_allow() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().unwrap().port();
+    let elf = build_with(
+        "tcp-proxy.c",
+        &[
+            ("UPSTREAM_HOST", "\"127.0.0.1\""),
+            ("UPSTREAM_PORT", &port.to_string()),
+        ],
+    );
+
+    let harness = Harness::new();
+    // The program declared it; the operator did not allow it. Neither side can
+    // widen the list alone, so the connect is refused before a packet moves.
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"anything\n",
+        EffectivePolicy::default(),
+        peer(Some(vec!["code".into()])),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(3), "the connect should have failed");
+    assert!(out.is_empty());
+}
+
+/// The runtime loads an object somebody else's compiler wrote.
+///
+/// Every other test here builds with the compiler in the binary, which would
+/// hide a disagreement between the two: the runtime takes ELF, not tinycc's
+/// ELF. Skipped where clang cannot target BPF, because a machine without the
+/// toolchain cannot answer this and a red test that means "no compiler"
+/// teaches people to ignore red tests.
+#[tokio::test]
+async fn an_example_built_with_clang_runs_the_same_way() {
+    let Some(elf) = compile_with_clang(&source("echo.c"), "echo.c") else {
+        return;
+    };
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"built elsewhere",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(out, b"built elsewhere");
+    assert_eq!(status, SockStatus::Ok(15));
+}

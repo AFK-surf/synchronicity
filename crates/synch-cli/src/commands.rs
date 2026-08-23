@@ -218,11 +218,57 @@ pub async fn run(cli: Cli) -> Result<()> {
             listen,
             once,
         } => crate::connect::run(&data_dir, reference, meta, listen.as_deref(), *once).await,
+        // Also not a `Run` command, and for a plainer reason: compiling a C
+        // file needs no node, no daemon and no data directory. Sending it to
+        // the daemon would mean a compiler in the daemon and a source file
+        // over a socket, for a job this process can do itself.
+        Command::Socket {
+            command:
+                SocketCommand::Build {
+                    source,
+                    output,
+                    define,
+                },
+        } => build_socket(source, output.as_deref(), define),
         _ => {
             let command = to_command(&cli)?;
             deliver(&data_dir, &cli, command).await
         }
     }
+}
+
+/// `synch socket build` — C in, eBPF object out, nothing installed.
+fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Result<()> {
+    if !synch_cc::SUPPORTED {
+        anyhow::bail!(
+            "this build has no C compiler in it; build the object with \
+             `clang -target bpf -O2 -mllvm -bpf-stack-size=4096 -c {}`",
+            source.display()
+        );
+    }
+
+    // `-DNAME` with no value defines it as empty, which is what `#ifdef` tests
+    // and what every other compiler does with the same spelling.
+    let defines: Vec<(&str, &str)> = defines
+        .iter()
+        .map(|text| match text.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (text.as_str(), ""),
+        })
+        .collect();
+
+    let headers = [("synch.h", synch_sock::sdk::HEADER)];
+    let object = synch_cc::compile_file(source, &headers, &defines)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("compiling {}", source.display()))?;
+
+    let output = match output {
+        Some(path) => path.to_path_buf(),
+        None => source.with_extension("o"),
+    };
+    std::fs::write(&output, &object).with_context(|| format!("writing {}", output.display()))?;
+    println!("{} ({} bytes)", output.display(), object.len());
+    Ok(())
 }
 
 async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Result<()> {
@@ -818,6 +864,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 target: target.clone(),
             }),
             SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
+            // Compiling is local work with no node in it, so `run` handles it
+            // before anything reaches here and there is no control command to
+            // build. Spelled out rather than left to `_`, so adding a socket
+            // command that *does* need the daemon is a compile error here
+            // rather than a silent no-op.
+            SocketCommand::Build { .. } => {
+                anyhow::bail!("`synch socket build` runs in this process, not the daemon")
+            }
         },
 
         Command::Pin { command } => match command {

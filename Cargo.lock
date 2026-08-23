@@ -140,9 +140,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.8"
+version = "0.4.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fda0b0042fa1c5d8401387e5f80b21c932c323848ccbde1801ba2a57d32ffa76"
+checksum = "d431fc9973f7d9a1b437e8d34caef9f01edf4469ad9f785c246178bbe4dfbdbb"
 dependencies = [
  "cfg-if",
  "elf",
@@ -4861,6 +4861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synch-cc"
+version = "0.1.3"
+dependencies = [
+ "cc",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "synch-cli"
 version = "0.1.3"
 dependencies = [
@@ -4873,6 +4882,7 @@ dependencies = [
  "iroh-base",
  "prost",
  "protox",
+ "synch-cc",
  "synch-core",
  "synch-engine",
  "synch-mpt",
@@ -5039,6 +5049,7 @@ dependencies = [
  "bytes",
  "hex",
  "rand 0.8.7",
+ "synch-cc",
  "synch-core",
  "thiserror 2.0.20",
  "tokio",

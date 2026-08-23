@@ -394,12 +394,20 @@ runs it *here*, one invocation per incoming stream, under
 [async-ebpf](https://github.com/losfair/async-ebpf):
 
 ```sh
+synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
 synch socket add code/git.sock --allow-egress git.internal:9418
 synch scan                                     # publish it as kind=Socket
 synch socket arm code/git.sock                 # print what it declares, approve it
 synch socket ls -l                             # armed root, drift, declarations
 synch socket sdk > synch.h                     # the header a program is built against
 ```
+
+The compiler is in the binary — a build of [tinycc](https://github.com/losfair/tinycc)
+that targets eBPF — so writing a socket costs a text editor and nothing else,
+rather than a clang built with a BPF backend that macOS does not ship. Six
+worked examples are in
+[`crates/synch-sock/examples/`](crates/synch-sock/examples/), and the test
+suite runs every one of them.
 
 From the other side, `synch connect` is a byte pump and nothing else — it names
 a path, and everything that decides what runs is state the far node already
@@ -417,8 +425,8 @@ socket-ness, because the entry kind comes from a local declaration and is never
 taken from a peer. Publishing is not permission either: an arming record pins
 the BLAKE3 content root that was approved, and bytes that change leave the
 socket published and not runnable until somebody approves the new program.
-Serving needs Linux or OpenBSD on x86-64 or arm64, which is where async-ebpf
-runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
+Serving needs Linux, macOS or OpenBSD on x86-64 or arm64, which is where
+async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 
 ## Layout
 
@@ -432,6 +440,7 @@ runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 | `synch-cli` | the `synch` binary: the daemon, the control service, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
 | `synch-sock` | the socket runtime: the eBPF host APIs, the endpoint reactor, the program cache |
+| `synch-cc` | the embedded C-to-eBPF compiler, so writing a socket needs no toolchain |
 | `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
 
 All logic lives in the library crates, so any Rust application can embed a full

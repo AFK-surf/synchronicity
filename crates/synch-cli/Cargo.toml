@@ -24,6 +24,7 @@ hyper-util.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 prost.workspace = true
+synch-cc.workspace = true
 synch-core.workspace = true
 synch-engine.workspace = true
 synch-mpt.workspace = true

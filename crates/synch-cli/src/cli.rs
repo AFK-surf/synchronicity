@@ -871,6 +871,32 @@ pub enum SocketCommand {
     },
     /// Print the C SDK header a socket program is compiled against.
     Sdk,
+    /// Compile a C program to the eBPF object a socket is made of.
+    ///
+    /// The compiler is inside this binary, so writing a socket needs nothing
+    /// installed — no clang, no BPF backend, no cross toolchain. `synch.h` is
+    /// included automatically and is the same header `synch socket sdk`
+    /// prints; there is no libc, and nothing else is on the include path.
+    ///
+    /// This does not publish anything. The object it writes becomes a socket
+    /// when it is in a space and `synch socket add` and `synch socket arm`
+    /// have been run over it.
+    Build {
+        /// The C source to compile.
+        source: PathBuf,
+        /// Where to write the object. Defaults to the source with `.o`.
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// `NAME[=VALUE]`, as a compiler's `-D`.
+        ///
+        /// What an example guards with `#ifndef` — an upstream host, a port, a
+        /// limit — so one source builds two ways. A socket's declarations are
+        /// compiled in, so changing one of these is a rebuild and a re-arm,
+        /// which is the point: a destination that could change without another
+        /// approval is not a destination anybody approved.
+        #[arg(short = 'D', long = "define", value_name = "NAME[=VALUE]")]
+        define: Vec<String>,
+    },
 }
 
 /// `synch pin ...`

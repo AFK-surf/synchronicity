@@ -337,7 +337,14 @@ impl Inner {
                 State::Connecting => false,
                 State::Open => ep.revents() & poll::HUP != 0,
             },
-            // An object or a cursor with an answer waiting is not quiet.
+            // An object with a fetch in flight is the loudest thing here: the
+            // answer is on its way. Quiet means *nothing can ever become
+            // ready*, and a program told that while its read is outstanding
+            // gives up on a file it was about to get — which is every socket
+            // that reads the tree after its caller has finished asking, since
+            // a half-closed caller makes every other handle quiet.
+            Slot::Object(obj) => !obj.pending.get() && obj.revents() == 0,
+            // A cursor with an answer waiting is not quiet either.
             other => other.revents() == 0,
         })
     }

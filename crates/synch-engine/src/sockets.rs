@@ -191,7 +191,7 @@ impl Node {
         if !synch_sock::SUPPORTED {
             return Err((
                 RefuseCode::Unsupported,
-                "this node has no eBPF runtime: async-ebpf supports Linux and OpenBSD on \
+                "this node has no eBPF runtime: async-ebpf supports Linux, macOS and OpenBSD on \
                  x86-64 and arm64"
                     .into(),
             ));
@@ -574,13 +574,13 @@ pub fn default_limits() -> Limits {
 /// The worker pool, where there is one.
 ///
 /// Two implementations of the same small API rather than `cfg` at every call
-/// site: async-ebpf exists on Linux and OpenBSD on x86-64 and arm64 and
+/// site: async-ebpf exists on Linux, macOS and OpenBSD on x86-64 and arm64 and
 /// nowhere else, and the engine has to build everywhere. What a node without
 /// it loses is serving — declaring, publishing, replicating and materializing
 /// socket entries all work, and so does `synch connect`, because the
 /// connecting side executes nothing.
 #[cfg(all(
-    any(target_os = "linux", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod pool {
@@ -679,7 +679,7 @@ mod pool {
 }
 
 #[cfg(not(all(
-    any(target_os = "linux", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 mod pool {

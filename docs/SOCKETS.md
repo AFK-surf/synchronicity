@@ -2,10 +2,10 @@
 
 Status: **implemented**. Everything here describes the built thing: the record
 kind, the arming tables, the `sync/sock/1` protocol, the host API and its
-runtime, the scanner's publishing rule, the live-invocation registry, and the
-command surface. The one thing named here and not built is `synch doctor`
-reporting on sockets — the same facts are in `synch socket ls -l` and
-`synch socket ps`, and each place below says so.
+runtime, the scanner's publishing rule, the live-invocation registry, the
+embedded compiler, and the command surface. The one thing named here and not
+built is `synch doctor` reporting on sockets — the same facts are in
+`synch socket ls -l` and `synch socket ps`, and each place below says so.
 
 Checked against the tree it landed in. Where the built thing differs from an
 earlier draft of this design, this document has been corrected to describe the
@@ -49,9 +49,9 @@ every node it can reach, and the sandbox is the only thing standing between a
 stranger and the machine. Under this one the sandbox is defence in depth and
 the *gate* is that the callee already chose to publish and arm the program.
 
-It also buys portability where it matters. async-ebpf runs on Linux and OpenBSD
-on x86-64 and arm64. Serving sockets is gated to those targets. `synch connect`
-is not, because it executes nothing.
+It also buys portability where it matters. async-ebpf runs on Linux, macOS and
+OpenBSD, on x86-64 and arm64. Serving sockets is gated to those targets.
+`synch connect` is not, because it executes nothing.
 
 ## 2. What a socket is in the tree
 
@@ -341,7 +341,8 @@ Two conventions fall out of the absence of a heap:
 
 ## 7. The host API
 
-Shipped as a single header, `synch --dump-sdk > synch.h`.
+Shipped as a single header, `synch socket sdk > synch.h`, and supplied
+automatically by `synch socket build` (§9).
 
 ```c
 #define SY_STR(s)   (s), sy_strlen((s))
@@ -473,6 +474,32 @@ Calling a declaration helper from `synchronicity.stream` returns `SY_EPERM`;
 calling an I/O helper from `synchronicity.init` does too. The init hook runs
 with no endpoint table at all, so there is nothing for it to reach.
 
+### 7.10 In the header, not in the host
+
+Four things in `synch.h` are ordinary C rather than helpers, because they are
+the same in every program and getting them wrong is silent.
+
+`sy_pump(from, to, buf, cap, st)` moves one buffer's worth between two handles.
+The `struct sy_pump` it carries is the point: a short write is backpressure,
+and the remainder stays in `buf` under `st` until a later call can place it.
+`sy_pump_blocked(st)` says whether a remainder is waiting, which is what decides
+whether to poll the far side for `SY_POLL_OUT` or the near side for
+`SY_POLL_IN`.
+
+`sy_write_all(handle, buf, len, timeout_ms)` is the same job for a program whose
+whole reply is one message, where waiting is the honest thing to do. Not in a
+proxy: blocking one direction on the other's window deadlocks as soon as a
+payload is large enough.
+
+`sy_utoa(value, out, cap)` writes a number in decimal. There is no `snprintf`
+here, and a Content-Length has to come from somewhere.
+
+`memset`, `memcpy` and `memmove` forward to the host helpers. Nothing calls
+them by name; a struct initializer or an array assignment is enough to make any
+C compiler emit a call, and without these that call would be an unresolved
+symbol — a program that fails to *link*, at arm time, on somebody else's node,
+a long way from the line that caused it.
+
 ## 8. A whole socket, end to end
 
 A git-over-TCP gateway for a delegated space: authorized by delegation rather
@@ -512,30 +539,44 @@ SY_ENTRY sy_s64 entry(void) {
   sy_s64 up = sy_tcp_connect(SY_STR("git.internal"), 9418);
   if (up < 0) return up;
 
-  struct sy_pollfd fds[2] = {
-    { SY_SELF, SY_POLL_IN, 0 },
-    { up,      SY_POLL_IN, 0 },
-  };
   /* The binding limit is the *frame*, not the stack: 4 KiB per function, of
-     which `who`, `key` and `fds` have already taken a little. A `char[4096]`
-     here does not compile. */
-  char buf[2048];
+     which `who`, `key` and the poll array have already taken a little. Two
+     `char[2048]` here would not compile. */
+  char upward[1536], downward[1536];
+
+  /* One buffer and one pump per direction. `sy_pump` holds a short write's
+     remainder in its buffer until there is room for it, which is why the two
+     directions cannot share either: one direction's backpressure would
+     otherwise stall the other's bytes, or overwrite them. */
+  struct sy_pump to_upstream = SY_PUMP_INIT, to_caller = SY_PUMP_INIT;
 
   /* Each direction ends on its own. A loop that stopped the moment either
      side hung up would cut off the reply to the last request it forwarded,
      which is the single most common way to get this wrong. */
-  int upstream_done = 0, caller_done = 0;
-  while (!(upstream_done && caller_done)) {
+  int caller_done = 0, upstream_done = 0;
+  while (!(caller_done && upstream_done)) {
+    struct sy_pollfd fds[2] = { { SY_SELF, 0, 0 }, { up, 0, 0 } };
+    /* While a pump is holding a remainder, wait for room on the far side
+       rather than for more to read: there is nowhere to put more. */
+    if (!caller_done) {
+      if (sy_pump_blocked(&to_upstream)) fds[1].events |= SY_POLL_OUT;
+      else                               fds[0].events |= SY_POLL_IN;
+    }
+    if (!upstream_done) {
+      if (sy_pump_blocked(&to_caller)) fds[0].events |= SY_POLL_OUT;
+      else                             fds[1].events |= SY_POLL_IN;
+    }
+
     if (sy_poll(fds, 2, 30000) <= 0) break;  /* 0 = 30s idle; negative = deadline */
 
-    if (fds[0].revents & SY_POLL_IN) {
-      sy_s64 n = sy_pump(SY_SELF, up, buf, sizeof buf);
-      if (n == 0) { sy_shutdown(up); caller_done = 1; fds[0].events = 0; }
+    if (!caller_done) {
+      sy_s64 n = sy_pump(SY_SELF, up, upward, sizeof upward, &to_upstream);
+      if (n == 0) { sy_shutdown(up); caller_done = 1; }
       else if (n < 0 && n != SY_EAGAIN) break;
     }
-    if (fds[1].revents & SY_POLL_IN) {
-      sy_s64 n = sy_pump(up, SY_SELF, buf, sizeof buf);
-      if (n == 0) { sy_shutdown(SY_SELF); upstream_done = 1; fds[1].events = 0; }
+    if (!upstream_done) {
+      sy_s64 n = sy_pump(up, SY_SELF, downward, sizeof downward, &to_caller);
+      if (n == 0) { sy_shutdown(SY_SELF); upstream_done = 1; }
       else if (n < 0 && n != SY_EAGAIN) break;
     }
     if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) break;
@@ -546,10 +587,14 @@ SY_ENTRY sy_s64 entry(void) {
 }
 ```
 
-`sy_pump` is in the header: it reads once, writes what it can, and leaves any
-remainder for the next poll rather than dropping it. A short write is
-backpressure, not failure, and writing that loop by hand is where the second
-most common mistake lives.
+`sy_pump` is in the header, and the `struct sy_pump` beside it is why: it reads
+once, writes what it can, and keeps the remainder *in the buffer* until a later
+call can place it. A short write is backpressure, not failure, and a pump that
+returned "moved 900 of 1500 bytes" with no way to say where the other 600 went
+would drop them — invisibly, and only once a payload got large enough to fill
+the far side's window. Writing that loop by hand is where the second most common
+mistake lives; `sy_write_all` is the same job for a program whose whole reply is
+one message.
 
 The `HUP` bit is reported only once an endpoint's buffer has drained, which is
 what makes the loop above safe: a peer that half-closes after sending a request
@@ -580,6 +625,9 @@ synch socket kill <invocation>                        end one; the stream closes
 synch socket log <space>/<path>                       what its sy_log calls said
 synch socket sdk                                      print the C SDK header, from the
                                                       build that defines the ABI
+synch socket build <file.c> [-o <file.o>]             compile C to the eBPF object a
+                   [-D NAME[=VALUE]]…                 socket is made of, with the
+                                                      compiler inside this binary
 
 synch connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
               [--meta k=v]…                           stream → stdout, exit code from
@@ -601,6 +649,26 @@ what it wrote to whatever it was talking to.
 A header on disk beside the binary is one that can be older than the binary,
 and the numbers in it are the guest's only view of the ABI: a guest compiled
 against a stale one gets wrong answers rather than errors.
+
+`synch socket build` is a compiler — [tinycc], targeting eBPF — linked into the
+binary. It runs in the CLI process: it needs no node, no daemon and no data
+directory, and it supplies `synch.h` itself, so the first socket somebody
+writes costs them a text editor and nothing else. The alternative was asking
+for a clang built with the BPF backend, which the distributions ship
+inconsistently and macOS does not ship at all; requiring a toolchain before the
+first twenty lines of C is how a capability goes unused. It is not an
+optimizing compiler and does not have to be — a socket is an event loop around
+helper calls, and the host does the work. A program that outgrows it is armed
+exactly the same way, because the runtime loads an ELF object and does not care
+which compiler wrote it. tinycc is LGPL-2.1 and is linked statically, under
+§6 of that licence.
+
+[tinycc]: https://github.com/losfair/tinycc
+
+Worked examples — an echo, an identity report, a read-only view of one
+directory, a status page over HTTP, a proxy, and a shared-secret gate — are in
+`crates/synch-sock/examples/`, compiled and *run* by the test suite on every
+build against the same runtime that serves them.
 
 ### 9.1 Where the listener runs
 
