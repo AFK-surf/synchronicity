@@ -659,11 +659,7 @@ async fn a_round_through_a_peer_that_never_saw_the_grant_does_not_widen() {
         &[],
     );
     let stale_syncer = Syncer::new(stale.store.clone());
-    let stale_to_work = stale
-        .net
-        .connect_mpt(work.net.direct_addr())
-        .await
-        .unwrap();
+    let stale_to_work = stale.net.connect_mpt(work.net.direct_addr()).await.unwrap();
     stale_syncer.sync_with(&stale_to_work).await.unwrap();
 
     // The grant arrives in the next head; the laptop replicates under it.
@@ -673,7 +669,11 @@ async fn a_round_through_a_peer_that_never_saw_the_grant_does_not_widen() {
         &[delegation(&laptop.key(), &["reports"])],
     );
     let syncer = Syncer::new(laptop.store.clone());
-    let to_work = laptop.net.connect_mpt(work.net.direct_addr()).await.unwrap();
+    let to_work = laptop
+        .net
+        .connect_mpt(work.net.direct_addr())
+        .await
+        .unwrap();
     syncer.sync_with(&to_work).await.unwrap();
     assert_eq!(
         laptop.store.local_scope().unwrap(),
@@ -751,10 +751,7 @@ async fn an_expired_delegation_collapses_the_read_scope_to_nothing() {
     // is cut off at the connection gate and never hears from a peer again;
     // the maintenance pass collapses the grantless scope.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let collapsed = delegate
-        .store
-        .collapse_grantless_scope(now_ns())
-        .unwrap();
+    let collapsed = delegate.store.collapse_grantless_scope(now_ns()).unwrap();
     assert!(collapsed, "the grantless scope must move");
 
     assert_eq!(

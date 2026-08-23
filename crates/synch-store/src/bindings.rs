@@ -637,14 +637,11 @@ impl Store {
     pub fn own_rooted_in_foreign_origin(&self, now: i64) -> Result<bool> {
         let own = self.own_keys()?;
         let self_origin = self.self_origin()?;
-        Ok(self
-            .live_bindings(now)?
-            .into_iter()
-            .any(|b| {
-                b.is_rooted()
-                    && own.contains(&b.node_id)
-                    && self_origin.as_ref().is_none_or(|o| o != &b.origin)
-            }))
+        Ok(self.live_bindings(now)?.into_iter().any(|b| {
+            b.is_rooted()
+                && own.contains(&b.node_id)
+                && self_origin.as_ref().is_none_or(|o| o != &b.origin)
+        }))
     }
 
     /// The origins that have delegated to *this* node (§3.5); empty if it is

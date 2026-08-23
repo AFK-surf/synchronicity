@@ -1572,15 +1572,16 @@ impl Adoption {
     fn rename_into_place(&mut self) -> Result<()> {
         match self.parent.take() {
             Some(dir) => {
-                let staging = self.staging.file_name().ok_or_else(|| {
-                    EngineError::invalid("the staging path has no file name")
-                })?;
-                let target = self.target.file_name().ok_or_else(|| {
-                    EngineError::invalid("the target path has no file name")
-                })?;
-                rustix::fs::renameat(&dir, staging, &dir, target).map_err(|e| {
-                    EngineError::invalid(format!("rename into place failed: {e}"))
-                })?;
+                let staging = self
+                    .staging
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the staging path has no file name"))?;
+                let target = self
+                    .target
+                    .file_name()
+                    .ok_or_else(|| EngineError::invalid("the target path has no file name"))?;
+                rustix::fs::renameat(&dir, staging, &dir, target)
+                    .map_err(|e| EngineError::invalid(format!("rename into place failed: {e}")))?;
             }
             None => std::fs::rename(&self.staging, &self.target)?,
         }
@@ -1643,16 +1644,12 @@ fn open_parent_no_follow(root: &Path, rel: &str) -> Result<rustix::fd::OwnedFd> 
                 // The path-based open creates missing parents; so does this
                 // one, with the same component-by-component no-follow rules
                 // applying to everything after.
-                rustix::fs::mkdirat(
-                    &dir,
-                    component,
-                    rustix::fs::Mode::from_bits_retain(0o777),
-                )
-                .map_err(|e| {
-                    EngineError::invalid(format!(
-                        "could not create the write's parent directory {component}: {e}"
-                    ))
-                })?;
+                rustix::fs::mkdirat(&dir, component, rustix::fs::Mode::from_bits_retain(0o777))
+                    .map_err(|e| {
+                        EngineError::invalid(format!(
+                            "could not create the write's parent directory {component}: {e}"
+                        ))
+                    })?;
                 dir = rustix::fs::openat(
                     &dir,
                     component,

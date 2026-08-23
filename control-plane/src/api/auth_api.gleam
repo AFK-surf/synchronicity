@@ -142,7 +142,8 @@ pub fn start(req: Request, ctx: AuthContext, key: String) -> Response {
     Error(Nil) -> error_json(404, "unknown_provider", "provider not configured")
     Ok(provider) ->
       with_db(ctx, fn(conn) {
-        let #(link_user_id, binding_hash, browser_token) = flow_session(req, conn)
+        let #(link_user_id, binding_hash, browser_token) =
+          flow_session(req, conn)
         case
           oauth.start(
             conn,
@@ -172,7 +173,8 @@ pub fn oidc_start(
       Error(Nil) ->
         error_json(404, "no_oidc", "this org has no OIDC provider configured")
       Ok(org) -> {
-        let #(link_user_id, binding_hash, browser_token) = flow_session(req, conn)
+        let #(link_user_id, binding_hash, browser_token) =
+          flow_session(req, conn)
         case
           oauth.start(
             conn,

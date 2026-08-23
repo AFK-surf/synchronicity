@@ -136,7 +136,16 @@ pub fn take_state(
   let _ =
     sqlite.exec(conn, "DELETE FROM oauth_states WHERE state = ?", [Text(state)])
   case lookup {
-    Ok([[Text(provider), Text(oidc), Text(verifier), Text(nonce), Text(link), session_hash]]) -> {
+    Ok([
+      [
+        Text(provider),
+        Text(oidc),
+        Text(verifier),
+        Text(nonce),
+        Text(link),
+        session_hash,
+      ],
+    ]) -> {
       let session_hash = case session_hash {
         Blob(hash) -> Some(hash)
         _ -> None

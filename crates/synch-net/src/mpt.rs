@@ -1059,7 +1059,10 @@ mod tests {
             stalled!("get_bindings", client.get_bindings(&origin)),
             stalled!(
                 "head_exchange",
-                client.head_exchange(Vec::new(), DeclaredScope::Untrusted, |_| (Vec::new(), Vec::new()))
+                client.head_exchange(Vec::new(), DeclaredScope::Untrusted, |_| (
+                    Vec::new(),
+                    Vec::new()
+                ))
             ),
         ];
         for (what, outcome) in stalled {
@@ -1170,7 +1173,9 @@ mod tests {
             .connect_mpt(server.direct_addr())
             .await
             .unwrap()
-            .head_exchange(Vec::new(), DeclaredScope::Untrusted, move |_| (pushed, vec![served.clone()]))
+            .head_exchange(Vec::new(), DeclaredScope::Untrusted, move |_| {
+                (pushed, vec![served.clone()])
+            })
             .await
             .expect("the exchange completes");
 
