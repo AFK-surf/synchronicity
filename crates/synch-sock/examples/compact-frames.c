@@ -1,6 +1,7 @@
 /* compact-frames — opt into a smaller contiguous call-frame layout.
  *
  *   synch socket build examples/compact-frames.c -o compact-frames.o
+ *   cp compact-frames.o ~/synchronicity/code/compact-frames.sock
  *   synch socket add code/compact-frames.sock
  *   synch socket arm code/compact-frames.sock
  *   synch connect nas:code/compact-frames.sock

@@ -314,9 +314,11 @@ read-only and *all* stores are confined to the stack.
 
 So the guest has **no heap** and **no mutable globals**. Its stack holds at
 least eight local-call frames plus 512 bytes of calldata: 128 KiB of frame
-space at the guarded 16 KiB default, with a 32 KiB floor for smaller custom
-frames. A program compiled with another frame size declares that size in
-`synchronicity.init`. Everything that outlives a helper call lives host-side:
+space at the 16 KiB default, with a 32 KiB floor for smaller custom frames.
+Default frames are guarded on hosts whose pages are no larger than 16 KiB and
+contiguous on larger-page hosts. A program compiled with another frame size
+declares that size in `synchronicity.init`. Everything that outlives a helper
+call lives host-side:
 
 The number that binds in practice is the **local-call frame**, not the total
 stack. The SDK examples' functions keep their locals below 4 KiB, while the
@@ -481,12 +483,13 @@ on that host and is printed in red at the arm prompt), `sy_declare_tree_read`,
 
 `sy_declare_stack_frame_size` must match the compiler's eBPF stack-frame
 setting. It accepts a multiple of 16 from 16 bytes through 32 KiB; omitting it
-keeps Synchronicity's 16 KiB default. Guarded frames are always required unless
-the program explicitly calls `sy_declare_guarded_stack_frames(0)`, so a guarded
-custom size must be aligned to the executing host's page size (16 KiB on Apple
-Silicon macOS). Disabling guards selects async-ebpf's contiguous layout;
-passing `1` explicitly requires them. The runtime never uses automatic guard
-selection. Both choices are included in the operator's approval text.
+keeps Synchronicity's 16 KiB default. Frames are guarded by default when the
+host page is no larger than 16 KiB. On hosts with larger pages the daemon warns
+at startup and explicitly selects async-ebpf's contiguous layout; it does not
+use automatic guard selection. A guarded custom size must be aligned to the
+executing host's page size. `sy_declare_guarded_stack_frames(0)` explicitly
+selects the contiguous layout, while passing `1` requires guards and refuses an
+incompatible host. Both choices are included in the operator's approval text.
 
 Calling a declaration helper from `synchronicity.stream` returns `SY_EPERM`;
 calling an I/O helper from `synchronicity.init` does too. The init hook runs
@@ -558,8 +561,8 @@ SY_ENTRY sy_s64 entry(void) {
   if (up < 0) return up;
 
   /* The binding limit is the *frame*, not the stack: this program uses the
-     guarded 16 KiB default per function. `who`, `key`, the poll array and the
-     two buffers all live inside that frame. */
+     16 KiB default per function. `who`, `key`, the poll array and the two
+     buffers all live inside that frame. */
   char upward[1536], downward[1536];
 
   /* One buffer and one pump per direction. `sy_pump` holds a short write's
@@ -714,7 +717,7 @@ own.
 | Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. |
 | rx / tx ring per endpoint | 256 KiB each | A full ring stops the host reading, which backpressures the far side. |
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |
-| Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Local-call frames are guarded and 16 KiB by default; sizes from 16 B through 32 KiB may be declared, with guards explicitly disabled for non-page-aligned sizes. |
+| Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Frames are 16 KiB and guarded by default on hosts with pages up to 16 KiB; larger-page hosts warn and fall back to contiguous frames. Sizes from 16 B through 32 KiB may be declared. |
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |

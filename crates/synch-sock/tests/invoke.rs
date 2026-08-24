@@ -458,7 +458,7 @@ async fn a_declared_stack_frame_size_configures_stream_local_calls() {
     .await;
     assert!(
         matches!(default_status, SockStatus::Fault(_)),
-        "the guarded 16 KiB default unexpectedly admitted 17 recursive frames: {default_status:?}"
+        "the 16 KiB default unexpectedly admitted 17 recursive frames: {default_status:?}"
     );
 
     let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
@@ -471,7 +471,8 @@ const MISALIGNED_GUARDED_FRAMES: &str = r#"
 #include <synch.h>
 
 SY_INIT_ENTRY sy_s64 declare(void) {
-  return sy_declare_stack_frame_size(512);
+  if (sy_declare_stack_frame_size(512) < 0) return -1;
+  return sy_declare_guarded_stack_frames(1);
 }
 
 SY_ENTRY sy_s64 entry(void) { return 0; }

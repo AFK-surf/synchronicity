@@ -1,7 +1,7 @@
 //! The socket map: the only state two invocations of one socket can share.
 //!
 //! The guest has no heap and no mutable globals — the data region is read-only
-//! after link and the JIT confines every store to the 32 KiB stack — so a
+//! after link and the JIT confines every store to the invocation's stack — so a
 //! program cannot accumulate anything across invocations by itself. This is
 //! where a session table, a nonce cache or a rate-limit counter lives.
 //!

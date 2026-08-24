@@ -118,8 +118,19 @@ fn resolve_stack_config(
     frame_size: Option<usize>,
     guarded: Option<bool>,
 ) -> Result<StackConfig, SockError> {
+    let page_size = host_page_size()
+        .ok_or_else(|| SockError::Load("cannot determine the host page size".into()))?;
+    resolve_stack_config_for_page(frame_size, guarded, page_size)
+}
+
+fn resolve_stack_config_for_page(
+    frame_size: Option<usize>,
+    guarded: Option<bool>,
+    page_size: usize,
+) -> Result<StackConfig, SockError> {
     let size = frame_size.unwrap_or(synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE as usize);
-    let guarded = guarded.unwrap_or(true);
+    let default_size = synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE as usize;
+    let guarded = guarded.unwrap_or_else(|| default_size.is_multiple_of(page_size));
     let valid = u32::try_from(size)
         .ok()
         .is_some_and(synch_core::valid_ebpf_stack_frame_size);
@@ -128,20 +139,29 @@ fn resolve_stack_config(
             "invalid declared stack frame size: {size}"
         )));
     }
-    if guarded {
-        let Some(page_size) = host_page_size() else {
-            return Err(SockError::Load(
-                "cannot determine the host page size".into(),
-            ));
-        };
-        if !size.is_multiple_of(page_size) {
-            return Err(SockError::Load(format!(
-                "guarded stack frame size {size} is not aligned to the host's \
-                 {page_size}-byte pages; declare guarded stack frames disabled"
-            )));
-        }
+    if guarded && !size.is_multiple_of(page_size) {
+        return Err(SockError::Load(format!(
+            "guarded stack frame size {size} is not aligned to the host's \
+             {page_size}-byte pages; declare guarded stack frames disabled"
+        )));
     }
     Ok((size, guarded))
+}
+
+fn warn_if_default_stack_is_contiguous() {
+    let Some(page_size) = host_page_size() else {
+        tracing::warn!("cannot determine the host page size; socket programs will fail to load");
+        return;
+    };
+    let default_size = synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE as usize;
+    if page_size > default_size {
+        tracing::warn!(
+            page_size,
+            frame_size = default_size,
+            "host pages are larger than the default eBPF stack frame; using contiguous \
+             stack frames unless the program explicitly requires guards"
+        );
+    }
 }
 
 fn guest_stack_size(frame_size: usize) -> Result<usize, SockError> {
@@ -222,6 +242,7 @@ impl WorkerHandle {
     /// configuration mistake that would surface as a hang rather than an error.
     pub fn start(count: usize, limits: Limits) -> WorkerHandle {
         let count = count.max(1);
+        warn_if_default_stack_is_contiguous();
         // Installed before any worker exists, so no thread can start a guest
         // before the handlers that contain its faults are in place.
         let global = global_env();
@@ -823,12 +844,24 @@ mod stack_tests {
 
     #[test]
     fn stack_configuration_never_uses_automatic_guard_selection() {
-        assert_eq!(resolve_stack_config(None, None).unwrap(), (16 * 1024, true));
-        assert!(resolve_stack_config(Some(512), None).is_err());
         assert_eq!(
-            resolve_stack_config(Some(512), Some(false)).unwrap(),
+            resolve_stack_config_for_page(None, None, 4 * 1024).unwrap(),
+            (16 * 1024, true)
+        );
+        assert_eq!(
+            resolve_stack_config_for_page(None, None, 64 * 1024).unwrap(),
+            (16 * 1024, false)
+        );
+        assert!(resolve_stack_config_for_page(Some(512), None, 4 * 1024).is_err());
+        assert_eq!(
+            resolve_stack_config_for_page(Some(512), None, 64 * 1024).unwrap(),
             (512, false)
         );
+        assert_eq!(
+            resolve_stack_config_for_page(Some(512), Some(false), 4 * 1024).unwrap(),
+            (512, false)
+        );
+        assert!(resolve_stack_config_for_page(Some(16 * 1024), Some(true), 64 * 1024).is_err());
     }
 
     #[test]

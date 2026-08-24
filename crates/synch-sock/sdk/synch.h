@@ -13,10 +13,11 @@
  * machine you are used to:
  *
  *   1. You have no heap and no mutable globals. The stack holds at least eight
- *      local-call frames; frames are guarded and 16 KiB unless
- *      `synchronicity.init` declares otherwise. A large buffer is a stack
- *      buffer; state that must outlive the invocation goes in the socket map
- *      (`sy_map_*`). A `static` you write to will not link.
+ *      local-call frames; frames are 16 KiB and guarded where the host page is
+ *      no larger than that. Larger-page hosts warn and use contiguous frames
+ *      unless `synchronicity.init` declares otherwise. A large buffer is a
+ *      stack buffer; state that must outlive the invocation goes in the socket
+ *      map (`sy_map_*`). A `static` you write to will not link.
  *
  *   2. Nothing blocks except `sy_poll`. Every read and write returns
  *      immediately, with a short count or `SY_EAGAIN`, and a short write is
@@ -246,8 +247,9 @@ extern sy_s64 sy_declare_max_streams(sy_u64 n);
 /* Must match the compiler's eBPF stack-frame setting: a multiple of 16 bytes,
  * from 16 through 32768. The default is 16384. */
 extern sy_s64 sy_declare_stack_frame_size(sy_u64 bytes);
-/* `enabled` is 0 or 1. Guarded frames are enabled by default; disabling them
- * permits frame sizes not aligned to the host page size. */
+/* `enabled` is 0 or 1. Guarded frames are enabled by default when the host
+ * page is at most 16 KiB; larger-page hosts warn and default to contiguous
+ * frames. Disabling guards permits sizes not aligned to the host page. */
 extern sy_s64 sy_declare_guarded_stack_frames(sy_u64 enabled);
 
 /* ---- what the compiler calls whether you write it or not ---------------- */

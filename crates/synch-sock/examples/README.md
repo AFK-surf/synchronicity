@@ -44,10 +44,11 @@ stopped working would fail the build rather than fail a reader.
 ## Three things about the machine you are writing for
 
 1. **At least eight stack frames, no heap, no mutable globals.** Frames are
-   guarded and 16 KiB by default. A large buffer is a stack buffer, and the
-   binding limit is its frame rather than the whole stack. State that must
-   outlive the invocation goes in the socket map (`sy_map_*`). A `static` you
-   write to will not link.
+   16 KiB and guarded by default where host pages are no larger than 16 KiB;
+   larger-page hosts warn and use contiguous frames. A large buffer is a stack
+   buffer, and the binding limit is its frame rather than the whole stack.
+   State that must outlive the invocation goes in the socket map (`sy_map_*`).
+   A `static` you write to will not link.
 
 2. **Nothing blocks except `sy_poll`.** Every read and write returns
    immediately, with a short count or `SY_EAGAIN`. A short write is
