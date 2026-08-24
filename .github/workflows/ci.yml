@@ -87,9 +87,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Split from `test`: real network + real clock per test makes this
       # crate alone slower than the rest of the workspace combined.
-      - run: cargo test -p synch-engine --all-targets --no-fail-fast
-      - run: cargo test -p synch-engine --doc --no-fail-fast
       - run: cargo test -p synch-engine --all-features --all-targets --no-fail-fast
+      - run: cargo test -p synch-engine --doc --no-fail-fast
       - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
   cloud-providers:
