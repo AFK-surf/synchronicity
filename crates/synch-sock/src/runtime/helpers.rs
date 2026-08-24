@@ -645,55 +645,66 @@ fn h_poll(
     if n == 0 || n > inner.limits.max_handles as u64 {
         return ret(errno::EINVAL);
     }
-    let raw = match bytes(scope, fds_ptr, n * POLLFD_SIZE) {
-        Ok(r) => r,
-        Err(e) => return ret(e),
-    };
+    let (watch, requested, epoch) = {
+        // This array is both the request and the reply. Register it as mutable
+        // once: async-ebpf keeps every guest-memory registration for the whole
+        // helper invocation, so reading it through `bytes` and registering it
+        // again for the immediate reply would be an overlapping write.
+        let mut region = match scope.user_memory_mut(fds_ptr, n * POLLFD_SIZE) {
+            Ok(r) => r,
+            Err(()) => return ret(errno::EINVAL),
+        };
 
-    // (handle, interest) pairs, read once. The guest's array is not read again
-    // until the answer is written back: what it does to it in between is its
-    // own business, and re-reading would make the reply describe a request
-    // nobody made.
-    let mut watch = Vec::with_capacity(n as usize);
-    // The remainder is discarded rather than refused: the length was checked
-    // against `n * POLLFD_SIZE` when it was read, so there is never one.
-    let (frames, _) = raw.as_chunks::<{ POLLFD_SIZE as usize }>();
-    for chunk in frames {
-        let handle = i64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes"));
-        let events = u32::from_le_bytes(chunk[8..12].try_into().expect("4 bytes"));
-        if events & !poll::ALL != 0 {
-            return ret(errno::EINVAL);
+        // (handle, interest) pairs, read once. The guest's array is not read
+        // again until the answer is written back: what it does to it in
+        // between is its own business, and re-reading would make the reply
+        // describe a request nobody made.
+        let mut watch = Vec::with_capacity(n as usize);
+        // The remainder is discarded rather than refused: the length was
+        // checked against `n * POLLFD_SIZE` when it was read, so there is never
+        // one.
+        let (frames, _) = region.as_chunks::<{ POLLFD_SIZE as usize }>();
+        for chunk in frames {
+            let handle = i64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes"));
+            let events = u32::from_le_bytes(chunk[8..12].try_into().expect("4 bytes"));
+            if events & !poll::ALL != 0 {
+                return ret(errno::EINVAL);
+            }
+            watch.push((handle, events));
         }
-        watch.push((handle, events));
-    }
 
-    let now = std::time::Instant::now();
-    let until_deadline = inner.deadline.get().saturating_duration_since(now);
-    let requested = if timeout_ms < 0 {
-        until_deadline
-    } else {
-        Duration::from_millis(timeout_ms as u64).min(until_deadline)
+        let now = std::time::Instant::now();
+        let until_deadline = inner.deadline.get().saturating_duration_since(now);
+        let requested = if timeout_ms < 0 {
+            until_deadline
+        } else {
+            Duration::from_millis(timeout_ms as u64).min(until_deadline)
+        };
+
+        inner
+            .live
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let epoch = inner.ready.epoch();
+        if let Some(count) = ready_now(&inner, &watch) {
+            inner.made_progress();
+            return finish_poll(&mut region, &inner, &watch, count);
+        }
+        // Nothing can ever become ready, so waiting is waiting for nothing.
+        // Told now rather than at the deadline: a program whose peers have all
+        // hung up is finished, not idle.
+        if inner.all_quiet() {
+            return finish_poll(&mut region, &inner, &watch, 0);
+        }
+
+        // Leaving this scope releases the view before the suspended task. Its
+        // completion callback gets a fresh HelperScope and guest-memory
+        // registration set.
+        (watch, requested, epoch)
     };
-
-    inner
-        .live
-        .polls
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let epoch = inner.ready.epoch();
-    if let Some(count) = ready_now(&inner, &watch) {
-        inner.made_progress();
-        return finish_poll(scope, fds_ptr, &inner, &watch, count);
-    }
-    // Nothing can ever become ready, so waiting is waiting for nothing. Told
-    // now rather than at the deadline: a program whose peers have all hung up
-    // is finished, not idle.
-    if inner.all_quiet() {
-        return finish_poll(scope, fds_ptr, &inner, &watch, 0);
-    }
-
     let posted = inner.clone();
-    let watch_for_task = watch.clone();
+    let watch_for_task = watch;
     scope.post_task(async move {
         let deadline = std::time::Instant::now() + requested;
         let mut epoch = epoch;
@@ -715,7 +726,7 @@ fn h_poll(
             posted.made_progress();
         }
         move |scope: &HelperScope| {
-            write_revents(scope, fds_ptr, &posted, &watch_for_task);
+            write_revents(scope, fds_ptr, &posted, &watch_for_task)?;
             Ok(count)
         }
     });
@@ -760,11 +771,19 @@ fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
 }
 
 /// Writes the answer back into the guest's array.
-fn write_revents(scope: &HelperScope, fds_ptr: u64, inner: &Inner, watch: &[(i64, u32)]) {
+fn write_revents(
+    scope: &HelperScope,
+    fds_ptr: u64,
+    inner: &Inner,
+    watch: &[(i64, u32)],
+) -> Result<(), ()> {
     let len = watch.len() as u64 * POLLFD_SIZE;
-    let Ok(mut region) = scope.user_memory_mut(fds_ptr, len) else {
-        return;
-    };
+    let mut region = scope.user_memory_mut(fds_ptr, len)?;
+    write_revents_into(&mut region, inner, watch);
+    Ok(())
+}
+
+fn write_revents_into(region: &mut [u8], inner: &Inner, watch: &[(i64, u32)]) {
     for (i, (handle, events)) in watch.iter().enumerate() {
         let bits = revents_for(inner, *handle, *events);
         let at = i * POLLFD_SIZE as usize + 12;
@@ -773,13 +792,12 @@ fn write_revents(scope: &HelperScope, fds_ptr: u64, inner: &Inner, watch: &[(i64
 }
 
 fn finish_poll(
-    scope: &HelperScope,
-    fds_ptr: u64,
+    region: &mut [u8],
     inner: &Inner,
     watch: &[(i64, u32)],
     count: u64,
 ) -> Result<u64, ()> {
-    write_revents(scope, fds_ptr, inner, watch);
+    write_revents_into(region, inner, watch);
     ret(count as i64)
 }
 

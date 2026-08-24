@@ -68,6 +68,74 @@ async fn a_program_echoes_a_stream_and_returns_cleanly() {
     assert_eq!(out, b"hello sockets");
 }
 
+const POLL_IMMEDIATE_ONE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* SY_SELF starts with tx room, so this must complete in the helper's
+     synchronous path and write the reply into the same 16-byte frame. */
+  struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_OUT, 0 } };
+  sy_s64 n = sy_poll(fds, 1, 5000);
+  sy_shutdown(SY_SELF);
+  if (n != 1) return -1;
+  if (!(fds[0].revents & SY_POLL_OUT)) return -2;
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn an_immediately_ready_poll_writes_revents() {
+    let elf = compile(POLL_IMMEDIATE_ONE, "poll-immediate-one.c");
+    let harness = Harness::new();
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+}
+
+const POLL_IMMEDIATE_TWO: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* The proxy-shaped 32-byte in/out array that exposed overlapping guest
+     memory registrations. Duplicate handles are separate poll entries. */
+  struct sy_pollfd fds[2] = {
+    { SY_SELF, SY_POLL_OUT, 0 },
+    { SY_SELF, SY_POLL_OUT, 0 },
+  };
+  sy_s64 n = sy_poll(fds, 2, 5000);
+  sy_shutdown(SY_SELF);
+  if (n != 2) return -1;
+  sy_u64 nonzero = (fds[0].revents != 0) + (fds[1].revents != 0);
+  if (nonzero != (sy_u64)n) return -2;
+  if (!(fds[0].revents & SY_POLL_OUT)) return -3;
+  if (!(fds[1].revents & SY_POLL_OUT)) return -4;
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn two_immediately_ready_poll_entries_write_both_revents() {
+    let elf = compile(POLL_IMMEDIATE_TWO, "poll-immediate-two.c");
+    let harness = Harness::new();
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+}
+
 const IDENTITY: &str = r#"
 #include <synch.h>
 
