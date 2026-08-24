@@ -479,8 +479,8 @@ after `sy_shutdown` when `sy_write` would return `SY_EPIPE`.
 
 ### 7.8 Bytes, hashes, encodings
 
-`sy_memcpy`, `sy_memcmp`, `sy_memset`, `sy_strlen`, `sy_ct_eq` (constant time),
-`sy_blake3`, `sy_sha256`, `sy_hmac_sha256`, `sy_base64_encode`,
+`sy_memcpy`, `sy_memcmp`, `sy_memset`, `sy_ct_eq` (constant time), `sy_blake3`,
+`sy_sha256`, `sy_hmac_sha256`, `sy_base64_encode`,
 `sy_base64_decode_in_place`, `sy_hex_encode`, `sy_hex_decode_in_place`.
 
 `sy_blake3` is first-class because content roots are BLAKE3: a program can
@@ -510,8 +510,12 @@ with no endpoint table at all, so there is nothing for it to reach.
 
 ### 7.10 In the header, not in the host
 
-Four things in `synch.h` are ordinary C rather than helpers, because they are
+Five things in `synch.h` are ordinary C rather than helpers, because they are
 the same in every program and getting them wrong is silent.
+
+`sy_strlen(s)` measures a NUL-terminated string directly in guest memory. It
+is ordinary C so measuring a short stack string does not make the host probe
+for the end of the stack region.
 
 `sy_pump(from, to, buf, cap, st)` moves one buffer's worth between two handles.
 The `struct sy_pump` it carries is the point: a short write is backpressure,

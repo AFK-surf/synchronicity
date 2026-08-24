@@ -92,7 +92,6 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_memcpy", h_memcpy),
     ("sy_memcmp", h_memcmp),
     ("sy_memset", h_memset),
-    ("sy_strlen", h_strlen),
     ("sy_ct_eq", h_ct_eq),
     ("sy_blake3", h_blake3),
     ("sy_sha256", h_sha256),
@@ -1244,40 +1243,6 @@ fn h_memset(scope: &HelperScope, dst: u64, byte: u64, n: u64, _: u64, _: u64) ->
     };
     region.fill(byte as u8);
     Ok(dst)
-}
-
-fn h_strlen(scope: &HelperScope, ptr: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    // Walked a chunk at a time rather than byte by byte through the validator,
-    // and bounded: an unterminated string in guest memory must not turn into an
-    // unbounded scan of the cage.
-    //
-    // A validated read takes one of the sixteen immutable region slots a helper
-    // call gets, so the chunk is as large as `MAX_COPY` divided by that budget:
-    // sixteen reads then cover the whole bound.
-    const CHUNK: u64 = MAX_COPY / 16;
-    let mut total = 0u64;
-    while total < MAX_COPY {
-        // A failed read means the *window* runs off the end of the region the
-        // pointer is in — not that the string is unterminated. So it narrows
-        // rather than giving up: a string that ends in the last bytes of the
-        // guest's stack is measured, where a fixed window would report every
-        // one of them as empty. Which is the whole top of a stack frame, and
-        // therefore most short buffers a program declares.
-        let mut want = (MAX_COPY - total).min(CHUNK);
-        let chunk = loop {
-            match scope.user_memory(ptr + total, want) {
-                Ok(chunk) => break Some(chunk),
-                Err(()) if want > 1 => want /= 2,
-                Err(()) => break None,
-            }
-        };
-        let Some(chunk) = chunk else { break };
-        if let Some(at) = chunk.iter().position(|b| *b == 0) {
-            return Ok(total + at as u64);
-        }
-        total += want;
-    }
-    Ok(total)
 }
 
 fn h_ct_eq(scope: &HelperScope, a: u64, b: u64, n: u64, _: u64, _: u64) -> Result<u64, ()> {

@@ -222,7 +222,14 @@ extern sy_s64 sy_rate_limit(const void *key, sy_u64 key_len, sy_u64 limit,
 extern void *sy_memcpy(void *dst, const void *src, sy_u64 n);
 extern sy_s64 sy_memcmp(const void *a, const void *b, sy_u64 n);
 extern void *sy_memset(void *dst, sy_s32 c, sy_u64 n);
-extern sy_u64 sy_strlen(const char *s);
+/* Guest-side rather than a host helper: direct byte reads avoid probing for
+ * the end of the containing stack or data region on every call. As in C's
+ * strlen, `s` must point to a NUL-terminated string. */
+SY_MAYBE_UNUSED static sy_u64 sy_strlen(const char *s) {
+  sy_u64 len = 0;
+  while (s[len]) len++;
+  return len;
+}
 /* Constant-time equality, for anything a token is checked against. */
 extern sy_s64 sy_ct_eq(const void *a, const void *b, sy_u64 n);
 /* First-class because content roots are BLAKE3: a program can check what it

@@ -1044,17 +1044,15 @@ SY_ENTRY sy_s64 entry(void) {
   if (sy_strlen(tiny) != 2) return -3;
 
   /* And a literal, which lives in the data section rather than the stack and
-     is measured the same way — `SY_STR` is `sy_strlen` under the macro. */
+     is measured the same way — `SY_STR` uses `sy_strlen` under the macro. */
   sy_write(SY_SELF, SY_STR("ok"));
   sy_shutdown(SY_SELF);
   return 0;
 }
 "#;
 
-/// `sy_strlen` used to answer 0 for a string with less than one scan chunk of
-/// readable memory after it — which is every buffer near the top of a frame,
-/// and therefore most short buffers a program declares. It answered *silently*:
-/// a program with `sy_write(h, buf, sy_strlen(buf))` in it wrote nothing.
+/// Header-side `sy_strlen` reads only the bytes of the string, including when
+/// the string is near the end of a stack frame or in the data section.
 #[tokio::test]
 async fn a_string_near_the_end_of_its_region_still_has_a_length() {
     let elf = compile(SHORT_BUFFER, "short-buffer.c");
