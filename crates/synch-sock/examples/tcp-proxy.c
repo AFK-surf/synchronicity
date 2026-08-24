@@ -3,7 +3,7 @@
  *   synch socket build examples/tcp-proxy.c -o tcp-proxy.o
  *   synch socket add code/git.sock
  *   synch socket arm code/git.sock        # inspect and copy the printed root
- *   synch socket arm code/git.sock --root <root>
+ *   synch socket arm code/git.sock --review <token>
  *   synch connect nas:code/git.sock --listen 127.0.0.1:9418
  *
  * The upstream is a compile-time constant because it is a *declaration*: the

@@ -99,7 +99,7 @@ pub const MIGRATIONS: &[Migration] = &[
 ///
 /// `sockets` is the declaration: it is what makes the scanner publish
 /// `EntryKind::Socket` for that path, and it carries the operator's half of the
-/// policy (allowed egress, allowed tree reads, the concurrency cap).
+/// policy (configuration, auto-arming, and the concurrency cap).
 ///
 /// `socket_arms` is the approval, keyed by the BLAKE3 content root it approved.
 /// The bytes changing changes the root, which leaves the declaration standing
@@ -120,6 +120,7 @@ CREATE TABLE sockets (
   auto             INTEGER NOT NULL DEFAULT 0,
   note             TEXT NOT NULL DEFAULT '',
   added_at         INTEGER NOT NULL,
+  generation       BLOB NOT NULL,            -- changes on every declaration update
   PRIMARY KEY (space, path)
 );
 
@@ -863,6 +864,7 @@ CREATE TABLE sockets (
   auto             INTEGER NOT NULL DEFAULT 0,
   note             TEXT NOT NULL DEFAULT '',
   added_at         INTEGER NOT NULL,
+  generation       BLOB NOT NULL,
   PRIMARY KEY (space, path)
 );
 

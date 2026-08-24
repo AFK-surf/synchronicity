@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
-use synch_core::{Declaration, EntryKind, Hash};
+use synch_core::{EntryKind, Hash};
 use synch_engine::{Node, NodeConfig};
-use synch_store::SocketRow;
+use synch_store::{ArmCandidate, SocketRow};
 
 /// A node with one space, and the directory that space indexes.
 async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
@@ -156,21 +156,30 @@ async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
 }
 
 #[tokio::test]
-async fn approval_is_compare_and_set_against_the_reviewed_root() {
+async fn approval_is_compare_and_set_against_the_reviewed_state() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF reviewed");
     node.socket_add(&declaration("code", "git.sock")).unwrap();
     node.scan_and_publish().unwrap();
 
-    let reviewed = node
-        .resolve_socket("code", "git.sock")
-        .unwrap()
-        .unwrap()
-        .root;
+    let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
+    let reviewed = resolved.root;
     let wrong = Hash::new(b"different bytes");
     assert!(
-        node.socket_approve("code", "git.sock", &wrong, &Declaration::default())
-            .is_err(),
+        !node
+            .store()
+            .arm_socket_reviewed(
+                node.origin(),
+                "code",
+                "git.sock",
+                ArmCandidate {
+                    generation: &resolved.state.generation,
+                    root: &wrong,
+                    declared: "",
+                    armed_at: synch_core::now_ns(),
+                },
+            )
+            .unwrap(),
         "approval accepted bytes other than the reviewed root"
     );
     assert!(node
@@ -181,8 +190,20 @@ async fn approval_is_compare_and_set_against_the_reviewed_root() {
         .arm
         .is_none());
 
-    node.socket_approve("code", "git.sock", &reviewed, &Declaration::default())
-        .unwrap();
+    assert!(node
+        .store()
+        .arm_socket_reviewed(
+            node.origin(),
+            "code",
+            "git.sock",
+            ArmCandidate {
+                generation: &resolved.state.generation,
+                root: &reviewed,
+                declared: "",
+                armed_at: synch_core::now_ns(),
+            },
+        )
+        .unwrap());
     assert!(node
         .resolve_socket("code", "git.sock")
         .unwrap()

@@ -822,12 +822,12 @@ pub enum SocketCommand {
     Arm {
         /// `<space>/<path>`.
         target: String,
-        /// Approve exactly this content root after reviewing the declaration.
+        /// Approve exactly this token after reviewing the declaration.
         ///
         /// Without this option the command only inspects the current program
-        /// and prints the root to pass on the approving invocation.
+        /// and prints the token to pass on the approving invocation.
         #[arg(long, value_name = "HEX")]
-        root: Option<String>,
+        review: Option<String>,
     },
     /// Withdraw an approval, leaving the socket published.
     Disarm {

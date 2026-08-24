@@ -844,8 +844,8 @@ message SocketAdd {
 
 message SocketArm {
   string target = 1;
-  // Empty inspects only; otherwise approve exactly this BLAKE3 root.
-  string root = 2;
+  // Empty inspects only; otherwise approve exactly this opaque review token.
+  string review = 2;
 }
 
 message SocketDisarm {

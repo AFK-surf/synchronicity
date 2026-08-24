@@ -24,8 +24,8 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -117,6 +117,36 @@ pub struct Worker {
     jobs: mpsc::UnboundedSender<Job>,
     /// How many invocations this worker is carrying, for placement.
     load: Arc<AtomicU64>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    stopping: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownSignal {
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_stopping() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// The pool the engine talks to.
@@ -127,6 +157,7 @@ pub struct WorkerHandle {
     registry: Arc<crate::registry::Registry>,
     limits: Limits,
     next_id: Arc<AtomicU64>,
+    shutdown: Arc<ShutdownSignal>,
 }
 
 impl WorkerHandle {
@@ -141,6 +172,7 @@ impl WorkerHandle {
         let global = global_env();
         let maps = SocketMaps::new();
         let registry = crate::registry::Registry::new();
+        let shutdown = Arc::new(ShutdownSignal::default());
         let workers = (0..count)
             .map(|index| {
                 Worker::spawn(
@@ -149,6 +181,7 @@ impl WorkerHandle {
                     limits.clone(),
                     maps.clone(),
                     registry.clone(),
+                    shutdown.clone(),
                 )
             })
             .collect();
@@ -158,6 +191,7 @@ impl WorkerHandle {
             registry,
             limits,
             next_id: Arc::new(AtomicU64::new(1)),
+            shutdown,
         }
     }
 
@@ -204,13 +238,16 @@ impl WorkerHandle {
 
     /// Runs one invocation, with a channel that ends it early.
     ///
-    /// The sender going away is what `synch socket kill` and a daemon shutdown
-    /// both look like from in here.
+    /// Operator cancellation is separate from the pool-wide shutdown signal,
+    /// so callers can distinguish `Killed` from `Shutdown`.
     pub async fn run_cancellable(
         &self,
         invocation: Invocation,
         cancel: oneshot::Receiver<()>,
     ) -> Result<Outcome, SockError> {
+        if self.shutdown.is_stopping() {
+            return Ok(shutdown_outcome());
+        }
         let worker = self
             .workers
             .iter()
@@ -232,6 +269,34 @@ impl WorkerHandle {
         load.fetch_sub(1, Ordering::Relaxed);
         out
     }
+
+    /// Cancels active work, drains queued work, and joins every worker thread.
+    /// Safe to call through multiple cloned handles.
+    pub async fn shutdown(&self) {
+        self.shutdown.stop();
+        let threads: Vec<_> = self
+            .workers
+            .iter()
+            .filter_map(|worker| {
+                worker
+                    .thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            })
+            .collect();
+        if threads.is_empty() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            for thread in threads {
+                if thread.join().is_err() {
+                    tracing::error!("socket worker thread panicked during shutdown");
+                }
+            }
+        })
+        .await;
+    }
 }
 
 impl Worker {
@@ -241,10 +306,12 @@ impl Worker {
         limits: Limits,
         maps: Arc<SocketMaps>,
         registry: Arc<crate::registry::Registry>,
+        shutdown: Arc<ShutdownSignal>,
     ) -> Worker {
         let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
         let load = Arc::new(AtomicU64::new(0));
-        std::thread::Builder::new()
+        let worker_shutdown = shutdown.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("synch-sock-{index}"))
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -267,31 +334,63 @@ impl Worker {
                     Rc::new(RefCell::new(HashMap::new()));
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
-                    while let Some(job) = rx.recv().await {
-                        let loader = loader.clone();
-                        let cache = cache.clone();
-                        let limits = limits.clone();
-                        let maps = maps.clone();
-                        let registry = registry.clone();
-                        tokio::task::spawn_local(async move {
-                            let outcome = run_job(
-                                &loader,
-                                &cache,
-                                thread_env,
-                                &limits,
-                                &maps,
-                                &registry,
-                                job.invocation,
-                                job.cancel,
-                            )
-                            .await;
-                            let _ = job.reply.send(outcome);
-                        });
+                    let mut running = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            _ = worker_shutdown.cancelled() => break,
+                            job = rx.recv() => match job {
+                                Some(job) => {
+                                    if worker_shutdown.is_stopping() {
+                                        let _ = job.reply.send(Ok(shutdown_outcome()));
+                                        continue;
+                                    }
+                                    let loader = loader.clone();
+                                    let cache = cache.clone();
+                                    let limits = limits.clone();
+                                    let maps = maps.clone();
+                                    let registry = registry.clone();
+                                    let shutdown = worker_shutdown.clone();
+                                    running.spawn_local(async move {
+                                        let outcome = run_job(
+                                            &loader,
+                                            &cache,
+                                            thread_env,
+                                            &limits,
+                                            &maps,
+                                            &registry,
+                                            &shutdown,
+                                            job.invocation,
+                                            job.cancel,
+                                        )
+                                        .await;
+                                        let _ = job.reply.send(outcome);
+                                    });
+                                }
+                                None => break,
+                            },
+                            Some(result) = running.join_next(), if !running.is_empty() => {
+                                if let Err(e) = result {
+                                    tracing::error!(worker = index, "socket invocation task failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                    while let Ok(job) = rx.try_recv() {
+                        let _ = job.reply.send(Ok(shutdown_outcome()));
+                    }
+                    while let Some(result) = running.join_next().await {
+                        if let Err(e) = result {
+                            tracing::error!(worker = index, "socket invocation task failed: {e}");
+                        }
                     }
                 });
             })
             .expect("spawning a socket worker thread");
-        Worker { jobs, load }
+        Worker {
+            jobs,
+            load,
+            thread: Mutex::new(Some(thread)),
+        }
     }
 }
 
@@ -329,6 +428,7 @@ async fn run_job(
     limits: &Limits,
     maps: &Arc<SocketMaps>,
     registry: &Arc<crate::registry::Registry>,
+    shutdown: &Arc<ShutdownSignal>,
     invocation: Invocation,
     cancel: oneshot::Receiver<()>,
 ) -> Result<Outcome, SockError> {
@@ -425,10 +525,10 @@ async fn run_job(
                     SockStatus::Fault(classify(&e.to_string()))
                 }
             },
-            // A kill or a shutdown: the guest is dropped where it stands, which
-            // is safe because everything it can hold is host-side and owned by
-            // `inner`.
+            // A kill or shutdown drops the guest where it stands. That is safe
+            // because everything it can hold is host-side and owned by `inner`.
             _ = &mut cancelled => SockStatus::Killed,
+            _ = shutdown.cancelled() => SockStatus::Shutdown,
         }
     };
 
@@ -475,6 +575,16 @@ async fn run_job(
         metrics,
         labels,
     })
+}
+
+fn shutdown_outcome() -> Outcome {
+    Outcome {
+        status: SockStatus::Shutdown,
+        bytes_in: 0,
+        bytes_out: 0,
+        metrics: Vec::new(),
+        labels: Vec::new(),
+    }
 }
 
 /// Reads async-ebpf's error text as a fault class.

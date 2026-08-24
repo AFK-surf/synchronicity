@@ -25,7 +25,7 @@ use synch_sock::{
     Admission, DuplexStream, EffectivePolicy, HostError, Limits, ObjectInfo, PeerIdentity,
     SocketHost, SocketId,
 };
-use synch_store::{SocketRow, SocketState};
+use synch_store::{ArmCandidate, SocketRow, SocketState};
 
 use crate::{
     error::{EngineError, Result},
@@ -41,6 +41,23 @@ pub struct Resolved {
     pub size: u64,
     /// The declaration and its arming record.
     pub state: SocketState,
+}
+
+/// The immutable result an operator reviews before arming a socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketInspection {
+    /// The content root that was inspected.
+    pub root: Hash,
+    /// What that exact execution of the program's init hook declared.
+    pub declaration: Declaration,
+    /// Opaque approval token binding the root, declaration revision, and
+    /// rendered program declaration.
+    pub review: Hash,
+}
+
+struct CurrentInspection {
+    public: SocketInspection,
+    generation: Hash,
 }
 
 impl Node {
@@ -87,7 +104,11 @@ impl Node {
     /// and per pointer signature, so a program that fails to compile would
     /// otherwise surface that on the first stream that reaches the bad path —
     /// a long way from the operator who armed it.
-    pub async fn socket_inspect(&self, space: &str, path: &str) -> Result<(Hash, Declaration)> {
+    pub async fn socket_inspect(&self, space: &str, path: &str) -> Result<SocketInspection> {
+        Ok(self.inspect_socket_current(space, path).await?.public)
+    }
+
+    async fn inspect_socket_current(&self, space: &str, path: &str) -> Result<CurrentInspection> {
         let resolved = self.resolve_socket(space, path)?.ok_or_else(|| {
             EngineError::invalid(format!(
                 "`{space}/{path}` is declared a socket but this node publishes no entry for it \
@@ -96,29 +117,45 @@ impl Node {
         })?;
         let elf = self.socket_program(&resolved).await?;
         let declared = self.declare_program(&elf)?;
-        Ok((resolved.root, declared))
+        let review = socket_review(&resolved.root, &resolved.state.generation, &declared);
+        Ok(CurrentInspection {
+            public: SocketInspection {
+                root: resolved.root,
+                declaration: declared,
+                review,
+            },
+            generation: resolved.state.generation,
+        })
     }
 
-    /// Approves a declaration previously inspected for exactly `root`.
-    pub fn socket_approve(
-        &self,
-        space: &str,
-        path: &str,
-        root: &Hash,
-        declared: &Declaration,
-    ) -> Result<()> {
-        let resolved = self.resolve_socket(space, path)?.ok_or_else(|| {
-            EngineError::invalid(format!("`{space}/{path}` is no longer a published socket"))
-        })?;
-        if &resolved.root != root {
-            return Err(EngineError::invalid(format!(
-                "reviewed root {} but the tree now names {}",
-                root.to_hex(),
-                resolved.root.to_hex()
-            )));
+    /// Approves only the exact init result returned by a prior inspection.
+    ///
+    /// Init is deliberately rerun here. A root alone is insufficient because
+    /// init may consult time or randomness; the opaque token proves that this
+    /// second execution produced the declaration the operator actually saw.
+    pub async fn socket_approve(&self, space: &str, path: &str, review: &Hash) -> Result<()> {
+        let inspected = self.inspect_socket_current(space, path).await?;
+        if &inspected.public.review != review {
+            return Err(EngineError::invalid(
+                "the socket's content, declaration, or init result changed after review; inspect it again",
+            ));
         }
-        self.store()
-            .arm_socket(space, path, root, &declared.render(), synch_core::now_ns())?;
+        let armed = self.store().arm_socket_reviewed(
+            self.origin(),
+            space,
+            path,
+            ArmCandidate {
+                generation: &inspected.generation,
+                root: &inspected.public.root,
+                declared: &inspected.public.declaration.render(),
+                armed_at: synch_core::now_ns(),
+            },
+        )?;
+        if !armed {
+            return Err(EngineError::invalid(
+                "the socket's declaration or published content changed while it was being armed; inspect it again",
+            ));
+        }
         // A re-arm is a different program; a session table minted by the old
         // one is not state the new one agreed to inherit.
         self.clear_socket_map(&format!("{space}/{path}"));
@@ -404,6 +441,16 @@ impl Node {
     }
 }
 
+fn socket_review(root: &Hash, generation: &Hash, declaration: &Declaration) -> Hash {
+    let rendered = declaration.render();
+    let mut bytes = Vec::with_capacity(32 + 32 + rendered.len() + 31);
+    bytes.extend_from_slice(b"synch/socket-review/v1\0");
+    bytes.extend_from_slice(root.as_bytes());
+    bytes.extend_from_slice(generation.as_bytes());
+    bytes.extend_from_slice(rendered.as_bytes());
+    Hash::new(&bytes)
+}
+
 /// The tree, as a running program reads it.
 ///
 /// Read-only, and scoped by default to this node's own view — the same scope
@@ -666,6 +713,11 @@ mod pool {
             self.0.run(invocation).await
         }
 
+        /// Cancels and drains every invocation, then joins all worker threads.
+        pub async fn shutdown(&self) {
+            self.0.shutdown().await;
+        }
+
         /// Takes a concurrency slot, or reports the socket full.
         #[allow(
             clippy::too_many_arguments,
@@ -763,6 +815,9 @@ mod pool {
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
             Err(synch_sock::SockError::Unsupported)
         }
+
+        /// Nothing runs on an unsupported platform.
+        pub async fn shutdown(&self) {}
 
         /// Unreachable: admission refuses before it reaches this.
         #[allow(
@@ -885,6 +940,7 @@ impl Node {
         let Some(state) = self.store().socket(space, path)? else {
             return Ok(());
         };
+        let generation = state.generation;
         if state.is_armed_for(root) {
             return Ok(());
         }
@@ -911,19 +967,29 @@ impl Node {
         };
         match self.declare_program(&elf) {
             Ok(declared) => {
-                self.store().arm_socket(
+                let armed = self.store().auto_arm_socket(
                     space,
                     path,
-                    root,
-                    &declared.render(),
-                    synch_core::now_ns(),
+                    ArmCandidate {
+                        generation: &generation,
+                        root,
+                        declared: &declared.render(),
+                        armed_at: synch_core::now_ns(),
+                    },
                 )?;
-                self.clear_socket_map(&format!("{space}/{path}"));
-                tracing::info!(
-                    socket = format!("{space}/{path}"),
-                    root = %root,
-                    "auto-armed"
-                );
+                if armed {
+                    self.clear_socket_map(&format!("{space}/{path}"));
+                    tracing::info!(
+                        socket = format!("{space}/{path}"),
+                        root = %root,
+                        "auto-armed"
+                    );
+                } else {
+                    tracing::info!(
+                        socket = format!("{space}/{path}"),
+                        "auto-arm skipped because the declaration changed or auto-arming was disabled"
+                    );
+                }
             }
             Err(e) => {
                 // A program that does not load is left disarmed rather than

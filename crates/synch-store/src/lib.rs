@@ -32,7 +32,7 @@ pub use proof::{Donor, Proven, ProvenSubtree};
 pub use recovery::ObservedHead;
 pub use replica::{ReplicaCoverage, WantRow};
 pub use schema::SCHEMA_VERSION;
-pub use sockets::{ArmRow, SocketRow, SocketState, MAX_SOCKETS_PER_SPACE};
+pub use sockets::{ArmCandidate, ArmRow, SocketRow, SocketState, MAX_SOCKETS_PER_SPACE};
 pub use unified::{Selection, Version, VersionPolicy, VersionSet};
 pub use uploads::{
     CompleteStart, Upload, UploadPart, UploadState, MAX_PART_NUMBER, MAX_PART_SIZE, MIN_PART_SIZE,

@@ -945,7 +945,13 @@ impl Node {
                 tracing::warn!(error = %e, "a retiring endpoint did not shut down cleanly");
             }
         }
-        self.net().shutdown().await?;
+        let network = self.net().shutdown().await;
+        // Tree hosts retain a Node while a guest is alive, so stopping the
+        // listeners is not enough: the pool owns and drains those lifetimes.
+        if let Some(pool) = &self.inner.sockets {
+            pool.shutdown().await;
+        }
+        network?;
         Ok(())
     }
 

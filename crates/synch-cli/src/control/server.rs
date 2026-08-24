@@ -1231,14 +1231,14 @@ async fn bridge_socket(
     let uplink = tokio::spawn(async move {
         while let Ok(Some(message)) = incoming.message().await {
             match message.kind {
-                Some(pb::connect_request::Kind::Data(bytes)) => {
+                Some(pb::connect_request::Kind::Data(bytes))
                     if tokio::io::AsyncWriteExt::write_all(&mut send, &bytes)
                         .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                        .is_err() =>
+                {
+                    return;
                 }
+                Some(pb::connect_request::Kind::Data(_)) => {}
                 // A half-close, not a hang-up: the program may still have a
                 // reply to write.
                 Some(pb::connect_request::Kind::Fin(_)) => break,
@@ -2653,40 +2653,37 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SocketArm(pb::SocketArm { target, root }) => {
+        Command::SocketArm(pb::SocketArm { target, review }) => {
             let (space, path) = split_socket_target(&target)?;
-            let (current, declared) = node
-                .socket_inspect(&space, &path)
-                .await
-                .map_err(ControlError::from)?;
-            out.line(format!("  program  {}", current.to_hex())).await?;
-            let rendered = declared.render();
-            if rendered.is_empty() {
-                out.line("  declares nothing — it reaches nothing and reads nothing".to_string())
+            if review.is_empty() {
+                let inspected = node
+                    .socket_inspect(&space, &path)
+                    .await
+                    .map_err(ControlError::from)?;
+                out.line(format!("  program  {}", inspected.root.to_hex()))
                     .await?;
-            } else {
-                for line in rendered.lines() {
-                    out.line(format!("  declares {line}")).await?;
+                let rendered = inspected.declaration.render();
+                if rendered.is_empty() {
+                    out.line(
+                        "  declares nothing — it reaches nothing and reads nothing".to_string(),
+                    )
+                    .await?;
+                } else {
+                    for line in rendered.lines() {
+                        out.line(format!("  declares {line}")).await?;
+                    }
                 }
-            }
-            if root.is_empty() {
                 out.line(format!(
-                    "reviewed only — approve with `synch socket arm {space}/{path} --root {}`",
-                    current.to_hex()
+                    "reviewed only — approve with `synch socket arm {space}/{path} --review {}`",
+                    inspected.review.to_hex()
                 ))
                 .await?;
             } else {
-                let expected = root
+                let expected = review
                     .parse::<synch_core::Hash>()
-                    .map_err(|e| ControlError::invalid(format!("--root: {e}")))?;
-                if expected != current {
-                    return Err(ControlError::invalid(format!(
-                        "reviewed root {} but the tree now names {}",
-                        expected.to_hex(),
-                        current.to_hex()
-                    )));
-                }
-                node.socket_approve(&space, &path, &current, &declared)
+                    .map_err(|e| ControlError::invalid(format!("--review: {e}")))?;
+                node.socket_approve(&space, &path, &expected)
+                    .await
                     .map_err(ControlError::from)?;
                 out.line(format!("armed {space}/{path}")).await?;
             }

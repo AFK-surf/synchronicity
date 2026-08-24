@@ -178,16 +178,17 @@ $ synch socket arm code/git.sock
             egress      git.internal:9418
             max streams 32
             tree reads  code/**  (own origin)
-  reviewed only — approve with `synch socket arm code/git.sock --root 9f86…a08`
+  reviewed only — approve with `synch socket arm code/git.sock --review 51a4…d20`
 ```
 
 Arming approves the capabilities the program declared. Egress or foreign-tree
 access with no declaration is denied. Because the declaration is compiled into
 the object, editing it changes the content root, which disarms the socket. A
 program cannot widen its own reach without a fresh review and approval, and an
-approval cannot silently outlive the code it approved. The explicit `--root`
-makes the review a compare-and-approve operation: if the bytes change between
-the two commands, approval fails.
+approval cannot silently outlive the code it approved. The opaque `--review`
+token binds the content root, the local declaration revision, and the exact
+init result shown above. If any of them changes between the two commands,
+approval fails; this remains true even if init consults time or randomness.
 
 ## 4. The wire — `sync/sock/1`
 
@@ -615,7 +616,7 @@ synch socket add <space>/<path> [--config k=v]…       declare a path in one of
                                                       publishes it as kind=Socket
 synch socket arm <space>/<path>                       inspect the current root and what
                                                       the program declares
-synch socket arm <space>/<path> --root <hex>          approve exactly the inspected root
+synch socket arm <space>/<path> --review <hex>        approve exactly the inspection
 synch socket disarm <space>/<path>                    keep publishing it, stop running it
 synch socket rm <space>/<path>                        republish as an ordinary file
 synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
@@ -752,7 +753,7 @@ own.
   engine crate stays embeddable — a library user gets sockets by enabling a
   feature, not by taking a dependency it cannot build.
 - **§10, schema.** Two tables: `sockets` (space, path, config, max streams,
-  auto flag) and `socket_arms` (space, path,
+  auto flag, declaration generation) and `socket_arms` (space, path,
   approved root, declarations as approved, armed_at). Both are local operator
   state and neither is ever published or replicated. The map store is
   memory-only and deliberately absent from SQLite.

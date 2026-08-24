@@ -397,8 +397,8 @@ runs it *here*, one invocation per incoming stream, under
 synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
 synch socket add code/git.sock
 synch scan                                     # publish it as kind=Socket
-synch socket arm code/git.sock                 # inspect declarations and copy the root
-synch socket arm code/git.sock --root <root>   # approve exactly what was inspected
+synch socket arm code/git.sock                 # inspect declarations and copy the token
+synch socket arm code/git.sock --review <token> # approve exactly what was inspected
 synch socket ls -l                             # armed root, drift, declarations
 synch socket sdk > synch.h                     # the header a program is built against
 ```

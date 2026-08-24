@@ -1830,7 +1830,7 @@ async fn a_socket_is_declared_listed_and_undeclared() {
         dir.path(),
         Command::SocketArm(pb::SocketArm {
             target: "code/git.sock".into(),
-            root: String::new(),
+            review: String::new(),
         }),
     )
     .await;

@@ -2056,6 +2056,7 @@ CREATE TABLE sockets (space TEXT NOT NULL, path TEXT NOT NULL,
                       auto INTEGER NOT NULL DEFAULT 0,   -- re-arm on every change
                       note TEXT NOT NULL DEFAULT '',
                       added_at INTEGER NOT NULL,
+                      generation BLOB NOT NULL,  -- fresh on every declaration update
                       PRIMARY KEY (space, path));
 
 -- The approval, keyed by the content root approved. The bytes changing changes

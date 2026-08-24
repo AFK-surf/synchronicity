@@ -575,6 +575,42 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_shutdown_cancels_and_drains_running_invocations() {
+    let elf = compile(HOLD_OPEN, "shutdown.c");
+    let harness = Harness::new();
+    let registry = harness.pool.registry().clone();
+    let (_mine, theirs) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(theirs);
+    let invocation = harness
+        .admitted(&elf, DuplexStream::new(reader, writer), &registry, 1)
+        .expect("the invocation is admitted");
+    let pool = harness.pool.clone();
+    let running = tokio::spawn(async move { pool.run(invocation).await.unwrap() });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while registry
+            .snapshot(None, std::time::Instant::now())
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the invocation never started");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), harness.pool.shutdown())
+        .await
+        .expect("pool shutdown did not join its workers");
+    assert_eq!(running.await.unwrap().status, SockStatus::Shutdown);
+    assert!(registry
+        .snapshot(None, std::time::Instant::now())
+        .is_empty());
+
+    // Cloned handles share ownership of the same joins; shutdown is idempotent.
+    harness.pool.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_registry_shows_a_running_invocation_and_caps_how_many_there_are() {
     let elf = compile(HOLD_OPEN, "hold-open.c");

@@ -42,7 +42,10 @@ pub use pb::{
 /// a bump, but a *call* addition does — an old daemon answers a new one with a
 /// bare gRPC `Unimplemented`, which reads as an internal error rather than the
 /// "restart the daemon" a version mismatch says.
-pub const CONTROL_VERSION: u32 = 2;
+///
+/// v3 changes socket arming from approval by content root to approval by an
+/// opaque token that also binds the declaration revision and init result.
+pub const CONTROL_VERSION: u32 = 3;
 
 /// How many payload bytes one chunk carries.
 ///

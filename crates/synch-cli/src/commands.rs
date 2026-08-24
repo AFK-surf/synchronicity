@@ -836,9 +836,9 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 auto: *auto,
                 note: note.clone().unwrap_or_default(),
             }),
-            SocketCommand::Arm { target, root } => Cmd::SocketArm(pb::SocketArm {
+            SocketCommand::Arm { target, review } => Cmd::SocketArm(pb::SocketArm {
                 target: target.clone(),
-                root: root.clone().unwrap_or_default(),
+                review: review.clone().unwrap_or_default(),
             }),
             SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
                 target: target.clone(),

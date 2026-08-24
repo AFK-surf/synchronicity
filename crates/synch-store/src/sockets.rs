@@ -17,7 +17,7 @@
 //! has to be cheap and exactly the one that must not lose anything.
 
 use rusqlite::{params, OptionalExtension};
-use synch_core::Hash;
+use synch_core::{Hash, OriginId};
 
 use crate::{
     db::{Store, Txn},
@@ -104,11 +104,29 @@ pub struct ArmRow {
     pub armed_at: i64,
 }
 
+/// The result of declaration work proposed for an atomic arming write.
+#[derive(Debug, Clone, Copy)]
+pub struct ArmCandidate<'a> {
+    /// Declaration revision that requested the work.
+    pub generation: &'a Hash,
+    /// Content root whose program was inspected.
+    pub root: &'a Hash,
+    /// Rendered result of its init hook.
+    pub declared: &'a str,
+    /// When the inspection completed, unix nanoseconds.
+    pub armed_at: i64,
+}
+
 /// What the store knows about one declared socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketState {
     /// The declaration.
     pub declaration: SocketRow,
+    /// Opaque identity of this exact declaration revision.
+    ///
+    /// It changes on every `put_socket`, including a delete followed by an
+    /// identical add, and is the compare-and-set token used by arming.
+    pub generation: Hash,
     /// The arming record, if there is one.
     pub arm: Option<ArmRow>,
 }
@@ -205,6 +223,77 @@ impl Store {
         self.transaction(|txn| txn.arm_socket(space, path, root, declared, armed_at))
     }
 
+    /// Arms a manually reviewed program only if both facts reviewed by the
+    /// caller are still current: the local declaration revision and this
+    /// origin's published socket root.
+    pub fn arm_socket_reviewed(
+        &self,
+        origin: &OriginId,
+        space: &str,
+        path: &str,
+        candidate: ArmCandidate<'_>,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            "INSERT INTO socket_arms (space, path, root, declared, armed_at)
+             SELECT ?2, ?3, ?5, ?6, ?7
+              WHERE EXISTS (
+                    SELECT 1 FROM sockets
+                     WHERE space = ?2 AND path = ?3 AND generation = ?4
+              )
+                AND EXISTS (
+                    SELECT 1 FROM entries
+                     WHERE origin_id = ?1 AND space = ?2 AND path = ?3
+                       AND kind = 4 AND content = ?5
+              )
+             ON CONFLICT(space, path) DO UPDATE SET
+               root = excluded.root,
+               declared = excluded.declared,
+               armed_at = excluded.armed_at",
+            params![
+                origin.canonical(),
+                space,
+                path,
+                candidate.generation.as_bytes().to_vec(),
+                candidate.root.as_bytes().to_vec(),
+                candidate.declared,
+                candidate.armed_at,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Auto-arms only if the declaration that requested the work still exists
+    /// unchanged and still has auto-arming enabled.
+    pub fn auto_arm_socket(
+        &self,
+        space: &str,
+        path: &str,
+        candidate: ArmCandidate<'_>,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            "INSERT INTO socket_arms (space, path, root, declared, armed_at)
+             SELECT ?1, ?2, ?4, ?5, ?6
+              WHERE EXISTS (
+                    SELECT 1 FROM sockets
+                     WHERE space = ?1 AND path = ?2
+                       AND generation = ?3 AND auto = 1
+              )
+             ON CONFLICT(space, path) DO UPDATE SET
+               root = excluded.root,
+               declared = excluded.declared,
+               armed_at = excluded.armed_at",
+            params![
+                space,
+                path,
+                candidate.generation.as_bytes().to_vec(),
+                candidate.root.as_bytes().to_vec(),
+                candidate.declared,
+                candidate.armed_at,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     /// What a device key may reach over `sync/sock/1`, and who it speaks for.
     ///
     /// Three answers, and the caller acts differently on each:
@@ -294,13 +383,14 @@ impl Txn<'_> {
         }
         self.conn().execute(
             "INSERT INTO sockets
-               (space, path, config, max_streams, auto, note, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               (space, path, config, max_streams, auto, note, added_at, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, randomblob(32))
              ON CONFLICT(space, path) DO UPDATE SET
                config = excluded.config,
                max_streams = excluded.max_streams,
                auto = excluded.auto,
-               note = excluded.note",
+               note = excluded.note,
+               generation = randomblob(32)",
             params![
                 row.space,
                 row.path,
@@ -354,13 +444,13 @@ impl Txn<'_> {
 }
 
 const SELECT_SOCKETS_BASE: &str = "SELECT s.space, s.path, s.config,
-            s.max_streams, s.auto, s.note, s.added_at,
+            s.max_streams, s.auto, s.note, s.added_at, s.generation,
             a.root, a.declared, a.armed_at
        FROM sockets s
        LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path";
 
 const SELECT_SOCKETS: &str = "SELECT s.space, s.path, s.config,
-            s.max_streams, s.auto, s.note, s.added_at,
+            s.max_streams, s.auto, s.note, s.added_at, s.generation,
             a.root, a.declared, a.armed_at
        FROM sockets s
        LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path
@@ -378,11 +468,12 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
         note: row.get(5)?,
         added_at: row.get(6)?,
     };
-    let arm = match row.get::<_, Option<Vec<u8>>>(7)? {
+    let generation = hash_column(row, 7, "sockets.generation")?;
+    let arm = match row.get::<_, Option<Vec<u8>>>(8)? {
         Some(bytes) => {
             let root = Hash::from_slice(&bytes).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    7,
+                    8,
                     rusqlite::types::Type::Blob,
                     "socket_arms.root is not a 32-byte hash".into(),
                 )
@@ -391,13 +482,28 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
                 space,
                 path,
                 root,
-                declared: row.get(8)?,
-                armed_at: row.get(9)?,
+                declared: row.get(9)?,
+                armed_at: row.get(10)?,
             })
         }
         None => None,
     };
-    Ok(SocketState { declaration, arm })
+    Ok(SocketState {
+        declaration,
+        generation,
+        arm,
+    })
+}
+
+fn hash_column(row: &rusqlite::Row<'_>, column: usize, name: &str) -> rusqlite::Result<Hash> {
+    let bytes: Vec<u8> = row.get(column)?;
+    Hash::from_slice(&bytes).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Blob,
+            format!("{name} is not a 32-byte hash").into(),
+        )
+    })
 }
 
 fn split_lines(text: &str) -> Vec<String> {
@@ -497,6 +603,39 @@ mod tests {
             got.arm.is_none(),
             "a re-declaration carried its old approval onto new terms"
         );
+    }
+
+    #[test]
+    fn redeclaring_changes_the_compare_and_set_generation() {
+        let (_d, store) = store();
+        store.put_socket(&row()).unwrap();
+        let before = store.socket("code", "git.sock").unwrap().unwrap();
+
+        store.put_socket(&row()).unwrap();
+        let after = store.socket("code", "git.sock").unwrap().unwrap();
+
+        assert_ne!(before.generation, after.generation);
+        assert!(
+            !store
+                .auto_arm_socket(
+                    "code",
+                    "git.sock",
+                    ArmCandidate {
+                        generation: &before.generation,
+                        root: &Hash::new(b"elf"),
+                        declared: "",
+                        armed_at: 3,
+                    },
+                )
+                .unwrap(),
+            "stale work armed a later declaration"
+        );
+        assert!(store
+            .socket("code", "git.sock")
+            .unwrap()
+            .unwrap()
+            .arm
+            .is_none());
     }
 
     #[test]
