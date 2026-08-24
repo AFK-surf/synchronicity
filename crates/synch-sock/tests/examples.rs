@@ -529,13 +529,16 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
         .await
         .expect("the upstream did not send its prefix")
         .expect("the upstream stopped before its prefix");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // A generous bound with a gentle poll: filling the path takes several
+    // ring-to-writer handoffs across threads, and on a loaded CI runner a
+    // hot yield loop under a tight clock has timed out spuriously.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let seen = registry.snapshot(None, std::time::Instant::now());
             if seen.first().is_some_and(|info| info.bytes_out >= 8192) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     })
     .await

@@ -19,5 +19,10 @@ workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# Only for the stack-frame agreement test: the compiled-for frame size must
+# equal the runtime default, and the crates stay otherwise independent.
+synch-core.workspace = true
+
 [build-dependencies]
 cc = "1"

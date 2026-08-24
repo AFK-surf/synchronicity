@@ -57,8 +57,8 @@ pub const SUPPORTED: bool = cfg!(tinycc);
 /// (`synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE`): a program compiled against
 /// a larger frame than the runtime provides would overflow its stack. The
 /// two crates stay independent — this crate does not know what a socket is —
-/// so the equality is enforced by a test in `synch-sock` instead of a
-/// dependency.
+/// so the equality is enforced by the test below through a dev-dependency
+/// rather than by sharing the constant.
 pub const STACK_FRAME_SIZE: u32 = 16 * 1024;
 
 /// Why a compile did not produce an object.
@@ -156,9 +156,9 @@ fn read_source(path: &Path) -> Result<(String, String), CcError> {
 /// Compiles one translation unit with the host's `clang` and `llc`.
 ///
 /// Clang optimizes the program at `-O2` into LLVM bitcode. `llc` then emits a
-/// BPF v3 relocatable object with the 16 KiB stack frames expected by the
-/// socket runtime. Both executables must be on `PATH` and come from compatible
-/// LLVM installations.
+/// BPF v3 relocatable object with the [`STACK_FRAME_SIZE`] stack frames the
+/// socket runtime expects. Both executables must be on `PATH` and come from
+/// compatible LLVM installations.
 pub fn compile_with_clang(
     source: &str,
     name: &str,
@@ -177,4 +177,17 @@ pub fn compile_file_with_clang(
 ) -> Result<Vec<u8>, CcError> {
     let (source, name) = read_source(path)?;
     compile_with_clang(&source, &name, headers, defines)
+}
+
+#[cfg(test)]
+mod stack_agreement {
+    #[test]
+    fn the_clang_path_compiles_for_the_runtime_default_frame() {
+        assert_eq!(
+            crate::STACK_FRAME_SIZE,
+            synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE,
+            "a program compiled against a larger frame than the runtime \
+             provides would overflow its stack"
+        );
+    }
 }

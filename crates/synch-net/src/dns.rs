@@ -1426,7 +1426,8 @@ impl DnssecResolver {
         let walked = tokio::task::spawn_blocking(move || match &owned {
             TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
             TufSource::Url(url) => tuf::fetch_metadata(
-                &tuf::HttpRepo::new(url).map_err(TufError::Malformed)?,
+                &tuf::HttpRepo::new(url)
+                    .map_err(|e| TufError::Malformed(format!("TUF client: {e}")))?,
                 from_root,
             ),
         })

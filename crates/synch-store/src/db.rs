@@ -1177,8 +1177,12 @@ fn note_redacted_in(conn: &Connection, hash: &Hash) -> Result<()> {
 }
 
 /// Reads a 32-byte hash column.
+///
+/// The message carries the length found: it is what distinguishes a
+/// truncated blob from a wrong-column read.
 pub(crate) fn hash_column(bytes: Vec<u8>, column: &'static str) -> Result<Hash> {
-    Hash::from_slice(&bytes).map_err(|_| StoreError::column(column, "not 32 bytes"))
+    Hash::from_slice(&bytes)
+        .map_err(|_| StoreError::column(column, format!("{} bytes, not 32", bytes.len())))
 }
 
 /// Reads a 32-byte device-key column.

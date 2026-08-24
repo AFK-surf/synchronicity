@@ -221,10 +221,11 @@ pub struct BlobSummary {
     pub last_access: i64,
 }
 
-/// The column list every whole-row `blobs` read shares, in the order
-/// [`raw_blob_row`] destructures. One spelling, because three hand-aligned
-/// tuple destructurings of the same eight columns is how a reordered schema
-/// change compiles cleanly and decodes the wrong column.
+/// The column list `blob` and `blobs` share, in the order [`raw_blob_row`]
+/// destructures. One spelling, because hand-aligned tuple destructurings of
+/// the same columns is how a reordered schema change compiles cleanly and
+/// decodes the wrong column. (`blob_candidates` still hand-decodes its own
+/// narrower row below.)
 const BLOB_COLUMNS: &str = "root, size, complete, bitmap, inline,
         EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
         last_access, durable";

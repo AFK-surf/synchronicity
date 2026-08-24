@@ -814,7 +814,7 @@ const TUF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// one at a few hundred KiB; the cap exists because these are bytes from a
 /// party nothing is trusted about, and a response with no bound is a reader
 /// that can be exhausted.
-pub const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
 
 /// A TUF repository read over HTTPS: the daemon's binding refresh and the
 /// monitor's discovery both walk one, so the transport — and above all its
@@ -852,7 +852,7 @@ impl HttpRepo {
         }
         Ok(HttpRepo {
             base: base.trim_end_matches('/').to_string(),
-            client: builder.build().map_err(|e| format!("TUF client: {e}"))?,
+            client: builder.build().map_err(|e| e.to_string())?,
         })
     }
 }

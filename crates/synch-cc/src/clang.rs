@@ -5,9 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::{CcError, Define, Header};
-
-use crate::STACK_FRAME_SIZE;
+use crate::{CcError, Define, Header, STACK_FRAME_SIZE};
 
 pub(crate) fn compile(
     source: &str,

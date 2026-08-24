@@ -871,16 +871,4 @@ mod stack_tests {
         assert_eq!(guest_stack_size(512).unwrap(), 32 * 1024 + 512);
         assert_eq!(guest_stack_size(16 * 1024).unwrap(), 128 * 1024 + 512);
     }
-
-    // The two crates stay independent, so the agreement is a test, not a
-    // dependency — as with the SDK-header helper-name test.
-    #[test]
-    fn the_clang_path_compiles_for_the_runtime_default_frame() {
-        assert_eq!(
-            synch_cc::STACK_FRAME_SIZE,
-            synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE,
-            "a program compiled against a larger frame than the runtime \
-             provides would overflow its stack"
-        );
-    }
 }

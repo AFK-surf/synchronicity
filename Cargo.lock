@@ -4865,6 +4865,7 @@ name = "synch-cc"
 version = "0.1.6"
 dependencies = [
  "cc",
+ "synch-core",
  "tempfile",
  "thiserror 2.0.20",
 ]

@@ -1082,7 +1082,7 @@ pub(crate) fn unsafe_name(path: &str) -> Option<String> {
 }
 
 /// Folds a path the way a case-insensitive, normalizing filesystem would.
-pub(crate) fn fold(path: &str) -> String {
+fn fold(path: &str) -> String {
     path.to_lowercase()
 }
 
