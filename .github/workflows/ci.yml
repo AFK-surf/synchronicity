@@ -84,6 +84,10 @@ jobs:
       # and the design's asymmetry claim — a client reads DER and never writes
       # it — is a fact about a build nothing ran.
       - run: cargo test --workspace --lib --bins --no-fail-fast --exclude synch-engine
+      # `fanout_bomb.rs`'s two tests are `#[ignore]`d so default `cargo test`
+      # stays fast for local iteration, not to drop their coverage — CI still
+      # runs them, once, explicitly.
+      - run: cargo test -p synch-mpt --test fanout_bomb --no-fail-fast -- --ignored
 
   test-engine:
     name: test synch-engine (${{ matrix.os }})

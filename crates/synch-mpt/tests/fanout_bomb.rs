@@ -51,11 +51,11 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
 
 /// Ignored because it is expensive *by construction*, not because it is
 /// flaky: refusal happens at `WALK_POSITION_CEILING`, so asserting it end to
-/// end means walking that many positions — ~8 s in release, ~90 s in a debug
-/// CI run, and the CI job runs the suite twice. `trie.rs`'s
-/// `the_walk_guard_stops_at_the_ceiling` covers the guard's arithmetic in
-/// microseconds; this covers the wiring, and is worth running by hand
-/// (`cargo test -- --ignored`) whenever either changes.
+/// end means walking that many positions — ~8 s in release, ~90 s in debug.
+/// `trie.rs`'s `the_walk_guard_stops_at_the_ceiling` covers the guard's
+/// arithmetic in microseconds; this covers the wiring. Excluded from the
+/// default `cargo test` run so local iteration stays fast, but CI runs it
+/// explicitly (`-- --ignored`) once per job, so it still gates every change.
 #[test]
 #[ignore = "walks to WALK_POSITION_CEILING; see the fast guard test in trie.rs"]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
@@ -91,11 +91,11 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
 /// guard.
 ///
 /// Ignored because it is expensive by construction, not because it is flaky:
-/// 120 000 real inserts through the trie, twice over — ~30 s in debug, run on
-/// every `cargo test` invocation across every OS in CI. There is no smaller
-/// stand-in: this is the only test that exercises the actual §7.1 corpus
-/// size, so run it by hand (`cargo test -- --ignored`) whenever `diff`,
-/// `insert`, or the fan-out guard changes.
+/// 120 000 real inserts through the trie, twice over — ~30 s in debug. There
+/// is no smaller stand-in: this is the only test that exercises the actual
+/// §7.1 corpus size. Excluded from the default `cargo test` run so local
+/// iteration stays fast, but CI runs it explicitly (`-- --ignored`) once per
+/// job, so it still gates every change.
 #[test]
 #[ignore = "120k-entry corpus, ~30s in debug; the only test at the documented §7.1 scale"]
 fn a_first_adoption_diff_survives_the_documented_corpus_size() {
