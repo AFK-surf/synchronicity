@@ -98,6 +98,8 @@ pub(crate) struct Endpoint {
     rx_room: Notify,
     /// Woken when the guest writes or half-closes, so the writer may continue.
     tx_data: Notify,
+    /// Wakes real I/O operations that are blocked outside the rings.
+    closed: Notify,
     /// Woken when anything the guest could poll on changes.
     ready: Rc<Readiness>,
     /// What `sy_endpoint_info` reports.
@@ -120,6 +122,7 @@ impl Endpoint {
             tx_shutdown: Cell::new(false),
             rx_room: Notify::new(),
             tx_data: Notify::new(),
+            closed: Notify::new(),
             ready,
             peer: RefCell::new(peer),
             bytes_in: Cell::new(0),
@@ -160,6 +163,7 @@ impl Endpoint {
         // the state and stop rather than parking forever on a dead endpoint.
         self.rx_room.notify_waiters();
         self.tx_data.notify_waiters();
+        self.closed.notify_waiters();
         self.ready.bump();
     }
 
@@ -167,6 +171,7 @@ impl Endpoint {
         self.state.set(State::Closed);
         self.rx_room.notify_waiters();
         self.tx_data.notify_waiters();
+        self.closed.notify_waiters();
         self.ready.bump();
     }
 
@@ -176,11 +181,6 @@ impl Endpoint {
 
     pub(crate) fn readable(&self) -> usize {
         self.rx.borrow().len()
-    }
-
-    /// Bytes the guest has written that the writer task has not yet pushed out.
-    pub(crate) fn pending_out(&self) -> usize {
-        self.tx.borrow().len()
     }
 
     pub(crate) fn writable(&self) -> usize {
@@ -326,7 +326,17 @@ pub(crate) async fn reader_task(ep: Rc<Endpoint>, mut reader: Box<dyn AsyncRead 
             .cap
             .saturating_sub(ep.rx.borrow().len())
             .min(scratch.len());
-        match reader.read(&mut scratch[..want]).await {
+        let closed = ep.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if ep.finished() {
+            return;
+        }
+        let read = tokio::select! {
+            read = reader.read(&mut scratch[..want]) => read,
+            _ = &mut closed => return,
+        };
+        match read {
             Ok(0) => {
                 ep.set_rx_eof();
                 return;
@@ -365,7 +375,18 @@ pub(crate) async fn writer_task(ep: Rc<Endpoint>, mut writer: Box<dyn AsyncWrite
             let _ = writer.shutdown().await;
             return;
         }
-        if let Err(e) = writer.write_all(&chunk).await {
+        let closed = ep.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if ep.finished() {
+            let _ = writer.shutdown().await;
+            return;
+        }
+        let written = tokio::select! {
+            written = writer.write_all(&chunk) => written,
+            _ = &mut closed => return,
+        };
+        if let Err(e) = written {
             ep.fail(io_errno(&e));
             return;
         }
@@ -379,7 +400,17 @@ pub(crate) async fn writer_task(ep: Rc<Endpoint>, mut writer: Box<dyn AsyncWrite
 /// somebody else's to point wherever they like, so the address it resolved to
 /// is checked before anything is connected to it.
 pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16) {
-    let addrs = match tokio::net::lookup_host((host.as_str(), port)).await {
+    let closed = ep.closed.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+    if ep.finished() {
+        return;
+    }
+    let lookup = tokio::select! {
+        lookup = tokio::net::lookup_host((host.as_str(), port)) => lookup,
+        _ = &mut closed => return,
+    };
+    let addrs = match lookup {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
         Err(e) => {
             ep.fail(io_errno(&e));
@@ -406,14 +437,26 @@ pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16) {
 
     let mut last = errno::ECONNRESET;
     for addr in permitted {
-        match tokio::net::TcpStream::connect(addr).await {
+        let closed = ep.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if ep.finished() {
+            return;
+        }
+        let connected = tokio::select! {
+            connected = tokio::net::TcpStream::connect(addr) => connected,
+            _ = &mut closed => return,
+        };
+        match connected {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
                 ep.set_peer(addr.to_string());
                 let (r, w) = tokio::io::split(stream);
                 ep.set_open();
-                tokio::task::spawn_local(reader_task(ep.clone(), Box::new(r)));
-                tokio::task::spawn_local(writer_task(ep.clone(), Box::new(w)));
+                tokio::join!(
+                    reader_task(ep.clone(), Box::new(r)),
+                    writer_task(ep.clone(), Box::new(w))
+                );
                 return;
             }
             Err(e) => last = io_errno(&e),

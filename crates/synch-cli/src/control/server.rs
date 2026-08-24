@@ -1264,17 +1264,19 @@ async fn bridge_socket(
             }
         }
     }
-    uplink.abort();
-
     // The status rides its own uni-stream, so it can only be read once the
     // data stream is done — which is exactly when it is worth reading.
     let closed = synch_net::frame::read_frame::<synch_core::SockClosed>(&mut control).await;
     let (exit_code, status) = match closed {
         Ok(closed) => (closed.status.exit_code(), format!("{:?}", closed.status)),
-        // A caller that never learns the status still learns the stream ended,
-        // which is the honest thing to report rather than inventing a zero.
-        Err(_) => (0, String::new()),
+        // A missing status is a transport failure, never a successful program
+        // return. Keep it distinct from the runtime's 70..=73 statuses.
+        Err(e) => (74, format!("completion status unavailable: {e}")),
     };
+    // The program has ended now. Until this point its output could have
+    // half-closed while it continued consuming caller input, so the uplink had
+    // to remain independent and alive.
+    uplink.abort();
     tx.send(Ok(pb::ConnectResponse {
         kind: Some(pb::connect_response::Kind::Closed(pb::ConnectClosed {
             exit_code,
@@ -2605,8 +2607,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::SocketAdd(pb::SocketAdd {
             target,
             config,
-            allow_egress,
-            allow_tree_read,
             max_streams,
             auto,
             note,
@@ -2622,8 +2622,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                         None => (pair.clone(), String::new()),
                     })
                     .collect(),
-                allow_egress,
-                allow_tree_read,
                 max_streams: (max_streams > 0).then_some(max_streams),
                 auto,
                 note,
@@ -2635,8 +2633,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line(format!("declared {space}/{path}")).await?;
             if !synch_sock::SUPPORTED {
                 out.line(
-                    "note: this build serves no sockets — async-ebpf supports Linux and \
-                     OpenBSD on x86-64 and arm64. The entry will publish and replicate; \
+                    "note: this build serves no sockets — async-ebpf supports Linux, macOS, \
+                     and OpenBSD on x86-64 and arm64. The entry will publish and replicate; \
                      a peer connecting to it is refused."
                         .to_string(),
                 )
@@ -2655,14 +2653,13 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SocketArm(pb::SocketArm { target }) => {
+        Command::SocketArm(pb::SocketArm { target, root }) => {
             let (space, path) = split_socket_target(&target)?;
-            let (root, declared) = node
-                .socket_arm(&space, &path)
+            let (current, declared) = node
+                .socket_inspect(&space, &path)
                 .await
                 .map_err(ControlError::from)?;
-            out.line(format!("armed {space}/{path}")).await?;
-            out.line(format!("  program  {}", root.to_hex())).await?;
+            out.line(format!("  program  {}", current.to_hex())).await?;
             let rendered = declared.render();
             if rendered.is_empty() {
                 out.line("  declares nothing — it reaches nothing and reads nothing".to_string())
@@ -2671,6 +2668,27 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 for line in rendered.lines() {
                     out.line(format!("  declares {line}")).await?;
                 }
+            }
+            if root.is_empty() {
+                out.line(format!(
+                    "reviewed only — approve with `synch socket arm {space}/{path} --root {}`",
+                    current.to_hex()
+                ))
+                .await?;
+            } else {
+                let expected = root
+                    .parse::<synch_core::Hash>()
+                    .map_err(|e| ControlError::invalid(format!("--root: {e}")))?;
+                if expected != current {
+                    return Err(ControlError::invalid(format!(
+                        "reviewed root {} but the tree now names {}",
+                        expected.to_hex(),
+                        current.to_hex()
+                    )));
+                }
+                node.socket_approve(&space, &path, &current, &declared)
+                    .map_err(ControlError::from)?;
+                out.line(format!("armed {space}/{path}")).await?;
             }
         }
 
@@ -2745,12 +2763,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                         for line in arm.declared.lines() {
                             out.line(format!("    declares {line}")).await?;
                         }
-                    }
-                    for rule in &state.declaration.allow_egress {
-                        out.line(format!("    allowed  egress {rule}")).await?;
-                    }
-                    for prefix in &state.declaration.allow_tree_read {
-                        out.line(format!("    allowed  tree-read {prefix}")).await?;
                     }
                     if let Some(n) = state.declaration.max_streams {
                         out.line(format!("    allowed  max-streams {n}")).await?;

@@ -388,19 +388,15 @@ async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
     );
 
     let harness = Harness::new();
-    // The operator's half of the intersection. A literal address is the one
-    // way a rule may name something in a range a *name* must never reach.
-    let allowed = EffectivePolicy {
-        egress: vec![format!("127.0.0.1:{port}")],
-        max_streams: 32,
-        ..EffectivePolicy::default()
-    };
+    // Arming approves the program's declaration. A literal address is the one
+    // way it may name something in a range a DNS name must never reach.
+    let armed = EffectivePolicy::armed(&declared, vec![], None, 64);
 
     let (status, out) = exchange(
         &harness,
         &elf,
         b"GET /info/refs\n",
-        allowed.clone(),
+        armed.clone(),
         peer(Some(vec!["code".into()])),
         vec![],
     )
@@ -414,44 +410,13 @@ async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
         &harness,
         &elf,
         b"GET /info/refs\n",
-        allowed,
+        armed,
         peer(Some(vec!["photos".into()])),
         vec![],
     )
     .await;
     assert_eq!(status, SockStatus::Ok(1));
     assert!(out.is_empty(), "a refused caller was told something");
-}
-
-/// The upstream this program declared is the only one it can reach.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_proxy_cannot_reach_an_upstream_the_operator_did_not_allow() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a loopback listener");
-    let port = listener.local_addr().unwrap().port();
-    let elf = build_with(
-        "tcp-proxy.c",
-        &[
-            ("UPSTREAM_HOST", "\"127.0.0.1\""),
-            ("UPSTREAM_PORT", &port.to_string()),
-        ],
-    );
-
-    let harness = Harness::new();
-    // The program declared it; the operator did not allow it. Neither side can
-    // widen the list alone, so the connect is refused before a packet moves.
-    let (status, out) = exchange(
-        &harness,
-        &elf,
-        b"anything\n",
-        EffectivePolicy::default(),
-        peer(Some(vec!["code".into()])),
-        vec![],
-    )
-    .await;
-    assert_eq!(status, SockStatus::Ok(3), "the connect should have failed");
-    assert!(out.is_empty());
 }
 
 /// The runtime loads an object somebody else's compiler wrote.

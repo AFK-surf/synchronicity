@@ -804,15 +804,6 @@ pub enum SocketCommand {
         /// `k=v`, readable by the program through `sy_config_get`.
         #[arg(long = "config", value_name = "K=V")]
         config: Vec<String>,
-        /// A destination the program may reach: `host` or `host:port`.
-        ///
-        /// The runtime enforces the intersection of this and what the program
-        /// declared, so a destination only one side names is denied.
-        #[arg(long = "allow-egress", value_name = "HOST[:PORT]")]
-        allow_egress: Vec<String>,
-        /// A path prefix the program may read from other origins' views.
-        #[arg(long = "allow-tree-read", value_name = "PREFIX")]
-        allow_tree_read: Vec<String>,
         /// A concurrency cap for this socket.
         #[arg(long, value_name = "N")]
         max_streams: Option<u32>,
@@ -831,6 +822,12 @@ pub enum SocketCommand {
     Arm {
         /// `<space>/<path>`.
         target: String,
+        /// Approve exactly this content root after reviewing the declaration.
+        ///
+        /// Without this option the command only inspects the current program
+        /// and prints the root to pass on the approving invocation.
+        #[arg(long, value_name = "HEX")]
+        root: Option<String>,
     },
     /// Withdraw an approval, leaving the socket published.
     Disarm {
@@ -873,8 +870,8 @@ pub enum SocketCommand {
     Sdk,
     /// Compile a C program to the eBPF object a socket is made of.
     ///
-    /// The compiler is inside this binary, so writing a socket needs nothing
-    /// installed — no clang, no BPF backend, no cross toolchain. `synch.h` is
+    /// On supported builds the compiler is inside this binary, so writing a
+    /// socket needs no clang, BPF backend, or cross toolchain. `synch.h` is
     /// included automatically and is the same header `synch socket sdk`
     /// prints; there is no libc, and nothing else is on the include path.
     ///

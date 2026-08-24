@@ -526,8 +526,7 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
             socket = %inner.socket.qualified(),
             host,
             port,
-            "socket egress refused: not in the intersection of what the program \
-             declared and what the operator armed"
+            "socket egress refused: the armed program did not declare it"
         );
         return errno::EPERM;
     }
@@ -556,7 +555,7 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
     };
     inner.egress_open.set(inner.egress_open.get() + 1);
     inner.publish_handles();
-    tokio::task::spawn_local(connect_task(ep, host, port));
+    inner.spawn(connect_task(ep, host, port));
     handle
 }
 
@@ -809,7 +808,7 @@ fn open_common(scope: &HelperScope, origin: Option<String>, path: String) -> Res
                 socket = %inner.socket.qualified(),
                 origin,
                 path,
-                "socket tree read refused: not in the armed --allow-tree-read set"
+                "socket tree read refused: the armed program did not declare it"
             );
             return ret(errno::EPERM);
         }
@@ -949,7 +948,7 @@ fn h_pread(
     let slot = obj.clone();
     let charged = len;
     let inner_for_task = inner.clone();
-    tokio::task::spawn_local(async move {
+    inner.spawn(async move {
         let outcome = host.pread(root, offset, charged).await;
         slot.pending.set(false);
         match outcome {
@@ -1013,8 +1012,13 @@ fn h_list_next(
     let Some(name) = cur.names.get(at) else {
         return ret(0);
     };
-    cur.at.set(at + 1);
-    out_str(scope, ptr, len, name)
+    let result = out_str(scope, ptr, len, name);
+    // `out_str` has snprintf semantics: a sizing call or truncated write has
+    // not consumed the entry. Advance only after its bytes and NUL all fit.
+    if len > name.len() as u64 && result == Ok(name.len() as u64) {
+        cur.at.set(at + 1);
+    }
+    result
 }
 
 // ---- state ---------------------------------------------------------------
@@ -1034,7 +1038,7 @@ fn h_map_get(
     let value = with(scope, |inner| {
         inner
             .maps
-            .get(&inner.socket.qualified(), &key, std::time::Instant::now())
+            .get(&inner.map_namespace(), &key, std::time::Instant::now())
     })?;
     match value {
         Some(v) => {
@@ -1068,7 +1072,7 @@ fn h_map_set(
     with(scope, |inner| {
         let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
         match inner.maps.set(
-            &inner.socket.qualified(),
+            &inner.map_namespace(),
             &key,
             &value,
             ttl,
@@ -1095,7 +1099,7 @@ fn h_map_delete(
         Err(e) => return ret(e),
     };
     with(scope, |inner| {
-        i64::from(inner.maps.delete(&inner.socket.qualified(), &key))
+        i64::from(inner.maps.delete(&inner.map_namespace(), &key))
     })
     .and_then(ret)
 }
@@ -1115,7 +1119,7 @@ fn h_map_incr(
     with(scope, |inner| {
         let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
         match inner.maps.incr(
-            &inner.socket.qualified(),
+            &inner.map_namespace(),
             &key,
             delta as i64,
             ttl,
@@ -1143,12 +1147,11 @@ fn h_rate_limit(
     };
     with(scope, |inner| {
         match inner.maps.rate_limit(
-            &inner.socket.qualified(),
+            &inner.map_namespace(),
             &key,
             limit,
             Duration::from_millis(window_ms.max(1)),
             std::time::Instant::now(),
-            inner.started,
             &inner.limits,
         ) {
             Ok(()) => 0,

@@ -617,10 +617,16 @@ impl Store {
 
     /// Removes a local space.
     pub fn remove_space(&self, id: &str) -> Result<bool> {
-        let n = self
-            .conn()
-            .execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
-        Ok(n > 0)
+        self.transaction(|txn| {
+            txn.conn()
+                .execute("DELETE FROM socket_arms WHERE space = ?1", params![id])?;
+            txn.conn()
+                .execute("DELETE FROM sockets WHERE space = ?1", params![id])?;
+            let n = txn
+                .conn()
+                .execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
+            Ok(n > 0)
+        })
     }
 
     /// Every configured local space.

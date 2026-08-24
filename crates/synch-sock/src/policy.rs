@@ -1,13 +1,12 @@
 //! Who is calling, and what this invocation may do.
 //!
-//! The effective policy is the **intersection** of two lists: what the program
-//! declared in its `synchronicity.init` hook, and what the operator allowed at
-//! `synch socket add`. Neither side can widen it alone. Egress that nobody
-//! declared is denied, which is the same answer as egress nobody allowed.
+//! Arming a program approves the capabilities it declared in its
+//! `synchronicity.init` hook. Egress or foreign-tree access the program did not
+//! declare remains denied.
 //!
-//! The intersection is computed once, when the invocation is built, so a helper
-//! answers a policy question by looking at a list rather than by re-deriving it
-//! — and so a policy change cannot take effect halfway through a stream.
+//! The effective policy is computed once when the invocation is built, so a
+//! helper answers a policy question by looking at a list rather than by
+//! re-deriving it.
 
 use std::net::IpAddr;
 
@@ -91,12 +90,12 @@ impl PeerIdentity {
     }
 }
 
-/// What one invocation may do: the intersection, already computed.
+/// What one invocation may do, already computed from the armed declaration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectivePolicy {
-    /// Egress rules both sides agreed to, as `host` or `host:port`.
+    /// Egress rules the armed program declared, as `host` or `host:port`.
     pub egress: Vec<String>,
-    /// Tree-read prefixes both sides agreed to.
+    /// Foreign-tree prefixes the armed program declared.
     pub tree_reads: Vec<String>,
     /// Config the operator set, readable through `sy_config_get`.
     pub config: Vec<(String, String)>,
@@ -105,44 +104,13 @@ pub struct EffectivePolicy {
 }
 
 impl EffectivePolicy {
-    /// Intersects what the program declared with what the operator allowed.
-    ///
-    /// A rule survives only if the *other* side's list also admits it. The
-    /// asymmetry worth naming: the operator's list is matched against the
-    /// program's rules and not the other way round, because the program's rules
-    /// are the ones a connection is checked against — the operator's list
-    /// bounds them, it does not add to them.
-    pub fn intersect(
+    /// Builds the runtime policy approved by arming this declaration.
+    pub fn armed(
         declared: &Declaration,
-        allow_egress: &[String],
-        allow_tree_read: &[String],
         config: Vec<(String, String)>,
         operator_max_streams: Option<u32>,
         default_max_streams: usize,
     ) -> EffectivePolicy {
-        let egress = declared
-            .egress
-            .iter()
-            .filter(|rule| {
-                let (host, port) = split_rule(rule);
-                allow_egress
-                    .iter()
-                    .any(|allowed| rule_admits(allowed, host, port))
-            })
-            .cloned()
-            .collect();
-
-        let tree_reads = declared
-            .tree_reads
-            .iter()
-            .filter(|prefix| {
-                allow_tree_read
-                    .iter()
-                    .any(|allowed| synch_core::sock::path_prefix_matches(allowed, prefix))
-            })
-            .cloned()
-            .collect();
-
         let max_streams = [
             declared.max_streams.map(|n| n as usize),
             operator_max_streams.map(|n| n as usize),
@@ -154,8 +122,8 @@ impl EffectivePolicy {
         .unwrap_or(default_max_streams);
 
         EffectivePolicy {
-            egress,
-            tree_reads,
+            egress: declared.egress.clone(),
+            tree_reads: declared.tree_reads.clone(),
             config,
             max_streams,
         }
@@ -184,42 +152,14 @@ impl EffectivePolicy {
     }
 }
 
-/// Splits `host` or `host:port`, leaving an IPv6 literal intact.
-fn split_rule(rule: &str) -> (&str, Option<u16>) {
-    match rule.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse().ok())
-        }
-        _ => (rule, None),
-    }
-}
-
-/// Whether an operator rule admits a program rule.
-///
-/// A program rule with no port is admitted only by an operator rule with no
-/// port: "any port on this host" is a wider thing to ask for than any single
-/// port, so an operator who named one port has not granted it.
-fn rule_admits(allowed: &str, host: &str, port: Option<u16>) -> bool {
-    match port {
-        Some(p) => egress_rule_matches(allowed, host, p),
-        None => {
-            let (allowed_host, allowed_port) = split_rule(allowed);
-            allowed_port.is_none()
-                && allowed_host
-                    .trim_matches(['[', ']'])
-                    .eq_ignore_ascii_case(host.trim_matches(['[', ']']))
-        }
-    }
-}
-
 /// Whether a resolved address may be connected to under a rule naming `host`.
 ///
-/// The check the name-based list cannot make. An operator who allows
-/// `metadata.example` has allowed a name, and a name is somebody else's to
+/// The check the name-based list cannot make. A program that declares
+/// `metadata.example` has named a destination whose address is somebody else's to
 /// point wherever they like — at `127.0.0.1`, at a link-local address, at the
 /// node's own control socket's interface. So an address in one of those ranges
 /// is refused unless the rule *named that address literally*, which is how a
-/// deliberate local upstream — `--allow-egress 127.0.0.1:5432` — keeps working.
+/// deliberate local upstream declared as `127.0.0.1:5432` keeps working.
 ///
 /// This is not a substitute for the policy check; it runs after it, on what DNS
 /// actually answered.
@@ -227,8 +167,7 @@ pub fn resolved_address_allowed(host: &str, addr: IpAddr) -> bool {
     if !is_restricted(addr) {
         return true;
     }
-    // The rule named this exact address, so the operator has already said yes
-    // to it in the only way that is unambiguous.
+    // The declaration named this exact address, so approval was unambiguous.
     host.trim_matches(['[', ']'])
         .parse::<IpAddr>()
         .is_ok_and(|literal| literal == addr)
@@ -239,6 +178,7 @@ fn is_restricted(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
             v4.is_loopback()
+                || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
@@ -273,55 +213,21 @@ mod tests {
         }
     }
 
-    fn intersect(program: &[&str], operator: &[&str]) -> EffectivePolicy {
-        EffectivePolicy::intersect(
-            &declared(program),
-            &operator.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &[],
-            vec![],
-            None,
-            64,
-        )
+    fn armed(program: &[&str]) -> EffectivePolicy {
+        EffectivePolicy::armed(&declared(program), vec![], None, 64)
     }
 
     #[test]
-    fn neither_side_can_widen_the_egress_list_alone() {
-        // Both agree.
-        let p = intersect(&["git.internal:9418"], &["git.internal:9418"]);
+    fn arming_approves_exactly_what_the_program_declared() {
+        let p = armed(&["git.internal:9418"]);
         assert!(p.egress_allowed("git.internal", 9418));
-
-        // The program asks for more than the operator allowed.
-        let p = intersect(
-            &["git.internal:9418", "anywhere.example:80"],
-            &["git.internal:9418"],
-        );
-        assert!(p.egress_allowed("git.internal", 9418));
-        assert!(!p.egress_allowed("anywhere.example", 80));
-
-        // The operator allows more than the program asked for. The program
-        // still cannot reach it: it never declared it, so the operator never
-        // approved it, and a list nobody wrote is not permission.
-        let p = intersect(&["git.internal:9418"], &["git.internal:9418", "extra:80"]);
         assert!(!p.egress_allowed("extra", 80));
-
-        // Nobody said anything.
-        assert!(!intersect(&[], &[]).egress_allowed("anything", 80));
+        assert!(!armed(&[]).egress_allowed("anything", 80));
     }
 
     #[test]
     fn a_named_port_does_not_grant_every_port() {
-        // The program wants any port on the host; the operator named one. "Any
-        // port" is the wider ask, so it is not granted.
-        let p = intersect(&["git.internal"], &["git.internal:9418"]);
-        assert!(
-            !p.egress_allowed("git.internal", 22),
-            "a one-port grant was read as a whole-host grant"
-        );
-        assert!(!p.egress_allowed("git.internal", 9418));
-
-        // The operator allowed the whole host, so the program's narrower ask
-        // survives whole.
-        let p = intersect(&["git.internal:9418"], &["git.internal"]);
+        let p = armed(&["git.internal:9418"]);
         assert!(p.egress_allowed("git.internal", 9418));
         assert!(!p.egress_allowed("git.internal", 22));
     }
@@ -329,13 +235,11 @@ mod tests {
     #[test]
     fn the_stream_cap_is_the_lowest_of_the_three() {
         let cap = |program, operator| {
-            EffectivePolicy::intersect(
+            EffectivePolicy::armed(
                 &Declaration {
                     max_streams: program,
                     ..Declaration::default()
                 },
-                &[],
-                &[],
                 vec![],
                 operator,
                 64,
@@ -354,6 +258,7 @@ mod tests {
     fn a_name_may_not_resolve_into_the_ranges_a_name_must_not_reach() {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
         let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+        let private = ["10.0.0.1", "172.16.0.1", "192.168.0.1"];
         let public: IpAddr = "93.184.216.34".parse().unwrap();
 
         assert!(resolved_address_allowed("git.internal", public));
@@ -362,6 +267,12 @@ mod tests {
             "a name resolved onto the node itself"
         );
         assert!(!resolved_address_allowed("git.internal", metadata));
+        for address in private {
+            assert!(
+                !resolved_address_allowed("git.internal", address.parse().unwrap()),
+                "a public name resolved into private address {address}"
+            );
+        }
 
         // A rule that names the address literally has said yes unambiguously,
         // which is how a deliberate local upstream keeps working.
@@ -380,23 +291,18 @@ mod tests {
     }
 
     #[test]
-    fn tree_reads_intersect_the_same_way() {
-        let p = EffectivePolicy::intersect(
+    fn arming_approves_the_declared_tree_reads() {
+        let p = EffectivePolicy::armed(
             &Declaration {
                 tree_reads: vec!["code/pub".into(), "secrets".into()],
                 ..Declaration::default()
             },
-            &[],
-            &["code".to_string()],
             vec![],
             None,
             64,
         );
         assert!(p.tree_read_allowed("code/pub/readme"));
-        assert!(
-            !p.tree_read_allowed("secrets/keys"),
-            "a prefix the operator never allowed survived the intersection"
-        );
+        assert!(p.tree_read_allowed("secrets/keys"));
     }
 
     #[test]

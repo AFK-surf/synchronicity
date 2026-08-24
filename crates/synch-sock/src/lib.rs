@@ -116,7 +116,7 @@ pub trait SocketHost: Send + Sync + 'static {
     /// Resolves `space/path` in one origin's view.
     ///
     /// `origin` is `None` for this node's own view, which is the default and
-    /// the only one a program gets without `--allow-tree-read`: it is the same
+    /// the default when the program names no foreign origin: it is the same
     /// scope the program itself came from.
     fn open(&self, origin: Option<&str>, path: &str) -> Result<ObjectInfo, HostError>;
 

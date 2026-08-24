@@ -116,8 +116,6 @@ CREATE TABLE sockets (
   space            TEXT NOT NULL,
   path             TEXT NOT NULL,
   config           TEXT NOT NULL DEFAULT '',  -- newline-separated k=v
-  allow_egress     TEXT NOT NULL DEFAULT '',  -- newline-separated host[:port]
-  allow_tree_read  TEXT NOT NULL DEFAULT '',  -- newline-separated path prefixes
   max_streams      INTEGER,                   -- NULL: the daemon's default
   auto             INTEGER NOT NULL DEFAULT 0,
   note             TEXT NOT NULL DEFAULT '',
@@ -861,8 +859,6 @@ CREATE TABLE sockets (
   space            TEXT NOT NULL,
   path             TEXT NOT NULL,
   config           TEXT NOT NULL DEFAULT '',
-  allow_egress     TEXT NOT NULL DEFAULT '',
-  allow_tree_read  TEXT NOT NULL DEFAULT '',
   max_streams      INTEGER,
   auto             INTEGER NOT NULL DEFAULT 0,
   note             TEXT NOT NULL DEFAULT '',

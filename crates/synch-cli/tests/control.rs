@@ -1786,8 +1786,6 @@ fn socket_add(target: &str) -> Command {
     Command::SocketAdd(pb::SocketAdd {
         target: target.into(),
         config: vec![],
-        allow_egress: vec!["git.internal:9418".into()],
-        allow_tree_read: vec![],
         max_streams: 32,
         auto: false,
         note: String::new(),
@@ -1825,10 +1823,6 @@ async fn a_socket_is_declared_listed_and_undeclared() {
     let out = lines(dir.path(), socket_ls("", true)).await;
     assert!(out.contains("code/git.sock"), "{out}");
     assert!(out.contains("unpublished"), "{out}");
-    assert!(
-        out.contains("allowed  egress git.internal:9418"),
-        "the long listing shows the operator's half of the policy: {out}"
-    );
 
     // Arming something with no published entry says what to do about it rather
     // than failing obscurely.
@@ -1836,6 +1830,7 @@ async fn a_socket_is_declared_listed_and_undeclared() {
         dir.path(),
         Command::SocketArm(pb::SocketArm {
             target: "code/git.sock".into(),
+            root: String::new(),
         }),
     )
     .await;

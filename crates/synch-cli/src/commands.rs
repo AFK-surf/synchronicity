@@ -247,13 +247,12 @@ fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Res
         );
     }
 
-    // `-DNAME` with no value defines it as empty, which is what `#ifdef` tests
-    // and what every other compiler does with the same spelling.
+    // Match GCC and Clang: `-DNAME` is shorthand for `-DNAME=1`.
     let defines: Vec<(&str, &str)> = defines
         .iter()
         .map(|text| match text.split_once('=') {
             Some((name, value)) => (name, value),
-            None => (text.as_str(), ""),
+            None => (text.as_str(), "1"),
         })
         .collect();
 
@@ -827,22 +826,19 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             SocketCommand::Add {
                 target,
                 config,
-                allow_egress,
-                allow_tree_read,
                 max_streams,
                 auto,
                 note,
             } => Cmd::SocketAdd(pb::SocketAdd {
                 target: target.clone(),
                 config: config.clone(),
-                allow_egress: allow_egress.clone(),
-                allow_tree_read: allow_tree_read.clone(),
                 max_streams: max_streams.unwrap_or(0),
                 auto: *auto,
                 note: note.clone().unwrap_or_default(),
             }),
-            SocketCommand::Arm { target } => Cmd::SocketArm(pb::SocketArm {
+            SocketCommand::Arm { target, root } => Cmd::SocketArm(pb::SocketArm {
                 target: target.clone(),
+                root: root.clone().unwrap_or_default(),
             }),
             SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
                 target: target.clone(),

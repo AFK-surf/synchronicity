@@ -129,7 +129,7 @@ pub struct Registry {
     logs: Mutex<HashMap<String, VecDeque<LogLine>>>,
     /// Per socket, whether each of the last [`FAULT_WINDOW`] invocations
     /// faulted. `true` is a fault.
-    faults: Mutex<HashMap<String, VecDeque<bool>>>,
+    faults: Mutex<HashMap<(String, Hash), VecDeque<bool>>>,
     /// Sockets whose fault history has tripped the threshold and which nobody
     /// has acted on yet.
     ///
@@ -137,7 +137,7 @@ pub struct Registry {
     /// different places: the worker sees the outcome and knows nothing about
     /// the store, and disarming is a store write. The worker sets it; the
     /// engine takes it and disarms.
-    quarantined: Mutex<std::collections::HashSet<String>>,
+    quarantined: Mutex<std::collections::HashSet<(String, Hash)>>,
 }
 
 impl std::fmt::Debug for Live {
@@ -293,9 +293,10 @@ impl Registry {
     /// The counter is cleared when it fires, so a socket that is re-armed and
     /// still broken gets a full window again rather than tripping on its first
     /// fault forever.
-    pub fn record_outcome(&self, socket: &str, faulted: bool) -> bool {
+    pub fn record_outcome(&self, socket: &str, program: Hash, faulted: bool) -> bool {
         let mut faults = self.faults.lock().expect("registry faults");
-        let ring = faults.entry(socket.to_string()).or_default();
+        let key = (socket.to_string(), program);
+        let ring = faults.entry(key.clone()).or_default();
         if ring.len() >= FAULT_WINDOW {
             ring.pop_front();
         }
@@ -307,7 +308,7 @@ impl Registry {
             self.quarantined
                 .lock()
                 .expect("registry faults")
-                .insert(socket.to_string());
+                .insert(key);
             return true;
         }
         false
@@ -318,11 +319,11 @@ impl Registry {
     /// Taken rather than read: the disarm happens once, and a second caller
     /// finding the flag still set would disarm a socket somebody has since
     /// repaired and re-armed.
-    pub fn take_quarantine(&self, socket: &str) -> bool {
+    pub fn take_quarantine(&self, socket: &str, program: Hash) -> bool {
         self.quarantined
             .lock()
             .expect("registry faults")
-            .remove(socket)
+            .remove(&(socket.to_string(), program))
     }
 
     /// Forgets a socket's remembered lines and fault history.
@@ -331,11 +332,14 @@ impl Registry {
     /// are not this one's.
     pub fn forget(&self, socket: &str) {
         self.logs.lock().expect("registry logs").remove(socket);
-        self.faults.lock().expect("registry faults").remove(socket);
+        self.faults
+            .lock()
+            .expect("registry faults")
+            .retain(|(name, _), _| name != socket);
         self.quarantined
             .lock()
             .expect("registry faults")
-            .remove(socket);
+            .retain(|(name, _)| name != socket);
     }
 
     fn release(&self, id: u64) {
@@ -390,6 +394,10 @@ mod tests {
 
     fn key() -> NodeId {
         NodeId::from_bytes(&crate::policy::NOBODY).expect("a valid key")
+    }
+
+    fn program() -> Hash {
+        Hash::new(b"elf")
     }
 
     fn reserve(registry: &Arc<Registry>, id: u64, socket: &str, cap: usize) -> Option<SlotGuard> {
@@ -514,28 +522,28 @@ mod tests {
         let registry = Registry::new();
         for i in 0..FAULT_QUARANTINE - 1 {
             assert!(
-                !registry.record_outcome("code/git.sock", true),
+                !registry.record_outcome("code/git.sock", program(), true),
                 "quarantined after only {} faults",
                 i + 1
             );
         }
         assert!(
-            registry.record_outcome("code/git.sock", true),
+            registry.record_outcome("code/git.sock", program(), true),
             "the threshold did not fire"
         );
         // Cleared when it fires, so a re-armed socket gets a full window rather
         // than tripping on its first fault forever.
-        assert!(!registry.record_outcome("code/git.sock", true));
+        assert!(!registry.record_outcome("code/git.sock", program(), true));
 
         // The verdict latches until somebody acts on it, and then it is gone:
         // a second taker would disarm a socket that has since been repaired.
-        assert!(registry.take_quarantine("code/git.sock"));
-        assert!(!registry.take_quarantine("code/git.sock"));
+        assert!(registry.take_quarantine("code/git.sock", program()));
+        assert!(!registry.take_quarantine("code/git.sock", program()));
 
         // And a re-arm clears the record the old program earned.
-        registry.record_outcome("code/other.sock", true);
+        registry.record_outcome("code/other.sock", program(), true);
         registry.forget("code/other.sock");
-        assert!(!registry.take_quarantine("code/other.sock"));
+        assert!(!registry.take_quarantine("code/other.sock", program()));
     }
 
     #[test]
@@ -547,9 +555,27 @@ mod tests {
         for round in 0..FAULT_WINDOW * 4 {
             let faulted = round % 5 == 0;
             assert!(
-                !registry.record_outcome("code/git.sock", faulted),
+                !registry.record_outcome("code/git.sock", program(), faulted),
                 "a 20% fault rate was quarantined at round {round}"
             );
         }
+    }
+
+    #[test]
+    fn fault_history_is_scoped_to_the_program_root() {
+        let registry = Registry::new();
+        let old = Hash::new(b"old program");
+        let new = Hash::new(b"new program");
+
+        for _ in 0..FAULT_QUARANTINE - 1 {
+            assert!(!registry.record_outcome("code/git.sock", old, true));
+        }
+        assert!(
+            !registry.record_outcome("code/git.sock", new, true),
+            "a new root inherited the old root's fault history"
+        );
+        assert!(registry.record_outcome("code/git.sock", old, true));
+        assert!(registry.take_quarantine("code/git.sock", old));
+        assert!(!registry.take_quarantine("code/git.sock", new));
     }
 }

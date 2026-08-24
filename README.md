@@ -395,16 +395,19 @@ runs it *here*, one invocation per incoming stream, under
 
 ```sh
 synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
-synch socket add code/git.sock --allow-egress git.internal:9418
+synch socket add code/git.sock
 synch scan                                     # publish it as kind=Socket
-synch socket arm code/git.sock                 # print what it declares, approve it
+synch socket arm code/git.sock                 # inspect declarations and copy the root
+synch socket arm code/git.sock --root <root>   # approve exactly what was inspected
 synch socket ls -l                             # armed root, drift, declarations
 synch socket sdk > synch.h                     # the header a program is built against
 ```
 
-The compiler is in the binary — a build of [tinycc](https://github.com/losfair/tinycc)
-that targets eBPF — so writing a socket costs a text editor and nothing else,
-rather than a clang built with a BPF backend that macOS does not ship. Six
+On supported builds the compiler is in the binary — a build of
+[tinycc](https://github.com/losfair/tinycc) that targets eBPF — so writing a
+socket costs a text editor and nothing else, rather than a clang built with a
+BPF backend that macOS does not ship. Windows MSVC builds report the command as
+unsupported and can use an externally built ELF object instead. Six
 worked examples are in
 [`crates/synch-sock/examples/`](crates/synch-sock/examples/), and the test
 suite runs every one of them.

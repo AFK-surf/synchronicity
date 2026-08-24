@@ -28,16 +28,22 @@ struct Store {
 struct Entry {
     value: Vec<u8>,
     expires: Option<Instant>,
-    /// Bumped on every write, so the least recently *used* entry can be found
-    /// without a second index.
-    touched: u64,
 }
 
-/// Every socket's map, keyed by `<space>/<path>`.
-#[derive(Debug, Default)]
+/// Every program version's map, keyed by `<space>/<path>\0<content-root>`.
+#[derive(Debug)]
 pub(crate) struct SocketMaps {
     inner: Mutex<HashMap<String, Store>>,
-    clock: Mutex<u64>,
+    epoch: Instant,
+}
+
+impl Default for SocketMaps {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            epoch: Instant::now(),
+        }
+    }
 }
 
 impl SocketMaps {
@@ -51,13 +57,11 @@ impl SocketMaps {
     /// A re-arm is a different program, and a session table minted by the old
     /// one is not state the new one agreed to inherit.
     pub(crate) fn clear(&self, socket: &str) {
-        self.inner.lock().expect("socket map").remove(socket);
-    }
-
-    fn tick(&self) -> u64 {
-        let mut clock = self.clock.lock().expect("socket map clock");
-        *clock += 1;
-        *clock
+        let prefix = format!("{socket}\0");
+        self.inner
+            .lock()
+            .expect("socket map")
+            .retain(|name, _| !name.starts_with(&prefix));
     }
 
     /// Reads a key. `None` if absent or expired.
@@ -77,9 +81,8 @@ impl SocketMaps {
     /// Inserts or replaces a key.
     ///
     /// A full map fails the write rather than evicting something a live
-    /// invocation may be depending on — except for what has already expired,
-    /// and for the least recently used entry, which is the one an eviction
-    /// policy is allowed to take. Failing closed is the right default for a
+    /// invocation may be depending on. Expired entries are removed first.
+    /// Failing closed is the right default for a
     /// store whose main use is remembering that somebody has already had their
     /// turn.
     pub(crate) fn set(
@@ -91,39 +94,10 @@ impl SocketMaps {
         now: Instant,
         limits: &Limits,
     ) -> Result<(), ()> {
-        let touched = self.tick();
         let mut all = self.inner.lock().expect("socket map");
         let store = all.entry(socket.to_string()).or_default();
         store.expire(now);
-
-        let incoming = key.len() + value.len();
-        if incoming > limits.map_max_bytes {
-            return Err(());
-        }
-        let existing = store.entries.get(key).map(|e| key.len() + e.value.len());
-        let mut projected = store.bytes - existing.unwrap_or(0) + incoming;
-        let mut count = store.entries.len() + usize::from(existing.is_none());
-
-        while (projected > limits.map_max_bytes || count > limits.map_max_keys)
-            && store.evict_lru(key)
-        {
-            projected = store.bytes - existing.unwrap_or(0) + incoming;
-            count = store.entries.len() + usize::from(existing.is_none());
-        }
-        if projected > limits.map_max_bytes || count > limits.map_max_keys {
-            return Err(());
-        }
-
-        store.bytes = projected;
-        store.entries.insert(
-            key.to_vec(),
-            Entry {
-                value: value.to_vec(),
-                expires: ttl.map(|d| now + d),
-                touched,
-            },
-        );
-        Ok(())
+        store.set(key, value, ttl, now, limits)
     }
 
     /// Removes a key, reporting whether one was there.
@@ -143,8 +117,7 @@ impl SocketMaps {
 
     /// Adds to a counter, returning the new value.
     ///
-    /// Atomic in the sense that matters here: a worker never yields inside a
-    /// helper, so nothing can interleave between the read and the write.
+    /// Atomic across every worker thread sharing this map.
     pub(crate) fn incr(
         &self,
         socket: &str,
@@ -154,12 +127,15 @@ impl SocketMaps {
         now: Instant,
         limits: &Limits,
     ) -> Result<i64, ()> {
-        let current = self
-            .get(socket, key, now)
+        let mut all = self.inner.lock().expect("socket map");
+        let store = all.entry(socket.to_string()).or_default();
+        store.expire(now);
+        let current = store
+            .get(key)
             .and_then(|v| v.try_into().ok().map(i64::from_le_bytes))
             .unwrap_or(0);
         let next = current.saturating_add(delta);
-        self.set(socket, key, &next.to_le_bytes(), ttl, now, limits)?;
+        store.set(key, &next.to_le_bytes(), ttl, now, limits)?;
         Ok(next)
     }
 
@@ -176,11 +152,6 @@ impl SocketMaps {
     /// Present at all because a limiter written by hand out of `incr` is
     /// written wrong about half the time: the usual attempt counts into a fixed
     /// window, which lets twice the limit through across a boundary.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the window arithmetic needs both `now` and the invocation's epoch, \
-                  and bundling them into a struct would hide which is which"
-    )]
     pub(crate) fn rate_limit(
         &self,
         socket: &str,
@@ -188,13 +159,12 @@ impl SocketMaps {
         limit: u64,
         window: Duration,
         now: Instant,
-        epoch: Instant,
         limits: &Limits,
     ) -> Result<(), ()> {
         if limit == 0 || window.is_zero() {
             return Err(());
         }
-        let elapsed = now.saturating_duration_since(epoch).as_nanos() as u64;
+        let elapsed = now.saturating_duration_since(self.epoch).as_nanos() as u64;
         let width = window.as_nanos().max(1) as u64;
         let index = elapsed / width;
         let into = elapsed % width;
@@ -207,8 +177,12 @@ impl SocketMaps {
             k
         };
 
+        let mut all = self.inner.lock().expect("socket map");
+        let store = all.entry(socket.to_string()).or_default();
+        store.expire(now);
         let count_of = |k: &[u8]| -> u64 {
-            self.get(socket, k, now)
+            store
+                .get(k)
                 .and_then(|v| v.try_into().ok().map(u64::from_le_bytes))
                 .unwrap_or(0)
         };
@@ -227,8 +201,7 @@ impl SocketMaps {
         }
         // Two windows of TTL, so the previous window is still there to be
         // prorated when the next one starts counting.
-        self.set(
-            socket,
+        store.set(
             &slot(index),
             &(current + 1).to_le_bytes(),
             Some(window * 2),
@@ -250,6 +223,39 @@ impl SocketMaps {
 }
 
 impl Store {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.entries.get(key).map(|entry| entry.value.clone())
+    }
+
+    fn set(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+        now: Instant,
+        limits: &Limits,
+    ) -> Result<(), ()> {
+        let incoming = key.len() + value.len();
+        if incoming > limits.map_max_bytes {
+            return Err(());
+        }
+        let existing = self.entries.get(key).map(|e| key.len() + e.value.len());
+        let projected = self.bytes - existing.unwrap_or(0) + incoming;
+        let count = self.entries.len() + usize::from(existing.is_none());
+        if projected > limits.map_max_bytes || count > limits.map_max_keys {
+            return Err(());
+        }
+        self.bytes = projected;
+        self.entries.insert(
+            key.to_vec(),
+            Entry {
+                value: value.to_vec(),
+                expires: ttl.map(|d| now + d),
+            },
+        );
+        Ok(())
+    }
+
     fn expire(&mut self, now: Instant) {
         let mut freed = 0;
         self.entries.retain(|k, v| {
@@ -261,32 +267,14 @@ impl Store {
         });
         self.bytes = self.bytes.saturating_sub(freed);
     }
-
-    /// Drops the least recently written entry, never `keep`.
-    fn evict_lru(&mut self, keep: &[u8]) -> bool {
-        let victim = self
-            .entries
-            .iter()
-            .filter(|(k, _)| k.as_slice() != keep)
-            .min_by_key(|(_, v)| v.touched)
-            .map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                if let Some(entry) = self.entries.remove(&k) {
-                    self.bytes = self.bytes.saturating_sub(k.len() + entry.value.len());
-                }
-                true
-            }
-            None => false,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const S: &str = "code/git.sock";
+    const SOCKET: &str = "code/git.sock";
+    const S: &str = "code/git.sock\0root-v1";
 
     fn limits() -> Limits {
         Limits::default()
@@ -312,8 +300,24 @@ mod tests {
         let now = Instant::now();
         maps.set(S, b"k", b"mine", None, now, &limits()).unwrap();
         assert_eq!(maps.get("code/other.sock", b"k", now), None);
-        maps.clear(S);
+        maps.clear(SOCKET);
         assert_eq!(maps.get(S, b"k", now), None, "re-arming kept the old state");
+    }
+
+    #[test]
+    fn program_versions_have_separate_maps_and_rearm_clears_them_all() {
+        let maps = SocketMaps::new();
+        let now = Instant::now();
+        let v2 = "code/git.sock\0root-v2";
+        maps.set(S, b"k", b"old", None, now, &limits()).unwrap();
+        maps.set(v2, b"k", b"new", None, now, &limits()).unwrap();
+
+        assert_eq!(maps.get(S, b"k", now).as_deref(), Some(&b"old"[..]));
+        assert_eq!(maps.get(v2, b"k", now).as_deref(), Some(&b"new"[..]));
+
+        maps.clear(SOCKET);
+        assert_eq!(maps.get(S, b"k", now), None);
+        assert_eq!(maps.get(v2, b"k", now), None);
     }
 
     #[test]
@@ -327,7 +331,28 @@ mod tests {
     }
 
     #[test]
-    fn a_full_map_fails_the_write_after_evicting_what_it_may() {
+    fn counters_are_atomic_across_worker_threads() {
+        let maps = SocketMaps::new();
+        let now = Instant::now();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let maps = maps.clone();
+            workers.push(std::thread::spawn(move || {
+                let limits = Limits::default();
+                for _ in 0..1000 {
+                    maps.incr(S, b"n", 1, None, now, &limits).unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let value: [u8; 8] = maps.get(S, b"n", now).unwrap().try_into().unwrap();
+        assert_eq!(i64::from_le_bytes(value), 8000);
+    }
+
+    #[test]
+    fn a_full_map_fails_without_evicting_live_state() {
         let maps = SocketMaps::new();
         let now = Instant::now();
         let l = Limits {
@@ -337,12 +362,12 @@ mod tests {
         };
         maps.set(S, b"a", b"1", None, now, &l).unwrap();
         maps.set(S, b"b", b"2", None, now, &l).unwrap();
-        maps.set(S, b"c", b"3", None, now, &l).unwrap();
+        assert!(maps.set(S, b"c", b"3", None, now, &l).is_err());
         assert_eq!(maps.len(S), 2, "the key cap was exceeded");
         assert_eq!(
             maps.get(S, b"a", now),
-            None,
-            "the oldest was not the victim"
+            Some(b"1".to_vec()),
+            "a failed write evicted live state"
         );
 
         // A single value larger than the whole budget cannot be made to fit by
@@ -355,19 +380,46 @@ mod tests {
     #[test]
     fn a_rate_limit_admits_exactly_its_limit_then_refuses() {
         let maps = SocketMaps::new();
-        let epoch = Instant::now();
+        let epoch = maps.epoch;
         let l = limits();
         let window = Duration::from_millis(1000);
         for i in 0..3 {
             assert!(
-                maps.rate_limit(S, b"peer", 3, window, epoch, epoch, &l)
-                    .is_ok(),
+                maps.rate_limit(S, b"peer", 3, window, epoch, &l).is_ok(),
                 "event {i} was refused inside the limit"
             );
         }
-        assert!(maps
-            .rate_limit(S, b"peer", 3, window, epoch, epoch, &l)
-            .is_err());
+        assert!(maps.rate_limit(S, b"peer", 3, window, epoch, &l).is_err());
+    }
+
+    #[test]
+    fn a_concurrent_rate_limit_never_over_admits() {
+        let maps = SocketMaps::new();
+        let now = maps.epoch;
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let maps = maps.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                maps.rate_limit(
+                    S,
+                    b"peer",
+                    5,
+                    Duration::from_secs(1),
+                    now,
+                    &Limits::default(),
+                )
+                .is_ok()
+            }));
+        }
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 5);
     }
 
     #[test]
@@ -376,19 +428,18 @@ mod tests {
         // whole limit at the end of one window, then again at the start of the
         // next, for 2x the limit inside one window's width.
         let maps = SocketMaps::new();
-        let epoch = Instant::now();
+        let epoch = maps.epoch;
         let l = limits();
         let window = Duration::from_millis(1000);
 
         let late = epoch + Duration::from_millis(900);
         for _ in 0..3 {
-            maps.rate_limit(S, b"peer", 3, window, late, epoch, &l)
-                .unwrap();
+            maps.rate_limit(S, b"peer", 3, window, late, &l).unwrap();
         }
         // 100 ms later a new fixed window would start and admit three more.
         let just_after = epoch + Duration::from_millis(1000);
         assert!(
-            maps.rate_limit(S, b"peer", 3, window, just_after, epoch, &l)
+            maps.rate_limit(S, b"peer", 3, window, just_after, &l)
                 .is_err(),
             "a boundary crossing admitted a second full limit"
         );
@@ -396,7 +447,7 @@ mod tests {
         // A full window later the earlier spend has aged out.
         let much_later = epoch + Duration::from_millis(2000);
         assert!(maps
-            .rate_limit(S, b"peer", 3, window, much_later, epoch, &l)
+            .rate_limit(S, b"peer", 3, window, much_later, &l)
             .is_ok());
     }
 
@@ -405,7 +456,7 @@ mod tests {
         let maps = SocketMaps::new();
         let now = Instant::now();
         assert!(maps
-            .rate_limit(S, b"k", 0, Duration::from_secs(1), now, now, &limits())
+            .rate_limit(S, b"k", 0, Duration::from_secs(1), now, &limits())
             .is_err());
     }
 }

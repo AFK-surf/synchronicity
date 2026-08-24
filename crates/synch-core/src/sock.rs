@@ -274,10 +274,8 @@ pub const MAX_DECLARED_TREE_READS: usize = 32;
 /// root, which disarms the socket: a program cannot widen its own reach
 /// without a fresh approval.
 ///
-/// Runtime policy is the **intersection** of this and the operator's own list.
-/// Neither side can widen it alone, and egress that nobody declared is denied —
-/// which is the same answer as egress nobody allowed, and the right one either
-/// way.
+/// Arming approves these capabilities for this exact program root. Egress or a
+/// foreign-tree read the program did not declare remains denied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declaration {
     /// A human name, for `synch socket ls` and `synch socket ps`.
@@ -286,7 +284,7 @@ pub struct Declaration {
     pub egress: Vec<String>,
     /// Path prefixes the program intends to read from other origins' views.
     pub tree_reads: Vec<String>,
-    /// A self-imposed concurrency cap, intersected with the operator's.
+    /// A self-imposed concurrency cap, bounded by operator and daemon caps.
     pub max_streams: Option<u32>,
 }
 
@@ -359,7 +357,7 @@ impl Declaration {
     }
 }
 
-/// True if an `allow-egress` or `declare-egress` rule admits `host:port`.
+/// True if a declared egress rule admits `host:port`.
 ///
 /// A rule is `host` or `host:port`. Host comparison is ASCII-case-insensitive
 /// because DNS is, and exact otherwise: no wildcards, no suffix matching. A
@@ -371,7 +369,10 @@ pub fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
     // at the first colon of the address itself.
     let (rule_host, rule_port) = match rule.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse::<u16>().ok())
+            let Ok(port) = p.parse::<u16>() else {
+                return false;
+            };
+            (h, Some(port))
         }
         _ => (rule, None),
     };
@@ -599,6 +600,10 @@ mod tests {
         assert!(
             egress_rule_matches("CACHE.INTERNAL", "cache.internal", 80),
             "DNS is case-insensitive and this comparison is not"
+        );
+        assert!(
+            !egress_rule_matches("cache.internal:99999", "cache.internal", 80),
+            "an invalid numeric port became an unrestricted host rule"
         );
         // No suffix matching: a rule whose reach changes when somebody else
         // registers a name is not a rule.

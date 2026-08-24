@@ -2047,13 +2047,11 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
 -- write bytes into a space directory that the scanner then publishes as this
 -- node's own view. These two rows are the gate instead.
 
--- The declaration. What makes the scanner publish kind=Socket for a path, and
--- the operator's half of the runtime policy: the program's `synchronicity.init`
--- hook declares the other half and the runtime enforces the intersection.
+-- The declaration. What makes the scanner publish kind=Socket for a path.
+-- Arming approves the capabilities in the program's `synchronicity.init`
+-- hook; there is no separate operator capability list.
 CREATE TABLE sockets (space TEXT NOT NULL, path TEXT NOT NULL,
                       config TEXT NOT NULL DEFAULT '',   -- newline-separated k=v
-                      allow_egress TEXT NOT NULL DEFAULT '',     -- host[:port]
-                      allow_tree_read TEXT NOT NULL DEFAULT '',  -- path prefixes
                       max_streams INTEGER,       -- NULL: the daemon's default
                       auto INTEGER NOT NULL DEFAULT 0,   -- re-arm on every change
                       note TEXT NOT NULL DEFAULT '',

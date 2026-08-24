@@ -3,9 +3,9 @@
  *   synch socket build examples/http-status.c -o http-status.o
  *   synch socket add ops/status.sock
  *   synch socket arm ops/status.sock
- *   synch connect nas:ops/status.sock --tcp 127.0.0.1:8080   # then open it
+ *   synch connect nas:ops/status.sock --listen 127.0.0.1:8080 # then open it
  *
- * `synch connect --tcp` puts a local listener in front of the stream, so a
+ * `synch connect --listen` puts a local listener in front of the stream, so a
  * socket that speaks HTTP is a page in a browser without anything on the node
  * listening on a port. The counter is in the socket map, so it survives the
  * invocation that incremented it and is shared by every stream of this socket

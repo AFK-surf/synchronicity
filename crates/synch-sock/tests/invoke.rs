@@ -167,14 +167,14 @@ SY_ENTRY sy_s64 entry(void) {
 "#;
 
 #[tokio::test]
-async fn egress_outside_the_armed_intersection_is_refused() {
+async fn undeclared_egress_is_refused() {
     let elf = compile(EGRESS, "egress.c");
     let harness = Harness::new();
     let (status, out) = exchange(
         &harness,
         &elf,
         b"",
-        // Nothing declared, nothing allowed: the program asks anyway.
+        // Nothing was declared, so the program asks for a capability it lacks.
         EffectivePolicy::default(),
         peer(None),
         vec![],
@@ -654,6 +654,65 @@ async fn the_registry_shows_a_running_invocation_and_caps_how_many_there_are() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_worker_can_run_two_long_lived_invocations_concurrently() {
+    let elf = compile(HOLD_OPEN, "hold-open-concurrent.c");
+    let harness = Harness::new();
+    let registry = harness.pool.registry().clone();
+
+    let (mut first_caller, first_guest) = tokio::io::duplex(4096);
+    let (first_r, first_w) = tokio::io::split(first_guest);
+    let first = harness
+        .admitted(&elf, DuplexStream::new(first_r, first_w), &registry, 2)
+        .expect("the first invocation is admitted");
+
+    let (mut second_caller, second_guest) = tokio::io::duplex(4096);
+    let (second_r, second_w) = tokio::io::split(second_guest);
+    let second = harness
+        .admitted(&elf, DuplexStream::new(second_r, second_w), &registry, 2)
+        .expect("the second invocation is admitted");
+
+    let first_pool = harness.pool.clone();
+    let first_run = tokio::spawn(async move { first_pool.run(first).await });
+    let second_pool = harness.pool.clone();
+    let second_run = tokio::spawn(async move { second_pool.run(second).await });
+
+    first_caller.write_all(b"first").await.unwrap();
+    let mut first_echo = [0; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        first_caller.read_exact(&mut first_echo),
+    )
+    .await
+    .expect("the first invocation did not start")
+    .unwrap();
+    assert_eq!(&first_echo, b"first");
+
+    // Keep the first invocation open while driving the second. A worker that
+    // awaits each job in its receive loop cannot produce this echo.
+    second_caller.write_all(b"second").await.unwrap();
+    let mut second_echo = [0; 6];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        second_caller.read_exact(&mut second_echo),
+    )
+    .await
+    .expect("the second invocation was serialized behind the first")
+    .unwrap();
+    assert_eq!(&second_echo, b"second");
+
+    first_caller.shutdown().await.unwrap();
+    second_caller.shutdown().await.unwrap();
+    for run in [first_run, second_run] {
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("an invocation did not finish")
+            .unwrap()
+            .expect("the program ran");
+        assert_eq!(outcome.status, SockStatus::Ok(0));
+    }
+}
+
 const TALKATIVE: &str = r#"
 #include <synch.h>
 
@@ -800,4 +859,39 @@ async fn a_tree_read_outlives_the_caller_that_asked_for_it() {
     .await;
     assert_eq!(status, SockStatus::Ok(0));
     assert_eq!(out, b"read after the question ended");
+}
+
+const LIST_RETRY: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 cur = sy_list_open(SY_STR("code/"));
+  if (cur < 0) return cur;
+  char tiny[2];
+  sy_s64 needed = sy_list_next(cur, tiny, sizeof tiny);
+  if (needed <= 0 || needed >= 64) return -10;
+  char name[64];
+  sy_s64 n = sy_list_next(cur, name, (sy_u64)needed + 1);
+  if (n != needed) return -11;
+  sy_write(SY_SELF, name, (sy_u64)n);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn a_short_list_buffer_can_retry_the_same_entry() {
+    let elf = compile(LIST_RETRY, "list-retry.c");
+    let harness = Harness::with_tree(&[("code/a-long-name", "body"), ("code/z", "body")]);
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"code/a-long-name");
 }

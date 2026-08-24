@@ -8,6 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    future::Future,
     rc::Rc,
     sync::Arc,
     time::Instant,
@@ -107,6 +108,8 @@ pub(crate) struct Inner {
     pub(crate) labels: RefCell<Vec<(String, String)>>,
     pub(crate) footprint: Cell<u64>,
     pub(crate) egress_open: Cell<usize>,
+    /// Detached helper work owned by this invocation.
+    pub(crate) async_tasks: RefCell<Vec<tokio::task::AbortHandle>>,
 
     /// Set while the `synchronicity.init` hook is running.
     ///
@@ -144,6 +147,31 @@ pub(crate) struct Ctx {
 }
 
 impl Inner {
+    /// Starts helper work and makes invocation cleanup its owner.
+    pub(crate) fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        let task = tokio::task::spawn_local(future);
+        self.async_tasks.borrow_mut().push(task.abort_handle());
+    }
+
+    /// Cancels helper work that has not naturally finished.
+    pub(crate) fn abort_tasks(&self) {
+        for task in self.async_tasks.borrow_mut().drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Namespace shared state by both socket path and armed program root.
+    ///
+    /// A NUL cannot occur in a normalized tree path, so this cannot collide
+    /// with another socket whose path merely has this one as a prefix.
+    pub(crate) fn map_namespace(&self) -> String {
+        format!(
+            "{}\0{}",
+            self.socket.qualified(),
+            self.program_root.to_hex()
+        )
+    }
+
     /// Looks a handle up.
     pub(crate) fn slot(&self, handle: i64) -> Option<Slot2> {
         if handle < 0 {

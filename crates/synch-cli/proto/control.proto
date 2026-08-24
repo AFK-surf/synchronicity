@@ -832,10 +832,7 @@ message SocketAdd {
   string target = 1;
   // `k=v` pairs the program reads through `sy_config_get`.
   repeated string config = 2;
-  // Destinations the program may reach, as `host` or `host:port`.
-  repeated string allow_egress = 3;
-  // Path prefixes the program may read from other origins' views.
-  repeated string allow_tree_read = 4;
+  reserved 3, 4;
   // A concurrency cap; zero means the daemon's default.
   uint32 max_streams = 5;
   // Re-arm on every content change. Correct for a path you are the only
@@ -847,6 +844,8 @@ message SocketAdd {
 
 message SocketArm {
   string target = 1;
+  // Empty inspects only; otherwise approve exactly this BLAKE3 root.
+  string root = 2;
 }
 
 message SocketDisarm {
@@ -860,7 +859,7 @@ message SocketRm {
 message SocketLs {
   // Empty lists every space.
   string space = 1;
-  // Show the armed root, the declaration, and the operator's policy.
+  // Show the armed root, declaration, configuration, and stream cap.
   bool long = 2;
 }
 

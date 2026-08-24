@@ -258,27 +258,35 @@ impl Worker {
                     }
                 };
                 let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-                let loader = ProgramLoader::new(
+                let loader = Rc::new(ProgramLoader::new(
                     &mut rand::thread_rng(),
                     Arc::new(DummyProgramEventListener),
                     &[helpers::HELPERS],
-                );
-                let cache: RefCell<HashMap<Hash, Rc<Program>>> = RefCell::new(HashMap::new());
+                ));
+                let cache: Rc<RefCell<HashMap<Hash, Rc<Program>>>> =
+                    Rc::new(RefCell::new(HashMap::new()));
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     while let Some(job) = rx.recv().await {
-                        let outcome = run_job(
-                            &loader,
-                            &cache,
-                            thread_env,
-                            &limits,
-                            &maps,
-                            &registry,
-                            job.invocation,
-                            job.cancel,
-                        )
-                        .await;
-                        let _ = job.reply.send(outcome);
+                        let loader = loader.clone();
+                        let cache = cache.clone();
+                        let limits = limits.clone();
+                        let maps = maps.clone();
+                        let registry = registry.clone();
+                        tokio::task::spawn_local(async move {
+                            let outcome = run_job(
+                                &loader,
+                                &cache,
+                                thread_env,
+                                &limits,
+                                &maps,
+                                &registry,
+                                job.invocation,
+                                job.cancel,
+                            )
+                            .await;
+                            let _ = job.reply.send(outcome);
+                        });
                     }
                 });
             })
@@ -339,9 +347,6 @@ async fn run_job(
         State::Open,
         invocation.peer.addr.clone(),
     );
-    tokio::task::spawn_local(reader_task(self_ep.clone(), invocation.stream.reader));
-    tokio::task::spawn_local(writer_task(self_ep.clone(), invocation.stream.writer));
-
     let started = Instant::now();
     let inner = Rc::new(Inner {
         slots: RefCell::new(vec![Some(Slot::Endpoint(self_ep.clone()))]),
@@ -363,6 +368,7 @@ async fn run_job(
         labels: RefCell::new(Vec::new()),
         footprint: Cell::new(0),
         egress_open: Cell::new(0),
+        async_tasks: RefCell::new(Vec::new()),
         init_mode: false,
         declaration: RefCell::new(Declaration::default()),
         live: invocation
@@ -372,6 +378,10 @@ async fn run_job(
             .unwrap_or_default(),
         registry: Some(registry.clone()),
     });
+    let self_reader =
+        tokio::task::spawn_local(reader_task(self_ep.clone(), invocation.stream.reader));
+    let mut self_writer =
+        tokio::task::spawn_local(writer_task(self_ep.clone(), invocation.stream.writer));
     debug_assert_eq!(SY_SELF, 0, "SY_SELF must be the first slot");
     inner.publish_handles();
 
@@ -426,7 +436,14 @@ async fn run_job(
     // Let whatever the guest wrote reach the wire before the stream is torn
     // down: the program returning is not the same as its last write landing.
     self_ep.shutdown();
-    drain(&self_ep).await;
+    if tokio::time::timeout(Duration::from_secs(5), &mut self_writer)
+        .await
+        .is_err()
+    {
+        self_writer.abort();
+    }
+    self_reader.abort();
+    inner.abort_tasks();
     // The length is read into a local first: a `for` loop's iterator
     // expression keeps its temporaries alive for the whole loop, so borrowing
     // the table to bound the range would still be borrowing it when `remove`
@@ -440,7 +457,11 @@ async fn run_job(
     // and giving it back before the invocation has finished would let the cap
     // be exceeded by exactly the number of invocations that are shutting down.
     if let Some(slot) = &invocation.slot {
-        registry.record_outcome(slot.socket(), matches!(status, SockStatus::Fault(_)));
+        registry.record_outcome(
+            slot.socket(),
+            invocation.program_root,
+            matches!(status, SockStatus::Fault(_)),
+        );
     }
     drop(invocation.slot);
 
@@ -454,15 +475,6 @@ async fn run_job(
         metrics,
         labels,
     })
-}
-
-/// Waits, briefly, for the writer task to push out what the guest left behind.
-async fn drain(ep: &Rc<Endpoint>) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ep.pending_out() > 0 && Instant::now() < deadline {
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
 }
 
 /// Reads async-ebpf's error text as a fault class.
@@ -561,6 +573,7 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         labels: RefCell::new(Vec::new()),
         footprint: Cell::new(0),
         egress_open: Cell::new(0),
+        async_tasks: RefCell::new(Vec::new()),
         init_mode: true,
         declaration: RefCell::new(Declaration::default()),
         live: Default::default(),

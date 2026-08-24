@@ -56,8 +56,8 @@ typedef unsigned char sy_u8;
 
 /* The declaration hook. Runs once, at `synch socket arm`, with no endpoint
  * table at all — an I/O helper called from here returns SY_EPERM. What it
- * declares is what the operator is shown and asked to approve, and the runtime
- * enforces the intersection of that with what the operator allowed.
+ * declares is what the operator is shown and approves. Undeclared capabilities
+ * remain unavailable.
  *
  *   SY_INIT_ENTRY sy_s64 declare(void) {
  *     sy_declare_name(SY_STR("git-http"));
@@ -188,7 +188,7 @@ extern sy_s64 sy_poll(struct sy_pollfd *fds, sy_u64 n, sy_s64 timeout_ms);
  * came from. Refuses a socket entry, so a socket cannot read out its
  * neighbours' code. */
 extern sy_s64 sy_open(const char *path, sy_u64 path_len);
-/* Another origin's version of a path. Needs `--allow-tree-read`. */
+/* Another origin's version of a path. Must be declared at arm time. */
 extern sy_s64 sy_open_from(const char *origin, sy_u64 origin_len,
                            const char *path, sy_u64 path_len);
 extern sy_s64 sy_open_root(const void *root32);

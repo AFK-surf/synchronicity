@@ -6,14 +6,14 @@
 //!
 //! The **declaration** ([`SocketRow`]) is what makes the scanner publish
 //! [`EntryKind::Socket`](synch_core::EntryKind::Socket) for a path, and carries
-//! the operator's half of the runtime policy. The **arming record**
+//! local configuration and the operator's stream cap. The **arming record**
 //! ([`ArmRow`]) is the approval, keyed by the BLAKE3 content root it approved.
 //!
 //! Keeping them in two tables rather than two columns of one is what makes
 //! disarming a deletion rather than a nulling, and what makes "declared but
 //! never armed" the natural state of a socket somebody has just added a file
 //! for. It also means the arming record can be dropped by a content change
-//! without touching the operator's policy, which is exactly the transition that
+//! without touching that local configuration, which is exactly the transition that
 //! has to be cheap and exactly the one that must not lose anything.
 
 use rusqlite::{params, OptionalExtension};
@@ -32,7 +32,7 @@ use crate::{
 /// make the scanner do per file?" has an answer.
 pub const MAX_SOCKETS_PER_SPACE: usize = 64;
 
-/// One declared socket: the operator's half of the policy.
+/// One declared socket: local configuration attached to its tree path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketRow {
     /// The space the socket lives in.
@@ -41,15 +41,6 @@ pub struct SocketRow {
     pub path: String,
     /// `k=v` pairs readable by the program through `sy_config_get`.
     pub config: Vec<(String, String)>,
-    /// Destinations the program may reach, as `host` or `host:port`.
-    ///
-    /// A bare host allows any port on it. Empty means no egress at all, which
-    /// is the default: a program that never declared a destination and an
-    /// operator who never allowed one agree, and the intersection of two empty
-    /// sets is the right answer either way.
-    pub allow_egress: Vec<String>,
-    /// Path prefixes the program may read from other origins' views.
-    pub allow_tree_read: Vec<String>,
     /// The concurrency cap, or `None` for the daemon's default.
     pub max_streams: Option<u32>,
     /// Whether the declaration re-arms itself on every content change.
@@ -72,8 +63,6 @@ impl SocketRow {
             space: space.into(),
             path: path.into(),
             config: Vec::new(),
-            allow_egress: Vec::new(),
-            allow_tree_read: Vec::new(),
             max_streams: None,
             auto: false,
             note: String::new(),
@@ -84,26 +73,6 @@ impl SocketRow {
     /// `<space>/<path>`, as every command and log line names a socket.
     pub fn qualified(&self) -> String {
         format!("{}/{}", self.space, self.path)
-    }
-
-    /// Whether this declaration permits reaching `host` on `port`.
-    ///
-    /// Matched against the operator's list only. The runtime intersects this
-    /// with what the program declared in its `synchronicity.init` hook, and
-    /// both have to say yes — which is the whole of the arming bargain: the
-    /// operator approves a list the program wrote, and neither can widen it
-    /// alone.
-    pub fn egress_allowed(&self, host: &str, port: u16) -> bool {
-        self.allow_egress
-            .iter()
-            .any(|rule| synch_core::sock::egress_rule_matches(rule, host, port))
-    }
-
-    /// Whether this declaration permits reading `path` from another origin.
-    pub fn tree_read_allowed(&self, path: &str) -> bool {
-        self.allow_tree_read
-            .iter()
-            .any(|prefix| synch_core::sock::path_prefix_matches(prefix, path))
     }
 
     /// The value of a config key, if the operator set one.
@@ -294,6 +263,18 @@ impl Store {
         )?;
         Ok(n > 0)
     }
+
+    /// Withdraws an approval only if it still names `root`.
+    ///
+    /// Fault quarantine uses this so an old invocation cannot disarm a newer
+    /// program that was armed while the old one was still finishing.
+    pub fn disarm_socket_root(&self, space: &str, path: &str, root: &Hash) -> Result<bool> {
+        let n = self.conn().execute(
+            "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2 AND root = ?3",
+            params![space, path, root.as_bytes().to_vec()],
+        )?;
+        Ok(n > 0)
+    }
 }
 
 impl Txn<'_> {
@@ -313,12 +294,10 @@ impl Txn<'_> {
         }
         self.conn().execute(
             "INSERT INTO sockets
-               (space, path, config, allow_egress, allow_tree_read, max_streams, auto, note, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (space, path, config, max_streams, auto, note, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(space, path) DO UPDATE SET
                config = excluded.config,
-               allow_egress = excluded.allow_egress,
-               allow_tree_read = excluded.allow_tree_read,
                max_streams = excluded.max_streams,
                auto = excluded.auto,
                note = excluded.note",
@@ -326,8 +305,6 @@ impl Txn<'_> {
                 row.space,
                 row.path,
                 join_pairs(&row.config),
-                row.allow_egress.join("\n"),
-                row.allow_tree_read.join("\n"),
                 row.max_streams,
                 i64::from(row.auto),
                 row.note,
@@ -376,14 +353,14 @@ impl Txn<'_> {
     }
 }
 
-const SELECT_SOCKETS_BASE: &str = "SELECT s.space, s.path, s.config, s.allow_egress,
-            s.allow_tree_read, s.max_streams, s.auto, s.note, s.added_at,
+const SELECT_SOCKETS_BASE: &str = "SELECT s.space, s.path, s.config,
+            s.max_streams, s.auto, s.note, s.added_at,
             a.root, a.declared, a.armed_at
        FROM sockets s
        LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path";
 
-const SELECT_SOCKETS: &str = "SELECT s.space, s.path, s.config, s.allow_egress,
-            s.allow_tree_read, s.max_streams, s.auto, s.note, s.added_at,
+const SELECT_SOCKETS: &str = "SELECT s.space, s.path, s.config,
+            s.max_streams, s.auto, s.note, s.added_at,
             a.root, a.declared, a.armed_at
        FROM sockets s
        LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path
@@ -396,18 +373,16 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
         space: space.clone(),
         path: path.clone(),
         config: split_pairs(&row.get::<_, String>(2)?),
-        allow_egress: split_lines(&row.get::<_, String>(3)?),
-        allow_tree_read: split_lines(&row.get::<_, String>(4)?),
-        max_streams: row.get(5)?,
-        auto: row.get::<_, i64>(6)? != 0,
-        note: row.get(7)?,
-        added_at: row.get(8)?,
+        max_streams: row.get(3)?,
+        auto: row.get::<_, i64>(4)? != 0,
+        note: row.get(5)?,
+        added_at: row.get(6)?,
     };
-    let arm = match row.get::<_, Option<Vec<u8>>>(9)? {
+    let arm = match row.get::<_, Option<Vec<u8>>>(7)? {
         Some(bytes) => {
             let root = Hash::from_slice(&bytes).map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    9,
+                    7,
                     rusqlite::types::Type::Blob,
                     "socket_arms.root is not a 32-byte hash".into(),
                 )
@@ -416,8 +391,8 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
                 space,
                 path,
                 root,
-                declared: row.get(10)?,
-                armed_at: row.get(11)?,
+                declared: row.get(8)?,
+                armed_at: row.get(9)?,
             })
         }
         None => None,
@@ -460,8 +435,6 @@ mod tests {
 
     fn row() -> SocketRow {
         SocketRow {
-            allow_egress: vec!["git.internal:9418".into()],
-            allow_tree_read: vec!["code".into()],
             config: vec![("upstream".into(), "git.internal".into())],
             max_streams: Some(32),
             ..SocketRow::new("code", "git.sock", 1)
@@ -506,20 +479,20 @@ mod tests {
 
     #[test]
     fn redeclaring_drops_the_approval_it_was_not_given_for() {
-        // The transition that has to be safe: an operator widens the egress
-        // list and the old approval must not carry over onto the new terms.
+        // The transition that has to be safe: an operator changes config and
+        // the old approval must not carry over onto the new terms.
         let (_d, store) = store();
         store.put_socket(&row()).unwrap();
         store
             .arm_socket("code", "git.sock", &Hash::new(b"elf"), "", 2)
             .unwrap();
 
-        let mut wider = row();
-        wider.allow_egress.push("anywhere.example:80".into());
-        store.put_socket(&wider).unwrap();
+        let mut changed = row();
+        changed.config.push(("mode".into(), "strict".into()));
+        store.put_socket(&changed).unwrap();
 
         let got = store.socket("code", "git.sock").unwrap().unwrap();
-        assert_eq!(got.declaration.allow_egress, wider.allow_egress);
+        assert_eq!(got.declaration.config, changed.config);
         assert!(
             got.arm.is_none(),
             "a re-declaration carried its old approval onto new terms"
@@ -544,48 +517,6 @@ mod tests {
 
         assert!(store.remove_socket("code", "git.sock").unwrap());
         assert!(store.socket("code", "git.sock").unwrap().is_none());
-    }
-
-    #[test]
-    fn egress_rules_match_host_and_port_exactly() {
-        let mut r = SocketRow::new("code", "s", 0);
-        r.allow_egress = vec!["git.internal:9418".into(), "cache.internal".into()];
-
-        assert!(r.egress_allowed("git.internal", 9418));
-        assert!(!r.egress_allowed("git.internal", 22), "a port was ignored");
-        // A bare host allows any port on it.
-        assert!(r.egress_allowed("cache.internal", 6379));
-        assert!(
-            r.egress_allowed("CACHE.INTERNAL", 80),
-            "DNS is case-insensitive"
-        );
-        // No suffix matching: a rule whose reach changes when somebody else
-        // registers a name is not a rule.
-        assert!(!r.egress_allowed("evil-git.internal", 9418));
-        assert!(!r.egress_allowed("git.internal.evil.example", 9418));
-        assert!(!SocketRow::new("code", "s", 0).egress_allowed("anything", 80));
-    }
-
-    #[test]
-    fn an_ipv6_literal_rule_is_not_cut_at_its_first_colon() {
-        let mut r = SocketRow::new("code", "s", 0);
-        r.allow_egress = vec!["[::1]:9418".into()];
-        assert!(r.egress_allowed("::1", 9418));
-        assert!(!r.egress_allowed("::1", 9419));
-    }
-
-    #[test]
-    fn tree_read_prefixes_stop_at_a_path_boundary() {
-        let mut r = SocketRow::new("code", "s", 0);
-        r.allow_tree_read = vec!["code/pub".into()];
-
-        assert!(r.tree_read_allowed("code/pub"));
-        assert!(r.tree_read_allowed("code/pub/readme"));
-        assert!(
-            !r.tree_read_allowed("code/public-secrets"),
-            "a prefix matched across a path boundary"
-        );
-        assert!(!r.tree_read_allowed("code"));
     }
 
     #[test]

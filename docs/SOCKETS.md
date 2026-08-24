@@ -149,7 +149,7 @@ gates stand between a published socket entry and an invocation:
    this space, is a socket. That is what makes the scanner publish
    `kind: Socket`. It is local state, never adopted from a peer, and never
    replicated.
-2. **Arming.** The declaration pins the BLAKE3 content root it approved. The
+2. **Arming.** The approval pins the BLAKE3 content root it approved. The
    bytes changing changes the root, which disarms the socket: `Refused
    { NotArmed }`, naming both roots. In-flight invocations keep running the root
    they started on.
@@ -178,16 +178,16 @@ $ synch socket arm code/git.sock
             egress      git.internal:9418
             max streams 32
             tree reads  code/**  (own origin)
-  operator  --allow-egress git.internal:9418        ← from `socket add`
-
-  arm this program? [y/N]
+  reviewed only — approve with `synch socket arm code/git.sock --root 9f86…a08`
 ```
 
-Runtime policy is the **intersection** of what the program declared and what
-the operator allowed; egress with no declaration is denied. Because the
-declaration is compiled into the object, editing it changes the content root,
-which disarms the socket. A program cannot widen its own reach without a fresh
-approval, and an approval cannot silently outlive the code it approved.
+Arming approves the capabilities the program declared. Egress or foreign-tree
+access with no declaration is denied. Because the declaration is compiled into
+the object, editing it changes the content root, which disarms the socket. A
+program cannot widen its own reach without a fresh review and approval, and an
+approval cannot silently outlive the code it approved. The explicit `--root`
+makes the review a compare-and-approve operation: if the bytes change between
+the two commands, approval fails.
 
 ## 4. The wire — `sync/sock/1`
 
@@ -320,7 +320,7 @@ is 512 bytes and nothing useful fits in that.
 | --- | --- | --- |
 | endpoint table | per invocation | 16 handles, `SY_SELF` included |
 | object table | per invocation | 32 objects, 1 MiB footprint |
-| socket map | per socket, outlives invocations | 4096 keys, 1 MiB, TTL then LRU |
+| socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each
 other. It is memory-only: cleared on daemon restart and on re-arm, and
@@ -437,7 +437,7 @@ deadline. One validated mutable region regardless of `n`.
 | Helper | What it does |
 | --- | --- |
 | `sy_open(path, len)` | Opens `space/path` **in this node's own trie** — the same scope the program came from. Refuses a `Socket` entry, so a socket cannot read out its neighbours' code. |
-| `sy_open_from(origin, olen, path, plen)` | Another origin's version. Requires `--allow-tree-read`; §8's mtime-trust caveat is why it is not the default. |
+| `sy_open_from(origin, olen, path, plen)` | Another origin's version. Requires a matching tree-read declaration in the armed program; §8's mtime-trust caveat is why it is not the default. |
 | `sy_open_root(root32)` | By content root — how a superseded version is read, mirroring `synch cat --root`. |
 | `sy_stat(obj, out, len)` | Fills a `struct sy_stat`. |
 | `sy_pread(obj, buf, len, off)` | Verified range read. Bytes in the CAS return immediately; bytes that must be fetched return `SY_EAGAIN` and the handle becomes pollable — a cold read is an ordinary poll wait, not a hidden stall. |
@@ -611,11 +611,11 @@ place the program sleeps.
 
 ```
 synch socket add <space>/<path> [--config k=v]…       declare a path in one of my spaces
-                 [--allow-egress <host>[:<port>]]…    to be a socket: publishes it as
-                 [--allow-tree-read <prefix>]…        kind=Socket and arms the content
-                 [--max-streams <n>] [--auto]         root it has now
-synch socket arm <space>/<path> [--root <hex>]        approve the current bytes, after
-                                                      printing what they declare
+                 [--max-streams <n>] [--auto]         to be a socket: the next scan
+                                                      publishes it as kind=Socket
+synch socket arm <space>/<path>                       inspect the current root and what
+                                                      the program declares
+synch socket arm <space>/<path> --root <hex>          approve exactly the inspected root
 synch socket disarm <space>/<path>                    keep publishing it, stop running it
 synch socket rm <space>/<path>                        republish as an ordinary file
 synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
@@ -650,8 +650,8 @@ A header on disk beside the binary is one that can be older than the binary,
 and the numbers in it are the guest's only view of the ABI: a guest compiled
 against a stale one gets wrong answers rather than errors.
 
-`synch socket build` is a compiler — [tinycc], targeting eBPF — linked into the
-binary. It runs in the CLI process: it needs no node, no daemon and no data
+On supported builds, `synch socket build` is a compiler — [tinycc], targeting
+eBPF — linked into the binary. It runs in the CLI process: it needs no node, no daemon and no data
 directory, and it supplies `synch.h` itself, so the first socket somebody
 writes costs them a text editor and nothing else. The alternative was asking
 for a clang built with the BPF backend, which the distributions ship
@@ -701,7 +701,7 @@ own.
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
 | Idle deadline | 300 s | Measured from the last *progress* — bytes copied in or out, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
-| Socket map | 4096 keys / 1 MiB | Per socket. TTL then LRU; a full map fails `sy_map_set` rather than evicting silently. |
+| Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
 | Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |
 
@@ -751,8 +751,8 @@ own.
   gains the `sync/sock/1` protocol handler beside the two it already mounts. The
   engine crate stays embeddable — a library user gets sockets by enabling a
   feature, not by taking a dependency it cannot build.
-- **§10, schema.** Two tables: `sockets` (space, path, config, allowed egress,
-  allowed tree reads, max streams, auto flag) and `socket_arms` (space, path,
+- **§10, schema.** Two tables: `sockets` (space, path, config, max streams,
+  auto flag) and `socket_arms` (space, path,
   approved root, declarations as approved, armed_at). Both are local operator
   state and neither is ever published or replicated. The map store is
   memory-only and deliberately absent from SQLite.
@@ -772,7 +772,8 @@ Not in this design:
   region is read-only after link and that is load-bearing, not incidental.
 - **Running a peer's program**, under any flag, at any trust level. This is the
   rule the whole design is built on.
-- **Serving sockets on macOS or Windows**, until async-ebpf runs there.
+- **Serving sockets on Windows**, until async-ebpf runs there. macOS is
+  supported on x86-64 and arm64.
 
 Worth building next:
 

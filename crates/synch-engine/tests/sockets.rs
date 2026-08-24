@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use synch_core::{EntryKind, Hash};
+use synch_core::{Declaration, EntryKind, Hash};
 use synch_engine::{Node, NodeConfig};
 use synch_store::SocketRow;
 
@@ -58,6 +58,33 @@ async fn a_declared_path_is_published_as_a_socket_and_an_undeclared_one_is_not()
 }
 
 #[tokio::test]
+async fn declaring_an_unchanged_published_file_changes_its_kind() {
+    let (_data, space, node) = node_with_space().await;
+    write(space.path(), "git.sock", b"\x7fELF unchanged");
+    node.scan_and_publish().unwrap();
+    assert_eq!(
+        node.store()
+            .entry(node.origin(), "code", "git.sock")
+            .unwrap()
+            .unwrap()
+            .kind,
+        EntryKind::File
+    );
+
+    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.scan_and_publish().unwrap();
+    assert_eq!(
+        node.store()
+            .entry(node.origin(), "code", "git.sock")
+            .unwrap()
+            .unwrap()
+            .kind,
+        EntryKind::Socket,
+        "the scanner's unchanged-file cache hid the new declaration"
+    );
+}
+
+#[tokio::test]
 async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
     // The kind is an assertion this origin makes about its own copy, so
     // withdrawing the assertion has to change what it publishes.
@@ -75,10 +102,6 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
     );
 
     assert!(node.socket_rm("code", "git.sock").unwrap());
-    // The bytes have to change for the scanner to restage the path; a socket
-    // whose content is identical is not rehashed, which is the same
-    // change-detection every file gets.
-    write(space.path(), "git.sock", b"\x7fELF, edited");
     node.scan_and_publish().unwrap();
 
     assert_eq!(
@@ -133,6 +156,42 @@ async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
 }
 
 #[tokio::test]
+async fn approval_is_compare_and_set_against_the_reviewed_root() {
+    let (_data, space, node) = node_with_space().await;
+    write(space.path(), "git.sock", b"\x7fELF reviewed");
+    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.scan_and_publish().unwrap();
+
+    let reviewed = node
+        .resolve_socket("code", "git.sock")
+        .unwrap()
+        .unwrap()
+        .root;
+    let wrong = Hash::new(b"different bytes");
+    assert!(
+        node.socket_approve("code", "git.sock", &wrong, &Declaration::default())
+            .is_err(),
+        "approval accepted bytes other than the reviewed root"
+    );
+    assert!(node
+        .resolve_socket("code", "git.sock")
+        .unwrap()
+        .unwrap()
+        .state
+        .arm
+        .is_none());
+
+    node.socket_approve("code", "git.sock", &reviewed, &Declaration::default())
+        .unwrap();
+    assert!(node
+        .resolve_socket("code", "git.sock")
+        .unwrap()
+        .unwrap()
+        .state
+        .is_armed_for(&reviewed));
+}
+
+#[tokio::test]
 async fn adopting_someone_elses_socket_adopts_its_bytes_and_not_its_socket_ness() {
     // The property the whole design rests on: a node executes only what is in
     // its own tree, and taking a peer's socket does not put a socket in it.
@@ -167,6 +226,16 @@ async fn a_socket_cannot_be_declared_outside_a_space_this_node_indexes() {
             .is_err(),
         "a path that leaves the space must be refused at declaration"
     );
+}
+
+#[tokio::test]
+async fn a_socket_cannot_be_declared_in_a_detached_space() {
+    let data = tempfile::tempdir().unwrap();
+    Node::init(data.path(), None).unwrap();
+    let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+    node.add_detached_space("code").unwrap();
+    let err = node.socket_add(&declaration("code", "git.sock"));
+    assert!(err.is_err(), "a space with no scanner accepted a socket");
 }
 
 #[tokio::test]

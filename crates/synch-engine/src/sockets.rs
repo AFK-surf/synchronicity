@@ -10,8 +10,8 @@
 //! whose program a connection lands on.
 //!
 //! **Admission** turns that into an invocation: it adds the caller's identity
-//! as the handshake established it, and the intersection of what the program
-//! declared with what the operator armed.
+//! as the handshake established it and the capabilities approved by arming the
+//! program's declaration.
 //!
 //! **The tree host** is what the running program reads through. It is the one
 //! place a socket touches the rest of the node, and it is read-only.
@@ -50,14 +50,26 @@ impl Node {
     /// what the operator meant to approve, and `synch socket arm` is where the
     /// approval happens after the declaration is printed.
     pub fn socket_add(&self, row: &SocketRow) -> Result<()> {
-        if self.store().space(&row.space)?.is_none() {
+        let Some(space) = self.store().space(&row.space)? else {
             return Err(EngineError::invalid(format!(
                 "`{}` is not a space this node indexes",
                 row.space
             )));
+        };
+        if space.local_path.is_none() {
+            return Err(EngineError::invalid(format!(
+                "`{}` is detached and has no scanner that can publish a socket",
+                row.space
+            )));
         }
-        synch_core::normalize_path(&row.path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        self.store().put_socket(row)?;
+        let mut row = row.clone();
+        row.path = synch_core::normalize_path(&row.path)
+            .map_err(|e| EngineError::invalid(e.to_string()))?;
+        self.store().put_socket(&row)?;
+        // Kind is part of the published entry even when the file's bytes and
+        // stat are unchanged. Invalidate the scanner cache so its next pass
+        // reaches the declaration check instead of returning early.
+        self.store().remove_local_file(&row.space, &row.path)?;
         Ok(())
     }
 
@@ -69,13 +81,13 @@ impl Node {
         })
     }
 
-    /// Runs the program's declaration hook and approves the current root.
+    /// Runs the program's declaration hook without approving anything.
     ///
     /// The dry run is not a formality. async-ebpf compiles lazily, per function
     /// and per pointer signature, so a program that fails to compile would
     /// otherwise surface that on the first stream that reaches the bad path —
     /// a long way from the operator who armed it.
-    pub async fn socket_arm(&self, space: &str, path: &str) -> Result<(Hash, Declaration)> {
+    pub async fn socket_inspect(&self, space: &str, path: &str) -> Result<(Hash, Declaration)> {
         let resolved = self.resolve_socket(space, path)?.ok_or_else(|| {
             EngineError::invalid(format!(
                 "`{space}/{path}` is declared a socket but this node publishes no entry for it \
@@ -84,17 +96,33 @@ impl Node {
         })?;
         let elf = self.socket_program(&resolved).await?;
         let declared = self.declare_program(&elf)?;
-        self.store().arm_socket(
-            space,
-            path,
-            &resolved.root,
-            &declared.render(),
-            synch_core::now_ns(),
-        )?;
+        Ok((resolved.root, declared))
+    }
+
+    /// Approves a declaration previously inspected for exactly `root`.
+    pub fn socket_approve(
+        &self,
+        space: &str,
+        path: &str,
+        root: &Hash,
+        declared: &Declaration,
+    ) -> Result<()> {
+        let resolved = self.resolve_socket(space, path)?.ok_or_else(|| {
+            EngineError::invalid(format!("`{space}/{path}` is no longer a published socket"))
+        })?;
+        if &resolved.root != root {
+            return Err(EngineError::invalid(format!(
+                "reviewed root {} but the tree now names {}",
+                root.to_hex(),
+                resolved.root.to_hex()
+            )));
+        }
+        self.store()
+            .arm_socket(space, path, root, &declared.render(), synch_core::now_ns())?;
         // A re-arm is a different program; a session table minted by the old
         // one is not state the new one agreed to inherit.
         self.clear_socket_map(&format!("{space}/{path}"));
-        Ok((resolved.root, declared))
+        Ok(())
     }
 
     /// Withdraws an approval, leaving the declaration standing.
@@ -110,6 +138,9 @@ impl Node {
     /// comes from the declaration and there is no longer one.
     pub fn socket_rm(&self, space: &str, path: &str) -> Result<bool> {
         let out = self.store().remove_socket(space, path)?;
+        if out {
+            self.store().remove_local_file(space, path)?;
+        }
         self.clear_socket_map(&format!("{space}/{path}"));
         Ok(out)
     }
@@ -166,10 +197,8 @@ impl Node {
             .as_ref()
             .map(|arm| Declaration::parse(&arm.declared))
             .unwrap_or_default();
-        EffectivePolicy::intersect(
+        EffectivePolicy::armed(
             &declared,
-            &state.declaration.allow_egress,
-            &state.declaration.allow_tree_read,
             state.declaration.config.clone(),
             state.declaration.max_streams,
             self.socket_limits().max_streams,
@@ -313,6 +342,7 @@ impl Node {
     /// Runs an admitted invocation.
     pub async fn run_socket(&self, admission: Admission, stream: DuplexStream) -> SockStatus {
         let socket = admission.socket.clone();
+        let program_root = admission.program_root;
         let Some(pool) = self.socket_workers() else {
             return SockStatus::Shutdown;
         };
@@ -325,8 +355,8 @@ impl Node {
         };
         // The pool has already recorded this outcome against the socket's
         // fault history; what it cannot do is disarm, which is a store write.
-        if pool.should_quarantine(&socket.qualified()) {
-            self.quarantine_socket(&socket.space, &socket.path);
+        if pool.should_quarantine(&socket.qualified(), program_root) {
+            self.quarantine_socket(&socket.space, &socket.path, program_root);
         }
         status
     }
@@ -338,8 +368,8 @@ impl Node {
     /// from their users. Disarmed rather than undeclared — the declaration and
     /// its policy are the operator's and survive; what is withdrawn is the
     /// approval of *these bytes*, which have proved they do not work.
-    fn quarantine_socket(&self, space: &str, path: &str) {
-        match self.store().disarm_socket(space, path) {
+    fn quarantine_socket(&self, space: &str, path: &str, root: Hash) {
+        match self.store().disarm_socket_root(space, path, &root) {
             Ok(true) => tracing::error!(
                 socket = format!("{space}/{path}"),
                 "socket disarmed: it faulted on most of its recent invocations.                  Fix the program and `synch socket arm` it again."
@@ -464,16 +494,33 @@ impl SocketHost for TreeHost {
             Some((space, rest)) => (space, rest),
             None => (prefix, ""),
         };
-        let rows = self
-            .node
-            .store()
-            .list_entries(Some(&self.own_origin), space, rest, None, Some(4096))
-            .map_err(|e| HostError::Unavailable(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| row.kind != EntryKind::Tombstone)
-            .map(|row| row.path)
-            .collect())
+        const PAGE: usize = 4096;
+        let mut after = None;
+        let mut names = Vec::new();
+        loop {
+            let rows = self
+                .node
+                .store()
+                .list_entries(
+                    Some(&self.own_origin),
+                    space,
+                    rest,
+                    after.as_deref(),
+                    Some(PAGE),
+                )
+                .map_err(|e| HostError::Unavailable(e.to_string()))?;
+            let done = rows.len() < PAGE;
+            after = rows.last().map(|row| row.path.clone());
+            names.extend(
+                rows.into_iter()
+                    .filter(|row| row.kind != EntryKind::Tombstone)
+                    .map(|row| row.path),
+            );
+            if done {
+                break;
+            }
+        }
+        Ok(names)
     }
 
     async fn pread(
@@ -645,10 +692,10 @@ mod pool {
         }
 
         /// Whether a socket has been faulting enough to be disarmed.
-        pub fn should_quarantine(&self, socket: &str) -> bool {
+        pub fn should_quarantine(&self, socket: &str, program: Hash) -> bool {
             // The pool recorded the outcome as the invocation ended; this only
             // reads the verdict it reached.
-            self.0.registry().take_quarantine(socket)
+            self.0.registry().take_quarantine(socket, program)
         }
 
         /// Everything running.
@@ -735,7 +782,7 @@ mod pool {
         }
 
         /// Nothing runs, so nothing faults.
-        pub fn should_quarantine(&self, _socket: &str) -> bool {
+        pub fn should_quarantine(&self, _socket: &str, _program: Hash) -> bool {
             false
         }
 

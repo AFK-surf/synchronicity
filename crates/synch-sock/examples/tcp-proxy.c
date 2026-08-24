@@ -1,9 +1,10 @@
 /* tcp-proxy — one upstream, reachable through the cluster and nowhere else.
  *
  *   synch socket build examples/tcp-proxy.c -o tcp-proxy.o
- *   synch socket add code/git.sock --allow-egress git.internal:9418
- *   synch socket arm code/git.sock        # prints the declarations, asks
- *   synch connect nas:code/git.sock --tcp 127.0.0.1:9418
+ *   synch socket add code/git.sock
+ *   synch socket arm code/git.sock        # inspect and copy the printed root
+ *   synch socket arm code/git.sock --root <root>
+ *   synch connect nas:code/git.sock --listen 127.0.0.1:9418
  *
  * The upstream is a compile-time constant because it is a *declaration*: the
  * init hook runs at arm time, with no config and nothing to reach, and what it
@@ -28,9 +29,8 @@
 
 SY_INIT_ENTRY sy_s64 declare(void) {
   sy_declare_name(SY_STR("tcp-proxy"));
-  /* The whole of what this program may reach. The runtime enforces the
-     intersection of this with the operator's `--allow-egress`, so neither side
-     can widen it alone, and a port named here is not a host granted. */
+  /* The whole of what this program may reach. Arming the program approves this
+     declaration; changing it changes the root and requires another approval. */
   sy_declare_egress(SY_STR(UPSTREAM_HOST), UPSTREAM_PORT);
   sy_declare_max_streams(32);
   return 0;
