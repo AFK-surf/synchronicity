@@ -59,27 +59,37 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The test suite binds only loopback sockets and disables relays and
-      # discovery, so it needs no network access.
-      # --no-fail-fast so one run reports every platform failure, rather than
-      # surfacing them one CI round-trip at a time.
-      - run: cargo test --workspace --all-targets --no-fail-fast
-      - run: cargo test --workspace --doc --no-fail-fast
-      # Optional features are off by default, so nothing above ever compiles
-      # them. `synch-mpt`'s `proofs` is a §13 capability kept ahead of its
-      # caller (§4.3) — code with no consumer and no build is code that stops
-      # compiling without anyone finding out, which is the opposite of keeping
-      # a capability ready.
-      - run: cargo test --workspace --all-features --all-targets --no-fail-fast
-      # And the shipped configuration. `--all-targets` unifies features across
-      # the graph — `synch-net` dev-depends on itself with `sim` — so every
-      # line above resolves `sim` ON and no test has ever executed against a
-      # client built the way a released one is. `--lib --bins` resolves it off.
-      # Behind the gate sit `chain::validate`, the DS-digest helpers,
-      # `RekorProof::encode`/`to_txt` and the whole `x509::SelfSigned` writer,
-      # and the design's asymmetry claim — a client reads DER and never writes
-      # it — is a fact about a build nothing ran.
-      - run: cargo test --workspace --lib --bins --no-fail-fast
+      # No network access needed: loopback only, relays and discovery off.
+      # --no-fail-fast reports every platform's failures in one round-trip.
+      # synch-engine is split into `test-engine` below: its real-network,
+      # real-clock integration tests alone outrun the rest of the workspace.
+      # `--all-features` is a strict superset of a default-features run here —
+      # optional features are all purely additive — so there's no separate one.
+      - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
+      - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
+      # `--lib --bins` resolves synch-net's `sim` dev-feature off, testing the
+      # configuration that actually ships (the run above resolves it on).
+      - run: cargo test --workspace --lib --bins --no-fail-fast --exclude synch-engine
+      # fanout_bomb's tests are #[ignore]d for fast local `cargo test`; CI
+      # still runs them explicitly so they keep gating changes.
+      - run: cargo test -p synch-mpt --test fanout_bomb --no-fail-fast -- --ignored
+
+  test-engine:
+    name: test synch-engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Split from `test`: real network + real clock per test makes this
+      # crate alone slower than the rest of the workspace combined.
+      - run: cargo test -p synch-engine --all-features --all-targets --no-fail-fast
+      - run: cargo test -p synch-engine --doc --no-fail-fast
+      - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
   cloud-providers:
     name: cloud CAS providers
