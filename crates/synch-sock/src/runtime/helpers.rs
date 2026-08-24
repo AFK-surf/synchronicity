@@ -751,17 +751,16 @@ fn ready_now(inner: &Inner, watch: &[(i64, u32)]) -> Option<u64> {
 
 /// The bits to report for one watched handle.
 ///
-/// `ERR` is reported whether or not it was asked for, as poll(2) does: a
-/// program that did not ask about failure still needs to be told, or it waits
-/// on a handle that will never do anything again. A bad handle is `ERR` too,
-/// rather than a refusal of the whole call — one stale handle in an array
-/// should not blind a program to the fifteen live ones beside it.
+/// `ERR` and terminal `HUP` are reported whether or not they were asked for,
+/// as poll(2) does: a program that did not ask about failure still needs to be
+/// told, or it waits on a handle that will never do anything again. `RDHUP`,
+/// like Linux's event of that name, remains subject to the requested mask. A
+/// bad handle is `ERR` too, rather than a refusal of the whole call — one stale
+/// handle in an array should not blind a program to the fifteen live ones
+/// beside it.
 fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
     match inner.slot(handle) {
-        Some(Slot2::Endpoint(ep)) => {
-            let bits = ep.revents();
-            bits & (events | poll::ERR | poll::HUP)
-        }
+        Some(Slot2::Endpoint(ep)) => ep.poll_revents(events),
         Some(Slot2::Object(obj)) => {
             let bits = match &*obj.result.borrow() {
                 Some(Ok(_)) => poll::IN,

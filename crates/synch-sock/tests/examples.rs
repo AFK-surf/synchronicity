@@ -17,7 +17,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use harness::{compile_with_clang, converse, exchange, peer, sdk, Harness};
 use synch_core::SockStatus;
-use synch_sock::{EffectivePolicy, Limits};
+use synch_sock::{DuplexStream, EffectivePolicy, Limits};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn examples_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"))
@@ -431,6 +432,143 @@ async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
     .await;
     assert_eq!(status, SockStatus::Ok(1));
     assert!(out.is_empty(), "a refused caller was told something");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().unwrap().port();
+
+    // Two complete endpoint rings put one chunk in the blocked host writer
+    // and leave the second ring full. The final byte then becomes a pump
+    // remainder at the same moment the upstream reaches terminal HUP.
+    let prefix: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let tail = vec![0xfe];
+    let mut expected = prefix.clone();
+    expected.extend(&tail);
+    let upstream_prefix = prefix;
+    let upstream_tail = tail;
+    let (prefix_sent, prefix_seen) = tokio::sync::oneshot::channel();
+    let (send_tail, tail_allowed) = tokio::sync::oneshot::channel();
+    let (eof_sent, eof_seen) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut request = Vec::new();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        socket.read_to_end(&mut request).await.expect("the request");
+        socket
+            .write_all(&upstream_prefix)
+            .await
+            .expect("the response prefix");
+        let _ = prefix_sent.send(());
+        let _ = tail_allowed.await;
+        socket
+            .write_all(&upstream_tail)
+            .await
+            .expect("the response tail");
+        socket.shutdown().await.expect("the upstream EOF");
+        let _ = eof_sent.send(());
+        request
+    });
+
+    let elf = build_with(
+        "tcp-proxy.c",
+        &[
+            ("UPSTREAM_HOST", "\"127.0.0.1\""),
+            ("UPSTREAM_PORT", &port.to_string()),
+        ],
+    );
+    let declared =
+        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the proxy loads");
+    let policy = EffectivePolicy::armed(&declared, vec![], None, 64);
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let registry = harness.pool.registry().clone();
+
+    let (mine, theirs) = tokio::io::duplex(1024);
+    let (their_r, their_w) = tokio::io::split(theirs);
+    let mut invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(their_r, their_w),
+        policy,
+        peer(Some(vec!["code".into()])),
+        vec![],
+    );
+    let id = invocation.id;
+    let socket = invocation.socket.qualified();
+    let peer_name = invocation.peer.origin.to_string();
+    invocation.slot = registry.reserve(
+        id,
+        &socket,
+        &peer_name,
+        invocation.peer.device_key,
+        invocation.program_root,
+        1,
+        std::time::Instant::now(),
+    );
+    assert!(invocation.slot.is_some(), "the proxy was not admitted");
+
+    let (start_reading, reading_allowed) = tokio::sync::oneshot::channel();
+    let driver = tokio::spawn(async move {
+        let mut mine = mine;
+        mine.write_all(b"request").await.unwrap();
+        mine.shutdown().await.unwrap();
+        let _ = reading_allowed.await;
+        let mut out = Vec::new();
+        mine.read_to_end(&mut out).await.unwrap();
+        out
+    });
+    let pool = harness.pool.clone();
+    let running = tokio::spawn(async move { pool.run(invocation).await.expect("the program ran") });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), prefix_seen)
+        .await
+        .expect("the upstream did not send its prefix")
+        .expect("the upstream stopped before its prefix");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let seen = registry.snapshot(None, std::time::Instant::now());
+            if seen.first().is_some_and(|info| info.bytes_out >= 8192) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the response prefix never filled the caller-facing path");
+
+    let _ = send_tail.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), eof_seen)
+        .await
+        .expect("the upstream did not send EOF")
+        .expect("the upstream stopped before EOF");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let before = registry.snapshot(None, std::time::Instant::now())[0].polls;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let after = registry.snapshot(None, std::time::Instant::now())[0].polls;
+
+    // Always release the reader before asserting, so a failure cannot leave
+    // the invocation and its worker blocked behind the test's own gate.
+    let _ = start_reading.send(());
+    let outcome = running.await.unwrap();
+    let out = driver.await.unwrap();
+    let request = upstream.await.unwrap();
+
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+    assert_eq!(request, b"request");
+    assert_eq!(
+        out, expected,
+        "the terminal upstream truncated its response"
+    );
+    assert!(
+        after.saturating_sub(before) <= 8,
+        "an inactive upstream HUP caused {} polls in 50 ms",
+        after.saturating_sub(before)
+    );
 }
 
 /// The runtime loads an object somebody else's compiler wrote.

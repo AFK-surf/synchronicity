@@ -179,6 +179,15 @@ impl Endpoint {
         matches!(self.state.get(), State::Failed | State::Closed)
     }
 
+    /// Whether both stream directions have reached shutdown for poll's HUP.
+    ///
+    /// Receive EOF alone is not terminal: as in Linux's TCP poll semantics,
+    /// the local write half remains live until the guest shuts it down. Bytes
+    /// received before EOF may still be buffered and readable after HUP.
+    pub(crate) fn poll_terminal(&self) -> bool {
+        self.finished() || (self.rx_eof.get() && self.tx_shutdown.get())
+    }
+
     pub(crate) fn readable(&self) -> usize {
         self.rx.borrow().len()
     }
@@ -235,15 +244,23 @@ impl Endpoint {
 
     /// Half-closes the write side once what is buffered has drained.
     pub(crate) fn shutdown(&self) {
-        self.tx_shutdown.set(true);
+        let changed = !self.tx_shutdown.replace(true);
         self.tx_data.notify_waiters();
+        if changed {
+            // OUT disappeared; and if receive EOF was already present, the
+            // endpoint just became a terminal, unconditional HUP.
+            self.ready.bump();
+        }
     }
 
     /// The readiness bits this endpoint has right now.
     pub(crate) fn revents(&self) -> u32 {
         let mut bits = 0;
         match self.state.get() {
-            State::Failed => bits |= poll::ERR,
+            // A failed stream is also shut in both directions. Linux TCP
+            // reports both EPOLLERR and EPOLLHUP once the socket reaches this
+            // terminal state.
+            State::Failed => bits |= poll::ERR | poll::HUP,
             State::Closed => bits |= poll::HUP,
             State::Connecting => {}
             State::Open => {}
@@ -254,17 +271,29 @@ impl Endpoint {
         if buffered > 0 || self.rx_eof.get() {
             bits |= poll::IN;
         }
-        // Hung up means "nothing more will ever arrive" — which is not the same
-        // as "the peer stopped writing", because what it already wrote may
-        // still be in the ring. Reporting HUP with data buffered is how a
-        // program that breaks on HUP silently drops the last response.
-        if self.rx_eof.get() && buffered == 0 {
-            bits |= poll::HUP;
+        // Linux separates receive-half shutdown from a terminal hangup.
+        // RDHUP may accompany buffered data; IN tells the guest to keep
+        // reading until read returns zero.
+        if self.rx_eof.get() {
+            bits |= poll::RDHUP;
+            if self.tx_shutdown.get() {
+                bits |= poll::HUP;
+            }
         }
         if self.state.get() == State::Open && self.writable() > 0 && !self.tx_shutdown.get() {
             bits |= poll::OUT;
         }
         bits
+    }
+
+    /// Filters readiness for one guest poll entry.
+    ///
+    /// `ERR` and terminal `HUP` are unconditional, as with epoll. `RDHUP` is
+    /// the maskable peer-write-half event; receive EOF also keeps `IN` ready so
+    /// a guest can discover it by reading zero without requesting `RDHUP`.
+    pub(crate) fn poll_revents(&self, events: u32) -> u32 {
+        let bits = self.revents();
+        bits & (events | poll::ERR | poll::HUP)
     }
 
     fn set_rx_eof(&self) {
@@ -505,20 +534,83 @@ mod tests {
         ep.push_rx(b"hello");
         ep.set_rx_eof();
 
-        // EOF is pending, but there are bytes: readable, and emphatically not
-        // hung up, or a program that breaks on HUP drops the last response.
-        assert_ne!(ep.revents() & poll::IN, 0);
+        // Receive shutdown is visible immediately, even while the bytes that
+        // preceded the FIN are still buffered. IN remains set until a read
+        // observes EOF; HUP is reserved for shutdown in both directions.
         assert_eq!(
-            ep.revents() & poll::HUP,
-            0,
-            "HUP reported over buffered data"
+            ep.revents() & (poll::IN | poll::RDHUP | poll::HUP),
+            poll::IN | poll::RDHUP
         );
 
         let mut buf = [0u8; 5];
         assert_eq!(ep.read(&mut buf), 5);
         assert_eq!(&buf, b"hello");
         assert_eq!(ep.read(&mut buf), 0, "a drained EOF reads as a clean zero");
-        assert_ne!(ep.revents() & poll::HUP, 0);
+        assert_eq!(
+            ep.revents() & (poll::IN | poll::RDHUP | poll::HUP),
+            poll::IN | poll::RDHUP
+        );
+    }
+
+    #[test]
+    fn a_receive_half_close_does_not_wake_output_or_inactive_poll_entries() {
+        let ep = endpoint(4);
+        ep.set_rx_eof();
+
+        assert_eq!(ep.poll_revents(0), 0, "an inactive entry woke on EOF");
+        assert_eq!(
+            ep.poll_revents(poll::OUT),
+            poll::OUT,
+            "receive EOF hid a still-writable output half"
+        );
+        assert_eq!(ep.write(b"full"), 4);
+        assert_eq!(
+            ep.poll_revents(poll::OUT),
+            0,
+            "receive EOF made a backpressured output wait spin"
+        );
+        assert_eq!(
+            ep.poll_revents(poll::IN),
+            poll::IN,
+            "IN did not make the pending EOF readable"
+        );
+        assert_eq!(
+            ep.poll_revents(poll::RDHUP),
+            poll::RDHUP,
+            "an explicitly requested receive shutdown was hidden"
+        );
+        assert_eq!(ep.poll_revents(poll::HUP), 0, "one live half became HUP");
+    }
+
+    #[test]
+    fn shutting_both_halves_down_is_an_unconditional_hangup() {
+        let ep = endpoint(4);
+        ep.push_rx(b"last");
+        ep.set_rx_eof();
+        ep.shutdown();
+
+        assert!(ep.poll_terminal());
+        assert_eq!(
+            ep.poll_revents(0),
+            poll::HUP,
+            "terminal HUP was masked by an empty interest set"
+        );
+        assert_eq!(
+            ep.poll_revents(poll::IN | poll::RDHUP),
+            poll::IN | poll::RDHUP | poll::HUP,
+            "terminal HUP hid buffered input or receive shutdown"
+        );
+    }
+
+    #[test]
+    fn terminal_endpoint_events_need_no_explicit_interest() {
+        let closed = endpoint(4);
+        closed.close();
+        assert_eq!(closed.poll_revents(0), poll::HUP);
+
+        let failed = endpoint(4);
+        failed.fail(errno::ECONNRESET);
+        assert_eq!(failed.poll_revents(0), poll::ERR | poll::HUP);
     }
 
     #[test]

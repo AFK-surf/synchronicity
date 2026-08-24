@@ -40,14 +40,16 @@ pub mod poll {
     pub const IN: u32 = 0x1;
     /// The tx window has room; a connecting endpoint has finished connecting.
     pub const OUT: u32 = 0x2;
-    /// The peer half-closed its write side.
+    /// The endpoint is shut in both directions. Reported without asking.
     pub const HUP: u32 = 0x4;
     /// The endpoint failed; `sy_errno` says why.
     pub const ERR: u32 = 0x8;
+    /// The peer closed or shut down its write side.
+    pub const RDHUP: u32 = 0x10;
     /// Every bit a program may ask for. Anything else in `events` is refused,
     /// so a guest built against a newer header fails loudly here rather than
     /// silently waiting for a condition this build never reports.
-    pub const ALL: u32 = IN | OUT | HUP | ERR;
+    pub const ALL: u32 = IN | OUT | HUP | ERR | RDHUP;
 }
 
 /// The inbound stream's handle. Always zero, always present, never allocated.

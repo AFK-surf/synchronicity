@@ -82,7 +82,19 @@ SY_ENTRY sy_s64 entry(void) {
       else fds[1].events |= SY_POLL_IN;
     }
 
-    if (sy_poll(fds, 2, 30000) <= 0) break;
+    /* HUP and ERR are unconditional, so an endpoint that is no longer part of
+       either active pump must not remain in the poll set with events == 0.
+       Compact the two fixed per-handle entries after their interests are
+       assembled. At least one direction is active while the loop continues. */
+    sy_u64 nfds;
+    if (fds[0].events == 0) {
+      fds[0] = fds[1];
+      nfds = 1;
+    } else {
+      nfds = fds[1].events == 0 ? 1 : 2;
+    }
+
+    if (sy_poll(fds, nfds, 30000) <= 0) break;
 
     /* Each direction ends on its own. A loop that stopped the moment either
        side hung up would cut off the reply to the last request it forwarded,
@@ -106,7 +118,9 @@ SY_ENTRY sy_s64 entry(void) {
       }
     }
 
-    if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) break;
+    sy_u32 revents = 0;
+    for (sy_u64 i = 0; i < nfds; i++) revents |= fds[i].revents;
+    if (revents & SY_POLL_ERR) break;
   }
 
   sy_close(up);

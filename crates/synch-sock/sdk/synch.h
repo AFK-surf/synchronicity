@@ -86,8 +86,9 @@ typedef unsigned char sy_u8;
 
 #define SY_POLL_IN   0x1  /* readable, or an EOF is pending                  */
 #define SY_POLL_OUT  0x2  /* tx has room; a connecting endpoint is up        */
-#define SY_POLL_HUP  0x4  /* the peer half-closed                            */
+#define SY_POLL_HUP  0x4  /* both halves shut; reported without asking        */
 #define SY_POLL_ERR  0x8  /* failed; sy_errno(h) says why                    */
+#define SY_POLL_RDHUP 0x10 /* peer write-half EOF; reported only when asked    */
 
 /* The inbound stream. Always handle 0, always open when your program starts. */
 #define SY_SELF 0

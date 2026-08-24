@@ -373,8 +373,9 @@ automatically by `synch socket build` (§9).
 
 #define SY_POLL_IN   0x1   /* readable, or EOF is pending                         */
 #define SY_POLL_OUT  0x2   /* tx window has room; a connecting socket is up       */
-#define SY_POLL_HUP  0x4   /* peer half-closed                                    */
+#define SY_POLL_HUP  0x4   /* both halves shut; reported without asking           */
 #define SY_POLL_ERR  0x8   /* sy_errno(h) says what                               */
+#define SY_POLL_RDHUP 0x10  /* peer write-half EOF; reported only when asked        */
 
 struct sy_pollfd { sy_s64 handle; sy_u32 events; sy_u32 revents; };
 struct sy_stat   { sy_u64 size; sy_s64 mtime_ns; sy_u32 mode; sy_u32 kind; sy_u8 root[32]; };
@@ -441,6 +442,18 @@ address by way of a name that resolves to it.
 the number ready, `0` on timeout, negative on error; `timeout_ms < 0` means
 "until something happens", clamped by the host to the invocation's idle
 deadline. One validated mutable region regardless of `n`.
+
+Endpoint shutdown uses Linux's level-triggered `HUP`/`RDHUP` distinction and
+filtering, rather than reproducing every bit returned by Linux `tcp_poll`.
+`IN` means a read can make progress, including by returning zero at EOF.
+`RDHUP` means the peer closed its write half and is returned only when
+requested. `HUP` means both directions are shut, while `ERR` means the endpoint
+failed; those two terminal events are returned whether or not the entry
+requested them, and a failed endpoint reports both. `RDHUP` and `HUP` may
+accompany buffered input, so drain `IN` until `sy_read` returns zero rather
+than treating either bit as permission to discard the receive buffer. `OUT`
+retains this ABI's narrower meaning of usable tx-ring room, so it is absent
+after `sy_shutdown` when `sy_write` would return `SY_EPIPE`.
 
 ### 7.6 Reading the tree — verified, scoped by default to this origin
 
@@ -588,7 +601,18 @@ SY_ENTRY sy_s64 entry(void) {
       else                             fds[1].events |= SY_POLL_IN;
     }
 
-    if (sy_poll(fds, 2, 30000) <= 0) break;  /* 0 = 30s idle; negative = deadline */
+    /* HUP and ERR are unconditional. Omit an inactive endpoint rather than
+       leaving it in the set with events == 0, where a terminal event would
+       wake an unrelated backpressure wait. */
+    sy_u64 nfds;
+    if (fds[0].events == 0) {
+      fds[0] = fds[1];
+      nfds = 1;
+    } else {
+      nfds = fds[1].events == 0 ? 1 : 2;
+    }
+
+    if (sy_poll(fds, nfds, 30000) <= 0) break; /* 0 = idle; negative = deadline */
 
     if (!caller_done) {
       sy_s64 n = sy_pump(SY_SELF, up, upward, sizeof upward, &to_upstream);
@@ -600,7 +624,9 @@ SY_ENTRY sy_s64 entry(void) {
       if (n == 0) { sy_shutdown(SY_SELF); upstream_done = 1; }
       else if (n < 0 && n != SY_EAGAIN) break;
     }
-    if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) break;
+    sy_u32 revents = 0;
+    for (sy_u64 i = 0; i < nfds; i++) revents |= fds[i].revents;
+    if (revents & SY_POLL_ERR) break;
   }
 
   sy_close(up);
@@ -617,10 +643,13 @@ the far side's window. Writing that loop by hand is where the second most common
 mistake lives; `sy_write_all` is the same job for a program whose whole reply is
 one message.
 
-The `HUP` bit is reported only once an endpoint's buffer has drained, which is
-what makes the loop above safe: a peer that half-closes after sending a request
-is `SY_POLL_IN` with data waiting, not `SY_POLL_HUP`, so a program that breaks
-on `HUP` still gets to read what it was sent.
+Peer EOF sets `RDHUP`, not `HUP`: the local write half may remain usable long
+after the caller stops writing. Because `RDHUP` is maskable, that receive-side
+event does not wake an `SY_POLL_OUT`-only backpressure wait. `IN` remains ready
+at EOF, so the read side of the loop still reaches `sy_read(...) == 0` without
+having to request `RDHUP`. Once the program also calls `sy_shutdown`, the
+endpoint is shut in both directions and `HUP` becomes an unconditional terminal
+event, matching Linux's distinction between `EPOLLRDHUP` and `EPOLLHUP`.
 
 Forty lines, no heap, no globals, one upstream, and an access-control rule that
 a caller cannot lie its way past. The pieces this design exists to provide are

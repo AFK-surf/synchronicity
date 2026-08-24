@@ -50,6 +50,7 @@ mod tests {
             ("SY_POLL_OUT", poll::OUT as i64),
             ("SY_POLL_HUP", poll::HUP as i64),
             ("SY_POLL_ERR", poll::ERR as i64),
+            ("SY_POLL_RDHUP", poll::RDHUP as i64),
             ("SY_SELF", abi::SY_SELF),
             ("SY_PEER_MEMBER", abi::peer_kind::MEMBER as i64),
             ("SY_PEER_DELEGATE", abi::peer_kind::DELEGATE as i64),

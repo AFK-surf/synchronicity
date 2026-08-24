@@ -136,6 +136,86 @@ async fn two_immediately_ready_poll_entries_write_both_revents() {
     assert_eq!(status, SockStatus::Ok(0));
 }
 
+const WRITE_AFTER_RECEIVE_EOF: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  char buf[1024];
+
+  /* Observe the caller's EOF before producing the reply. The peer's FIN must
+     leave this endpoint's write half usable. */
+  for (;;) {
+    struct sy_pollfd in[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+    if (sy_poll(in, 1, 5000) <= 0) return 10;
+    sy_s64 n = sy_read(SY_SELF, buf, sizeof buf);
+    if (n == 0) break;
+    if (n < 0 && n != SY_EAGAIN) return 11;
+  }
+
+  for (sy_u64 i = 0; i < sizeof buf; i++) buf[i] = (char)(i % 251);
+  sy_u64 sent = 0;
+  while (sent < 65536) {
+    sy_u64 want = 65536 - sent;
+    if (want > sizeof buf) want = sizeof buf;
+    sy_s64 n = sy_write(SY_SELF, buf, want);
+    if (n == SY_EAGAIN) {
+      struct sy_pollfd out[1] = { { SY_SELF, SY_POLL_OUT, 0 } };
+      sy_s64 ready = sy_poll(out, 1, 5000);
+      if (ready == 0) return 12;
+      if (ready < 0) return 13;
+      if (out[0].revents & (SY_POLL_RDHUP | SY_POLL_HUP)) return 14;
+      if (!(out[0].revents & SY_POLL_OUT)) return 15;
+      continue;
+    }
+    if (n < 0) return 16;
+    sent += (sy_u64)n;
+  }
+
+  sy_shutdown(SY_SELF);
+  struct sy_pollfd terminal[1] = { { SY_SELF, 0, 0 } };
+  if (sy_poll(terminal, 1, 5000) != 1) return 17;
+  if (terminal[0].revents != SY_POLL_HUP) return 18;
+  return 42;
+}
+"#;
+
+#[tokio::test]
+async fn receive_eof_does_not_end_a_backpressured_output_wait() {
+    let elf = compile(WRITE_AFTER_RECEIVE_EOF, "write-after-receive-eof.c");
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let (mine, theirs) = tokio::io::duplex(1024);
+    let (their_r, their_w) = tokio::io::split(theirs);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(their_r, their_w),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+
+    let driver = tokio::spawn(async move {
+        let mut mine = mine;
+        mine.shutdown().await.unwrap();
+        // Hold the read side still long enough for both the host write and tx
+        // ring to fill. The guest must remain parked on OUT until this drains.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut out = Vec::new();
+        mine.read_to_end(&mut out).await.unwrap();
+        out
+    });
+
+    let outcome = harness.pool.run(invocation).await.expect("the program ran");
+    let out = driver.await.unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(42));
+    assert_eq!(out.len(), 65536, "the response ended under backpressure");
+    for (i, byte) in out.into_iter().enumerate() {
+        assert_eq!(byte, (i % 1024 % 251) as u8, "wrong byte at {i}");
+    }
+}
+
 const IDENTITY: &str = r#"
 #include <synch.h>
 

@@ -352,25 +352,25 @@ impl Inner {
         }
     }
 
-    /// True if every endpoint has closed, failed, or hung up.
+    /// True if every endpoint is terminal and no other handle has work coming.
     ///
     /// What the idle deadline is measured against: a program parked in
     /// `sy_poll` with nothing left that can ever become ready is not idle, it
-    /// is finished, and it should be told so rather than waited out.
+    /// is finished, and it should be told so rather than waited out. Called
+    /// only after current requested and unconditional readiness was checked.
     pub(crate) fn all_quiet(&self) -> bool {
         let slots = self.slots.borrow();
         slots.iter().flatten().all(|slot| match slot {
             Slot::Endpoint(ep) => match ep.state() {
                 State::Failed | State::Closed => true,
                 State::Connecting => false,
-                State::Open => ep.revents() & poll::HUP != 0,
+                State::Open => ep.poll_terminal(),
             },
             // An object with a fetch in flight is the loudest thing here: the
             // answer is on its way. Quiet means *nothing can ever become
             // ready*, and a program told that while its read is outstanding
-            // gives up on a file it was about to get — which is every socket
-            // that reads the tree after its caller has finished asking, since
-            // a half-closed caller makes every other handle quiet.
+            // gives up on a file it was about to get. This matters especially
+            // after the stream endpoint has been fully shut or removed.
             Slot::Object(obj) => !obj.pending.get() && obj.revents() == 0,
             // A cursor with an answer waiting is not quiet either.
             other => other.revents() == 0,
