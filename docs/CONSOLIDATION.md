@@ -150,8 +150,11 @@ verification code — the one place a fix must not have to land twice.
 `run_job` and `declare_here` each construct the 24-field invocation state, one
 for serving and one for arming. A field defaulted differently between them is
 a divergence between what arming showed the operator and what runs. Proposal:
-`Inner::serving(..)` / `Inner::declaring(..)` over one base constructor, plus
-one `load_pinned` for the duplicated program-load-and-entrypoint-check.
+`Inner::serving(..)` / `Inner::declaring(..)` over one base constructor. The
+second half of this item — one loader construction and one
+load-pin-entrypoint-check shared by both paths — is done (`stack_loader` /
+`load_pinned` in `runtime/mod.rs`), which matters more now that the loader
+carries a per-declaration stack configuration.
 
 ### 5. Unique staging/temp-file naming
 

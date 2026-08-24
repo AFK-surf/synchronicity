@@ -465,6 +465,37 @@ impl Worker {
     }
 }
 
+/// Builds the loader for one stack configuration.
+///
+/// Serving (`program_for`) and arming (`declare_here`) must load with the
+/// same loader shape, or what the operator reviewed is not what runs.
+fn stack_loader(config: StackConfig) -> Result<ProgramLoader, SockError> {
+    Ok(ProgramLoader::new(
+        &mut rand::thread_rng(),
+        Arc::new(DummyProgramEventListener),
+        &[helpers::HELPERS],
+    )
+    .with_stack_frame_size(config.0)
+    .with_guest_stack_size(guest_stack_size(config.0)?)
+    .with_guarded_stack_frames(config.1))
+}
+
+/// Loads an ELF, pins it to this thread, and requires the stream entrypoint.
+fn load_pinned(
+    loader: &ProgramLoader,
+    elf: &[u8],
+    thread_env: ThreadEnv,
+) -> Result<Program, SockError> {
+    let unbound: UnboundProgram = loader
+        .load(&mut rand::thread_rng(), elf)
+        .map_err(|e| SockError::Load(e.to_string()))?;
+    let program = unbound.pin_to_current_thread(thread_env);
+    if !program.has_section(SECTION_STREAM) {
+        return Err(SockError::NoEntrypoint);
+    }
+    Ok(program)
+}
+
 /// Compiles, or returns the compiled program for, one content root.
 fn program_for(
     loaders: &LoaderCache,
@@ -484,26 +515,11 @@ fn program_for(
     let loader = if let Some(loader) = existing_loader {
         loader
     } else {
-        let loader = ProgramLoader::new(
-            &mut rand::thread_rng(),
-            Arc::new(DummyProgramEventListener),
-            &[helpers::HELPERS],
-        );
-        let loader = loader
-            .with_stack_frame_size(config.0)
-            .with_guest_stack_size(guest_stack_size(config.0)?)
-            .with_guarded_stack_frames(config.1);
-        let loader = Rc::new(loader);
+        let loader = Rc::new(stack_loader(config)?);
         loaders.borrow_mut().insert(config, loader.clone());
         loader
     };
-    let unbound: UnboundProgram = loader
-        .load(&mut rand::thread_rng(), elf)
-        .map_err(|e| SockError::Load(e.to_string()))?;
-    let program = Rc::new(unbound.pin_to_current_thread(thread_env));
-    if !program.has_section(SECTION_STREAM) {
-        return Err(SockError::NoEntrypoint);
-    }
+    let program = Rc::new(load_pinned(&loader, elf, thread_env)?);
     cache.borrow_mut().insert(key, program.clone());
     Ok(program)
 }
@@ -731,22 +747,8 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         .build()
         .map_err(|e| SockError::Load(e.to_string()))?;
     let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-    let default_stack = resolve_stack_config(None, None)?;
-    let loader = ProgramLoader::new(
-        &mut rand::thread_rng(),
-        Arc::new(DummyProgramEventListener),
-        &[helpers::HELPERS],
-    )
-    .with_stack_frame_size(default_stack.0)
-    .with_guest_stack_size(guest_stack_size(default_stack.0)?)
-    .with_guarded_stack_frames(default_stack.1);
-    let unbound = loader
-        .load(&mut rand::thread_rng(), elf)
-        .map_err(|e| SockError::Load(e.to_string()))?;
-    let program = unbound.pin_to_current_thread(thread_env);
-    if !program.has_section(SECTION_STREAM) {
-        return Err(SockError::NoEntrypoint);
-    }
+    let loader = stack_loader(resolve_stack_config(None, None)?)?;
+    let program = load_pinned(&loader, elf, thread_env)?;
     if !program.has_section(SECTION_INIT) {
         // No hook is a legitimate shape: a socket that reaches nothing and
         // reads nothing needs to declare nothing. It gets the empty
