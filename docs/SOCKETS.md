@@ -312,16 +312,17 @@ randomized guard regions around both, and a JIT that masks every load and store
 address back inside it, branchlessly. After linking, code and data are frozen
 read-only and *all* stores are confined to the stack.
 
-So the guest has **32 KiB of stack** (eight local-call frames of 4 KiB, plus
-512 bytes of calldata), **no heap**, and **no mutable globals**. Everything that
-outlives a helper call lives host-side:
+So the guest has **no heap** and **no mutable globals**. Its stack holds at
+least eight local-call frames plus 512 bytes of calldata: 128 KiB of frame
+space at the guarded 16 KiB default, with a 32 KiB floor for smaller custom
+frames. A program compiled with another frame size declares that size in
+`synchronicity.init`. Everything that outlives a helper call lives host-side:
 
-The number that binds in practice is the **4 KiB frame**, not the 32 KiB total.
-One function's locals must fit in one frame, so a `char[4096]` buffer does not
-compile even though the stack is eight times that: it fills the frame and
-leaves no room for the handles and counters beside it. Programs are also
-compiled with `-mllvm -bpf-stack-size=4096`, because LLVM's default BPF frame
-is 512 bytes and nothing useful fits in that.
+The number that binds in practice is the **local-call frame**, not the total
+stack. The SDK examples' functions keep their locals below 4 KiB, while the
+runtime's guarded 16 KiB frame stride is portable to both 4 KiB- and 16
+KiB-page hosts. A program built for another value must pass that value to
+`sy_declare_stack_frame_size`.
 
 | Table | Scope | Bound |
 | --- | --- | --- |
@@ -475,7 +476,17 @@ because there is no heap to decode into.
 
 `sy_declare_name`, `sy_declare_egress(host, len, port)` (port `0` means any port
 on that host and is printed in red at the arm prompt), `sy_declare_tree_read`,
-`sy_declare_max_streams`.
+`sy_declare_max_streams`, `sy_declare_stack_frame_size(bytes)`,
+`sy_declare_guarded_stack_frames(enabled)`.
+
+`sy_declare_stack_frame_size` must match the compiler's eBPF stack-frame
+setting. It accepts a multiple of 16 from 16 bytes through 32 KiB; omitting it
+keeps Synchronicity's 16 KiB default. Guarded frames are always required unless
+the program explicitly calls `sy_declare_guarded_stack_frames(0)`, so a guarded
+custom size must be aligned to the executing host's page size (16 KiB on Apple
+Silicon macOS). Disabling guards selects async-ebpf's contiguous layout;
+passing `1` explicitly requires them. The runtime never uses automatic guard
+selection. Both choices are included in the operator's approval text.
 
 Calling a declaration helper from `synchronicity.stream` returns `SY_EPERM`;
 calling an I/O helper from `synchronicity.init` does too. The init hook runs
@@ -546,9 +557,9 @@ SY_ENTRY sy_s64 entry(void) {
   sy_s64 up = sy_tcp_connect(SY_STR("git.internal"), 9418);
   if (up < 0) return up;
 
-  /* The binding limit is the *frame*, not the stack: 4 KiB per function, of
-     which `who`, `key` and the poll array have already taken a little. Two
-     `char[2048]` here would not compile. */
+  /* The binding limit is the *frame*, not the stack: this program uses the
+     guarded 16 KiB default per function. `who`, `key`, the poll array and the
+     two buffers all live inside that frame. */
   char upward[1536], downward[1536];
 
   /* One buffer and one pump per direction. `sy_pump` holds a short write's
@@ -703,7 +714,7 @@ own.
 | Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. |
 | rx / tx ring per endpoint | 256 KiB each | A full ring stops the host reading, which backpressures the far side. |
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |
-| Guest stack | 32 KiB | Fixed by async-ebpf: 8 local-call frames of 4 KiB, plus 512 B of calldata. |
+| Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Local-call frames are guarded and 16 KiB by default; sizes from 16 B through 32 KiB may be declared, with guards explicitly disabled for non-page-aligned sizes. |
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |

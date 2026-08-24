@@ -78,6 +78,20 @@ fn every_example_compiles_loads_and_declares_itself() {
 }
 
 #[tokio::test]
+async fn compact_frames_runs_with_the_layout_it_declares() {
+    let elf = build("compact-frames.c");
+    let harness = Harness::new();
+    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    assert_eq!(declaration.stack_frame_size, Some(512));
+    assert_eq!(declaration.guarded_stack_frames, Some(false));
+
+    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"compact frames\n");
+}
+
+#[tokio::test]
 async fn echo_returns_what_it_was_sent_and_counts_it() {
     let elf = build("echo.c");
     let harness = Harness::new();

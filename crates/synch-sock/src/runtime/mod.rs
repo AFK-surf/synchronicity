@@ -103,6 +103,61 @@ struct Job {
     cancel: oneshot::Receiver<()>,
 }
 
+type StackConfig = (usize, bool);
+type LoaderCache = RefCell<HashMap<StackConfig, Rc<ProgramLoader>>>;
+type ProgramCache = RefCell<HashMap<(Hash, StackConfig), Rc<Program>>>;
+
+fn host_page_size() -> Option<usize> {
+    // SAFETY: `sysconf` reads a process-wide platform constant and has no
+    // pointer or lifetime requirements.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).ok().filter(|size| *size > 0)
+}
+
+fn resolve_stack_config(
+    frame_size: Option<usize>,
+    guarded: Option<bool>,
+) -> Result<StackConfig, SockError> {
+    let size = frame_size.unwrap_or(synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE as usize);
+    let guarded = guarded.unwrap_or(true);
+    let valid = u32::try_from(size)
+        .ok()
+        .is_some_and(synch_core::valid_ebpf_stack_frame_size);
+    if !valid {
+        return Err(SockError::Load(format!(
+            "invalid declared stack frame size: {size}"
+        )));
+    }
+    if guarded {
+        let Some(page_size) = host_page_size() else {
+            return Err(SockError::Load(
+                "cannot determine the host page size".into(),
+            ));
+        };
+        if !size.is_multiple_of(page_size) {
+            return Err(SockError::Load(format!(
+                "guarded stack frame size {size} is not aligned to the host's \
+                 {page_size}-byte pages; declare guarded stack frames disabled"
+            )));
+        }
+    }
+    Ok((size, guarded))
+}
+
+fn guest_stack_size(frame_size: usize) -> Result<usize, SockError> {
+    const DEFAULT_FRAME_COUNT: usize = 8;
+    const CALLDATA_HEADROOM: usize = async_ebpf::program::DEFAULT_GUEST_STACK_SIZE
+        - async_ebpf::program::DEFAULT_STACK_FRAME_SIZE * DEFAULT_FRAME_COUNT;
+
+    frame_size
+        .checked_mul(DEFAULT_FRAME_COUNT)
+        .and_then(|size| size.checked_add(CALLDATA_HEADROOM))
+        .map(|size| size.max(async_ebpf::program::DEFAULT_GUEST_STACK_SIZE))
+        .ok_or_else(|| {
+            SockError::Load("declared stack frame size overflows the guest stack".into())
+        })
+}
+
 impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Job")
@@ -325,13 +380,8 @@ impl Worker {
                     }
                 };
                 let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-                let loader = Rc::new(ProgramLoader::new(
-                    &mut rand::thread_rng(),
-                    Arc::new(DummyProgramEventListener),
-                    &[helpers::HELPERS],
-                ));
-                let cache: Rc<RefCell<HashMap<Hash, Rc<Program>>>> =
-                    Rc::new(RefCell::new(HashMap::new()));
+                let loaders: Rc<LoaderCache> = Rc::new(RefCell::new(HashMap::new()));
+                let cache: Rc<ProgramCache> = Rc::new(RefCell::new(HashMap::new()));
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     let mut running = tokio::task::JoinSet::new();
@@ -344,7 +394,7 @@ impl Worker {
                                         let _ = job.reply.send(Ok(shutdown_outcome()));
                                         continue;
                                     }
-                                    let loader = loader.clone();
+                                    let loaders = loaders.clone();
                                     let cache = cache.clone();
                                     let limits = limits.clone();
                                     let maps = maps.clone();
@@ -352,7 +402,7 @@ impl Worker {
                                     let shutdown = worker_shutdown.clone();
                                     running.spawn_local(async move {
                                         let outcome = run_job(
-                                            &loader,
+                                            &loaders,
                                             &cache,
                                             thread_env,
                                             &limits,
@@ -396,15 +446,36 @@ impl Worker {
 
 /// Compiles, or returns the compiled program for, one content root.
 fn program_for(
-    loader: &ProgramLoader,
-    cache: &RefCell<HashMap<Hash, Rc<Program>>>,
+    loaders: &LoaderCache,
+    cache: &ProgramCache,
     thread_env: ThreadEnv,
     root: &Hash,
     elf: &[u8],
+    stack_frame_size: Option<usize>,
+    guarded_stack_frames: Option<bool>,
 ) -> Result<Rc<Program>, SockError> {
-    if let Some(program) = cache.borrow().get(root) {
+    let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
+    let key = (*root, config);
+    if let Some(program) = cache.borrow().get(&key) {
         return Ok(program.clone());
     }
+    let existing_loader = loaders.borrow().get(&config).cloned();
+    let loader = if let Some(loader) = existing_loader {
+        loader
+    } else {
+        let loader = ProgramLoader::new(
+            &mut rand::thread_rng(),
+            Arc::new(DummyProgramEventListener),
+            &[helpers::HELPERS],
+        );
+        let loader = loader
+            .with_stack_frame_size(config.0)
+            .with_guest_stack_size(guest_stack_size(config.0)?)
+            .with_guarded_stack_frames(config.1);
+        let loader = Rc::new(loader);
+        loaders.borrow_mut().insert(config, loader.clone());
+        loader
+    };
     let unbound: UnboundProgram = loader
         .load(&mut rand::thread_rng(), elf)
         .map_err(|e| SockError::Load(e.to_string()))?;
@@ -412,7 +483,7 @@ fn program_for(
     if !program.has_section(SECTION_STREAM) {
         return Err(SockError::NoEntrypoint);
     }
-    cache.borrow_mut().insert(*root, program.clone());
+    cache.borrow_mut().insert(key, program.clone());
     Ok(program)
 }
 
@@ -422,8 +493,8 @@ fn program_for(
     reason = "everything a worker needs to run one invocation, and every one of               them is per-worker state a struct would only rename"
 )]
 async fn run_job(
-    loader: &ProgramLoader,
-    cache: &RefCell<HashMap<Hash, Rc<Program>>>,
+    loaders: &LoaderCache,
+    cache: &ProgramCache,
     thread_env: ThreadEnv,
     limits: &Limits,
     maps: &Arc<SocketMaps>,
@@ -433,11 +504,13 @@ async fn run_job(
     cancel: oneshot::Receiver<()>,
 ) -> Result<Outcome, SockError> {
     let program = program_for(
-        loader,
+        loaders,
         cache,
         thread_env,
         &invocation.program_root,
         &invocation.program,
+        invocation.policy.stack_frame_size,
+        invocation.policy.guarded_stack_frames,
     )?;
 
     let ready = Rc::new(Readiness::default());
@@ -637,11 +710,15 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         .build()
         .map_err(|e| SockError::Load(e.to_string()))?;
     let thread_env = global.init_thread(PREEMPTION_INTERVAL);
+    let default_stack = resolve_stack_config(None, None)?;
     let loader = ProgramLoader::new(
         &mut rand::thread_rng(),
         Arc::new(DummyProgramEventListener),
         &[helpers::HELPERS],
-    );
+    )
+    .with_stack_frame_size(default_stack.0)
+    .with_guest_stack_size(guest_stack_size(default_stack.0)?)
+    .with_guarded_stack_frames(default_stack.1);
     let unbound = loader
         .load(&mut rand::thread_rng(), elf)
         .map_err(|e| SockError::Load(e.to_string()))?;
@@ -717,6 +794,10 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
     declaration
         .validate()
         .map_err(|e| SockError::Load(format!("invalid declaration: {e}")))?;
+    resolve_stack_config(
+        declaration.stack_frame_size.map(|size| size as usize),
+        declaration.guarded_stack_frames,
+    )?;
     Ok(declaration)
 }
 
@@ -734,4 +815,25 @@ fn zero_key() -> synch_core::NodeId {
 #[cfg(test)]
 pub(crate) fn helper_names() -> Vec<&'static str> {
     helpers::helper_names()
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    #[test]
+    fn stack_configuration_never_uses_automatic_guard_selection() {
+        assert_eq!(resolve_stack_config(None, None).unwrap(), (16 * 1024, true));
+        assert!(resolve_stack_config(Some(512), None).is_err());
+        assert_eq!(
+            resolve_stack_config(Some(512), Some(false)).unwrap(),
+            (512, false)
+        );
+    }
+
+    #[test]
+    fn the_stack_keeps_at_least_eight_frames() {
+        assert_eq!(guest_stack_size(512).unwrap(), 32 * 1024 + 512);
+        assert_eq!(guest_stack_size(16 * 1024).unwrap(), 128 * 1024 + 512);
+    }
 }

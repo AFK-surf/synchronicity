@@ -272,6 +272,26 @@ pub const MAX_DECLARED_TREE_READS: usize = 32;
 /// stack size.
 pub const MAX_DECLARATION_VALUE_BYTES: usize = 4096;
 
+/// The local-call frame size used when a socket does not declare another one.
+pub const DEFAULT_EBPF_STACK_FRAME_SIZE: u32 = 16 * 1024;
+
+/// Smallest local-call frame async-ebpf accepts.
+pub const MIN_EBPF_STACK_FRAME_SIZE: u32 = 16;
+
+/// Largest local-call frame a socket may request.
+///
+/// At eight frames this keeps one invocation's frame storage at 256 KiB.
+pub const MAX_EBPF_STACK_FRAME_SIZE: u32 = 32 * 1024;
+
+/// Alignment required by async-ebpf's local-call ABI.
+pub const EBPF_STACK_FRAME_ALIGNMENT: u32 = 16;
+
+/// Whether `size` is a local-call frame size the socket runtime can load.
+pub fn valid_ebpf_stack_frame_size(size: u32) -> bool {
+    (MIN_EBPF_STACK_FRAME_SIZE..=MAX_EBPF_STACK_FRAME_SIZE).contains(&size)
+        && size.is_multiple_of(EBPF_STACK_FRAME_ALIGNMENT)
+}
+
 /// Why a program declaration cannot be reviewed or armed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeclarationError {
@@ -293,6 +313,12 @@ pub enum DeclarationError {
         /// Which repeated declaration field exceeded its bound.
         field: &'static str,
     },
+    /// The requested eBPF local-call frame cannot be represented by the runtime.
+    #[error(
+        "stack-frame-size must be a multiple of {EBPF_STACK_FRAME_ALIGNMENT} from \
+         {MIN_EBPF_STACK_FRAME_SIZE} through {MAX_EBPF_STACK_FRAME_SIZE} bytes"
+    )]
+    InvalidStackFrameSize,
 }
 
 /// Whether text may be displayed verbatim in an operator-facing line.
@@ -362,6 +388,10 @@ pub struct Declaration {
     pub tree_reads: Vec<String>,
     /// A self-imposed concurrency cap, bounded by operator and daemon caps.
     pub max_streams: Option<u32>,
+    /// Bytes in each eBPF local-call frame; absent means the 16 KiB default.
+    pub stack_frame_size: Option<u32>,
+    /// Whether inaccessible host-page gaps must separate local-call frames.
+    pub guarded_stack_frames: Option<bool>,
 }
 
 impl Declaration {
@@ -380,6 +410,12 @@ impl Declaration {
         }
         for prefix in &self.tree_reads {
             validate_declaration_value("tree-read", prefix)?;
+        }
+        if self
+            .stack_frame_size
+            .is_some_and(|size| !valid_ebpf_stack_frame_size(size))
+        {
+            return Err(DeclarationError::InvalidStackFrameSize);
         }
         Ok(())
     }
@@ -410,6 +446,13 @@ impl Declaration {
         if let Some(n) = self.max_streams {
             out.push(format!("max-streams {n}"));
         }
+        if let Some(n) = self.stack_frame_size {
+            out.push(format!("stack-frame-size {n}"));
+        }
+        if let Some(enabled) = self.guarded_stack_frames {
+            let value = if enabled { "enabled" } else { "disabled" };
+            out.push(format!("guarded-stack-frames {value}"));
+        }
         out.join("\n")
     }
 
@@ -436,6 +479,14 @@ impl Declaration {
                     out.tree_reads.push(v.to_string())
                 }
                 Some(("max-streams", v)) => out.max_streams = v.parse().ok(),
+                Some(("stack-frame-size", v)) => {
+                    out.stack_frame_size =
+                        v.parse().ok().filter(|n| valid_ebpf_stack_frame_size(*n))
+                }
+                Some(("guarded-stack-frames", "enabled")) => out.guarded_stack_frames = Some(true),
+                Some(("guarded-stack-frames", "disabled")) => {
+                    out.guarded_stack_frames = Some(false)
+                }
                 _ => {}
             }
         }
@@ -744,6 +795,8 @@ mod tests {
             egress: vec!["git.internal:9418".into(), "cache.internal".into()],
             tree_reads: vec!["code".into()],
             max_streams: Some(32),
+            stack_frame_size: Some(512),
+            guarded_stack_frames: Some(false),
         };
         let parsed = Declaration::parse(&d.render());
         // `render` sorts, so compare against a sorted original rather than
@@ -799,6 +852,42 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(Declaration::parse(&text).egress.len(), MAX_DECLARED_EGRESS);
+    }
+
+    #[test]
+    fn invalid_stack_frame_sizes_are_not_accepted_from_stored_text() {
+        for size in [0, 15, 17, MAX_EBPF_STACK_FRAME_SIZE + 16] {
+            let parsed = Declaration::parse(&format!("stack-frame-size {size}"));
+            assert_eq!(parsed.stack_frame_size, None, "accepted {size}");
+        }
+        assert_eq!(
+            Declaration::parse("stack-frame-size 512").stack_frame_size,
+            Some(512)
+        );
+        assert!(matches!(
+            Declaration {
+                stack_frame_size: Some(17),
+                ..Declaration::default()
+            }
+            .validate(),
+            Err(DeclarationError::InvalidStackFrameSize)
+        ));
+    }
+
+    #[test]
+    fn guarded_stack_frame_choice_round_trips_only_known_values() {
+        assert_eq!(
+            Declaration::parse("guarded-stack-frames disabled").guarded_stack_frames,
+            Some(false)
+        );
+        assert_eq!(
+            Declaration::parse("guarded-stack-frames enabled").guarded_stack_frames,
+            Some(true)
+        );
+        assert_eq!(
+            Declaration::parse("guarded-stack-frames perhaps").guarded_stack_frames,
+            None
+        );
     }
 
     #[test]

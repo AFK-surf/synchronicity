@@ -101,6 +101,10 @@ pub struct EffectivePolicy {
     pub config: Vec<(String, String)>,
     /// The concurrency cap, already the lower of the two.
     pub max_streams: usize,
+    /// Bytes charged to each eBPF local-call frame.
+    pub stack_frame_size: Option<usize>,
+    /// Whether inaccessible host-page gaps must separate local-call frames.
+    pub guarded_stack_frames: Option<bool>,
 }
 
 impl EffectivePolicy {
@@ -126,6 +130,8 @@ impl EffectivePolicy {
             tree_reads: declared.tree_reads.clone(),
             config,
             max_streams,
+            stack_frame_size: declared.stack_frame_size.map(|size| size as usize),
+            guarded_stack_frames: declared.guarded_stack_frames,
         }
     }
 
@@ -252,6 +258,23 @@ mod tests {
         assert_eq!(cap(Some(32), Some(8)), 8);
         assert_eq!(cap(Some(8), Some(32)), 8);
         assert_eq!(cap(Some(1000), Some(1000)), 64, "the default is a ceiling");
+    }
+
+    #[test]
+    fn the_declared_stack_frame_size_reaches_the_runtime_policy() {
+        assert_eq!(armed(&[]).stack_frame_size, None);
+        let policy = EffectivePolicy::armed(
+            &Declaration {
+                stack_frame_size: Some(512),
+                guarded_stack_frames: Some(false),
+                ..Declaration::default()
+            },
+            vec![],
+            None,
+            64,
+        );
+        assert_eq!(policy.stack_frame_size, Some(512));
+        assert_eq!(policy.guarded_stack_frames, Some(false));
     }
 
     #[test]

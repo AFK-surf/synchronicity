@@ -242,7 +242,7 @@ fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Res
     if !synch_cc::SUPPORTED {
         anyhow::bail!(
             "this build has no C compiler in it; build the object with \
-             `clang -target bpf -O2 -mllvm -bpf-stack-size=4096 -c {}`",
+             `clang -target bpf -O2 -mllvm -bpf-stack-size=16384 -c {}`",
             source.display()
         );
     }

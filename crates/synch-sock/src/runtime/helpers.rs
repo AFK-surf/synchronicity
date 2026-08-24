@@ -106,6 +106,11 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_declare_egress", h_declare_egress),
     ("sy_declare_tree_read", h_declare_tree_read),
     ("sy_declare_max_streams", h_declare_max_streams),
+    ("sy_declare_stack_frame_size", h_declare_stack_frame_size),
+    (
+        "sy_declare_guarded_stack_frames",
+        h_declare_guarded_stack_frames,
+    ),
 ];
 
 /// Every helper name, for the SDK-header agreement test.
@@ -1535,6 +1540,56 @@ fn h_declare_max_streams(
             return e;
         }
         inner.declaration.borrow_mut().max_streams = Some(n.min(u32::MAX as u64) as u32);
+        0
+    })
+    .and_then(ret)
+}
+
+fn h_declare_stack_frame_size(
+    scope: &HelperScope,
+    size: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with(scope, |inner| {
+        if let Some(e) = mode_check(inner, true) {
+            return e;
+        }
+        let Ok(size) = u32::try_from(size) else {
+            return errno::ELIMIT;
+        };
+        if size > synch_core::MAX_EBPF_STACK_FRAME_SIZE {
+            return errno::ELIMIT;
+        }
+        if !synch_core::valid_ebpf_stack_frame_size(size) {
+            return errno::EINVAL;
+        }
+        inner.declaration.borrow_mut().stack_frame_size = Some(size);
+        0
+    })
+    .and_then(ret)
+}
+
+fn h_declare_guarded_stack_frames(
+    scope: &HelperScope,
+    enabled: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    with(scope, |inner| {
+        if let Some(e) = mode_check(inner, true) {
+            return e;
+        }
+        let enabled = match enabled {
+            0 => false,
+            1 => true,
+            _ => return errno::EINVAL,
+        };
+        inner.declaration.borrow_mut().guarded_stack_frames = Some(enabled);
         0
     })
     .and_then(ret)

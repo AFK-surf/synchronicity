@@ -140,9 +140,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.10"
+version = "0.4.0-alpha.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173535928b875caa53e3e92af7a0c86894d5fd8c45990bc4d39b6da8d803bad9"
+checksum = "268c46a6d4fd0d5ad47f7127472f61a09193301ea4de3fed34eaa05b44a11372"
 dependencies = [
  "cfg-if",
  "elf",
@@ -5050,6 +5050,7 @@ dependencies = [
  "blake3",
  "bytes",
  "hex",
+ "libc",
  "rand 0.8.7",
  "synch-cc",
  "synch-core",

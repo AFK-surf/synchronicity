@@ -93,8 +93,8 @@ pub const MAX_LABELS: usize = 8;
 /// The most bytes a single helper will copy in one call.
 ///
 /// Not a security bound — the pointer cage already confines every access to the
-/// guest's own 32 KiB stack, so a larger request simply fails validation. It is
-/// here so that an absurd length argument is refused as an argument rather than
+/// guest's own stack, so a larger request simply fails validation. It is here
+/// so that an absurd length argument is refused as an argument rather than
 /// walked.
 pub const MAX_COPY: u64 = 64 * 1024;
 

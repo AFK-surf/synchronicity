@@ -391,8 +391,13 @@ SY_INIT_ENTRY sy_s64 declare(void) {
   sy_declare_egress(SY_STR("git.internal"), 9418);
   sy_declare_tree_read(SY_STR("code"));
   sy_declare_max_streams(32);
+  if (sy_declare_stack_frame_size(17) != SY_EINVAL) return -1;
+  if (sy_declare_stack_frame_size(32784) != SY_ELIMIT) return -2;
+  sy_declare_stack_frame_size(512);
+  if (sy_declare_guarded_stack_frames(2) != SY_EINVAL) return -3;
+  sy_declare_guarded_stack_frames(0);
   /* An I/O helper here has nothing to reach, and is refused before it tries. */
-  if (sy_tcp_connect(SY_STR("git.internal"), 9418) != SY_EPERM) return -1;
+  if (sy_tcp_connect(SY_STR("git.internal"), 9418) != SY_EPERM) return -4;
   return 0;
 }
 
@@ -413,6 +418,71 @@ fn the_init_hook_declares_and_cannot_reach_anything() {
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
     assert_eq!(declared.tree_reads, vec!["code".to_string()]);
     assert_eq!(declared.max_streams, Some(32));
+    assert_eq!(declared.stack_frame_size, Some(512));
+    assert_eq!(declared.guarded_stack_frames, Some(false));
+}
+
+const SMALL_FRAMES: &str = r#"
+#include <synch.h>
+
+SY_INIT_ENTRY sy_s64 declare(void) {
+  if (sy_declare_stack_frame_size(512) < 0) return -1;
+  return sy_declare_guarded_stack_frames(0);
+}
+
+static sy_s64 descend(sy_s64 n) {
+  volatile sy_s64 local = n;
+  if (n == 0) return 0;
+  sy_s64 below = descend(n - 1);
+  return below + (local != 0);
+}
+
+SY_ENTRY sy_s64 entry(void) {
+  return descend(16);
+}
+"#;
+
+#[tokio::test]
+async fn a_declared_stack_frame_size_configures_stream_local_calls() {
+    let elf = compile(SMALL_FRAMES, "small-frames.c");
+    let harness = Harness::new();
+
+    let (default_status, _) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(default_status, SockStatus::Fault(_)),
+        "the guarded 16 KiB default unexpectedly admitted 17 recursive frames: {default_status:?}"
+    );
+
+    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let (declared_status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(declared_status, SockStatus::Ok(16));
+}
+
+const MISALIGNED_GUARDED_FRAMES: &str = r#"
+#include <synch.h>
+
+SY_INIT_ENTRY sy_s64 declare(void) {
+  return sy_declare_stack_frame_size(512);
+}
+
+SY_ENTRY sy_s64 entry(void) { return 0; }
+"#;
+
+#[test]
+fn custom_frames_require_page_alignment_unless_guarding_is_disabled() {
+    let elf = compile(MISALIGNED_GUARDED_FRAMES, "misaligned-guarded-frames.c");
+    let error = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+        .expect_err("512-byte guarded frames cannot be host-page aligned");
+    assert!(error.to_string().contains("not aligned"), "{error}");
 }
 
 const UNSAFE_DECLARATION: &str = r#"

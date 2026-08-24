@@ -63,10 +63,9 @@ pub fn compile_with_clang(source: &str, name: &str) -> Option<Vec<u8>> {
 
     let out = Command::new("clang")
         .args(["-target", "bpf", "-O2", "-g0"])
-        // The guest gets 4 KiB per local call frame; clang's default BPF stack
-        // is 512, and a program with a 2 KiB buffer will not compile without
-        // this.
-        .args(["-mllvm", "-bpf-stack-size=4096"])
+        // Synchronicity's guarded local-call frame is 16 KiB by default;
+        // clang's BPF default is 512 bytes and must be raised to match it.
+        .args(["-mllvm", "-bpf-stack-size=16384"])
         .arg("-I")
         .arg(&sdk_dir)
         .arg("-c")

@@ -1,6 +1,6 @@
 # Socket examples
 
-Six programs, each demonstrating one thing, each a program you could arm as it
+Seven programs, each demonstrating one thing, each a program you could arm as it
 stands. `docs/SOCKETS.md` is the design; this is what it looks like written
 down.
 
@@ -35,6 +35,7 @@ synch connect nas:code/echo.sock
 | [`http-status.c`](http-status.c) | a status page over HTTP | speaking a real protocol, and state that outlives the invocation |
 | [`tcp-proxy.c`](tcp-proxy.c) | forwards to one upstream | declared egress, per-caller rate limits, and a bidirectional loop that ends correctly |
 | [`token-gate.c`](token-gate.c) | checks a shared secret | config as a secret store, and a constant-time comparison |
+| [`compact-frames.c`](compact-frames.c) | uses 512-byte contiguous call frames | declaring a compiler-matched frame size and explicitly disabling guarded frames |
 
 Every one of them is compiled and run by `../tests/examples.rs` on each build,
 against the same runtime that serves them in a daemon — so an example that
@@ -42,10 +43,11 @@ stopped working would fail the build rather than fail a reader.
 
 ## Three things about the machine you are writing for
 
-1. **32 KiB of stack, no heap, no mutable globals.** A large buffer is a stack
-   buffer, and the binding limit is the *frame* — 4 KiB per function — not the
-   whole stack. State that must outlive the invocation goes in the socket map
-   (`sy_map_*`). A `static` you write to will not link.
+1. **At least eight stack frames, no heap, no mutable globals.** Frames are
+   guarded and 16 KiB by default. A large buffer is a stack buffer, and the
+   binding limit is its frame rather than the whole stack. State that must
+   outlive the invocation goes in the socket map (`sy_map_*`). A `static` you
+   write to will not link.
 
 2. **Nothing blocks except `sy_poll`.** Every read and write returns
    immediately, with a short count or `SY_EAGAIN`. A short write is
@@ -65,5 +67,5 @@ ELF object and does not care which compiler wrote it:
 
 ```sh
 synch socket sdk > synch.h
-clang -target bpf -O2 -g0 -mllvm -bpf-stack-size=4096 -I. -c echo.c -o echo.o
+clang -target bpf -O2 -g0 -mllvm -bpf-stack-size=16384 -I. -c echo.c -o echo.o
 ```
