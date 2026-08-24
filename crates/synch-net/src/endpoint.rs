@@ -265,6 +265,9 @@ impl crate::HeadSink for RefuseHeads {
 pub struct Net {
     router: Router,
     store: Arc<Store>,
+    /// Handle onto the mounted socket protocol, so node shutdown can stop
+    /// admission and drain final status frames before closing the endpoint.
+    sockets: Option<crate::sock::SockProtocol>,
     /// One live connection per peer and ALPN, reused across requests.
     ///
     /// A QUIC session is not a request: opening one costs a handshake, a
@@ -374,12 +377,12 @@ impl Net {
                 )
                 .on_unknown_key(options.on_unknown_key.clone()),
             );
-        let router = match options.sockets.clone() {
-            Some(service) => router.accept(
-                synch_core::ALPN_SOCK,
-                crate::sock::SockProtocol::new(store.clone(), service)
-                    .on_unknown_key(options.on_unknown_key.clone()),
-            ),
+        let sockets = options.sockets.clone().map(|service| {
+            crate::sock::SockProtocol::new(store.clone(), service)
+                .on_unknown_key(options.on_unknown_key.clone())
+        });
+        let router = match &sockets {
+            Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),
             None => router,
         };
         let router = router.spawn();
@@ -387,6 +390,7 @@ impl Net {
         Ok(Net {
             router,
             store,
+            sockets,
             dialed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -404,6 +408,20 @@ impl Net {
     /// The store this endpoint serves from.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// Stops this endpoint accepting new socket streams.
+    pub fn stop_socket_admission(&self) {
+        if let Some(protocol) = &self.sockets {
+            protocol.stop();
+        }
+    }
+
+    /// Waits for accepted socket streams to flush their final frames.
+    pub async fn drain_socket_streams(&self) {
+        if let Some(protocol) = &self.sockets {
+            protocol.drain().await;
+        }
     }
 
     /// An address carrying only this endpoint's directly bound sockets.

@@ -120,7 +120,7 @@ CREATE TABLE sockets (
   auto             INTEGER NOT NULL DEFAULT 0,
   note             TEXT NOT NULL DEFAULT '',
   added_at         INTEGER NOT NULL,
-  generation       BLOB NOT NULL,            -- changes on every declaration update
+  generation       BLOB NOT NULL,            -- changes on declaration update or disarm
   PRIMARY KEY (space, path)
 );
 

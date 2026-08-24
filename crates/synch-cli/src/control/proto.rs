@@ -44,7 +44,7 @@ pub use pb::{
 /// "restart the daemon" a version mismatch says.
 ///
 /// v3 changes socket arming from approval by content root to approval by an
-/// opaque token that also binds the declaration revision and init result.
+/// opaque token that also binds the authorization revision and init result.
 pub const CONTROL_VERSION: u32 = 3;
 
 /// How many payload bytes one chunk carries.

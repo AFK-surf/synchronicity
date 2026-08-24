@@ -347,6 +347,26 @@ fn the_init_hook_declares_and_cannot_reach_anything() {
     assert_eq!(declared.max_streams, Some(32));
 }
 
+const UNSAFE_DECLARATION: &str = r#"
+#include <synch.h>
+
+SY_INIT_ENTRY sy_s64 declare(void) {
+  if (sy_declare_name(SY_STR("benign\negress evil.example:443")) != SY_EINVAL) return -1;
+  if (sy_declare_tree_read(SY_STR("public\x1b[2J")) != SY_EINVAL) return -2;
+  return 0;
+}
+
+SY_ENTRY sy_s64 entry(void) { return 0; }
+"#;
+
+#[test]
+fn declaration_helpers_reject_line_and_terminal_control_text() {
+    let elf = compile(UNSAFE_DECLARATION, "unsafe-declaration.c");
+    let declared =
+        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook ran");
+    assert_eq!(declared, synch_core::Declaration::default());
+}
+
 #[tokio::test]
 async fn a_declaration_helper_is_refused_outside_the_init_hook() {
     let elf = compile(DECLARE, "declare.c");

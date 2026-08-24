@@ -50,8 +50,9 @@ pub struct SocketInspection {
     pub root: Hash,
     /// What that exact execution of the program's init hook declared.
     pub declaration: Declaration,
-    /// Opaque approval token binding the root, declaration revision, and
-    /// rendered program declaration.
+    /// Opaque approval token binding the root, authorization revision, and
+    /// rendered program declaration. Disarm also advances the revision, so a
+    /// copied token cannot restore an approval the operator withdrew.
     pub review: Hash,
 }
 
@@ -67,6 +68,7 @@ impl Node {
     /// what the operator meant to approve, and `synch socket arm` is where the
     /// approval happens after the declaration is printed.
     pub fn socket_add(&self, row: &SocketRow) -> Result<()> {
+        let _authorization = self.socket_authorization_write();
         let Some(space) = self.store().space(&row.space)? else {
             return Err(EngineError::invalid(format!(
                 "`{}` is not a space this node indexes",
@@ -140,6 +142,7 @@ impl Node {
                 "the socket's content, declaration, or init result changed after review; inspect it again",
             ));
         }
+        let _authorization = self.socket_authorization_write();
         let armed = self.store().arm_socket_reviewed(
             self.origin(),
             space,
@@ -164,6 +167,7 @@ impl Node {
 
     /// Withdraws an approval, leaving the declaration standing.
     pub fn socket_disarm(&self, space: &str, path: &str) -> Result<bool> {
+        let _authorization = self.socket_authorization_write();
         let out = self.store().disarm_socket(space, path)?;
         self.clear_socket_map(&format!("{space}/{path}"));
         Ok(out)
@@ -174,6 +178,7 @@ impl Node {
     /// The next scan republishes the path as an ordinary file, because the kind
     /// comes from the declaration and there is no longer one.
     pub fn socket_rm(&self, space: &str, path: &str) -> Result<bool> {
+        let _authorization = self.socket_authorization_write();
         let out = self.store().remove_socket(space, path)?;
         if out {
             self.store().remove_local_file(space, path)?;
@@ -326,7 +331,30 @@ impl Node {
             Err(e) => return Err((RefuseCode::ProgramInvalid, e.to_string())),
         };
 
-        let policy = self.socket_policy(&resolved.state);
+        // Program loading may fetch from a remote CAS. Authorization is
+        // deliberately not held across that wait, but it must be checked again
+        // while the registry slot is made live. Arm/disarm/redeclare take the
+        // write side of this gate, so either this admission becomes in-flight
+        // first or the revocation wins and this request is refused.
+        let _authorization = self.socket_authorization_read();
+        let current = match self.resolve_socket(&open.space, &open.path) {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                return Err((
+                    RefuseCode::NotArmed,
+                    "the socket was removed or republished during admission".into(),
+                ))
+            }
+            Err(e) => return Err((RefuseCode::NotArmed, e.to_string())),
+        };
+        if !authorization_unchanged(&resolved, &current) {
+            return Err((
+                RefuseCode::NotArmed,
+                "the socket was disarmed, redeclared, or changed during admission".into(),
+            ));
+        }
+
+        let policy = self.socket_policy(&current.state);
         let qualified = format!("{}/{}", open.space, open.path);
         let id = self.next_socket_id();
 
@@ -406,6 +434,7 @@ impl Node {
     /// its policy are the operator's and survive; what is withdrawn is the
     /// approval of *these bytes*, which have proved they do not work.
     fn quarantine_socket(&self, space: &str, path: &str, root: Hash) {
+        let _authorization = self.socket_authorization_write();
         match self.store().disarm_socket_root(space, path, &root) {
             Ok(true) => tracing::error!(
                 socket = format!("{space}/{path}"),
@@ -439,6 +468,12 @@ impl Node {
             None => Vec::new(),
         }
     }
+}
+
+fn authorization_unchanged(reviewed: &Resolved, current: &Resolved) -> bool {
+    current.root == reviewed.root
+        && current.state.generation == reviewed.state.generation
+        && current.state.is_armed_for(&current.root)
 }
 
 fn socket_review(root: &Hash, generation: &Hash, declaration: &Declaration) -> Hash {
@@ -967,6 +1002,7 @@ impl Node {
         };
         match self.declare_program(&elf) {
             Ok(declared) => {
+                let _authorization = self.socket_authorization_write();
                 let armed = self.store().auto_arm_socket(
                     space,
                     path,
@@ -1113,4 +1149,53 @@ pub struct SocketConnection {
     pub control: iroh::endpoint::RecvStream,
     /// The invocation itself.
     pub stream: synch_net::sock::SockStream,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_store::{ArmRow, SocketRow};
+
+    fn resolved(generation: Hash, root: Hash) -> Resolved {
+        Resolved {
+            root,
+            size: 3,
+            state: SocketState {
+                declaration: SocketRow::new("code", "git.sock", 0),
+                generation,
+                arm: Some(ArmRow {
+                    space: "code".into(),
+                    path: "git.sock".into(),
+                    root,
+                    declared: String::new(),
+                    armed_at: 0,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn final_admission_rejects_every_authorization_change() {
+        let root = Hash::new(b"program");
+        let generation = Hash::new(b"authorization");
+        let reviewed = resolved(generation, root);
+        assert!(authorization_unchanged(
+            &reviewed,
+            &resolved(generation, root)
+        ));
+
+        let after_disarm = Resolved {
+            state: SocketState {
+                generation: Hash::new(b"after disarm"),
+                arm: None,
+                ..reviewed.state.clone()
+            },
+            ..reviewed.clone()
+        };
+        assert!(!authorization_unchanged(&reviewed, &after_disarm));
+        assert!(!authorization_unchanged(
+            &reviewed,
+            &resolved(generation, Hash::new(b"new program"))
+        ));
+    }
 }

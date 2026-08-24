@@ -122,10 +122,10 @@ pub struct ArmCandidate<'a> {
 pub struct SocketState {
     /// The declaration.
     pub declaration: SocketRow,
-    /// Opaque identity of this exact declaration revision.
+    /// Opaque identity of this exact authorization revision.
     ///
-    /// It changes on every `put_socket`, including a delete followed by an
-    /// identical add, and is the compare-and-set token used by arming.
+    /// It changes on every `put_socket` and disarm, and is the compare-and-set
+    /// token used by arming and final admission.
     pub generation: Hash,
     /// The arming record, if there is one.
     pub arm: Option<ArmRow>,
@@ -224,7 +224,7 @@ impl Store {
     }
 
     /// Arms a manually reviewed program only if both facts reviewed by the
-    /// caller are still current: the local declaration revision and this
+    /// caller are still current: the local authorization revision and this
     /// origin's published socket root.
     pub fn arm_socket_reviewed(
         &self,
@@ -346,11 +346,21 @@ impl Store {
 
     /// Withdraws an approval, leaving the declaration standing.
     pub fn disarm_socket(&self, space: &str, path: &str) -> Result<bool> {
-        let n = self.conn().execute(
-            "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2",
-            params![space, path],
-        )?;
-        Ok(n > 0)
+        self.transaction(|txn| {
+            // Rotation is unconditional for an existing declaration. Besides
+            // invalidating a copied manual-review token, this cancels auto-arm
+            // work that may still be running even when there is no arm row yet.
+            txn.conn().execute(
+                "UPDATE sockets SET generation = randomblob(32)
+                  WHERE space = ?1 AND path = ?2",
+                params![space, path],
+            )?;
+            let n = txn.conn().execute(
+                "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2",
+                params![space, path],
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Withdraws an approval only if it still names `root`.
@@ -358,11 +368,20 @@ impl Store {
     /// Fault quarantine uses this so an old invocation cannot disarm a newer
     /// program that was armed while the old one was still finishing.
     pub fn disarm_socket_root(&self, space: &str, path: &str, root: &Hash) -> Result<bool> {
-        let n = self.conn().execute(
-            "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2 AND root = ?3",
-            params![space, path, root.as_bytes().to_vec()],
-        )?;
-        Ok(n > 0)
+        self.transaction(|txn| {
+            let n = txn.conn().execute(
+                "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2 AND root = ?3",
+                params![space, path, root.as_bytes().to_vec()],
+            )?;
+            if n > 0 {
+                txn.conn().execute(
+                    "UPDATE sockets SET generation = randomblob(32)
+                      WHERE space = ?1 AND path = ?2",
+                    params![space, path],
+                )?;
+            }
+            Ok(n > 0)
+        })
     }
 }
 
@@ -656,6 +675,42 @@ mod tests {
 
         assert!(store.remove_socket("code", "git.sock").unwrap());
         assert!(store.socket("code", "git.sock").unwrap().is_none());
+    }
+
+    #[test]
+    fn disarm_invalidates_auto_arm_work_already_in_flight() {
+        let (_d, store) = store();
+        let mut automatic = row();
+        automatic.auto = true;
+        store.put_socket(&automatic).unwrap();
+        let before = store.socket("code", "git.sock").unwrap().unwrap();
+        let root = Hash::new(b"elf");
+        store.arm_socket("code", "git.sock", &root, "", 2).unwrap();
+
+        assert!(store.disarm_socket("code", "git.sock").unwrap());
+        let after = store.socket("code", "git.sock").unwrap().unwrap();
+        assert_ne!(before.generation, after.generation);
+        assert!(
+            !store
+                .auto_arm_socket(
+                    "code",
+                    "git.sock",
+                    ArmCandidate {
+                        generation: &before.generation,
+                        root: &Hash::new(b"new elf"),
+                        declared: "",
+                        armed_at: 3,
+                    },
+                )
+                .unwrap(),
+            "auto-arm work that began before disarm restored the approval"
+        );
+        assert!(store
+            .socket("code", "git.sock")
+            .unwrap()
+            .unwrap()
+            .arm
+            .is_none());
     }
 
     #[test]

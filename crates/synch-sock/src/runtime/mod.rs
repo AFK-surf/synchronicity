@@ -714,6 +714,9 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
     })?;
     inner.flush_log();
     let declaration = inner.declaration.borrow().clone();
+    declaration
+        .validate()
+        .map_err(|e| SockError::Load(format!("invalid declaration: {e}")))?;
     Ok(declaration)
 }
 

@@ -15,7 +15,10 @@
 //! long-lived, and its concurrency bound is the socket's own armed
 //! `max_streams` rather than a number this layer picks.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 
 use iroh::{
     endpoint::Connection,
@@ -28,6 +31,12 @@ use synch_sock::{Admission, DuplexStream};
 use synch_store::Store;
 
 use crate::{error::NetError, frame};
+
+/// Makes the control uni-stream observable before the first invocation ends.
+/// QUIC does not announce an opened uni-stream to its receiver until bytes are
+/// sent on it, so without this preamble both sides wait forever: the client for
+/// `control()`, the server for an invocation whose status it could write.
+const CONTROL_READY: &[u8] = b"sync/sock/control/1\0";
 
 /// What the engine has to supply for this ALPN to serve anything.
 ///
@@ -56,6 +65,80 @@ pub struct SockProtocol {
     store: Arc<Store>,
     service: Arc<dyn SocketService>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    state: Arc<ProtocolState>,
+}
+
+#[derive(Debug, Default)]
+struct ProtocolState {
+    stopping: AtomicBool,
+    active_streams: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl ProtocolState {
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn enter(self: &Arc<Self>) -> Option<ActiveStream> {
+        if self.is_stopping() {
+            return None;
+        }
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        if self.is_stopping() {
+            self.leave();
+            return None;
+        }
+        Some(ActiveStream {
+            state: self.clone(),
+        })
+    }
+
+    fn leave(&self) {
+        if self.active_streams.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_stopping() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn drained(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.active_streams.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveStream {
+    state: Arc<ProtocolState>,
+}
+
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        self.state.leave();
+    }
 }
 
 impl std::fmt::Debug for SockProtocol {
@@ -71,6 +154,7 @@ impl SockProtocol {
             store,
             service,
             on_unknown_key: None,
+            state: Arc::new(ProtocolState::default()),
         }
     }
 
@@ -79,11 +163,29 @@ impl SockProtocol {
         self.on_unknown_key = wake;
         self
     }
+
+    /// Refuses new socket streams and wakes incomplete handshakes.
+    pub fn stop(&self) {
+        self.state.stop();
+    }
+
+    /// Waits until every stream accepted before [`stop`](Self::stop) has
+    /// delivered its final response or refusal.
+    pub async fn drain(&self) {
+        if self.state.is_stopping() {
+            self.state.drained().await;
+        }
+    }
 }
 
 impl ProtocolHandler for SockProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
+
+        if self.state.is_stopping() {
+            connection.close(0u32.into(), b"shutdown");
+            return Ok(());
+        }
 
         // The same accept gate the other two ALPNs use, and for the same
         // reason: a device key with no live binding is not a peer.
@@ -103,7 +205,13 @@ impl ProtocolHandler for SockProtocol {
         // stream would cost a length prefix on every proxied byte, and a
         // RESET_STREAM would discard output the program had already written.
         let control = match connection.open_uni().await {
-            Ok(stream) => Arc::new(tokio::sync::Mutex::new(stream)),
+            Ok(mut stream) => {
+                if let Err(e) = stream.write_all(CONTROL_READY).await {
+                    tracing::debug!(peer = %remote.fmt_short(), "control preamble failed: {e}");
+                    return Err(AcceptError::from_err(std::io::Error::other(e)));
+                }
+                Arc::new(tokio::sync::Mutex::new(stream))
+            }
             Err(e) => {
                 tracing::debug!(peer = %remote.fmt_short(), "no control stream: {e}");
                 return Err(AcceptError::from_err(std::io::Error::other(e)));
@@ -111,7 +219,26 @@ impl ProtocolHandler for SockProtocol {
         };
 
         let mut index = 0u64;
-        while let Ok((send, recv)) = connection.accept_bi().await {
+        loop {
+            let accepted = tokio::select! {
+                _ = self.state.cancelled() => break,
+                accepted = connection.accept_bi() => accepted,
+            };
+            let Ok((mut send, recv)) = accepted else {
+                break;
+            };
+            let Some(active) = self.state.enter() else {
+                let _ = frame::write_frame(
+                    &mut send,
+                    &SockOpened::Refused {
+                        code: RefuseCode::Busy,
+                        message: "the node is shutting down".into(),
+                    },
+                )
+                .await;
+                let _ = send.finish();
+                break;
+            };
             // Per stream, not just per connection: a binding revoked mid-session
             // must stop the next invocation rather than linger for the life of
             // the QUIC connection. A stream already running is left alone — it
@@ -135,6 +262,7 @@ impl ProtocolHandler for SockProtocol {
             index += 1;
 
             tokio::spawn(async move {
+                let _active = active;
                 let status = handler
                     .serve_stream(remote, addr, this_index, send, recv)
                     .await;
@@ -144,6 +272,13 @@ impl ProtocolHandler for SockProtocol {
                         frame::write_frame(&mut control, &SockClosed { stream_id, status }).await;
                 }
             });
+        }
+        // Router treats the handler future as the lifetime of the connection.
+        // Keep it alive until the detached stream tasks have written their
+        // completion frames; returning here earlier closes the control stream
+        // underneath them.
+        if self.state.is_stopping() {
+            self.state.drained().await;
         }
         Ok(())
     }
@@ -164,7 +299,20 @@ impl SockProtocol {
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Option<SockStatus> {
-        let open = match read_open(&mut recv).await {
+        let open = match tokio::select! {
+            _ = self.state.cancelled() => {
+                let _ = frame::write_frame(
+                    &mut send,
+                    &SockOpened::Refused {
+                        code: RefuseCode::Busy,
+                        message: "the node is shutting down".into(),
+                    },
+                ).await;
+                let _ = send.finish();
+                return None;
+            }
+            open = read_open(&mut recv) => open,
+        } {
             Ok(open) => open,
             Err(e) => {
                 tracing::debug!(peer = %peer.fmt_short(), "bad socket Open: {e}");
@@ -181,7 +329,20 @@ impl SockProtocol {
             }
         };
 
-        let admission = match self.service.admit(peer, addr, index, &open).await {
+        let admission = match tokio::select! {
+            _ = self.state.cancelled() => {
+                let _ = frame::write_frame(
+                    &mut send,
+                    &SockOpened::Refused {
+                        code: RefuseCode::Busy,
+                        message: "the node is shutting down".into(),
+                    },
+                ).await;
+                let _ = send.finish();
+                return None;
+            }
+            admission = self.service.admit(peer, addr, index, &open) => admission,
+        } {
             Ok(admission) => admission,
             Err((code, message)) => {
                 tracing::debug!(
@@ -303,14 +464,130 @@ impl SockClient {
 
     /// Accepts the callee's control uni-stream.
     pub async fn control(&self) -> Result<iroh::endpoint::RecvStream, NetError> {
-        self.connection
+        let mut control = self
+            .connection
             .accept_uni()
             .await
-            .map_err(|e| NetError::Unexpected(e.to_string()))
+            .map_err(|e| NetError::Unexpected(e.to_string()))?;
+        let mut ready = [0u8; CONTROL_READY.len()];
+        control.read_exact(&mut ready).await?;
+        if ready != CONTROL_READY {
+            return Err(NetError::Unexpected(
+                "socket control stream has an invalid preamble".into(),
+            ));
+        }
+        Ok(control)
     }
 
     /// The underlying connection, for callers that want to close it.
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        endpoint::NetOptions,
+        testing::{test_store, trusting_pair},
+    };
+    use synch_core::{Hash, OriginId};
+    use synch_sock::{EffectivePolicy, HostError, ObjectInfo, PeerIdentity, SocketHost, SocketId};
+
+    #[derive(Debug)]
+    struct NoTree;
+
+    #[async_trait::async_trait]
+    impl SocketHost for NoTree {
+        fn open(&self, _origin: Option<&str>, _path: &str) -> Result<ObjectInfo, HostError> {
+            Err(HostError::NotFound)
+        }
+
+        fn open_root(&self, _root: &Hash) -> Result<ObjectInfo, HostError> {
+            Err(HostError::NotFound)
+        }
+
+        fn list(&self, _prefix: &str) -> Result<Vec<String>, HostError> {
+            Err(HostError::NotFound)
+        }
+
+        async fn pread(&self, _root: Hash, _offset: u64, _len: u64) -> Result<Vec<u8>, HostError> {
+            Err(HostError::NotFound)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ShutdownService {
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl SocketService for ShutdownService {
+        async fn admit(
+            &self,
+            peer: NodeId,
+            addr: String,
+            stream_index: u64,
+            open: &SockOpen,
+        ) -> Result<Admission, (RefuseCode, String)> {
+            Ok(Admission {
+                program: Arc::new(Vec::new()),
+                program_root: Hash::EMPTY,
+                socket: SocketId::new(&open.space, &open.path),
+                peer: PeerIdentity {
+                    origin: OriginId::Key(peer),
+                    device_key: peer,
+                    spaces: None,
+                    addr,
+                    stream_index,
+                },
+                policy: EffectivePolicy::default(),
+                meta: open.meta.clone(),
+                self_origin: open.origin.clone(),
+                host: Arc::new(NoTree),
+                id: 7,
+                slot: None,
+            })
+        }
+
+        async fn run(&self, _admission: Admission, _stream: DuplexStream) -> SockStatus {
+            self.release.notified().await;
+            SockStatus::Shutdown
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_flushes_shutdown_status_before_endpoint_close() {
+        let (_server_dir, store) = test_store();
+        let service = Arc::new(ShutdownService::default());
+        let options = NetOptions {
+            sockets: Some(service.clone()),
+            ..NetOptions::loopback()
+        };
+        let (server, client, _client_dir) = trusting_pair(store, options).await;
+        let socket = client.connect_sock(server.direct_addr()).await.unwrap();
+        let open = SockOpen::new(OriginId::Key(server.id()), "code", "hold.sock", vec![]);
+        let mut control = socket.control().await.unwrap();
+        let stream = socket.open(&open).await.unwrap().unwrap();
+
+        server.stop_socket_admission();
+        service.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.drain_socket_streams(),
+        )
+        .await
+        .expect("accepted socket streams drain");
+
+        let closed = socket.next_closed(&mut control).await.unwrap();
+        assert_eq!(closed.status, SockStatus::Shutdown);
+        assert_eq!(closed.stream_id, 0);
+
+        drop(stream);
+        drop(control);
+        drop(socket);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 }

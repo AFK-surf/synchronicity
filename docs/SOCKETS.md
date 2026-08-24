@@ -186,7 +186,7 @@ access with no declaration is denied. Because the declaration is compiled into
 the object, editing it changes the content root, which disarms the socket. A
 program cannot widen its own reach without a fresh review and approval, and an
 approval cannot silently outlive the code it approved. The opaque `--review`
-token binds the content root, the local declaration revision, and the exact
+token binds the content root, the local authorization revision, and the exact
 init result shown above. If any of them changes between the two commands,
 approval fails; this remains true even if init consults time or randomness.
 
@@ -218,7 +218,8 @@ enum RefuseCode {
     Busy, ProgramInvalid, Unsupported,       // Unsupported = callee has no runtime
 }
 
-// callee → caller, one uni-stream per connection, opened at connection setup
+// callee → caller, one uni-stream per connection, opened at connection setup;
+// begins with the fixed bytes `sync/sock/control/1\0`, then framed Closed values
 struct Closed { stream_id: u64, status: Status }
 enum Status { Ok(i64), Fault(FaultKind), Killed, Shutdown, Deadline }
 ```

@@ -265,6 +265,82 @@ pub const MAX_DECLARED_EGRESS: usize = 32;
 /// The most tree-read prefixes one program may declare.
 pub const MAX_DECLARED_TREE_READS: usize = 32;
 
+/// The most UTF-8 bytes one human-readable declaration value may carry.
+///
+/// Declaration text is both an approval surface and persisted policy input.
+/// Keeping each value small bounds that surface independently of the guest's
+/// stack size.
+pub const MAX_DECLARATION_VALUE_BYTES: usize = 4096;
+
+/// Why a program declaration cannot be reviewed or armed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DeclarationError {
+    /// One value is too large to present safely to an operator.
+    #[error("{field} is longer than {MAX_DECLARATION_VALUE_BYTES} bytes")]
+    TooLong {
+        /// Which declaration field was invalid.
+        field: &'static str,
+    },
+    /// One value contains terminal or line-control text.
+    #[error("{field} contains a control or directional-formatting character")]
+    UnsafeText {
+        /// Which declaration field was invalid.
+        field: &'static str,
+    },
+    /// More values were supplied than the declaration format permits.
+    #[error("too many {field} values")]
+    TooMany {
+        /// Which repeated declaration field exceeded its bound.
+        field: &'static str,
+    },
+}
+
+/// Whether text may be displayed verbatim in an operator-facing line.
+///
+/// Besides ASCII/C0 controls, Unicode directional formatting is excluded: it
+/// can visually reorder otherwise printable capability text. Callers that need
+/// arbitrary bytes must encode them rather than presenting them as a trusted
+/// line.
+pub fn display_text_is_safe(value: &str) -> bool {
+    value.len() <= MAX_DECLARATION_VALUE_BYTES && value.chars().all(display_char_is_safe)
+}
+
+fn display_char_is_safe(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn validate_declaration_value(field: &'static str, value: &str) -> Result<(), DeclarationError> {
+    if value.len() > MAX_DECLARATION_VALUE_BYTES {
+        return Err(DeclarationError::TooLong { field });
+    }
+    if !display_text_is_safe(value) {
+        return Err(DeclarationError::UnsafeText { field });
+    }
+    Ok(())
+}
+
+fn escaped_declaration_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if display_char_is_safe(c) {
+            escaped.push(c);
+        } else {
+            escaped.extend(c.escape_default());
+        }
+    }
+    escaped
+}
+
 /// What a program's `synchronicity.init` hook said about itself
 /// (`docs/SOCKETS.md` §3.1).
 ///
@@ -289,6 +365,25 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// Checks that this declaration is bounded, line-safe, and suitable for
+    /// both operator review and persisted policy.
+    pub fn validate(&self) -> Result<(), DeclarationError> {
+        if self.egress.len() > MAX_DECLARED_EGRESS {
+            return Err(DeclarationError::TooMany { field: "egress" });
+        }
+        if self.tree_reads.len() > MAX_DECLARED_TREE_READS {
+            return Err(DeclarationError::TooMany { field: "tree-read" });
+        }
+        validate_declaration_value("name", &self.name)?;
+        for host in &self.egress {
+            validate_declaration_value("egress", host)?;
+        }
+        for prefix in &self.tree_reads {
+            validate_declaration_value("tree-read", prefix)?;
+        }
+        Ok(())
+    }
+
     /// Renders the declaration as the stable text an approval is stored as.
     ///
     /// Line-oriented and sorted within each kind, so two runs of the same hook
@@ -298,19 +393,19 @@ impl Declaration {
     pub fn render(&self) -> String {
         let mut out = Vec::new();
         if !self.name.is_empty() {
-            out.push(format!("name {}", self.name));
+            out.push(format!("name {}", escaped_declaration_value(&self.name)));
         }
         let mut egress = self.egress.clone();
         egress.sort();
         egress.dedup();
         for host in egress {
-            out.push(format!("egress {host}"));
+            out.push(format!("egress {}", escaped_declaration_value(&host)));
         }
         let mut reads = self.tree_reads.clone();
         reads.sort();
         reads.dedup();
         for prefix in reads {
-            out.push(format!("tree-read {prefix}"));
+            out.push(format!("tree-read {}", escaped_declaration_value(&prefix)));
         }
         if let Some(n) = self.max_streams {
             out.push(format!("max-streams {n}"));
@@ -328,11 +423,16 @@ impl Declaration {
         let mut out = Declaration::default();
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
             match line.split_once(' ') {
-                Some(("name", v)) => out.name = v.to_string(),
-                Some(("egress", v)) if out.egress.len() < MAX_DECLARED_EGRESS => {
+                Some(("name", v)) if display_text_is_safe(v) => out.name = v.to_string(),
+                Some(("egress", v))
+                    if out.egress.len() < MAX_DECLARED_EGRESS && display_text_is_safe(v) =>
+                {
                     out.egress.push(v.to_string())
                 }
-                Some(("tree-read", v)) if out.tree_reads.len() < MAX_DECLARED_TREE_READS => {
+                Some(("tree-read", v))
+                    if out.tree_reads.len() < MAX_DECLARED_TREE_READS
+                        && display_text_is_safe(v) =>
+                {
                     out.tree_reads.push(v.to_string())
                 }
                 Some(("max-streams", v)) => out.max_streams = v.parse().ok(),
@@ -656,6 +756,31 @@ mod tests {
             d.render(),
             "rendering is not stable across a round trip"
         );
+    }
+
+    #[test]
+    fn declaration_values_cannot_inject_or_conceal_capabilities() {
+        let injected = Declaration {
+            name: "benign\negress evil.example:443".into(),
+            tree_reads: vec!["public\u{1b}[2J".into()],
+            ..Declaration::default()
+        };
+        assert!(matches!(
+            injected.validate(),
+            Err(DeclarationError::UnsafeText { .. })
+        ));
+
+        let rendered = injected.render();
+        assert!(!rendered.contains('\u{1b}'));
+        assert_eq!(rendered.lines().count(), 2);
+        let reparsed = Declaration::parse(&rendered);
+        assert!(reparsed.egress.is_empty(), "a name became an egress rule");
+
+        let directional = Declaration {
+            name: "safe-looking\u{202e}txt".into(),
+            ..Declaration::default()
+        };
+        assert!(directional.validate().is_err());
     }
 
     #[test]

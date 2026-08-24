@@ -108,6 +108,11 @@ struct NodeInner {
     /// installs process-wide SIGUSR1 and SIGSEGV handlers, and that is a thing
     /// to do while starting up rather than while serving.
     sockets: Option<crate::sockets::SocketPool>,
+    /// Serializes socket authorization changes against the final admission
+    /// check. Slow reads and declaration hooks stay outside it; only the
+    /// transition that makes an invocation live shares this gate with arm,
+    /// disarm, redeclare, removal, and quarantine.
+    socket_authorization: std::sync::RwLock<()>,
     /// When each configured membership domain is next due for re-resolution,
     /// and when it was last attempted (§3.2, §3.4).
     dns: std::sync::Mutex<std::collections::HashMap<String, crate::membership::DomainSchedule>>,
@@ -726,6 +731,7 @@ impl Node {
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
                 sockets: socket_pool,
+                socket_authorization: std::sync::RwLock::new(()),
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
@@ -938,19 +944,48 @@ impl Node {
         &self.inner.config
     }
 
+    /// Holds socket authorization stable while an admission becomes live.
+    pub(crate) fn socket_authorization_read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.inner
+            .socket_authorization
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Excludes final admission while local authorization changes.
+    pub(crate) fn socket_authorization_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.inner
+            .socket_authorization
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Shuts every endpoint this node holds down cleanly.
     pub async fn shutdown(&self) -> Result<()> {
-        for net in self.retiring_nets() {
+        let retiring = self.retiring_nets();
+        let active = self.net();
+
+        // First close the admission gate on every key this node still serves.
+        // Existing connections remain alive so their workers can report a
+        // clean `Closed{Shutdown}` on the control stream.
+        for net in retiring.iter().chain(std::iter::once(&active)) {
+            net.stop_socket_admission();
+        }
+        if let Some(pool) = &self.inner.sockets {
+            pool.shutdown().await;
+        }
+        // Worker replies are delivered by protocol tasks outside the pool.
+        // Do not tear their endpoint out from underneath the final frame.
+        for net in retiring.iter().chain(std::iter::once(&active)) {
+            net.drain_socket_streams().await;
+        }
+
+        for net in retiring {
             if let Err(e) = net.shutdown().await {
                 tracing::warn!(error = %e, "a retiring endpoint did not shut down cleanly");
             }
         }
-        let network = self.net().shutdown().await;
-        // Tree hosts retain a Node while a guest is alive, so stopping the
-        // listeners is not enough: the pool owns and drains those lifetimes.
-        if let Some(pool) = &self.inner.sockets {
-            pool.shutdown().await;
-        }
+        let network = active.shutdown().await;
         network?;
         Ok(())
     }

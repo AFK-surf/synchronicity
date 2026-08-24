@@ -271,6 +271,9 @@ fn h_metric_add(
         Ok(n) => n,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&name) {
+        return ret(errno::EINVAL);
+    }
     with(scope, |inner| inner.metric(&name, delta as i64)).and_then(ret)
 }
 
@@ -290,6 +293,9 @@ fn h_label_set(
         Ok(v) => v,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&key) || !synch_core::display_text_is_safe(&value) {
+        return ret(errno::EINVAL);
+    }
     with(scope, |inner| inner.label(&key, &value)).and_then(ret)
 }
 
@@ -571,6 +577,9 @@ fn h_tcp_connect(
         Ok(h) => h,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&host) {
+        return ret(errno::EINVAL);
+    }
     if port == 0 || port > u16::MAX as u64 {
         return ret(errno::EINVAL);
     }
@@ -972,6 +981,9 @@ fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) 
         Ok(p) => p,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&prefix) {
+        return ret(errno::EINVAL);
+    }
     let inner = with(scope, Rc::clone)?;
     if inner.init_mode {
         return ret(errno::EPERM);
@@ -1412,6 +1424,9 @@ fn h_declare_name(
         Ok(n) => n,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&name) {
+        return ret(errno::EINVAL);
+    }
     with(scope, |inner| {
         if let Some(e) = mode_check(inner, true) {
             return e;
@@ -1434,6 +1449,9 @@ fn h_declare_egress(
         Ok(h) => h,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&host) {
+        return ret(errno::EINVAL);
+    }
     if port > u16::MAX as u64 {
         return ret(errno::EINVAL);
     }
@@ -1469,6 +1487,9 @@ fn h_declare_tree_read(
         Ok(p) => p,
         Err(e) => return ret(e),
     };
+    if !synch_core::display_text_is_safe(&prefix) {
+        return ret(errno::EINVAL);
+    }
     with(scope, |inner| {
         if let Some(e) = mode_check(inner, true) {
             return e;
