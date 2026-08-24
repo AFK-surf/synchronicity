@@ -341,7 +341,28 @@ const FAULT: &str = r#"
 
 SY_ENTRY sy_s64 entry(void) {
   /* Reach far outside the cage. The pointer is masked back inside a guard
-     region, which faults, which the runtime contains. */
+     region, which faults, which the runtime contains.
+
+     Derived from a local rather than spelled as a bare integer, so that the
+     runtime's static region analysis can still route it — to the stack — and
+     the access is compiled rather than refused. A bare wild integer is the
+     other test below: this one is about what happens when a *routable* access
+     lands outside its region, which is the case the SIGSEGV handler exists
+     for. The offset is computed at runtime so no compiler can fold it away. */
+  char buf[16];
+  sy_u64 far = (sy_u64)sy_monotonic_ns() | 0x41414141ULL;
+  volatile char *p = (volatile char *)(buf + far);
+  *p = 1;
+  return 0;
+}
+"#;
+
+const UNROUTABLE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* A pointer with no provenance the analysis can follow: not derived from
+     this frame, and not an address in the read-only data region. */
   volatile char *p = (volatile char *)0x4141414141414141ULL;
   *p = 1;
   return 0;
@@ -370,6 +391,49 @@ async fn a_fault_is_contained_and_the_worker_survives_it() {
 
     // The whole point of containment: the next invocation on the same worker
     // runs normally.
+    let (status, out) = exchange(
+        &harness,
+        &echo,
+        b"still here",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"still here");
+}
+
+/// An access the region analysis cannot route is refused, not run.
+///
+/// The runtime loads every program with async-ebpf's
+/// `require_static_region_analysis`, so a load or store whose pointer could be
+/// in either region is a program that does not compile rather than one that
+/// gets the dual-region runtime probe. It surfaces at the first call of the
+/// function that holds it — async-ebpf compiles lazily — which is why this is a
+/// `Fault(Load)` on the stream rather than a `SockError` from the loader.
+#[tokio::test]
+async fn an_access_that_cannot_be_routed_to_one_region_is_refused() {
+    let unroutable = compile(UNROUTABLE, "unroutable.c");
+    let echo = compile(ECHO, "echo.c");
+    let harness = Harness::new();
+
+    let (status, _) = exchange(
+        &harness,
+        &unroutable,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(status, SockStatus::Fault(FaultKind::Load)),
+        "expected the program to be refused as unloadable, got {status:?}"
+    );
+
+    // A refusal is not a broken worker either: it is a compile failure the
+    // worker records and moves past.
     let (status, out) = exchange(
         &harness,
         &echo,

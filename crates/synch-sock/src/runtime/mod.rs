@@ -164,6 +164,46 @@ fn warn_if_default_stack_is_contiguous() {
     }
 }
 
+/// The text async-ebpf's static region analysis rejection carries.
+///
+/// Matched rather than typed because the runtime keeps its `Error` variants
+/// private, the same reason [`classify`] reads error text.
+const STATIC_REGION_REJECTION: &str = "static region analysis failed";
+
+/// Builds the loader for one stack configuration.
+///
+/// Both callers — a worker compiling a program for a stream, and the
+/// declaration run behind `synch socket arm` — want the same loader, so the
+/// settings live here rather than in two places free to drift.
+fn new_loader(config: StackConfig) -> Result<ProgramLoader, SockError> {
+    let loader = ProgramLoader::new(
+        &mut rand::thread_rng(),
+        Arc::new(DummyProgramEventListener),
+        &[helpers::HELPERS],
+    )
+    .with_stack_frame_size(config.0)
+    .with_guest_stack_size(guest_stack_size(config.0)?)
+    .with_guarded_stack_frames(config.1)
+    // Every executed load, store and atomic must be statically routable to one
+    // region — the stack or the read-only data — rather than left to the
+    // dual-region runtime probe.
+    //
+    // Not for soundness: an unclassified access is still masked back inside the
+    // cage, so the flag only tightens what is accepted. What it buys is that a
+    // program whose addressing the analysis cannot follow is refused rather than
+    // served, and that a guest cannot reach an access whose region is settled
+    // per execution.
+    //
+    // The cost is where the rejection lands. async-ebpf compiles lazily, per
+    // function and per pointer signature, so this runs at first compilation of
+    // each variant, not at load: `declare` runs the init hook and forces it
+    // early for everything that hook reaches (`docs/SOCKETS.md` §10's "a program
+    // that will not load cannot be armed"), while a path first reached by a
+    // stream is checked then and reports `Fault{Load}`.
+    .require_static_region_analysis(true);
+    Ok(loader)
+}
+
 fn guest_stack_size(frame_size: usize) -> Result<usize, SockError> {
     const DEFAULT_FRAME_COUNT: usize = 8;
     const CALLDATA_HEADROOM: usize = async_ebpf::program::DEFAULT_GUEST_STACK_SIZE
@@ -484,16 +524,7 @@ fn program_for(
     let loader = if let Some(loader) = existing_loader {
         loader
     } else {
-        let loader = ProgramLoader::new(
-            &mut rand::thread_rng(),
-            Arc::new(DummyProgramEventListener),
-            &[helpers::HELPERS],
-        );
-        let loader = loader
-            .with_stack_frame_size(config.0)
-            .with_guest_stack_size(guest_stack_size(config.0)?)
-            .with_guarded_stack_frames(config.1);
-        let loader = Rc::new(loader);
+        let loader = Rc::new(new_loader(config)?);
         loaders.borrow_mut().insert(config, loader.clone());
         loader
     };
@@ -691,7 +722,14 @@ fn classify(message: &str) -> FaultKind {
         FaultKind::Memory
     } else if message.contains("helper returned error") {
         FaultKind::Helper
-    } else if message.contains("linker") || message.contains("elf") || message.contains("jit") {
+    } else if message.contains("linker")
+        || message.contains("elf")
+        || message.contains("jit")
+        // A function refused by static region analysis has not faulted; it has
+        // failed to compile, and it does so at first entry rather than at load
+        // because async-ebpf compiles lazily.
+        || message.contains(STATIC_REGION_REJECTION)
+    {
         FaultKind::Load
     } else {
         FaultKind::Limit
@@ -732,14 +770,7 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         .map_err(|e| SockError::Load(e.to_string()))?;
     let thread_env = global.init_thread(PREEMPTION_INTERVAL);
     let default_stack = resolve_stack_config(None, None)?;
-    let loader = ProgramLoader::new(
-        &mut rand::thread_rng(),
-        Arc::new(DummyProgramEventListener),
-        &[helpers::HELPERS],
-    )
-    .with_stack_frame_size(default_stack.0)
-    .with_guest_stack_size(guest_stack_size(default_stack.0)?)
-    .with_guarded_stack_frames(default_stack.1);
+    let loader = new_loader(default_stack)?;
     let unbound = loader
         .load(&mut rand::thread_rng(), elf)
         .map_err(|e| SockError::Load(e.to_string()))?;
@@ -808,7 +839,17 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
                 &preemption,
             )
             .await
-            .map_err(|e| SockError::Fault(e.to_string()))
+            .map_err(|e| {
+                let message = e.to_string();
+                // Same distinction `classify` draws, and it matters more here:
+                // this is the path an operator arming a socket sees, and a
+                // program refused by static region analysis has not faulted.
+                if message.contains(STATIC_REGION_REJECTION) {
+                    SockError::Load(message)
+                } else {
+                    SockError::Fault(message)
+                }
+            })
     })?;
     inner.flush_log();
     let declaration = inner.declaration.borrow().clone();
@@ -836,6 +877,39 @@ fn zero_key() -> synch_core::NodeId {
 #[cfg(test)]
 pub(crate) fn helper_names() -> Vec<&'static str> {
     helpers::helper_names()
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// The exact text async-ebpf 0.4.0-alpha.11 rejects an unroutable access
+    /// with. Pinned here because [`classify`] reads error text, so a change in
+    /// the wording upstream is a silent misclassification rather than a build
+    /// failure — and this is the test that catches it. `tests/invoke.rs` checks
+    /// the same thing end to end, against whatever the runtime actually says.
+    const REJECTION: &str = "ebpf runtime error: invalid argument: static region analysis failed \
+                             in function [403, 612): 1 memory access(es) could not be routed to a \
+                             single region (instruction slots [471])";
+
+    #[test]
+    fn a_static_region_rejection_reads_as_a_load_failure() {
+        // Not `Limit`, which is what an unrecognized message falls through to,
+        // and not `Memory` — the message says "memory access", not "memory
+        // fault", and nothing has faulted.
+        assert_eq!(classify(REJECTION), FaultKind::Load);
+    }
+
+    #[test]
+    fn the_other_fault_classes_still_read_the_way_they_did() {
+        assert_eq!(
+            classify("ebpf runtime error: memory fault"),
+            FaultKind::Memory
+        );
+        assert_eq!(classify("helper returned error: 5"), FaultKind::Helper);
+        assert_eq!(classify("jit: out of code space"), FaultKind::Load);
+        assert_eq!(classify("instruction limit exceeded"), FaultKind::Limit);
+    }
 }
 
 #[cfg(test)]

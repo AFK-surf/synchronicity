@@ -306,16 +306,31 @@ SY_MAYBE_UNUSED static sy_s64 sy_write_all(sy_s64 handle, const void *buf,
 
 /* Writes `value` in decimal into `out`, returning how many bytes it wrote or
  * SY_EINVAL if `cap` was too small. Nothing here is `snprintf`, and a
- * Content-Length, a counter or an id has to be spelled somehow. */
+ * Content-Length, a counter or an id has to be spelled somehow.
+ *
+ * Counts the digits and then writes them back-to-front, rather than spelling
+ * them into a local buffer and reversing that into `out`. The two-buffer
+ * version is the more obvious one and it does not survive the runtime's static
+ * region analysis: a loop that reads a local and stores through a pointer
+ * parameter leaves one address register holding "stack here, data there", the
+ * analysis cannot route it to a single region, and the function is refused at
+ * its first call. Counting costs one extra divide loop over at most twenty
+ * digits and keeps every access in this function routable. */
 SY_MAYBE_UNUSED static sy_s64 sy_utoa(sy_u64 value, char *out, sy_u64 cap) {
-  char digits[20];
   sy_u64 n = 0;
+  sy_u64 rest = value;
   do {
-    digits[n++] = (char)('0' + (int)(value % 10));
-    value /= 10;
-  } while (value);
+    n++;
+    rest /= 10;
+  } while (rest);
   if (n > cap) return SY_EINVAL;
-  for (sy_u64 i = 0; i < n; i++) out[i] = digits[n - 1 - i];
+  /* Nothing is written before the cap check: a caller that gets SY_EINVAL has
+     an untouched buffer, not a half-spelled number. */
+  rest = value;
+  for (sy_u64 i = n; i > 0; i--) {
+    out[i - 1] = (char)('0' + (int)(rest % 10));
+    rest /= 10;
+  }
   return (sy_s64)n;
 }
 

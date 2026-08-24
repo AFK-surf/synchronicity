@@ -312,6 +312,21 @@ randomized guard regions around both, and a JIT that masks every load and store
 address back inside it, branchlessly. After linking, code and data are frozen
 read-only and *all* stores are confined to the stack.
 
+The runtime asks async-ebpf for one thing more than the cage guarantees:
+**every executed load, store and atomic must be statically routable to one
+region.** The masking is sound without it — an access whose region is not known
+at compile time is masked by a runtime probe against both — so this buys strict
+rejection rather than safety: a program whose addressing the analysis cannot
+follow is refused instead of served. What it rules out in practice is one
+pointer register that holds a stack address on one path through a function and a
+data address on another; the usual way to write one by accident is a loop that
+reads a local array and stores through a pointer parameter, which is why
+`sy_utoa` counts its digits instead of spelling them into a scratch buffer and
+reversing that into the caller's. A refusal reports as a load failure, and
+because async-ebpf compiles lazily it lands at the first call of the function
+that holds the access — at arm time for anything the init hook reaches, on the
+first stream that gets there otherwise.
+
 So the guest has **no heap** and **no mutable globals**. Its stack holds at
 least eight local-call frames plus 512 bytes of calldata: 128 KiB of frame
 space at the 16 KiB default, with a 32 KiB floor for smaller custom frames.
@@ -732,6 +747,7 @@ own.
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
 | Faults on ≥ 8 of the last 16 invocations | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
 | JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |
+| A memory access that is not statically routable | refused | The §6 strictness. Same shape as a JIT failure and reported as one — `Refused{ProgramInvalid}` at arm time, `Closed{Fault}` with the load class on a path a stream reaches first — because it *is* a compile failure, not a fault: nothing ran. |
 | Bytes changed under an armed socket | refused | `Refused{NotArmed}` naming both roots. In-flight invocations keep their root. |
 | Egress to an unarmed destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
