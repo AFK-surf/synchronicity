@@ -23,6 +23,7 @@ mod serve;
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub mod sim;
+pub mod sock;
 #[cfg(test)]
 mod testing;
 pub mod tls;

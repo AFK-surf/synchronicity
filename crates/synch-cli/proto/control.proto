@@ -40,6 +40,21 @@ service Control {
   // an explicit commit. Nothing is buffered whole at either end.
   rpc Put(stream PutRequest) returns (stream Written);
 
+  // Pipes bytes to and from one socket invocation on another node
+  // (`docs/SOCKETS.md` §9.1).
+  //
+  // The daemon owns the only iroh endpoint (§9.1), so `synch connect` cannot
+  // dial for itself; it opens one of these and the daemon bridges it to a QUIC
+  // stream on the remote node. In `--listen` mode the TCP listener stays in the
+  // CLI process and each accepted connection opens another of these, so the
+  // foreground process owns the public port and the daemon never holds a
+  // listening socket it was not configured with.
+  //
+  // Named `OpenSocket` rather than `Connect` because tonic's generated client
+  // already has a `connect` constructor, and a method that shadowed it would
+  // make the client unbuildable.
+  rpc OpenSocket(stream ConnectRequest) returns (stream ConnectResponse);
+
   // Reads a config value from the `s3.*` namespace.
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
 
@@ -199,6 +214,24 @@ message Command {
     // `synch fill [<origin>:]<space>[/<dir>] [--from <o>|--strict] [--force]
     // [--dry-run]`
     Fill fill = 46;
+    // `synch socket add <space>/<path> ...`
+    SocketAdd socket_add = 47;
+    // `synch socket arm <space>/<path>`
+    SocketArm socket_arm = 48;
+    // `synch socket disarm <space>/<path>`
+    SocketDisarm socket_disarm = 49;
+    // `synch socket rm <space>/<path>`
+    SocketRm socket_rm = 50;
+    // `synch socket ls [<space>]`
+    SocketLs socket_ls = 51;
+    // `synch socket sdk`
+    SocketSdk socket_sdk = 52;
+    // `synch socket ps [<space>/<path>]`
+    SocketPs socket_ps = 53;
+    // `synch socket kill <invocation>`
+    SocketKill socket_kill = 54;
+    // `synch socket log <space>/<path>`
+    SocketLog socket_log = 55;
   }
 }
 
@@ -501,6 +534,9 @@ enum EntryKind {
   ENTRY_KIND_DIR = 2;
   ENTRY_KIND_SYMLINK = 3;
   ENTRY_KIND_TOMBSTONE = 4;
+  // Content is an eBPF ELF object this origin will execute for a peer that
+  // connects to it (`docs/SOCKETS.md` §2).
+  ENTRY_KIND_SOCKET = 5;
 }
 
 // One entry of the unified tree (§8).
@@ -786,4 +822,113 @@ message PartInfo {
   bytes root = 3;
   // When it was recorded, unix nanoseconds.
   int64 created_ns = 4;
+}
+
+
+// ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
+
+message SocketAdd {
+  // `<space>/<path>`.
+  string target = 1;
+  // `k=v` pairs the program reads through `sy_config_get`.
+  repeated string config = 2;
+  reserved 3, 4;
+  // A concurrency cap; zero means the daemon's default.
+  uint32 max_streams = 5;
+  // Re-arm on every content change. Correct for a path you are the only
+  // writer of, wrong for any path an S3 key, a fill or a take can reach.
+  bool auto = 6;
+  // A free-form operator note.
+  string note = 7;
+}
+
+message SocketArm {
+  string target = 1;
+  // Empty inspects only; otherwise approve exactly this opaque review token.
+  string review = 2;
+}
+
+message SocketDisarm {
+  string target = 1;
+}
+
+message SocketRm {
+  string target = 1;
+}
+
+message SocketLs {
+  // Empty lists every space.
+  string space = 1;
+  // Show the armed root, declaration, configuration, and stream cap.
+  bool long = 2;
+}
+
+message SocketSdk {}
+
+message SocketPs {
+  // Empty lists every socket's invocations.
+  string target = 1;
+}
+
+message SocketKill {
+  // The invocation id `synch socket ps` printed.
+  uint64 invocation = 1;
+}
+
+message SocketLog {
+  // `<space>/<path>`.
+  string target = 1;
+}
+
+// One `synch connect` message.
+message ConnectRequest {
+  oneof kind {
+    // Sent once, first.
+    ConnectOpen open = 1;
+    // Bytes for the program.
+    bytes data = 2;
+    // The caller's write side is done; the program sees an EOF.
+    ConnectFin fin = 3;
+  }
+}
+
+message ConnectOpen {
+  // `<origin>:<space>/<path>` — origin-qualified, always. Connecting is the
+  // one read that takes no version policy: a socket is served by the node that
+  // published it, so there is nothing to select between.
+  string reference = 1;
+  // Caller-supplied metadata, readable by the program through `sy_conn_meta`.
+  repeated MetaPair meta = 2;
+}
+
+message MetaPair {
+  string key = 1;
+  string value = 2;
+}
+
+message ConnectFin {}
+
+message ConnectResponse {
+  oneof kind {
+    // Sent once, before any data: the invocation is running.
+    ConnectOpened opened = 1;
+    // Bytes from the program.
+    bytes data = 2;
+    // The invocation ended.
+    ConnectClosed closed = 3;
+  }
+}
+
+message ConnectOpened {
+  // The content root actually running, so a caller can audit what it reached.
+  bytes program = 1;
+  // The callee's id for this invocation, as `synch socket ps` prints it.
+  uint64 invocation = 2;
+}
+
+message ConnectClosed {
+  // What `synch connect` exits with.
+  int32 exit_code = 1;
+  // How it ended, in words.
+  string status = 2;
 }

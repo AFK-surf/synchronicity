@@ -9,6 +9,7 @@ pub mod head;
 pub mod origin;
 pub mod path;
 pub mod record;
+pub mod sock;
 pub mod wire;
 
 pub use blocking::{assert_off_runtime, blocking_is_allowed, offload, BlockingScope, TaskLost};
@@ -23,6 +24,12 @@ pub use record::{
     space_prefix, validate_space, AdState, BlobAd, ChunkFormat, ChunkParams, Delegation, EntryKind,
     FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
     MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+};
+pub use sock::{
+    display_text_is_safe, Declaration, DeclarationError, FaultKind, OpenError, RefuseCode,
+    SockClosed, SockOpen, SockOpened, SockStatus, ALPN_SOCK, MAX_DECLARATION_VALUE_BYTES,
+    MAX_DECLARED_EGRESS, MAX_DECLARED_TREE_READS, MAX_OPEN_FRAME_LEN, MAX_OPEN_META_BYTES,
+    MAX_OPEN_META_PAIRS, SOCK_PROTO_VERSION,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,

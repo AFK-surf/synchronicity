@@ -17,7 +17,8 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 use crate::{
     cli::{
         CasBackendArg, CasCommand, Cli, CloudCommand, Command, DaemonCommand, DelegateCommand,
-        DomainCommand, KeyCommand, MirrorCommand, PinCommand, SpaceCommand, TrustCommand,
+        DomainCommand, KeyCommand, MirrorCommand, PinCommand, SocketCommand, SpaceCommand,
+        TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -209,11 +210,64 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Cas {
             command: CasCommand::Migrate { to },
         } => migrate_cas(&cli, &data_dir, *to).await,
+        // Not a `Run` command: it is a bidirectional byte pipe, and rendering
+        // it as lines of text would be rendering somebody else's protocol.
+        Command::Connect {
+            reference,
+            meta,
+            listen,
+            once,
+        } => crate::connect::run(&data_dir, reference, meta, listen.as_deref(), *once).await,
+        // Also not a `Run` command, and for a plainer reason: compiling a C
+        // file needs no node, no daemon and no data directory. Sending it to
+        // the daemon would mean a compiler in the daemon and a source file
+        // over a socket, for a job this process can do itself.
+        Command::Socket {
+            command:
+                SocketCommand::Build {
+                    source,
+                    output,
+                    define,
+                },
+        } => build_socket(source, output.as_deref(), define),
         _ => {
             let command = to_command(&cli)?;
             deliver(&data_dir, &cli, command).await
         }
     }
+}
+
+/// `synch socket build` — C in, eBPF object out, nothing installed.
+fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Result<()> {
+    if !synch_cc::SUPPORTED {
+        anyhow::bail!(
+            "this build has no C compiler in it; build the object with \
+             `clang -target bpf -O2 -mllvm -bpf-stack-size=4096 -c {}`",
+            source.display()
+        );
+    }
+
+    // Match GCC and Clang: `-DNAME` is shorthand for `-DNAME=1`.
+    let defines: Vec<(&str, &str)> = defines
+        .iter()
+        .map(|text| match text.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (text.as_str(), "1"),
+        })
+        .collect();
+
+    let headers = [("synch.h", synch_sock::sdk::HEADER)];
+    let object = synch_cc::compile_file(source, &headers, &defines)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("compiling {}", source.display()))?;
+
+    let output = match output {
+        Some(path) => path.to_path_buf(),
+        None => source.with_extension("o"),
+    };
+    std::fs::write(&output, &object).with_context(|| format!("writing {}", output.display()))?;
+    println!("{} ({} bytes)", output.display(), object.len());
+    Ok(())
 }
 
 async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Result<()> {
@@ -617,6 +671,7 @@ fn build_migration_backend(
 fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
+        Command::Connect { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),
@@ -765,6 +820,54 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             }),
             MirrorCommand::Ls => Cmd::MirrorLs(pb::MirrorLs {}),
             MirrorCommand::Sync => Cmd::MirrorSync(pb::MirrorSync {}),
+        },
+
+        Command::Socket { command } => match command {
+            SocketCommand::Add {
+                target,
+                config,
+                max_streams,
+                auto,
+                note,
+            } => Cmd::SocketAdd(pb::SocketAdd {
+                target: target.clone(),
+                config: config.clone(),
+                max_streams: max_streams.unwrap_or(0),
+                auto: *auto,
+                note: note.clone().unwrap_or_default(),
+            }),
+            SocketCommand::Arm { target, review } => Cmd::SocketArm(pb::SocketArm {
+                target: target.clone(),
+                review: review.clone().unwrap_or_default(),
+            }),
+            SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
+                target: target.clone(),
+            }),
+            SocketCommand::Rm { target } => Cmd::SocketRm(pb::SocketRm {
+                target: target.clone(),
+            }),
+            SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
+                space: space.clone().unwrap_or_default(),
+                long: *long,
+            }),
+            SocketCommand::Ps { target } => Cmd::SocketPs(pb::SocketPs {
+                target: target.clone().unwrap_or_default(),
+            }),
+            SocketCommand::Kill { invocation } => Cmd::SocketKill(pb::SocketKill {
+                invocation: *invocation,
+            }),
+            SocketCommand::Log { target } => Cmd::SocketLog(pb::SocketLog {
+                target: target.clone(),
+            }),
+            SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
+            // Compiling is local work with no node in it, so `run` handles it
+            // before anything reaches here and there is no control command to
+            // build. Spelled out rather than left to `_`, so adding a socket
+            // command that *does* need the daemon is a compile error here
+            // rather than a silent no-op.
+            SocketCommand::Build { .. } => {
+                anyhow::bail!("`synch socket build` runs in this process, not the daemon")
+            }
         },
 
         Command::Pin { command } => match command {

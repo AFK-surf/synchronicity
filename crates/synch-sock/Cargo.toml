@@ -1,0 +1,47 @@
+[package]
+name = "synch-sock"
+description = "The socket runtime: eBPF host APIs, the endpoint reactor, and the program cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+synch-core.workspace = true
+
+async-trait.workspace = true
+
+aws-lc-rs.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# async-ebpf runs on Linux, macOS and OpenBSD, on x86-64 and arm64, and refuses
+# to compile anywhere else (its `lib.rs` says so with a `compile_error!`). The
+# dependency is therefore per-target rather than unconditional, so this crate —
+# and `synch-engine`, which is meant to stay embeddable — still builds on
+# Windows. What is missing there is the runtime, not the crate: a node can
+# declare, publish, replicate and materialize socket entries anywhere, and
+# `synch connect` works everywhere because the connecting side executes nothing
+# (`docs/SOCKETS.md` §1).
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "openbsd"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+async-ebpf = "0.4.0-alpha.10"
+rand = "0.8"
+
+[dev-dependencies]
+# The compiler the tests build their fixtures with. A dev-dependency, so the
+# runtime does not carry a C compiler into anybody's binary, and so the two
+# crates stay independent: `synch-cc` does not know what a socket is.
+synch-cc.workspace = true
+hex.workspace = true
+tokio = { workspace = true, features = ["full"] }
+async-trait.workspace = true

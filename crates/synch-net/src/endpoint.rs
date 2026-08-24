@@ -118,6 +118,14 @@ pub struct NetOptions {
     /// answers on a public address, where the gain is real: peers dial it
     /// straight, without a relay round trip. Ignored unless `dht`.
     pub dht_publish_direct_addrs: bool,
+    /// The socket service, mounted as `sync/sock/1` when present
+    /// (`docs/SOCKETS.md` §4).
+    ///
+    /// Absent means the ALPN is not offered at all, which is the right shape
+    /// for a node that serves no sockets: a peer's dial fails at ALPN
+    /// negotiation rather than after a handshake and a refusal, and a build
+    /// with no eBPF runtime never advertises something it cannot do.
+    pub sockets: Option<Arc<dyn crate::sock::SocketService>>,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -146,6 +154,7 @@ impl NetOptions {
             dht_publish_direct_addrs: false,
             on_unknown_key: None,
             heads: None,
+            sockets: None,
         }
     }
 }
@@ -256,6 +265,9 @@ impl crate::HeadSink for RefuseHeads {
 pub struct Net {
     router: Router,
     store: Arc<Store>,
+    /// Handle onto the mounted socket protocol, so node shutdown can stop
+    /// admission and drain final status frames before closing the endpoint.
+    sockets: Option<crate::sock::SockProtocol>,
     /// One live connection per peer and ALPN, reused across requests.
     ///
     /// A QUIC session is not a request: opening one costs a handshake, a
@@ -322,7 +334,13 @@ impl Net {
                 .map_err(|e| NetError::Endpoint(e.to_string()))?;
         }
         let endpoint = builder
-            .alpns(vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()])
+            .alpns({
+                let mut alpns = vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()];
+                if options.sockets.is_some() {
+                    alpns.push(synch_core::ALPN_SOCK.to_vec());
+                }
+                alpns
+            })
             .bind()
             .await
             .map_err(|e| {
@@ -358,12 +376,21 @@ impl Net {
                     }),
                 )
                 .on_unknown_key(options.on_unknown_key.clone()),
-            )
-            .spawn();
+            );
+        let sockets = options.sockets.clone().map(|service| {
+            crate::sock::SockProtocol::new(store.clone(), service)
+                .on_unknown_key(options.on_unknown_key.clone())
+        });
+        let router = match &sockets {
+            Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),
+            None => router,
+        };
+        let router = router.spawn();
 
         Ok(Net {
             router,
             store,
+            sockets,
             dialed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -381,6 +408,20 @@ impl Net {
     /// The store this endpoint serves from.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// Stops this endpoint accepting new socket streams.
+    pub fn stop_socket_admission(&self) {
+        if let Some(protocol) = &self.sockets {
+            protocol.stop();
+        }
+    }
+
+    /// Waits for accepted socket streams to flush their final frames.
+    pub async fn drain_socket_streams(&self) {
+        if let Some(protocol) = &self.sockets {
+            protocol.drain().await;
+        }
     }
 
     /// An address carrying only this endpoint's directly bound sockets.
@@ -439,6 +480,25 @@ impl Net {
         addr: impl Into<EndpointAddr>,
     ) -> Result<BlobClient, NetError> {
         Ok(BlobClient::new(self.connect(addr, ALPN_BLOB).await?))
+    }
+
+    /// Connects to a peer on the socket ALPN.
+    ///
+    /// Not session-reusing, unlike the other two. A socket connection carries
+    /// long-lived streams whose lifetime is the caller's business, and handing
+    /// two unrelated `synch connect` invocations the same QUIC connection would
+    /// make one of them able to close the other's.
+    pub async fn connect_sock(
+        &self,
+        addr: impl Into<EndpointAddr>,
+    ) -> Result<crate::sock::SockClient, NetError> {
+        let addr = addr.into();
+        let connection = self
+            .endpoint()
+            .connect(addr, synch_core::ALPN_SOCK)
+            .await
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        Ok(crate::sock::SockClient::new(connection))
     }
 
     async fn connect(

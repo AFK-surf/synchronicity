@@ -119,6 +119,17 @@ impl Client {
         Ok(Chunks { stream })
     }
 
+    /// Opens one socket invocation on another node and pipes bytes both ways.
+    ///
+    /// The daemon owns the only iroh endpoint (§9.1), so this is how the CLI
+    /// reaches a socket at all.
+    pub async fn open_socket(
+        &mut self,
+        requests: ReceiverStream<pb::ConnectRequest>,
+    ) -> Result<tonic::Streaming<pb::ConnectResponse>, ControlError> {
+        Ok(self.inner.open_socket(requests).await?.into_inner())
+    }
+
     /// Opens a streamed write into one of this node's own spaces (§7.1, §9.4).
     ///
     /// Returns once the daemon has taken its gates — publishability, a

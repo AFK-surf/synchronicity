@@ -1779,3 +1779,171 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     ));
     daemon.shutdown().await;
 }
+
+// ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
+
+fn socket_add(target: &str) -> Command {
+    Command::SocketAdd(pb::SocketAdd {
+        target: target.into(),
+        config: vec![],
+        max_streams: 32,
+        auto: false,
+        note: String::new(),
+    })
+}
+
+fn socket_ls(space: &str, long: bool) -> Command {
+    Command::SocketLs(pb::SocketLs {
+        space: space.into(),
+        long,
+    })
+}
+
+#[tokio::test]
+async fn a_socket_is_declared_listed_and_undeclared() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+
+    lines(
+        dir.path(),
+        space_add("code", space.path().to_str().unwrap()),
+    )
+    .await;
+
+    let out = lines(dir.path(), socket_add("code/git.sock")).await;
+    assert!(out.contains("declared code/git.sock"), "{out}");
+    assert!(
+        out.contains("socket arm"),
+        "the next step has to be named: {out}"
+    );
+
+    // Declared but not published: the scanner has not run, so there is nothing
+    // for an arming record to pin.
+    let out = lines(dir.path(), socket_ls("", true)).await;
+    assert!(out.contains("code/git.sock"), "{out}");
+    assert!(out.contains("unpublished"), "{out}");
+
+    // Arming something with no published entry says what to do about it rather
+    // than failing obscurely.
+    let code = failure(
+        dir.path(),
+        Command::SocketArm(pb::SocketArm {
+            target: "code/git.sock".into(),
+            review: String::new(),
+        }),
+    )
+    .await;
+    assert_eq!(code, ErrorCode::Invalid);
+
+    let out = lines(
+        dir.path(),
+        Command::SocketRm(pb::SocketRm {
+            target: "code/git.sock".into(),
+        }),
+    )
+    .await;
+    assert!(out.contains("undeclared"), "{out}");
+    assert!(lines(dir.path(), socket_ls("", false))
+        .await
+        .contains("no sockets declared"),);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_socket_target_must_name_this_nodes_own_space_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+
+    // An origin-qualified target is refused: a socket is declared on the node
+    // that publishes it, so naming somebody else's tree here is a mistake
+    // worth saying out loud rather than quietly dropping.
+    assert_eq!(
+        failure(dir.path(), socket_add("nas@cluster.example:code/git.sock")).await,
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        failure(dir.path(), socket_add("nopathhere")).await,
+        ErrorCode::Invalid
+    );
+    // A space this node does not index has nothing to declare in.
+    assert_eq!(
+        failure(dir.path(), socket_add("absent/git.sock")).await,
+        ErrorCode::Invalid
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_sdk_header_is_served_by_the_daemon_that_defines_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+
+    let header = lines(dir.path(), Command::SocketSdk(pb::SocketSdk {})).await;
+    // A guest compiled against a stale header gets wrong answers rather than
+    // errors, so the header travels with the build that defines the ABI.
+    assert!(header.contains("#define SY_EAGAIN"), "{header}");
+    assert!(header.contains("synchronicity.stream"), "{header}");
+    assert!(header.contains("sy_poll"), "{header}");
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_live_surface_answers_when_nothing_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    lines(
+        dir.path(),
+        space_add("code", space.path().to_str().unwrap()),
+    )
+    .await;
+    lines(dir.path(), socket_add("code/git.sock")).await;
+
+    // An empty answer is an answer, and saying so beats printing nothing and
+    // leaving an operator wondering whether the command worked.
+    let out = lines(
+        dir.path(),
+        Command::SocketPs(pb::SocketPs {
+            target: String::new(),
+        }),
+    )
+    .await;
+    assert!(out.contains("no invocations running"), "{out}");
+
+    let out = lines(
+        dir.path(),
+        Command::SocketLog(pb::SocketLog {
+            target: "code/git.sock".into(),
+        }),
+    )
+    .await;
+    assert!(out.contains("said nothing recently"), "{out}");
+
+    // Killing something that is not there is a not-found, not a silent success.
+    assert_eq!(
+        failure(
+            dir.path(),
+            Command::SocketKill(pb::SocketKill { invocation: 99 })
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+
+    // `ps` for one socket takes the same target shape everything else does.
+    assert_eq!(
+        failure(
+            dir.path(),
+            Command::SocketPs(pb::SocketPs {
+                target: "nas@cluster.example:code/git.sock".into(),
+            })
+        )
+        .await,
+        ErrorCode::Invalid
+    );
+
+    daemon.shutdown().await;
+}

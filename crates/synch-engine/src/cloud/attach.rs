@@ -1113,6 +1113,7 @@ fn kind_name(kind: EntryKind) -> &'static str {
         EntryKind::Dir => "dir",
         EntryKind::Symlink => "symlink",
         EntryKind::Tombstone => "tombstone",
+        EntryKind::Socket => "socket",
     }
 }
 

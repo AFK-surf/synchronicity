@@ -139,6 +139,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "async-ebpf"
+version = "0.4.0-alpha.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173535928b875caa53e3e92af7a0c86894d5fd8c45990bc4d39b6da8d803bad9"
+dependencies = [
+ "cfg-if",
+ "elf",
+ "futures",
+ "libc",
+ "memmap2",
+ "parking_lot",
+ "rand 0.8.7",
+ "scopeguard",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1054,6 +1072,12 @@ name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
+name = "elf"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4445909572dbd556c457c849c4ca58623d84b27c8fff1e74b0b4227d8b90d17b"
 
 [[package]]
 name = "embedded-io"
@@ -2524,6 +2548,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3827,6 +3860,7 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
+ "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
@@ -4827,6 +4861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synch-cc"
+version = "0.1.3"
+dependencies = [
+ "cc",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "synch-cli"
 version = "0.1.3"
 dependencies = [
@@ -4837,12 +4880,15 @@ dependencies = [
  "hyper-util",
  "iroh",
  "iroh-base",
+ "libc",
  "prost",
  "protox",
+ "synch-cc",
  "synch-core",
  "synch-engine",
  "synch-mpt",
  "synch-net",
+ "synch-sock",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",
@@ -4876,6 +4922,7 @@ dependencies = [
 name = "synch-engine"
 version = "0.1.3"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "directories",
  "futures-util",
@@ -4890,6 +4937,7 @@ dependencies = [
  "synch-core",
  "synch-mpt",
  "synch-net",
+ "synch-sock",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",
@@ -4935,6 +4983,7 @@ dependencies = [
 name = "synch-net"
 version = "0.1.3"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",
  "ctor",
@@ -4954,6 +5003,7 @@ dependencies = [
  "synch-core",
  "synch-mpt",
  "synch-net",
+ "synch-sock",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",
@@ -4986,6 +5036,25 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "synch-sock"
+version = "0.1.3"
+dependencies = [
+ "async-ebpf",
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "hex",
+ "rand 0.8.7",
+ "synch-cc",
+ "synch-core",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5189,6 +5258,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

@@ -85,7 +85,54 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V19_S3_MULTIPART_UPLOADS),
     Migration::Sql(V20_SERVERLESS_FOUNDATION),
     Migration::Sql(V21_REPLICATION),
+    Migration::Sql(V22_SOCKETS),
 ];
+
+/// v22 — socket declarations and their arming records (`docs/SOCKETS.md` §3).
+///
+/// Both tables are **local operator state**. Neither is ever published,
+/// replicated, or derived from a peer's trie, and that is the whole point: a
+/// node's own tree is not a closed system — `synch take`, `synch fill --force`
+/// and an S3 `PUT` all write bytes into a space directory that the scanner then
+/// publishes as this node's own view — so publication cannot be the gate on
+/// execution. These rows are the gate.
+///
+/// `sockets` is the declaration: it is what makes the scanner publish
+/// `EntryKind::Socket` for that path, and it carries the operator's half of the
+/// policy (configuration, auto-arming, and the concurrency cap).
+///
+/// `socket_arms` is the approval, keyed by the BLAKE3 content root it approved.
+/// The bytes changing changes the root, which leaves the declaration standing
+/// and the arming behind it, so the socket keeps being published and stops
+/// being runnable. `declared` records what the program's `synchronicity.init`
+/// hook said at the moment of approval, so `synch socket ls` can show what was
+/// agreed to rather than re-running the hook and showing what is claimed now.
+///
+/// A row is deleted with its space, because a space this node no longer indexes
+/// has no path for the scanner to publish and no directory for the bytes to
+/// live in.
+const V22_SOCKETS: &str = r#"
+CREATE TABLE sockets (
+  space            TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  config           TEXT NOT NULL DEFAULT '',  -- newline-separated k=v
+  max_streams      INTEGER,                   -- NULL: the daemon's default
+  auto             INTEGER NOT NULL DEFAULT 0,
+  note             TEXT NOT NULL DEFAULT '',
+  added_at         INTEGER NOT NULL,
+  generation       BLOB NOT NULL,            -- changes on declaration update or disarm
+  PRIMARY KEY (space, path)
+);
+
+CREATE TABLE socket_arms (
+  space      TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  root       BLOB NOT NULL,              -- the approved content root (32 bytes)
+  declared   TEXT NOT NULL DEFAULT '',   -- the init hook's declaration, as approved
+  armed_at   INTEGER NOT NULL,
+  PRIMARY KEY (space, path)
+);
+"#;
 
 /// v20 — state shared by filesystem and serverless CAS backends.
 ///
@@ -807,6 +854,27 @@ CREATE TABLE s3_upload_parts (
   root        BLOB NOT NULL,
   created_ns  INTEGER NOT NULL,
   PRIMARY KEY (upload, number)
+);
+
+CREATE TABLE sockets (
+  space            TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  config           TEXT NOT NULL DEFAULT '',
+  max_streams      INTEGER,
+  auto             INTEGER NOT NULL DEFAULT 0,
+  note             TEXT NOT NULL DEFAULT '',
+  added_at         INTEGER NOT NULL,
+  generation       BLOB NOT NULL,
+  PRIMARY KEY (space, path)
+);
+
+CREATE TABLE socket_arms (
+  space      TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  root       BLOB NOT NULL,
+  declared   TEXT NOT NULL DEFAULT '',
+  armed_at   INTEGER NOT NULL,
+  PRIMARY KEY (space, path)
 );
 "#;
 

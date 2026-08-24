@@ -35,6 +35,7 @@ pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
         synch_core::EntryKind::Dir => "dir",
         synch_core::EntryKind::Symlink => "symlink",
         synch_core::EntryKind::Tombstone => "deleted",
+        synch_core::EntryKind::Socket => "socket",
     }
 }
 

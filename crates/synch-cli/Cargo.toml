@@ -24,11 +24,13 @@ hyper-util.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 prost.workspace = true
+synch-cc.workspace = true
 synch-core.workspace = true
 synch-engine.workspace = true
 synch-mpt.workspace = true
 synch-net.workspace = true
 synch-store.workspace = true
+synch-sock.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -43,12 +45,15 @@ protox.workspace = true
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
+# For the one test that has to shrink a child process's stack.
+libc = "0.2"
 blake3.workspace = true
 # `sim` marks a test build: it carries the pre-main TLS provider install
 # test binaries need since the aws-lc-rs move (crate::tls), and the
 # simulated zone/log harness.
 synch-net = { workspace = true, features = ["sim"] }
 synch-store.workspace = true
+synch-sock.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -2039,6 +2039,36 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
                               root BLOB NOT NULL,        -- the part's own blake3 root
                               created_ns INTEGER NOT NULL,
                               PRIMARY KEY (upload, number));
+
+-- ---- sockets (`docs/SOCKETS.md` §3) --------------------------------------
+--
+-- Local operator state, never published and never replicated. Publication
+-- cannot gate execution: `synch take`, `synch fill --force` and an S3 PUT all
+-- write bytes into a space directory that the scanner then publishes as this
+-- node's own view. These two rows are the gate instead.
+
+-- The declaration. What makes the scanner publish kind=Socket for a path.
+-- Arming approves the capabilities in the program's `synchronicity.init`
+-- hook; there is no separate operator capability list.
+CREATE TABLE sockets (space TEXT NOT NULL, path TEXT NOT NULL,
+                      config TEXT NOT NULL DEFAULT '',   -- newline-separated k=v
+                      max_streams INTEGER,       -- NULL: the daemon's default
+                      auto INTEGER NOT NULL DEFAULT 0,   -- re-arm on every change
+                      note TEXT NOT NULL DEFAULT '',
+                      added_at INTEGER NOT NULL,
+                      generation BLOB NOT NULL,  -- fresh on declaration update or disarm
+                      PRIMARY KEY (space, path));
+
+-- The approval, keyed by the content root approved. The bytes changing changes
+-- the root, which leaves the declaration standing and this row behind it: the
+-- socket keeps being published and stops being runnable. `declared` is what the
+-- init hook said when it was approved, kept so `synch socket ls` can show what
+-- was agreed to rather than what is claimed now.
+CREATE TABLE socket_arms (space TEXT NOT NULL, path TEXT NOT NULL,
+                          root BLOB NOT NULL,
+                          declared TEXT NOT NULL DEFAULT '',
+                          armed_at INTEGER NOT NULL,
+                          PRIMARY KEY (space, path));
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can

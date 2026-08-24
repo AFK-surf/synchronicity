@@ -85,6 +85,7 @@ fn kind_to_int(kind: EntryKind) -> i64 {
         EntryKind::Dir => 1,
         EntryKind::Symlink => 2,
         EntryKind::Tombstone => 3,
+        EntryKind::Socket => 4,
     }
 }
 
@@ -94,6 +95,7 @@ fn kind_from_int(value: i64) -> Result<EntryKind> {
         1 => EntryKind::Dir,
         2 => EntryKind::Symlink,
         3 => EntryKind::Tombstone,
+        4 => EntryKind::Socket,
         other => return Err(StoreError::column("entries.kind", other.to_string())),
     })
 }
@@ -615,10 +617,16 @@ impl Store {
 
     /// Removes a local space.
     pub fn remove_space(&self, id: &str) -> Result<bool> {
-        let n = self
-            .conn()
-            .execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
-        Ok(n > 0)
+        self.transaction(|txn| {
+            txn.conn()
+                .execute("DELETE FROM socket_arms WHERE space = ?1", params![id])?;
+            txn.conn()
+                .execute("DELETE FROM sockets WHERE space = ?1", params![id])?;
+            let n = txn
+                .conn()
+                .execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
+            Ok(n > 0)
+        })
     }
 
     /// Every configured local space.

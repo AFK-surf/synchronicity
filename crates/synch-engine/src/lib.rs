@@ -27,6 +27,7 @@ pub mod reference;
 pub mod replica;
 pub mod rotation;
 pub mod scanner;
+pub mod sockets;
 #[cfg(test)]
 mod testkit;
 pub mod tree;
