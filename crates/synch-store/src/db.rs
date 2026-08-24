@@ -481,12 +481,7 @@ impl Store {
 
     /// Writes a config value.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        set_config_in(&self.conn(), key, value)
     }
 
     /// Appends one newline-separated record to a config value, creating the
@@ -509,9 +504,7 @@ impl Store {
 
     /// Deletes a config value.
     pub fn clear_config(&self, key: &str) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM config WHERE key = ?1", params![key])?;
-        Ok(())
+        clear_config_in(&self.conn(), key)
     }
 
     /// This node's own [`OriginId`], if `synch init` has run.
@@ -693,12 +686,7 @@ impl Txn<'_> {
 
     /// Sets this node's own [`OriginId`], inside the transaction.
     pub fn set_self_origin(&self, origin: &OriginId) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO config (key, value) VALUES ('self_origin_id', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![origin.canonical()],
-        )?;
-        Ok(())
+        self.set_config("self_origin_id", &origin.canonical())
     }
 
     /// Marks a device key as retiring or active, inside the transaction.
@@ -716,19 +704,12 @@ impl Txn<'_> {
 
     /// Writes a config value, inside the transaction.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        set_config_in(self.conn(), key, value)
     }
 
     /// Deletes a config value, inside the transaction.
     pub fn clear_config(&self, key: &str) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM config WHERE key = ?1", params![key])?;
-        Ok(())
+        clear_config_in(self.conn(), key)
     }
 
     /// Forgets every redaction boundary, inside the transaction.
@@ -744,16 +725,9 @@ impl Txn<'_> {
     /// Sets or clears the membership domain, inside the transaction.
     pub fn set_membership_domain(&self, domain: Option<&str>) -> Result<()> {
         match domain {
-            Some(domain) => self.conn().execute(
-                "INSERT INTO config (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![DOMAIN_KEY, domain],
-            )?,
-            None => self
-                .conn()
-                .execute("DELETE FROM config WHERE key = ?1", params![DOMAIN_KEY])?,
-        };
-        Ok(())
+            Some(domain) => self.set_config(DOMAIN_KEY, domain),
+            None => self.clear_config(DOMAIN_KEY),
+        }
     }
 
     /// Drops the publishing floor, inside the transaction.
@@ -762,9 +736,7 @@ impl Txn<'_> {
     /// identity migration it would floor history nobody holds under the name
     /// being adopted.
     pub fn clear_publish_floor(&self) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM config WHERE key = 'publish_floor'", [])?;
-        Ok(())
+        self.clear_config("publish_floor")
     }
 
     /// Records an identity adoption, inside the transaction (§3.1).
@@ -847,6 +819,24 @@ impl Txn<'_> {
         )?;
         Ok(())
     }
+}
+
+/// The config upsert every writer shares. `Store`, `Txn`, and the CAS backend
+/// migration all write this exact statement; keeping it in one place means a
+/// `config` schema change cannot land in some of them and not the rest.
+pub(crate) fn set_config_in(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// The config delete shared the same way as [`set_config_in`].
+pub(crate) fn clear_config_in(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM config WHERE key = ?1", params![key])?;
+    Ok(())
 }
 
 fn set_device_key_state_in(conn: &Connection, node_id: &NodeId, state: KeyState) -> Result<()> {

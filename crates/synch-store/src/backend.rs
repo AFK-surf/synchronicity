@@ -435,11 +435,7 @@ fn scratch_generation(scratch: &std::path::Path) -> Result<String> {
     let mut file = std::fs::File::create(&marker_path)?;
     file.write_all(marker.as_bytes())?;
     file.sync_all()?;
-    if let Some(parent) = marker_path.parent() {
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-    }
+    synch_core::fs::fsync_parent(&marker_path);
     Ok(marker)
 }
 
@@ -1017,11 +1013,7 @@ fn materialize_cached(
             clone_or_copy(&store.blob_path(&root), &temporary)?
         };
         crate::cas::replace_file(&temporary, target)?;
-        if let Some(parent) = target.parent() {
-            if let Ok(directory) = std::fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
-        }
+        synch_core::fs::fsync_parent(target);
         Ok(kind)
     })();
     if result.is_err() {
@@ -1072,15 +1064,13 @@ fn reflink_file(source: &std::fs::File, dest: &std::fs::File) -> std::io::Result
     }
 }
 
+/// The blocking-pool handoff, pinned to this crate's error type. The
+/// implementation is [`synch_core::offload`], shared with every crate that
+/// needs it; this is only the type pin.
 async fn blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(move || {
-        let _scope = synch_core::BlockingScope::enter();
-        operation()
-    })
-    .await
-    .map_err(|error| StoreError::invalid(format!("CAS blocking task failed: {error}")))?
+    synch_core::offload(operation).await
 }
 
 #[cfg(test)]

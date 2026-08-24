@@ -490,13 +490,7 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
     let generation = hash_column(row, 7, "sockets.generation")?;
     let arm = match row.get::<_, Option<Vec<u8>>>(8)? {
         Some(bytes) => {
-            let root = Hash::from_slice(&bytes).map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    8,
-                    rusqlite::types::Type::Blob,
-                    "socket_arms.root is not a 32-byte hash".into(),
-                )
-            })?;
+            let root = hash_bytes(&bytes, 8, "socket_arms.root")?;
             Some(ArmRow {
                 space,
                 path,
@@ -516,7 +510,11 @@ fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
 
 fn hash_column(row: &rusqlite::Row<'_>, column: usize, name: &str) -> rusqlite::Result<Hash> {
     let bytes: Vec<u8> = row.get(column)?;
-    Hash::from_slice(&bytes).map_err(|_| {
+    hash_bytes(&bytes, column, name)
+}
+
+fn hash_bytes(bytes: &[u8], column: usize, name: &str) -> rusqlite::Result<Hash> {
+    Hash::from_slice(bytes).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             column,
             rusqlite::types::Type::Blob,

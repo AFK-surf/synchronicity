@@ -125,6 +125,33 @@ fn head_in(
     }))
 }
 
+fn all_heads_in(conn: &rusqlite::Connection, slot: Slot) -> Result<Vec<StoredHead>> {
+    let mut stmt = conn.prepare(&format!(
+        "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
+    ))?;
+    let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
+        match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
+            Ok(head) => out.push(StoredHead {
+                head,
+                received_at,
+                verified_at,
+            }),
+            Err(e) => tracing::warn!(
+                origin,
+                seq,
+                slot = slot.as_str(),
+                error = %e,
+                "skipping a head row that cannot be read; this origin cannot sync until \
+                 the row is repaired"
+            ),
+        }
+    }
+    Ok(out)
+}
+
 impl Store {
     /// Reads one head slot.
     pub fn head(&self, origin: &OriginId, slot: Slot) -> Result<Option<StoredHead>> {
@@ -186,31 +213,7 @@ impl Store {
     /// stops garbage collection node-wide until it is repaired. Skipping it here
     /// buys the rest of the maintenance pass, not GC.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
-        ))?;
-        let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
-            match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
-                Ok(head) => out.push(StoredHead {
-                    head,
-                    received_at,
-                    verified_at,
-                }),
-                Err(e) => tracing::warn!(
-                    origin,
-                    seq,
-                    slot = slot.as_str(),
-                    error = %e,
-                    "skipping a head row that cannot be read; this origin cannot sync until \
-                     the row is repaired"
-                ),
-            }
-        }
-        Ok(out)
+        all_heads_in(&self.conn(), slot)
     }
 
     /// The `(origin, root)` of every complete slot, without decoding signatures.
@@ -763,29 +766,7 @@ impl Txn<'_> {
     /// read and the write would keep a completeness claim made under a scope
     /// that has gone.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
-        let mut stmt = self.conn().prepare(&format!(
-            "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
-        ))?;
-        let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
-            match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
-                Ok(head) => out.push(StoredHead {
-                    head,
-                    received_at,
-                    verified_at,
-                }),
-                Err(e) => tracing::warn!(
-                    origin,
-                    seq,
-                    slot = slot.as_str(),
-                    error = %e,
-                    "skipping a head row that cannot be read"
-                ),
-            }
-        }
-        Ok(out)
+        all_heads_in(self.conn(), slot)
     }
 
     /// Clears a head slot, inside the transaction.

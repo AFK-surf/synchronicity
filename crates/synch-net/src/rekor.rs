@@ -1764,16 +1764,24 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Standard base64, padding optional.
-fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
+/// Strips whitespace and padding, then decodes with `engine`: the one body
+/// behind every padding-optional decoder here and in [`crate::tuf`], so a
+/// hardening change to what these trust-boundary parsers accept cannot land in
+/// one of them and not the others.
+fn decode_padless(
+    engine: &impl base64::Engine,
+    text: &str,
+) -> Result<Vec<u8>, base64::DecodeError> {
     let trimmed: String = text
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '=')
         .collect();
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(&trimmed)
-        .map_err(|_| ())
+    engine.decode(&trimmed)
+}
+
+/// Standard base64, padding optional.
+pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
+    decode_padless(&base64::engine::general_purpose::STANDARD_NO_PAD, text).map_err(|_| ())
 }
 
 /// base64url without padding — how a proof travels in a TXT record.
@@ -1784,13 +1792,7 @@ pub fn base64url_encode(bytes: &[u8]) -> String {
 
 /// Decodes a base64url TXT payload, padding optional.
 fn base64url_decode(text: &str) -> Result<Vec<u8>, ProofError> {
-    use base64::Engine;
-    let trimmed: String = text
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .collect();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&trimmed)
+    decode_padless(&base64::engine::general_purpose::URL_SAFE_NO_PAD, text)
         .map_err(|e| ProofError::Malformed(format!("not base64url: {e}")))
 }
 

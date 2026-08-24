@@ -64,7 +64,7 @@ use futures_util::stream::StreamExt;
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
     classify::{classify, Finding, KnownKeys, Tier},
-    discover::{self, HttpRepo},
+    discover,
     state::{MonitorState, TrustSurface},
     tiles::{HttpTiles, TileSource, Tree},
     MonitorError,
@@ -594,7 +594,7 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let found = tokio::task::spawn_blocking(move || {
         let repo = match no_tuf {
             true => None,
-            false => Some(HttpRepo::new(&tuf)?),
+            false => Some(discover::http_repo(&tuf)?),
         };
         discover::discover(
             repo.as_ref().map(|repo| repo as &dyn synch_net::tuf::Repo),

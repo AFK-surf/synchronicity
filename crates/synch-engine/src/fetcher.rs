@@ -846,6 +846,34 @@ impl Node {
         level: u8,
         out: &mut synch_net::ProofOutcome,
     ) -> Result<()> {
+        let client = self.dial_provider(provider).await?;
+        // The accumulator is ours, so a window that fails part-way through
+        // leaves what was already proven with the caller rather than
+        // discarding it.
+        client
+            .fetch_proof_into(self.cas_backend(), *root, size, ask, level, out)
+            .await?;
+        Ok(())
+    }
+
+    /// Dials a provider's keys in order and returns the first connection made.
+    ///
+    /// The one dial loop both transfer paths share, so its bookkeeping cannot
+    /// diverge between them — it already had, once: the proof path recorded
+    /// only successful dials, so a dead peer kept its low EWMA there forever.
+    ///
+    /// Timed at the dial, not around the transfer. A fetch walks the provider's
+    /// whole share one window at a time, so timing it would measure *how much
+    /// was asked of the peer*, not how quick the peer is — a provider that
+    /// successfully served a gigabyte would record tens of seconds, worse than
+    /// `FAILURE_PENALTY_US`, and so rank below a peer whose dial was refused,
+    /// inverting the ranking under exactly the load it exists to spread.
+    ///
+    /// A failed dial has to move the EWMA, or ranking is a one-way ratchet:
+    /// with latency recorded only on success, a peer that was once fast and is
+    /// now a black hole keeps its low EWMA and is therefore selected first on
+    /// every subsequent fetch, forever, with nothing able to demote it.
+    async fn dial_provider(&self, provider: &Provider) -> Result<synch_net::BlobClient> {
         let mut last_error = None;
         for key in &provider.keys {
             let addr = match self.peer_addr_off_runtime(key).await? {
@@ -855,20 +883,14 @@ impl Node {
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
                 Ok(client) => {
-                    // The dial, for the same reason as the slice path above: a
-                    // proof descent is also a walk of as many windows as the
-                    // range needs.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
                     self.record_dial_off_runtime(key, elapsed).await;
-                    // The accumulator is ours, so a window that fails part-way
-                    // through leaves what was already proven with the caller
-                    // rather than discarding it.
-                    client
-                        .fetch_proof_into(self.cas_backend(), *root, size, ask, level, out)
-                        .await?;
-                    return Ok(());
+                    return Ok(client);
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => {
+                    self.record_dial_failure_off_runtime(key).await;
+                    last_error = Some(e);
+                }
             }
         }
         Err(match last_error {
@@ -1080,48 +1102,14 @@ impl Node {
         ask: &ChunkRanges,
         got: &mut ChunkRanges,
     ) -> Result<()> {
-        let mut last_error = None;
-        for key in &provider.keys {
-            let addr = match self.peer_addr_off_runtime(key).await? {
-                Some(addr) => addr,
-                None => iroh::EndpointAddr::new(*key),
-            };
-            let started = std::time::Instant::now();
-            match self.net().connect_blob(addr).await {
-                Ok(client) => {
-                    // Timed at the dial, not around the transfer. `fetch_into`
-                    // walks the provider's whole share one window at a time, so
-                    // timing it would measure *how much was asked of the peer*,
-                    // not how quick the peer is — a provider that successfully
-                    // served a gigabyte would record tens of seconds, worse
-                    // than `FAILURE_PENALTY_US`, and so rank below a peer whose
-                    // dial was refused, inverting the ranking under exactly the
-                    // load it exists to spread.
-                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.record_dial_off_runtime(key, elapsed).await;
-                    // Likewise: the groups are in the bitmap whether or not a
-                    // later window fails, so the caller keeps them and does not
-                    // ask another provider for bytes it already holds.
-                    client
-                        .fetch_into(self.cas_backend(), *root, size, ask, got)
-                        .await?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    // A failed dial has to move the EWMA, or ranking is a
-                    // one-way ratchet: with latency recorded only on success, a
-                    // peer that was once fast and is now a black hole keeps its
-                    // low EWMA and is therefore selected first on every
-                    // subsequent fetch, forever, with nothing able to demote it.
-                    self.record_dial_failure_off_runtime(key).await;
-                    last_error = Some(e);
-                }
-            }
-        }
-        Err(match last_error {
-            Some(e) => EngineError::Net(e),
-            None => EngineError::not_found(format!("no dialable key for {}", provider.origin)),
-        })
+        let client = self.dial_provider(provider).await?;
+        // The groups are in the bitmap whether or not a later window fails, so
+        // the caller keeps them and does not ask another provider for bytes it
+        // already holds.
+        client
+            .fetch_into(self.cas_backend(), *root, size, ask, got)
+            .await?;
+        Ok(())
     }
 
     /// [`Node::peer_addr`] on the blocking pool: it reads `peers_seen`.

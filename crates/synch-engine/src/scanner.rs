@@ -1619,7 +1619,7 @@ impl Adoption {
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.sync_all()?;
         self.rename_into_place(file)?;
-        fsync_parent(&self.target);
+        synch_core::fs::fsync_parent(&self.target);
         Ok(())
     }
 
@@ -2221,18 +2221,6 @@ mod nt {
         }
         buf.truncate(len as usize);
         Ok(buf)
-    }
-}
-
-/// Flushes a directory entry — a rename or a create — to stable storage.
-///
-/// Best effort: a platform that cannot open a directory as a file simply does
-/// not get the guarantee, which is the same posture the CAS takes (§6.2).
-fn fsync_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
     }
 }
 

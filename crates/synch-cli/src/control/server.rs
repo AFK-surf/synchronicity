@@ -70,17 +70,7 @@ where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(move || {
-        let _scope = synch_core::BlockingScope::enter();
-        f()
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => Err(ControlError::internal(format!(
-            "a blocking task did not complete: {e}"
-        ))),
-    }
+    synch_core::offload(f).await
 }
 
 /// Reads node or store state on the blocking pool.
@@ -822,16 +812,17 @@ impl Control for ControlService {
         for part in &request.parts {
             let root = match part.root.len() {
                 0 => None,
-                32 => Some(Hash::from(
-                    <[u8; 32]>::try_from(part.root.as_slice()).expect("32"),
-                )),
-                other => {
-                    return Err(ControlError::invalid(format!(
-                        "part {} named a {other}-byte root",
-                        part.number
-                    ))
-                    .into())
-                }
+                _ => match Hash::from_slice(&part.root) {
+                    Ok(root) => Some(root),
+                    Err(_) => {
+                        return Err(ControlError::invalid(format!(
+                            "part {} named a {}-byte root",
+                            part.number,
+                            part.root.len()
+                        ))
+                        .into())
+                    }
+                },
             };
             named.push((part.number, root));
         }

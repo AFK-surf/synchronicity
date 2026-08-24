@@ -139,8 +139,8 @@ impl Node {
         let id = new_upload_id()?;
         let dir = self.store().upload_dir(&id);
         std::fs::create_dir_all(&dir)?;
-        fsync_dir(&dir);
-        fsync_dir(&self.store().uploads_dir());
+        synch_core::fs::fsync_dir(&dir);
+        synch_core::fs::fsync_dir(&self.store().uploads_dir());
         self.store()
             .create_upload(&id, space, path, principal, synch_core::now_ns())?;
         Ok(id)
@@ -962,13 +962,6 @@ fn nonce() -> String {
 
 fn cloud_part_key(upload: &str, file: &str) -> String {
     format!("uploads/{upload}/{file}")
-}
-
-/// Flushes a directory entry, best effort — the same posture the CAS takes.
-fn fsync_dir(path: &Path) {
-    if let Ok(dir) = std::fs::File::open(path) {
-        let _ = dir.sync_all();
-    }
 }
 
 #[cfg(test)]

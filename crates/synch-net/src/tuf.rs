@@ -53,7 +53,7 @@ use std::{
 
 use aws_lc_rs::signature;
 
-use crate::rekor::{base64_encode, sha256, LogKey, LogKeys};
+use crate::rekor::{base64_decode, base64_encode, sha256, LogKey, LogKeys};
 
 /// The target the chain has to authenticate for any of this to matter.
 pub const TRUSTED_ROOT_TARGET: &str = "trusted_root.json";
@@ -807,6 +807,91 @@ pub trait Repo {
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String>;
 }
 
+/// How long one file of a TUF walk may take.
+const TUF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most a single TUF file may be. Sigstore's `targets.json` is the big
+/// one at a few hundred KiB; the cap exists because these are bytes from a
+/// party nothing is trusted about, and a response with no bound is a reader
+/// that can be exhausted.
+pub const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// A TUF repository read over HTTPS: the daemon's binding refresh and the
+/// monitor's discovery both walk one, so the transport — and above all its
+/// byte cap — exists once rather than as two copies annotated as needing to
+/// agree.
+///
+/// Built and used inside [`tokio::task::spawn_blocking`], which is what makes
+/// a blocking client the right one: the walk is sequential — each file names
+/// the next — so there is no concurrency to give up, and the JSON parsing
+/// stays off the reactor. TLS is not load-bearing: every byte fetched is
+/// self-authenticating and checked against [`EMBEDDED_TUF_ROOT`] before it
+/// moves anything, so a hostile mirror can deny this walk and cannot make it
+/// mean anything (§10.2).
+#[derive(Debug)]
+pub struct HttpRepo {
+    base: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpRepo {
+    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]).
+    pub fn new(base: &str) -> Result<HttpRepo, String> {
+        HttpRepo::build(base, None)
+    }
+
+    /// The same repository, with requests identified by `user_agent`.
+    pub fn with_user_agent(base: &str, user_agent: &str) -> Result<HttpRepo, String> {
+        HttpRepo::build(base, Some(user_agent))
+    }
+
+    fn build(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
+        let mut builder = reqwest::blocking::Client::builder().timeout(TUF_TIMEOUT);
+        if let Some(user_agent) = user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        Ok(HttpRepo {
+            base: base.trim_end_matches('/').to_string(),
+            client: builder.build().map_err(|e| format!("TUF client: {e}"))?,
+        })
+    }
+}
+
+impl Repo for HttpRepo {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{path}", self.base);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        match response.status().as_u16() {
+            200 => {
+                // Read through a `take`, never `bytes()`: a cap applied to
+                // the result of `bytes()` is a bound on nothing, because the
+                // allocation already happened — an endless body from a hostile
+                // mirror exhausts the reader before the comparison runs. One
+                // byte past the cap keeps "at the cap" and "over it"
+                // distinguishable.
+                use std::io::Read;
+                let mut body = Vec::new();
+                response
+                    .take(MAX_TUF_BYTES as u64 + 1)
+                    .read_to_end(&mut body)
+                    .map_err(|e| format!("{url}: {e}"))?;
+                if body.len() > MAX_TUF_BYTES {
+                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
+                }
+                Ok(Some(body))
+            }
+            // The end of the root chain is a 404, and Sigstore's CDN answers
+            // 403 for an object that is not there.
+            403 | 404 => Ok(None),
+            status => Err(format!("{url}: the repository answered {status}")),
+        }
+    }
+}
+
 /// Walks a TUF repository, starting the root chain at `from_root` — the
 /// version the caller already trusts. **This verifies nothing.** It follows
 /// the consistent-snapshot naming so the right files are collected —
@@ -1303,13 +1388,7 @@ fn pem_body(pem: &str) -> Result<Vec<u8>, TufError> {
 /// is refused, rather than a general ASN.1 reader parsing whatever it is
 /// handed.
 fn spki_point(der: &[u8], scheme: TufScheme) -> Result<Vec<u8>, TufError> {
-    const P256_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
-    const ED25519_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
+    use crate::rekor::{ED25519_SPKI_PREFIX, P256_SPKI_PREFIX};
     let bad = TufError::Signature("a key is not the SubjectPublicKeyInfo its scheme names".into());
     match scheme {
         TufScheme::EcdsaP256Sha256 => match der.strip_prefix(P256_SPKI_PREFIX) {
@@ -1503,33 +1582,16 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
         }
         _ => return None,
     };
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset)
-}
-
-/// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
-/// `days_from_civil`, the standard branch-free form).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    Some(
+        synch_core::civil::days_from_civil(year, month, day) * 86_400
+            + hour * 3600
+            + minute * 60
+            + second
+            - offset,
+    )
 }
 
 // ------------------------------------------------------------- encodings
-
-/// Standard base64, padding optional.
-fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
-    let trimmed: String = text
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .collect();
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(&trimmed)
-        .map_err(|_| ())
-}
 
 /// Lowercase or uppercase hex, as TUF writes signatures and digests.
 fn hex_decode(text: &str) -> Option<Vec<u8>> {

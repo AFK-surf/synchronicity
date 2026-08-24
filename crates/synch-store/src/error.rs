@@ -69,9 +69,22 @@ pub enum StoreError {
         /// The object size.
         size: u64,
     },
+    /// The blocking pool lost a task before it completed (§10).
+    ///
+    /// Its own variant rather than `Invalid`: a runtime shutting down mid-write
+    /// is this node's failure, and classifying it as a bad argument would let
+    /// fault attribution blame the origin whose data was being written.
+    #[error("a blocking task did not complete: {0}")]
+    Blocking(String),
     /// A caller supplied an invalid argument.
     #[error("{0}")]
     Invalid(String),
+}
+
+impl synch_core::TaskLost for StoreError {
+    fn task_lost(reason: String) -> Self {
+        StoreError::Blocking(reason)
+    }
 }
 
 impl StoreError {

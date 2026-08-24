@@ -510,8 +510,7 @@ fn validate_parts(
 /// part that is.
 fn parse_root(etag: &str) -> Option<synch_core::Hash> {
     let bytes = hex::decode(etag.trim_matches('"')).ok()?;
-    let array: [u8; 32] = bytes.try_into().ok()?;
-    Some(synch_core::Hash::from(array))
+    synch_core::Hash::from_slice(&bytes).ok()
 }
 
 /// `AbortMultipartUpload`.

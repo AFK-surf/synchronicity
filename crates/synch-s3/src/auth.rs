@@ -361,47 +361,19 @@ pub fn parse_amz_date(s: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec)
-}
-
-/// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's
-/// `days_from_civil`), so date arithmetic needs no calendar dependency.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Inverse of [`days_from_civil`]: `(year, month, day)` from a day count since
-/// the Unix epoch.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    Some(
+        synch_core::civil::days_from_civil(year, month, day) * 86_400
+            + hour * 3_600
+            + min * 60
+            + sec,
+    )
 }
 
 /// Formats Unix seconds as an ISO8601 basic `x-amz-date` (`YYYYMMDDTHHMMSSZ`).
 /// The scope date a signature needs is its first eight characters.
 pub fn format_amz_date(unix: i64) -> String {
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
-        secs / 3_600,
-        (secs % 3_600) / 60,
-        secs % 60
-    )
+    let (y, m, d, hour, min, sec) = synch_core::civil::civil_from_unix(unix);
+    format!("{y:04}{m:02}{d:02}T{hour:02}{min:02}{sec:02}Z")
 }
 
 /// Compares two byte strings without leaking their contents through timing.

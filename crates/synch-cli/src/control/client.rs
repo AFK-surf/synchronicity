@@ -625,10 +625,8 @@ pub struct CompletedUpload {
 
 /// Reads a 32-byte hash column off the wire.
 fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))?;
-    Ok(Hash::from(array))
+    Hash::from_slice(bytes)
+        .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))
 }
 
 /// What a delete did, and what it left behind.

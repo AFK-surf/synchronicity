@@ -191,6 +191,12 @@ impl ControlError {
     }
 }
 
+impl synch_core::TaskLost for ControlError {
+    fn task_lost(reason: String) -> Self {
+        ControlError::internal(format!("a blocking task did not complete: {reason}"))
+    }
+}
+
 impl From<ControlError> for Status {
     fn from(e: ControlError) -> Status {
         let mut status = Status::new(e.code.grpc(), e.message);
