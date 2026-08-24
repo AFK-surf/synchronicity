@@ -6,8 +6,9 @@
  * `docs/SOCKETS.md`.
  *
  * `synch socket build prog.c -o prog.o` compiles against this header with the
- * compiler built into the binary, so nothing has to be installed first. Worked
- * examples are in `crates/synch-sock/examples/`.
+ * compiler built into the binary, so nothing has to be installed first;
+ * `--clang` selects optimized system clang/llc output. Worked examples are in
+ * `crates/synch-sock/examples/`.
  *
  * Three things about the machine you are writing for, because they are not the
  * machine you are used to:

@@ -680,8 +680,8 @@ synch socket log <space>/<path>                       what its sy_log calls said
 synch socket sdk                                      print the C SDK header, from the
                                                       build that defines the ABI
 synch socket build <file.c> [-o <file.o>]             compile C to the eBPF object a
-                   [-D NAME[=VALUE]]…                 socket is made of, with the
-                                                      compiler inside this binary
+                   [-D NAME[=VALUE]]… [--clang]       socket is made of; --clang uses
+                                                      optimized system clang/llc
 
 synch connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
               [--meta k=v]…                           stream → stdout, exit code from
@@ -704,18 +704,21 @@ A header on disk beside the binary is one that can be older than the binary,
 and the numbers in it are the guest's only view of the ABI: a guest compiled
 against a stale one gets wrong answers rather than errors.
 
-On supported builds, `synch socket build` is a compiler — [tinycc], targeting
-eBPF — linked into the binary. It runs in the CLI process: it needs no node, no daemon and no data
-directory, and it supplies `synch.h` itself, so the first socket somebody
-writes costs them a text editor and nothing else. The alternative was asking
-for a clang built with the BPF backend, which the distributions ship
-inconsistently and macOS does not ship at all; requiring a toolchain before the
-first twenty lines of C is how a capability goes unused. It is not an
-optimizing compiler and does not have to be — a socket is an event loop around
-helper calls, and the host does the work. A program that outgrows it is armed
-exactly the same way, because the runtime loads an ELF object and does not care
-which compiler wrote it. tinycc is LGPL-2.1 and is linked statically, under
-§6 of that licence.
+On supported builds, `synch socket build` defaults to [tinycc], targeting eBPF
+and linked into the binary. It runs in the CLI process: it needs no node, no
+daemon and no data directory, and it supplies `synch.h` itself, so the first
+socket somebody writes costs them a text editor and nothing else. A clang built
+with the BPF backend is shipped inconsistently and macOS does not ship one at
+all; requiring that toolchain before the first twenty lines of C is how a
+capability goes unused.
+
+Pass `--clang` when the program benefits from optimized code and compatible
+`clang` and `llc` executables are on `PATH`. The command runs clang at `-O2` to
+produce LLVM bitcode, then llc for BPF v3 with the runtime's 16 KiB stack frame.
+It supplies the same `synch.h`, defines, and output handling as the embedded
+path. Either object is armed exactly the same way because the runtime loads ELF
+and does not care which compiler wrote it. tinycc is LGPL-2.1 and is linked
+statically, under §6 of that licence.
 
 [tinycc]: https://github.com/losfair/tinycc
 

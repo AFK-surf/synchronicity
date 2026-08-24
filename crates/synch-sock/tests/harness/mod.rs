@@ -9,7 +9,7 @@
 // Each test binary uses a different part of this, and neither re-exports it.
 #![allow(dead_code, unreachable_pub)]
 
-use std::{process::Command, sync::Arc};
+use std::sync::Arc;
 
 use synch_core::{Hash, NodeId, OriginId, SockStatus};
 use synch_sock::{
@@ -45,44 +45,16 @@ pub fn compile_with(source: &str, name: &str, defines: &[(&str, &str)]) -> Vec<u
 /// compiler" teaches people to ignore red tests.
 pub fn compile_with_clang(source: &str, name: &str) -> Option<Vec<u8>> {
     if !clang_targets_bpf() {
-        eprintln!("skipping the clang half of {name}: no clang with a BPF backend");
+        eprintln!("skipping the clang half of {name}: no compatible clang/llc BPF toolchain");
         return None;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "synch-sock-clang-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
-    let src = dir.join("prog.c");
-    let obj = dir.join("prog.o");
-    let sdk_dir = dir.join("sdk");
-    std::fs::create_dir_all(&sdk_dir).ok()?;
-    std::fs::write(sdk_dir.join("synch.h"), synch_sock::sdk::HEADER).ok()?;
-    std::fs::write(&src, source).ok()?;
-
-    let out = Command::new("clang")
-        .args(["-target", "bpf", "-O2", "-g0"])
-        // Synchronicity's guarded local-call frame is 16 KiB by default;
-        // clang's BPF default is 512 bytes and must be raised to match it.
-        .args(["-mllvm", "-bpf-stack-size=16384"])
-        .arg("-I")
-        .arg(&sdk_dir)
-        .arg("-c")
-        .arg(&src)
-        .arg("-o")
-        .arg(&obj)
-        .output()
-        .ok()?;
-    assert!(
-        out.status.success(),
-        "clang is present and rejected the fixture:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    std::fs::read(&obj).ok()
+    Some(
+        synch_cc::compile_with_clang(source, name, &sdk(), &[])
+            .unwrap_or_else(|e| panic!("{name} does not compile with clang:\n{e}")),
+    )
 }
 
-/// Whether clang exists *and* has the BPF backend built in.
+/// Whether compatible clang and llc executables exist with the BPF backend.
 ///
 /// Checked by compiling rather than by running `--version`: Apple's clang is
 /// present on every macOS and cannot emit BPF, so "clang exists" answers the
@@ -91,22 +63,7 @@ fn clang_targets_bpf() -> bool {
     use std::sync::OnceLock;
     static ANSWER: OnceLock<bool> = OnceLock::new();
     *ANSWER.get_or_init(|| {
-        let dir =
-            std::env::temp_dir().join(format!("synch-sock-clang-probe-{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_err() {
-            return false;
-        }
-        let src = dir.join("probe.c");
-        if std::fs::write(&src, "int probe(void) { return 0; }\n").is_err() {
-            return false;
-        }
-        Command::new("clang")
-            .args(["-target", "bpf", "-c"])
-            .arg(&src)
-            .arg("-o")
-            .arg(dir.join("probe.o"))
-            .output()
-            .is_ok_and(|out| out.status.success())
+        synch_cc::compile_with_clang("int probe(void) { return 0; }\n", "probe.c", &[], &[]).is_ok()
     })
 }
 

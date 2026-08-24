@@ -5,7 +5,9 @@
 //! ship inconsistently, which macOS's system clang does not have at all, and
 //! which is a large thing to ask somebody to install before they can write
 //! twenty lines of C. So the compiler travels with the binary: a build of
-//! [tinycc] targeting eBPF, linked in, reached through [`compile`].
+//! [tinycc] targeting eBPF, linked in, reached through [`compile`]. Programs
+//! that benefit from optimized code can instead use [`compile_with_clang`],
+//! which drives `clang` and `llc` from the host.
 //!
 //! [tinycc]: https://github.com/losfair/tinycc
 //!
@@ -35,6 +37,7 @@
 
 use std::path::Path;
 
+mod clang;
 #[cfg(tinycc)]
 mod fold;
 #[cfg(tinycc)]
@@ -57,7 +60,8 @@ pub enum CcError {
     /// A path or a source contains a NUL, or a name is not usable as a file.
     #[error("{0}")]
     Invalid(String),
-    /// The scratch directory could not be written.
+    /// Source or scratch files could not be accessed, or an external compiler
+    /// could not be started.
     #[error("{0}")]
     Io(String),
     /// This build has no compiler in it.
@@ -131,4 +135,35 @@ pub fn compile_file(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     compile(&source, &name, headers, defines)
+}
+
+/// Compiles one translation unit with the host's `clang` and `llc`.
+///
+/// Clang optimizes the program at `-O2` into LLVM bitcode. `llc` then emits a
+/// BPF v3 relocatable object with the 16 KiB stack frames expected by the
+/// socket runtime. Both executables must be on `PATH` and come from compatible
+/// LLVM installations.
+pub fn compile_with_clang(
+    source: &str,
+    name: &str,
+    headers: &[Header<'_>],
+    defines: &[Define<'_>],
+) -> Result<Vec<u8>, CcError> {
+    clang::compile(source, name, headers, defines)
+}
+
+/// Compiles a file with the host's `clang` and `llc`, naming diagnostics after
+/// it.
+pub fn compile_file_with_clang(
+    path: &Path,
+    headers: &[Header<'_>],
+    defines: &[Define<'_>],
+) -> Result<Vec<u8>, CcError> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| CcError::Io(format!("cannot read {}: {e}", path.display())))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    compile_with_clang(&source, &name, headers, defines)
 }

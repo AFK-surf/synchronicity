@@ -871,9 +871,10 @@ pub enum SocketCommand {
     /// Compile a C program to the eBPF object a socket is made of.
     ///
     /// On supported builds the compiler is inside this binary, so writing a
-    /// socket needs no clang, BPF backend, or cross toolchain. `synch.h` is
-    /// included automatically and is the same header `synch socket sdk`
-    /// prints; there is no libc, and nothing else is on the include path.
+    /// socket needs no clang, BPF backend, or cross toolchain. Pass `--clang`
+    /// to use optimized system clang/llc output instead. `synch.h` is included
+    /// automatically and is the same header `synch socket sdk` prints; there
+    /// is no libc.
     ///
     /// This does not publish anything. The object it writes becomes a socket
     /// when it is in a space and `synch socket add` and `synch socket arm`
@@ -884,6 +885,9 @@ pub enum SocketCommand {
         /// Where to write the object. Defaults to the source with `.o`.
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+        /// Compile optimized BPF with `clang` and `llc` from `PATH`.
+        #[arg(long)]
+        clang: bool,
         /// `NAME[=VALUE]`, as a compiler's `-D`.
         ///
         /// What an example guards with `#ifndef` — an upstream host, a port, a
@@ -1010,6 +1014,25 @@ mod tests {
             cli.command,
             Command::Daemon {
                 command: DaemonCommand::Start
+            }
+        ));
+    }
+
+    #[test]
+    fn socket_build_uses_the_embedded_compiler_unless_clang_is_requested() {
+        let cli = Cli::parse_from(["synch", "socket", "build", "echo.c"]);
+        assert!(matches!(
+            cli.command,
+            Command::Socket {
+                command: SocketCommand::Build { clang: false, .. }
+            }
+        ));
+
+        let cli = Cli::parse_from(["synch", "socket", "build", "echo.c", "--clang"]);
+        assert!(matches!(
+            cli.command,
+            Command::Socket {
+                command: SocketCommand::Build { clang: true, .. }
             }
         ));
     }

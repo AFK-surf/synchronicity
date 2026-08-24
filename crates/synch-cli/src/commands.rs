@@ -227,9 +227,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 SocketCommand::Build {
                     source,
                     output,
+                    clang,
                     define,
                 },
-        } => build_socket(source, output.as_deref(), define),
+        } => build_socket(source, output.as_deref(), *clang, define),
         _ => {
             let command = to_command(&cli)?;
             deliver(&data_dir, &cli, command).await
@@ -238,12 +239,16 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 /// `synch socket build` — C in, eBPF object out, nothing installed.
-fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Result<()> {
-    if !synch_cc::SUPPORTED {
+fn build_socket(
+    source: &Path,
+    output: Option<&Path>,
+    clang: bool,
+    defines: &[String],
+) -> Result<()> {
+    if !clang && !synch_cc::SUPPORTED {
         anyhow::bail!(
-            "this build has no C compiler in it; build the object with \
-             `clang -target bpf -O2 -mllvm -bpf-stack-size=16384 -c {}`",
-            source.display()
+            "this build has no embedded C compiler; rerun with `--clang` and compatible \
+             `clang` and `llc` executables on PATH"
         );
     }
 
@@ -257,9 +262,13 @@ fn build_socket(source: &Path, output: Option<&Path>, defines: &[String]) -> Res
         .collect();
 
     let headers = [("synch.h", synch_sock::sdk::HEADER)];
-    let object = synch_cc::compile_file(source, &headers, &defines)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("compiling {}", source.display()))?;
+    let object = if clang {
+        synch_cc::compile_file_with_clang(source, &headers, &defines)
+    } else {
+        synch_cc::compile_file(source, &headers, &defines)
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .with_context(|| format!("compiling {}", source.display()))?;
 
     let output = match output {
         Some(path) => path.to_path_buf(),

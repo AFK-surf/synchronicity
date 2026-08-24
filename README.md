@@ -395,6 +395,7 @@ runs it *here*, one invocation per incoming stream, under
 
 ```sh
 synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
+synch socket build git.c --clang -o git.o       # optimized; needs clang + llc on PATH
 synch socket add code/git.sock
 synch scan                                     # publish it as kind=Socket
 synch socket arm code/git.sock                 # inspect declarations and copy the token
@@ -407,8 +408,9 @@ On supported builds the compiler is in the binary — a build of
 [tinycc](https://github.com/losfair/tinycc) that targets eBPF — so writing a
 socket costs a text editor and nothing else, rather than a clang built with a
 BPF backend that macOS does not ship. Windows MSVC builds report the command as
-unsupported and can use an externally built ELF object instead. Six
-worked examples are in
+unsupported unless `--clang` selects a compatible system clang/llc toolchain.
+The system path compiles at `-O2` for programs that benefit from optimized
+code. Six worked examples are in
 [`crates/synch-sock/examples/`](crates/synch-sock/examples/), and the test
 suite runs every one of them.
 
