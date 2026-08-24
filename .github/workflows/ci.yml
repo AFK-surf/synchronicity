@@ -67,18 +67,18 @@ jobs:
       # its integration tests spawn real loopback network endpoints per test
       # (no mocked/paused clock) and alone take longer than every other crate
       # combined — splitting it out keeps this job's feedback fast.
-      - run: cargo test --workspace --all-targets --no-fail-fast --exclude synch-engine
-      - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
-      # Optional features are off by default, so nothing above ever compiles
-      # them. `synch-mpt`'s `proofs` is a §13 capability kept ahead of its
-      # caller (§4.3) — code with no consumer and no build is code that stops
-      # compiling without anyone finding out, which is the opposite of keeping
-      # a capability ready.
+      # Optional features (`synch-mpt`'s `proofs`, a §13 capability kept ahead
+      # of its caller per §4.3; `synch-net`'s `sim`; `synch-monitor`'s
+      # `testsupport`) are purely additive — nothing in the workspace has a
+      # `cfg(not(feature = ...))` branch that only compiles with one off — so
+      # `--all-features` is a strict superset of the default-features run and
+      # there is no separate default-features step.
       - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
+      - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
       # And the shipped configuration. `--all-targets` unifies features across
-      # the graph — `synch-net` dev-depends on itself with `sim` — so every
-      # line above resolves `sim` ON and no test has ever executed against a
-      # client built the way a released one is. `--lib --bins` resolves it off.
+      # the graph — `synch-net` dev-depends on itself with `sim` — so the run
+      # above resolves `sim` ON and no test has ever executed against a client
+      # built the way a released one is. `--lib --bins` resolves it off.
       # Behind the gate sit `chain::validate`, the DS-digest helpers,
       # `RekorProof::encode`/`to_txt` and the whole `x509::SelfSigned` writer,
       # and the design's asymmetry claim — a client reads DER and never writes
