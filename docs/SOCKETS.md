@@ -317,15 +317,24 @@ The runtime asks async-ebpf for one thing more than the cage guarantees:
 region.** The masking is sound without it — an access whose region is not known
 at compile time is masked by a runtime probe against both — so this buys strict
 rejection rather than safety: a program whose addressing the analysis cannot
-follow is refused instead of served. What it rules out in practice is one
-pointer register that holds a stack address on one path through a function and a
-data address on another; the usual way to write one by accident is a loop that
-reads a local array and stores through a pointer parameter, which is why
-`sy_utoa` counts its digits instead of spelling them into a scratch buffer and
-reversing that into the caller's. A refusal reports as a load failure, and
+follow is refused instead of served. A refusal reports as a load failure, and
 because async-ebpf compiles lazily it lands at the first call of the function
 that holds the access — at arm time for anything the init hook reaches, on the
 first stream that gets there otherwise.
+
+What refuses a program in practice is narrower than "complicated pointers", and
+worth knowing before writing a helper that takes one. A pointer parameter
+arrives in a register with its region attached, and the analysis follows it
+through the spill slot a compiler parks it in. What it cannot follow is a write
+to a local at an index it cannot evaluate — `digits[n++]`, `buf[i] = c` — which
+may land anywhere in the frame, so every spilled value in that function is
+assumed clobbered from there on. A pointer parameter reloaded after such a write
+has no region left, and a store through it is refused. So the shape to avoid is
+one function that both indexes into a local array and writes through a pointer
+its caller passed in; splitting those across two functions is enough, and
+`sy_utoa` instead drops its scratch buffer entirely. The limit is the analysis's
+alias precision, not the guest's memory model: async-ebpf sees one flat frame off
+`r10` and cannot tell that an index into one local stays out of another's slot.
 
 So the guest has **no heap** and **no mutable globals**. Its stack holds at
 least eight local-call frames plus 512 bytes of calldata: 128 KiB of frame

@@ -311,11 +311,15 @@ SY_MAYBE_UNUSED static sy_s64 sy_write_all(sy_s64 handle, const void *buf,
  * Counts the digits and then writes them back-to-front, rather than spelling
  * them into a local buffer and reversing that into `out`. The two-buffer
  * version is the more obvious one and it does not survive the runtime's static
- * region analysis: a loop that reads a local and stores through a pointer
- * parameter leaves one address register holding "stack here, data there", the
- * analysis cannot route it to a single region, and the function is refused at
- * its first call. Counting costs one extra divide loop over at most twenty
- * digits and keeps every access in this function routable. */
+ * region analysis, for a reason worth knowing because it is not about this
+ * function: a pointer parameter arrives in a register, but a compiler spills it
+ * to a stack slot and reloads it before use. The analysis follows that round
+ * trip — until the same function writes to a local at an index it cannot
+ * evaluate, like `digits[n++]`. That write could land anywhere in the frame, so
+ * every spilled value is assumed clobbered, `out` comes back from its slot with
+ * no region, and the store through it is refused. Dropping the scratch buffer
+ * removes the indexed write, which is what keeps `out` routable. Counting costs
+ * one extra divide loop over at most twenty digits. */
 SY_MAYBE_UNUSED static sy_s64 sy_utoa(sy_u64 value, char *out, sy_u64 cap) {
   sy_u64 n = 0;
   sy_u64 rest = value;
