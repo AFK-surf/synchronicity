@@ -44,6 +44,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 # The simulated zone/log harness, for tests only.
+synch-cc.workspace = true
 synch-net = { workspace = true, features = ["sim"] }
 iroh-base.workspace = true
 synch-store.workspace = true

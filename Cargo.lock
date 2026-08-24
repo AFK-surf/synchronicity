@@ -4934,6 +4934,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "synch-cc",
  "synch-core",
  "synch-mpt",
  "synch-net",

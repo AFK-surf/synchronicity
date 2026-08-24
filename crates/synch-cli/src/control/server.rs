@@ -615,7 +615,7 @@ impl Control for ControlService {
     /// otherwise accept the upload, write it into the space, and lose it
     /// (§3.4). Taking it before the response opens is what lets the refusal
     /// reach a client that has not started streaming yet.
-    /// Bridges a control stream to a socket invocation on another node.
+    /// Bridges a control stream to a socket invocation on a named node.
     ///
     /// The daemon owns the only iroh endpoint (§9.1), so this is the whole
     /// reason the call exists: the CLI cannot dial for itself. Nothing here
@@ -1204,21 +1204,75 @@ fn socket_reference(text: &str) -> Result<(synch_core::OriginId, String, String)
 /// take turns.
 async fn bridge_socket(
     connection: synch_engine::sockets::SocketConnection,
-    mut incoming: Streaming<pb::ConnectRequest>,
+    incoming: Streaming<pb::ConnectRequest>,
     tx: &mpsc::Sender<Result<pb::ConnectResponse, Status>>,
 ) -> Result<(), ControlError> {
-    let synch_engine::sockets::SocketConnection {
-        client: _client,
-        mut control,
-        stream,
-    } = connection;
-    let synch_net::sock::SockStream {
-        program,
-        invocation,
-        mut send,
-        mut recv,
-    } = stream;
+    use synch_engine::sockets::SocketConnection;
 
+    match connection {
+        SocketConnection::Remote {
+            client,
+            mut control,
+            stream,
+        } => {
+            let synch_net::sock::SockStream {
+                program,
+                invocation,
+                send,
+                recv,
+            } = stream;
+            bridge_socket_parts(
+                program,
+                invocation,
+                send,
+                recv,
+                async move {
+                    let _client = client;
+                    synch_net::frame::read_frame::<synch_core::SockClosed>(&mut control)
+                        .await
+                        .map(|closed| closed.status)
+                        .map_err(|e| e.to_string())
+                },
+                incoming,
+                tx,
+            )
+            .await
+        }
+        SocketConnection::Local {
+            program,
+            invocation,
+            stream,
+            completion,
+        } => {
+            let (recv, send) = tokio::io::split(stream);
+            bridge_socket_parts(
+                program,
+                invocation,
+                send,
+                recv,
+                async move { completion.await.map_err(|e| e.to_string()) },
+                incoming,
+                tx,
+            )
+            .await
+        }
+    }
+}
+
+async fn bridge_socket_parts<R, W, F>(
+    program: synch_core::Hash,
+    invocation: u64,
+    mut send: W,
+    mut recv: R,
+    completion: F,
+    mut incoming: Streaming<pb::ConnectRequest>,
+    tx: &mpsc::Sender<Result<pb::ConnectResponse, Status>>,
+) -> Result<(), ControlError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: std::future::Future<Output = Result<synch_core::SockStatus, String>> + Send,
+{
     tx.send(Ok(pb::ConnectResponse {
         kind: Some(pb::connect_response::Kind::Opened(pb::ConnectOpened {
             program: program.as_bytes().to_vec(),
@@ -1245,16 +1299,14 @@ async fn bridge_socket(
                 _ => {}
             }
         }
-        let _ = send.finish();
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
     });
 
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        match recv.read(&mut buf).await {
-            // `None` is the stream's FIN; `Some(0)` cannot happen for a
-            // non-empty buffer, but reading it as an EOF would spin.
-            Ok(None) | Ok(Some(0)) | Err(_) => break,
-            Ok(Some(n)) => {
+        match tokio::io::AsyncReadExt::read(&mut recv, &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
                 let message = pb::ConnectResponse {
                     kind: Some(pb::connect_response::Kind::Data(buf[..n].to_vec())),
                 };
@@ -1264,11 +1316,11 @@ async fn bridge_socket(
             }
         }
     }
-    // The status rides its own uni-stream, so it can only be read once the
-    // data stream is done — which is exactly when it is worth reading.
-    let closed = synch_net::frame::read_frame::<synch_core::SockClosed>(&mut control).await;
+    // Remote status rides its own uni-stream; local status comes directly from
+    // the same runtime outcome. Either is only worth reading once output ends.
+    let closed = completion.await;
     let (exit_code, status) = match closed {
-        Ok(closed) => (closed.status.exit_code(), format!("{:?}", closed.status)),
+        Ok(status) => (status.exit_code(), format!("{status:?}")),
         // A missing status is a transport failure, never a successful program
         // return. Keep it distinct from the runtime's 70..=73 statuses.
         Err(e) => (74, format!("completion status unavailable: {e}")),

@@ -1799,6 +1799,81 @@ fn socket_ls(space: &str, long: bool) -> Command {
     })
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn the_control_socket_can_invoke_this_nodes_own_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    daemon.node.add_space("code", space.path()).unwrap();
+
+    let elf = synch_cc::compile(
+        include_str!("../../synch-sock/examples/echo.c"),
+        "echo.c",
+        &[("synch.h", synch_sock::sdk::HEADER)],
+        &[],
+    )
+    .unwrap();
+    std::fs::write(space.path().join("echo.sock"), elf).unwrap();
+    daemon
+        .node
+        .socket_add(&synch_store::SocketRow::new(
+            "code",
+            "echo.sock",
+            synch_core::now_ns(),
+        ))
+        .unwrap();
+    daemon.node.scan_and_publish().unwrap();
+    let inspected = daemon
+        .node
+        .socket_inspect("code", "echo.sock")
+        .await
+        .unwrap();
+    daemon
+        .node
+        .socket_approve("code", "echo.sock", &inspected.review)
+        .await
+        .unwrap();
+
+    let (requests, rx) = tokio::sync::mpsc::channel(4);
+    for kind in [
+        pb::connect_request::Kind::Open(pb::ConnectOpen {
+            reference: format!("{}:code/echo.sock", daemon.node.origin().canonical()),
+            meta: Vec::new(),
+        }),
+        pb::connect_request::Kind::Data(b"through control".to_vec()),
+        pb::connect_request::Kind::Fin(pb::ConnectFin {}),
+    ] {
+        requests
+            .send(pb::ConnectRequest { kind: Some(kind) })
+            .await
+            .unwrap();
+    }
+    drop(requests);
+
+    let mut client = Client::connect(dir.path()).await.unwrap();
+    let mut responses = client
+        .open_socket(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    let mut exit = None;
+    while let Some(response) = responses.message().await.unwrap() {
+        match response.kind {
+            Some(pb::connect_response::Kind::Data(bytes)) => output.extend(bytes),
+            Some(pb::connect_response::Kind::Closed(closed)) => exit = Some(closed.exit_code),
+            _ => {}
+        }
+    }
+
+    assert_eq!(output, b"through control");
+    assert_eq!(exit, Some(output.len() as i32));
+    daemon.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_socket_is_declared_listed_and_undeclared() {
     let dir = tempfile::tempdir().unwrap();

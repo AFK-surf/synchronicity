@@ -18,6 +18,11 @@ own* CAS, and runs it under [async-ebpf][ae] — one invocation per incoming
 stream. The caller supplies bytes and a verified identity. It never supplies
 code.
 
+The publisher may call its own socket with the same command. That path uses an
+in-memory stream because iroh does not dial its own endpoint, but it still goes
+through ordinary admission and the socket worker runtime with the node's bound
+device identity.
+
 [ae]: https://github.com/losfair/async-ebpf
 [zs]: https://github.com/losfair/zeroserve
 

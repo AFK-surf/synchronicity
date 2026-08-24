@@ -413,7 +413,7 @@ worked examples are in
 suite runs every one of them.
 
 From the other side, `synch connect` is a byte pump and nothing else — it names
-a path, and everything that decides what runs is state the far node already
+a path, and everything that decides what runs is state the named node already
 holds:
 
 ```sh

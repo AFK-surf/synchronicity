@@ -119,7 +119,7 @@ impl Client {
         Ok(Chunks { stream })
     }
 
-    /// Opens one socket invocation on another node and pipes bytes both ways.
+    /// Opens one socket invocation on a named node and pipes bytes both ways.
     ///
     /// The daemon owns the only iroh endpoint (§9.1), so this is how the CLI
     /// reaches a socket at all.

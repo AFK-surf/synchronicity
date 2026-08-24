@@ -1063,7 +1063,7 @@ impl Node {
 }
 
 impl Node {
-    /// Opens a socket on another node (`docs/SOCKETS.md` §4).
+    /// Opens a socket on a node (`docs/SOCKETS.md` §4), including this one.
     ///
     /// The connecting side of the design, and it executes nothing: it names a
     /// path, and everything that decides what runs is state the callee already
@@ -1080,15 +1080,36 @@ impl Node {
         path: &str,
         meta: Vec<(String, String)>,
     ) -> Result<SocketConnection> {
-        if origin == self.origin() {
-            return Err(EngineError::invalid(
-                "a socket is served by the node that published it; this is that node, and \
-                 connecting to yourself over the network is not how to reach it",
-            ));
-        }
         let open = SockOpen::new(origin.clone(), space, path, meta);
         open.validate()
             .map_err(|e| EngineError::invalid(e.to_string()))?;
+
+        if origin == self.origin() {
+            let admission = self
+                .admit_socket(self.node_id(), "local".into(), 0, &open)
+                .await
+                .map_err(|(code, message)| {
+                    EngineError::invalid(format!(
+                        "{} refused {space}/{path}: {}: {message}",
+                        origin.canonical(),
+                        code.as_str()
+                    ))
+                })?;
+            let program = admission.program_root;
+            let invocation = admission.id;
+            let (caller, guest) = tokio::io::duplex(self.socket_limits().ring_bytes);
+            let node = self.clone();
+            let completion = tokio::spawn(async move {
+                node.run_socket(admission, DuplexStream::from_split(guest))
+                    .await
+            });
+            return Ok(SocketConnection::Local {
+                program,
+                invocation,
+                stream: caller,
+                completion,
+            });
+        }
 
         let keys = self.store().keys_for_origin(origin, synch_core::now_ns())?;
         if keys.is_empty() {
@@ -1100,13 +1121,14 @@ impl Node {
 
         let mut last: Option<EngineError> = None;
         for key in keys {
-            let Some(addr) = self.peer_addr_off_runtime(&key).await? else {
-                last = Some(EngineError::not_found(format!(
-                    "no address known for {}",
-                    key.fmt_short()
-                )));
-                continue;
-            };
+            // `peers_seen.last_addr` is only a hint. A live binding with no
+            // stored address is the normal shape for a peer reached through
+            // iroh/Pkarr discovery, so give iroh the authenticated key and let
+            // its configured address lookup resolve it.
+            let addr = self
+                .peer_addr_off_runtime(&key)
+                .await?
+                .unwrap_or_else(|| iroh::EndpointAddr::new(key));
             let client = match self.net().connect_sock(addr).await {
                 Ok(client) => client,
                 Err(e) => {
@@ -1118,7 +1140,7 @@ impl Node {
             // connection setup and a status has to have somewhere to arrive.
             let control = client.control().await.map_err(EngineError::Net)?;
             return match client.open(&open).await.map_err(EngineError::Net)? {
-                Ok(stream) => Ok(SocketConnection {
+                Ok(stream) => Ok(SocketConnection::Remote {
                     client,
                     control,
                     stream,
@@ -1137,18 +1159,28 @@ impl Node {
 
 /// A live socket connection on the caller's side.
 #[derive(Debug)]
-pub struct SocketConnection {
-    /// Kept alive: dropping it closes the QUIC connection under the stream.
-    ///
-    /// Public because the caller has to destructure this to get at the stream
-    /// and the control channel independently, and it must keep this half in
-    /// scope while it does — a connection dropped out from under a live stream
-    /// takes the invocation with it.
-    pub client: synch_net::sock::SockClient,
-    /// Where the invocation's exit status arrives.
-    pub control: iroh::endpoint::RecvStream,
-    /// The invocation itself.
-    pub stream: synch_net::sock::SockStream,
+pub enum SocketConnection {
+    /// A connection to a peer over `sync/sock/1`.
+    Remote {
+        /// Kept alive: dropping it closes the QUIC connection under the stream.
+        client: synch_net::sock::SockClient,
+        /// Where the invocation's exit status arrives.
+        control: iroh::endpoint::RecvStream,
+        /// The invocation itself.
+        stream: synch_net::sock::SockStream,
+    },
+    /// A connection to this node, carried in memory but admitted and run by the
+    /// same engine path as a remote invocation.
+    Local {
+        /// The content root actually running.
+        program: Hash,
+        /// The callee's invocation id.
+        invocation: u64,
+        /// Opaque bytes in both directions.
+        stream: tokio::io::DuplexStream,
+        /// The invocation's eventual status.
+        completion: tokio::task::JoinHandle<SockStatus>,
+    },
 }
 
 #[cfg(test)]

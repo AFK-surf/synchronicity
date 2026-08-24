@@ -5,6 +5,8 @@
 //! means, and what happens to a socket that arrives from somebody else. The
 //! runtime's own end-to-end tests live in `synch-sock`.
 
+mod common;
+
 use std::path::Path;
 
 use synch_core::{EntryKind, Hash};
@@ -268,6 +270,151 @@ async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
         .resolve_socket("code", "missing.sock")
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn a_node_can_connect_to_its_own_socket() {
+    let (_data, space, node) = node_with_space().await;
+    write(space.path(), "local.sock", b"\x7fELF not armed");
+    node.socket_add(&declaration("code", "local.sock")).unwrap();
+    node.scan_and_publish().unwrap();
+
+    let err = node
+        .connect_socket(node.origin(), "code", "local.sock", Vec::new())
+        .await
+        .expect_err("an unarmed socket should be refused after the self-connection lands");
+    assert!(
+        err.to_string().contains("declared but never armed"),
+        "self-connection did not reach socket admission: {err}"
+    );
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn a_self_connection_runs_the_armed_program() {
+    use synch_core::SockStatus;
+    use synch_engine::sockets::SocketConnection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_data, space, node) = node_with_space().await;
+    let elf = synch_cc::compile(
+        include_str!("../../synch-sock/examples/echo.c"),
+        "echo.c",
+        &[("synch.h", synch_sock::sdk::HEADER)],
+        &[],
+    )
+    .unwrap();
+    write(space.path(), "echo.sock", &elf);
+    node.socket_add(&declaration("code", "echo.sock")).unwrap();
+    node.scan_and_publish().unwrap();
+    let inspected = node.socket_inspect("code", "echo.sock").await.unwrap();
+    node.socket_approve("code", "echo.sock", &inspected.review)
+        .await
+        .unwrap();
+
+    let connection = node
+        .connect_socket(node.origin(), "code", "echo.sock", Vec::new())
+        .await
+        .unwrap();
+    let SocketConnection::Local {
+        mut stream,
+        completion,
+        ..
+    } = connection
+    else {
+        panic!("a self-connection used the remote transport");
+    };
+    stream.write_all(b"hello local socket").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut echoed = Vec::new();
+    stream.read_to_end(&mut echoed).await.unwrap();
+
+    assert_eq!(echoed, b"hello local socket");
+    assert_eq!(
+        completion.await.unwrap(),
+        SockStatus::Ok(echoed.len() as i64)
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn a_discovery_only_peer_can_connect_to_a_socket() {
+    use iroh::address_lookup::memory::MemoryLookup;
+    use synch_core::SockStatus;
+    use synch_engine::sockets::SocketConnection;
+    use tokio::io::AsyncWriteExt;
+
+    let (_server_data, server_space, server) = node_with_space().await;
+    let (_client_data, _client_space, client) = node_with_space().await;
+    let elf = synch_cc::compile(
+        include_str!("../../synch-sock/examples/echo.c"),
+        "echo.c",
+        &[("synch.h", synch_sock::sdk::HEADER)],
+        &[],
+    )
+    .unwrap();
+    write(server_space.path(), "echo.sock", &elf);
+    server
+        .socket_add(&declaration("code", "echo.sock"))
+        .unwrap();
+    server.scan_and_publish().unwrap();
+    let inspected = server.socket_inspect("code", "echo.sock").await.unwrap();
+    server
+        .socket_approve("code", "echo.sock", &inspected.review)
+        .await
+        .unwrap();
+
+    // Trust is present in both directions, but neither node records the
+    // other's address in `peers_seen`. The client's iroh resolver is the only
+    // source of the server's transport address.
+    client
+        .store()
+        .put_binding(&common::binding(server.origin(), &server.node_id()))
+        .unwrap();
+    server
+        .store()
+        .put_binding(&common::binding(client.origin(), &client.node_id()))
+        .unwrap();
+    assert!(client.peer_addr(&server.node_id()).unwrap().is_none());
+    client
+        .net()
+        .endpoint()
+        .address_lookup()
+        .unwrap()
+        .add(MemoryLookup::from_endpoint_info([server
+            .net()
+            .direct_addr()]));
+
+    let connection = client
+        .connect_socket(server.origin(), "code", "echo.sock", Vec::new())
+        .await
+        .unwrap();
+    let SocketConnection::Remote {
+        client: socket_client,
+        mut control,
+        stream,
+    } = connection
+    else {
+        panic!("a peer connection used the local transport");
+    };
+    let synch_net::sock::SockStream {
+        mut send, mut recv, ..
+    } = stream;
+    send.write_all(b"discovered").await.unwrap();
+    send.shutdown().await.unwrap();
+    let echoed = recv.read_to_end(1024).await.unwrap();
+    let closed = socket_client.next_closed(&mut control).await.unwrap();
+
+    assert_eq!(echoed, b"discovered");
+    assert_eq!(closed.status, SockStatus::Ok(echoed.len() as i64));
+    common::shutdown(&[&client, &server]).await;
 }
 
 #[tokio::test]

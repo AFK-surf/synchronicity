@@ -460,10 +460,10 @@ pub enum Command {
         #[command(subcommand)]
         command: SocketCommand,
     },
-    /// Connect to a socket on another node, over stdio or a local listener.
+    /// Connect to a socket on any node, including this one.
     ///
     /// The connecting side executes nothing: it names a path, and everything
-    /// that decides what runs is state the far node already holds.
+    /// that decides what runs is state the named node already holds.
     Connect {
         /// `<origin>:<space>/<path>` — origin-qualified, always.
         ///

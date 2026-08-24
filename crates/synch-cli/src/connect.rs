@@ -2,14 +2,15 @@
 //!
 //! This is a byte pump and nothing more. It executes no eBPF, holds no policy,
 //! and knows nothing about what it is talking to: it names a path, and
-//! everything that decides what runs is state the far node already holds. That
+//! everything that decides what runs is state the named node already holds. That
 //! is why this half of the design works on platforms where the runtime does not
 //! exist at all.
 //!
 //! DESIGN.md §9.1 is categorical that the daemon owns the node and the CLI is
 //! only a client of it — one endpoint, one lifecycle, no second iroh endpoint
 //! sharing the device key. So this opens a bidirectional control-socket stream
-//! and the daemon bridges it to a QUIC stream on the remote node.
+//! and the daemon bridges it to QUIC for a peer or an in-memory stream for
+//! itself.
 //!
 //! In `--listen` mode the **TCP listener lives here**, in the foreground
 //! process, not in the daemon. Closing this command ends the exposure, and the
