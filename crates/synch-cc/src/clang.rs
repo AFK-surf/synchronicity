@@ -7,8 +7,7 @@ use std::{
 
 use crate::{CcError, Define, Header};
 
-/// Synchronicity's default guarded local-call frame size.
-const STACK_FRAME_SIZE: &str = "16384";
+use crate::STACK_FRAME_SIZE;
 
 pub(crate) fn compile(
     source: &str,

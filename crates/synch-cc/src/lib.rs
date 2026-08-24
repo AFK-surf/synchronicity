@@ -51,6 +51,16 @@ mod tinycc;
 /// serving sockets needs an eBPF runtime, which Windows has none of.
 pub const SUPPORTED: bool = cfg!(tinycc);
 
+/// The eBPF stack frame size clang-built programs are compiled for.
+///
+/// This must equal the socket runtime's default local-call frame
+/// (`synch_core::DEFAULT_EBPF_STACK_FRAME_SIZE`): a program compiled against
+/// a larger frame than the runtime provides would overflow its stack. The
+/// two crates stay independent — this crate does not know what a socket is —
+/// so the equality is enforced by a test in `synch-sock` instead of a
+/// dependency.
+pub const STACK_FRAME_SIZE: u32 = 16 * 1024;
+
 /// Why a compile did not produce an object.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CcError {
@@ -128,13 +138,19 @@ pub fn compile_file(
     headers: &[Header<'_>],
     defines: &[Define<'_>],
 ) -> Result<Vec<u8>, CcError> {
+    let (source, name) = read_source(path)?;
+    compile(&source, &name, headers, defines)
+}
+
+/// Reads a source file and derives the name diagnostics use for it.
+fn read_source(path: &Path) -> Result<(String, String), CcError> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| CcError::Io(format!("cannot read {}: {e}", path.display())))?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    compile(&source, &name, headers, defines)
+    Ok((source, name))
 }
 
 /// Compiles one translation unit with the host's `clang` and `llc`.
@@ -159,11 +175,6 @@ pub fn compile_file_with_clang(
     headers: &[Header<'_>],
     defines: &[Define<'_>],
 ) -> Result<Vec<u8>, CcError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| CcError::Io(format!("cannot read {}: {e}", path.display())))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let (source, name) = read_source(path)?;
     compile_with_clang(&source, &name, headers, defines)
 }
