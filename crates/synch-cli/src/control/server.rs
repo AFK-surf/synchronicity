@@ -48,6 +48,14 @@ const ACCEPT_BACKLOG: usize = 16;
 /// costs bounded memory rather than a buffered response.
 const SEND_AHEAD: usize = 4;
 
+/// The largest socket payload carried by one control response.
+///
+/// The first read waits normally, but subsequent reads only take bytes which
+/// are already available. That keeps an interactive response prompt while
+/// avoiding one protobuf and HTTP/2 exchange for every short QUIC read in a
+/// bulk stream.
+const SOCKET_RESPONSE_SIZE: usize = 64 * 1024;
+
 /// Runs a blocking store or filesystem operation off the runtime.
 ///
 /// The daemon serves this service on the same runtime that carries the endpoint,
@@ -1302,15 +1310,18 @@ where
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
     });
 
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; SOCKET_RESPONSE_SIZE];
     loop {
-        match tokio::io::AsyncReadExt::read(&mut recv, &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
+        match read_socket_response(&mut recv, &mut buf).await {
+            SocketRead::End => break,
+            SocketRead::Data { len, end } => {
                 let message = pb::ConnectResponse {
-                    kind: Some(pb::connect_response::Kind::Data(buf[..n].to_vec())),
+                    kind: Some(pb::connect_response::Kind::Data(buf[..len].to_vec())),
                 };
                 if tx.send(Ok(message)).await.is_err() {
+                    break;
+                }
+                if end {
                     break;
                 }
             }
@@ -1338,6 +1349,146 @@ where
     .await
     .map_err(|_| ControlError::internal("the caller went away"))?;
     Ok(())
+}
+
+/// One coalesced read from a socket stream.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketRead {
+    /// No more output can arrive.
+    End,
+    /// Payload bytes, and whether EOF or an error followed them immediately.
+    Data { len: usize, end: bool },
+}
+
+/// Waits for socket output, then drains everything immediately ready with it.
+///
+/// `AsyncReadExt::read` is intentionally used only for the first bytes. Once
+/// they arrive, polling subsequent reads exactly once means a lone interactive
+/// message is sent without a batching timer, while a run of queued short writes
+/// becomes one bounded control response.
+async fn read_socket_response<R>(recv: &mut R, buf: &mut [u8]) -> SocketRead
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, ReadBuf};
+
+    let mut len = match recv.read(buf).await {
+        Ok(0) | Err(_) => return SocketRead::End,
+        Ok(n) => n,
+    };
+    let mut end = false;
+
+    while len < buf.len() {
+        let immediate = std::future::poll_fn(|cx| {
+            let mut read = ReadBuf::new(&mut buf[len..]);
+            match Pin::new(&mut *recv).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(read.filled().len()))),
+                Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+                Poll::Pending => Poll::Ready(None),
+            }
+        })
+        .await;
+
+        match immediate {
+            Some(Ok(0) | Err(_)) => {
+                end = true;
+                break;
+            }
+            Some(Ok(n)) => len += n,
+            None => break,
+        }
+    }
+
+    SocketRead::Data { len, end }
+}
+
+#[cfg(test)]
+mod socket_response_tests {
+    use std::{
+        collections::VecDeque,
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use super::{read_socket_response, SocketRead};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Debug)]
+    enum ReadStep {
+        Bytes(VecDeque<u8>),
+        Pending,
+    }
+
+    #[derive(Debug)]
+    struct SteppedReader {
+        steps: VecDeque<ReadStep>,
+    }
+
+    impl SteppedReader {
+        fn new(steps: impl IntoIterator<Item = Option<&'static [u8]>>) -> Self {
+            Self {
+                steps: steps
+                    .into_iter()
+                    .map(|step| match step {
+                        Some(bytes) => ReadStep::Bytes(bytes.iter().copied().collect()),
+                        None => ReadStep::Pending,
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl AsyncRead for SteppedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.steps.front_mut() {
+                Some(ReadStep::Bytes(bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes.make_contiguous()[..n]);
+                    bytes.drain(..n);
+                    if bytes.is_empty() {
+                        self.steps.pop_front();
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                Some(ReadStep::Pending) => {
+                    self.steps.pop_front();
+                    // Let the next awaited read make progress. The coalescing
+                    // poll itself must still stop at this availability edge.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                None => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_short_reads_share_a_response_without_waiting_for_more() {
+        let mut reader = SteppedReader::new([
+            Some(&b"one"[..]),
+            Some(&b"two"[..]),
+            None,
+            Some(&b"three"[..]),
+        ]);
+        let mut buf = [0u8; 32];
+
+        assert_eq!(
+            read_socket_response(&mut reader, &mut buf).await,
+            SocketRead::Data { len: 6, end: false }
+        );
+        assert_eq!(&buf[..6], b"onetwo");
+
+        assert_eq!(
+            read_socket_response(&mut reader, &mut buf).await,
+            SocketRead::Data { len: 5, end: true }
+        );
+        assert_eq!(&buf[..5], b"three");
+    }
 }
 
 /// Splits a `<space>/<path>` socket target.
