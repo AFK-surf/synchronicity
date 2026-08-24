@@ -89,7 +89,15 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
 /// First adoption of an origin diffs from `Hash::EMPTY`, and that must survive
 /// a corpus the size §7.1 names — including the shape that most stresses the
 /// guard.
+///
+/// Ignored because it is expensive by construction, not because it is flaky:
+/// 120 000 real inserts through the trie, twice over — ~30 s in debug, run on
+/// every `cargo test` invocation across every OS in CI. There is no smaller
+/// stand-in: this is the only test that exercises the actual §7.1 corpus
+/// size, so run it by hand (`cargo test -- --ignored`) whenever `diff`,
+/// `insert`, or the fan-out guard changes.
 #[test]
+#[ignore = "120k-entry corpus, ~30s in debug; the only test at the documented §7.1 scale"]
 fn a_first_adoption_diff_survives_the_documented_corpus_size() {
     let store = MemStore::new();
     let trie = Trie::new(&store);

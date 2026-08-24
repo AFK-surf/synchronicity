@@ -63,14 +63,18 @@ jobs:
       # discovery, so it needs no network access.
       # --no-fail-fast so one run reports every platform failure, rather than
       # surfacing them one CI round-trip at a time.
-      - run: cargo test --workspace --all-targets --no-fail-fast
-      - run: cargo test --workspace --doc --no-fail-fast
+      # synch-engine is excluded and run separately by the `test-engine` job:
+      # its integration tests spawn real loopback network endpoints per test
+      # (no mocked/paused clock) and alone take longer than every other crate
+      # combined — splitting it out keeps this job's feedback fast.
+      - run: cargo test --workspace --all-targets --no-fail-fast --exclude synch-engine
+      - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
       # Optional features are off by default, so nothing above ever compiles
       # them. `synch-mpt`'s `proofs` is a §13 capability kept ahead of its
       # caller (§4.3) — code with no consumer and no build is code that stops
       # compiling without anyone finding out, which is the opposite of keeping
       # a capability ready.
-      - run: cargo test --workspace --all-features --all-targets --no-fail-fast
+      - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
       # And the shipped configuration. `--all-targets` unifies features across
       # the graph — `synch-net` dev-depends on itself with `sim` — so every
       # line above resolves `sim` ON and no test has ever executed against a
@@ -79,7 +83,28 @@ jobs:
       # `RekorProof::encode`/`to_txt` and the whole `x509::SelfSigned` writer,
       # and the design's asymmetry claim — a client reads DER and never writes
       # it — is a fact about a build nothing ran.
-      - run: cargo test --workspace --lib --bins --no-fail-fast
+      - run: cargo test --workspace --lib --bins --no-fail-fast --exclude synch-engine
+
+  test-engine:
+    name: test synch-engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Kept separate from `test` (see there): every test here spawns real
+      # nodes over real loopback network endpoints and polls for convergence
+      # on the real clock, so the crate alone runs longer than the rest of
+      # the workspace combined. Still required to merge — this is a second
+      # job for parallelism and clearer signal, not a demotion to optional.
+      - run: cargo test -p synch-engine --all-targets --no-fail-fast
+      - run: cargo test -p synch-engine --doc --no-fail-fast
+      - run: cargo test -p synch-engine --all-features --all-targets --no-fail-fast
+      - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
   cloud-providers:
     name: cloud CAS providers
