@@ -558,7 +558,7 @@ impl Node {
     /// tombstones were staged for removal.
     pub(crate) fn expire_tombstones(&self) -> Result<usize> {
         // Excluding whatever is already waiting to be published, for the reason
-        // `scan_all_with` gives: a removal that lands in the same batch as a
+        // `scan_all_with_ingest` gives: a removal that lands in the same batch as a
         // live entry for the same key erases the path outright. Here the two are
         // not even ordered — the scanner and this pass stage into one buffer
         // concurrently — so the filter is what makes the outcome defined.
@@ -1023,12 +1023,14 @@ impl Node {
             .store()
             .space(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
-        let local_path = space.local_path.as_deref().ok_or_else(|| {
+        let local_path = space.local_path.ok_or_else(|| {
             EngineError::invalid(format!(
                 "space {space_id} is detached and has no filesystem adoption target"
             ))
         })?;
-        target_within_checked(Path::new(local_path), space_id, path)
+        let root = PathBuf::from(local_path);
+        let (target, normalized) = target_within_checked(&root, space_id, path)?;
+        Ok((target, (root, normalized)))
     }
 }
 
@@ -1042,7 +1044,7 @@ pub(crate) fn target_within_checked(
     root: &Path,
     space_id: &str,
     path: &str,
-) -> Result<(PathBuf, (PathBuf, String))> {
+) -> Result<(PathBuf, String)> {
     let normalized = normalized_adoption_path(path)?;
     // Lexical safety is still not enough. A space root is canonicalized when
     // it is added but its *interior* never is, so a symlinked directory
@@ -1055,7 +1057,7 @@ pub(crate) fn target_within_checked(
             "{space_id}/{path} resolves through a symlinked directory and would leave the space"
         )));
     }
-    Ok((root.join(&normalized), (root.to_path_buf(), normalized)))
+    Ok((root.join(&normalized), normalized))
 }
 
 /// The guard itself, over a space root already in hand.
@@ -2214,7 +2216,7 @@ fn walk(
     // discarding them left the child indistinguishable from one that was never
     // there — which the deletion sweep reads as "gone" and publishes a tombstone
     // for. The name is what is unknown here, so no single path can be exempted;
-    // `scan_all_with` already records a failed space and keeps every other
+    // `scan_all_with_ingest` already records a failed space and keeps every other
     // space's work, which is the containment this wants.
     let mut sorted = Vec::new();
     for entry in entries {
@@ -2336,6 +2338,11 @@ mod tests {
         let (_data, node) = crate::testkit::node().await;
         node.add_detached_space("media").unwrap();
         assert!(node.is_detached_space("media").unwrap());
+        // The scan path's own re-check: a space that turns detached between
+        // the caller's listing and the per-space scan is refused, not walked.
+        assert!(node
+            .scan_space_with_ingest("media", &mut |_| unreachable!("nothing to ingest"))
+            .is_err());
         assert!(crate::watcher::SpaceWatcher::configured_spaces(&node)
             .unwrap()
             .is_empty());

@@ -205,7 +205,7 @@ impl Node {
                          `synch mirror add {space_id} <dir>` materializes one"
                     ))
                 })?;
-                // The guard `scan_space` takes, for the same reason and the
+                // The guard `scan_space_with_ingest` takes, for the same reason and the
                 // opposite failure. A vanished root — an unmounted drive, a
                 // renamed mount — must not read to the scanner as "every file
                 // deleted", and must not read to a fill as "every file
@@ -1709,7 +1709,7 @@ mod tests {
     }
 
     /// A space root that has gone — an unmounted drive, a renamed mount — is
-    /// refused rather than recreated. `scan_space` takes the same guard against
+    /// refused rather than recreated. `scan_space_with_ingest` takes the same guard against
     /// the opposite misreading, that every file was deleted.
     #[tokio::test]
     async fn a_vanished_space_root_is_refused_rather_than_recreated() {

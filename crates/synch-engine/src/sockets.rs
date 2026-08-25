@@ -829,26 +829,26 @@ mod pool {
 
     impl SocketPool {
         /// Never starts: there is no runtime to start.
-        pub fn start(_workers: usize, _limits: Limits) -> Option<SocketPool> {
+        pub(crate) fn start(_workers: usize, _limits: Limits) -> Option<SocketPool> {
             None
         }
 
         /// The documented defaults, so `synch socket ls` prints the same
         /// numbers everywhere even where nothing can run.
-        pub fn limits(&self) -> Limits {
+        pub(crate) fn limits(&self) -> Limits {
             Limits::default()
         }
 
         /// Unreachable: nothing admits an invocation without a pool.
-        pub fn next_id(&self) -> u64 {
+        pub(crate) fn next_id(&self) -> u64 {
             0
         }
 
         /// Nothing to clear.
-        pub fn clear_map(&self, _socket: &str) {}
+        pub(crate) fn clear_map(&self, _socket: &str) {}
 
         /// Unreachable: nothing admits an invocation without a pool.
-        pub async fn run(
+        pub(crate) async fn run(
             &self,
             _invocation: synch_sock::Invocation,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
@@ -856,14 +856,14 @@ mod pool {
         }
 
         /// Nothing runs on an unsupported platform.
-        pub async fn shutdown(&self) {}
+        pub(crate) async fn shutdown(&self) {}
 
         /// Unreachable: admission refuses before it reaches this.
         #[allow(
             clippy::too_many_arguments,
             reason = "matches the shape of the implementation it stands in for"
         )]
-        pub fn reserve(
+        pub(crate) fn reserve(
             &self,
             _id: u64,
             _socket: &str,
@@ -881,17 +881,17 @@ mod pool {
         }
 
         /// Nothing runs here.
-        pub fn snapshot(&self, _socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
+        pub(crate) fn snapshot(&self, _socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
             Vec::new()
         }
 
         /// Nothing runs here.
-        pub fn kill(&self, _id: u64) -> bool {
+        pub(crate) fn kill(&self, _id: u64) -> bool {
             false
         }
 
         /// Nothing runs here.
-        pub fn logs(&self, _socket: &str) -> Vec<synch_sock::LogLine> {
+        pub(crate) fn logs(&self, _socket: &str) -> Vec<synch_sock::LogLine> {
             Vec::new()
         }
     }
@@ -904,6 +904,8 @@ mod pool {
         Err(synch_sock::SockError::Unsupported)
     }
 }
+
+pub(crate) use pool::SocketPool;
 
 /// A tree the declaration hook cannot read.
 ///
@@ -949,8 +951,6 @@ impl SocketHost for NoTree {
         ))
     }
 }
-
-pub(crate) use pool::SocketPool;
 
 /// Runs a declaration hook on a thread that is allowed to block.
 ///

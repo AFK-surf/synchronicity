@@ -250,7 +250,7 @@ impl Registry {
 
     /// How many invocations of one socket are running.
     #[cfg(test)]
-    pub fn running(&self, socket: &str) -> usize {
+    pub(crate) fn running(&self, socket: &str) -> usize {
         self.live
             .lock()
             .expect("registry")

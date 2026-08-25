@@ -342,7 +342,7 @@ mod imp {
 
     impl Listener {
         /// Creates the first pipe instance.
-        pub async fn bind(data_dir: &Path) -> io::Result<Listener> {
+        pub(crate) async fn bind(data_dir: &Path) -> io::Result<Listener> {
             harden_data_dir(data_dir)?;
             let name = endpoint_name(data_dir);
             if ClientOptions::new().open(&name).is_ok() {
@@ -368,7 +368,7 @@ mod imp {
         }
 
         /// Waits for a client, then re-arms the next instance.
-        pub async fn accept(&mut self) -> io::Result<Transport> {
+        pub(crate) async fn accept(&mut self) -> io::Result<Transport> {
             let server = match self.next.take() {
                 Some(server) => server,
                 None => ServerOptions::new().create(&self.name)?,

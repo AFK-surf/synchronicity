@@ -122,7 +122,7 @@ fn an_under_occupied_branch_is_refused() {
 
 /// An extension above anything but a branch is refused where the structure is
 /// walked (`check_invariants`): it reads correctly but gives one key/value map
-/// several distinct roots, silently disabling `MissingWalk::since`'s pruning.
+/// several distinct roots, silently disabling `MissingWalk::scoped`'s pruning.
 #[test]
 fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
     use synch_mpt::MissingWalk;

@@ -1202,7 +1202,7 @@ impl Node {
             // asking for this usually means "re-sync this space from my peers",
             // which is the exact opposite.
             //
-            // `scan_space` already refuses a root that is missing or is not a
+            // `scan_space_with_ingest` already refuses a root that is missing or is not a
             // directory, with the same reasoning in its comment; this is the
             // sibling case it does not test, where the root is present, is a
             // directory, and is simply somewhere else.

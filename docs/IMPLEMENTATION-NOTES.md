@@ -204,7 +204,7 @@ its version (§8), and that is what the mirror reproduces.
 ### §7.1 — reconciling `local_files` on open
 
 Batching introduces a failure the synchronous publisher did not have.
-`scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it indexes,
+The scanner records `(size, mtime_ns, file_id)` in `local_files` as it indexes,
 and that record is exactly what makes the *next* scan skip the file. If a
 daemon dies with a batch still buffered, the files were hashed and recorded but
 no root mentions them, and every later scan skips them: silent, permanent
