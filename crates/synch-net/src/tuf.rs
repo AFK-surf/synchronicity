@@ -51,9 +51,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aws_lc_rs::signature;
-
-use crate::rekor::{base64_decode, base64_encode, sha256, LogKey, LogKeys};
+use crate::{
+    pubkey::{RawKey, Scheme},
+    rekor::{base64_decode, base64_encode, sha256, LogKey, LogKeys},
+};
 
 /// The target the chain has to authenticate for any of this to matter.
 pub const TRUSTED_ROOT_TARGET: &str = "trusted_root.json";
@@ -1298,23 +1299,9 @@ impl Root {
 
 // -------------------------------------------------------------------- keys
 
-/// The signature scheme a TUF key uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TufScheme {
-    /// ECDSA P-256 with SHA-256. Sigstore signs with DER-encoded `r`,`s`;
-    /// the fixed-width form is accepted too, being the same signature.
-    EcdsaP256Sha256,
-    /// Ed25519.
-    Ed25519,
-}
-
-/// One key from a root's key table.
+/// One key from a root's key table: a [`RawKey`] and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TufKey {
-    scheme: TufScheme,
-    /// The raw public key: an uncompressed P-256 point, or 32 Ed25519 bytes.
-    point: Vec<u8>,
-}
+struct TufKey(RawKey);
 
 impl TufKey {
     /// Parses one entry of `signed.keys`.
@@ -1328,46 +1315,37 @@ impl TufKey {
     fn parse(key: &serde_json::Value) -> Result<TufKey, TufError> {
         let bad = |why: &str| TufError::Signature(format!("key: {why}"));
         let scheme = match key["scheme"].as_str() {
-            Some("ecdsa-sha2-nistp256") => TufScheme::EcdsaP256Sha256,
-            Some("ed25519") => TufScheme::Ed25519,
+            Some("ecdsa-sha2-nistp256") => Scheme::EcdsaP256Sha256,
+            Some("ed25519") => Scheme::Ed25519,
             Some(other) => return Err(bad(&format!("unsupported scheme {other}"))),
             None => return Err(bad("no scheme")),
         };
         let public = key["keyval"]["public"]
             .as_str()
             .ok_or_else(|| bad("no keyval.public"))?;
-        let point = match public.contains("-----BEGIN") {
-            true => spki_point(&pem_body(public)?, scheme)?,
-            false => raw_point(
+        let key = match public.contains("-----BEGIN") {
+            true => RawKey::from_spki_as(&pem_body(public)?, scheme).ok_or_else(|| {
+                TufError::Signature("a key is not the SubjectPublicKeyInfo its scheme names".into())
+            })?,
+            false => RawKey::from_raw(
                 &hex_decode(public.trim()).ok_or_else(|| bad("keyval.public is not hex"))?,
                 scheme,
-            )?,
+            )
+            .ok_or_else(|| {
+                TufError::Signature("a key is not the raw material its scheme names".into())
+            })?,
         };
-        Ok(TufKey { scheme, point })
+        Ok(TufKey(key))
     }
 
-    /// Verifies one signature over the canonical bytes.
+    /// Verifies one signature over the canonical bytes, under the shared
+    /// double-encoding rule ([`RawKey::verifies`]): Sigstore's TUF signatures
+    /// are DER, and the fixed-width verifier refuses those outright.
     fn verify(&self, message: &[u8], sig: &[u8]) -> Result<(), TufError> {
-        let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.scheme {
-            // Sigstore's TUF signatures are DER; the fixed-width verifier
-            // refuses those outright, so both encodings are tried — two
-            // spellings of one signature, conceding nothing beyond the
-            // malleability ASN.1 already has.
-            TufScheme::EcdsaP256Sha256 => &[
-                &signature::ECDSA_P256_SHA256_ASN1,
-                &signature::ECDSA_P256_SHA256_FIXED,
-            ],
-            TufScheme::Ed25519 => &[&signature::ED25519],
-        };
-        for algorithm in algorithms {
-            if signature::UnparsedPublicKey::new(*algorithm, &self.point)
-                .verify(message, sig)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        match self.0.verifies(message, sig) {
+            true => Ok(()),
+            false => Err(TufError::Signature("a signature does not verify".into())),
         }
-        Err(TufError::Signature("a signature does not verify".into()))
     }
 }
 
@@ -1379,51 +1357,6 @@ fn pem_body(pem: &str) -> Result<Vec<u8>, TufError> {
         .collect::<Vec<_>>()
         .join("");
     base64_decode(body.trim()).map_err(|_| TufError::Signature("a PEM key is not base64".into()))
-}
-
-/// The raw key inside a DER SubjectPublicKeyInfo.
-///
-/// Deliberately narrow, the same stance as [`crate::rekor::LogKey::from_spki`]
-/// (whose prefixes these are): two shapes are recognized and everything else
-/// is refused, rather than a general ASN.1 reader parsing whatever it is
-/// handed.
-fn spki_point(der: &[u8], scheme: TufScheme) -> Result<Vec<u8>, TufError> {
-    use crate::rekor::{ED25519_SPKI_PREFIX, P256_SPKI_PREFIX};
-    let bad = TufError::Signature("a key is not the SubjectPublicKeyInfo its scheme names".into());
-    match scheme {
-        TufScheme::EcdsaP256Sha256 => match der.strip_prefix(P256_SPKI_PREFIX) {
-            Some(point) if point.len() == 64 => {
-                let mut uncompressed = Vec::with_capacity(65);
-                uncompressed.push(0x04);
-                uncompressed.extend_from_slice(point);
-                Ok(uncompressed)
-            }
-            _ => Err(bad),
-        },
-        TufScheme::Ed25519 => match der.strip_prefix(ED25519_SPKI_PREFIX) {
-            Some(point) if point.len() == 32 => Ok(point.to_vec()),
-            _ => Err(bad),
-        },
-    }
-}
-
-/// The pre-PEM form: hex key material, as Sigstore's roots 1–4 wrote it.
-fn raw_point(bytes: &[u8], scheme: TufScheme) -> Result<Vec<u8>, TufError> {
-    let bad = TufError::Signature("a key is not the raw material its scheme names".into());
-    match scheme {
-        TufScheme::EcdsaP256Sha256 => match bytes {
-            [0x04, ..] if bytes.len() == 65 => Ok(bytes.to_vec()),
-            _ if bytes.len() == 64 => {
-                let mut uncompressed = Vec::with_capacity(65);
-                uncompressed.push(0x04);
-                uncompressed.extend_from_slice(bytes);
-                Ok(uncompressed)
-            }
-            _ => Err(bad),
-        },
-        TufScheme::Ed25519 if bytes.len() == 32 => Ok(bytes.to_vec()),
-        TufScheme::Ed25519 => Err(bad),
-    }
 }
 
 /// The key id TUF derives for a key object: SHA-256 over its canonical JSON.

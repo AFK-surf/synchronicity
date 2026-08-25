@@ -1588,7 +1588,7 @@ impl SimTufKey {
         let key = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
         // The same prefix `LogKey::from_spki` strips back off, named once
         // there rather than spelled out again here.
-        let mut spki = crate::rekor::ED25519_SPKI_PREFIX.to_vec();
+        let mut spki = crate::pubkey::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(aws_lc_rs::signature::KeyPair::public_key(&key).as_ref());
         SimTufKey {
             pkcs8,

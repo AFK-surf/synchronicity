@@ -85,6 +85,7 @@ use hickory_resolver::proto::dnssec::TrustAnchors;
 
 use crate::{
     chain::{self, ChainError},
+    pubkey::{RawKey, Scheme, P256_SPKI_PREFIX},
     x509::Certificate,
 };
 
@@ -1337,22 +1338,13 @@ impl Checkpoint {
 }
 
 /// The signature algorithm a pinned log key uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogKeyAlgorithm {
-    /// ECDSA P-256 with SHA-256, signatures as raw `r || s`.
-    EcdsaP256Sha256,
-    /// Ed25519.
-    Ed25519,
-}
-
 /// One pinned log verification key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogKey {
     /// SHA-256 of the DER SubjectPublicKeyInfo — the `log_id` a proof names.
     pub id: [u8; 32],
-    algorithm: LogKeyAlgorithm,
-    /// The raw public key: an uncompressed P-256 point, or 32 Ed25519 bytes.
-    point: Vec<u8>,
+    /// The scheme and raw key material (`crate::pubkey`).
+    key: RawKey,
     /// The checkpoint origin this key is pinned *for*, when the pin came from
     /// an artifact that named one.
     ///
@@ -1371,21 +1363,6 @@ pub struct LogKey {
 }
 
 impl LogKey {
-    /// Verifies a checkpoint signature, accepting **either** ECDSA encoding.
-    ///
-    /// An ECDSA signature travels two ways — IEEE P1363's fixed 64-byte
-    /// `r ‖ s`, and ASN.1/DER — and Sigstore signs its notes with DER: the live
-    /// `rekor.sigstore.dev` signature is 70 bytes opening `30 44 02 20`, an
-    /// unmistakable DER header. A DER signature can never satisfy a
-    /// fixed-width verifier, so a verifier that took only one encoding would
-    /// refuse every proof from a P-256-keyed shard with a "checkpoint" error
-    /// that reads like a misconfigured pin set. Ed25519 has one encoding, which
-    /// is why the only real checkpoint fixtures — both from the Ed25519 shard —
-    /// exercise none of this.
-    ///
-    /// Accepting both is not a weakening: either encoding of a valid
-    /// signature is a valid signature by that key, and nothing here treats a
-    /// signature as unique.
     /// The four-byte C2SP note key id this key has for `origin`, where the
     /// derivation is unambiguous.
     ///
@@ -1395,33 +1372,25 @@ impl LogKey {
     /// the whole SubjectPublicKeyInfo as that arm's `logId.keyId`, so there is
     /// no one derivation to check a hint against and nothing is claimed.
     fn note_hint(&self, origin: &str) -> Option<[u8; 4]> {
-        match self.algorithm {
-            LogKeyAlgorithm::EcdsaP256Sha256 => None,
-            LogKeyAlgorithm::Ed25519 => {
+        match self.key.scheme {
+            Scheme::EcdsaP256Sha256 => None,
+            Scheme::Ed25519 => {
                 let mut input = Vec::with_capacity(origin.len() + 34);
                 input.extend_from_slice(origin.as_bytes());
                 input.push(0x0a);
                 input.push(0x01);
-                input.extend_from_slice(&self.point);
+                input.extend_from_slice(&self.key.point);
                 let digest = sha256(&input);
                 Some([digest[0], digest[1], digest[2], digest[3]])
             }
         }
     }
 
+    /// Verifies a checkpoint signature under the shared double-encoding rule
+    /// ([`RawKey::verifies`]). The only real checkpoint fixtures — both from
+    /// the Ed25519 shard — exercise none of the ECDSA half.
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), ProofError> {
-        let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.algorithm {
-            LogKeyAlgorithm::EcdsaP256Sha256 => &[
-                &signature::ECDSA_P256_SHA256_ASN1,
-                &signature::ECDSA_P256_SHA256_FIXED,
-            ],
-            LogKeyAlgorithm::Ed25519 => &[&signature::ED25519],
-        };
-        match algorithms.iter().any(|algorithm| {
-            signature::UnparsedPublicKey::new(*algorithm, &self.point)
-                .verify(message, signature)
-                .is_ok()
-        }) {
+        match self.key.verifies(message, signature) {
             true => Ok(()),
             false => Err(ProofError::Checkpoint("signature does not verify".into())),
         }
@@ -1537,20 +1506,6 @@ impl LogKeys {
     }
 }
 
-/// The DER SubjectPublicKeyInfo prefix for an uncompressed P-256 point:
-/// the `id-ecPublicKey` / `prime256v1` algorithm identifier, the bit-string
-/// header, and the `0x04` uncompressed-point tag.
-///
-pub(crate) const P256_SPKI_PREFIX: &[u8] = &[
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
-    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-];
-
-/// The same for an Ed25519 key.
-pub(crate) const ED25519_SPKI_PREFIX: &[u8] = &[
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-
 impl LogKey {
     /// The same key, pinned for the checkpoint origin `origin`.
     ///
@@ -1563,39 +1518,20 @@ impl LogKey {
         }
     }
 
-    /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key.
-    ///
-    /// Deliberately narrow: two shapes are recognized and everything else is
-    /// refused, rather than a general ASN.1 reader parsing whatever it is
-    /// handed. The `id` is SHA-256 over the DER bytes exactly as given.
+    /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key
+    /// ([`RawKey::from_spki`]). The `id` is SHA-256 over the DER bytes exactly
+    /// as given.
     pub fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
-        let id = sha256(der);
-        if let Some(point) = der.strip_prefix(P256_SPKI_PREFIX) {
-            if point.len() == 64 {
-                let mut uncompressed = Vec::with_capacity(65);
-                uncompressed.push(0x04);
-                uncompressed.extend_from_slice(point);
-                return Ok(LogKey {
-                    id,
-                    algorithm: LogKeyAlgorithm::EcdsaP256Sha256,
-                    point: uncompressed,
-                    origin: None,
-                });
-            }
+        match RawKey::from_spki(der) {
+            Some(key) => Ok(LogKey {
+                id: sha256(der),
+                key,
+                origin: None,
+            }),
+            None => Err(ProofError::UnknownLog(
+                "a log key is neither an ECDSA P-256 nor an Ed25519 SubjectPublicKeyInfo".into(),
+            )),
         }
-        if let Some(point) = der.strip_prefix(ED25519_SPKI_PREFIX) {
-            if point.len() == 32 {
-                return Ok(LogKey {
-                    id,
-                    algorithm: LogKeyAlgorithm::Ed25519,
-                    point: point.to_vec(),
-                    origin: None,
-                });
-            }
-        }
-        Err(ProofError::UnknownLog(
-            "a log key is neither an ECDSA P-256 nor an Ed25519 SubjectPublicKeyInfo".into(),
-        ))
     }
 }
 
@@ -2157,7 +2093,7 @@ mod tests {
         let ed25519 = embedded
             .keys()
             .iter()
-            .find(|key| key.algorithm == LogKeyAlgorithm::Ed25519)
+            .find(|key| key.key.scheme == Scheme::Ed25519)
             .expect("the embedded set has an Ed25519 shard")
             .clone();
 
@@ -2215,7 +2151,7 @@ mod tests {
         let p256 = embedded
             .keys()
             .iter()
-            .find(|key| key.algorithm == LogKeyAlgorithm::EcdsaP256Sha256)
+            .find(|key| key.key.scheme == Scheme::EcdsaP256Sha256)
             .expect("the embedded set has a P-256 shard");
         assert_eq!(p256.note_hint(&checkpoint.origin), None);
     }
@@ -2232,7 +2168,11 @@ mod tests {
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("key");
-        let spki = [ED25519_SPKI_PREFIX, pair.public_key().as_ref()].concat();
+        let spki = [
+            crate::pubkey::ED25519_SPKI_PREFIX,
+            pair.public_key().as_ref(),
+        ]
+        .concat();
         let key = LogKey::from_spki(&spki).expect("an ed25519 pin");
 
         // A note whose signed origin names some *other* log, signed by this
