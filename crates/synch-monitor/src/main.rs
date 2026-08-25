@@ -279,10 +279,6 @@ async fn main() {
     };
     match result {
         Ok(code) => std::process::exit(code),
-        // A reader that hung up (`entry ... | head`) is not an incomplete
-        // run: exiting 30 for it read as "the monitor could not finish"
-        // against the documented severity-ordered codes.
-        Err(e) if synch_net::process::reader_hung_up(&e) => std::process::exit(0),
         Err(e) => {
             eprintln!("synch-monitor: {e}");
             std::process::exit(EXIT_INCOMPLETE);
@@ -333,9 +329,16 @@ fn dump_entry(args: &EntryArgs) -> Result<i32, MonitorError> {
             args.state.display()
         ))
     })?;
-    std::io::stdout()
-        .write_all(&body)
-        .map_err(|e| MonitorError::State(format!("writing stdout: {e}")))?;
+    match std::io::stdout().write_all(&body) {
+        Ok(()) => {}
+        // The reader hanging up (`entry … | head`) is the reader saying
+        // "enough", not an incomplete run. Decided here, where the io error
+        // still carries its kind: `MonitorError` stringifies what it wraps
+        // (its variants are `Clone + Eq`), so by the time `main` sees the
+        // error there is nothing left to classify.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(MonitorError::State(format!("writing stdout: {e}"))),
+    }
     Ok(0)
 }
 

@@ -1106,7 +1106,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     ///
     /// `step` is handed the parent's state, the child nibble, and the child's
     /// path (already pushed); what it answers is a [`Step`]. `path` keeps
-    /// whatever prefix it arrives with.
+    /// whatever prefix it arrives with. The ceiling is charged on the step's
+    /// *answer*, so the position that trips it has already done its own work
+    /// (emitted its change, taken its value) before the walk refuses — one
+    /// position's worth of slack against an 8 M bound, accepted so the driver
+    /// need not know in advance which children are real.
     pub(crate) fn descend<T>(
         &self,
         start: T,
@@ -1139,7 +1143,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 Step::Skip => {
                     path.pop();
                 }
-                Step::Stop => return Ok(()),
+                // The prefix contract holds on every exit, the early one
+                // included: a caller that reuses the buffer after a stopped
+                // walk must find it as it was handed over.
+                Step::Stop => {
+                    path.truncate(base);
+                    return Ok(());
+                }
             }
         }
         Ok(())
