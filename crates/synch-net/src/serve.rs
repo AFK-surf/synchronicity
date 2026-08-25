@@ -71,39 +71,12 @@ where
     S: std::future::Future<Output = ()>,
 {
     let remote = connection.remote_id();
-    // Enforcement at connection-accept time (§3.2): connections from device
-    // keys with no live binding are closed immediately after the handshake.
-    //
-    // Off the runtime, like every other store read (§10). It looks like the one
-    // lookup small enough to stay inline — one indexed row — and it is not: the
-    // cost is not the query, it is the wait for the store's single connection
-    // mutex, which a publish batch or a GC pass holds for as long as it runs.
-    // This is also the only store call in the process an *unauthenticated*
-    // dialer can reach, so leaving it here let anyone who could complete a QUIC
-    // handshake park a runtime worker behind whatever was writing.
-    match trusted(store, &remote).await {
-        true => {}
-        false => {
-            tracing::debug!(peer = %remote.fmt_short(), "refusing connection: no live binding");
-            if let Some(wake) = on_unknown_key {
-                wake.notify_waiters();
-            }
-            connection.close(0u32.into(), b"untrusted");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "peer has no live binding",
-            )));
-        }
-    }
+    admit(store, &connection, &remote, on_unknown_key).await?;
     on_request(remote).await;
 
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     while let Ok((send, recv)) = connection.accept_bi().await {
-        // §3.2 enforcement is per message, not just per connection: a binding
-        // revoked or expired mid-connection must cut off further requests, not
-        // linger for the life of the QUIC session.
-        if !trusted(store, &remote).await {
-            tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
-            connection.close(0u32.into(), b"untrusted");
+        if !still_admitted(store, &connection, &remote).await {
             break;
         }
         on_request(remote).await;
@@ -124,12 +97,64 @@ where
     Ok(())
 }
 
+/// Admits a freshly accepted connection, or refuses and closes it (§3.2):
+/// a device key with no live binding is not a peer, and the connection is
+/// closed immediately after the handshake. Rings the §3.4 unknown-key bell on
+/// refusal — the far side of a key rotation arrives exactly this way.
+///
+/// One refusal for every ALPN, because the gate is membership policy, not
+/// protocol: a third handler restating it is a third place for the §3.2 rule
+/// to drift.
+pub(crate) async fn admit(
+    store: &Arc<Store>,
+    connection: &Connection,
+    remote: &NodeId,
+    on_unknown_key: Option<&Arc<tokio::sync::Notify>>,
+) -> Result<(), AcceptError> {
+    if trusted(store, remote).await {
+        return Ok(());
+    }
+    tracing::debug!(peer = %remote.fmt_short(), "refusing connection: no live binding");
+    if let Some(wake) = on_unknown_key {
+        wake.notify_waiters();
+    }
+    connection.close(0u32.into(), b"untrusted");
+    Err(AcceptError::from_err(std::io::Error::other(
+        "peer has no live binding",
+    )))
+}
+
+/// The per-message half of [`admit`] (§3.2): a binding revoked or expired
+/// mid-connection must cut off further requests, not linger for the life of
+/// the QUIC session. On a lapse the connection is closed and `false` returned;
+/// work already in flight is a conversation in progress and is left to finish.
+pub(crate) async fn still_admitted(
+    store: &Arc<Store>,
+    connection: &Connection,
+    remote: &NodeId,
+) -> bool {
+    if trusted(store, remote).await {
+        return true;
+    }
+    tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
+    connection.close(0u32.into(), b"untrusted");
+    false
+}
+
 /// Whether a device key has a live binding, decided on the blocking pool.
+///
+/// Off the runtime, like every other store read (§10). It looks like the one
+/// lookup small enough to stay inline — one indexed row — and it is not: the
+/// cost is not the query, it is the wait for the store's single connection
+/// mutex, which a publish batch or a GC pass holds for as long as it runs.
+/// This is also the only store call in the process an *unauthenticated* dialer
+/// can reach, so running it inline let anyone who could complete a QUIC
+/// handshake park a runtime worker behind whatever was writing.
 ///
 /// A failure to reach the store is not a grant: anything but a definite `true`
 /// closes the connection, which is the same fail-closed reading the inline
 /// version had.
-pub(crate) async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
+async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
     let store = store.clone();
     let remote = *remote;
     let answer: Result<bool, crate::error::NetError> =

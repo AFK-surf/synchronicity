@@ -187,18 +187,16 @@ impl ProtocolHandler for SockProtocol {
             return Ok(());
         }
 
-        // The same accept gate the other two ALPNs use, and for the same
-        // reason: a device key with no live binding is not a peer.
-        if !crate::serve::trusted(&self.store, &remote).await {
-            tracing::debug!(peer = %remote.fmt_short(), "refusing socket connection: no live binding");
-            if let Some(wake) = &self.on_unknown_key {
-                wake.notify_waiters();
-            }
-            connection.close(0u32.into(), b"untrusted");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "peer has no live binding",
-            )));
-        }
+        // The same accept gate as the other two ALPNs — literally: the §3.2
+        // rule is membership policy, and this file's own rationale for
+        // `serve_connection` is "one implementation, because two drift".
+        crate::serve::admit(
+            &self.store,
+            &connection,
+            &remote,
+            self.on_unknown_key.as_ref(),
+        )
+        .await?;
 
         // One uni-stream per connection, opened before anything is served, so
         // that a status always has somewhere to go. A trailer on the data
@@ -239,14 +237,11 @@ impl ProtocolHandler for SockProtocol {
                 let _ = send.finish();
                 break;
             };
-            // Per stream, not just per connection: a binding revoked mid-session
-            // must stop the next invocation rather than linger for the life of
-            // the QUIC connection. A stream already running is left alone — it
-            // is a conversation in progress, and cutting it here would be a
-            // partial write to whatever the program is talking to.
-            if !crate::serve::trusted(&self.store, &remote).await {
-                tracing::debug!(peer = %remote.fmt_short(), "closing socket connection: binding lapsed");
-                connection.close(0u32.into(), b"untrusted");
+            // Per stream, not just per connection: a binding revoked
+            // mid-session must stop the next invocation. A stream already
+            // running is left alone — cutting it would be a partial write to
+            // whatever the program is talking to.
+            if !crate::serve::still_admitted(&self.store, &connection, &remote).await {
                 break;
             }
 
