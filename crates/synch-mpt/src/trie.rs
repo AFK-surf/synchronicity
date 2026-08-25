@@ -160,12 +160,22 @@ enum RemoveFrame {
     },
 }
 
-/// One level of an explicit walk stack: the cursor at that level, and which
-/// child nibble to visit next.
-#[derive(Debug)]
-pub(crate) struct Frame {
-    pub(crate) cursor: Cursor,
-    pub(crate) next: u8,
+/// One step of a [`Trie::descend`] walk: the parent's state, the child
+/// nibble, and the child's path (already pushed), deciding a [`Step`].
+pub(crate) type StepFn<'s, T> = dyn FnMut(&T, u8, &[u8]) -> Result<Step<T>, MptError> + 's;
+
+/// What one step of a [`Trie::descend`] walk decided about a child position.
+pub(crate) enum Step<T> {
+    /// A real position worth descending: charged against the walk ceiling,
+    /// its state pushed as the next level.
+    Descend(T),
+    /// A real position not worth descending — a diff whose subtrees are
+    /// structurally shared, say. Charged, not pushed.
+    Visited,
+    /// Nothing there, or pruned before it was read. Uncharged.
+    Skip,
+    /// The walk has what it came for; unwind everything.
+    Stop,
 }
 
 /// Maps the empty-trie sentinel onto `None`.
@@ -1080,13 +1090,62 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Ok(out)
     }
 
-    /// Walks a subtree, collecting values, with an explicit heap stack.
+    /// Drives one structural walk with an explicit heap stack: the hostile-trie
+    /// defences, held once for every descent (`scan`'s collect, `diff`'s
+    /// lockstep walk).
     ///
     /// Depth is attacker-controlled — a peer's trie is fetched by hash and
     /// nothing about its shape is canonicalized, so it may chain extensions to
-    /// any depth — and a recursive walk would abort the process on a stack
-    /// overflow (§12). The frames live on the heap, and the walk stops past
-    /// [`MAX_DEPTH_NIBBLES`], below which no valid key can begin.
+    /// any depth — and a recursive walk would meet that with a stack overflow:
+    /// an abort rather than an error, in `diff`'s case inside head promotion
+    /// (§5.2, §12). So the frames live on the heap, the walk stops past
+    /// [`MAX_DEPTH_NIBBLES`] (below which no valid key can begin), and every
+    /// real position is charged against [`FanoutGuard`]'s ceiling, which keeps
+    /// the walk proportional to the trie — a fan-out DAG cannot turn a handful
+    /// of nodes into an unbounded walk.
+    ///
+    /// `step` is handed the parent's state, the child nibble, and the child's
+    /// path (already pushed); what it answers is a [`Step`]. `path` keeps
+    /// whatever prefix it arrives with.
+    pub(crate) fn descend<T>(
+        &self,
+        start: T,
+        path: &mut Vec<u8>,
+        step: &mut StepFn<'_, T>,
+    ) -> Result<(), MptError> {
+        let base = path.len();
+        let mut guard = FanoutGuard::default();
+        let mut stack: Vec<(T, u8)> = vec![(start, 0)];
+        while let Some(top) = stack.len().checked_sub(1) {
+            let nibble = stack[top].1;
+            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
+                stack.pop();
+                if path.len() > base {
+                    path.pop();
+                }
+                continue;
+            }
+            stack[top].1 += 1;
+            path.push(nibble);
+            match step(&stack[top].0, nibble, path)? {
+                Step::Descend(child) => {
+                    guard.visit()?;
+                    stack.push((child, 0));
+                }
+                Step::Visited => {
+                    guard.visit()?;
+                    path.pop();
+                }
+                Step::Skip => {
+                    path.pop();
+                }
+                Step::Stop => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Walks a subtree, collecting values ([`Trie::descend`]).
     fn collect(
         &self,
         cursor: &Cursor,
@@ -1096,50 +1155,21 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         out: &mut Vec<Entry>,
     ) -> Result<(), MptError> {
         let after_bytes = after.map(|a| a.to_bytes().unwrap_or_default());
-        let base = path.len();
-        let mut stack: Vec<Frame> = Vec::new();
-        // Keeps the scan proportional to the trie, so a fan-out DAG cannot turn
-        // a handful of nodes into an unbounded walk.
-        let mut guard = FanoutGuard::default();
-
         self.take_value(cursor, path, after_bytes.as_deref(), limit, out)?;
-        stack.push(Frame {
-            cursor: cursor.clone(),
-            next: 0,
-        });
-
-        while let Some(top) = stack.len().checked_sub(1) {
+        self.descend(cursor.clone(), path, &mut |parent, nibble, path| {
             if limit.is_some_and(|l| out.len() >= l) {
-                return Ok(());
+                return Ok(Step::Stop);
             }
-            let nibble = stack[top].next;
-            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
-                stack.pop();
-                if path.len() > base {
-                    path.pop();
-                }
-                continue;
+            if after.is_some_and(|a| subtree_is_below(path, a.as_slice())) {
+                return Ok(Step::Skip);
             }
-            stack[top].next += 1;
-            path.push(nibble);
-            let skip = after.is_some_and(|a| subtree_is_below(path, a.as_slice()));
-            if skip {
-                path.pop();
-                continue;
-            }
-            let child = self.cursor_child(&stack[top].cursor, nibble)?;
+            let child = self.cursor_child(parent, nibble)?;
             if child.is_empty() {
-                path.pop();
-                continue;
+                return Ok(Step::Skip);
             }
-            guard.visit()?;
             self.take_value(&child, path, after_bytes.as_deref(), limit, out)?;
-            stack.push(Frame {
-                cursor: child,
-                next: 0,
-            });
-        }
-        Ok(())
+            Ok(Step::Descend(child))
+        })
     }
 
     /// Emits the value sitting exactly at `path`, if there is one and the scan
