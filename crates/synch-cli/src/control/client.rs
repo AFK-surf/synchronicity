@@ -497,7 +497,7 @@ impl<P: WriteFamily> StreamedWrite<P> {
     ///
     /// There is no success to report, so the daemon's account of what it threw
     /// away is the return value: an abandoned write always ends in an error.
-    /// A send that fails here already carries that account — [`Self::send`]
+    /// A send that fails here already carries that account — `send`
     /// reads it off the answer stream — so it is returned as it stands: a
     /// second read of the stream would find it ended and misreport the daemon
     /// as having kept the write. The two machines had drifted exactly here,

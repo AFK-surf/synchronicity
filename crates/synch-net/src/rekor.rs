@@ -1519,7 +1519,7 @@ impl LogKey {
     }
 
     /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key
-    /// ([`RawKey::from_spki`]). The `id` is SHA-256 over the DER bytes exactly
+    /// (`RawKey::from_spki`). The `id` is SHA-256 over the DER bytes exactly
     /// as given.
     pub fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
         match RawKey::from_spki(der) {
