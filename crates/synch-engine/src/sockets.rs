@@ -950,6 +950,8 @@ impl SocketHost for NoTree {
     }
 }
 
+pub(crate) use pool::SocketPool;
+
 /// Runs a declaration hook on a thread that is allowed to block.
 ///
 /// The hook always runs against [`NoTree`]: a declaration names intent, and
@@ -1236,5 +1238,3 @@ mod tests {
         ));
     }
 }
-
-pub(crate) use pool::SocketPool;

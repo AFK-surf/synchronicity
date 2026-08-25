@@ -73,7 +73,7 @@ pub(crate) const ERROR_CODE_HEADER: &str = "x-synch-error-code";
 ///
 /// The CLI renders these as its own exit status rather than as a transport
 /// error (§9.3). Each maps to a gRPC status code and travels alongside it in
-/// the [`ERROR_CODE_HEADER`] trailer, because more of them exist than gRPC has
+/// the `ERROR_CODE_HEADER` trailer, because more of them exist than gRPC has
 /// codes to keep apart — and a caller that renders codes as protocol statuses,
 /// as the S3 gateway does, needs the distinction the mapping loses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

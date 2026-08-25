@@ -140,7 +140,7 @@ impl Store {
     }
 
     /// The instant a trust decision is evaluated at: `reading`, floored by
-    /// [`Store::trust_floor`].
+    /// `Store::trust_floor`.
     ///
     /// An untrustworthy reading is returned unchanged rather than rescued by
     /// the floor — a stored floor is evidence about the past, not a substitute

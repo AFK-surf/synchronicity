@@ -173,7 +173,7 @@ impl Store {
     /// Anything in a shard directory that is not named for an object is left
     /// alone.
     ///
-    /// Half-written ingests go with them, by way of [`Store::gc_staging`].
+    /// Half-written ingests go with them, by way of `Store::gc_staging`.
     ///
     /// Nothing in the CAS root but a directory is descended into. That is not
     /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,

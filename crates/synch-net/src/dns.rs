@@ -783,7 +783,7 @@ impl GatedTxt {
 /// signing zone signed these records and hickory's chain to the trust anchor
 /// held. It says nothing about whether the key that did so is on the
 /// transparency log, which under [`RekorPolicy::Require`] is the question
-/// that matters — a trust decision belongs on [`GatedTxt`]. Named for the
+/// that matters — a trust decision belongs on `GatedTxt`. Named for the
 /// check it *did* pass rather than for "validated", the previous name, which
 /// read at every binding site as though the answer were finished being
 /// checked.
@@ -1069,7 +1069,7 @@ impl DnssecResolver {
     ///
     /// **No trust decision may be made from this.** `gated_txt` is the one
     /// way to get an answer that may be acted on, and it returns a
-    /// [`GatedTxt`] so that "has this been gated?" is a question the type
+    /// `GatedTxt` so that "has this been gated?" is a question the type
     /// system answers. No production caller reaches this at all; it exists
     /// so `synch doctor` and the tests can see the answer a resolver took
     /// *before* anything judged it — a diagnostic, not an input.

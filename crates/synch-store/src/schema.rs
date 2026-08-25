@@ -1,7 +1,7 @@
 //! The schema as an ordered chain of migrations (§10).
 //!
 //! There is one path to a database of the current shape: replaying
-//! [`MIGRATIONS`] from wherever a database currently is. `MIGRATIONS[v]` takes
+//! `MIGRATIONS` from wherever a database currently is. `MIGRATIONS[v]` takes
 //! a database from version `v` to `v + 1`, so index 0 takes an *empty* file to
 //! version 1 — the original schema — and a fresh database is simply one that
 //! replays the whole chain. There is deliberately no separate "current schema"
@@ -16,7 +16,7 @@
 //! - A database stamped newer than this build knows is **refused**, not probed.
 //! - No `IF NOT EXISTS` anywhere: whether an object exists is determined by the
 //!   version number, never discovered by trying.
-//! - Anything SQL cannot express is a [`Migration::Rust`] step in the same
+//! - Anything SQL cannot express is a `Migration::Rust` step in the same
 //!   numbered chain, under the same transaction rule.
 
 use rusqlite::{OptionalExtension, Transaction};

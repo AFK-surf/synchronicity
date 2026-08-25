@@ -52,7 +52,7 @@ pub(crate) const MAX_REFUSE_MESSAGE_LEN: usize = 512;
 /// Opens one invocation. The caller's whole influence over what runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SockOpen {
-    /// Protocol version; must be [`SOCK_PROTO_VERSION`].
+    /// Protocol version; must be `SOCK_PROTO_VERSION`.
     pub v: u8,
     /// The origin whose tree the socket is to be resolved in.
     ///
@@ -131,7 +131,7 @@ pub enum SockOpened {
     Refused {
         /// Why.
         code: RefuseCode,
-        /// A human-readable elaboration, bounded at [`MAX_REFUSE_MESSAGE_LEN`].
+        /// A human-readable elaboration, bounded at `MAX_REFUSE_MESSAGE_LEN`.
         #[serde(deserialize_with = "bounded_message")]
         message: String,
     },

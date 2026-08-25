@@ -1573,7 +1573,7 @@ fn verify_ecdsa_p256_asn1(
 ///
 /// The prefix is the fixed algorithm identifier for `id-ecPublicKey` over
 /// `prime256v1` plus the bit-string header and the `0x04` uncompressed-point
-/// tag — the same 27 bytes [`LogKey::from_spki`] strips back off.
+/// tag — the same 27 bytes `LogKey::from_spki` strips back off.
 pub fn p256_spki(point: &[u8]) -> Vec<u8> {
     let mut der = Vec::with_capacity(P256_SPKI_PREFIX.len() + point.len());
     der.extend_from_slice(P256_SPKI_PREFIX);

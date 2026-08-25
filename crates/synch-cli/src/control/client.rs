@@ -393,7 +393,7 @@ impl Chunks {
 /// One streamed-write family (§9.4): the request envelope, the daemon's one
 /// answer, and what a committed write yields.
 ///
-/// [`Put`] and [`PartUpload`] are [`StreamedWrite`] over the two families —
+/// `Put` and `PartUpload` are [`StreamedWrite`] over the two families —
 /// the machine exists once, and this trait is the whole of the difference.
 pub trait WriteFamily: Sized {
     /// The request envelope around one part.

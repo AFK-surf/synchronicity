@@ -178,7 +178,7 @@ pub struct SpaceRow {
     /// publishes and reads.
     pub replicate: Option<ReplicaPolicy>,
     /// Seconds a released root is still held. `None` takes
-    /// [`DEFAULT_REPLICA_GRACE_SECS`].
+    /// `DEFAULT_REPLICA_GRACE_SECS`.
     pub grace: Option<i64>,
     /// A ceiling on bytes held for this space, or `None` for no ceiling.
     pub budget: Option<u64>,

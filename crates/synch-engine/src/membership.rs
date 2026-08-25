@@ -354,7 +354,7 @@ impl Node {
     /// This is the operator's setting, not necessarily the zone in force: an
     /// edit lands here immediately and identity is resolved once per process,
     /// so between a `synch domain set` and the next start the two differ. See
-    /// [`resolving_domain`](Self::resolving_domain) for what is actually being
+    /// `resolving_domain`(Self::resolving_domain) for what is actually being
     /// refreshed.
     pub fn domain(&self) -> Result<Option<String>> {
         Ok(self.store().membership_domain()?)

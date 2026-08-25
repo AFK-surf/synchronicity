@@ -1,10 +1,8 @@
 //! The optional system-Clang compiler path.
 
-use std::{
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+use std::process::{Command, Stdio};
 
+use crate::scratch::{sanitize, write_header};
 use crate::{CcError, Define, Header, STACK_FRAME_SIZE};
 
 pub(crate) fn compile(
@@ -92,17 +90,6 @@ fn run(command: &mut Command, tool: &str, name: &str) -> Result<(), CcError> {
     }
 }
 
-fn write_header(dir: &Path, name: &str, body: &str) -> Result<(), CcError> {
-    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
-        return Err(CcError::Invalid(format!(
-            "{name:?} is not usable as a header name"
-        )));
-    }
-    let path = dir.join(name);
-    std::fs::write(&path, body)
-        .map_err(|e| CcError::Io(format!("cannot write {}: {e}", path.display())))
-}
-
 fn validate_define(symbol: &str) -> Result<(), CcError> {
     let usable = !symbol.is_empty()
         && !symbol.starts_with(|c: char| c.is_ascii_digit())
@@ -118,38 +105,12 @@ fn validate_define(symbol: &str) -> Result<(), CcError> {
     }
 }
 
-fn sanitize(name: &str) -> String {
-    let stem: String = PathBuf::from(name)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let stem = stem.trim_matches('.').to_string();
-    if stem.is_empty() {
-        "program.c".to_string()
-    } else if stem.ends_with(".c") {
-        stem
-    } else {
-        format!("{stem}.c")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{sanitize, validate_define};
+    use super::validate_define;
 
     #[test]
     fn compiler_arguments_cannot_escape_the_scratch_directory() {
-        assert_eq!(sanitize("code/echo.c"), "echo.c");
-        assert_eq!(sanitize("../../etc/passwd"), "passwd.c");
         assert!(validate_define("UPSTREAM_PORT").is_ok());
         assert!(validate_define("not-a-name").is_err());
     }

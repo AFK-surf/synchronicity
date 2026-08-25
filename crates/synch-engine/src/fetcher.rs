@@ -335,7 +335,7 @@ impl Node {
     /// Fetches specific chunk groups, offering local donors first
     /// (`docs/DELTA-SYNC.md` §3.3).
     ///
-    /// Everything [`Node::fetch_groups`] does, with a descent in front of it:
+    /// Everything `Node::fetch_groups` does, with a descent in front of it:
     /// the object's tree is asked for at span granularity, compared against
     /// what the donors hold at the same offsets, and every span that turns out
     /// to be byte-identical is promoted out of local storage instead of being
@@ -343,7 +343,7 @@ impl Node {
     /// again, and only what survives *that* reaches the network.
     ///
     /// The floor is worth stating plainly: with no donors, no provider that
-    /// answers, or no span in common, this is [`Node::fetch_groups`] plus at
+    /// answers, or no span in common, this is `Node::fetch_groups` plus at
     /// most one small exchange — which is why the delta attempt needs no
     /// similarity heuristic in front of it (§3.3).
     pub async fn fetch_groups_from(
