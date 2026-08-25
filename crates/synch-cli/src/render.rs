@@ -129,16 +129,14 @@ pub fn ago(timestamp: i64) -> String {
         return "never".into();
     }
     let seconds = (now_ns() - timestamp) / 1_000_000_000;
-    match seconds {
-        s if s < 0 => "just now".into(),
-        s if s < 60 => format!("{s}s ago"),
-        s if s < 3600 => format!("{}m ago", s / 60),
-        s if s < 86400 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86400),
+    if seconds < 0 {
+        return "just now".into();
     }
+    format!("{} ago", duration(seconds))
 }
 
-/// A coarse duration in seconds, for grace windows.
+/// A coarse duration in seconds: the one s/m/h/d ladder `ago` and
+/// `remaining` render through as well.
 pub fn duration(seconds: i64) -> String {
     match seconds {
         s if s < 60 => format!("{s}s"),
@@ -297,10 +295,7 @@ pub fn remaining(expires_at: i64, now: i64) -> String {
     let seconds = (expires_at - now) / 1_000_000_000;
     match seconds {
         s if s <= 0 => "expired".into(),
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86400),
+        s => duration(s),
     }
 }
 
@@ -808,19 +803,7 @@ fn compare_json(report: &CompareReport) -> String {
 /// quotes and backslashes, so hand-formatting JSON has to escape them.
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    synch_core::json::json_string_into(&mut out, value);
     out
 }
 

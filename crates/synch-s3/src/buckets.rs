@@ -137,7 +137,7 @@ pub fn validate_name(name: &str) -> S3Result<()> {
 }
 
 /// Folds the append-only record log into the bucket map it describes
-/// ([`crate::record_log`]: later records win, a lone name is a removal, a
+/// (`record_log`: later records win, a lone name is a removal, a
 /// malformed record costs only itself).
 pub fn fold(records: &[String]) -> Vec<Bucket> {
     let mut out = crate::record_log::fold(

@@ -112,3 +112,9 @@ pub enum MonitorError {
     #[error("state: {0}")]
     State(String),
 }
+
+impl synch_core::TaskLost for MonitorError {
+    fn task_lost(reason: String) -> Self {
+        MonitorError::Transport(format!("a blocking task did not complete: {reason}"))
+    }
+}

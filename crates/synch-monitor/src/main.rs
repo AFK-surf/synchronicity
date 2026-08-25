@@ -597,7 +597,10 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         args.skip_log.clone(),
         now_unix(),
     );
-    let found = tokio::task::spawn_blocking(move || {
+    // The shared handoff rather than a raw `spawn_blocking`: `offload` enters
+    // the `BlockingScope` that marks this thread as allowed to block, which is
+    // the contract `assert_off_runtime` checks in debug builds.
+    let found = synch_core::offload(move || {
         let repo = match no_tuf {
             true => None,
             false => Some(discover::http_repo(&tuf)?),
@@ -612,8 +615,7 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
             &mut |warning| eprintln!("synch-monitor: {warning}"),
         )
     })
-    .await
-    .map_err(|e| MonitorError::Transport(format!("discovery: {e}")))??;
+    .await?;
     eprintln!(
         "synch-monitor: reading {} log(s) (via {}): {}",
         found.base_urls.len(),

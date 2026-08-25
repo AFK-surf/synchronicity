@@ -8,6 +8,7 @@ pub mod civil;
 pub mod fs;
 pub mod hash;
 pub mod head;
+pub mod json;
 pub mod origin;
 pub mod path;
 pub mod record;
