@@ -125,6 +125,21 @@ fn ret(value: i64) -> Result<u64, ()> {
     Ok(value as u64)
 }
 
+/// Unwraps a guest-supplied argument, answering the guest's errno and ending
+/// the helper when it does not parse.
+///
+/// The same four-line match stood at every argument read in this file; in a
+/// file whose auditability matters, the pattern deserves one name beside
+/// [`ret`], so a reviewer reads the argument, not the plumbing.
+macro_rules! guest {
+    ($e:expr) => {
+        match $e {
+            Ok(value) => value,
+            Err(e) => return ret(e),
+        }
+    };
+}
+
 /// Runs `f` with the invocation state.
 ///
 /// A missing resource is a runtime bug rather than anything a guest can
@@ -189,10 +204,7 @@ fn mode_check(inner: &Inner, declaring: bool) -> Option<i64> {
 // ---- diagnostics and configuration ---------------------------------------
 
 fn h_log(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let msg = match bytes(scope, ptr, len.min(MAX_LOG_LINE as u64)) {
-        Ok(m) => m,
-        Err(e) => return ret(e),
-    };
+    let msg = guest!(bytes(scope, ptr, len.min(MAX_LOG_LINE as u64)));
     with(scope, |inner| {
         let mut buf = inner.log_buf.borrow_mut();
         for byte in msg {
@@ -250,10 +262,7 @@ fn h_config_get(
     out_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match string(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(string(scope, key_ptr, key_len));
     let value = with(scope, |inner| {
         inner.policy.config_get(&key).map(str::to_string)
     })?;
@@ -271,10 +280,7 @@ fn h_metric_add(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let name = match string(scope, ptr, len) {
-        Ok(n) => n,
-        Err(e) => return ret(e),
-    };
+    let name = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&name) {
         return ret(errno::EINVAL);
     }
@@ -289,14 +295,8 @@ fn h_label_set(
     val_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match string(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
-    let value = match string(scope, val_ptr, val_len) {
-        Ok(v) => v,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(string(scope, key_ptr, key_len));
+    let value = guest!(string(scope, val_ptr, val_len));
     if !synch_core::display_text_is_safe(&key) || !synch_core::display_text_is_safe(&value) {
         return ret(errno::EINVAL);
     }
@@ -367,10 +367,7 @@ fn h_peer_has_space(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let space = match string(scope, ptr, len) {
-        Ok(s) => s,
-        Err(e) => return ret(e),
-    };
+    let space = guest!(string(scope, ptr, len));
     with(scope, |inner| u64::from(inner.peer.has_space(&space)))
 }
 
@@ -387,10 +384,7 @@ fn h_conn_meta(
     out_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match string(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(string(scope, key_ptr, key_len));
     let value = with(scope, |inner| {
         inner
             .meta
@@ -447,10 +441,7 @@ fn h_write(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len.min(MAX_COPY)) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len.min(MAX_COPY)));
     let Some(ep) = with(scope, |inner| inner.endpoint(handle as i64))? else {
         return ret(errno::EBADF);
     };
@@ -577,10 +568,7 @@ fn h_tcp_connect(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let host = match string(scope, ptr, len) {
-        Ok(h) => h,
-        Err(e) => return ret(e),
-    };
+    let host = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&host) {
         return ret(errno::EINVAL);
     }
@@ -601,10 +589,7 @@ fn h_tcp_connect_ip(
     // Accepts the textual form: a program with no heap builds an address by
     // printing it far more easily than by packing four or sixteen bytes, and
     // the policy list it is checked against is textual anyway.
-    let host = match string(scope, ptr, len) {
-        Ok(h) => h,
-        Err(e) => return ret(e),
-    };
+    let host = guest!(string(scope, ptr, len));
     if host.parse::<std::net::IpAddr>().is_err() {
         return ret(errno::EINVAL);
     }
@@ -872,10 +857,7 @@ fn h_open_from(
     path_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let origin = match string(scope, origin_ptr, origin_len) {
-        Ok(o) => o,
-        Err(e) => return ret(e),
-    };
+    let origin = guest!(string(scope, origin_ptr, origin_len));
     match string(scope, path_ptr, path_len) {
         Ok(path) => open_common(scope, Some(origin), path),
         Err(e) => ret(e),
@@ -883,10 +865,7 @@ fn h_open_from(
 }
 
 fn h_open_root(scope: &HelperScope, ptr: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let raw = match bytes(scope, ptr, 32) {
-        Ok(r) => r,
-        Err(e) => return ret(e),
-    };
+    let raw = guest!(bytes(scope, ptr, 32));
     let Ok(root) = synch_core::Hash::from_slice(&raw) else {
         return ret(errno::EINVAL);
     };
@@ -998,10 +977,7 @@ fn h_pread(
 }
 
 fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let prefix = match string(scope, ptr, len) {
-        Ok(p) => p,
-        Err(e) => return ret(e),
-    };
+    let prefix = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&prefix) {
         return ret(errno::EINVAL);
     }
@@ -1064,10 +1040,7 @@ fn h_map_get(
     out_len: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, key_ptr, key_len));
     let value = with(scope, |inner| {
         inner
             .maps
@@ -1094,14 +1067,8 @@ fn h_map_set(
     val_len: u64,
     ttl_ms: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
-    let value = match bytes(scope, val_ptr, val_len) {
-        Ok(v) => v,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, key_ptr, key_len));
+    let value = guest!(bytes(scope, val_ptr, val_len));
     with(scope, |inner| {
         let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
         match inner.maps.set(
@@ -1127,10 +1094,7 @@ fn h_map_delete(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, ptr, len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, ptr, len));
     with(scope, |inner| {
         i64::from(inner.maps.delete(&inner.map_namespace(), &key))
     })
@@ -1145,10 +1109,7 @@ fn h_map_incr(
     ttl_ms: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, key_ptr, key_len));
     with(scope, |inner| {
         let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
         match inner.maps.incr(
@@ -1174,10 +1135,7 @@ fn h_rate_limit(
     window_ms: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, key_ptr, key_len));
     with(scope, |inner| {
         match inner.maps.rate_limit(
             &inner.map_namespace(),
@@ -1200,10 +1158,7 @@ fn h_memcpy(scope: &HelperScope, dst: u64, src: u64, n: u64, _: u64, _: u64) -> 
     if n == 0 {
         return Ok(dst);
     }
-    let data = match bytes(scope, src, n) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, src, n));
     let Ok(mut region) = scope.user_memory_mut(dst, n) else {
         return ret(errno::EINVAL);
     };
@@ -1215,14 +1170,8 @@ fn h_memcmp(scope: &HelperScope, a: u64, b: u64, n: u64, _: u64, _: u64) -> Resu
     if n == 0 {
         return ret(0);
     }
-    let left = match bytes(scope, a, n) {
-        Ok(l) => l,
-        Err(e) => return ret(e),
-    };
-    let right = match bytes(scope, b, n) {
-        Ok(r) => r,
-        Err(e) => return ret(e),
-    };
+    let left = guest!(bytes(scope, a, n));
+    let right = guest!(bytes(scope, b, n));
     for (l, r) in left.iter().zip(right.iter()) {
         if l != r {
             return ret(i64::from(*l) - i64::from(*r));
@@ -1246,14 +1195,8 @@ fn h_memset(scope: &HelperScope, dst: u64, byte: u64, n: u64, _: u64, _: u64) ->
 }
 
 fn h_ct_eq(scope: &HelperScope, a: u64, b: u64, n: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let left = match bytes(scope, a, n) {
-        Ok(l) => l,
-        Err(e) => return ret(e),
-    };
-    let right = match bytes(scope, b, n) {
-        Ok(r) => r,
-        Err(e) => return ret(e),
-    };
+    let left = guest!(bytes(scope, a, n));
+    let right = guest!(bytes(scope, b, n));
     let mut diff = 0u8;
     for (l, r) in left.iter().zip(right.iter()) {
         diff |= l ^ r;
@@ -1262,18 +1205,12 @@ fn h_ct_eq(scope: &HelperScope, a: u64, b: u64, n: u64, _: u64, _: u64) -> Resul
 }
 
 fn h_blake3(scope: &HelperScope, ptr: u64, len: u64, out: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     out_exact(scope, out, 32, blake3::hash(&data).as_bytes())
 }
 
 fn h_sha256(scope: &HelperScope, ptr: u64, len: u64, out: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &data);
     out_exact(scope, out, 32, digest.as_ref())
 }
@@ -1286,14 +1223,8 @@ fn h_hmac_sha256(
     msg_len: u64,
     out: u64,
 ) -> Result<u64, ()> {
-    let key = match bytes(scope, key_ptr, key_len) {
-        Ok(k) => k,
-        Err(e) => return ret(e),
-    };
-    let msg = match bytes(scope, msg_ptr, msg_len) {
-        Ok(m) => m,
-        Err(e) => return ret(e),
-    };
+    let key = guest!(bytes(scope, key_ptr, key_len));
+    let msg = guest!(bytes(scope, msg_ptr, msg_len));
     let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &key);
     let tag = aws_lc_rs::hmac::sign(&key, &msg);
     out_exact(scope, out, 32, tag.as_ref())
@@ -1318,10 +1249,7 @@ fn h_base64_encode(
     out_len: u64,
     kind: u64,
 ) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     let Some(engine) = engine(kind) else {
         return ret(errno::EINVAL);
     };
@@ -1336,10 +1264,7 @@ fn h_base64_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     let Some(engine) = engine(kind) else {
         return ret(errno::EINVAL);
     };
@@ -1363,10 +1288,7 @@ fn h_hex_encode(
     out_len: u64,
     upper: u64,
 ) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     let text = if upper == 0 {
         hex::encode(&data)
     } else {
@@ -1383,10 +1305,7 @@ fn h_hex_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = match bytes(scope, ptr, len) {
-        Ok(d) => d,
-        Err(e) => return ret(e),
-    };
+    let data = guest!(bytes(scope, ptr, len));
     let Ok(decoded) = hex::decode(&data) else {
         return ret(errno::EINVAL);
     };
@@ -1407,10 +1326,7 @@ fn h_declare_name(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let name = match string(scope, ptr, len) {
-        Ok(n) => n,
-        Err(e) => return ret(e),
-    };
+    let name = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&name) {
         return ret(errno::EINVAL);
     }
@@ -1432,10 +1348,7 @@ fn h_declare_egress(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let host = match string(scope, ptr, len) {
-        Ok(h) => h,
-        Err(e) => return ret(e),
-    };
+    let host = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&host) {
         return ret(errno::EINVAL);
     }
@@ -1470,10 +1383,7 @@ fn h_declare_tree_read(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let prefix = match string(scope, ptr, len) {
-        Ok(p) => p,
-        Err(e) => return ret(e),
-    };
+    let prefix = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&prefix) {
         return ret(errno::EINVAL);
     }
