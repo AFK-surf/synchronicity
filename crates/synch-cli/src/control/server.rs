@@ -788,7 +788,6 @@ impl Control for ControlService {
             .await
             .map_err(ControlError::from)?;
         Ok(Response::new(pb::DeleteResponse {
-            removed: deleted.removed,
             still_published: deleted.still_published,
         }))
     }
@@ -845,7 +844,6 @@ impl Control for ControlService {
         Ok(Response::new(pb::CompleteUploadResponse {
             etag: completed.root.as_bytes().to_vec(),
             size: completed.size,
-            replayed: completed.replayed,
         }))
     }
 
@@ -3438,7 +3436,6 @@ fn entry_info(row: &EntryRow, set: &VersionSet) -> EntryInfo {
         size: row.size,
         mtime_ns: row.mtime_ns,
         content: row.content,
-        seq: row.seq,
         symlink_target: row.symlink_target.clone(),
         versions: set.version_count() as u32,
     }

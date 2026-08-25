@@ -171,7 +171,6 @@ impl Client {
             .await?
             .into_inner();
         Ok(Deleted {
-            removed: response.removed,
             still_published: response.still_published,
         })
     }
@@ -252,7 +251,6 @@ impl Client {
         Ok(CompletedUpload {
             etag: hash_from(&response.etag, "etag")?,
             size: response.size,
-            replayed: response.replayed,
         })
     }
 
@@ -643,8 +641,6 @@ pub struct CompletedUpload {
     pub etag: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// True when a retry was answered from the recorded result.
-    pub replayed: bool,
 }
 
 /// Reads a 32-byte hash column off the wire.
@@ -653,11 +649,9 @@ fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
         .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))
 }
 
-/// What a delete did, and what it left behind.
+/// What a delete left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deleted {
-    /// Whether there was a local copy to remove.
-    pub removed: bool,
     /// Whether some origin still publishes a live entry for the path (§8).
     pub still_published: bool,
 }

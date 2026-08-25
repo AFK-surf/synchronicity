@@ -283,8 +283,6 @@ pub struct EntryInfo {
     pub mtime_ns: i64,
     /// The object root, for files.
     pub content: Option<Hash>,
-    /// The origin trie seq this version was published at.
-    pub seq: u64,
     /// The link target, for a symlink.
     pub symlink_target: Option<String>,
     /// How many versions the path carries in the unified tree (§8). One means
@@ -302,7 +300,6 @@ impl From<EntryInfo> for pb::Entry {
             size: info.size,
             mtime_ns: info.mtime_ns,
             content: info.content.map(|root| root.as_bytes().to_vec()),
-            seq: info.seq,
             symlink_target: info.symlink_target,
             versions: info.versions,
         }
@@ -327,7 +324,6 @@ impl TryFrom<pb::Entry> for EntryInfo {
             size: entry.size,
             mtime_ns: entry.mtime_ns,
             content,
-            seq: entry.seq,
             symlink_target: entry.symlink_target,
             versions: entry.versions,
         })
@@ -416,7 +412,6 @@ mod tests {
             size: 7,
             mtime_ns: 42,
             content: Some(Hash::new(b"payload")),
-            seq: 3,
             symlink_target: None,
             versions: 1,
         };

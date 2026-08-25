@@ -750,6 +750,11 @@ impl<'a, S: TileSource> Tree<'a, S> {
     }
 
     /// The RFC 6962 audit path from leaf `index` to this tree's root.
+    ///
+    /// The monitor never emits proofs — this exists so the test below can
+    /// cross-check `synch_net::rekor::verify_inclusion` against a path
+    /// computed by an independent walk.
+    #[cfg(test)]
     pub async fn inclusion_path(&self, index: u64) -> Result<Vec<[u8; 32]>, MonitorError> {
         if index >= self.size {
             return Err(MonitorError::Tile(format!(
@@ -1164,6 +1169,7 @@ fn fold(data: &[u8]) -> Option<[u8; 32]> {
 ///
 /// Checked for the same reason as [`max_pow2_le`]: the bound comes from the
 /// log.
+#[cfg(test)]
 fn max_pow2_lt(n: u64) -> u64 {
     let mut k = 1u64;
     while k.checked_mul(2).is_some_and(|next| next < n) {

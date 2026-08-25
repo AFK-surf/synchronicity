@@ -76,8 +76,6 @@ pub struct PartStaging {
 /// What a delete did, and what it left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deleted {
-    /// Whether there was a local copy to remove.
-    pub removed: bool,
     /// Whether some origin still publishes a live entry for the path.
     ///
     /// True means the delete did what it could and the key is still readable:
@@ -92,9 +90,6 @@ pub struct CompletedUpload {
     pub root: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// True when the answer came from a recorded result rather than an
-    /// assembly that ran now.
-    pub replayed: bool,
 }
 
 impl Node {
@@ -335,11 +330,7 @@ impl Node {
             // A retried completion. The client never saw the first answer, so
             // it gets that answer rather than being told its upload is gone.
             synch_store::CompleteStart::AlreadyCompleted { etag, size } => {
-                return Ok(CompletedUpload {
-                    root: etag,
-                    size,
-                    replayed: true,
-                })
+                return Ok(CompletedUpload { root: etag, size })
             }
             synch_store::CompleteStart::Ready { space, path, parts } => (space, path, parts),
         };
@@ -491,11 +482,7 @@ impl Node {
             }
         }
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        Ok(CompletedUpload {
-            root,
-            size,
-            replayed: false,
-        })
+        Ok(CompletedUpload { root, size })
     }
 
     /// Removes this node's copy of a path and publishes its tombstone (§8,
@@ -522,12 +509,11 @@ impl Node {
         // store, and §10 keeps store reads off the runtime workers.
         let node = self.clone();
         let (space_owned, path_owned) = (space.to_string(), path.to_string());
-        let removed = crate::blocking::offload(move || {
+        crate::blocking::offload(move || {
             node.ensure_publishable()?;
             node.adopt_deletion(&space_owned, &path_owned)
         })
-        .await?
-        .is_some();
+        .await?;
 
         // Unconditionally, and not only when a file was removed. The tombstone
         // comes from the scanner's deletion sweep, which walks `local_files`
@@ -610,10 +596,7 @@ impl Node {
             .entries
             .iter()
             .any(|entry| entry.origin != *ours && entry.kind != synch_core::EntryKind::Tombstone);
-        Ok(Deleted {
-            removed,
-            still_published,
-        })
+        Ok(Deleted { still_published })
     }
 
     /// Drops an upload and everything staged for it.
