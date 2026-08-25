@@ -1,6 +1,16 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, fill, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key or a network-scoped join key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
+description: >-
+  Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon,
+  index local directories as spaces, join a control-plane-managed membership
+  zone, delegate space-restricted access, read the unified tree, resolve
+  divergent paths, build and serve Synchronicity sockets, mirror, fill, pin,
+  rotate keys, and recover a lost origin — and drive the control plane's own
+  HTTP API with an org-scoped API key or a network-scoped join key, to enroll
+  devices, manage networks and keys, and browse a cluster's files without a
+  browser. Use whenever a task involves `synch`, `synch-s3`, a Synchronicity
+  socket, a synchronicity cluster, a node's data directory, or the
+  control-plane API.
 ---
 
 # synch
@@ -237,6 +247,118 @@ media/notes.txt  2 version(s)  ⑂2
 
 `synch take <origin>:media/notes.txt` on that tombstone removes the local copy
 and publishes your own. Once every publisher has, the path leaves the tree.
+
+## Synchronicity sockets
+
+A **socket** exposes a program at a path in this node's published tree. Its
+file content is an eBPF ELF object; an incoming stream runs one invocation of
+that object on the node that published it. The caller supplies bytes and a
+verified peer identity, never code. This is the rule to keep in mind:
+
+> A node executes only eBPF that is present in its own published tree.
+
+That makes the two sides deliberately asymmetric. `synch socket ...` builds,
+declares, approves and operates programs belonging to this node. `synch
+connect ...` is only a byte pump to a socket belonging to a named origin and
+needs no eBPF runtime on the caller.
+
+### Build, publish and arm one
+
+The normal path from C source to a runnable socket is:
+
+```sh
+synch socket build git.c -o code/git.sock       # C to eBPF; no daemon needed
+synch socket add code/git.sock                  # declare this local path a socket
+synch scan                                      # publish it as kind=Socket
+synch socket arm code/git.sock                  # inspect root and declarations
+synch socket arm code/git.sock --review <token> # approve exactly that inspection
+synch socket ls -l                              # verify armed root and policy
+```
+
+On supported builds, `socket build` uses the compiler embedded in `synch` and
+automatically supplies its matching `synch.h`; there is no libc. Use
+`synch socket sdk > synch.h` to inspect that header. `--clang` instead uses
+compatible `clang` and `llc` executables from `PATH` at `-O2`, and `-D
+NAME[=VALUE]` supplies compile-time definitions. Windows builds need this
+`--clang` route to build, but can connect normally.
+
+The object must already be below a directory registered with `synch space
+add`. Declaration and arming are separate local gates:
+
+- `synch socket add <space>/<path>` makes the next scan publish the entry as a
+  socket. Add `--config k=v` for values read through `sy_config_get`,
+  `--max-streams N` for a local concurrency ceiling, or `--note TEXT` for an
+  operator note.
+- The first `socket arm` runs the object's `synchronicity.init` hook and prints
+  the program root, resource shape and declared effects, such as outbound TCP
+  destinations or tree reads. It does **not** approve the object. Review that
+  output, then pass its opaque token to `--review`; the token binds the content
+  root, current local authorization revision and exact init result.
+- Approval pins the BLAKE3 content root. Replacing the object and scanning
+  leaves the new root published but not runnable until it is reviewed and
+  armed. In-flight invocations keep the root they started with.
+
+`synch socket add --auto` deliberately skips that fresh review by re-arming on
+every content change. Use it only when the path has a single trusted writer.
+It is unsafe for a path an S3 key, `synch fill`, or `synch take` can write,
+because each can replace bytes that this node then publishes as its own.
+
+Serving sockets requires Linux, macOS or OpenBSD on x86-64 or arm64, where the
+async-ebpf runtime is available. Connecting works on every platform supported
+by `synch` because the connecting side executes nothing.
+
+### Connect to one
+
+Connections always require an origin-qualified reference; there is no
+`newest`, `strict`, or other version-selection policy for execution:
+
+```sh
+synch connect nas@cluster.acme.example.com:code/git.sock
+synch connect nas@cluster.acme.example.com:code/git.sock --meta repo=docs
+synch connect nas@cluster.acme.example.com:code/git.sock \
+  --listen 127.0.0.1:9418
+synch connect nas@cluster.acme.example.com:code/git.sock \
+  --listen 127.0.0.1:9418 --once
+```
+
+Without `--listen`, stdin goes to the stream and the reply goes to stdout.
+With it, the CLI owns the TCP listener and opens one invocation per accepted
+connection; ending the CLI ends the listener. `--meta k=v` is caller-chosen,
+untrusted metadata the program may read. The local daemon owns the actual
+Synchronicity endpoint and bridges the control-socket stream, so it must be
+running on the connecting side too.
+
+The destination resolves the path only in the named origin's trie, verifies
+membership and delegation, requires the entry to be a locally declared socket,
+and requires its current root to be armed. Publication alone is never execute
+permission. A program's undeclared tree reads and outbound connections are
+also denied even after it is armed.
+
+Adopting a peer's socket with `synch take`, `fill`, a mirror or S3 copies its
+bytes as an ordinary file. Socket-ness is a local assertion created only by
+`synch socket add`, and executability is a separate local approval. If one
+origin publishes a socket and another publishes a regular file with identical
+bytes, they are divergent versions rather than one unanimous version.
+
+### Operate and troubleshoot sockets
+
+```sh
+synch socket ls [<space>] -l        # declarations, current/armed roots, drift
+synch socket ps [<space>/<path>]    # live invocations, ids, peers and counters
+synch socket log <space>/<path>     # recent sy_log output
+synch socket kill <invocation>      # end one invocation
+synch socket disarm <space>/<path>  # keep publishing it; refuse new runs
+synch socket rm <space>/<path>      # undeclare; next scan publishes a file
+```
+
+The common refusals say which gate failed: `NoSuchPath` means that origin does
+not publish the path, `NotASocket` that it is not a socket entry, `NotArmed`
+that the current root lacks approval, `Unauthorized` that the caller is not a
+member or delegate, `SpaceNotDelegated` that the socket falls outside the
+caller's grant, `Busy` that its concurrency cap is full, and `ProgramInvalid`
+that the object could not load or link. Repeated program faults automatically
+disarm that socket; inspect `socket log` and `socket ls -l`, fix or rebuild the
+object, scan it, and review and arm the new root.
 
 ## Membership
 
