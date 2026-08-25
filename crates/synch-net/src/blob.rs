@@ -26,8 +26,17 @@ use synch_store::{Proven, Store};
 use crate::{
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
-    frame::{read_bytes, read_frame, write_bytes, write_frame},
+    frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame},
 };
+
+impl crate::frame::Answer for BlobMessage {
+    /// The blob protocol has no in-band refusal frame: a provider that cannot
+    /// serve answers with empty served ranges, and one that refuses outright
+    /// resets the stream. Every frame is therefore its own answer.
+    fn into_refusal(self) -> Result<Self, String> {
+        Ok(self)
+    }
+}
 
 /// How many consecutive empty windows a provider may answer with before a
 /// fetch gives up on it and lets the caller try someone else.
@@ -355,19 +364,12 @@ impl BlobClient {
     /// Requests a verified slice.
     pub async fn get_slice(&self, root: Hash, ranges: &ChunkRanges) -> Result<Slice, NetError> {
         under_deadline(self.deadline, "a slice request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(
-                &mut send,
-                &BlobMessage::GetSlice {
-                    root,
-                    ranges: ranges.clone(),
-                },
-            )
-            .await?;
-            let _ = send.finish();
-
-            let encoded = read_bytes(&mut recv).await?;
-            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+            let request = BlobMessage::GetSlice {
+                root,
+                ranges: ranges.clone(),
+            };
+            let (encoded, end) = self.body_and_end(&request).await?;
+            let served = match end {
                 BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
                 _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
             };
@@ -384,26 +386,31 @@ impl BlobClient {
         level: u8,
     ) -> Result<Proof, NetError> {
         under_deadline(self.deadline, "a proof request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(
-                &mut send,
-                &BlobMessage::GetProof {
-                    root,
-                    ranges: ranges.clone(),
-                    level,
-                },
-            )
-            .await?;
-            let _ = send.finish();
-
-            let encoded = read_bytes(&mut recv).await?;
-            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+            let request = BlobMessage::GetProof {
+                root,
+                ranges: ranges.clone(),
+                level,
+            };
+            let (encoded, end) = self.body_and_end(&request).await?;
+            let served = match end {
                 BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
                 _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
             };
             Ok(Proof { encoded, served })
         })
         .await
+    }
+
+    /// Runs one blob exchange: the request, then the raw body and its End
+    /// frame — the answer shape both blob requests share.
+    async fn body_and_end(
+        &self,
+        request: &BlobMessage,
+    ) -> Result<(Vec<u8>, BlobMessage), NetError> {
+        let mut recv = crate::frame::request(&self.connection, request).await?;
+        let encoded = read_bytes(&mut recv).await?;
+        let end = read_answer::<BlobMessage>(&mut recv).await?;
+        Ok((encoded, end))
     }
 
     /// Requests the tree over a range and commits it to the local CAS,

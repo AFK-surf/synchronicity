@@ -22,7 +22,7 @@ use synch_store::Store;
 use crate::{
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
-    frame::{read_frame, write_frame},
+    frame::{exchange, read_answer, read_frame, write_frame},
 };
 
 /// What the `sync/mpt/1` responder needs from the layer that reconciles heads.
@@ -656,6 +656,15 @@ fn unexpected(wanted: &str, got: &MptMessage) -> NetError {
     NetError::Unexpected(format!("expected {wanted}, got {}", message_name(got)))
 }
 
+impl crate::frame::Answer for MptMessage {
+    fn into_refusal(self) -> Result<Self, String> {
+        match self {
+            MptMessage::Error { reason } => Err(reason),
+            other => Ok(other),
+        }
+    }
+}
+
 fn message_name(msg: &MptMessage) -> &'static str {
     match msg {
         MptMessage::Hello { .. } => "Hello",
@@ -771,7 +780,7 @@ impl MptClient {
             )
             .await?;
 
-            let (summaries, scope) = match read_frame::<MptMessage>(&mut recv).await? {
+            let (summaries, scope) = match read_answer::<MptMessage>(&mut recv).await? {
                 MptMessage::Hello {
                     proto,
                     heads,
@@ -785,10 +794,6 @@ impl MptClient {
                     check_heads(heads.len(), "a Hello summary list")?;
                     (heads, scope)
                 }
-                // A responder that refuses says why, and the reason is the
-                // error — reading it as a shape mismatch loses the only account
-                // of what went wrong the peer will ever give.
-                MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
                 other => return Err(unexpected("Hello", &other)),
             };
 
@@ -797,7 +802,7 @@ impl MptClient {
             write_frame(&mut send, &MptMessage::Heads { heads: push }).await?;
             write_frame(&mut send, &MptMessage::HeadsWant { origins: want }).await?;
 
-            let received = match read_frame::<MptMessage>(&mut recv).await? {
+            let received = match read_answer::<MptMessage>(&mut recv).await? {
                 MptMessage::Heads { heads } => {
                     // The answer to our own `HeadsWant` is bounded like every
                     // other head-carrying message, and it is the easiest one to
@@ -811,7 +816,6 @@ impl MptClient {
                     check_heads(heads.len(), "a Heads answer")?;
                     heads
                 }
-                MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
                 other => return Err(unexpected("Heads", &other)),
             };
             let _ = send.finish();
@@ -828,12 +832,13 @@ impl MptClient {
     /// Pushes a head reactively (§5.3).
     pub async fn push_head(&self, head: &SignedHead) -> Result<(), NetError> {
         under_deadline(self.deadline, "a head push", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::HeadPush { head: head.clone() }).await?;
-            let _ = send.finish();
-            match read_frame::<MptMessage>(&mut recv).await? {
+            match exchange(
+                &self.connection,
+                &MptMessage::HeadPush { head: head.clone() },
+            )
+            .await?
+            {
                 MptMessage::Heads { .. } => Ok(()),
-                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("an acknowledgement", &other)),
             }
         })
@@ -854,10 +859,12 @@ impl MptClient {
         debug_assert!(wants.len() <= MAX_BATCH, "a batch past the responder's cap");
         let batch: Vec<(Vec<u8>, Hash)> = wants.to_vec();
         under_deadline(self.deadline, "a trie node request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::GetNodes { root, wants: batch }).await?;
-            let _ = send.finish();
-            match read_frame::<MptMessage>(&mut recv).await? {
+            match exchange(
+                &self.connection,
+                &MptMessage::GetNodes { root, wants: batch },
+            )
+            .await?
+            {
                 MptMessage::Nodes {
                     nodes,
                     missing,
@@ -867,7 +874,6 @@ impl MptClient {
                     missing,
                     redacted,
                 }),
-                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Nodes", &other)),
             }
         })
@@ -885,12 +891,13 @@ impl MptClient {
         debug_assert!(wants.len() <= MAX_BATCH, "a batch past the responder's cap");
         let batch: Vec<(Vec<u8>, Hash)> = wants.to_vec();
         under_deadline(self.deadline, "a trie value request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::GetValues { root, wants: batch }).await?;
-            let _ = send.finish();
-            match read_frame::<MptMessage>(&mut recv).await? {
+            match exchange(
+                &self.connection,
+                &MptMessage::GetValues { root, wants: batch },
+            )
+            .await?
+            {
                 MptMessage::Values { values, missing } => Ok(ValuesResponse { values, missing }),
-                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Values", &other)),
             }
         })
@@ -904,10 +911,7 @@ impl MptClient {
         object_root: Hash,
     ) -> Result<Vec<(OriginId, BlobAd)>, NetError> {
         under_deadline(self.deadline, "a provider hint request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::FindProviders { object_root }).await?;
-            let _ = send.finish();
-            match read_frame::<MptMessage>(&mut recv).await? {
+            match exchange(&self.connection, &MptMessage::FindProviders { object_root }).await? {
                 MptMessage::Providers { ads } => {
                     if ads.len() > MAX_PROVIDER_ADS {
                         return Err(NetError::Unexpected(format!(
@@ -917,7 +921,6 @@ impl MptClient {
                     }
                     Ok(ads)
                 }
-                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Providers", &other)),
             }
         })
@@ -932,16 +935,10 @@ impl MptClient {
     /// and that a node cannot make from its own view of DNS.
     pub async fn get_bindings(&self, origin: &OriginId) -> Result<Vec<NodeId>, NetError> {
         under_deadline(self.deadline, "a binding request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(
-                &mut send,
-                &MptMessage::GetBindings {
-                    origin: origin.clone(),
-                },
-            )
-            .await?;
-            let _ = send.finish();
-            match read_frame::<MptMessage>(&mut recv).await? {
+            let request = MptMessage::GetBindings {
+                origin: origin.clone(),
+            };
+            match exchange(&self.connection, &request).await? {
                 MptMessage::BindingsFor {
                     origin: answered,
                     keys,
@@ -959,7 +956,6 @@ impl MptClient {
                 } => Err(NetError::Unexpected(format!(
                     "asked about {origin}, answered about {answered}"
                 ))),
-                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("BindingsFor", &other)),
             }
         })
