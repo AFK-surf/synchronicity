@@ -20,9 +20,6 @@ use crate::{
     node::{Node, StagedChange},
 };
 
-/// Distinguishes concurrent detached ingests before their content root exists.
-static DETACHED_INGEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// How far past a file's mtime its hash must have been taken before the
 /// `(size, mtime_ns, file_id)` stat check is proof of "unchanged".
 ///
@@ -806,11 +803,10 @@ impl Node {
         let staged = {
             let node = self.clone();
             crate::blocking::offload(move || {
-                Ok(node.store().staging_dir().join(format!(
-                    "take-{}-{}.payload",
-                    std::process::id(),
-                    now_ns()
-                )))
+                Ok(node
+                    .store()
+                    .staging_dir()
+                    .join(format!("take-{}.payload", synch_core::fs::unique_suffix())))
             })
             .await?
         };
@@ -891,9 +887,8 @@ impl Node {
             self.ensure_adoptable(space_id, path)?;
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
-                "detached-{}-{}.payload",
-                std::process::id(),
-                DETACHED_INGEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                "detached-{}.payload",
+                synch_core::fs::unique_suffix()
             ));
             return Adoption::open(target);
         }
@@ -1260,9 +1255,8 @@ impl Adoption {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "object".into());
         let staging = target.with_file_name(format!(
-            ".{name}.{}.{}{PART_SUFFIX}",
-            std::process::id(),
-            synch_core::now_ns()
+            ".{name}.{}{PART_SUFFIX}",
+            synch_core::fs::unique_suffix()
         ));
         // Read *and* write: the payload is written here, and a multipart
         // completion reads it straight back to take the object's root before
@@ -1310,11 +1304,7 @@ impl Adoption {
         // The staging name has to be unique per write: two clients putting the
         // same key at once must not share one file and interleave their bytes.
         let name = rel.rsplit('/').next().unwrap_or(rel);
-        let staging_name = format!(
-            ".{name}.{}.{}{PART_SUFFIX}",
-            std::process::id(),
-            synch_core::now_ns()
-        );
+        let staging_name = format!(".{name}.{}{PART_SUFFIX}", synch_core::fs::unique_suffix());
         // Read *and* write: the payload is written here, and a multipart
         // completion reads it straight back to take the object's root before
         // the rename. `File::create` alone is write-only, and the read then
@@ -1371,11 +1361,7 @@ impl Adoption {
         // The staging name has to be unique per write: two clients putting the
         // same key at once must not share one file and interleave their bytes.
         let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
-        let staging_name = format!(
-            ".{name}.{}.{}{PART_SUFFIX}",
-            std::process::id(),
-            synch_core::now_ns()
-        );
+        let staging_name = format!(".{name}.{}{PART_SUFFIX}", synch_core::fs::unique_suffix());
         // Created relative to the pinned parent — a pre-placed reparse point
         // at the staging name is opened as itself (`OPEN_REPARSE_POINT`)
         // rather than followed, and overwritten in place.

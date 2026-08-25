@@ -7,7 +7,6 @@ use std::{
     collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use bao_tree::BaoTree;
@@ -27,8 +26,6 @@ use crate::{
 };
 
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
-static INGEST_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// One cloud service admitted by the serverless CAS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudService {
@@ -436,11 +433,7 @@ struct Staged {
 fn stage_and_hash(source: &Path, scratch_dir: &Path) -> Result<Staged> {
     std::fs::create_dir_all(scratch_dir)?;
     let size = std::fs::metadata(source)?.len();
-    let payload = scratch_dir.join(format!(
-        "ingest-{}-{}.tmp",
-        std::process::id(),
-        INGEST_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let payload = scratch_dir.join(format!("ingest-{}.tmp", synch_core::fs::unique_suffix()));
     let staged = (|| {
         let tree = BaoTree::new(size, bao_tree::BlockSize::from_chunk_log(CHUNK_GROUP_LOG2));
         let mut outboard = vec![0u8; tree.outboard_size() as usize];

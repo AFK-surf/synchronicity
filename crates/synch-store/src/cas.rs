@@ -34,10 +34,6 @@ use crate::{
 /// The bao block size synchronicity uses everywhere: 16 KiB chunk groups.
 pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(CHUNK_GROUP_LOG2);
 
-/// Distinguishes concurrent staging files within one process. The name also
-/// carries the pid, so two daemons over one CAS never collide either.
-static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Flushes a file's contents to stable storage. A blob row is only ever written
 /// after this returns, so a crash cannot leave a `complete=1` index row whose
 /// bytes never reached the disk (§6.2 durability).
@@ -48,41 +44,7 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
 
 pub(crate) use synch_core::fs::fsync_parent;
 
-/// Atomically replaces a file on platforms whose plain rename refuses an
-/// existing destination.
-#[cfg(not(windows))]
-pub(crate) fn replace_file(
-    source: &std::path::Path,
-    target: &std::path::Path,
-) -> std::io::Result<()> {
-    std::fs::rename(source, target)
-}
-
-#[cfg(windows)]
-pub(crate) fn replace_file(
-    source: &std::path::Path,
-    target: &std::path::Path,
-) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
+pub(crate) use synch_core::fs::replace_file;
 
 /// Writes a file whole and flushes it (contents and directory entry) to stable
 /// storage before returning.
@@ -108,11 +70,7 @@ fn write_and_sync(
     data: &[u8],
 ) -> Result<()> {
     std::fs::create_dir_all(staging_dir)?;
-    let staging = staging_dir.join(format!(
-        "{}-{}.tmp",
-        std::process::id(),
-        STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let staging = staging_dir.join(format!("{}.tmp", synch_core::fs::unique_suffix()));
     let write = || -> Result<()> {
         let mut file = File::create(&staging)?;
         file.write_all(data)?;
@@ -701,11 +659,9 @@ impl Store {
         // (a scan and a control-socket `put`, or parallel space scans) must not
         // share one staging file, or each would truncate the other's stream and
         // rename a corrupt payload into place under a correct-looking root.
-        let staging = self.staging_dir().join(format!(
-            "{}-{}.tmp",
-            std::process::id(),
-            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let staging = self
+            .staging_dir()
+            .join(format!("{}.tmp", synch_core::fs::unique_suffix()));
         let root = {
             let source = File::open(path)?;
             let sink = File::create(&staging)?;

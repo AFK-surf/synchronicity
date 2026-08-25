@@ -402,78 +402,12 @@ impl PinState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Written to a sibling and renamed over, never truncating the real
-        // file: a plain write leaves the state half-formed for as long as it
-        // takes, and a reader catching it there gets a file that does not
-        // parse and is treated as no state at all. The temporary carries the
-        // mode before it is in place, so the state is never briefly
-        // world-readable; and its name is unique to this write, because two
-        // processes sharing a temporary fill in one another's bytes and each
-        // renames whatever is there over the real file — the half-formed
-        // state the dance exists to prevent.
-        let temporary = unique_temporary(path);
-        // Durability before visibility: a rename that reaches the directory
-        // ahead of the bytes leaves a valid name over an empty file. Synced
-        // through the writing handle and closed before the rename: reopening
-        // read-only to sync works on Unix and cannot work on Windows, where
-        // `sync_all` needs write access and every save failed.
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            // Narrowed before the bytes land, so the state is never briefly
-            // world-readable.
-            restrict(&temporary)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-        }
-        match std::fs::rename(&temporary, path) {
-            Ok(()) => {
-                // The rename itself, flushed the way the scanner and the CAS
-                // flush theirs (§6.2): best effort, because a platform that
-                // cannot open a directory as a file gets no guarantee — the
-                // bytes are durable but the name over them need not be.
-                if let Some(parent) = path.parent() {
-                    if let Ok(dir) = std::fs::File::open(parent) {
-                        let _ = dir.sync_all();
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temporary);
-                Err(e)
-            }
-        }
+        // A plain write leaves the state half-formed for as long as it takes,
+        // and a reader catching it there gets a file that does not parse and
+        // is treated as no state at all — so the sibling-and-rename ritual,
+        // with the mode carried before the bytes land.
+        synch_core::fs::write_atomic_owner_only(path, text.as_bytes())
     }
-}
-
-/// A temporary path beside `path`, unique to this write.
-fn unique_temporary(path: &Path) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    /// Distinguishes two writes by this process within one nanosecond, which
-    /// a coarse clock makes reachable.
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{nanos}.{sequence}.tmp", std::process::id()));
-    path.with_file_name(name)
-}
-
-/// Narrows a file to its owner. On platforms without POSIX modes the
-/// directory's own ACL is what protects it, as everywhere else in the tree.
-#[cfg(unix)]
-fn restrict(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// What an accepted update established, for logs and `synch doctor`.

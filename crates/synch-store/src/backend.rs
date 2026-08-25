@@ -4,14 +4,7 @@
 //! `Store` CAS. `LocalFs` centralizes its blocking handoff; `Cloud` adds the
 //! remote durability promise while retaining the same cache codec.
 
-use std::{
-    io::Write,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{io::Write, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use synch_core::{group_count, groups_for_byte_range, ChunkRanges, Hash, CHUNK_GROUP_SIZE};
@@ -990,15 +983,13 @@ fn materialize_cached(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    static MATERIALIZE_SEQ: AtomicU64 = AtomicU64::new(0);
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "object".to_string());
     let temporary = target.with_file_name(format!(
-        ".{name}.{}.{}.synch-materialize",
-        std::process::id(),
-        MATERIALIZE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ".{name}.{}.synch-materialize",
+        synch_core::fs::unique_suffix()
     ));
     let result = (|| {
         let kind = if let Some(inline) = row.inline {

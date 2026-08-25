@@ -28,6 +28,7 @@ hickory-resolver.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
+synch-core.workspace = true
 synch-net.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
