@@ -128,18 +128,17 @@ impl HeadOutcome {
 /// What happened when a pending head's trie was fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchOutcome {
-    /// There was no pending head to fetch.
-    Idle,
     /// The trie is now complete and the head flipped.
     Completed,
-    /// The fetch ran and the head did not flip.
+    /// The head did not flip and there is nothing more to do with the origin
+    /// this exchange.
     ///
-    /// Usually because the trie is still incomplete. Also covers the promotion
-    /// declining for a reason the fetch cannot act on — the verdict was already
-    /// in the refusal memo, or the slot had moved on — which is why this does not
-    /// claim progress was made. No caller distinguishes them: both mean this
-    /// exchange is done with the origin.
-    Partial,
+    /// There was no pending head to fetch; or the fetch ran and the trie is
+    /// still incomplete; or the promotion declined for a reason the fetch
+    /// cannot act on — the verdict was already in the refusal memo, or the
+    /// slot had moved on. No caller has ever needed these apart: each means
+    /// this exchange is done with the origin, with nothing to report.
+    NoFlip,
     /// Every candidate persistently returned `missing`; the pending head was
     /// abandoned and head selection re-runs (§5.2).
     Abandoned,
@@ -239,14 +238,14 @@ impl Syncer {
     /// Every merge path ends in [`Syncer::try_promote`] — the Hello exchange
     /// in either direction, a pushed head whose trie was already here, a
     /// pending head's completed fetch — so this one bell covers all of them.
-    pub fn on_replica(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
-        self.on_replica = wake;
+    pub(crate) fn on_replica(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.on_replica = Some(wake);
         self
     }
 
     /// The bell rung when a promotion flips a head to complete.
-    pub fn on_change(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
-        self.on_change = wake;
+    pub(crate) fn on_change(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.on_change = Some(wake);
         self
     }
 
@@ -261,8 +260,8 @@ impl Syncer {
     /// §5.3 claims for reactive push was a pointer that no reading surface —
     /// `entries`, mirrors, the S3 gateway — looks at, because all of them sit
     /// behind promotion.
-    pub fn on_pending(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
-        self.on_pending = wake;
+    pub(crate) fn on_pending(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.on_pending = Some(wake);
         self
     }
 
@@ -339,7 +338,8 @@ impl Syncer {
         Ok(out)
     }
 
-    /// Records what a peer advertised for *this node's own* origin (§3.4).
+    /// Records what a peer advertised for *this node's own* origin (§3.4),
+    /// and which peer made the claim.
     ///
     /// A node that lost its key and its database holds no head of its own, and
     /// the heads its peers still hold for it are signed by the lost key: no
@@ -347,17 +347,11 @@ impl Syncer {
     /// existence is what recovery reads, and it is already in every `Hello`
     /// summary — no new wire message, and no unbound signature is trusted here.
     /// Summaries for other origins are ignored: for those, the ordinary
-    /// acceptance rule is both sufficient and stricter.
+    /// acceptance rule is both sufficient and stricter. Detection rests on
+    /// unauthenticated summaries, so the attribution is what lets an operator
+    /// judge a claim that holds a node in recovery.
     ///
     /// Returns the highest seq now observed for our origin.
-    pub fn observe_summaries(&self, summaries: &[HeadSummary], now: i64) -> Result<Option<u64>> {
-        self.observe_summaries_from(None, summaries, now)
-    }
-
-    /// The same, recording which peer made the claim (§3.4).
-    ///
-    /// Detection rests on unauthenticated summaries, so the attribution is
-    /// what lets an operator judge a claim that holds a node in recovery.
     pub fn observe_summaries_from(
         &self,
         claimed_by: Option<synch_core::NodeId>,
@@ -746,7 +740,7 @@ impl Syncer {
             let origin = origin.clone();
             crate::blocking::offload(move || Ok(store.pending_head(&origin)?)).await?
         }) else {
-            return Ok(FetchOutcome::Idle);
+            return Ok(FetchOutcome::NoFlip);
         };
         // What this origin's trie looked like when we last held all of it. Every
         // subtree the new root shares with it is already here, so the walk can
@@ -1022,7 +1016,7 @@ impl Syncer {
         if promoted == Promotion::Flipped {
             Ok(FetchOutcome::Completed)
         } else {
-            Ok(FetchOutcome::Partial)
+            Ok(FetchOutcome::NoFlip)
         }
     }
 
@@ -1032,7 +1026,7 @@ impl Syncer {
     /// This is what the recovery quiesce collects with. It is the ordinary
     /// exchange with an empty decision, so a recovering node learns how far
     /// peers say its origin had got without adopting anything.
-    pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
+    pub(crate) async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
         let ours = self.summaries_off_runtime(client.remote_id()).await?;
         let exchange = client
             .head_exchange(ours.summaries, ours.declared, |_theirs| {
@@ -2210,7 +2204,7 @@ mod containment_tests {
     async fn the_fetch_bell_keeps_mid_round_rings_and_stays_silent_for_refusals() {
         let (_d, store, key, origin) = setup();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+        let syncer = Syncer::new(store.clone()).on_pending(wake.clone());
 
         // Rung with no listener parked, which is the mid-round case.
         let head = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);

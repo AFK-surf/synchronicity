@@ -33,7 +33,7 @@ pub fn data_dir(cli: &Cli) -> Result<PathBuf> {
 }
 
 /// Builds the node configuration from the CLI flags.
-pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
+pub(crate) fn node_config(cli: &Cli) -> Result<NodeConfig> {
     let mut config = NodeConfig::new(data_dir(cli)?);
     config.net.offline = cli.offline;
     if let Some(bind) = &cli.bind {
@@ -54,22 +54,14 @@ pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
     config.dns.no_tuf = cli.no_tuf;
     // The daemon installs its SQLite store as `rekor_config` during open, so
     // the monotonic pin state rides Litestream with every other durable fact.
-    config.cloud = cloud_config_for(cli, cli.cas_backend, config.data_dir.join("cloud"))?;
-    Ok(config)
-}
-
-fn cloud_config_for(
-    cli: &Cli,
-    backend: CasBackendArg,
-    scratch_dir: PathBuf,
-) -> Result<Option<synch_store::cloud::CloudConfig>> {
-    cloud_config_with_fallback(
+    config.cloud = cloud_config_with_fallback(
         cli,
-        backend,
-        scratch_dir,
+        cli.cas_backend,
+        config.data_dir.join("cloud"),
         &std::collections::HashMap::new(),
         false,
-    )
+    )?;
+    Ok(config)
 }
 
 fn cloud_config_with_fallback(

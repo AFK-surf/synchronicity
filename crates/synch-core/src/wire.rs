@@ -171,7 +171,7 @@ where
 ///
 /// Generous for a sentence naming what went wrong, and small enough that a
 /// stream of them is not a way to write to this node's log.
-pub const MAX_ERROR_REASON_LEN: usize = 1024;
+pub(crate) const MAX_ERROR_REASON_LEN: usize = 1024;
 
 /// Decodes an error reason that refuses to grow past [`MAX_ERROR_REASON_LEN`].
 ///

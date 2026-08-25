@@ -5,7 +5,7 @@
 use std::{cell::Cell, convert::Infallible};
 
 use synch_core::Hash;
-use synch_mpt::{MemStore, MissingWalk, NodeStore, Trie};
+use synch_mpt::{MemStore, MissingWalk, NodeStore, Scope, Trie};
 
 /// A store that counts the node reads made through it.
 #[derive(Debug)]
@@ -127,7 +127,7 @@ fn a_fetch_against_a_held_root_touches_only_what_changed() {
 
     let counting = Counting::new(&store);
     let counted = Trie::new(&counting);
-    let mut walk = MissingWalk::since(Some(old_root), new_root);
+    let mut walk = MissingWalk::scoped(Some(old_root), new_root, Scope::full());
     let missing = walk.next_batch(&counted, 256).unwrap();
 
     assert!(missing.is_empty(), "everything is present locally");
@@ -166,7 +166,7 @@ fn pruning_never_reports_a_partial_trie_complete() {
     // A destination holding nothing, handed the old root as a reference it does not have.
     let destination = MemStore::new();
     let trie = Trie::new(&destination);
-    let mut walk = MissingWalk::since(Some(old_root), new_root);
+    let mut walk = MissingWalk::scoped(Some(old_root), new_root, Scope::full());
     let missing = walk.next_batch(&trie, 256).unwrap();
     assert!(!missing.is_empty());
     assert!(!walk.is_exhausted());

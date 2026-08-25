@@ -48,7 +48,7 @@ pub fn unique_suffix() -> String {
 }
 
 /// A temporary path beside `path`, unique to this write.
-pub fn unique_temporary(path: &Path) -> PathBuf {
+pub(crate) fn unique_temporary(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.tmp", unique_suffix()));
     path.with_file_name(name)

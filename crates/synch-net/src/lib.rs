@@ -33,13 +33,13 @@ pub mod tuf;
 pub mod x509;
 pub mod zonecert;
 
-pub use blob::{proof_window, BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
+pub use blob::{proof_window, BlobClient, Proof, ProofOutcome};
 pub use dns::{
-    ControlPlaneRecord, CpRecordError, DialHint, DnssecResolver, MemberRecord, MemberResolver,
-    MemberSet, RecordError, RekorPolicy, ResolverOptions,
+    ControlPlaneRecord, DialHint, DnssecResolver, MemberResolver, MemberSet, RekorPolicy,
+    ResolverOptions,
 };
-pub use endpoint::{Net, NetOptions, DIAL_TIMEOUT, REQUEST_TIMEOUT};
+pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
-pub use mpt::{HeadExchange, HeadSink, MptClient, MptProtocol, NodesResponse, ValuesResponse};
+pub use mpt::{HeadSink, MptClient};
 pub use rekor::{ProofError, RekorProof};
 pub use tuf::{PinState, TufError, TufMetadata};

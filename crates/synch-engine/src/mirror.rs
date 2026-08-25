@@ -347,7 +347,7 @@ impl Node {
     /// A mirror whose pass fails is reported in its slot rather than stopping
     /// the rest: this is the standing loop's body, and one broken mirror must
     /// not starve the others.
-    pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, Result<MirrorReport>)>> {
+    pub(crate) async fn sync_all_mirrors(&self) -> Result<Vec<(String, Result<MirrorReport>)>> {
         let mut out = Vec::new();
         let node = self.clone();
         let mirrors = crate::blocking::offload(move || Ok(node.store().mirrors()?)).await?;

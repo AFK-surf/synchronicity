@@ -8,10 +8,10 @@
 use crate::error::{EngineError, Result};
 
 /// The per-space ignore file name.
-pub const IGNORE_FILE: &str = ".syncignore";
+pub(crate) const IGNORE_FILE: &str = ".syncignore";
 
 /// Patterns ignored regardless of configuration (§7.1).
-pub const BUILTIN_DEFAULTS: &[&str] = &[
+pub(crate) const BUILTIN_DEFAULTS: &[&str] = &[
     ".DS_Store",
     "Thumbs.db",
     "desktop.ini",
@@ -47,13 +47,13 @@ struct Rule {
 
 /// A compiled set of ignore rules for one space.
 #[derive(Debug, Clone, Default)]
-pub struct IgnoreSet {
+pub(crate) struct IgnoreSet {
     rules: Vec<Rule>,
 }
 
 impl IgnoreSet {
     /// The built-in defaults alone.
-    pub fn builtin() -> Self {
+    pub(crate) fn builtin() -> Self {
         let mut set = IgnoreSet::default();
         set.extend(BUILTIN_DEFAULTS.iter().copied());
         set
@@ -63,7 +63,7 @@ impl IgnoreSet {
     ///
     /// Absence is fine; any other read error is returned so exclusions are not
     /// silently dropped.
-    pub fn for_space(root: &std::path::Path) -> Result<Self> {
+    pub(crate) fn for_space(root: &std::path::Path) -> Result<Self> {
         let mut set = IgnoreSet::builtin();
         match std::fs::read_to_string(root.join(IGNORE_FILE)) {
             Ok(text) => set.extend(text.lines()),
@@ -81,7 +81,7 @@ impl IgnoreSet {
     }
 
     /// Adds patterns, skipping blanks and `#` comments.
-    pub fn extend<'a>(&mut self, lines: impl IntoIterator<Item = &'a str>) {
+    pub(crate) fn extend<'a>(&mut self, lines: impl IntoIterator<Item = &'a str>) {
         for line in lines {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -120,7 +120,7 @@ impl IgnoreSet {
     /// has to replay that descent: `raw/photo.raw` is excluded by a `raw/` rule
     /// that names only the directory, and a caller asking about the leaf alone
     /// hears "not excluded" and writes a file the scanner will never look at.
-    pub fn excludes_path(&self, path: &str) -> bool {
+    pub(crate) fn excludes_path(&self, path: &str) -> bool {
         let mut prefix = String::new();
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {
@@ -143,7 +143,7 @@ impl IgnoreSet {
     /// Later rules win, which is what makes `!` un-ignore work. A caller
     /// holding a whole path rather than walking one wants
     /// [`IgnoreSet::excludes_path`].
-    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+    pub(crate) fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for rule in &self.rules {
             if rule.dir_only && !is_dir {

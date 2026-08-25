@@ -45,20 +45,20 @@ pub const DEFAULT_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_se
 /// clear it. Without a steal the upload can never be completed, aborted, or
 /// swept: every one of those refuses a latched row. An hour is far longer than
 /// any assembly and far shorter than the TTL.
-pub const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+pub(crate) const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// How many uploads may be open at once, in total.
 ///
 /// The data dir carries the database, the CAS and this node's signing key, so
 /// an unbounded number of open uploads is not "S3 writes get slow" — it is the
 /// node losing the disk it needs to publish, or recover, at all.
-pub const MAX_OPEN_UPLOADS: u64 = 10_000;
+pub(crate) const MAX_OPEN_UPLOADS: u64 = 10_000;
 
 /// How many uploads one access key may hold open at once.
-pub const MAX_OPEN_UPLOADS_PER_PRINCIPAL: u64 = 1_000;
+pub(crate) const MAX_OPEN_UPLOADS_PER_PRINCIPAL: u64 = 1_000;
 
 /// How many bytes all staged parts may hold before new ones are refused.
-pub const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+pub(crate) const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 /// Where a part's payload is being staged, and what it will be recorded as.
 #[derive(Debug, Clone)]
@@ -76,8 +76,6 @@ pub struct PartStaging {
 /// What a delete did, and what it left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deleted {
-    /// Whether there was a local copy to remove.
-    pub removed: bool,
     /// Whether some origin still publishes a live entry for the path.
     ///
     /// True means the delete did what it could and the key is still readable:
@@ -92,9 +90,6 @@ pub struct CompletedUpload {
     pub root: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// True when the answer came from a recorded result rather than an
-    /// assembly that ran now.
-    pub replayed: bool,
 }
 
 impl Node {
@@ -223,7 +218,11 @@ impl Node {
     /// is written, so a row never names a file that is not there. A crash
     /// between the two leaves an unreferenced payload, which the sweeper
     /// collects — the safe half of the asymmetry.
-    pub fn commit_part(&self, staging: PartStaging, adoption: Adoption) -> Result<UploadPart> {
+    pub(crate) fn commit_part(
+        &self,
+        staging: PartStaging,
+        adoption: Adoption,
+    ) -> Result<UploadPart> {
         let size = adoption.written();
         if size > MAX_PART_SIZE {
             return Err(EngineError::invalid(format!(
@@ -331,11 +330,7 @@ impl Node {
             // A retried completion. The client never saw the first answer, so
             // it gets that answer rather than being told its upload is gone.
             synch_store::CompleteStart::AlreadyCompleted { etag, size } => {
-                return Ok(CompletedUpload {
-                    root: etag,
-                    size,
-                    replayed: true,
-                })
+                return Ok(CompletedUpload { root: etag, size })
             }
             synch_store::CompleteStart::Ready { space, path, parts } => (space, path, parts),
         };
@@ -487,11 +482,7 @@ impl Node {
             }
         }
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        Ok(CompletedUpload {
-            root,
-            size,
-            replayed: false,
-        })
+        Ok(CompletedUpload { root, size })
     }
 
     /// Removes this node's copy of a path and publishes its tombstone (§8,
@@ -518,12 +509,11 @@ impl Node {
         // store, and §10 keeps store reads off the runtime workers.
         let node = self.clone();
         let (space_owned, path_owned) = (space.to_string(), path.to_string());
-        let removed = crate::blocking::offload(move || {
+        crate::blocking::offload(move || {
             node.ensure_publishable()?;
             node.adopt_deletion(&space_owned, &path_owned)
         })
-        .await?
-        .is_some();
+        .await?;
 
         // Unconditionally, and not only when a file was removed. The tombstone
         // comes from the scanner's deletion sweep, which walks `local_files`
@@ -606,10 +596,7 @@ impl Node {
             .entries
             .iter()
             .any(|entry| entry.origin != *ours && entry.kind != synch_core::EntryKind::Tombstone);
-        Ok(Deleted {
-            removed,
-            still_published,
-        })
+        Ok(Deleted { still_published })
     }
 
     /// Drops an upload and everything staged for it.
@@ -721,7 +708,7 @@ impl Node {
     /// supersedes an attempt a completion might still have had open — those sit
     /// inside a directory that is very much still live, so no directory-level
     /// sweep would ever see them.
-    pub fn sweep_uploads(&self, ttl: std::time::Duration) -> Result<usize> {
+    pub(crate) fn sweep_uploads(&self, ttl: std::time::Duration) -> Result<usize> {
         let ttl_ns = i64::try_from(ttl.as_nanos()).unwrap_or(i64::MAX);
         let cutoff = synch_core::now_ns().saturating_sub(ttl_ns);
         let mut collected = 0;

@@ -25,24 +25,21 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::{server::Connected, Channel, Endpoint, Uri};
 
 /// The Unix socket file inside the data directory.
-pub const SOCKET_FILE: &str = "control.sock";
+pub(crate) const SOCKET_FILE: &str = "control.sock";
 
 /// The token file inside the data directory.
-pub const TOKEN_FILE: &str = "control.token";
+pub(crate) const TOKEN_FILE: &str = "control.token";
 
 /// Stable inode used to exclude daemon startup and offline CAS migration.
 const LIFECYCLE_FILE: &str = "lifecycle.lock";
 
-/// How many bytes the control token has.
-pub const TOKEN_LEN: usize = 32;
-
 /// Process-held exclusive ownership of a data directory's mutable lifecycle.
 #[derive(Debug)]
-pub struct LifecycleLock(std::fs::File);
+pub(crate) struct LifecycleLock(std::fs::File);
 
 impl LifecycleLock {
     /// Acquires the lock before opening the Store or any network endpoint.
-    pub fn acquire(data_dir: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(data_dir: &Path) -> io::Result<Self> {
         use fs2::FileExt;
         harden_data_dir(data_dir)?;
         let file = std::fs::OpenOptions::new()
@@ -76,7 +73,7 @@ impl Drop for LifecycleLock {
 const LOCAL_AUTHORITY: &str = "http://synchronicity.local";
 
 /// The error a client gets when nothing is listening (§9.1).
-pub fn no_daemon_error(data_dir: &Path) -> io::Error {
+pub(crate) fn no_daemon_error(data_dir: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
         format!(
@@ -108,7 +105,7 @@ fn already_running_error(data_dir: &Path) -> io::Error {
 /// Regenerated on every daemon start, so a token captured from an earlier run
 /// is worthless (§9.3); the bytes come from the same CSPRNG that generates
 /// device keys.
-pub fn write_token(data_dir: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn write_token(data_dir: &Path) -> io::Result<Vec<u8>> {
     harden_data_dir(data_dir)?;
     let token = SecretKey::generate().to_bytes().to_vec();
     let path = token_path(data_dir);
@@ -147,7 +144,7 @@ pub fn read_token(data_dir: &Path) -> io::Result<Vec<u8>> {
 }
 
 /// Removes the token file, so a stopped daemon leaves no credential behind.
-pub fn remove_token(data_dir: &Path) {
+pub(crate) fn remove_token(data_dir: &Path) {
     let path = token_path(data_dir);
     // The staging name too: a crash between the write and the rename leaves a
     // file that looks exactly like a credential, and "leaves no credential
@@ -184,7 +181,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Restricts the data directory to its owner (`0700`), where the platform has
 /// such a notion.
-pub fn harden_data_dir(data_dir: &Path) -> io::Result<()> {
+pub(crate) fn harden_data_dir(data_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     #[cfg(unix)]
     {
@@ -213,7 +210,7 @@ mod imp {
     /// acronym, no measurement, no remedy — one command *after* `synch init`
     /// said everything was fine. This check runs at init and at bind, so the
     /// answer names the length, the limit, and the fix.
-    pub fn check_socket_path(data_dir: &Path) -> io::Result<()> {
+    pub(crate) fn check_socket_path(data_dir: &Path) -> io::Result<()> {
         let path = socket_path(data_dir);
         let len = path.as_os_str().len();
         if len > MAX_SOCKET_PATH {
@@ -227,7 +224,7 @@ mod imp {
     }
 
     /// The socket path for a data directory.
-    pub fn endpoint_name(data_dir: &Path) -> String {
+    pub(crate) fn endpoint_name(data_dir: &Path) -> String {
         socket_path(data_dir).display().to_string()
     }
 
@@ -238,7 +235,7 @@ mod imp {
 
     /// The daemon's listening socket.
     #[derive(Debug)]
-    pub struct Listener {
+    pub(crate) struct Listener {
         inner: UnixListener,
         path: PathBuf,
     }
@@ -248,7 +245,7 @@ mod imp {
         ///
         /// Staleness is decided by connecting: a socket that accepts belongs to
         /// a live daemon and this fails; one that refuses is removed.
-        pub async fn bind(data_dir: &Path) -> io::Result<Listener> {
+        pub(crate) async fn bind(data_dir: &Path) -> io::Result<Listener> {
             check_socket_path(data_dir)?;
             harden_data_dir(data_dir)?;
             let path = socket_path(data_dir);
@@ -270,7 +267,7 @@ mod imp {
         }
 
         /// Accepts one connection.
-        pub async fn accept(&mut self) -> io::Result<Transport> {
+        pub(crate) async fn accept(&mut self) -> io::Result<Transport> {
             let (stream, _addr) = self.inner.accept().await?;
             Ok(stream)
         }
@@ -321,14 +318,14 @@ mod imp {
     /// first when it exists, so `C:\data` and `C:\data\.` name one pipe; when it
     /// does not exist yet the raw text is hashed, which is enough because the
     /// daemon creates the directory before it binds.
-    pub fn endpoint_name(data_dir: &Path) -> String {
+    pub(crate) fn endpoint_name(data_dir: &Path) -> String {
         let resolved = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
         let hash = synch_core::Hash::new(resolved.to_string_lossy().as_bytes());
         format!("\\\\.\\pipe\\synchronicity-{}", &hash.to_hex()[..16])
     }
 
     /// Pipe names are hashed to a fixed length; there is nothing to check.
-    pub fn check_socket_path(_data_dir: &Path) -> io::Result<()> {
+    pub(crate) fn check_socket_path(_data_dir: &Path) -> io::Result<()> {
         Ok(())
     }
 
@@ -338,14 +335,14 @@ mod imp {
     /// clean up: when the owning process dies its instances go with it. The
     /// live-daemon check is the same connect attempt Unix makes.
     #[derive(Debug)]
-    pub struct Listener {
+    pub(crate) struct Listener {
         name: String,
         next: Option<NamedPipeServer>,
     }
 
     impl Listener {
         /// Creates the first pipe instance.
-        pub async fn bind(data_dir: &Path) -> io::Result<Listener> {
+        pub(crate) async fn bind(data_dir: &Path) -> io::Result<Listener> {
             harden_data_dir(data_dir)?;
             let name = endpoint_name(data_dir);
             if ClientOptions::new().open(&name).is_ok() {
@@ -371,7 +368,7 @@ mod imp {
         }
 
         /// Waits for a client, then re-arms the next instance.
-        pub async fn accept(&mut self) -> io::Result<Transport> {
+        pub(crate) async fn accept(&mut self) -> io::Result<Transport> {
             let server = match self.next.take() {
                 Some(server) => server,
                 None => ServerOptions::new().create(&self.name)?,
@@ -409,7 +406,8 @@ mod imp {
 
 #[cfg(unix)]
 pub use imp::socket_path;
-pub use imp::{check_socket_path, dial, endpoint_name, Listener, Transport};
+pub(crate) use imp::{check_socket_path, endpoint_name, Listener};
+pub use imp::{dial, Transport};
 
 /// One accepted connection, ready to be served gRPC over.
 ///

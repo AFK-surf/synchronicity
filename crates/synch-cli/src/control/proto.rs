@@ -58,22 +58,22 @@ pub const CHUNK_SIZE: usize = 256 * 1024;
 /// A chunk is [`CHUNK_SIZE`] and nothing else in the protocol is close, so the
 /// ceiling bounds what a malformed length can make the other side allocate
 /// rather than being reached.
-pub const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
 /// The header carrying the client's [`CONTROL_VERSION`].
-pub const VERSION_HEADER: &str = "x-synch-control-version";
+pub(crate) const VERSION_HEADER: &str = "x-synch-control-version";
 
 /// The header carrying the datadir token.
-pub const TOKEN_HEADER: &str = "x-synch-control-token-bin";
+pub(crate) const TOKEN_HEADER: &str = "x-synch-control-token-bin";
 
 /// The trailer naming the [`ErrorCode`] of a failed call.
-pub const ERROR_CODE_HEADER: &str = "x-synch-error-code";
+pub(crate) const ERROR_CODE_HEADER: &str = "x-synch-error-code";
 
 /// Why a request failed.
 ///
 /// The CLI renders these as its own exit status rather than as a transport
 /// error (§9.3). Each maps to a gRPC status code and travels alongside it in
-/// the [`ERROR_CODE_HEADER`] trailer, because more of them exist than gRPC has
+/// the `ERROR_CODE_HEADER` trailer, because more of them exist than gRPC has
 /// codes to keep apart — and a caller that renders codes as protocol statuses,
 /// as the S3 gateway does, needs the distinction the mapping loses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl ErrorCode {
 
     /// The gRPC status code a client that does not know this protocol would
     /// see.
-    pub fn grpc(self) -> Code {
+    pub(crate) fn grpc(self) -> Code {
         match self {
             ErrorCode::Unauthorized => Code::Unauthenticated,
             ErrorCode::VersionMismatch | ErrorCode::NotInitialized => Code::FailedPrecondition,
@@ -283,8 +283,6 @@ pub struct EntryInfo {
     pub mtime_ns: i64,
     /// The object root, for files.
     pub content: Option<Hash>,
-    /// The origin trie seq this version was published at.
-    pub seq: u64,
     /// The link target, for a symlink.
     pub symlink_target: Option<String>,
     /// How many versions the path carries in the unified tree (§8). One means
@@ -302,7 +300,6 @@ impl From<EntryInfo> for pb::Entry {
             size: info.size,
             mtime_ns: info.mtime_ns,
             content: info.content.map(|root| root.as_bytes().to_vec()),
-            seq: info.seq,
             symlink_target: info.symlink_target,
             versions: info.versions,
         }
@@ -327,7 +324,6 @@ impl TryFrom<pb::Entry> for EntryInfo {
             size: entry.size,
             mtime_ns: entry.mtime_ns,
             content,
-            seq: entry.seq,
             symlink_target: entry.symlink_target,
             versions: entry.versions,
         })
@@ -360,7 +356,7 @@ fn kind_from_pb(kind: pb::EntryKind) -> Result<EntryKind, ControlError> {
 }
 
 /// Compares two tokens without leaking their contents through timing.
-pub fn tokens_match(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn tokens_match(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -416,7 +412,6 @@ mod tests {
             size: 7,
             mtime_ns: 42,
             content: Some(Hash::new(b"payload")),
-            seq: 3,
             symlink_target: None,
             versions: 1,
         };

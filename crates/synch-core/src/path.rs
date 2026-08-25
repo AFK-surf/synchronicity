@@ -91,20 +91,6 @@ pub fn normalize_native_path(path: &std::path::Path) -> Result<String, PathError
     normalize_path(&parts.join("/"))
 }
 
-/// Returns true if `path` is already in canonical form.
-pub fn is_normalized(path: &str) -> bool {
-    matches!(normalize_path(path), Ok(p) if p == path)
-}
-
-/// Splits a normalized path into its parent prefix (trailing slash, empty at
-/// the root) and its final component.
-pub fn split_parent(path: &str) -> (&str, &str) {
-    match path.rfind('/') {
-        Some(idx) => (&path[..idx + 1], &path[idx + 1..]),
-        None => ("", path),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,8 +129,12 @@ mod tests {
         let nfd = "cafe\u{0301}/x";
         let out = normalize_path(nfd).unwrap();
         assert_eq!(out, "caf\u{00e9}/x");
-        assert!(is_normalized(&out));
-        assert!(!is_normalized(nfd));
+        assert_eq!(
+            normalize_path(&out).unwrap(),
+            out,
+            "canonical form is a fixed point"
+        );
+        assert_ne!(normalize_path(nfd).unwrap(), nfd);
     }
 
     #[test]

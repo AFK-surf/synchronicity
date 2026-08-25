@@ -53,23 +53,8 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Diffs two roots, returning one [`Change`] per differing key in
     /// lexicographic key order.
     pub fn diff(&self, old_root: Hash, new_root: Hash) -> Result<Vec<Change>, MptError> {
-        self.diff_scoped(old_root, new_root, &Scope::full())
-    }
-
-    /// The same diff, confined to the part of the keyspace `scope` admits.
-    ///
-    /// A node reading under a scope holds only that part of it, so an unscoped
-    /// diff would descend into a subtree it was never sent and fail on an
-    /// absence that is the design working (§5.5). Promotion's materialization
-    /// is scoped exactly as the fetch that filled the trie was.
-    pub fn diff_scoped(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        scope: &Scope,
-    ) -> Result<Vec<Change>, MptError> {
         let mut out = Vec::new();
-        self.diff_each_scoped(old_root, new_root, scope, |change| {
+        self.diff_each_scoped(old_root, new_root, &Scope::full(), |change| {
             out.push(change);
             Ok(())
         })?;
@@ -77,21 +62,12 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         Ok(out)
     }
 
-    /// Diffs two roots, handing each [`Change`] to `emit` as it is found.
+    /// Diffs two roots within `scope`, handing each [`Change`] to `emit` as it
+    /// is found.
     ///
     /// Unordered, unlike [`Trie::diff`]: sorting needs the whole set in memory,
     /// which is the thing a streaming walk exists not to need.
-    pub fn diff_each(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        emit: impl FnMut(Change) -> Result<(), MptError>,
-    ) -> Result<(), MptError> {
-        self.diff_each_scoped(old_root, new_root, &Scope::full(), emit)
-    }
-
-    /// The same streaming diff, confined to `scope`.
-    pub fn diff_each_scoped(
+    pub(crate) fn diff_each_scoped(
         &self,
         old_root: Hash,
         new_root: Hash,
@@ -182,23 +158,13 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Diffs two roots and resolves every value to bytes.
     ///
     /// Materializes the whole set, which is what makes it the wrong shape for
-    /// applying a promotion: see [`Trie::for_each_resolved_change`].
+    /// applying a promotion: see [`Trie::for_each_resolved_change_scoped`].
     pub fn diff_resolved(
         &self,
         old_root: Hash,
         new_root: Hash,
     ) -> Result<Vec<ResolvedChange>, MptError> {
-        self.diff_resolved_scoped(old_root, new_root, &Scope::full())
-    }
-
-    /// The same, confined to `scope`.
-    pub fn diff_resolved_scoped(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        scope: &Scope,
-    ) -> Result<Vec<ResolvedChange>, MptError> {
-        self.diff_scoped(old_root, new_root, scope)?
+        self.diff(old_root, new_root)?
             .into_iter()
             .map(|c| {
                 Ok(ResolvedChange {
@@ -225,25 +191,12 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Only the **new** side is resolved. The old side decides nothing but
     /// whether the change is a deletion, which its presence already says;
     /// resolving it doubled the reads and peak for a value nothing reads.
-    pub fn for_each_resolved_change<E, F>(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        apply: F,
-    ) -> Result<usize, E>
-    where
-        E: From<MptError>,
-        F: FnMut(ChangeView<'_>) -> Result<(), E>,
-    {
-        self.for_each_resolved_change_scoped(old_root, new_root, &Scope::full(), apply)
-    }
-
-    /// The same stream, confined to the part of the keyspace `scope` admits.
     ///
-    /// A node reading under a scope holds only that part of it, so an unscoped
-    /// walk would descend into a subtree it was never sent and fail on an
-    /// absence that is the design working (§5.5). Promotion's materialization
-    /// is scoped exactly as the fetch that filled the trie was.
+    /// Confined to the part of the keyspace `scope` admits. A node reading
+    /// under a scope holds only that part of it, so an unscoped walk would
+    /// descend into a subtree it was never sent and fail on an absence that
+    /// is the design working (§5.5). Promotion's materialization is scoped
+    /// exactly as the fetch that filled the trie was.
     pub fn for_each_resolved_change_scoped<E, F>(
         &self,
         old_root: Hash,
@@ -315,7 +268,7 @@ fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
 /// value's bytes.
 ///
 /// Borrowed, and missing the old side on purpose — see
-/// [`Trie::for_each_resolved_change`].
+/// [`Trie::for_each_resolved_change_scoped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeView<'a> {
     /// The key.
@@ -370,7 +323,7 @@ mod tests {
 
         let mut seen = 0usize;
         let stopped: Result<usize, MptError> =
-            t.for_each_resolved_change(Hash::EMPTY, root, |_change| {
+            t.for_each_resolved_change_scoped(Hash::EMPTY, root, &Scope::full(), |_change| {
                 seen += 1;
                 Err(MptError::OddDepthValue)
             });
@@ -383,7 +336,7 @@ mod tests {
         // `diff_completeness` property test).
         let mut keys = Vec::new();
         let count: usize = t
-            .for_each_resolved_change(Hash::EMPTY, root, |change| {
+            .for_each_resolved_change_scoped(Hash::EMPTY, root, &Scope::full(), |change| {
                 assert_eq!(change.kind, ChangeKind::Added);
                 assert_eq!(change.new, Some(b"v".as_slice()));
                 keys.push(change.key.to_vec());

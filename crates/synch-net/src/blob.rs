@@ -182,7 +182,7 @@ fn check_served(served: ChunkRanges, requested: &ChunkRanges) -> Result<ChunkRan
 
 /// The `sync/blob/1` protocol handler.
 #[derive(Debug, Clone)]
-pub struct BlobProtocol {
+pub(crate) struct BlobProtocol {
     store: Arc<Store>,
     backend: Arc<dyn synch_store::backend::CasBackend>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
@@ -190,7 +190,10 @@ pub struct BlobProtocol {
 
 impl BlobProtocol {
     /// Builds a handler over a store.
-    pub fn new(store: Arc<Store>, backend: Arc<dyn synch_store::backend::CasBackend>) -> Self {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        backend: Arc<dyn synch_store::backend::CasBackend>,
+    ) -> Self {
         BlobProtocol {
             store,
             backend,
@@ -199,7 +202,7 @@ impl BlobProtocol {
     }
 
     /// Rings `wake` whenever a connection is refused for an unknown key (§3.4).
-    pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+    pub(crate) fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_unknown_key = wake;
         self
     }
@@ -438,7 +441,7 @@ impl BlobClient {
     }
 
     /// Requests the tree over a range, without its bytes.
-    pub async fn get_proof(
+    pub(crate) async fn get_proof(
         &self,
         root: Hash,
         ranges: &ChunkRanges,

@@ -252,7 +252,7 @@ impl Node {
     /// Every refusal here is a distinct code, because the caller can act on the
     /// difference: `NotArmed` is the operator's to fix, `SpaceNotDelegated` is
     /// the caller's, and `NoSuchPath` means look again.
-    pub async fn admit_socket(
+    pub(crate) async fn admit_socket(
         &self,
         peer: NodeId,
         addr: String,
@@ -405,7 +405,11 @@ impl Node {
     }
 
     /// Runs an admitted invocation.
-    pub async fn run_socket(&self, admission: Admission, stream: DuplexStream) -> SockStatus {
+    pub(crate) async fn run_socket(
+        &self,
+        admission: Admission,
+        stream: DuplexStream,
+    ) -> SockStatus {
         let socket = admission.socket.clone();
         let program_root = admission.program_root;
         let Some(pool) = self.socket_workers() else {
@@ -646,18 +650,18 @@ impl SocketHost for TreeHost {
 /// rather than a lock, because this is written once during startup and read on
 /// every connection thereafter.
 #[derive(Debug, Clone, Default)]
-pub struct SocketDispatch {
+pub(crate) struct SocketDispatch {
     node: Arc<std::sync::OnceLock<crate::node::WeakNode>>,
 }
 
 impl SocketDispatch {
     /// An unbound dispatcher, ready to be mounted.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SocketDispatch::default()
     }
 
     /// Binds it to the node it serves. Called once, at the end of startup.
-    pub fn bind(&self, node: &Node) {
+    pub(crate) fn bind(&self, node: &Node) {
         let _ = self.node.set(node.downgrade());
     }
 
@@ -696,7 +700,7 @@ impl synch_net::sock::SocketService for SocketDispatch {
 }
 
 /// The limits every socket on this node runs under.
-pub fn default_limits() -> Limits {
+pub(crate) fn default_limits() -> Limits {
     Limits::default()
 }
 
@@ -717,31 +721,31 @@ mod pool {
 
     /// A started pool.
     #[derive(Debug, Clone)]
-    pub struct SocketPool(synch_sock::WorkerHandle);
+    pub(crate) struct SocketPool(synch_sock::WorkerHandle);
 
     impl SocketPool {
         /// Starts `workers` threads.
-        pub fn start(workers: usize, limits: Limits) -> Option<SocketPool> {
+        pub(crate) fn start(workers: usize, limits: Limits) -> Option<SocketPool> {
             Some(SocketPool(synch_sock::WorkerHandle::start(workers, limits)))
         }
 
         /// The limits every invocation runs under.
-        pub fn limits(&self) -> Limits {
+        pub(crate) fn limits(&self) -> Limits {
             self.0.limits().clone()
         }
 
         /// The next invocation id.
-        pub fn next_id(&self) -> u64 {
+        pub(crate) fn next_id(&self) -> u64 {
             self.0.next_id()
         }
 
         /// Drops what one socket's map held.
-        pub fn clear_map(&self, socket: &str) {
+        pub(crate) fn clear_map(&self, socket: &str) {
             self.0.clear_map(socket);
         }
 
         /// Runs one invocation.
-        pub async fn run(
+        pub(crate) async fn run(
             &self,
             invocation: synch_sock::Invocation,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
@@ -749,7 +753,7 @@ mod pool {
         }
 
         /// Cancels and drains every invocation, then joins all worker threads.
-        pub async fn shutdown(&self) {
+        pub(crate) async fn shutdown(&self) {
             self.0.shutdown().await;
         }
 
@@ -758,7 +762,7 @@ mod pool {
             clippy::too_many_arguments,
             reason = "a pass-through to `Registry::reserve`, whose arguments are                       the facts an entry is made of"
         )]
-        pub fn reserve(
+        pub(crate) fn reserve(
             &self,
             id: u64,
             socket: &str,
@@ -779,26 +783,26 @@ mod pool {
         }
 
         /// Whether a socket has been faulting enough to be disarmed.
-        pub fn should_quarantine(&self, socket: &str, program: Hash) -> bool {
+        pub(crate) fn should_quarantine(&self, socket: &str, program: Hash) -> bool {
             // The pool recorded the outcome as the invocation ended; this only
             // reads the verdict it reached.
             self.0.registry().take_quarantine(socket, program)
         }
 
         /// Everything running.
-        pub fn snapshot(&self, socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
+        pub(crate) fn snapshot(&self, socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
             self.0
                 .registry()
                 .snapshot(socket, std::time::Instant::now())
         }
 
         /// Ends one invocation.
-        pub fn kill(&self, id: u64) -> bool {
+        pub(crate) fn kill(&self, id: u64) -> bool {
             self.0.registry().kill(id)
         }
 
         /// One socket's recent log lines.
-        pub fn logs(&self, socket: &str) -> Vec<synch_sock::LogLine> {
+        pub(crate) fn logs(&self, socket: &str) -> Vec<synch_sock::LogLine> {
             self.0.registry().logs(socket)
         }
     }
@@ -821,30 +825,30 @@ mod pool {
 
     /// A pool that does not exist on this platform.
     #[derive(Debug, Clone)]
-    pub struct SocketPool;
+    pub(crate) struct SocketPool;
 
     impl SocketPool {
         /// Never starts: there is no runtime to start.
-        pub fn start(_workers: usize, _limits: Limits) -> Option<SocketPool> {
+        pub(crate) fn start(_workers: usize, _limits: Limits) -> Option<SocketPool> {
             None
         }
 
         /// The documented defaults, so `synch socket ls` prints the same
         /// numbers everywhere even where nothing can run.
-        pub fn limits(&self) -> Limits {
+        pub(crate) fn limits(&self) -> Limits {
             Limits::default()
         }
 
         /// Unreachable: nothing admits an invocation without a pool.
-        pub fn next_id(&self) -> u64 {
+        pub(crate) fn next_id(&self) -> u64 {
             0
         }
 
         /// Nothing to clear.
-        pub fn clear_map(&self, _socket: &str) {}
+        pub(crate) fn clear_map(&self, _socket: &str) {}
 
         /// Unreachable: nothing admits an invocation without a pool.
-        pub async fn run(
+        pub(crate) async fn run(
             &self,
             _invocation: synch_sock::Invocation,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
@@ -852,14 +856,14 @@ mod pool {
         }
 
         /// Nothing runs on an unsupported platform.
-        pub async fn shutdown(&self) {}
+        pub(crate) async fn shutdown(&self) {}
 
         /// Unreachable: admission refuses before it reaches this.
         #[allow(
             clippy::too_many_arguments,
             reason = "matches the shape of the implementation it stands in for"
         )]
-        pub fn reserve(
+        pub(crate) fn reserve(
             &self,
             _id: u64,
             _socket: &str,
@@ -872,22 +876,22 @@ mod pool {
         }
 
         /// Nothing runs, so nothing faults.
-        pub fn should_quarantine(&self, _socket: &str, _program: Hash) -> bool {
+        pub(crate) fn should_quarantine(&self, _socket: &str, _program: Hash) -> bool {
             false
         }
 
         /// Nothing runs here.
-        pub fn snapshot(&self, _socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
+        pub(crate) fn snapshot(&self, _socket: Option<&str>) -> Vec<synch_sock::InvocationInfo> {
             Vec::new()
         }
 
         /// Nothing runs here.
-        pub fn kill(&self, _id: u64) -> bool {
+        pub(crate) fn kill(&self, _id: u64) -> bool {
             false
         }
 
         /// Nothing runs here.
-        pub fn logs(&self, _socket: &str) -> Vec<synch_sock::LogLine> {
+        pub(crate) fn logs(&self, _socket: &str) -> Vec<synch_sock::LogLine> {
             Vec::new()
         }
     }
@@ -901,7 +905,7 @@ mod pool {
     }
 }
 
-pub use pool::SocketPool;
+pub(crate) use pool::SocketPool;
 
 /// A tree the declaration hook cannot read.
 ///
@@ -949,9 +953,12 @@ impl SocketHost for NoTree {
 }
 
 /// Runs a declaration hook on a thread that is allowed to block.
-pub(crate) fn declare_blocking(elf: &[u8], host: Arc<dyn SocketHost>) -> Result<Declaration> {
+///
+/// The hook always runs against [`NoTree`]: a declaration names intent, and
+/// granting it a tree to read would let the arming step observe state.
+pub(crate) fn declare_blocking(elf: &[u8]) -> Result<Declaration> {
     let _scope = synch_core::BlockingScope::enter();
-    pool::declare(elf, host).map_err(|e| EngineError::invalid(e.to_string()))
+    pool::declare(elf, Arc::new(NoTree)).map_err(|e| EngineError::invalid(e.to_string()))
 }
 
 impl Node {

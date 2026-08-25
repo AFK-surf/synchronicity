@@ -35,7 +35,7 @@ pub struct Client {
 
 /// The version and token every call carries.
 #[derive(Debug, Clone)]
-pub struct Credentials {
+pub(crate) struct Credentials {
     version: MetadataValue<tonic::metadata::Ascii>,
     token: MetadataValue<tonic::metadata::Binary>,
 }
@@ -171,7 +171,6 @@ impl Client {
             .await?
             .into_inner();
         Ok(Deleted {
-            removed: response.removed,
             still_published: response.still_published,
         })
     }
@@ -252,7 +251,6 @@ impl Client {
         Ok(CompletedUpload {
             etag: hash_from(&response.etag, "etag")?,
             size: response.size,
-            replayed: response.replayed,
         })
     }
 
@@ -395,7 +393,7 @@ impl Chunks {
 /// One streamed-write family (§9.4): the request envelope, the daemon's one
 /// answer, and what a committed write yields.
 ///
-/// [`Put`] and [`PartUpload`] are [`StreamedWrite`] over the two families —
+/// `Put` and `PartUpload` are [`StreamedWrite`] over the two families —
 /// the machine exists once, and this trait is the whole of the difference.
 pub trait WriteFamily: Sized {
     /// The request envelope around one part.
@@ -478,7 +476,7 @@ impl WriteFamily for super::proto::UploadPartPart {
 }
 
 /// A write in progress (§9.4).
-pub type Put = StreamedWrite<super::proto::PutPart>;
+pub(crate) type Put = StreamedWrite<super::proto::PutPart>;
 
 /// A streamed write, which the daemon keeps nothing of until it is committed.
 #[derive(Debug)]
@@ -610,7 +608,7 @@ impl UploadRef {
 }
 
 /// A streamed write of one part, which records nothing until it is finished.
-pub type PartUpload = StreamedWrite<super::proto::UploadPartPart>;
+pub(crate) type PartUpload = StreamedWrite<super::proto::UploadPartPart>;
 
 /// One part the daemon has recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,8 +641,6 @@ pub struct CompletedUpload {
     pub etag: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// True when a retry was answered from the recorded result.
-    pub replayed: bool,
 }
 
 /// Reads a 32-byte hash column off the wire.
@@ -653,11 +649,9 @@ fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
         .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))
 }
 
-/// What a delete did, and what it left behind.
+/// What a delete left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deleted {
-    /// Whether there was a local copy to remove.
-    pub removed: bool,
     /// Whether some origin still publishes a live entry for the path (§8).
     pub still_published: bool,
 }

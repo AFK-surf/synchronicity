@@ -48,15 +48,19 @@ impl From<&str> for X509Error {
 // ------------------------------------------------------------------- OIDs
 
 /// `id-ce-basicConstraints` (2.5.29.19).
-pub const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+#[cfg(any(test, feature = "sim"))]
+pub(crate) const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 /// `id-ce-keyUsage` (2.5.29.15).
-pub const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+#[cfg(any(test, feature = "sim"))]
+pub(crate) const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 /// `id-ce-subjectAltName` (2.5.29.17).
-pub const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
+pub(crate) const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 /// `id-at-commonName` (2.5.4.3).
-pub const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+#[cfg(any(test, feature = "sim"))]
+pub(crate) const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
 /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
-pub const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+#[cfg(any(test, feature = "sim"))]
+pub(crate) const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 
 // ---------------------------------------------------------------- parsing
 
@@ -379,7 +383,7 @@ pub fn x509_time(unix: i64) -> Time {
 #[cfg(any(test, feature = "sim"))]
 impl SelfSigned<'_> {
     /// The `tbsCertificate` DER — the bytes the self-signature covers.
-    pub fn tbs(&self) -> Vec<u8> {
+    pub(crate) fn tbs(&self) -> Vec<u8> {
         let mut body = Vec::new();
         // [0] EXPLICIT version = 2, i.e. v3: the version that has extensions.
         body.extend_from_slice(&tlv(0xa0, &tlv(0x02, &[0x02])));
@@ -478,7 +482,7 @@ pub fn integer(magnitude: &[u8]) -> Vec<u8> {
 
 /// A DER tag-length-value.
 #[cfg(any(test, feature = "sim"))]
-pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 6);
     out.push(tag);
     let len = body.len();
@@ -505,24 +509,24 @@ pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
 /// what the callers above spell out by hand — the shapes this reads are all
 /// known in advance.
 #[derive(Debug)]
-pub struct Der<'a> {
+pub(crate) struct Der<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Der<'a> {
     /// A reader over raw DER bytes.
-    pub fn new(bytes: &'a [u8]) -> Der<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Der<'a> {
         Der { bytes, at: 0 }
     }
 
     /// Whether every element has been read.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.at >= self.bytes.len()
     }
 
     /// The next element, as `(tag, contents)`.
-    pub fn next(&mut self, what: &str) -> Result<(u8, &'a [u8]), X509Error> {
+    pub(crate) fn next(&mut self, what: &str) -> Result<(u8, &'a [u8]), X509Error> {
         let bad = |why: &str| X509Error::new(format!("{what}: {why}"));
         let tag = *self.bytes.get(self.at).ok_or_else(|| bad("truncated"))?;
         let first = *self
@@ -571,7 +575,7 @@ impl<'a> Der<'a> {
     }
 
     /// The next element, which must carry `tag`.
-    pub fn tagged(&mut self, tag: u8, what: &str) -> Result<&'a [u8], X509Error> {
+    pub(crate) fn tagged(&mut self, tag: u8, what: &str) -> Result<&'a [u8], X509Error> {
         let at = self.at;
         let (actual, body) = self.next(what)?;
         if actual != tag {
@@ -585,7 +589,7 @@ impl<'a> Der<'a> {
 
     /// The next element if it carries `tag`, leaving the reader untouched
     /// otherwise — how the optional members of a certificate are read.
-    pub fn optional(&mut self, tag: u8) -> Option<&'a [u8]> {
+    pub(crate) fn optional(&mut self, tag: u8) -> Option<&'a [u8]> {
         let at = self.at;
         match self.next("optional") {
             Ok((actual, body)) if actual == tag => Some(body),
@@ -597,7 +601,7 @@ impl<'a> Der<'a> {
     }
 
     /// A reader over the next element's contents, which must be a SEQUENCE.
-    pub fn sequence(&mut self, what: &str) -> Result<Der<'a>, X509Error> {
+    pub(crate) fn sequence(&mut self, what: &str) -> Result<Der<'a>, X509Error> {
         Ok(Der::new(self.tagged(0x30, what)?))
     }
 
@@ -615,14 +619,14 @@ impl<'a> Der<'a> {
     /// A combinator rather than an `is_empty()` at each call site, because the
     /// sites are what get forgotten: the rule belongs to the shape, and the
     /// next wrapper somebody adds gets it without knowing to ask.
-    pub fn only_sequence(mut self, what: &str) -> Result<Der<'a>, X509Error> {
+    pub(crate) fn only_sequence(mut self, what: &str) -> Result<Der<'a>, X509Error> {
         let inner = self.sequence(what)?;
         self.finish(what)?;
         Ok(inner)
     }
 
     /// Asserts this reader is exhausted — every member accounted for.
-    pub fn finish(&self, what: &str) -> Result<(), X509Error> {
+    pub(crate) fn finish(&self, what: &str) -> Result<(), X509Error> {
         match self.is_empty() {
             true => Ok(()),
             false => Err(X509Error::new(format!("bytes after {what}"))),
@@ -631,14 +635,14 @@ impl<'a> Der<'a> {
 
     /// The next SEQUENCE including its own header — for members carried
     /// verbatim, like the SubjectPublicKeyInfo the key binding compares.
-    pub fn raw_sequence(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
+    pub(crate) fn raw_sequence(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
         let start = self.at;
         self.tagged(0x30, what)?;
         Ok(&self.bytes[start..self.at])
     }
 
     /// Skips one element of any tag.
-    pub fn any(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
+    pub(crate) fn any(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
         Ok(self.next(what)?.1)
     }
 }

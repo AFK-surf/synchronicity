@@ -27,7 +27,7 @@ use crate::{
 /// address costs seconds, not the 30–60 s QUIC would spend retrying, which a
 /// stale binding would otherwise charge to `sync`, `take` and every head push,
 /// silently.
-pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long one request may wait for its answer before the peer is treated as
 /// failed.
@@ -39,7 +39,7 @@ pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// matches the serve side's budget for one stream, so an honest provider
 /// doing real disk work for a window is never cut off; applied per exchange,
 /// a windowed fetch gets the deadline once per window, not once for the walk.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Runs one client exchange under a deadline, naming what stalled.
 ///
@@ -144,17 +144,9 @@ impl NetOptions {
     /// Options for a loopback-only, fully offline endpoint.
     pub fn loopback() -> Self {
         NetOptions {
-            cas: None,
             bind_addr: Some("127.0.0.1:0".parse().expect("valid loopback address")),
             offline: true,
-            relay_urls: Vec::new(),
-            discovery_url: None,
-            dht: false,
-            dht_bootstrap: Vec::new(),
-            dht_publish_direct_addrs: false,
-            on_unknown_key: None,
-            heads: None,
-            sockets: None,
+            ..NetOptions::default()
         }
     }
 }

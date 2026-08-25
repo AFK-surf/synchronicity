@@ -579,7 +579,7 @@ impl Node {
     /// being replicated yields a removal, because a claim left standing over a
     /// space this node no longer holds is the one kind of lie this record can
     /// tell that nobody could check.
-    pub fn replica_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
+    pub(crate) fn replica_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
         let mut out = Vec::new();
         let mut claimed = std::collections::HashSet::new();
         for space in self.store().replicated_spaces()? {
@@ -639,7 +639,7 @@ impl Node {
     /// factor of two, which is what a coverage claim is for: it describes
     /// another node's disk at a moment that node chose (§4.2), and no reader
     /// may act on it beyond ordering its own work.
-    pub fn material_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
+    pub(crate) fn material_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
         let mut out = Vec::new();
         for change in self.replica_claim_changes()? {
             let space = synch_core::parse_replica_claim_key(&change.0)?;
@@ -687,7 +687,7 @@ impl Node {
     ///
     /// Rendered as a claim wherever it is shown. It is a member's assertion
     /// about its own disk, and this node has no way to check it — §4.2.
-    pub fn replica_claim_of(
+    pub(crate) fn replica_claim_of(
         &self,
         origin: &synch_core::OriginId,
         space: &str,
@@ -711,7 +711,7 @@ impl Node {
     }
 
     /// Every origin's claim on a space, for `space ls <id>`.
-    pub fn replica_claims_on(
+    pub(crate) fn replica_claims_on(
         &self,
         space: &str,
     ) -> Result<Vec<(synch_core::OriginId, synch_core::ReplicaClaim)>> {

@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// The config value holding the bucket map.
-pub const BUCKETS_CONFIG: &str = "s3.buckets";
+pub(crate) const BUCKETS_CONFIG: &str = "s3.buckets";
 
 /// Which version of each key a bucket's reads serve (§8).
 ///
@@ -95,14 +95,6 @@ impl Bucket {
         format!("{}\t{}\t{}", self.name, self.space, self.policy.render())
     }
 
-    /// True if the bucket pins an origin other than the local node's.
-    ///
-    /// Writes still land — they publish our own view — but reads keep serving
-    /// the pinned origin, so what was written will not come back (§9.4).
-    pub fn pins_a_foreign_origin(&self, ours: &str) -> bool {
-        self.policy.pinned_origin().is_some_and(|o| o != ours)
-    }
-
     /// The warning §9.4 asks the gateway to log for such a bucket.
     pub fn foreign_pin_warning(&self, ours: &str) -> Option<String> {
         self.policy
@@ -119,7 +111,7 @@ impl Bucket {
 }
 
 /// Validates a bucket name against the S3 naming rules we enforce.
-pub fn validate_name(name: &str) -> S3Result<()> {
+pub(crate) fn validate_name(name: &str) -> S3Result<()> {
     let ok = (3..=63).contains(&name.len())
         && name
             .bytes()
@@ -308,7 +300,6 @@ mod tests {
             space: "media".into(),
             policy: Policy::Origin("nas@cluster.example".into()),
         };
-        assert!(bucket.pins_a_foreign_origin(ours));
         let warning = bucket.foreign_pin_warning(ours).unwrap();
         assert!(warning.contains("read-only"));
 
@@ -318,7 +309,6 @@ mod tests {
                 space: "media".into(),
                 policy,
             };
-            assert!(!bucket.pins_a_foreign_origin(ours));
             assert!(bucket.foreign_pin_warning(ours).is_none());
         }
     }

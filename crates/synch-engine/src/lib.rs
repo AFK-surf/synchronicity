@@ -34,31 +34,20 @@ pub mod tree;
 pub mod uploads;
 pub mod watcher;
 
-pub use aae::RoundReport;
-pub use cloud::{CloudDomainStatus, CloudSettings};
 pub use compare::{CompareChange, CompareReport, CompareStatus};
 pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};
-pub use fetcher::{FetchReport, PreparedRange, Provider};
-pub use fill::{FillOptions, FillReport};
-pub use ignore::IgnoreSet;
-pub use membership::{
-    DoctorReport, DomainHealth, DomainOutcome, DomainRefresh, HeadStatus, ResolverStatus,
-    TrustConfig,
-};
-pub use mirror::MirrorReport;
-pub use node::{InitReport, Node, StagedChange};
-pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
-pub use reconcile::{FetchOutcome, HeadOutcome, Promotion, SyncReport, Syncer};
-pub use recovery::{
-    ObserveRound, RecoveryOptions, RecoveryProgress, RecoveryReport, RecoveryState,
-    UnreconciledHistory, DEFAULT_RECOVERY_QUIESCE, DEFAULT_SEQ_GAP,
-};
+pub use fetcher::{PreparedRange, Provider};
+pub use fill::FillOptions;
+pub use membership::{DomainHealth, DomainRefresh, ResolverStatus};
+pub use node::Node;
+pub use publisher::Publisher;
+pub use reconcile::{FetchOutcome, Promotion, Syncer};
+pub use recovery::RecoveryOptions;
 pub use reference::EntryRef;
-pub use rotation::{Activation, PeerBindings, RotationPlan};
-pub use scanner::{Adoption, CloneKind, ScanReport};
+pub use rotation::PeerBindings;
+pub use scanner::Adoption;
+pub(crate) use scanner::CloneKind;
 pub use synch_net::dns::RekorPolicy;
 pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
-pub use tree::reference_of;
 pub use uploads::{CompletedUpload, Deleted, PartStaging, DEFAULT_UPLOAD_TTL};
-pub use watcher::SpaceWatcher;

@@ -64,7 +64,7 @@ impl Store {
     ///
     /// Zero when it has never recorded one, which is a node that has not yet
     /// seen a working clock rather than a node at the epoch.
-    pub fn trust_floor(&self) -> Result<i64> {
+    pub(crate) fn trust_floor(&self) -> Result<i64> {
         Ok(self
             .config(CLOCK_FLOOR_KEY)?
             .and_then(|text| text.parse::<i64>().ok())
@@ -76,7 +76,7 @@ impl Store {
     /// The same value [`Store::read_instant`] returns, and the reason it exists
     /// twice is that a decision taken *inside* a transaction must be dated by
     /// what that transaction can see.
-    pub fn read_instant_on(conn: &rusqlite::Connection) -> Result<i64> {
+    pub(crate) fn read_instant_on(conn: &rusqlite::Connection) -> Result<i64> {
         let floor: Option<String> = conn
             .query_row(
                 "SELECT value FROM config WHERE key = ?1",
@@ -140,7 +140,7 @@ impl Store {
     }
 
     /// The instant a trust decision is evaluated at: `reading`, floored by
-    /// [`Store::trust_floor`].
+    /// `Store::trust_floor`.
     ///
     /// An untrustworthy reading is returned unchanged rather than rescued by
     /// the floor — a stored floor is evidence about the past, not a substitute

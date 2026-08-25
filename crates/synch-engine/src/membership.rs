@@ -36,7 +36,7 @@ use crate::{
 /// The trigger is an inbound connection from an unbound key, which a peer that
 /// keeps retrying produces as fast as it can dial; the cooldown is what keeps
 /// that from becoming a query flood.
-pub const DNS_TRIGGER_COOLDOWN: Duration = Duration::from_secs(30);
+pub(crate) const DNS_TRIGGER_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// The shortest the DNS loop ever sleeps between passes.
 const DNS_POLL_FLOOR: Duration = Duration::from_secs(1);
@@ -354,8 +354,7 @@ impl Node {
     /// This is the operator's setting, not necessarily the zone in force: an
     /// edit lands here immediately and identity is resolved once per process,
     /// so between a `synch domain set` and the next start the two differ. See
-    /// [`resolving_domain`](Self::resolving_domain) for what is actually being
-    /// refreshed.
+    /// `Node::resolving_domain` for what is actually being refreshed.
     pub fn domain(&self) -> Result<Option<String>> {
         Ok(self.store().membership_domain()?)
     }
@@ -375,7 +374,7 @@ impl Node {
     /// members through static bindings pinned by hand, which never expire.
     /// There is no third case: a node belongs to one cluster, so this is one
     /// zone or none, never a set.
-    pub fn resolving_domain(&self) -> Option<String> {
+    pub(crate) fn resolving_domain(&self) -> Option<String> {
         match self.origin().domain() {
             Some(named) => Some(named.to_string()),
             None => self.store().membership_domain().ok().flatten(),
@@ -451,7 +450,7 @@ impl Node {
     /// The whole answer is discarded unless it validates end to end; bindings
     /// that merely vanished from DNS keep their existing expiry so a
     /// propagation glitch cannot shrink the member set (§3.2).
-    pub async fn refresh_domain(
+    pub(crate) async fn refresh_domain(
         &self,
         resolver: &dyn MemberResolver,
         domain: &str,
@@ -472,7 +471,7 @@ impl Node {
     /// node cannot place is the one thing worse than not extending it, and the
     /// refusal is reported rather than logged — it reaches `domain refresh`,
     /// `domain ls` and `doctor` as this domain's last error.
-    pub fn apply_member_set(
+    pub(crate) fn apply_member_set(
         &self,
         set: &MemberSet,
         ttl: Duration,
@@ -631,7 +630,7 @@ impl Node {
     /// This is what the daemon's DNS loop calls. A domain that has never been
     /// resolved is due immediately; otherwise it comes due one clamped TTL
     /// after the answer that produced its bindings.
-    pub async fn refresh_due_domains(
+    pub(crate) async fn refresh_due_domains(
         &self,
         resolver: &dyn MemberResolver,
         now: i64,
@@ -654,7 +653,7 @@ impl Node {
     /// with no live binding is the shape a lagging rotation takes, so it earns
     /// an immediate lookup. The cooldown is what keeps a peer that keeps
     /// retrying — or a hostile one — from turning that into a query flood.
-    pub async fn refresh_triggered(
+    pub(crate) async fn refresh_triggered(
         &self,
         resolver: &dyn MemberResolver,
         now: i64,
@@ -678,7 +677,7 @@ impl Node {
 
     /// How long the DNS loop should sleep before it next looks for due
     /// domains.
-    pub fn next_dns_delay(&self, now: i64) -> Duration {
+    pub(crate) fn next_dns_delay(&self, now: i64) -> Duration {
         let schedule = self.dns_schedule();
         let soonest = self
             .resolving_domains()

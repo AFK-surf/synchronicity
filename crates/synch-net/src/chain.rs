@@ -490,7 +490,7 @@ fn verify_declaration(
             )));
         }
     }
-    verify_rrset(link, RecordType::TXT, &link.txt, &link.txt_sigs, zone_keys)
+    verify_rrset(link, RecordType::TXT, zone_keys)
 }
 
 /// Whether one TXT record carries the declaration text.
@@ -600,7 +600,7 @@ pub fn dnskey_rdata(key: &DNSKEY) -> Vec<u8> {
 }
 
 /// The only DNSKEY protocol byte DNSSEC defines (RFC 4034 §2.1.2).
-pub const DNSKEY_PROTOCOL: u8 = 3;
+pub(crate) const DNSKEY_PROTOCOL: u8 = 3;
 
 /// Whether a DNSKEY may be used as a signer, and whether it belongs in a
 /// proven key set.
@@ -665,8 +665,6 @@ fn verify_dnskey_set<'a>(
     verify_rrset(
         link,
         RecordType::DNSKEY,
-        &link.dnskeys,
-        &link.dnskey_sigs,
         anchored.into_iter().cloned().collect::<Vec<_>>().as_slice(),
     )?;
     Ok(&link.dnskeys)
@@ -691,13 +689,7 @@ fn verify_dnskey_set_under<'a>(
             link.zone
         )));
     }
-    verify_rrset(
-        link,
-        RecordType::DNSKEY,
-        &link.dnskeys,
-        &link.dnskey_sigs,
-        &matching,
-    )?;
+    verify_rrset(link, RecordType::DNSKEY, &matching)?;
     Ok(&link.dnskeys)
 }
 
@@ -712,7 +704,7 @@ fn verify_ds_set<'a>(
             link.zone
         )));
     }
-    verify_rrset(link, RecordType::DS, &link.ds, &link.ds_sigs, parent_keys)?;
+    verify_rrset(link, RecordType::DS, parent_keys)?;
     Ok(&link.ds)
 }
 
@@ -742,10 +734,21 @@ const MAX_RRSIG_VERIFICATIONS: usize = 16;
 fn verify_rrset(
     link: &ParsedLink,
     type_covered: RecordType,
-    rrset: &[Record],
-    sigs: &[RRSIG],
     keys: &[Record],
 ) -> Result<(), ChainError> {
+    // The RRset and its signatures are always the link's own for the covered
+    // type — taking them as parameters let a caller pair `link.ds` with
+    // `RecordType::DNSKEY`, an error this match makes unwritable.
+    let (rrset, sigs) = match type_covered {
+        RecordType::TXT => (&link.txt, &link.txt_sigs),
+        RecordType::DNSKEY => (&link.dnskeys, &link.dnskey_sigs),
+        RecordType::DS => (&link.ds, &link.ds_sigs),
+        other => {
+            return Err(ChainError::Signature(format!(
+                "no rrset of type {other} on a chain link"
+            )))
+        }
+    };
     let mut budget = MAX_RRSIG_VERIFICATIONS;
     for sig in sigs {
         if sig.input().type_covered != type_covered {

@@ -54,11 +54,11 @@ pub enum MptError {
     OddDepthValue,
     /// A caller's own error ended a streaming walk.
     ///
-    /// Never returned to that caller — [`Trie::for_each_resolved_change`] hands
+    /// Never returned to that caller — [`Trie::for_each_resolved_change_scoped`] hands
     /// back the error it was carrying. It exists because the walk's own
     /// signature is `Result<_, MptError>` and a caller's error type is not one.
     ///
-    /// [`Trie::for_each_resolved_change`]: crate::Trie::for_each_resolved_change
+    /// [`Trie::for_each_resolved_change_scoped`]: crate::Trie::for_each_resolved_change_scoped
     #[error("a walk was stopped by its caller")]
     WalkStopped,
     /// The backing store failed.

@@ -171,11 +171,6 @@ impl NodeConfig {
             ..NodeConfig::new(data_dir)
         }
     }
-
-    /// Uses the platform data directory.
-    pub fn default_dir() -> Result<Self> {
-        Ok(NodeConfig::new(default_data_dir()?))
-    }
 }
 
 fn hostname() -> String {

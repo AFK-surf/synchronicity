@@ -55,7 +55,7 @@ use synch_core::{Hash, NodeId, OriginId, SockStatus};
 
 pub use limits::Limits;
 pub use policy::{EffectivePolicy, PeerIdentity, SocketId};
-pub use registry::{InvocationInfo, LiveStats, LogLine, Registry, SlotGuard};
+pub use registry::{InvocationInfo, LogLine, Registry, SlotGuard};
 pub use stream::DuplexStream;
 
 /// Whether this build has an eBPF runtime, and can therefore *serve* sockets.
@@ -284,6 +284,6 @@ pub struct Outcome {
 }
 
 /// A device key rendered the way `sy_peer_device_key` hands it over.
-pub fn device_key_bytes(id: &NodeId) -> [u8; 32] {
+pub(crate) fn device_key_bytes(id: &NodeId) -> [u8; 32] {
     *id.as_bytes()
 }

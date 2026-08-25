@@ -40,6 +40,7 @@ use std::path::Path;
 mod clang;
 #[cfg(tinycc)]
 mod fold;
+mod scratch;
 #[cfg(tinycc)]
 mod tinycc;
 
@@ -59,7 +60,7 @@ pub const SUPPORTED: bool = cfg!(tinycc);
 /// two crates stay independent — this crate does not know what a socket is —
 /// so the equality is enforced by the test below through a dev-dependency
 /// rather than by sharing the constant.
-pub const STACK_FRAME_SIZE: u32 = 16 * 1024;
+pub(crate) const STACK_FRAME_SIZE: u32 = 16 * 1024;
 
 /// Why a compile did not produce an object.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -94,7 +95,7 @@ pub type Header<'a> = (&'a str, &'a str);
 /// puts around a constant, this is how one source builds against two upstreams
 /// without an edit — and, because a socket's declarations are compiled in, why
 /// changing one is a rebuild and a rearm rather than a setting.
-pub type Define<'a> = (&'a str, &'a str);
+pub(crate) type Define<'a> = (&'a str, &'a str);
 
 /// Compiles one translation unit to an eBPF relocatable object.
 ///
@@ -156,7 +157,7 @@ fn read_source(path: &Path) -> Result<(String, String), CcError> {
 /// Compiles one translation unit with the host's `clang` and `llc`.
 ///
 /// Clang optimizes the program at `-O2` into LLVM bitcode. `llc` then emits a
-/// BPF v3 relocatable object with the [`STACK_FRAME_SIZE`] stack frames the
+/// BPF v3 relocatable object with the `STACK_FRAME_SIZE` stack frames the
 /// socket runtime expects. Both executables must be on `PATH` and come from
 /// compatible LLVM installations.
 pub fn compile_with_clang(

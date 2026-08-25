@@ -34,7 +34,7 @@ use crate::limits::{FAULT_QUARANTINE, FAULT_WINDOW};
 /// Small on purpose. This is a tail for "what did it just say?", not a log
 /// store: every line also goes to the daemon's own log, which is where history
 /// lives and where an operator's log tooling already points.
-pub const MAX_LOG_LINES: usize = 256;
+pub(crate) const MAX_LOG_LINES: usize = 256;
 
 /// Counters a running invocation updates and an operator reads.
 ///
@@ -60,12 +60,12 @@ pub struct LiveStats {
 
 impl LiveStats {
     /// Replaces the label set, which the invocation owns.
-    pub fn set_labels(&self, labels: Vec<(String, String)>) {
+    pub(crate) fn set_labels(&self, labels: Vec<(String, String)>) {
         *self.labels.lock().expect("live stats") = labels;
     }
 
     /// Replaces the metric set, which the invocation owns.
-    pub fn set_metrics(&self, metrics: Vec<(String, i64)>) {
+    pub(crate) fn set_metrics(&self, metrics: Vec<(String, i64)>) {
         *self.metrics.lock().expect("live stats") = metrics;
     }
 }
@@ -205,7 +205,7 @@ impl Registry {
     }
 
     /// Records the channel `synch socket kill` pulls.
-    pub fn attach_cancel(&self, id: u64, cancel: tokio::sync::oneshot::Sender<()>) {
+    pub(crate) fn attach_cancel(&self, id: u64, cancel: tokio::sync::oneshot::Sender<()>) {
         if let Some(entry) = self.live.lock().expect("registry").get_mut(&id) {
             entry.cancel = Some(cancel);
         }
@@ -249,7 +249,8 @@ impl Registry {
     }
 
     /// How many invocations of one socket are running.
-    pub fn running(&self, socket: &str) -> usize {
+    #[cfg(test)]
+    pub(crate) fn running(&self, socket: &str) -> usize {
         self.live
             .lock()
             .expect("registry")
@@ -259,7 +260,7 @@ impl Registry {
     }
 
     /// Remembers a line one socket's program wrote.
-    pub fn log_line(&self, socket: &str, invocation: u64, at: i64, text: String) {
+    pub(crate) fn log_line(&self, socket: &str, invocation: u64, at: i64, text: String) {
         let mut logs = self.logs.lock().expect("registry logs");
         let ring = logs.entry(socket.to_string()).or_default();
         if ring.len() >= MAX_LOG_LINES {
@@ -293,7 +294,7 @@ impl Registry {
     /// The counter is cleared when it fires, so a socket that is re-armed and
     /// still broken gets a full window again rather than tripping on its first
     /// fault forever.
-    pub fn record_outcome(&self, socket: &str, program: Hash, faulted: bool) -> bool {
+    pub(crate) fn record_outcome(&self, socket: &str, program: Hash, faulted: bool) -> bool {
         let mut faults = self.faults.lock().expect("registry faults");
         let key = (socket.to_string(), program);
         let ring = faults.entry(key.clone()).or_default();

@@ -25,13 +25,13 @@ pub const ALPN_SOCK: &[u8] = b"sync/sock/1";
 /// Checked before anything else in the frame is trusted. Like `Hello`'s
 /// version on the metadata ALPN, a peer on another version is refused rather
 /// than negotiated with.
-pub const SOCK_PROTO_VERSION: u8 = 1;
+pub(crate) const SOCK_PROTO_VERSION: u8 = 1;
 
 /// The most metadata pairs one [`SockOpen`] may carry.
-pub const MAX_OPEN_META_PAIRS: usize = 16;
+pub(crate) const MAX_OPEN_META_PAIRS: usize = 16;
 
 /// The most bytes [`SockOpen::meta`] may occupy, keys and values summed.
-pub const MAX_OPEN_META_BYTES: usize = 4096;
+pub(crate) const MAX_OPEN_META_BYTES: usize = 4096;
 
 /// The largest accepted `Open` frame, in bytes (`docs/SOCKETS.md` §10).
 ///
@@ -47,12 +47,12 @@ pub const MAX_OPEN_META_BYTES: usize = 4096;
 pub const MAX_OPEN_FRAME_LEN: usize = crate::MAX_KEY_LEN + MAX_OPEN_META_BYTES + 1024;
 
 /// The most bytes a [`SockOpened::Refused`] message may carry.
-pub const MAX_REFUSE_MESSAGE_LEN: usize = 512;
+pub(crate) const MAX_REFUSE_MESSAGE_LEN: usize = 512;
 
 /// Opens one invocation. The caller's whole influence over what runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SockOpen {
-    /// Protocol version; must be [`SOCK_PROTO_VERSION`].
+    /// Protocol version; must be `SOCK_PROTO_VERSION`.
     pub v: u8,
     /// The origin whose tree the socket is to be resolved in.
     ///
@@ -131,7 +131,7 @@ pub enum SockOpened {
     Refused {
         /// Why.
         code: RefuseCode,
-        /// A human-readable elaboration, bounded at [`MAX_REFUSE_MESSAGE_LEN`].
+        /// A human-readable elaboration, bounded at `MAX_REFUSE_MESSAGE_LEN`.
         #[serde(deserialize_with = "bounded_message")]
         message: String,
     },
@@ -246,17 +246,6 @@ impl SockOpen {
         }
         Ok(())
     }
-
-    /// The value of a metadata key, if the caller sent one.
-    ///
-    /// First match wins: the list is the caller's to build, so it may hold the
-    /// same key twice, and a program asking for one value must get exactly one.
-    pub fn meta_get(&self, key: &str) -> Option<&str> {
-        self.meta
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
 }
 
 /// The most destinations one program may declare.
@@ -270,13 +259,13 @@ pub const MAX_DECLARED_TREE_READS: usize = 32;
 /// Declaration text is both an approval surface and persisted policy input.
 /// Keeping each value small bounds that surface independently of the guest's
 /// stack size.
-pub const MAX_DECLARATION_VALUE_BYTES: usize = 4096;
+pub(crate) const MAX_DECLARATION_VALUE_BYTES: usize = 4096;
 
 /// The local-call frame size used when a socket does not declare another one.
 pub const DEFAULT_EBPF_STACK_FRAME_SIZE: u32 = 16 * 1024;
 
 /// Smallest local-call frame async-ebpf accepts.
-pub const MIN_EBPF_STACK_FRAME_SIZE: u32 = 16;
+pub(crate) const MIN_EBPF_STACK_FRAME_SIZE: u32 = 16;
 
 /// Largest local-call frame a socket may request.
 ///
@@ -284,7 +273,7 @@ pub const MIN_EBPF_STACK_FRAME_SIZE: u32 = 16;
 pub const MAX_EBPF_STACK_FRAME_SIZE: u32 = 32 * 1024;
 
 /// Alignment required by async-ebpf's local-call ABI.
-pub const EBPF_STACK_FRAME_ALIGNMENT: u32 = 16;
+pub(crate) const EBPF_STACK_FRAME_ALIGNMENT: u32 = 16;
 
 /// Whether `size` is a local-call frame size the socket runtime can load.
 pub fn valid_ebpf_stack_frame_size(size: u32) -> bool {
@@ -491,20 +480,6 @@ impl Declaration {
             }
         }
         out
-    }
-
-    /// Whether the program declared an intent to reach `host` on `port`.
-    pub fn egress_declared(&self, host: &str, port: u16) -> bool {
-        self.egress
-            .iter()
-            .any(|rule| egress_rule_matches(rule, host, port))
-    }
-
-    /// Whether the program declared an intent to read `path`.
-    pub fn tree_read_declared(&self, path: &str) -> bool {
-        self.tree_reads
-            .iter()
-            .any(|prefix| path_prefix_matches(prefix, path))
     }
 }
 
@@ -842,7 +817,10 @@ mod tests {
         // this build cannot understand it must not treat as a grant.
         let parsed = Declaration::parse("name x\nudp-egress anywhere:53\negress git:9418");
         assert_eq!(parsed.egress, vec!["git:9418".to_string()]);
-        assert!(!parsed.egress_declared("anywhere", 53));
+        assert!(!parsed
+            .egress
+            .iter()
+            .any(|rule| egress_rule_matches(rule, "anywhere", 53)));
     }
 
     #[test]

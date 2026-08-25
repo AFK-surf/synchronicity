@@ -560,8 +560,8 @@ message Entry {
   int64 mtime_ns = 6;
   // The object root, for files.
   optional bytes content = 7;
-  // The origin trie seq this version was published at.
-  uint64 seq = 8;
+  // Field 8 carried the publishing seq; nothing ever read it.
+  reserved 8;
   // The link target, for a symlink.
   optional string symlink_target = 9;
   // How many versions the path carries in the unified tree (§8). One means
@@ -697,8 +697,8 @@ message DeleteRequest {
 }
 
 message DeleteResponse {
-  // False when there was no local copy, which a delete treats as success.
-  bool removed = 1;
+  // Field 1 said whether a local copy existed; nothing ever read it.
+  reserved 1;
   // True when some origin still publishes a live entry for the path, so the
   // key remains readable through the unified tree (§8).
   bool still_published = 2;
@@ -774,9 +774,9 @@ message CompleteUploadResponse {
   bytes etag = 1;
   // Its size in bytes.
   uint64 size = 2;
-  // True when this answered a retry from the recorded result rather than
-  // assembling anything.
-  bool replayed = 3;
+  // Field 3 said when the answer was replayed from the recorded result;
+  // nothing ever read it.
+  reserved 3;
 }
 
 message AbortUploadRequest {

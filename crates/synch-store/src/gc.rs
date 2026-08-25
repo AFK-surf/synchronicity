@@ -50,7 +50,7 @@ impl Store {
     /// serve it. The same window eats a peer's in-flight bootstrap, since
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
-    pub fn gc_trie(&self) -> Result<GcStats> {
+    pub(crate) fn gc_trie(&self) -> Result<GcStats> {
         let mut stats = GcStats::default();
         let (swept_nodes, swept_values, roots) =
             self.transaction(|txn| -> Result<(usize, usize, Vec<Hash>)> {
@@ -173,7 +173,7 @@ impl Store {
     /// Anything in a shard directory that is not named for an object is left
     /// alone.
     ///
-    /// Half-written ingests go with them, by way of [`Store::gc_staging`].
+    /// Half-written ingests go with them, by way of `Store::gc_staging`.
     ///
     /// Nothing in the CAS root but a directory is descended into. That is not
     /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,
@@ -247,7 +247,7 @@ impl Store {
     /// nothing else would.
     ///
     /// Returns how many files went.
-    pub fn gc_staging(&self, before: i64) -> Result<usize> {
+    pub(crate) fn gc_staging(&self, before: i64) -> Result<usize> {
         // The staging directory holds staging files and nothing else, so every
         // stale file in it goes; the CAS root holds shard directories, so only
         // the names an older build staged there do.

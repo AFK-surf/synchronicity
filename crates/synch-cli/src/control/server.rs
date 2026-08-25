@@ -173,7 +173,7 @@ impl Server {
     ///
     /// The reduced service: enough to explain the state and to change the zone
     /// this node waits on, and a refusal naming both for everything else.
-    pub async fn bind_pending(
+    pub(crate) async fn bind_pending(
         pending: Pending,
         stop: broadcast::Sender<()>,
     ) -> std::io::Result<Server> {
@@ -199,7 +199,7 @@ impl Server {
     }
 
     /// The socket path or pipe name this server listens on.
-    pub fn endpoint_name(&self) -> String {
+    pub(crate) fn endpoint_name(&self) -> String {
         transport::endpoint_name(&self.served.data_dir())
     }
 
@@ -428,7 +428,7 @@ impl Drop for StopOnDrop {
 /// A command's output, plus whatever the command left for the connection to do
 /// once it has all been read.
 #[derive(Debug)]
-pub struct RunStream {
+pub(crate) struct RunStream {
     inner: ReceiverStream<Result<pb::Frame, Status>>,
     /// Dropped with the stream, once tonic has delivered the last frame.
     stop: Option<StopOnDrop>,
@@ -788,7 +788,6 @@ impl Control for ControlService {
             .await
             .map_err(ControlError::from)?;
         Ok(Response::new(pb::DeleteResponse {
-            removed: deleted.removed,
             still_published: deleted.still_published,
         }))
     }
@@ -845,7 +844,6 @@ impl Control for ControlService {
         Ok(Response::new(pb::CompleteUploadResponse {
             etag: completed.root.as_bytes().to_vec(),
             size: completed.size,
-            replayed: completed.replayed,
         }))
     }
 
@@ -3438,7 +3436,6 @@ fn entry_info(row: &EntryRow, set: &VersionSet) -> EntryInfo {
         size: row.size,
         mtime_ns: row.mtime_ns,
         content: row.content,
-        seq: row.seq,
         symlink_target: row.symlink_target.clone(),
         versions: set.version_count() as u32,
     }

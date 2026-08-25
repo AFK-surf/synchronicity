@@ -44,9 +44,6 @@ pub struct SimZone {
     pkcs8: Vec<u8>,
     txt: Vec<String>,
     ttl: u32,
-    /// When true, answers carry no signatures: syntactically fine,
-    /// cryptographically nothing — the tamper case.
-    pub unsigned: bool,
     /// Proof records served at `_synchronicity-rekor.<origin>`, each one
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
@@ -155,7 +152,6 @@ impl SimZone {
             pkcs8: pkcs8.secret_pkcs8_der().to_vec(),
             txt,
             ttl: 300,
-            unsigned: false,
             rekor_txt: Vec::new(),
             cp_txt: Vec::new(),
             extra_dnskeys: Vec::new(),
@@ -385,7 +381,7 @@ impl SimZone {
     }
 
     /// The same, under a caller-chosen signer.
-    pub fn signed_txt_by(
+    pub(crate) fn signed_txt_by(
         &self,
         owner: Name,
         text: &str,
@@ -455,13 +451,17 @@ impl SimZone {
 
     /// The DS RRset for `child`, signed by *this* zone — a real delegation
     /// step, as a parent publishes it.
-    pub fn ds_records_for(&self, child: &SimZone, inception: time::OffsetDateTime) -> Vec<Record> {
+    pub(crate) fn ds_records_for(
+        &self,
+        child: &SimZone,
+        inception: time::OffsetDateTime,
+    ) -> Vec<Record> {
         self.ds_records_by(child, inception, DigestType::SHA256, None)
     }
 
     /// The same over RFC 4509 digest type 4, which `chain::covers` also
     /// follows and which a registrar may publish instead of type 2.
-    pub fn ds_records_sha384_for(
+    pub(crate) fn ds_records_sha384_for(
         &self,
         child: &SimZone,
         inception: time::OffsetDateTime,
@@ -477,7 +477,7 @@ impl SimZone {
     /// the flag check inside `verify_rrset`. Expressing that needs a DS signed
     /// by a key that is in the RRset and must not be used, which is what this
     /// is for.
-    pub fn ds_records_signed_by(
+    pub(crate) fn ds_records_signed_by(
         &self,
         child: &SimZone,
         inception: time::OffsetDateTime,
@@ -583,13 +583,8 @@ impl SimZone {
         chain::transparency_name(&self.origin).expect("transparency name")
     }
 
-    /// The name part 1 of a proof lives under.
-    pub fn rekor_name(&self) -> Name {
-        Name::from_utf8(format!("{}.{}", rekor::REKOR_TXT_PREFIX, self.origin)).expect("rekor name")
-    }
-
     /// The name the control-plane attach record lives under.
-    pub fn cp_name(&self) -> Name {
+    pub(crate) fn cp_name(&self) -> Name {
         Name::from_utf8(format!("{}.{}", crate::dns::CP_TXT_PREFIX, self.origin)).expect("cp name")
     }
 
@@ -803,32 +798,30 @@ impl SimZone {
             }
             _ => return response,
         };
-        if !self.unsigned {
-            // Inception an hour ago: RRSIG validity has to bracket "now".
-            let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
-            let qname = query.name();
-            let membership_txt = query.query_type() == RecordType::TXT
-                && (*qname == self.txt_name()
-                    || self
-                        .impersonate
-                        .as_ref()
-                        .is_some_and(|(owner, _)| owner == qname));
-            let cp_txt = query.query_type() == RecordType::TXT && *qname == self.cp_name();
-            let signer = if membership_txt {
-                self.txt_signer.as_ref().unwrap_or(&self.signer)
-            } else if cp_txt {
-                self.cp_signer.as_ref().unwrap_or(&self.signer)
-            } else {
-                &self.signer
-            };
-            let rrsig =
-                RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign rrset");
-            set.insert_rrsig(Record::from_rdata(
-                set.name().clone(),
-                self.ttl,
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
-            ));
-        }
+        // Inception an hour ago: RRSIG validity has to bracket "now".
+        let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let qname = query.name();
+        let membership_txt = query.query_type() == RecordType::TXT
+            && (*qname == self.txt_name()
+                || self
+                    .impersonate
+                    .as_ref()
+                    .is_some_and(|(owner, _)| owner == qname));
+        let cp_txt = query.query_type() == RecordType::TXT && *qname == self.cp_name();
+        let signer = if membership_txt {
+            self.txt_signer.as_ref().unwrap_or(&self.signer)
+        } else if cp_txt {
+            self.cp_signer.as_ref().unwrap_or(&self.signer)
+        } else {
+            &self.signer
+        };
+        let rrsig = RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign rrset");
+        set.insert_rrsig(Record::from_rdata(
+            set.name().clone(),
+            self.ttl,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+
         response.add_answers(set.records(true).cloned());
         // Spliced in *after* signing and outside the RecordSet entirely, at
         // the queried name but in another class: the record an attacker adds
@@ -848,7 +841,7 @@ impl SimZone {
     }
 
     /// The name the membership records live under.
-    pub fn txt_name(&self) -> Name {
+    pub(crate) fn txt_name(&self) -> Name {
         Name::from_utf8(format!("{TXT_PREFIX}.{}", self.origin)).expect("txt name")
     }
 

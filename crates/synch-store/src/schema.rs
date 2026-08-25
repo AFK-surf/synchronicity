@@ -1,7 +1,7 @@
 //! The schema as an ordered chain of migrations (§10).
 //!
 //! There is one path to a database of the current shape: replaying
-//! [`MIGRATIONS`] from wherever a database currently is. `MIGRATIONS[v]` takes
+//! `MIGRATIONS` from wherever a database currently is. `MIGRATIONS[v]` takes
 //! a database from version `v` to `v + 1`, so index 0 takes an *empty* file to
 //! version 1 — the original schema — and a fresh database is simply one that
 //! replays the whole chain. There is deliberately no separate "current schema"
@@ -16,7 +16,7 @@
 //! - A database stamped newer than this build knows is **refused**, not probed.
 //! - No `IF NOT EXISTS` anywhere: whether an object exists is determined by the
 //!   version number, never discovered by trying.
-//! - Anything SQL cannot express is a [`Migration::Rust`] step in the same
+//! - Anything SQL cannot express is a `Migration::Rust` step in the same
 //!   numbered chain, under the same transaction rule.
 
 use rusqlite::{OptionalExtension, Transaction};
@@ -24,10 +24,11 @@ use rusqlite::{OptionalExtension, Transaction};
 use crate::error::Result;
 
 /// The version a database this build writes carries: the length of the chain.
-pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+#[cfg(test)]
+pub(crate) const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
 /// One step of the migration chain.
-pub enum Migration {
+pub(crate) enum Migration {
     /// A batch of SQL statements.
     Sql(&'static str),
     /// A step SQL cannot express — a backfill, a rewrite of stored text.
@@ -51,7 +52,7 @@ impl std::fmt::Debug for Migration {
 /// The whole history of this schema, in order.
 ///
 /// `MIGRATIONS[v]` upgrades a database at version `v` to version `v + 1`.
-pub const MIGRATIONS: &[Migration] = &[
+pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V1_ORIGINAL),
     Migration::Sql(V2_OBSERVED_HEADS),
     Migration::Sql(V3_DROP_WANT),
@@ -709,7 +710,7 @@ const V13_PROVIDERS_BY_ORIGIN: &str =
 /// `cfg(test)` is what makes "there is exactly one path to a database" a
 /// property of the code rather than a promise.
 #[cfg(test)]
-pub const FINAL_SCHEMA: &str = r#"
+pub(crate) const FINAL_SCHEMA: &str = r#"
 CREATE TABLE config        (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE device_keys (
   node_id     BLOB PRIMARY KEY,

@@ -18,7 +18,7 @@ pub fn escape(text: &str) -> String {
 
 /// One object in a `ListObjectsV2` result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListedObject {
+pub(crate) struct ListedObject {
     /// The object key.
     pub key: String,
     /// Its size in bytes.
@@ -31,7 +31,7 @@ pub struct ListedObject {
 
 /// A `ListObjectsV2` result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListResult {
+pub(crate) struct ListResult {
     /// The bucket listed.
     pub bucket: String,
     /// The prefix filter.
@@ -54,7 +54,7 @@ pub struct ListResult {
 
 impl ListResult {
     /// Renders the S3 XML body.
-    pub fn to_xml(&self) -> String {
+    pub(crate) fn to_xml(&self) -> String {
         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
         xml.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
         xml.push_str(&format!("<Name>{}</Name>", escape(&self.bucket)));
@@ -101,7 +101,7 @@ impl ListResult {
 }
 
 /// Renders a `ListBuckets` result.
-pub fn list_buckets_xml(names: &[String]) -> String {
+pub(crate) fn list_buckets_xml(names: &[String]) -> String {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     xml.push_str("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     xml.push_str("<Owner><ID>synchronicity</ID><DisplayName>synchronicity</DisplayName></Owner>");
@@ -126,7 +126,7 @@ const OWNERSHIP: &str = "<Initiator><ID>synchronicity</ID>\
      <Owner><ID>synchronicity</ID><DisplayName>synchronicity</DisplayName></Owner>";
 
 /// Renders an `InitiateMultipartUploadResult` (§9.4).
-pub fn initiate_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+pub(crate) fn initiate_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -144,7 +144,7 @@ pub fn initiate_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
 /// rendered rather than left out — but the gateway has no idea what host it is
 /// reached at, so it is the path form, which is what a path-style client asked
 /// on anyway.
-pub fn complete_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+pub(crate) fn complete_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -160,7 +160,7 @@ pub fn complete_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
 
 /// One part in a `ListPartsResult`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListedPart {
+pub(crate) struct ListedPart {
     /// The part number.
     pub number: u32,
     /// Its size in bytes.
@@ -175,7 +175,7 @@ pub struct ListedPart {
 ///
 /// Paginated like every other listing, because `aws s3api list-parts` walks the
 /// markers whether or not there are 10 000 parts to walk.
-pub fn list_parts_xml(
+pub(crate) fn list_parts_xml(
     bucket: &str,
     key: &str,
     upload_id: &str,
@@ -216,7 +216,7 @@ pub fn list_parts_xml(
 
 /// One upload in a `ListMultipartUploadsResult`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListedUpload {
+pub(crate) struct ListedUpload {
     /// The key it will publish to.
     pub key: String,
     /// The upload id.
@@ -226,7 +226,7 @@ pub struct ListedUpload {
 }
 
 /// Renders a `ListMultipartUploadsResult` (§9.4).
-pub fn list_uploads_xml(
+pub(crate) fn list_uploads_xml(
     bucket: &str,
     prefix: &str,
     markers: (&str, &str),
@@ -277,11 +277,11 @@ pub fn list_uploads_xml(
 /// by whatever echoes them back, so a legitimate 10 000-part completion runs
 /// past S3's number. 256 bytes a part leaves room for that and for the
 /// checksum elements clients add.
-pub const MAX_COMPLETE_BODY: usize = 10_000 * 256;
+pub(crate) const MAX_COMPLETE_BODY: usize = 10_000 * 256;
 
 /// One part a `CompleteMultipartUpload` body named.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestedPart {
+pub(crate) struct RequestedPart {
     /// The part number the client named.
     pub number: u32,
     /// The ETag it expects that part to have, unquoted.
@@ -294,7 +294,7 @@ pub struct RequestedPart {
 /// one: the body is attacker-controlled, so a `DOCTYPE` or an entity — the
 /// shapes an XXE turns on — is refused outright rather than expanded, and
 /// anything this gateway does not recognize is skipped rather than guessed at.
-pub fn parse_complete_upload(body: &str) -> Result<Vec<RequestedPart>, String> {
+pub(crate) fn parse_complete_upload(body: &str) -> Result<Vec<RequestedPart>, String> {
     if body.len() > MAX_COMPLETE_BODY {
         return Err(format!(
             "the completion body is larger than the {MAX_COMPLETE_BODY}-byte maximum"
@@ -431,7 +431,7 @@ fn unescape(text: &str) -> String {
 }
 
 /// Formats unix nanoseconds as the RFC 3339 timestamp S3 clients expect.
-pub fn format_timestamp(nanos: i64) -> String {
+pub(crate) fn format_timestamp(nanos: i64) -> String {
     let nanos = nanos.max(0);
     let millis = (nanos % 1_000_000_000) / 1_000_000;
     let (year, month, day, hour, minute, second) =
@@ -445,7 +445,7 @@ pub fn format_timestamp(nanos: i64) -> String {
 /// The XML body wants RFC 3339 and the header wants HTTP-date, and they are
 /// not interchangeable: AWS SDKs parse the header strictly, so an RFC 3339
 /// value there broke rclone outright.
-pub fn format_http_date(nanos: i64) -> String {
+pub(crate) fn format_http_date(nanos: i64) -> String {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

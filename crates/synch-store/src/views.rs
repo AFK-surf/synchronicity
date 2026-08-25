@@ -150,7 +150,7 @@ impl std::str::FromStr for ReplicaPolicy {
 /// One: a replica will not be the last holder to let go of something. It does
 /// not try to enforce a cluster-wide floor either — that is the deferred half
 /// of §4.3, and the hazard is written down there.
-pub const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
+pub(crate) const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 
 /// How long a released root outlives the last entry naming it, when a space
 /// does not say (`docs/REPLICATION.md` §5).
@@ -160,7 +160,7 @@ pub const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 /// long a read cache keeps what nobody references, while this is the entire
 /// recovery story for an accidental deletion under the `tree` policy. The one
 /// an operator regrets is the short one.
-pub const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
+pub(crate) const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
 
 /// A configured space (§4.1, `docs/SERVERLESS.md` §10, `docs/REPLICATION.md`).
 ///
@@ -178,7 +178,7 @@ pub struct SpaceRow {
     /// publishes and reads.
     pub replicate: Option<ReplicaPolicy>,
     /// Seconds a released root is still held. `None` takes
-    /// [`DEFAULT_REPLICA_GRACE_SECS`].
+    /// `DEFAULT_REPLICA_GRACE_SECS`.
     pub grace: Option<i64>,
     /// A ceiling on bytes held for this space, or `None` for no ceiling.
     pub budget: Option<u64>,
@@ -451,7 +451,8 @@ impl Store {
     }
 
     /// Deletes one provider row.
-    pub fn delete_provider(&self, root: &Hash, origin: &OriginId) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn delete_provider(&self, root: &Hash, origin: &OriginId) -> Result<()> {
         self.conn().execute(
             "DELETE FROM blob_providers WHERE object_root = ?1 AND origin_id = ?2",
             params![root.as_bytes().to_vec(), origin.canonical()],
@@ -1105,7 +1106,7 @@ impl Txn<'_> {
         // changes there can be and says nothing about how large each one is, so
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
-        // in ([`Trie::for_each_resolved_change`]).
+        // in (`Trie::for_each_resolved_change_scoped`).
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
             apply_change(self.conn(), origin, &change, now, release_now, &replicas)
         })
@@ -1125,7 +1126,7 @@ impl Txn<'_> {
     /// The third table `materialize_diff` writes, and the one a rebuild used
     /// to leave standing. Scoped by `issuer`, so it removes what this origin
     /// granted and never a binding some other origin issued for the same key.
-    pub fn delete_origin_delegations(&self, issuer: &OriginId) -> Result<usize> {
+    pub(crate) fn delete_origin_delegations(&self, issuer: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM bindings WHERE source = 'delegated' AND issuer = ?1",
             params![issuer.canonical()],

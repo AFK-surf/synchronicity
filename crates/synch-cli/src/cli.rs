@@ -923,7 +923,7 @@ pub enum PinCommand {
 ///
 /// Kept deliberately small: this is the only duration the command surface takes
 /// and it does not warrant a dependency.
-pub fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
+pub(crate) fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
     let text = text.trim();
     if text.is_empty() {
         anyhow::bail!("a duration looks like 30s, 90m, 1h, 2h30m, or a plain number of seconds");
@@ -963,7 +963,7 @@ pub fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
 
 /// A parsed `--range` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteRange {
+pub(crate) struct ByteRange {
     /// The first byte, inclusive.
     pub start: u64,
     /// The last byte, exclusive. `None` means "to the end".
@@ -972,7 +972,7 @@ pub struct ByteRange {
 
 impl ByteRange {
     /// Parses `START..END`, `START..`, `..END`, or `..`.
-    pub fn parse(text: &str) -> anyhow::Result<ByteRange> {
+    pub(crate) fn parse(text: &str) -> anyhow::Result<ByteRange> {
         let (start, end) = text
             .split_once("..")
             .ok_or_else(|| anyhow::anyhow!("a range looks like START..END"))?;
@@ -991,7 +991,7 @@ impl ByteRange {
     }
 
     /// How many bytes the range covers, when it is bounded.
-    pub fn length(&self) -> Option<u64> {
+    pub(crate) fn length(&self) -> Option<u64> {
         self.end.map(|end| end.saturating_sub(self.start))
     }
 }

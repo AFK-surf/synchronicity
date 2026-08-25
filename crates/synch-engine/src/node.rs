@@ -42,7 +42,7 @@ fn self_binding(origin: &OriginId, node_id: NodeId, now: i64) -> Binding {
 }
 
 /// A staged trie change: a key, and its new value or `None` to remove it.
-pub type StagedChange = (Vec<u8>, Option<Vec<u8>>);
+pub(crate) type StagedChange = (Vec<u8>, Option<Vec<u8>>);
 
 /// A running node.
 ///
@@ -686,9 +686,9 @@ impl Node {
         // pointer no reading surface follows (§5.3).
         let pending_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone())
-            .on_change(Some(mirror_wake.clone()))
-            .on_replica(Some(replica_wake.clone()))
-            .on_pending(Some(pending_wake.clone()));
+            .on_change(mirror_wake.clone())
+            .on_replica(replica_wake.clone())
+            .on_pending(pending_wake.clone());
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
         let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {
             (Some(objects), Some(cloud)) => Arc::new(
@@ -844,8 +844,7 @@ impl Node {
     /// forcing compilation early is half the point of running it, and that is
     /// real CPU on a thread the reactor is not waiting for.
     pub(crate) fn declare_program(&self, elf: &[u8]) -> Result<synch_core::Declaration> {
-        let host: Arc<dyn synch_sock::SocketHost> = Arc::new(crate::sockets::NoTree);
-        crate::sockets::declare_blocking(elf, host)
+        crate::sockets::declare_blocking(elf)
     }
 
     /// The batch between staging and one signed root (§7.1).
@@ -1118,7 +1117,7 @@ impl Node {
     /// holding a live *rooted* binding there, so a delegate's records are
     /// honored by nobody whatever it publishes. This is what makes the command
     /// say so instead of reporting a success that means nothing.
-    pub fn is_delegated(&self) -> Result<bool> {
+    pub(crate) fn is_delegated(&self) -> Result<bool> {
         // A live delegation of this node's own key is the authoritative
         // answer, because it came out of a signed trie. The adopted read scope
         // is only the bootstrap — what a delegate has before it has replicated
@@ -1203,7 +1202,7 @@ impl Node {
             // asking for this usually means "re-sync this space from my peers",
             // which is the exact opposite.
             //
-            // `scan_space` already refuses a root that is missing or is not a
+            // `scan_space_with_ingest` already refuses a root that is missing or is not a
             // directory, with the same reasoning in its comment; this is the
             // sibling case it does not test, where the root is present, is a
             // directory, and is simply somewhere else.
@@ -1340,14 +1339,6 @@ impl Node {
     /// a mirror pass (§7.2) and a `synch fill` of a space (fill.rs) alike.
     pub(crate) async fn lock_materialization(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.mirror_lock.lock().await
-    }
-
-    /// Rings the unknown-key bell as an inbound refusal would.
-    ///
-    /// The endpoint rings it on its own; this is how a caller that already
-    /// knows a binding is stale asks for the same re-resolution.
-    pub fn trigger_dns_refresh(&self) {
-        self.inner.dns_wake.notify_waiters();
     }
 
     /// The resolver slot every membership refresh in this process reads from.
@@ -1490,7 +1481,7 @@ impl Node {
     /// record of its own under `m:space/<id>`, because a leaf value cannot be
     /// partly redacted and a single manifest listing every space would be
     /// unshowable to a delegate (§5.5).
-    pub fn manifest_change(&self) -> Result<StagedChange> {
+    pub(crate) fn manifest_change(&self) -> Result<StagedChange> {
         let manifest = NodeManifest {
             v: synch_core::RECORD_VERSION,
             name: self.inner.config.name.clone(),
@@ -1501,7 +1492,7 @@ impl Node {
     }
 
     /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §5.5).
-    pub fn space_info_changes(&self) -> Result<Vec<StagedChange>> {
+    pub(crate) fn space_info_changes(&self) -> Result<Vec<StagedChange>> {
         let mut out = Vec::new();
         for space in self.store().spaces()? {
             let entry_count = self.store().count_entries(self.origin(), &space.id)?;
@@ -1540,7 +1531,7 @@ impl Node {
     }
 
     /// The tombstone that removes one space's advertised record.
-    pub fn space_info_removal(&self, space: &str) -> Result<StagedChange> {
+    pub(crate) fn space_info_removal(&self, space: &str) -> Result<StagedChange> {
         Ok((synch_core::space_info_key(space)?, None))
     }
 
@@ -1564,7 +1555,8 @@ impl Node {
     }
 
     /// Reads an origin's published manifest.
-    pub fn manifest_of(&self, origin: &OriginId) -> Result<Option<NodeManifest>> {
+    #[cfg(test)]
+    pub(crate) fn manifest_of(&self, origin: &OriginId) -> Result<Option<NodeManifest>> {
         let Some(head) = self.store().complete_head(origin)? else {
             return Ok(None);
         };
@@ -1580,7 +1572,7 @@ impl Node {
     // ---- blob advertisements ---------------------------------------------
 
     /// The `b:` record for a locally held object, if we hold any of it.
-    pub fn ad_change(&self, root: &Hash) -> Result<Option<StagedChange>> {
+    pub(crate) fn ad_change(&self, root: &Hash) -> Result<Option<StagedChange>> {
         if self.cas_backend().remote_upload_parts()
             && self
                 .store()
@@ -1658,7 +1650,7 @@ impl Node {
     /// Ads are published on first ingest and on completion, and otherwise at
     /// most once per `ad_update_interval` per object while a download is in
     /// flight — never per chunk.
-    pub fn ad_update_due(&self, root: &Hash) -> Result<bool> {
+    pub(crate) fn ad_update_due(&self, root: &Hash) -> Result<bool> {
         let Some(blob) = self.store().blob(root)? else {
             return Ok(false);
         };
@@ -1778,7 +1770,7 @@ fn canonical_dir(path: &Path) -> Result<PathBuf> {
 }
 
 /// True if either path contains the other.
-pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
@@ -1791,7 +1783,7 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// misses overlaps — on macOS every temp path under `/var` resolves to
 /// `/private/var`, so the guard passed a directory it should have refused.
 /// Falls back to the raw value when the directory no longer exists.
-pub fn stored_root(path: &str) -> PathBuf {
+pub(crate) fn stored_root(path: &str) -> PathBuf {
     let raw = PathBuf::from(path);
     std::fs::canonicalize(&raw).unwrap_or(raw)
 }
@@ -1845,7 +1837,7 @@ pub fn encode_addr(addr: &EndpointAddr) -> Vec<u8> {
 }
 
 /// Decodes an endpoint address from the `peers_seen.last_addr` column.
-pub fn decode_addr(id: NodeId, bytes: &[u8]) -> Option<EndpointAddr> {
+pub(crate) fn decode_addr(id: NodeId, bytes: &[u8]) -> Option<EndpointAddr> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut addr = EndpointAddr::new(id);
     for part in text.split('\n').filter(|p| !p.is_empty()) {

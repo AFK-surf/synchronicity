@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// a frame an end has not learnt fails to decode, and a failed decode ends the
 /// connection rather than answering. The version is how the control plane
 /// knows which questions this daemon can be asked at all.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest settled version this daemon will serve under.
 ///
@@ -35,7 +35,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 ///
 /// Two, not one: v1 predates the delegations query, and a control plane that
 /// settled on v1 would be old enough that nothing in this tree has met one.
-pub const MIN_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const MIN_PROTOCOL_VERSION: u32 = 2;
 
 /// Whether this daemon will serve under the version a control plane settled on.
 ///
@@ -43,7 +43,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 2;
 /// has one definition and a test can hold it to it: getting the ends wrong is
 /// either a tunnel that drops on upgrade or one that stays up while a frame
 /// goes undecoded, and neither announces itself.
-pub fn settles_at(version: u32) -> bool {
+pub(crate) fn settles_at(version: u32) -> bool {
     (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
 }
 
@@ -51,17 +51,17 @@ pub fn settles_at(version: u32) -> bool {
 ///
 /// Distinct from `sync-head/1`, so a signature minted here can never be read
 /// as a head signature, nor a head signature replayed as an attach proof.
-pub const ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-attach-v1";
+pub(crate) const ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-attach-v1";
 
 /// How many bytes an attach nonce carries.
-pub const NONCE_LEN: usize = 32;
+pub(crate) const NONCE_LEN: usize = 32;
 
 /// The largest payload one binary content frame carries.
-pub const MAX_CHUNK: usize = 64 * 1024;
+pub(crate) const MAX_CHUNK: usize = 64 * 1024;
 
 /// The fixed header every binary content frame opens with: request id then
 /// sequence, both big-endian `u32`.
-pub const CHUNK_HEADER_LEN: usize = 8;
+pub(crate) const CHUNK_HEADER_LEN: usize = 8;
 
 /// The exact bytes an attach proof covers:
 ///
@@ -74,7 +74,7 @@ pub const CHUNK_HEADER_LEN: usize = 8;
 /// suffix does not already give. Binding the URL is what stops a proof minted
 /// for one control plane being replayed at another: the daemon signs the
 /// endpoint it actually dialed, and the endpoint checks against its own.
-pub fn attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
+pub(crate) fn attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(ATTACH_SIGNING_DOMAIN.len() + url.len() + nonce.len());
     buf.extend_from_slice(ATTACH_SIGNING_DOMAIN);
     buf.extend_from_slice(url.as_bytes());
@@ -83,7 +83,7 @@ pub fn attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
 }
 
 /// Wraps a payload in its content-frame header.
-pub fn encode_chunk(id: u32, seq: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_chunk(id: u32, seq: u32, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(CHUNK_HEADER_LEN + data.len());
     buf.extend_from_slice(&id.to_be_bytes());
     buf.extend_from_slice(&seq.to_be_bytes());
@@ -92,7 +92,11 @@ pub fn encode_chunk(id: u32, seq: u32, data: &[u8]) -> Vec<u8> {
 }
 
 /// Reads a content frame's header, returning the payload behind it.
-pub fn decode_chunk(frame: &[u8]) -> Option<(u32, u32, &[u8])> {
+///
+/// The production decoder is the control plane's; this one exists so tests can
+/// check what [`encode_chunk`] put on the wire.
+#[cfg(test)]
+pub(crate) fn decode_chunk(frame: &[u8]) -> Option<(u32, u32, &[u8])> {
     if frame.len() < CHUNK_HEADER_LEN {
         return None;
     }
@@ -108,7 +112,7 @@ pub fn decode_chunk(frame: &[u8]) -> Option<(u32, u32, &[u8])> {
 /// on the node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
-pub enum Down {
+pub(crate) enum Down {
     /// The 32-byte nonce, hex, that the attach proof must cover.
     Challenge {
         /// The nonce, hex-encoded.
@@ -229,7 +233,7 @@ pub enum Down {
 /// What the node sends up the tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
-pub enum Up {
+pub(crate) enum Up {
     /// The opening frame: who is attaching, for what, and speaking what.
     Hello {
         /// The protocol version this daemon speaks.
@@ -331,7 +335,7 @@ pub enum Up {
 
 /// One entry of a directory of the unified tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryJson {
+pub(crate) struct EntryJson {
     /// The entry's name within the directory listed.
     pub name: String,
     /// The full path within the space.
@@ -355,7 +359,7 @@ pub struct EntryJson {
 
 /// One version of one path, as a listing or the inspector renders it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VersionJson {
+pub(crate) struct VersionJson {
     /// The content root, hex, for content-carrying kinds.
     pub root: Option<String>,
     /// `file`, `dir`, `symlink` or `tombstone`.
@@ -380,7 +384,7 @@ pub struct VersionJson {
 /// a date is not enough to tell. The date travels too, because "when does this
 /// end" is a different question from "does it hold now".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegationJson {
+pub(crate) struct DelegationJson {
     /// The delegated device key, z-base-32.
     pub key: String,
     /// The origin that issued it, canonically rendered.
@@ -405,7 +409,7 @@ pub struct DelegationJson {
 /// report exists for — a queue that is draining and a queue that is dead —
 /// behind one that cannot tell them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicaSpaceJson {
+pub(crate) struct ReplicaSpaceJson {
     /// The space's id.
     pub space: String,
     /// `tree` or `archive`.

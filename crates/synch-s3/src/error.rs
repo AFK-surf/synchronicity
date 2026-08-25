@@ -9,7 +9,7 @@ use synch_cli::control::{ControlError, ErrorCode};
 use crate::xml::escape;
 
 /// The gateway result alias.
-pub type S3Result<T> = std::result::Result<T, S3Error>;
+pub(crate) type S3Result<T> = std::result::Result<T, S3Error>;
 
 /// An S3 API error, rendered as the XML body clients expect.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -37,7 +37,7 @@ impl S3Error {
     }
 
     /// Attaches the resource the error refers to.
-    pub fn with_resource(mut self, resource: impl Into<String>) -> S3Error {
+    pub(crate) fn with_resource(mut self, resource: impl Into<String>) -> S3Error {
         self.resource = resource.into();
         self
     }
@@ -47,7 +47,7 @@ impl S3Error {
     /// The daemon reports failures in terms of a space and a path; the S3
     /// resource is the key, which only the handler that took the request knows.
     /// An error that already carries a resource keeps it.
-    pub fn with_key(mut self, key: &str) -> S3Error {
+    pub(crate) fn with_key(mut self, key: &str) -> S3Error {
         if self.resource.is_empty() {
             self.resource = key.to_string();
         }
@@ -55,7 +55,7 @@ impl S3Error {
     }
 
     /// `NoSuchBucket`.
-    pub fn no_such_bucket(bucket: &str) -> S3Error {
+    pub(crate) fn no_such_bucket(bucket: &str) -> S3Error {
         S3Error::new(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -65,18 +65,18 @@ impl S3Error {
     }
 
     /// `NoSuchKey`.
-    pub fn no_such_key(key: &str) -> S3Error {
+    pub(crate) fn no_such_key(key: &str) -> S3Error {
         S3Error::new(StatusCode::NOT_FOUND, "NoSuchKey", "no such key")
             .with_resource(key.to_string())
     }
 
     /// `AccessDenied`.
-    pub fn access_denied(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn access_denied(reason: impl Into<String>) -> S3Error {
         S3Error::new(StatusCode::FORBIDDEN, "AccessDenied", reason)
     }
 
     /// `InvalidAccessKeyId`.
-    pub fn invalid_access_key(id: &str) -> S3Error {
+    pub(crate) fn invalid_access_key(id: &str) -> S3Error {
         S3Error::new(
             StatusCode::FORBIDDEN,
             "InvalidAccessKeyId",
@@ -85,7 +85,7 @@ impl S3Error {
     }
 
     /// `SignatureDoesNotMatch`.
-    pub fn signature_mismatch() -> S3Error {
+    pub(crate) fn signature_mismatch() -> S3Error {
         S3Error::new(
             StatusCode::FORBIDDEN,
             "SignatureDoesNotMatch",
@@ -94,7 +94,7 @@ impl S3Error {
     }
 
     /// `InvalidRequest` for an unsupported signing algorithm.
-    pub fn unsupported_algorithm(header: &str) -> S3Error {
+    pub(crate) fn unsupported_algorithm(header: &str) -> S3Error {
         S3Error::new(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -103,7 +103,7 @@ impl S3Error {
     }
 
     /// `AuthorizationHeaderMalformed`.
-    pub fn malformed_auth(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn malformed_auth(reason: impl Into<String>) -> S3Error {
         S3Error::new(
             StatusCode::BAD_REQUEST,
             "AuthorizationHeaderMalformed",
@@ -112,7 +112,7 @@ impl S3Error {
     }
 
     /// `InvalidRange`.
-    pub fn invalid_range(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn invalid_range(reason: impl Into<String>) -> S3Error {
         S3Error::new(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange", reason)
     }
 
@@ -122,7 +122,7 @@ impl S3Error {
     /// key" back from a `CompleteMultipartUpload` learns nothing, while
     /// `NoSuchUpload` is the code every SDK branches on to stop retrying and
     /// start the upload over.
-    pub fn no_such_upload(upload_id: &str) -> S3Error {
+    pub(crate) fn no_such_upload(upload_id: &str) -> S3Error {
         S3Error::new(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",
@@ -133,12 +133,12 @@ impl S3Error {
 
     /// `InvalidPart`: a completion named a part that was never uploaded, or
     /// one whose ETag does not match what was.
-    pub fn invalid_part(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn invalid_part(reason: impl Into<String>) -> S3Error {
         S3Error::new(StatusCode::BAD_REQUEST, "InvalidPart", reason)
     }
 
     /// `InvalidPartOrder`: a completion's part numbers do not ascend.
-    pub fn invalid_part_order() -> S3Error {
+    pub(crate) fn invalid_part_order() -> S3Error {
         S3Error::new(
             StatusCode::BAD_REQUEST,
             "InvalidPartOrder",
@@ -147,12 +147,12 @@ impl S3Error {
     }
 
     /// `EntityTooSmall`: an interior part is under S3's 5 MiB minimum.
-    pub fn entity_too_small(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn entity_too_small(reason: impl Into<String>) -> S3Error {
         S3Error::new(StatusCode::BAD_REQUEST, "EntityTooSmall", reason)
     }
 
     /// `MalformedXML`: a request body this gateway could not read.
-    pub fn malformed_xml(reason: impl Into<String>) -> S3Error {
+    pub(crate) fn malformed_xml(reason: impl Into<String>) -> S3Error {
         S3Error::new(StatusCode::BAD_REQUEST, "MalformedXML", reason)
     }
 
@@ -163,7 +163,7 @@ impl S3Error {
     /// `NoSuchKey`, which is the wrong answer to a question about an upload.
     /// Only the handler knows which question was asked, so only the handler can
     /// correct it.
-    pub fn about_upload(self, upload_id: &str) -> S3Error {
+    pub(crate) fn about_upload(self, upload_id: &str) -> S3Error {
         if self.status == StatusCode::NOT_FOUND {
             return S3Error::no_such_upload(upload_id);
         }
@@ -171,7 +171,7 @@ impl S3Error {
     }
 
     /// `NotImplemented`, for the operations §9.4 defers past v1.
-    pub fn not_implemented(operation: &str) -> S3Error {
+    pub(crate) fn not_implemented(operation: &str) -> S3Error {
         S3Error::new(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
@@ -204,7 +204,7 @@ impl S3Error {
     }
 
     /// The XML body clients parse.
-    pub fn to_xml(&self) -> String {
+    pub(crate) fn to_xml(&self) -> String {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource></Error>",

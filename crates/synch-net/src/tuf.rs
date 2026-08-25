@@ -331,7 +331,7 @@ impl PinState {
     }
 
     /// Decodes persisted JSON against the selected TUF root anchor.
-    pub fn decode_anchored(text: &str, anchor: &[u8]) -> Option<PinState> {
+    pub(crate) fn decode_anchored(text: &str, anchor: &[u8]) -> Option<PinState> {
         let value: serde_json::Value = serde_json::from_str(text).ok()?;
         // A file this build cannot read is not an error: the pin set falls
         // back to the bootstrap snapshot and the next accepted update
@@ -552,7 +552,7 @@ impl Tlog {
     /// the epoch, a negative end one that closed then. A cast in either
     /// direction turns `u64::MAX` into `-1` and makes every window vacuous —
     /// the one answer a validity check must never give.
-    pub fn valid_at(&self, now: u64) -> bool {
+    pub(crate) fn valid_at(&self, now: u64) -> bool {
         let started = match u64::try_from(self.valid_from) {
             Ok(start) => start <= now,
             Err(_) => true,
@@ -707,7 +707,7 @@ pub const SIGSTORE_TUF_URL: &str = "https://tuf-repo-cdn.sigstore.dev";
 /// day is far more often than that; and the walk is a handful of HTTPS GETs,
 /// the difference between touching a CDN once a day and touching it on every
 /// membership refresh.
-pub const REFRESH_INTERVAL: u64 = 24 * 60 * 60;
+pub(crate) const REFRESH_INTERVAL: u64 = 24 * 60 * 60;
 
 /// How many root versions past the one already trusted [`fetch_metadata`] will
 /// probe before giving up. Sigstore rotates roughly yearly; this is decades
@@ -721,13 +721,13 @@ const ROOT_CEILING: u64 = 200;
 /// more than a gigabyte resident. This aggregate is generous against the
 /// real repository — `targets.json` is the only large file, at a few hundred
 /// KiB, and roots are tens of KiB apiece.
-pub const MAX_WALK_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_WALK_BYTES: usize = 8 * 1024 * 1024;
 
 /// The longest one walk may take, end to end. A per-request timeout is not a
 /// bound either: ~204 requests each stalling just inside it is hours of
 /// walk, awaited inside a membership refresh. Whatever is collected by this
 /// point is abandoned and the pins in force stand (§10.2).
-pub const MAX_WALK_TIME: Duration = Duration::from_secs(120);
+pub(crate) const MAX_WALK_TIME: Duration = Duration::from_secs(120);
 
 /// A TUF repository, as the one operation walking it needs. Injected rather
 /// than hardwired, the same shape the control plane's fetch uses:
@@ -770,17 +770,9 @@ pub struct HttpRepo {
 }
 
 impl HttpRepo {
-    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]).
-    pub fn new(base: &str) -> Result<HttpRepo, String> {
-        HttpRepo::build(base, None)
-    }
-
-    /// The same repository, with requests identified by `user_agent`.
-    pub fn with_user_agent(base: &str, user_agent: &str) -> Result<HttpRepo, String> {
-        HttpRepo::build(base, Some(user_agent))
-    }
-
-    fn build(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
+    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]), with requests
+    /// identified by `user_agent` when one is given.
+    pub fn new(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
         let mut builder = reqwest::blocking::Client::builder().timeout(TUF_TIMEOUT);
         if let Some(user_agent) = user_agent {
             builder = builder.user_agent(user_agent);
@@ -1299,7 +1291,8 @@ fn pem_body(pem: &str) -> Result<Vec<u8>, TufError> {
 /// that agree with this for every key in every root but one — root 11 kept a
 /// key's id while editing a `x-tuf-on-ci-online-uri` member inside it — so
 /// this is how a fixture test says the two normally agree.
-pub fn key_id(key: &serde_json::Value) -> Result<String, TufError> {
+#[cfg(any(test, feature = "sim"))]
+pub(crate) fn key_id(key: &serde_json::Value) -> Result<String, TufError> {
     Ok(hex::encode(sha256(
         &canonical_json(key).map_err(TufError::Malformed)?,
     )))

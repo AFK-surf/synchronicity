@@ -329,7 +329,7 @@ KiB-page hosts. A program built for another value must pass that value to
 | Table | Scope | Bound |
 | --- | --- | --- |
 | endpoint table | per invocation | 16 handles, `SY_SELF` included |
-| object table | per invocation | 32 objects, 1 MiB footprint |
+| object table | per invocation | shares the 16-handle table with endpoints, 1 MiB footprint |
 | socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each

@@ -24,7 +24,7 @@ use crate::{classify::KnownKeys, MonitorError};
 /// fresh keys and each is a genuine new authorization. The cap makes the file
 /// bounded outright; the oldest indices go first and the run says so, because
 /// silently dropping evidence would be the same mistake in a quieter place.
-pub const MAX_STORED_ENTRIES: usize = 1024;
+pub(crate) const MAX_STORED_ENTRIES: usize = 1024;
 
 /// Where a monitor got to in one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -124,7 +124,7 @@ pub struct MonitorState {
     /// stays hand-readable JSON.
     ///
     /// Only the entries behind **reports on stdout** are kept, and at most
-    /// [`MAX_STORED_ENTRIES`] per log. An unauthorized claim is something
+    /// `MAX_STORED_ENTRIES` per log. An unauthorized claim is something
     /// anyone can publish for free by minting a self-signed certificate that
     /// names a watched apex, so keeping a body for every finding made the file
     /// grow without bound at an attacker's choosing.
@@ -136,7 +136,7 @@ impl MonitorState {
     /// Records one entry body under its log's origin, base64 — the file
     /// stays hand-readable JSON.
     ///
-    /// Returns the indices dropped to stay under [`MAX_STORED_ENTRIES`], so
+    /// Returns the indices dropped to stay under `MAX_STORED_ENTRIES`, so
     /// the run can say which evidence is no longer local.
     pub fn record_entry(&mut self, origin: &str, index: u64, body: &[u8]) -> Vec<u64> {
         let bodies = self.entries.entry(origin.to_string()).or_default();

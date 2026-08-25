@@ -116,7 +116,7 @@ Two consequences of that cut, named up front:
 
 - **`blob_path` is no longer a public API.** The former CAS payload-path API
   escaped the store crate and was reflinked into mirror targets
-  (`Adoption::cloning` via `fetcher.rs`). That call site is now
+  (`Adoption::clone_from` via `fetcher.rs`). That call site is now
   `backend.materialize(root, target)`: the local backend reflinks where the
   filesystem allows, the cloud backend downloads through its cache. Nothing
   outside a backend may ever again assume a blob is a file.
