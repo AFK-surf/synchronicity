@@ -272,6 +272,10 @@ async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
         .is_none());
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn a_node_can_connect_to_its_own_socket() {
     let (_data, space, node) = node_with_space().await;

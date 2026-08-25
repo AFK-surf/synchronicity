@@ -1425,9 +1425,11 @@ impl DnssecResolver {
         let owned = source.clone();
         let walked = tokio::task::spawn_blocking(move || match &owned {
             TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
-            TufSource::Url(url) => {
-                tuf::fetch_metadata(&HttpRepo::new(url).map_err(TufError::Malformed)?, from_root)
-            }
+            TufSource::Url(url) => tuf::fetch_metadata(
+                &tuf::HttpRepo::new(url)
+                    .map_err(|e| TufError::Malformed(format!("TUF client: {e}")))?,
+                from_root,
+            ),
         })
         .await
         .map_err(|e| NetError::Dns(format!("the TUF walk did not finish: {e}")))?;
@@ -1787,75 +1789,6 @@ fn now_unix(floor: u64) -> Option<u64> {
         return Some(now);
     }
     Some(now.max(floor))
-}
-
-/// How long one file of a TUF walk may take.
-const TUF_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The most a single TUF file may be. Sigstore's `targets.json` is the big
-/// one at a few hundred KiB; the cap exists for the same reason the DoH body
-/// has one — these are bytes from a party nothing is trusted about, and a
-/// response with no bound is a reader that can be exhausted.
-const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
-
-/// Sigstore's TUF repository, read over HTTPS. Built and used entirely inside
-/// [`tokio::task::spawn_blocking`], which is what makes a blocking client the
-/// right one: the walk is sequential — each file names the next — so there is
-/// no concurrency to give up, and the JSON parsing stays off the reactor.
-/// TLS is not load-bearing: every byte fetched is self-authenticating and
-/// checked against [`tuf::EMBEDDED_TUF_ROOT`] before it moves anything, so a
-/// hostile mirror can deny this walk and cannot make it mean anything (§10.2).
-struct HttpRepo {
-    base: String,
-    client: reqwest::blocking::Client,
-}
-
-impl HttpRepo {
-    fn new(base: &str) -> Result<HttpRepo, String> {
-        Ok(HttpRepo {
-            base: base.trim_end_matches('/').to_string(),
-            client: reqwest::blocking::Client::builder()
-                .timeout(TUF_TIMEOUT)
-                .build()
-                .map_err(|e| format!("TUF client: {e}"))?,
-        })
-    }
-}
-
-impl Repo for HttpRepo {
-    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
-        let url = format!("{}/{path}", self.base);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("{url}: {e}"))?;
-        match response.status().as_u16() {
-            200 => {
-                // Read through a `take`, never `bytes()`: a cap applied to
-                // the result of `bytes()` is a bound on nothing, because the
-                // allocation already happened — an endless body exhausts the
-                // reader before the comparison runs, and this sits on the
-                // membership-refresh path. One byte past the cap keeps "at
-                // the cap" and "over it" distinguishable; the monitor's copy
-                // reads the same way.
-                use std::io::Read;
-                let mut body = Vec::new();
-                response
-                    .take(MAX_TUF_BYTES as u64 + 1)
-                    .read_to_end(&mut body)
-                    .map_err(|e| format!("{url}: {e}"))?;
-                if body.len() > MAX_TUF_BYTES {
-                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
-                }
-                Ok(Some(body))
-            }
-            // The end of the root chain is a 404, and Sigstore's CDN answers
-            // 403 for an object that is not there.
-            403 | 404 => Ok(None),
-            status => Err(format!("{url}: the repository answered {status}")),
-        }
-    }
 }
 
 /// How long one DoH exchange may take end to end.

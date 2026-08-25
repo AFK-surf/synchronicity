@@ -56,7 +56,7 @@ use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 use crate::{
     error::{EngineError, Result},
     ignore::IgnoreSet,
-    mirror::{apply_metadata, escapes_via_symlink, fold, materialize_symlink, Metadata},
+    mirror::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
 };
@@ -805,35 +805,18 @@ fn decide(
             continue;
         }
 
-        // Two published paths that fold onto one local name — `Link` and
-        // `link` — are not both materializable where the filesystem folds them.
-        // The first claimant wins and the rest are reported, exactly as a mirror
-        // does it: without the claim, `--force` would write one over the other
-        // and call both of them filled. Where the filesystem does *not* fold,
-        // there is no collision to report and both are written.
-        // Two published paths that fold onto one local name — `Link` and
-        // `link` on a case-insensitive filesystem — are not both materializable
-        // there. The first claimant wins and the rest are reported, exactly as a
-        // mirror does it: without the claim, `--force` would write one over the
-        // other and call both of them filled.
+        // The first claimant to a folded name wins and the rest are reported
+        // (`claim_folded_name`): without the claim, `--force` would write one
+        // over the other and call both of them filled.
         //
         // Applied on every platform, as the mirror applies it. A fill could ask
         // the filesystem instead — and did, for three revisions — but the cost
         // of being wrong runs the other way: refusing a name is a report about
         // two files that are both there, while a wrong "does not fold" is a
         // silent clobber. §7.2 takes the conservative side.
-        let folded = fold(&set.path);
-        match claimed.get(&folded) {
-            Some(winner) if winner != &set.path => {
-                report.skipped.push((
-                    set.path.clone(),
-                    format!("collides with {winner} under filesystem name folding"),
-                ));
-                continue;
-            }
-            _ => {
-                claimed.insert(folded, set.path.clone());
-            }
+        if let Err(reason) = crate::mirror::claim_folded_name(&mut claimed, &set.path) {
+            report.skipped.push((set.path.clone(), reason));
+            continue;
         }
 
         if selected.kind == EntryKind::Symlink {

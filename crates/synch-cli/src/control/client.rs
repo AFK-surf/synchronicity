@@ -154,7 +154,10 @@ impl Client {
             .put(ReceiverStream::new(body))
             .await?
             .into_inner();
-        Ok(Put { parts, written })
+        Ok(Put {
+            parts,
+            answer: written,
+        })
     }
 
     /// Removes this node's copy of a path and publishes its tombstone.
@@ -220,7 +223,10 @@ impl Client {
             .upload_part(ReceiverStream::new(body))
             .await?
             .into_inner();
-        Ok(PartUpload { parts, recorded })
+        Ok(PartUpload {
+            parts,
+            answer: recorded,
+        })
     }
 
     /// Assembles the named parts and publishes the object.
@@ -386,47 +392,53 @@ impl Chunks {
     }
 }
 
-/// A write in progress (§9.4).
-#[derive(Debug)]
-pub struct Put {
-    parts: mpsc::Sender<pb::PutRequest>,
-    written: Streaming<pb::Written>,
+/// One streamed-write family (§9.4): the request envelope, the daemon's one
+/// answer, and what a committed write yields.
+///
+/// [`Put`] and [`PartUpload`] are [`StreamedWrite`] over the two families —
+/// the machine exists once, and this trait is the whole of the difference.
+pub trait WriteFamily: Sized {
+    /// The request envelope around one part.
+    type Request: Send + 'static;
+    /// The daemon's one answer.
+    type Response;
+    /// What a committed write yields to the caller.
+    type Output;
+    /// This write's name in errors: "the write" or "the part".
+    const WHAT: &'static str;
+    /// The impossible success the daemon must not report after an abort.
+    const ABANDONED: &'static str;
+    /// One piece of the payload.
+    fn chunk(bytes: Vec<u8>) -> Self;
+    /// The abandonment, with its reason.
+    fn abort(why: String) -> Self;
+    /// The explicit commit.
+    fn commit() -> Self;
+    /// Wraps this part in its request envelope.
+    fn into_request(self) -> Self::Request;
+    /// Reads the daemon's answer into what the caller keeps.
+    fn output(answer: Self::Response) -> Result<Self::Output, ControlError>;
 }
 
-impl Put {
-    /// Sends one piece of the payload.
-    pub async fn chunk(&mut self, bytes: Vec<u8>) -> Result<(), ControlError> {
-        self.send(super::proto::PutPart::Chunk(bytes)).await
+impl WriteFamily for super::proto::PutPart {
+    type Request = pb::PutRequest;
+    type Response = pb::Written;
+    type Output = Written;
+    const WHAT: &'static str = "the write";
+    const ABANDONED: &'static str = "the daemon published a write that was abandoned";
+    fn chunk(bytes: Vec<u8>) -> Self {
+        Self::Chunk(bytes)
     }
-
-    /// Abandons the write, so the daemon keeps nothing.
-    ///
-    /// There is no success to report, so the daemon's account of what it threw
-    /// away is the return value: an abandoned write always ends in an error.
-    pub async fn abort(mut self, why: impl Into<String>) -> ControlError {
-        if let Err(e) = self.send(super::proto::PutPart::Abort(why.into())).await {
-            return e;
-        }
-        drop(self.parts);
-        match self.written.message().await {
-            Err(status) => status.into(),
-            Ok(_) => ControlError::internal("the daemon published a write that was abandoned"),
-        }
+    fn abort(why: String) -> Self {
+        Self::Abort(why)
     }
-
-    /// Completes the write and returns the published entry.
-    pub async fn finish(mut self) -> Result<Written, ControlError> {
-        // The commit is a message of its own, so that every other way this
-        // handle can end — an early `?`, a cancelled future, a process that
-        // died — leaves the daemon with a payload it was never told to keep.
-        self.send(super::proto::PutPart::Commit(pb::Commit {}))
-            .await?;
-        drop(self.parts);
-        let written = self
-            .written
-            .message()
-            .await?
-            .ok_or_else(|| ControlError::internal("the daemon did not report the write"))?;
+    fn commit() -> Self {
+        Self::Commit(pb::Commit {})
+    }
+    fn into_request(self) -> pb::PutRequest {
+        pb::PutRequest { part: Some(self) }
+    }
+    fn output(written: pb::Written) -> Result<Written, ControlError> {
         let entry = written
             .entry
             .ok_or_else(|| ControlError::internal("the daemon did not report the entry"))?;
@@ -435,19 +447,92 @@ impl Put {
             entry: EntryInfo::try_from(entry)?,
         })
     }
+}
 
-    async fn send(&mut self, part: super::proto::PutPart) -> Result<(), ControlError> {
-        if self
-            .parts
-            .send(pb::PutRequest { part: Some(part) })
-            .await
-            .is_err()
-        {
+impl WriteFamily for super::proto::UploadPartPart {
+    type Request = pb::UploadPartRequest;
+    type Response = pb::UploadPartResponse;
+    type Output = RecordedPart;
+    const WHAT: &'static str = "the part";
+    const ABANDONED: &'static str = "the daemon recorded a part that was abandoned";
+    fn chunk(bytes: Vec<u8>) -> Self {
+        Self::Chunk(bytes)
+    }
+    fn abort(why: String) -> Self {
+        Self::Abort(why)
+    }
+    fn commit() -> Self {
+        Self::Commit(pb::Commit {})
+    }
+    fn into_request(self) -> pb::UploadPartRequest {
+        pb::UploadPartRequest { part: Some(self) }
+    }
+    fn output(recorded: pb::UploadPartResponse) -> Result<RecordedPart, ControlError> {
+        Ok(RecordedPart {
+            number: recorded.number,
+            size: recorded.size,
+            root: hash_from(&recorded.root, "part root")?,
+            created_ns: recorded.created_ns,
+        })
+    }
+}
+
+/// A write in progress (§9.4).
+pub type Put = StreamedWrite<super::proto::PutPart>;
+
+/// A streamed write, which the daemon keeps nothing of until it is committed.
+#[derive(Debug)]
+pub struct StreamedWrite<P: WriteFamily> {
+    parts: mpsc::Sender<P::Request>,
+    answer: Streaming<P::Response>,
+}
+
+impl<P: WriteFamily> StreamedWrite<P> {
+    /// Sends one piece of the payload.
+    pub async fn chunk(&mut self, bytes: Vec<u8>) -> Result<(), ControlError> {
+        self.send(P::chunk(bytes)).await
+    }
+
+    /// Abandons the write, so the daemon keeps nothing.
+    ///
+    /// There is no success to report, so the daemon's account of what it threw
+    /// away is the return value: an abandoned write always ends in an error.
+    /// A send that fails here already carries that account — `send`
+    /// reads it off the answer stream — so it is returned as it stands: a
+    /// second read of the stream would find it ended and misreport the daemon
+    /// as having kept the write. The two machines had drifted exactly here,
+    /// and the copy that read twice was the wrong one.
+    pub async fn abort(mut self, why: impl Into<String>) -> ControlError {
+        if let Err(e) = self.send(P::abort(why.into())).await {
+            return e;
+        }
+        drop(self.parts);
+        match self.answer.message().await {
+            Err(status) => status.into(),
+            Ok(_) => ControlError::internal(P::ABANDONED),
+        }
+    }
+
+    /// Completes the write and returns what the daemon reports.
+    pub async fn finish(mut self) -> Result<P::Output, ControlError> {
+        // The commit is a message of its own, so that every other way this
+        // handle can end — an early `?`, a cancelled future, a process that
+        // died — leaves the daemon with a payload it was never told to keep.
+        self.send(P::commit()).await?;
+        drop(self.parts);
+        let answer = self.answer.message().await?.ok_or_else(|| {
+            ControlError::internal(format!("the daemon did not report {}", P::WHAT))
+        })?;
+        P::output(answer)
+    }
+
+    async fn send(&mut self, part: P) -> Result<(), ControlError> {
+        if self.parts.send(part.into_request()).await.is_err() {
             // The daemon dropped its side, which means it has already decided
             // the write cannot go on; its reason is on the response stream.
-            return Err(match self.written.message().await {
+            return Err(match self.answer.message().await {
                 Err(status) => status.into(),
-                Ok(_) => ControlError::internal("the daemon stopped reading the write"),
+                Ok(_) => ControlError::internal(format!("the daemon stopped reading {}", P::WHAT)),
             });
         }
         Ok(())
@@ -525,68 +610,7 @@ impl UploadRef {
 }
 
 /// A streamed write of one part, which records nothing until it is finished.
-#[derive(Debug)]
-pub struct PartUpload {
-    parts: mpsc::Sender<pb::UploadPartRequest>,
-    recorded: Streaming<pb::UploadPartResponse>,
-}
-
-impl PartUpload {
-    /// Sends one piece of the part's payload.
-    pub async fn chunk(&mut self, bytes: Vec<u8>) -> Result<(), ControlError> {
-        self.send(super::proto::UploadPartPart::Chunk(bytes)).await
-    }
-
-    /// Abandons the part, so the daemon keeps nothing of it.
-    pub async fn abort(mut self, why: impl Into<String>) -> ControlError {
-        let why = why.into();
-        let _ = self
-            .send(super::proto::UploadPartPart::Abort(why.clone()))
-            .await;
-        drop(self.parts);
-        match self.recorded.message().await {
-            Err(status) => status.into(),
-            Ok(_) => ControlError::internal("the daemon recorded a part that was abandoned"),
-        }
-    }
-
-    /// Commits the part and returns what the daemon recorded.
-    pub async fn finish(mut self) -> Result<RecordedPart, ControlError> {
-        // The commit is a message of its own, so every other way this handle
-        // can end leaves the daemon with a payload it was never told to keep.
-        self.send(super::proto::UploadPartPart::Commit(pb::Commit {}))
-            .await?;
-        drop(self.parts);
-        let recorded = self
-            .recorded
-            .message()
-            .await?
-            .ok_or_else(|| ControlError::internal("the daemon did not report the part"))?;
-        Ok(RecordedPart {
-            number: recorded.number,
-            size: recorded.size,
-            root: hash_from(&recorded.root, "part root")?,
-            created_ns: recorded.created_ns,
-        })
-    }
-
-    async fn send(&mut self, part: super::proto::UploadPartPart) -> Result<(), ControlError> {
-        if self
-            .parts
-            .send(pb::UploadPartRequest { part: Some(part) })
-            .await
-            .is_err()
-        {
-            // The daemon dropped its side, which means it has already decided
-            // the part cannot go on; its reason is on the response stream.
-            return Err(match self.recorded.message().await {
-                Err(status) => status.into(),
-                Ok(_) => ControlError::internal("the daemon stopped reading the part"),
-            });
-        }
-        Ok(())
-    }
-}
+pub type PartUpload = StreamedWrite<super::proto::UploadPartPart>;
 
 /// One part the daemon has recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,10 +649,8 @@ pub struct CompletedUpload {
 
 /// Reads a 32-byte hash column off the wire.
 fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
-    let array: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))?;
-    Ok(Hash::from(array))
+    Hash::from_slice(bytes)
+        .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))
 }
 
 /// What a delete did, and what it left behind.

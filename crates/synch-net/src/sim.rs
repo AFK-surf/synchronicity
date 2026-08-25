@@ -1588,7 +1588,7 @@ impl SimTufKey {
         let key = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
         // The same prefix `LogKey::from_spki` strips back off, named once
         // there rather than spelled out again here.
-        let mut spki = crate::rekor::ED25519_SPKI_PREFIX.to_vec();
+        let mut spki = crate::pubkey::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(aws_lc_rs::signature::KeyPair::public_key(&key).as_ref());
         SimTufKey {
             pkcs8,
@@ -1662,37 +1662,11 @@ fn sign_metadata<'a>(
         .into_bytes()
 }
 
-/// A unix timestamp as the RFC 3339 form TUF `expires` fields carry.
+/// A unix timestamp as the RFC 3339 form TUF `expires` fields carry —
+/// the inverse of the conversion `crate::tuf` uses to read these back.
 fn rfc3339(seconds: i64) -> String {
-    let days = seconds.div_euclid(86_400);
-    let rest = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        (rest % 3600) / 60,
-        rest % 60
-    )
-}
-
-/// Howard Hinnant's `civil_from_days`: the inverse of the conversion
-/// crate::tuf uses to read these back.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let days = days + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (year + i64::from(month <= 2), month, day)
+    let (year, month, day, hour, minute, second) = synch_core::civil::civil_from_unix(seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// RFC 6962 §2.1: the Merkle tree hash over a list of leaf hashes.

@@ -192,53 +192,15 @@ impl MonitorState {
     }
 
     /// Writes the state so that a crash leaves either the previous file or
-    /// this one, and never half of either.
-    ///
-    /// Write to a temporary, flush it to the device, rename over the target,
-    /// then flush the directory. The `fsync` before the rename is what makes
-    /// the rename meaningful: without it the directory entry can reach the
-    /// device before the bytes do, and a crash in between leaves a file that
-    /// exists and is empty — the state a monitor cannot tell from "never read
-    /// anything".
-    ///
-    /// The temporary is unique to this write because two saves over one state
-    /// file are an ordinary operator mistake (a cron job that overlaps its
-    /// predecessor). One shared `.tmp` name lets them rename each other's
-    /// partial bytes over the real file, which is the exact accident the
-    /// rename dance exists to prevent. A process id and a clock reading are
-    /// not enough on their own: two writes from one process can read the same
-    /// nanosecond on a coarse clock, so a sequence number separates them.
+    /// this one, and never half of either: the shared temporary-fsync-rename
+    /// ritual (`synch_core::fs::write_atomic`), whose unique temporary is what
+    /// keeps two overlapping saves — a cron job that outlives its slot — from
+    /// renaming each other's partial bytes over the real file.
     pub fn save(&self, path: &std::path::Path) -> Result<(), MonitorError> {
-        use std::io::Write;
-
         let json =
             serde_json::to_vec_pretty(self).map_err(|e| MonitorError::State(e.to_string()))?;
-        let directory = path.parent().unwrap_or(std::path::Path::new("."));
-        let temporary = unique_temporary(path);
-
-        let write = |temporary: &std::path::Path| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(temporary)?;
-            file.write_all(&json)?;
-            file.sync_all()
-        };
-        if let Err(e) = write(&temporary) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(MonitorError::State(format!("{}: {e}", temporary.display())));
-        }
-        if let Err(e) = std::fs::rename(&temporary, path) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(MonitorError::State(format!(
-                "{} -> {}: {e}",
-                temporary.display(),
-                path.display()
-            )));
-        }
-        // A directory that cannot be flushed is not a failed save: the bytes
-        // are on the device and the rename is in the log. Nothing to say.
-        if let Ok(dir) = std::fs::File::open(directory) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        synch_core::fs::write_atomic(path, &json)
+            .map_err(|e| MonitorError::State(format!("{}: {e}", path.display())))
     }
 
     /// Where this monitor got to in the log calling itself `origin`, or a
@@ -255,34 +217,6 @@ impl MonitorState {
     pub fn is_fresh(&self) -> bool {
         self.logs.values().all(LogPosition::is_fresh)
     }
-}
-
-/// A temporary path beside `path`, unique to this write.
-///
-/// A process id and a clock reading are not enough on their own: two writes
-/// from one process can read the same nanosecond on a coarse clock, and two
-/// saves that agree on a temporary rename each other's partial bytes over the
-/// target. The sequence number is what separates them.
-fn unique_temporary(path: &std::path::Path) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    temporary_at(path, nanos)
-}
-
-/// The naming proper, at a caller-supplied clock reading.
-///
-/// The reading is a parameter so the uniqueness that does not depend on the
-/// clock can be asserted without one: hold `nanos` still and the names must
-/// still differ.
-fn temporary_at(path: &std::path::Path, nanos: u128) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{nanos}.{sequence}.tmp", std::process::id()));
-    path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -384,9 +318,5 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, ["monitor.json"]);
-
-        // Pinned directly too: on a coarse clock the names must still differ.
-        let frozen = temporary_at(&path, 1_760_000_000);
-        assert_ne!(temporary_at(&path, 1_760_000_000), frozen);
     }
 }

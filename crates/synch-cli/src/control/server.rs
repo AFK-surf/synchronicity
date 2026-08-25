@@ -70,17 +70,7 @@ where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(move || {
-        let _scope = synch_core::BlockingScope::enter();
-        f()
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => Err(ControlError::internal(format!(
-            "a blocking task did not complete: {e}"
-        ))),
-    }
+    synch_core::offload(f).await
 }
 
 /// Reads node or store state on the blocking pool.
@@ -463,6 +453,30 @@ impl Drop for RunStream {
 /// The stream every other streaming call answers with.
 type Items<T> = ReceiverStream<Result<T, Status>>;
 
+impl ControlService {
+    /// Answers a streaming call with one message: the work's outcome, or the
+    /// daemon's stop if that arrives first.
+    ///
+    /// `put` and `upload_part` both run their receive loop under this shell,
+    /// so a daemon stopping mid-stream ends either call the same way.
+    fn answer_or_stopped<T, F>(&self, work: F) -> Items<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, ControlError>> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(1);
+        let mut stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                outcome = work => outcome,
+                _ = stopping.recv() => Err(stopped()),
+            };
+            let _ = tx.send(outcome.map_err(Status::from)).await;
+        });
+        ReceiverStream::new(rx)
+    }
+}
+
 #[tonic::async_trait]
 impl Control for ControlService {
     type RunStream = RunStream;
@@ -689,27 +703,13 @@ impl Control for ControlService {
             .await?
         };
 
-        let (tx, rx) = mpsc::channel(1);
         let node = self.served.node()?.clone();
-        let mut stopping = self.stop.subscribe();
-        tokio::spawn(async move {
-            // A write the daemon gives up on is one it keeps nothing of: the
-            // staging file goes with the dropped `Adoption`, exactly as an
-            // abandoned upload's does.
-            let written = tokio::select! {
-                written = receive(&node, incoming, adoption, &header) => written,
-                _ = stopping.recv() => Err(stopped()),
-            };
-            match written {
-                Ok(written) => {
-                    let _ = tx.send(Ok(written)).await;
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error.into())).await;
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        // A write the daemon gives up on is one it keeps nothing of: the
+        // staging file goes with the dropped `Adoption`, exactly as an
+        // abandoned upload's does.
+        let answer = self
+            .answer_or_stopped(async move { receive(&node, incoming, adoption, &header).await });
+        Ok(Response::new(answer))
     }
 
     // ---- multipart upload (§9.4) -----------------------------------------
@@ -769,26 +769,12 @@ impl Control for ControlService {
             )
             .map_err(ControlError::from)?;
 
-        let (tx, rx) = mpsc::channel(1);
         let node = self.served.node()?.clone();
-        let mut stopping = self.stop.subscribe();
-        tokio::spawn(async move {
-            // A part the daemon gives up on is one it keeps nothing of: the
-            // staging file goes with the dropped `Adoption`.
-            let recorded = tokio::select! {
-                recorded = receive_part(&node, incoming, staging) => recorded,
-                _ = stopping.recv() => Err(stopped()),
-            };
-            match recorded {
-                Ok(part) => {
-                    let _ = tx.send(Ok(part)).await;
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error.into())).await;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        // A part the daemon gives up on is one it keeps nothing of: the
+        // staging file goes with the dropped `Adoption`.
+        let answer =
+            self.answer_or_stopped(async move { receive_part(&node, incoming, staging).await });
+        Ok(Response::new(Box::pin(answer)))
     }
 
     async fn delete(
@@ -822,16 +808,17 @@ impl Control for ControlService {
         for part in &request.parts {
             let root = match part.root.len() {
                 0 => None,
-                32 => Some(Hash::from(
-                    <[u8; 32]>::try_from(part.root.as_slice()).expect("32"),
-                )),
-                other => {
-                    return Err(ControlError::invalid(format!(
-                        "part {} named a {other}-byte root",
-                        part.number
-                    ))
-                    .into())
-                }
+                _ => match Hash::from_slice(&part.root) {
+                    Ok(root) => Some(root),
+                    Err(_) => {
+                        return Err(ControlError::invalid(format!(
+                            "part {} named a {}-byte root",
+                            part.number,
+                            part.root.len()
+                        ))
+                        .into())
+                    }
+                },
             };
             named.push((part.number, root));
         }

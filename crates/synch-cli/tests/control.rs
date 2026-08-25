@@ -1693,9 +1693,20 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
         node.shutdown().await.unwrap();
     }
 
-    // Long enough that only the initial scan pushes anything during the test.
+    // Long enough that only the initial scan talks to the peer during the
+    // test. That must include anti-entropy: a round mid-request when the stop
+    // arrives is allowed by design to run to its per-request deadline (the
+    // daemon's join waits for it), so with the default interval whether this
+    // test measured the scan's cancellation or that deadline was a jitter
+    // draw.
     let mut config = NodeConfig::loopback(dir.path());
     config.publish_quiesce = std::time::Duration::from_secs(300);
+    config.aae_interval = std::time::Duration::from_secs(300);
+    // Bounds the startup readoption probe of the same silent peer, which runs
+    // before the control server starts accepting and would otherwise hold the
+    // stop request back for the full request deadline. The initial scan's
+    // push keeps its deadline — the stop must be heard while it is stalled.
+    config.sync_round_budget = std::time::Duration::from_secs(1);
     let running = tokio::spawn(synch_cli::daemon::run(config));
 
     // Wait for the control socket, then ask the daemon to stop.

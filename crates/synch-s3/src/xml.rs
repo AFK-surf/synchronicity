@@ -432,20 +432,11 @@ fn unescape(text: &str) -> String {
 
 /// Formats unix nanoseconds as the RFC 3339 timestamp S3 clients expect.
 pub fn format_timestamp(nanos: i64) -> String {
-    // A small civil-from-days conversion keeps the gateway free of a date
-    // library for the one field that needs one.
     let nanos = nanos.max(0);
-    let seconds = nanos / 1_000_000_000;
     let millis = (nanos % 1_000_000_000) / 1_000_000;
-    let days = seconds / 86_400;
-    let time = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        time / 3600,
-        (time % 3600) / 60,
-        time % 60,
-    )
+    let (year, month, day, hour, minute, second) =
+        synch_core::civil::civil_from_unix(nanos / 1_000_000_000);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 /// Formats unix nanoseconds as the RFC 7231 HTTP-date the `Last-Modified`
@@ -463,7 +454,7 @@ pub fn format_http_date(nanos: i64) -> String {
     let seconds = nanos / 1_000_000_000;
     let days = seconds / 86_400;
     let time = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let (year, month, day) = synch_core::civil::civil_from_days(days);
     // 1970-01-01 was a Thursday.
     let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
     format!(
@@ -473,20 +464,6 @@ pub fn format_http_date(nanos: i64) -> String {
         (time % 3600) / 60,
         time % 60,
     )
-}
-
-/// Howard Hinnant's `civil_from_days`, for the epoch-days to Y/M/D conversion.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

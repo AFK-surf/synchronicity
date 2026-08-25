@@ -364,7 +364,7 @@ impl Time {
 /// mandates for its year.
 #[cfg(any(test, feature = "sim"))]
 pub fn x509_time(unix: i64) -> Time {
-    let (year, month, day, hour, minute, second) = civil(unix);
+    let (year, month, day, hour, minute, second) = synch_core::civil::civil_from_unix(unix);
     match (1950..=2049).contains(&year) {
         true => Time::Utc(format!(
             "{:02}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z",
@@ -374,34 +374,6 @@ pub fn x509_time(unix: i64) -> Time {
             "{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z"
         )),
     }
-}
-
-#[cfg(any(test, feature = "sim"))]
-/// Howard Hinnant's `civil_from_days`, plus the time of day.
-fn civil(unix: i64) -> (i64, i64, i64, i64, i64, i64) {
-    let days = unix.div_euclid(86_400) + 719_468;
-    let rest = unix.rem_euclid(86_400);
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (
-        year + i64::from(month <= 2),
-        month,
-        day,
-        rest / 3600,
-        (rest % 3600) / 60,
-        rest % 60,
-    )
 }
 
 #[cfg(any(test, feature = "sim"))]

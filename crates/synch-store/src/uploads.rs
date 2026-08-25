@@ -26,7 +26,7 @@ use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
 
 use crate::{
-    db::Store,
+    db::{hash_column, Store},
     error::{Result, StoreError},
 };
 
@@ -110,14 +110,6 @@ pub struct UploadPart {
     pub root: Hash,
     /// When it was recorded, unix nanoseconds.
     pub created_ns: i64,
-}
-
-fn hash_column(value: Vec<u8>, column: &'static str) -> Result<Hash> {
-    let bytes: [u8; 32] = value.try_into().map_err(|v: Vec<u8>| StoreError::Column {
-        column,
-        reason: format!("{} bytes, not 32", v.len()),
-    })?;
-    Ok(Hash::from(bytes))
 }
 
 /// The column list every `Upload` read shares.

@@ -574,18 +574,9 @@ fn plan_pass(
             }
             // Claim before dispatching on kind so symlinks participate in the
             // same folded-name collision rule as regular files (§7.2).
-            let folded = fold(&set.path);
-            match claimed.get(&folded) {
-                Some(winner) if winner != &set.path => {
-                    report.skipped.push((
-                        set.path.clone(),
-                        format!("collides with {winner} under filesystem name folding"),
-                    ));
-                    continue;
-                }
-                _ => {
-                    claimed.insert(folded, set.path.clone());
-                }
+            if let Err(reason) = claim_folded_name(&mut claimed, &set.path) {
+                report.skipped.push((set.path.clone(), reason));
+                continue;
             }
             if selected.kind == EntryKind::Symlink {
                 match materialize_symlink(&target, selected.symlink_target.as_deref()) {
@@ -1091,8 +1082,31 @@ pub(crate) fn unsafe_name(path: &str) -> Option<String> {
 }
 
 /// Folds a path the way a case-insensitive, normalizing filesystem would.
-pub(crate) fn fold(path: &str) -> String {
+fn fold(path: &str) -> String {
     path.to_lowercase()
+}
+
+/// Claims `path`'s folded name, or reports the path that already holds it.
+///
+/// The §7.2 first-claimant-wins rule — two published paths that fold onto one
+/// local name are not both materializable, and without the claim one would be
+/// silently written over the other. One implementation, shared by the mirror
+/// and the fill, because it is a policy rule that must not be able to differ
+/// between them. `Err` carries the skip reason for the caller's report.
+pub(crate) fn claim_folded_name(
+    claimed: &mut HashMap<String, String>,
+    path: &str,
+) -> std::result::Result<(), String> {
+    let folded = fold(path);
+    match claimed.get(&folded) {
+        Some(winner) if winner != path => Err(format!(
+            "collides with {winner} under filesystem name folding"
+        )),
+        _ => {
+            claimed.insert(folded, path.to_string());
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -22,18 +22,10 @@ use std::path::{Path, PathBuf};
 
 use synch_net::{
     rekor::LogKeys,
-    tuf::{self, PinState, Repo, TufMetadata},
+    tuf::{self, HttpRepo, PinState, Repo, TufMetadata},
 };
 
 use crate::MonitorError;
-
-/// The most a single TUF file may be.
-///
-/// Sigstore's `targets.json` is the big one at a few hundred KiB. The cap is
-/// here for the same reason [`crate::tiles`] has one: these bytes come from a
-/// party the monitor is auditing, and a response with no bound is a reader
-/// that can be exhausted rather than a file that can be parsed.
-const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where the pin state lives, beside the monitor's own state file — the same
 /// file name the client uses under its data directory.
@@ -44,60 +36,12 @@ pub fn pins_beside(state: &Path) -> PathBuf {
     }
 }
 
-/// A TUF repository read over HTTPS.
-#[derive(Debug)]
-pub struct HttpRepo {
-    base: String,
-    client: reqwest::blocking::Client,
-}
-
-impl HttpRepo {
-    /// A repository at `base` (e.g. [`tuf::SIGSTORE_TUF_URL`]).
-    pub fn new(base: &str) -> Result<HttpRepo, MonitorError> {
-        Ok(HttpRepo {
-            base: base.trim_end_matches('/').to_string(),
-            client: reqwest::blocking::Client::builder()
-                .user_agent("synch-monitor")
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| MonitorError::Transport(e.to_string()))?,
-        })
-    }
-}
-
-impl Repo for HttpRepo {
-    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
-        let url = format!("{}/{path}", self.base);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("{url}: {e}"))?;
-        match response.status().as_u16() {
-            200 => {
-                // Read through a `take`, never `bytes()`. A cap applied to the
-                // result of `bytes()` is a bound on nothing, because the
-                // allocation has already happened — an endless body from a
-                // hostile mirror exhausts the reader before the comparison
-                // runs. One byte past the cap is read so that "exactly at the
-                // cap" and "over it" are distinguishable.
-                use std::io::Read;
-                let mut body = Vec::new();
-                response
-                    .take(MAX_TUF_BYTES as u64 + 1)
-                    .read_to_end(&mut body)
-                    .map_err(|e| format!("{url}: {e}"))?;
-                if body.len() > MAX_TUF_BYTES {
-                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
-                }
-                Ok(Some(body))
-            }
-            // The end of the root chain is a 404, and Sigstore's CDN answers
-            // 403 for an object that is not there.
-            403 | 404 => Ok(None),
-            status => Err(format!("{url}: the repository answered {status}")),
-        }
-    }
+/// The shared [`HttpRepo`] at `base` (e.g. [`tuf::SIGSTORE_TUF_URL`]), with
+/// its requests identified as the monitor's. The transport — and its byte
+/// cap, which guards against the party this program audits — is
+/// [`synch_net::tuf`]'s, not a second copy of it.
+pub fn http_repo(base: &str) -> Result<HttpRepo, MonitorError> {
+    HttpRepo::with_user_agent(base, "synch-monitor").map_err(MonitorError::Transport)
 }
 
 /// The logs a run should read, and the keys their checkpoints must verify

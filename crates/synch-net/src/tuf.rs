@@ -51,9 +51,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aws_lc_rs::signature;
-
-use crate::rekor::{base64_encode, sha256, LogKey, LogKeys};
+use crate::{
+    pubkey::{RawKey, Scheme},
+    rekor::{base64_decode, base64_encode, sha256, LogKey, LogKeys},
+};
 
 /// The target the chain has to authenticate for any of this to matter.
 pub const TRUSTED_ROOT_TARGET: &str = "trusted_root.json";
@@ -401,78 +402,12 @@ impl PinState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Written to a sibling and renamed over, never truncating the real
-        // file: a plain write leaves the state half-formed for as long as it
-        // takes, and a reader catching it there gets a file that does not
-        // parse and is treated as no state at all. The temporary carries the
-        // mode before it is in place, so the state is never briefly
-        // world-readable; and its name is unique to this write, because two
-        // processes sharing a temporary fill in one another's bytes and each
-        // renames whatever is there over the real file — the half-formed
-        // state the dance exists to prevent.
-        let temporary = unique_temporary(path);
-        // Durability before visibility: a rename that reaches the directory
-        // ahead of the bytes leaves a valid name over an empty file. Synced
-        // through the writing handle and closed before the rename: reopening
-        // read-only to sync works on Unix and cannot work on Windows, where
-        // `sync_all` needs write access and every save failed.
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            // Narrowed before the bytes land, so the state is never briefly
-            // world-readable.
-            restrict(&temporary)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-        }
-        match std::fs::rename(&temporary, path) {
-            Ok(()) => {
-                // The rename itself, flushed the way the scanner and the CAS
-                // flush theirs (§6.2): best effort, because a platform that
-                // cannot open a directory as a file gets no guarantee — the
-                // bytes are durable but the name over them need not be.
-                if let Some(parent) = path.parent() {
-                    if let Ok(dir) = std::fs::File::open(parent) {
-                        let _ = dir.sync_all();
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temporary);
-                Err(e)
-            }
-        }
+        // A plain write leaves the state half-formed for as long as it takes,
+        // and a reader catching it there gets a file that does not parse and
+        // is treated as no state at all — so the sibling-and-rename ritual,
+        // with the mode carried before the bytes land.
+        synch_core::fs::write_atomic_owner_only(path, text.as_bytes())
     }
-}
-
-/// A temporary path beside `path`, unique to this write.
-fn unique_temporary(path: &Path) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    /// Distinguishes two writes by this process within one nanosecond, which
-    /// a coarse clock makes reachable.
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{nanos}.{sequence}.tmp", std::process::id()));
-    path.with_file_name(name)
-}
-
-/// Narrows a file to its owner. On platforms without POSIX modes the
-/// directory's own ACL is what protects it, as everywhere else in the tree.
-#[cfg(unix)]
-fn restrict(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// What an accepted update established, for logs and `synch doctor`.
@@ -805,6 +740,91 @@ pub const MAX_WALK_TIME: Duration = Duration::from_secs(120);
 pub trait Repo {
     /// Fetches one path relative to the repository root.
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// How long one file of a TUF walk may take.
+const TUF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most a single TUF file may be. Sigstore's `targets.json` is the big
+/// one at a few hundred KiB; the cap exists because these are bytes from a
+/// party nothing is trusted about, and a response with no bound is a reader
+/// that can be exhausted.
+const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// A TUF repository read over HTTPS: the daemon's binding refresh and the
+/// monitor's discovery both walk one, so the transport — and above all its
+/// byte cap — exists once rather than as two copies annotated as needing to
+/// agree.
+///
+/// Built and used inside [`tokio::task::spawn_blocking`], which is what makes
+/// a blocking client the right one: the walk is sequential — each file names
+/// the next — so there is no concurrency to give up, and the JSON parsing
+/// stays off the reactor. TLS is not load-bearing: every byte fetched is
+/// self-authenticating and checked against [`EMBEDDED_TUF_ROOT`] before it
+/// moves anything, so a hostile mirror can deny this walk and cannot make it
+/// mean anything (§10.2).
+#[derive(Debug)]
+pub struct HttpRepo {
+    base: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpRepo {
+    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]).
+    pub fn new(base: &str) -> Result<HttpRepo, String> {
+        HttpRepo::build(base, None)
+    }
+
+    /// The same repository, with requests identified by `user_agent`.
+    pub fn with_user_agent(base: &str, user_agent: &str) -> Result<HttpRepo, String> {
+        HttpRepo::build(base, Some(user_agent))
+    }
+
+    fn build(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
+        let mut builder = reqwest::blocking::Client::builder().timeout(TUF_TIMEOUT);
+        if let Some(user_agent) = user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        Ok(HttpRepo {
+            base: base.trim_end_matches('/').to_string(),
+            client: builder.build().map_err(|e| e.to_string())?,
+        })
+    }
+}
+
+impl Repo for HttpRepo {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{path}", self.base);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        match response.status().as_u16() {
+            200 => {
+                // Read through a `take`, never `bytes()`: a cap applied to
+                // the result of `bytes()` is a bound on nothing, because the
+                // allocation already happened — an endless body from a hostile
+                // mirror exhausts the reader before the comparison runs. One
+                // byte past the cap keeps "at the cap" and "over it"
+                // distinguishable.
+                use std::io::Read;
+                let mut body = Vec::new();
+                response
+                    .take(MAX_TUF_BYTES as u64 + 1)
+                    .read_to_end(&mut body)
+                    .map_err(|e| format!("{url}: {e}"))?;
+                if body.len() > MAX_TUF_BYTES {
+                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
+                }
+                Ok(Some(body))
+            }
+            // The end of the root chain is a 404, and Sigstore's CDN answers
+            // 403 for an object that is not there.
+            403 | 404 => Ok(None),
+            status => Err(format!("{url}: the repository answered {status}")),
+        }
+    }
 }
 
 /// Walks a TUF repository, starting the root chain at `from_root` — the
@@ -1213,23 +1233,9 @@ impl Root {
 
 // -------------------------------------------------------------------- keys
 
-/// The signature scheme a TUF key uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TufScheme {
-    /// ECDSA P-256 with SHA-256. Sigstore signs with DER-encoded `r`,`s`;
-    /// the fixed-width form is accepted too, being the same signature.
-    EcdsaP256Sha256,
-    /// Ed25519.
-    Ed25519,
-}
-
-/// One key from a root's key table.
+/// One key from a root's key table: a [`RawKey`] and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TufKey {
-    scheme: TufScheme,
-    /// The raw public key: an uncompressed P-256 point, or 32 Ed25519 bytes.
-    point: Vec<u8>,
-}
+struct TufKey(RawKey);
 
 impl TufKey {
     /// Parses one entry of `signed.keys`.
@@ -1243,46 +1249,37 @@ impl TufKey {
     fn parse(key: &serde_json::Value) -> Result<TufKey, TufError> {
         let bad = |why: &str| TufError::Signature(format!("key: {why}"));
         let scheme = match key["scheme"].as_str() {
-            Some("ecdsa-sha2-nistp256") => TufScheme::EcdsaP256Sha256,
-            Some("ed25519") => TufScheme::Ed25519,
+            Some("ecdsa-sha2-nistp256") => Scheme::EcdsaP256Sha256,
+            Some("ed25519") => Scheme::Ed25519,
             Some(other) => return Err(bad(&format!("unsupported scheme {other}"))),
             None => return Err(bad("no scheme")),
         };
         let public = key["keyval"]["public"]
             .as_str()
             .ok_or_else(|| bad("no keyval.public"))?;
-        let point = match public.contains("-----BEGIN") {
-            true => spki_point(&pem_body(public)?, scheme)?,
-            false => raw_point(
+        let key = match public.contains("-----BEGIN") {
+            true => RawKey::from_spki_as(&pem_body(public)?, scheme).ok_or_else(|| {
+                TufError::Signature("a key is not the SubjectPublicKeyInfo its scheme names".into())
+            })?,
+            false => RawKey::from_raw(
                 &hex_decode(public.trim()).ok_or_else(|| bad("keyval.public is not hex"))?,
                 scheme,
-            )?,
+            )
+            .ok_or_else(|| {
+                TufError::Signature("a key is not the raw material its scheme names".into())
+            })?,
         };
-        Ok(TufKey { scheme, point })
+        Ok(TufKey(key))
     }
 
-    /// Verifies one signature over the canonical bytes.
+    /// Verifies one signature over the canonical bytes, under the shared
+    /// double-encoding rule ([`RawKey::verifies`]): Sigstore's TUF signatures
+    /// are DER, and the fixed-width verifier refuses those outright.
     fn verify(&self, message: &[u8], sig: &[u8]) -> Result<(), TufError> {
-        let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.scheme {
-            // Sigstore's TUF signatures are DER; the fixed-width verifier
-            // refuses those outright, so both encodings are tried — two
-            // spellings of one signature, conceding nothing beyond the
-            // malleability ASN.1 already has.
-            TufScheme::EcdsaP256Sha256 => &[
-                &signature::ECDSA_P256_SHA256_ASN1,
-                &signature::ECDSA_P256_SHA256_FIXED,
-            ],
-            TufScheme::Ed25519 => &[&signature::ED25519],
-        };
-        for algorithm in algorithms {
-            if signature::UnparsedPublicKey::new(*algorithm, &self.point)
-                .verify(message, sig)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        match self.0.verifies(message, sig) {
+            true => Ok(()),
+            false => Err(TufError::Signature("a signature does not verify".into())),
         }
-        Err(TufError::Signature("a signature does not verify".into()))
     }
 }
 
@@ -1294,57 +1291,6 @@ fn pem_body(pem: &str) -> Result<Vec<u8>, TufError> {
         .collect::<Vec<_>>()
         .join("");
     base64_decode(body.trim()).map_err(|_| TufError::Signature("a PEM key is not base64".into()))
-}
-
-/// The raw key inside a DER SubjectPublicKeyInfo.
-///
-/// Deliberately narrow, the same stance as [`crate::rekor::LogKey::from_spki`]
-/// (whose prefixes these are): two shapes are recognized and everything else
-/// is refused, rather than a general ASN.1 reader parsing whatever it is
-/// handed.
-fn spki_point(der: &[u8], scheme: TufScheme) -> Result<Vec<u8>, TufError> {
-    const P256_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
-    const ED25519_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
-    let bad = TufError::Signature("a key is not the SubjectPublicKeyInfo its scheme names".into());
-    match scheme {
-        TufScheme::EcdsaP256Sha256 => match der.strip_prefix(P256_SPKI_PREFIX) {
-            Some(point) if point.len() == 64 => {
-                let mut uncompressed = Vec::with_capacity(65);
-                uncompressed.push(0x04);
-                uncompressed.extend_from_slice(point);
-                Ok(uncompressed)
-            }
-            _ => Err(bad),
-        },
-        TufScheme::Ed25519 => match der.strip_prefix(ED25519_SPKI_PREFIX) {
-            Some(point) if point.len() == 32 => Ok(point.to_vec()),
-            _ => Err(bad),
-        },
-    }
-}
-
-/// The pre-PEM form: hex key material, as Sigstore's roots 1–4 wrote it.
-fn raw_point(bytes: &[u8], scheme: TufScheme) -> Result<Vec<u8>, TufError> {
-    let bad = TufError::Signature("a key is not the raw material its scheme names".into());
-    match scheme {
-        TufScheme::EcdsaP256Sha256 => match bytes {
-            [0x04, ..] if bytes.len() == 65 => Ok(bytes.to_vec()),
-            _ if bytes.len() == 64 => {
-                let mut uncompressed = Vec::with_capacity(65);
-                uncompressed.push(0x04);
-                uncompressed.extend_from_slice(bytes);
-                Ok(uncompressed)
-            }
-            _ => Err(bad),
-        },
-        TufScheme::Ed25519 if bytes.len() == 32 => Ok(bytes.to_vec()),
-        TufScheme::Ed25519 => Err(bad),
-    }
 }
 
 /// The key id TUF derives for a key object: SHA-256 over its canonical JSON.
@@ -1503,33 +1449,16 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
         }
         _ => return None,
     };
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset)
-}
-
-/// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
-/// `days_from_civil`, the standard branch-free form).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    Some(
+        synch_core::civil::days_from_civil(year, month, day) * 86_400
+            + hour * 3600
+            + minute * 60
+            + second
+            - offset,
+    )
 }
 
 // ------------------------------------------------------------- encodings
-
-/// Standard base64, padding optional.
-fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
-    let trimmed: String = text
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .collect();
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(&trimmed)
-        .map_err(|_| ())
-}
 
 /// Lowercase or uppercase hex, as TUF writes signatures and digests.
 fn hex_decode(text: &str) -> Option<Vec<u8>> {

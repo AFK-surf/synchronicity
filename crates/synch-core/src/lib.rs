@@ -4,6 +4,8 @@
 #![deny(missing_docs)]
 
 pub mod blocking;
+pub mod civil;
+pub mod fs;
 pub mod hash;
 pub mod head;
 pub mod origin;

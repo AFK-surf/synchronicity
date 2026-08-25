@@ -1,8 +1,11 @@
 name: CI
 
+# `push` is main-only, as in control-plane.yml: a branch with an open pull
+# request already runs on `pull_request`, and both triggers firing ran the
+# whole workflow twice per push.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 concurrency:

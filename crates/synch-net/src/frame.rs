@@ -21,11 +21,65 @@
 //! ([`synch_core::MptMessage`]), because a frame this size is seconds of CPU to
 //! deserialize.
 
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{de::DeserializeOwned, Serialize};
 use synch_core::MAX_FRAME_LEN;
 
 use crate::error::NetError;
+
+/// An answer frame from a protocol that may carry an in-band refusal.
+///
+/// The unwrapping lives here, expressed once over both message enums, because
+/// it is the piece the request/response sites had already let drift: every
+/// decoded answer must pass through it before its shape is matched, or a
+/// responder's stated reason is reported as a shape mismatch.
+pub(crate) trait Answer: Sized {
+    /// Extracts the peer's refusal, where this protocol has one.
+    ///
+    /// A responder that refuses says why, and the reason is the error —
+    /// reading it as a shape mismatch loses the only account of what went
+    /// wrong the peer will ever give.
+    fn into_refusal(self) -> Result<Self, String>;
+}
+
+/// Opens a stream, sends one request frame, and closes this side.
+///
+/// The send half is finished immediately: every exchange under this helper is
+/// one request frame followed by the peer's answer, so anything more this side
+/// wrote would be a protocol error anyway.
+pub(crate) async fn request<Req: Serialize>(
+    connection: &Connection,
+    request: &Req,
+) -> Result<RecvStream, NetError> {
+    let (mut send, recv) = connection.open_bi().await?;
+    write_frame(&mut send, request).await?;
+    let _ = send.finish();
+    Ok(recv)
+}
+
+/// Reads one answer frame, unwrapping an in-band refusal into the error.
+pub(crate) async fn read_answer<Ans>(recv: &mut RecvStream) -> Result<Ans, NetError>
+where
+    Ans: DeserializeOwned + Answer,
+{
+    read_frame::<Ans>(recv)
+        .await?
+        .into_refusal()
+        .map_err(NetError::Unexpected)
+}
+
+/// One whole request/response exchange: [`request`], then [`read_answer`].
+///
+/// The caller keeps only the decoded answer; a protocol that reads more than
+/// one frame back composes the two halves itself.
+pub(crate) async fn exchange<Req, Ans>(connection: &Connection, req: &Req) -> Result<Ans, NetError>
+where
+    Req: Serialize,
+    Ans: DeserializeOwned + Answer,
+{
+    let mut recv = request(connection, req).await?;
+    read_answer(&mut recv).await
+}
 
 /// Writes one length-framed postcard message.
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<(), NetError> {

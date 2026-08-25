@@ -14,6 +14,7 @@ pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod mpt;
+mod pubkey;
 pub mod rekor;
 mod serve;
 /// Test machinery — a simulated signed zone, transparency log and TUF

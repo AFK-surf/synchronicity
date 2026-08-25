@@ -14,7 +14,7 @@ use axum::body::Body;
 use synch_cli::control::{
     proto::{pb, CHUNK_SIZE},
     Client, Command, CompletedUpload, Deleted, EntryInfo, Frame, OpenUpload, RecordedPart,
-    UploadRef,
+    StreamedWrite, UploadRef, WriteFamily,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
@@ -211,41 +211,13 @@ impl Daemon {
     /// Streams an HTTP request body into a space and returns the published
     /// entry.
     ///
-    /// Pieces are coalesced up to one [`CHUNK_SIZE`] message — an HTTP body
-    /// arrives in whatever pieces the network chose, and a message per TCP
-    /// segment would be all overhead — and never beyond it.
+    /// The daemon takes its gates before it answers `put`, so a refusal — a
+    /// node in recovery, say — arrives as the coded error it is (§3.4), before
+    /// a byte of the body has been read.
     pub async fn put(&self, space: &str, path: &str, body: Body) -> S3Result<EntryInfo> {
         let mut client = self.connect().await?;
-        // The daemon takes its gates before it answers, so a refusal — a node
-        // in recovery, say — arrives as the coded error it is (§3.4), before a
-        // byte of the body has been read.
-        let mut put = client.put(space, path).await?;
-
-        let mut stream = body.into_data_stream();
-        let mut coalesce = Coalesce::default();
-        let mut truncated = None;
-        while let Some(piece) = stream.next().await {
-            let piece = match piece {
-                Ok(piece) => piece,
-                // A body that stopped early must not be published as a whole
-                // object, and only the daemon can decide that: it is the one
-                // holding the staging file.
-                Err(e) => {
-                    truncated = Some(e.to_string());
-                    break;
-                }
-            };
-            for chunk in coalesce.push(&piece) {
-                put.chunk(chunk).await?;
-            }
-        }
-        if let Some(why) = truncated {
-            return Err(put.abort(why).await.into());
-        }
-        if let Some(rest) = coalesce.rest() {
-            put.chunk(rest).await?;
-        }
-        Ok(put.finish().await?.entry)
+        let put = client.put(space, path).await?;
+        Ok(stream_body(put, body).await?.entry)
     }
 
     /// Removes this node's copy of a path and publishes its tombstone (§8).
@@ -269,10 +241,8 @@ impl Daemon {
 
     /// Streams one part of an upload, returning what the daemon recorded.
     ///
-    /// The same shape as [`Daemon::put`], and for the same reasons: the gates
-    /// are taken before the body is read, the payload is coalesced into
-    /// protocol-sized messages rather than network-sized ones, and a truncated
-    /// body aborts the part rather than recording a short one as whole.
+    /// The same contract as [`Daemon::put`]: the gates are taken before the
+    /// body is read, so a refusal arrives before a byte of the part is sent.
     pub async fn upload_part(
         &self,
         upload: UploadRef,
@@ -280,30 +250,8 @@ impl Daemon {
         body: Body,
     ) -> S3Result<RecordedPart> {
         let mut client = self.connect().await?;
-        let mut part = client.upload_part(upload, number).await?;
-
-        let mut stream = body.into_data_stream();
-        let mut coalesce = Coalesce::default();
-        let mut truncated = None;
-        while let Some(piece) = stream.next().await {
-            let piece = match piece {
-                Ok(piece) => piece,
-                Err(e) => {
-                    truncated = Some(e.to_string());
-                    break;
-                }
-            };
-            for chunk in coalesce.push(&piece) {
-                part.chunk(chunk).await?;
-            }
-        }
-        if let Some(why) = truncated {
-            return Err(part.abort(why).await.into());
-        }
-        if let Some(rest) = coalesce.rest() {
-            part.chunk(rest).await?;
-        }
-        Ok(part.finish().await?)
+        let part = client.upload_part(upload, number).await?;
+        stream_body(part, body).await
     }
 
     /// Assembles the named parts and publishes the object.
@@ -349,6 +297,42 @@ impl Daemon {
         self.connect().await?.append_config(key, record).await?;
         Ok(())
     }
+}
+
+/// Streams an HTTP request body into one write, whichever write it is.
+///
+/// The one loop behind [`Daemon::put`] and [`Daemon::upload_part`], because
+/// its rules must hold on both paths: the payload is coalesced into
+/// protocol-sized messages rather than network-sized ones, and a body that
+/// stopped early aborts the write rather than committing a short payload as
+/// whole — only the daemon can decide what a truncated body leaves behind,
+/// since it is the one holding the staging file.
+async fn stream_body<P: WriteFamily>(
+    mut write: StreamedWrite<P>,
+    body: Body,
+) -> S3Result<P::Output> {
+    let mut stream = body.into_data_stream();
+    let mut coalesce = Coalesce::default();
+    let mut truncated = None;
+    while let Some(piece) = stream.next().await {
+        let piece = match piece {
+            Ok(piece) => piece,
+            Err(e) => {
+                truncated = Some(e.to_string());
+                break;
+            }
+        };
+        for chunk in coalesce.push(&piece) {
+            write.chunk(chunk).await?;
+        }
+    }
+    if let Some(why) = truncated {
+        return Err(write.abort(why).await.into());
+    }
+    if let Some(rest) = coalesce.rest() {
+        write.chunk(rest).await?;
+    }
+    Ok(write.finish().await?)
 }
 
 /// Gathers an HTTP body's pieces into control-protocol chunks.

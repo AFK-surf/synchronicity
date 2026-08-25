@@ -4865,6 +4865,7 @@ name = "synch-cc"
 version = "0.1.6"
 dependencies = [
  "cc",
+ "synch-core",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -4913,9 +4914,11 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4960,6 +4963,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "synch-core",
  "synch-monitor",
  "synch-net",
  "tempfile",
