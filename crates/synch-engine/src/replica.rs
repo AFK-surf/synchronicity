@@ -737,17 +737,13 @@ impl Node {
     /// running while it is making progress: one pass takes at most
     /// `replica_concurrency` objects, and a cold replica has millions.
     pub async fn run_replicas(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
-        let wake = self.replica_wake();
-        loop {
-            self.replica_pass_logged().await;
-            tokio::select! {
-                _ = &mut shutdown => return,
-                _ = wake.notified() => {}
-                _ = tokio::time::sleep(crate::aae::jittered(self.config().replica_interval)) => {}
-            }
-        }
+        crate::aae::run_standing(
+            shutdown,
+            self.replica_wake(),
+            self.config().replica_interval,
+            || self.replica_pass_logged(),
+        )
+        .await
     }
 
     /// One sweep and as much fetching as it turns up, logged rather than

@@ -368,17 +368,13 @@ impl Node {
     /// backstop for drift nobody rang about: a `chmod` moves nothing a record
     /// holds, and only a pass repairs it.
     pub async fn run_mirrors(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
-        let wake = self.mirror_wake();
-        loop {
-            self.sync_all_mirrors_logged().await;
-            tokio::select! {
-                _ = &mut shutdown => return,
-                _ = wake.notified() => {}
-                _ = tokio::time::sleep(crate::aae::jittered(self.config().mirror_interval)) => {}
-            }
-        }
+        crate::aae::run_standing(
+            shutdown,
+            self.mirror_wake(),
+            self.config().mirror_interval,
+            || self.sync_all_mirrors_logged(),
+        )
+        .await
     }
 
     /// One pass over every mirror, logged rather than streamed: the standing

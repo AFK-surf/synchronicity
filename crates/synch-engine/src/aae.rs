@@ -217,8 +217,7 @@ impl Node {
     /// sub-second propagation delivered a pointer and the data followed up to
     /// 45 s later.
     pub async fn run_anti_entropy(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
+        let mut shutdown = std::pin::pin!(shutdown);
         let pending = self.pending_wake();
         let mut last = tokio::time::Instant::now() - REACTIVE_FLOOR;
         loop {
@@ -250,8 +249,7 @@ impl Node {
     /// Runs the periodic maintenance loop: GC, binding expiry, and tombstone
     /// expiry (§5.4, §3.2, §4.2).
     pub async fn run_maintenance(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
+        let mut shutdown = std::pin::pin!(shutdown);
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
@@ -626,6 +624,33 @@ pub fn jittered_floor(base: Duration) -> Duration {
         return base;
     }
     base + Duration::from_millis(jitter_seed() % span_ms)
+}
+
+/// Runs a standing pass-per-wake loop until `shutdown` resolves.
+///
+/// The skeleton `run_mirrors` and `run_replicas` each wrote out: one pass
+/// before the first wait, so a node restarted with a backlog starts working
+/// through it rather than waiting out an interval; then one pass per ring of
+/// `wake` or per jittered `interval`, whichever comes first — the interval
+/// being the backstop for drift nobody rang a bell about.
+pub(crate) async fn run_standing<F, Fut>(
+    shutdown: impl std::future::Future<Output = ()>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    interval: Duration,
+    mut pass: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        pass().await;
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = wake.notified() => {}
+            _ = tokio::time::sleep(jittered(interval)) => {}
+        }
+    }
 }
 
 /// A cheap non-cryptographic source of jitter, seeded from the clock.

@@ -180,8 +180,7 @@ impl Node {
                 return;
             }
         };
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
+        let mut shutdown = std::pin::pin!(shutdown);
         let spaces_changed = self.spaces_changed_signal();
         loop {
             tokio::select! {
@@ -223,8 +222,7 @@ impl Node {
     /// Like the watcher, this stages into the publisher rather than publishing
     /// on its own.
     pub async fn run_scanner(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
+        let mut shutdown = std::pin::pin!(shutdown);
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
