@@ -56,16 +56,49 @@ pub fn unique_temporary(path: &Path) -> PathBuf {
 
 /// Renames `source` over `target`, replacing it if it exists.
 ///
-/// `std::fs::rename` already means that on Unix; on Windows it refuses an
-/// existing target, so the replacement has to be asked for by flag.
+/// `std::fs::rename` already means that on Unix; on Windows it takes the
+/// `MOVEFILE_REPLACE_EXISTING` flag and, unlike a plain rename, a
+/// write-through so the replacement reaches the device.
 #[cfg(not(windows))]
 pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(source, target)
 }
 
 /// Renames `source` over `target`, replacing it if it exists.
+///
+/// Retried briefly on a transient refusal. On Windows a replace can be denied
+/// with nothing wrong: the target is itself mid-replace (an overlapping save
+/// of the same file — the exact concurrency the unique temporary exists to
+/// survive), or an antivirus or indexer holds the name for a moment. Those
+/// surface as `ERROR_ACCESS_DENIED` or `ERROR_SHARING_VIOLATION` and pass;
+/// anything else, or a denial that outlasts the retries, is real and
+/// reported.
 #[cfg(windows)]
 pub fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let mut delay = std::time::Duration::from_millis(1);
+    for attempt in 0..10 {
+        match replace_file_once(source, target) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if attempt < 9
+                    && matches!(
+                        e.raw_os_error(),
+                        Some(ERROR_ACCESS_DENIED) | Some(ERROR_SHARING_VIOLATION)
+                    ) =>
+            {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns on its last attempt");
+}
+
+#[cfg(windows)]
+fn replace_file_once(source: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
