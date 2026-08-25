@@ -691,6 +691,11 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         replace_file(&staging, &target)?;
+        // The instant the lease is for: the payload is in place under its
+        // final name and the only row naming this root is the *old* one, which
+        // a `gc_content` pass may hold to be collectable. A no-op outside this
+        // crate's tests, which stop the write here to watch a sweep refuse it.
+        self.pause_in_write_window();
         // Flush the payload contents, the outboard, and the directory entries
         // before the index row claims this blob is complete. Checked, like the
         // flushes below it: a swallowed ENOSPC or EIO here is a row claiming
@@ -2484,18 +2489,18 @@ mod tests {
 
     /// An ingest re-creating content whose old row is collectable keeps its
     /// bytes: between the rename and the row write there is a window a
-    /// `gc_content` pass could unlink the payload in. Threaded with a
-    /// handshake, because the window only exists inside `ingest_file` and the
-    /// collector must be spinning before the ingest begins.
+    /// `gc_content` pass could unlink the payload in. The ingest is stopped
+    /// inside that window by a [`WriteWindow`] rather than raced for — a
+    /// rename, an fsync and a row is about a millisecond where `fsync` returns
+    /// before the disk does, and a collector thread spinning to catch it caught
+    /// it everywhere but on a loaded macOS runner.
     #[test]
     fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let (dir, store) = store();
         let store = std::sync::Arc::new(store);
         // Past `INLINE_BLOB_MAX`, so the payload is a file rather than a column
         // and the rename → fsync → outboard → row window is a real one.
-        let payload = data(32 * 1024 * 1024);
+        let payload = data(1024 * 1024);
         let source = dir.path().join("restored.bin");
         std::fs::write(&source, &payload).unwrap();
 
@@ -2504,45 +2509,38 @@ mod tests {
         // candidate — while the same content is ingested again.
         let root = store.ingest_bytes(&payload, 0).unwrap();
 
-        let ready = std::sync::Arc::new(AtomicBool::new(false));
-        let observed = std::sync::Arc::new(AtomicBool::new(false));
-        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let window = std::sync::Arc::new(crate::db::WriteWindow::default());
+        store.set_write_window(window.clone());
         let collector = {
             let store = store.clone();
-            let (ready, observed, done) = (ready.clone(), observed.clone(), done.clone());
+            let window = window.clone();
             std::thread::spawn(move || {
-                ready.store(true, Ordering::SeqCst);
-                while !done.load(Ordering::SeqCst) {
-                    if store.is_being_written(&root) {
-                        observed.store(true, Ordering::SeqCst);
-                        // Refused — or this returns true and unlinks the bytes
-                        // the ingest is midway through writing, leaving the row
-                        // it is about to commit describing nothing.
-                        assert!(
-                            !store.delete_blob_if_collectable(&root, i64::MAX).unwrap(),
-                            "an ingest in flight is not a collectable object"
-                        );
-                        return;
-                    }
-                    std::thread::yield_now();
-                }
+                window.wait_entered();
+                let leased = store.is_being_written(&root);
+                // Refused — or this returns true and unlinks the bytes the
+                // ingest is midway through writing, leaving the row it is about
+                // to commit describing nothing.
+                let collected = store.delete_blob_if_collectable(&root, i64::MAX);
+                // Before the assertions: a panic here with the ingest still
+                // parked in its window would hang the test rather than fail it.
+                window.release();
+                assert!(
+                    leased,
+                    "the ingest held no write lease, so a sweep in its window \
+                     would have unlinked the bytes of the row it then committed"
+                );
+                assert!(
+                    !collected.unwrap(),
+                    "an ingest in flight is not a collectable object"
+                );
             })
         };
-        while !ready.load(Ordering::SeqCst) {
-            std::thread::yield_now();
-        }
 
         let (ingested, size) = store.ingest_file(&source, 1).unwrap();
-        done.store(true, Ordering::SeqCst);
         collector.join().unwrap();
 
         assert_eq!(ingested, root);
         assert_eq!(size, payload.len() as u64);
-        assert!(
-            observed.load(Ordering::SeqCst),
-            "the ingest held no write lease, so a sweep in its window would have \
-             unlinked the bytes of the row it then committed"
-        );
         // The invariant: a row calling the object complete, and the bytes it
         // describes.
         assert!(store.blob(&root).unwrap().unwrap().complete);
