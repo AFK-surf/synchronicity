@@ -35,7 +35,7 @@ pub struct Client {
 
 /// The version and token every call carries.
 #[derive(Debug, Clone)]
-pub struct Credentials {
+pub(crate) struct Credentials {
     version: MetadataValue<tonic::metadata::Ascii>,
     token: MetadataValue<tonic::metadata::Binary>,
 }
@@ -478,7 +478,7 @@ impl WriteFamily for super::proto::UploadPartPart {
 }
 
 /// A write in progress (§9.4).
-pub type Put = StreamedWrite<super::proto::PutPart>;
+pub(crate) type Put = StreamedWrite<super::proto::PutPart>;
 
 /// A streamed write, which the daemon keeps nothing of until it is committed.
 #[derive(Debug)]
@@ -610,7 +610,7 @@ impl UploadRef {
 }
 
 /// A streamed write of one part, which records nothing until it is finished.
-pub type PartUpload = StreamedWrite<super::proto::UploadPartPart>;
+pub(crate) type PartUpload = StreamedWrite<super::proto::UploadPartPart>;
 
 /// One part the daemon has recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -468,7 +468,7 @@ impl Store {
     }
 
     /// The distinct paths of the unified tree under a prefix, for pagination.
-    pub fn unified_paths(
+    pub(crate) fn unified_paths(
         &self,
         space: &str,
         prefix: &str,

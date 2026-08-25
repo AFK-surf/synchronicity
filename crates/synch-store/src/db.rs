@@ -26,7 +26,7 @@ pub const CAS_DIR: &str = "store";
 /// sweep permanently — and only that sweep can remove the file. Under a name of
 /// its own the sweep has one rule about one place, and the CAS root holds
 /// nothing but directories by construction.
-pub const STAGING_DIR: &str = "incoming";
+pub(crate) const STAGING_DIR: &str = "incoming";
 /// The database file name (§10).
 pub const DB_FILE: &str = "synchronicity.db";
 
@@ -245,7 +245,7 @@ pub struct Store {
 /// `synch cat`, say — overlap legitimately, and the first to finish must not
 /// clear the mark the second is relying on.
 #[derive(Debug)]
-pub struct WriteLease<'a> {
+pub(crate) struct WriteLease<'a> {
     store: &'a Store,
     root: Hash,
 }
@@ -295,23 +295,6 @@ impl Store {
         Ok(store)
     }
 
-    /// Opens a purely in-memory store backed by a temporary CAS directory.
-    ///
-    /// Intended for tests; `data_dir` still receives blob payloads.
-    pub fn open_in_memory(data_dir: impl AsRef<Path>) -> Result<Store> {
-        let data_dir = data_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(data_dir.join(CAS_DIR))?;
-        let store = Store {
-            conn: Mutex::new(Connection::open_in_memory()?),
-            data_dir,
-            remote_cas: std::sync::atomic::AtomicBool::new(false),
-            complete_roots: Mutex::new(std::collections::HashSet::new()),
-            writing: Mutex::new(std::collections::HashMap::new()),
-        };
-        store.init()?;
-        Ok(store)
-    }
-
     fn init(&self) -> Result<()> {
         let mut conn = self.conn();
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -347,7 +330,7 @@ impl Store {
     }
 
     /// The CAS root directory.
-    pub fn cas_dir(&self) -> PathBuf {
+    pub(crate) fn cas_dir(&self) -> PathBuf {
         self.data_dir.join(CAS_DIR)
     }
 
@@ -717,7 +700,7 @@ impl Txn<'_> {
     /// A boundary is a fact about a scope, not about a node, so the memo is
     /// dropped whenever the scope moves — see [`Store::set_read_scope`],
     /// which is the only thing that should call this.
-    pub fn clear_redacted(&self) -> Result<()> {
+    pub(crate) fn clear_redacted(&self) -> Result<()> {
         self.conn().execute("DELETE FROM redacted_nodes", [])?;
         Ok(())
     }
@@ -1091,7 +1074,7 @@ impl Store {
     /// five minutes against a thirty-second anti-entropy interval, so clearing
     /// it wholesale gives the cost back on roughly one round in ten, forever.
     /// Retaining the marked roots keeps the optimization and the honesty.
-    pub fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
+    pub(crate) fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
         self.complete_roots().retain(|root| keep.contains(root));
     }
 }

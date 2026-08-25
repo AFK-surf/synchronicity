@@ -784,7 +784,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
     /// Fetching and decoding are separate steps ([`Tree::bundle_request`],
     /// [`Tree::bundle_decode`]) so a caller can run many fetches at once and
     /// still decode strictly in order — which [`Tree::bundle_stream`] does.
-    pub fn bundle_request(&self, index: u64) -> Result<BundleRequest, MonitorError> {
+    pub(crate) fn bundle_request(&self, index: u64) -> Result<BundleRequest, MonitorError> {
         if index >= self.size {
             return Err(MonitorError::Tile(format!(
                 "entry {index} is outside a tree of {}",
@@ -806,7 +806,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
     /// The framing is a big-endian `uint16` length before each body, 256 to a
     /// full bundle. Returned as `(index, body)` so a caller can name an entry
     /// without recomputing the arithmetic.
-    pub fn bundle_decode(
+    pub(crate) fn bundle_decode(
         &self,
         request: &BundleRequest,
         data: &[u8],
@@ -1127,7 +1127,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
 
 /// One entry bundle to fetch, as [`Tree::bundle_request`] describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleRequest {
+pub(crate) struct BundleRequest {
     /// The index of the bundle's first entry.
     pub first_index: u64,
     /// How many entries the bundle holds at this tree size.

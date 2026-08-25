@@ -89,7 +89,7 @@ impl Scope {
     /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
-    pub fn contains_subtree(&self, path: &[u8]) -> bool {
+    pub(crate) fn contains_subtree(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
             Some(prefixes) => prefixes.iter().any(|p| path.starts_with(p.as_slice())),
@@ -97,7 +97,7 @@ impl Scope {
     }
 
     /// True if a key, given as a full nibble path, lies inside this scope.
-    pub fn admits_key_path(&self, key: &[u8]) -> bool {
+    pub(crate) fn admits_key_path(&self, key: &[u8]) -> bool {
         self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
     }
 
@@ -146,8 +146,11 @@ impl Scope {
     ///
     /// Stricter than [`Scope::admits_path`]: a key is a leaf position, so
     /// being an ancestor of an allowed prefix is not enough — `f:` is on the
-    /// spine of every space, and is nobody's key.
-    pub fn admits_key(&self, key: &[u8]) -> bool {
+    /// spine of every space, and is nobody's key. Production admission works
+    /// in nibbles (`admits_key_path`); this byte-key form is what the tests
+    /// below state the rules through.
+    #[cfg(test)]
+    pub(crate) fn admits_key(&self, key: &[u8]) -> bool {
         match self.prefixes {
             None => true,
             Some(_) => self.admits_key_path(Nibbles::from_bytes(key).as_slice()),

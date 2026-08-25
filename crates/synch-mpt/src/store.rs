@@ -136,14 +136,6 @@ impl MemStore {
             .len()
     }
 
-    /// The number of stored out-of-line values.
-    pub fn value_count(&self) -> usize {
-        self.values
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
-    }
-
     /// Every stored node hash.
     pub fn node_hashes(&self) -> Vec<Hash> {
         self.nodes

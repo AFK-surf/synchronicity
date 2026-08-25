@@ -82,7 +82,7 @@ impl PeerIdentity {
     }
 
     /// Whether the caller may read `space`.
-    pub fn has_space(&self, space: &str) -> bool {
+    pub(crate) fn has_space(&self, space: &str) -> bool {
         match &self.spaces {
             None => true,
             Some(list) => list.iter().any(|s| s == space),
@@ -136,14 +136,14 @@ impl EffectivePolicy {
     }
 
     /// Whether this invocation may connect to `host` on `port`.
-    pub fn egress_allowed(&self, host: &str, port: u16) -> bool {
+    pub(crate) fn egress_allowed(&self, host: &str, port: u16) -> bool {
         self.egress
             .iter()
             .any(|rule| egress_rule_matches(rule, host, port))
     }
 
     /// Whether this invocation may read `path` from another origin's view.
-    pub fn tree_read_allowed(&self, path: &str) -> bool {
+    pub(crate) fn tree_read_allowed(&self, path: &str) -> bool {
         self.tree_reads
             .iter()
             .any(|prefix| synch_core::sock::path_prefix_matches(prefix, path))
@@ -169,7 +169,7 @@ impl EffectivePolicy {
 ///
 /// This is not a substitute for the policy check; it runs after it, on what DNS
 /// actually answered.
-pub fn resolved_address_allowed(host: &str, addr: IpAddr) -> bool {
+pub(crate) fn resolved_address_allowed(host: &str, addr: IpAddr) -> bool {
     if !is_restricted(addr) {
         return true;
     }

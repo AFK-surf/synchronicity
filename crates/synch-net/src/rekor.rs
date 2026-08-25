@@ -93,10 +93,10 @@ use crate::{
 /// the apex DNSKEY RRset its chain proves, the entry signature is
 /// attribution by the certificate's own key, and the wire carries no
 /// key-tag selector. Any other version byte is refused as malformed.
-pub const PROOF_VERSION: u8 = 4;
+pub(crate) const PROOF_VERSION: u8 = 4;
 
 /// The token every chunk of a proof record starts with.
-pub const PROOF_TXT_PREFIX: &str = "sync1p";
+pub(crate) const PROOF_TXT_PREFIX: &str = "sync1p";
 
 /// The most base64url characters one record carries.
 ///
@@ -114,26 +114,26 @@ pub const REKOR_TXT_PREFIX: &str = "_synchronicity-rekor";
 pub const DSSE_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 
 /// The only entry kind Rekor v2 accepts, and the only one this design logs.
-pub const HASHEDREKORD_KIND: &str = "hashedrekord";
+pub(crate) const HASHEDREKORD_KIND: &str = "hashedrekord";
 
 /// The entry API version the body must declare.
-pub const HASHEDREKORD_API_VERSION: &str = "0.0.2";
+pub(crate) const HASHEDREKORD_API_VERSION: &str = "0.0.2";
 
 /// The `hashedrekord` v0.0.2 digest algorithm name the body carries.
-pub const HASHEDREKORD_DIGEST_ALGORITHM: &str = "SHA2_256";
+pub(crate) const HASHEDREKORD_DIGEST_ALGORITHM: &str = "SHA2_256";
 
 /// The `hashedrekord` v0.0.2 verifier key-details tag for a P-256 key.
-pub const HASHEDREKORD_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
+pub(crate) const HASHEDREKORD_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
 
 /// The in-toto Statement type the entry must declare.
-pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
+pub(crate) const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 
 /// The predicate type carrying the zone-key claim.
 ///
 /// v2 is the key-set claim: the subject is the apex DNSKEY RRset the chain
 /// proves, and the DSSE signer is whoever published the entry — attribution,
 /// not possession.
-pub const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v2";
+pub(crate) const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v2";
 
 /// Why a zone-key transparency record was refused.
 ///
@@ -360,7 +360,7 @@ impl RekorProof {
 /// records instead. Availability against the zone's own signer is not
 /// defensible here and is not claimed (§4.3); *authorization* is, and the
 /// group digest and the chain walk hold it whatever the records look like.
-pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
+pub(crate) fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
     use std::collections::BTreeMap;
 
     // group -> the (index, total, chunk) readings its records support.
@@ -479,7 +479,7 @@ fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<Rekor
 /// Publisher-side: a client derives the name it asks for from the index it
 /// wants, never the other way round.
 #[cfg(any(test, feature = "sim"))]
-pub fn part_index_of(record: &str) -> Option<usize> {
+pub(crate) fn part_index_of(record: &str) -> Option<usize> {
     parse_chunk(record).ok().map(|(_, index, _, _)| index)
 }
 
@@ -590,7 +590,7 @@ pub struct ZoneKey<'a> {
 /// `PKIX_ECDSA_P256_SHA_256`). The zone keys the entry authorizes are not
 /// constrained by algorithm at all: they are matched by rdata membership in
 /// the chain-proven RRset.
-pub fn p256_point(spki: &[u8]) -> Option<&[u8]> {
+pub(crate) fn p256_point(spki: &[u8]) -> Option<&[u8]> {
     let point = spki.get(27..)?;
     if point.len() != 64 || p256_spki(point) != spki {
         return None;
@@ -1486,7 +1486,7 @@ impl LogKeys {
 
     /// A pin set from keys already parsed — how [`crate::tuf::tlog_keys`]
     /// builds one, so the origin each key is pinned for survives.
-    pub fn from_keys(keys: Vec<LogKey>) -> LogKeys {
+    pub(crate) fn from_keys(keys: Vec<LogKey>) -> LogKeys {
         LogKeys { keys }
     }
 
@@ -1511,7 +1511,7 @@ impl LogKey {
     ///
     /// Used by [`crate::tuf::tlog_keys`], which reads the origin out of the
     /// same trusted root that named the key.
-    pub fn for_origin(self, origin: String) -> LogKey {
+    pub(crate) fn for_origin(self, origin: String) -> LogKey {
         LogKey {
             origin: Some(origin),
             ..self
@@ -1521,7 +1521,7 @@ impl LogKey {
     /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key
     /// (`RawKey::from_spki`). The `id` is SHA-256 over the DER bytes exactly
     /// as given.
-    pub fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
+    pub(crate) fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
         match RawKey::from_spki(der) {
             Some(key) => Ok(LogKey {
                 id: sha256(der),
@@ -1709,7 +1709,7 @@ pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
 }
 
 /// base64url without padding — how a proof travels in a TXT record.
-pub fn base64url_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64url_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

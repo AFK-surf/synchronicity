@@ -385,7 +385,7 @@ impl SimZone {
     }
 
     /// The same, under a caller-chosen signer.
-    pub fn signed_txt_by(
+    pub(crate) fn signed_txt_by(
         &self,
         owner: Name,
         text: &str,
@@ -455,13 +455,17 @@ impl SimZone {
 
     /// The DS RRset for `child`, signed by *this* zone — a real delegation
     /// step, as a parent publishes it.
-    pub fn ds_records_for(&self, child: &SimZone, inception: time::OffsetDateTime) -> Vec<Record> {
+    pub(crate) fn ds_records_for(
+        &self,
+        child: &SimZone,
+        inception: time::OffsetDateTime,
+    ) -> Vec<Record> {
         self.ds_records_by(child, inception, DigestType::SHA256, None)
     }
 
     /// The same over RFC 4509 digest type 4, which `chain::covers` also
     /// follows and which a registrar may publish instead of type 2.
-    pub fn ds_records_sha384_for(
+    pub(crate) fn ds_records_sha384_for(
         &self,
         child: &SimZone,
         inception: time::OffsetDateTime,
@@ -477,7 +481,7 @@ impl SimZone {
     /// the flag check inside `verify_rrset`. Expressing that needs a DS signed
     /// by a key that is in the RRset and must not be used, which is what this
     /// is for.
-    pub fn ds_records_signed_by(
+    pub(crate) fn ds_records_signed_by(
         &self,
         child: &SimZone,
         inception: time::OffsetDateTime,
@@ -583,13 +587,8 @@ impl SimZone {
         chain::transparency_name(&self.origin).expect("transparency name")
     }
 
-    /// The name part 1 of a proof lives under.
-    pub fn rekor_name(&self) -> Name {
-        Name::from_utf8(format!("{}.{}", rekor::REKOR_TXT_PREFIX, self.origin)).expect("rekor name")
-    }
-
     /// The name the control-plane attach record lives under.
-    pub fn cp_name(&self) -> Name {
+    pub(crate) fn cp_name(&self) -> Name {
         Name::from_utf8(format!("{}.{}", crate::dns::CP_TXT_PREFIX, self.origin)).expect("cp name")
     }
 
@@ -848,7 +847,7 @@ impl SimZone {
     }
 
     /// The name the membership records live under.
-    pub fn txt_name(&self) -> Name {
+    pub(crate) fn txt_name(&self) -> Name {
         Name::from_utf8(format!("{TXT_PREFIX}.{}", self.origin)).expect("txt name")
     }
 

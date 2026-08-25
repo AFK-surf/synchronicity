@@ -30,7 +30,7 @@ use crate::{
 /// operator with sixty-five sockets in one space has a naming problem this
 /// number is not going to fix. It exists so that "how much work can one space
 /// make the scanner do per file?" has an answer.
-pub const MAX_SOCKETS_PER_SPACE: usize = 64;
+pub(crate) const MAX_SOCKETS_PER_SPACE: usize = 64;
 
 /// One declared socket: local configuration attached to its tree path.
 #[derive(Debug, Clone, PartialEq, Eq)]

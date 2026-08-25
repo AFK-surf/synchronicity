@@ -703,7 +703,8 @@ impl Store {
     /// one and a byte-identical private copy in `gc`, with the sweep executing
     /// the copy and the sweep's own test asserting on this one. A rule verified
     /// against a version production does not run is not verified.
-    pub fn retained_roots(&self) -> Result<Vec<Hash>> {
+    #[cfg(test)]
+    pub(crate) fn retained_roots(&self) -> Result<Vec<Hash>> {
         crate::gc::retained_roots_in(&self.conn())
     }
 }

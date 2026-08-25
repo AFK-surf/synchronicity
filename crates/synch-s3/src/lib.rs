@@ -46,7 +46,7 @@ use crate::{
 };
 
 /// The default `max-keys` for a listing.
-pub const DEFAULT_MAX_KEYS: usize = 1000;
+pub(crate) const DEFAULT_MAX_KEYS: usize = 1000;
 
 /// The smallest a multipart part may be when it is not the last one: S3's
 /// 5 MiB.
@@ -886,7 +886,7 @@ fn quoted(value: &str) -> String {
 }
 
 /// Parses an HTTP `Range` header into a half-open byte range.
-pub fn parse_range(value: &str, size: u64) -> S3Result<(u64, u64)> {
+pub(crate) fn parse_range(value: &str, size: u64) -> S3Result<(u64, u64)> {
     let spec = value
         .strip_prefix("bytes=")
         .ok_or_else(|| S3Error::invalid_range(format!("unsupported range unit in {value:?}")))?;

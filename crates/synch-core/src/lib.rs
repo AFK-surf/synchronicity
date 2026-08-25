@@ -16,24 +16,21 @@ pub mod sock;
 pub mod wire;
 
 pub use blocking::{assert_off_runtime, blocking_is_allowed, offload, BlockingScope, TaskLost};
-pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash, HashParseError};
-pub use head::{head_signing_input, HeadError, HeadSummary, SignedHead, HEAD_SIGNING_DOMAIN};
-pub use origin::{NodeId, OriginId, OriginParseError};
-pub use path::{normalize_native_path, normalize_path, PathError, MAX_KEY_LEN};
+pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash};
+pub use head::{head_signing_input, HeadSummary, SignedHead};
+pub use origin::{NodeId, OriginId};
+pub use path::{normalize_native_path, normalize_path, MAX_KEY_LEN};
 pub use record::{
-    blob_key, blob_prefix, delegation_key, delegation_prefix, dir_prefix, file_key, manifest_key,
-    parse_blob_key, parse_delegation_key, parse_file_key, parse_replica_claim_key,
-    parse_space_info_key, publish_prefixes, replica_claim_key, scope_prefixes, space_info_key,
-    space_prefix, validate_space, AdState, BlobAd, ChunkFormat, ChunkParams, Delegation, EntryKind,
-    FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
-    MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+    blob_key, delegation_key, dir_prefix, file_key, manifest_key, parse_blob_key,
+    parse_delegation_key, parse_file_key, parse_replica_claim_key, publish_prefixes,
+    replica_claim_key, scope_prefixes, space_info_key, space_prefix, validate_space, AdState,
+    BlobAd, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys,
+    SpaceInfo, AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use sock::{
-    display_text_is_safe, valid_ebpf_stack_frame_size, Declaration, DeclarationError, FaultKind,
-    OpenError, RefuseCode, SockClosed, SockOpen, SockOpened, SockStatus, ALPN_SOCK,
-    DEFAULT_EBPF_STACK_FRAME_SIZE, EBPF_STACK_FRAME_ALIGNMENT, MAX_DECLARATION_VALUE_BYTES,
+    display_text_is_safe, valid_ebpf_stack_frame_size, Declaration, FaultKind, RefuseCode,
+    SockClosed, SockOpen, SockOpened, SockStatus, ALPN_SOCK, DEFAULT_EBPF_STACK_FRAME_SIZE,
     MAX_DECLARED_EGRESS, MAX_DECLARED_TREE_READS, MAX_EBPF_STACK_FRAME_SIZE, MAX_OPEN_FRAME_LEN,
-    MAX_OPEN_META_BYTES, MAX_OPEN_META_PAIRS, MIN_EBPF_STACK_FRAME_SIZE, SOCK_PROTO_VERSION,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,
@@ -119,11 +116,6 @@ pub fn clock_is_trusted(ns: i64) -> bool {
     ns >= MIN_TRUSTED_NS
 }
 
-/// Converts a byte offset to the chunk group index containing it.
-pub fn group_of_offset(offset: u64) -> u64 {
-    offset / CHUNK_GROUP_SIZE
-}
-
 /// Converts a byte range to the half-open group range covering it.
 pub fn groups_for_byte_range(start: u64, end: u64) -> GroupRange {
     if start >= end {
@@ -147,7 +139,6 @@ mod tests {
 
     #[test]
     fn group_math() {
-        assert_eq!(group_of_offset(CHUNK_GROUP_SIZE), 1);
         assert_eq!(groups_for_byte_range(0, 1), GroupRange::new(0, 1));
         assert_eq!(
             groups_for_byte_range(CHUNK_GROUP_SIZE - 1, CHUNK_GROUP_SIZE + 1),

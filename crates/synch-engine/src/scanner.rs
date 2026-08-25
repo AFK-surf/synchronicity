@@ -77,19 +77,6 @@ impl Node {
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))
     }
 
-    /// Walks one space and stages everything that changed.
-    pub fn scan_space(&self, space_id: &str) -> Result<ScanReport> {
-        if self.cas_backend().remote_upload_parts() {
-            return Err(EngineError::invalid(
-                "cloud-CAS scans must use the async backend-aware scan path",
-            ));
-        }
-        let store = self.store().clone();
-        self.scan_space_with_ingest(space_id, &mut move |path| {
-            Ok(store.ingest_file(path, now_ns())?)
-        })
-    }
-
     fn scan_space_with_ingest(
         &self,
         space_id: &str,
@@ -414,22 +401,14 @@ impl Node {
     }
 
     /// Scans every configured space.
-    pub fn scan_all(&self) -> Result<ScanReport> {
-        self.scan_all_with(|_, _| {})
-    }
-
-    /// Scans every configured space, reporting each one as it completes.
-    ///
-    /// Hashing a large tree takes as long as it takes; `on_space` is how a
-    /// caller says so while it happens, rather than after everything is done.
-    pub fn scan_all_with(&self, mut on_space: impl FnMut(&str, &ScanReport)) -> Result<ScanReport> {
+    pub(crate) fn scan_all(&self) -> Result<ScanReport> {
         if self.cas_backend().remote_upload_parts() {
             return Err(EngineError::invalid(
                 "cloud-CAS scans must use the async backend-aware scan path",
             ));
         }
         let store = self.store().clone();
-        self.scan_all_with_ingest(&mut on_space, &mut move |path| {
+        self.scan_all_with_ingest(&mut |_, _| {}, &mut move |path| {
             Ok(store.ingest_file(path, now_ns())?)
         })
     }
@@ -445,7 +424,7 @@ impl Node {
                 continue;
             }
             // One space's failure does not discard the others' work. It used
-            // to: `scan_space` commits the `local_files` row removal for a
+            // to: `scan_space_with_ingest` commits the `local_files` row removal for a
             // vanished path as it goes (the tombstone that replaces it only
             // enters `report.staged`), so a later space failing — an unmounted
             // removable disk is the ordinary case — dropped the tombstone while
@@ -516,7 +495,7 @@ impl Node {
     /// back to reading as absent. Only this node's own tombstones are ever
     /// considered — a replicated trie belongs to its origin, and this node
     /// cannot rewrite it.
-    pub fn expired_tombstone_changes(&self) -> Result<Vec<StagedChange>> {
+    pub(crate) fn expired_tombstone_changes(&self) -> Result<Vec<StagedChange>> {
         let ttl = self.config().tombstone_ttl.as_nanos().min(i64::MAX as u128) as i64;
         let cutoff = now_ns().saturating_sub(ttl);
         let mut changes = Vec::new();
@@ -543,7 +522,7 @@ impl Node {
     ///
     /// Retiring is the same shape as tombstone expiry — staged, so it costs one
     /// head like any other batch.
-    pub fn retired_ad_changes(&self) -> Result<Vec<StagedChange>> {
+    pub(crate) fn retired_ad_changes(&self) -> Result<Vec<StagedChange>> {
         let mut changes = Vec::new();
         for root in self.store().provider_roots_for_origin(self.origin())? {
             // Still held, whole or in part: the ad stands, and a partial
@@ -559,7 +538,7 @@ impl Node {
     /// Stages the removal of ads for objects this node has dropped.
     ///
     /// Returns how many were staged.
-    pub fn retire_ads(&self) -> Result<usize> {
+    pub(crate) fn retire_ads(&self) -> Result<usize> {
         let changes = self.retired_ad_changes()?;
         let retired = changes.len();
         if retired > 0 {
@@ -577,7 +556,7 @@ impl Node {
     /// Staged rather than published: expiry flows through the ordinary
     /// publisher, so it costs one head like any other batch. Returns how many
     /// tombstones were staged for removal.
-    pub fn expire_tombstones(&self) -> Result<usize> {
+    pub(crate) fn expire_tombstones(&self) -> Result<usize> {
         // Excluding whatever is already waiting to be published, for the reason
         // `scan_all_with` gives: a removal that lands in the same batch as a
         // live entry for the same key erases the path outright. Here the two are
@@ -611,30 +590,22 @@ impl Node {
         Ok((report, head))
     }
 
-    /// Scans every space and stages the result for the publisher (§7.1).
+    /// Scans every space and stages the result for the publisher (§7.1), on
+    /// the blocking pool.
     ///
     /// This is what a watcher hint and the periodic rescan use: a burst of
     /// saves becomes one batch and therefore one head. Nothing is published
-    /// until the batch flushes.
+    /// until the batch flushes. The recovery gate is taken here for the same
+    /// reason it is taken in [`Node::scan_and_publish`] — the scan writes
+    /// `local_files` either way.
     ///
-    /// The recovery gate is taken here for the same reason it is taken in
-    /// [`Node::scan_and_publish`] — the scan writes `local_files` either way.
-    pub fn scan_and_stage(&self) -> Result<ScanReport> {
-        self.ensure_publishable()?;
-        let report = self.scan_all()?;
-        self.stage(report.staged.iter().cloned());
-        Ok(report)
-    }
-
-    /// [`Node::scan_and_stage`] run on the blocking pool.
-    ///
-    /// This is the form every async caller wants. A scan walks every space,
+    /// Always off the runtime. A scan walks every space,
     /// stats every path, and re-hashes whatever moved — work bounded by the
     /// size of the tree, not by anything the runtime can preempt. Run inline on
     /// a worker thread it stops that thread from polling for as long as it
     /// takes, which on a multi-gigabyte space is the daemon going quiet: no
     /// peer answered, no control request served, no timer fired on time (§10).
-    pub async fn scan_and_stage_async(&self) -> Result<ScanReport> {
+    pub(crate) async fn scan_and_stage_async(&self) -> Result<ScanReport> {
         Ok(self.scan_and_stage_async_with_reports().await?.0)
     }
 
@@ -665,7 +636,7 @@ impl Node {
 
     /// Re-indexes local paths whose staged changes never reached a root.
     ///
-    /// `scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it
+    /// A scan records `(size, mtime_ns, file_id)` in `local_files` as it
     /// indexes, and that record is what makes the *next* scan skip the file.
     /// Batching puts a window between the two: a daemon that dies with a batch
     /// still buffered would leave rows claiming a file is published while no
@@ -1153,7 +1124,7 @@ const APPEND_CHUNK: u64 = 1024 * 1024;
 ///
 /// Matched by a built-in ignore rule ([`crate::ignore::BUILTIN_DEFAULTS`]), so
 /// a scan that runs while an upload is still arriving walks straight past it.
-pub const PART_SUFFIX: &str = ".synch-part";
+pub(crate) const PART_SUFFIX: &str = ".synch-part";
 
 /// A streamed write into a local space that has not landed yet (§9.4).
 ///
@@ -1372,7 +1343,7 @@ impl Adoption {
         })
     }
 
-    /// Stages a write that starts out as a clone of a file already on disk
+    /// Fills the staging file from `source`, sharing its extents if it can
     /// (`docs/DELTA-SYNC.md` §3.5).
     ///
     /// The atomicity invariant is unchanged — the bytes land in a staging file
@@ -1385,29 +1356,8 @@ impl Adoption {
     /// extents copy-on-write, so the write is O(1) and consumes no space until
     /// one of the two files is written to. Everywhere else — a target on a
     /// different filesystem from the source, ext4, a kernel or platform without
-    /// the ioctl — it falls back to [`std::fs::copy`], which on Linux is itself
-    /// a kernel-side `copy_file_range` rather than a bounce through user space.
-    ///
-    /// Every failure path unlinks the staging file before returning. The
-    /// obvious way to write the fallback leaves one behind when the copy fails
-    /// *and* the handle cannot be reopened — ENOSPC, EMFILE — and the file it
-    /// strands wears a name the scanner's built-in ignore rules skip, so it
-    /// would sit beside the target unnoticed and uncollected forever.
-    pub fn cloning(target: impl Into<PathBuf>, source: &Path) -> Result<(Adoption, CloneKind)> {
-        let mut adoption = Adoption::open(target.into())?;
-        match adoption.clone_from(source) {
-            Ok(kind) => Ok((adoption, kind)),
-            Err(e) => {
-                // `Drop` only unlinks while the handle is live, and the copy
-                // fallback below has to let go of it.
-                let _ = std::fs::remove_file(&adoption.staging);
-                adoption.file = None;
-                Err(e)
-            }
-        }
-    }
-
-    /// Fills the staging file from `source`, sharing its extents if it can.
+    /// the ioctl — it falls back to a plain copy, which on Linux is itself a
+    /// kernel-side `copy_file_range` rather than a bounce through user space.
     fn clone_from(&mut self, source: &Path) -> Result<CloneKind> {
         let mut file = self
             .file
@@ -1468,7 +1418,7 @@ impl Adoption {
     /// describing the bytes this call assembled and describing whatever the
     /// tree holds for that key by the time the scan reaches it — which a
     /// concurrent write to the same key wins.
-    pub fn hash_staged(&mut self) -> Result<synch_core::Hash> {
+    pub(crate) fn hash_staged(&mut self) -> Result<synch_core::Hash> {
         use std::io::{Seek, Write};
         let file = self
             .file
@@ -1491,14 +1441,14 @@ impl Adoption {
     /// through user space on one that cannot — so a 50 GiB object assembled
     /// from 8 MiB parts never passes through this process.
     ///
-    /// `FICLONE` is deliberately not used here even though [`Adoption::cloning`]
+    /// `FICLONE` is deliberately not used here even though `Adoption::clone_from`
     /// prefers it: it is a *whole file* clone that replaces the destination,
     /// which is the one thing an append must not do. The range form needs
     /// block-aligned offsets that arbitrary part sizes do not have.
     ///
     /// Blocking, like every other method here — the caller runs it off the
     /// runtime.
-    pub fn append_file(&mut self, source: &Path) -> Result<u64> {
+    pub(crate) fn append_file(&mut self, source: &Path) -> Result<u64> {
         use std::io::{Read, Seek, Write};
         let mut src = std::fs::File::open(source)?;
         let len = src.metadata()?.len();
@@ -2205,9 +2155,9 @@ mod nt {
     }
 }
 
-/// How [`Adoption::cloning`] managed to give the staging file its head start.
+/// How `Adoption::clone_from` managed to give the staging file its head start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloneKind {
+pub(crate) enum CloneKind {
     /// Extents shared with the source, copy-on-write: no data was moved.
     Reflink,
     /// The source's bytes were copied.
@@ -2393,12 +2343,6 @@ pub fn decode_entry(bytes: &[u8]) -> Result<FileEntry> {
     Ok(synch_core::record::decode(bytes)?)
 }
 
-/// The content root a staged file entry points at, if any.
-pub fn staged_content(change: &StagedChange) -> Option<Hash> {
-    let value = change.1.as_ref()?;
-    decode_entry(value).ok()?.content
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,7 +2354,6 @@ mod tests {
         let (_data, node) = crate::testkit::node().await;
         node.add_detached_space("media").unwrap();
         assert!(node.is_detached_space("media").unwrap());
-        assert!(node.scan_space("media").is_err());
         assert!(crate::watcher::SpaceWatcher::configured_spaces(&node)
             .unwrap()
             .is_empty());
@@ -3207,7 +3150,7 @@ mod tests {
             #[cfg(unix)]
             std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
             // The batch is lost: hashed and recorded, never published.
-            let report = node.scan_and_stage().unwrap();
+            let report = node.scan_and_stage_async().await.unwrap();
             assert_eq!(report.hashed, rows);
             assert!(node.publisher().pending() > 0);
             assert!(node.own_head().unwrap().is_none());

@@ -1,7 +1,5 @@
 //! Signed heads: the mutable pointer per origin (§4.4).
 
-use std::cmp::Ordering;
-
 use iroh_base::{SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +9,7 @@ use crate::{
 };
 
 /// The signing domain-separation tag (§4.4).
-pub const HEAD_SIGNING_DOMAIN: &[u8] = b"sync-head/1";
+pub(crate) const HEAD_SIGNING_DOMAIN: &[u8] = b"sync-head/1";
 
 /// The mutable pointer per origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,11 +110,6 @@ impl SignedHead {
         (self.seq, self.root.0)
     }
 
-    /// Lexicographic `(seq, root)` comparison; `created_at` never orders — clocks lie.
-    pub fn cmp_order(&self, other: &SignedHead) -> Ordering {
-        self.order_key().cmp(&other.order_key())
-    }
-
     /// True if this head displaces `current` under the §5.2 rule: strictly
     /// greater `(seq, root)` lexicographically.
     pub fn supersedes(&self, current: Option<&(u64, Hash)>) -> bool {
@@ -124,12 +117,6 @@ impl SignedHead {
             None => true,
             Some((seq, root)) => self.order_key() > (*seq, root.0),
         }
-    }
-
-    /// True if this head equivocates against `other`: same origin and seq, but a
-    /// different root (§4.4).
-    pub fn equivocates_with(&self, other: &SignedHead) -> bool {
-        self.origin == other.origin && self.seq == other.seq && self.root != other.root
     }
 }
 
@@ -208,21 +195,13 @@ mod tests {
         let same_seq_high_root = SignedHead::sign(&key, origin(), 1, Hash([2u8; 32]), 0);
         let high_seq = SignedHead::sign(&key, origin(), 2, Hash([0u8; 32]), 0);
 
-        assert_eq!(low.cmp_order(&same_seq_high_root), Ordering::Less);
-        assert_eq!(same_seq_high_root.cmp_order(&high_seq), Ordering::Less);
+        assert!(low.order_key() < same_seq_high_root.order_key());
+        assert!(same_seq_high_root.order_key() < high_seq.order_key());
 
         // Equal-seq, greater-root heads are accepted, not ignored (§5.2).
         assert!(same_seq_high_root.supersedes(Some(&(1, Hash([1u8; 32])))));
         assert!(!low.supersedes(Some(&(1, Hash([2u8; 32])))));
         assert!(!low.supersedes(Some(&(1, Hash([1u8; 32])))));
         assert!(low.supersedes(None));
-
-        // Same-seq, different-root is equivocation; the next seq is not.
-        let a = SignedHead::sign(&key, origin(), 3, Hash([1u8; 32]), 0);
-        let b = SignedHead::sign(&key, origin(), 3, Hash([2u8; 32]), 0);
-        let c = SignedHead::sign(&key, origin(), 4, Hash([2u8; 32]), 0);
-        assert!(a.equivocates_with(&b));
-        assert!(!a.equivocates_with(&c));
-        assert!(!a.equivocates_with(&a.clone()));
     }
 }

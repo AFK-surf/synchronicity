@@ -291,7 +291,7 @@ impl Store {
     /// every pass, on the one write connection that publishes and GC also want.
     /// Fairness between spaces is [`Store::wants_to_attempt`]'s job, not this
     /// one's: this returns one space's window, and the caller interleaves.
-    pub fn wants_ready_of(
+    pub(crate) fn wants_ready_of(
         &self,
         holder: &PinHolder,
         now: i64,
@@ -326,7 +326,7 @@ impl Store {
     /// object with one holder is the one about to be lost when that holder
     /// leaves. Ties go to the oldest want, so nothing starves behind a stream
     /// of equally rare newcomers.
-    pub fn rank_rarest_first(&self, mut candidates: Vec<WantRow>) -> Result<Vec<WantRow>> {
+    pub(crate) fn rank_rarest_first(&self, mut candidates: Vec<WantRow>) -> Result<Vec<WantRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT COUNT(*) FROM blob_providers
@@ -447,7 +447,7 @@ impl Store {
     /// statement the two cannot separate. `synch_engine`'s `Node::view_state`
     /// answers the same question for reporting, and says *why* when the answer
     /// is no. (Named rather than linked: the dependency runs the other way.)
-    pub fn schedule_stale_releases(&self, holder: &PinHolder, at: i64) -> Result<usize> {
+    pub(crate) fn schedule_stale_releases(&self, holder: &PinHolder, at: i64) -> Result<usize> {
         Ok(self.conn().execute(
             &format!(
                 "UPDATE pins SET release_after = ?2

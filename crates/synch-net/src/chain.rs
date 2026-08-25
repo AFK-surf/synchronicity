@@ -600,7 +600,7 @@ pub fn dnskey_rdata(key: &DNSKEY) -> Vec<u8> {
 }
 
 /// The only DNSKEY protocol byte DNSSEC defines (RFC 4034 §2.1.2).
-pub const DNSKEY_PROTOCOL: u8 = 3;
+pub(crate) const DNSKEY_PROTOCOL: u8 = 3;
 
 /// Whether a DNSKEY may be used as a signer, and whether it belongs in a
 /// proven key set.

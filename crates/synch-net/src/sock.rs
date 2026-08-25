@@ -61,7 +61,7 @@ pub trait SocketService: std::fmt::Debug + Send + Sync + 'static {
 
 /// Serves `sync/sock/1`.
 #[derive(Clone)]
-pub struct SockProtocol {
+pub(crate) struct SockProtocol {
     store: Arc<Store>,
     service: Arc<dyn SocketService>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
@@ -149,7 +149,7 @@ impl std::fmt::Debug for SockProtocol {
 
 impl SockProtocol {
     /// Builds a handler over a store and a service.
-    pub fn new(store: Arc<Store>, service: Arc<dyn SocketService>) -> Self {
+    pub(crate) fn new(store: Arc<Store>, service: Arc<dyn SocketService>) -> Self {
         SockProtocol {
             store,
             service,
@@ -159,19 +159,19 @@ impl SockProtocol {
     }
 
     /// Rings `wake` whenever a connection is refused for an unknown key (§3.4).
-    pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+    pub(crate) fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_unknown_key = wake;
         self
     }
 
     /// Refuses new socket streams and wakes incomplete handshakes.
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.state.stop();
     }
 
     /// Waits until every stream accepted before [`stop`](Self::stop) has
     /// delivered its final response or refusal.
-    pub async fn drain(&self) {
+    pub(crate) async fn drain(&self) {
         if self.state.is_stopping() {
             self.state.drained().await;
         }

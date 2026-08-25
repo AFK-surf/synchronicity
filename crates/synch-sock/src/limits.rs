@@ -69,26 +69,26 @@ impl Default for Limits {
 /// yield often enough that a busy program does not delay the reactor past a
 /// millisecond, throttle at the point where "busy" has become "spinning", and
 /// sleep long enough that the throttle is felt.
-pub const YIELD_AFTER: Duration = Duration::from_millis(1);
+pub(crate) const YIELD_AFTER: Duration = Duration::from_millis(1);
 /// See [`YIELD_AFTER`].
-pub const THROTTLE_AFTER: Duration = Duration::from_millis(20);
+pub(crate) const THROTTLE_AFTER: Duration = Duration::from_millis(20);
 /// See [`YIELD_AFTER`].
-pub const THROTTLE_FOR: Duration = Duration::from_millis(100);
+pub(crate) const THROTTLE_FOR: Duration = Duration::from_millis(100);
 
 /// How often the preemption watcher interrupts a running guest.
 ///
 /// Preemption is asynchronous and has no cooperative fallback, which is what
 /// makes a program with no `sy_poll` in it still interruptible.
-pub const PREEMPTION_INTERVAL: Duration = Duration::from_micros(500);
+pub(crate) const PREEMPTION_INTERVAL: Duration = Duration::from_micros(500);
 
 /// The most bytes one `sy_log` line may carry before it is flushed.
-pub const MAX_LOG_LINE: usize = 512;
+pub(crate) const MAX_LOG_LINE: usize = 512;
 
 /// The most distinct metric names one socket may create.
-pub const MAX_METRIC_NAMES: usize = 32;
+pub(crate) const MAX_METRIC_NAMES: usize = 32;
 
 /// The most labels one invocation may carry.
-pub const MAX_LABELS: usize = 8;
+pub(crate) const MAX_LABELS: usize = 8;
 
 /// The most bytes a single helper will copy in one call.
 ///
@@ -96,7 +96,7 @@ pub const MAX_LABELS: usize = 8;
 /// guest's own stack, so a larger request simply fails validation. It is here
 /// so that an absurd length argument is refused as an argument rather than
 /// walked.
-pub const MAX_COPY: u64 = 64 * 1024;
+pub(crate) const MAX_COPY: u64 = 64 * 1024;
 
 /// Consecutive faults, out of the last [`FAULT_WINDOW`] invocations, that
 /// auto-disarm a socket.
@@ -104,6 +104,6 @@ pub const MAX_COPY: u64 = 64 * 1024;
 /// A program that cannot run is not left accepting connections. The window is
 /// short because the signal is unambiguous: a fault is a contained crash, not a
 /// refusal, and a program faulting half the time is broken rather than picky.
-pub const FAULT_QUARANTINE: usize = 8;
+pub(crate) const FAULT_QUARANTINE: usize = 8;
 /// See [`FAULT_QUARANTINE`].
-pub const FAULT_WINDOW: usize = 16;
+pub(crate) const FAULT_WINDOW: usize = 16;

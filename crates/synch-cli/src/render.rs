@@ -44,12 +44,12 @@ pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
 ///
 /// Deliberately a *count* rather than a flag — "two versions" is the fact, and
 /// it is the number `synch status` will lay out.
-pub fn divergence_mark(versions: usize) -> String {
+pub(crate) fn divergence_mark(versions: usize) -> String {
     format!("\u{2442}{versions}")
 }
 
 /// One line of an origin-pinned listing: a single origin's entry.
-pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
+pub(crate) fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
     format!(
         "{:>12}  {:<8}  {}{}",
         row.size,
@@ -67,7 +67,7 @@ pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
 ///
 /// `now` is `Store::read_instant`, taken beside the listing: it touches the
 /// connection, and this renders on a runtime worker (§10).
-pub fn unified_line(node: &Node, set: &VersionSet, all: bool, now: i64) -> Lines {
+pub(crate) fn unified_line(node: &Node, set: &VersionSet, all: bool, now: i64) -> Lines {
     let selected = node.resolve_set(set, &VersionPolicy::Newest, now)?;
     let mark = set
         .is_divergent()
@@ -80,7 +80,7 @@ pub fn unified_line(node: &Node, set: &VersionSet, all: bool, now: i64) -> Lines
 }
 
 /// Every version of a path, newest first — the body of `synch status`.
-pub fn version_set(set: &VersionSet) -> Vec<String> {
+pub(crate) fn version_set(set: &VersionSet) -> Vec<String> {
     let mut out = vec![format!(
         "{}/{}  {} version(s){}",
         set.space,
@@ -151,7 +151,7 @@ pub fn duration(seconds: i64) -> String {
 /// The two halves of a row are independent and the line has to show both, or
 /// an operator cannot tell a detached replica from a checkout that replicates
 /// nothing — which are opposite answers to "what is this machine for".
-pub fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -> String {
+pub(crate) fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -> String {
     let replication = match (space.replicate, coverage) {
         (None, _) => "—".to_string(),
         (Some(policy), None) => format!("replicate {policy}"),
@@ -333,7 +333,7 @@ pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
 /// The policy first — it decides whether an answer is accepted at all — then
 /// every override: an override is a different universe, and the operator has
 /// to see which one they are in.
-pub fn trust_summary(status: &ResolverStatus) -> String {
+pub(crate) fn trust_summary(status: &ResolverStatus) -> String {
     match status {
         ResolverStatus::Absent => "no membership resolver in this process".into(),
         ResolverStatus::Failed(why) => {

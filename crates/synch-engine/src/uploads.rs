@@ -45,20 +45,20 @@ pub const DEFAULT_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_se
 /// clear it. Without a steal the upload can never be completed, aborted, or
 /// swept: every one of those refuses a latched row. An hour is far longer than
 /// any assembly and far shorter than the TTL.
-pub const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+pub(crate) const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// How many uploads may be open at once, in total.
 ///
 /// The data dir carries the database, the CAS and this node's signing key, so
 /// an unbounded number of open uploads is not "S3 writes get slow" — it is the
 /// node losing the disk it needs to publish, or recover, at all.
-pub const MAX_OPEN_UPLOADS: u64 = 10_000;
+pub(crate) const MAX_OPEN_UPLOADS: u64 = 10_000;
 
 /// How many uploads one access key may hold open at once.
-pub const MAX_OPEN_UPLOADS_PER_PRINCIPAL: u64 = 1_000;
+pub(crate) const MAX_OPEN_UPLOADS_PER_PRINCIPAL: u64 = 1_000;
 
 /// How many bytes all staged parts may hold before new ones are refused.
-pub const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+pub(crate) const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
 /// Where a part's payload is being staged, and what it will be recorded as.
 #[derive(Debug, Clone)]
@@ -223,7 +223,11 @@ impl Node {
     /// is written, so a row never names a file that is not there. A crash
     /// between the two leaves an unreferenced payload, which the sweeper
     /// collects — the safe half of the asymmetry.
-    pub fn commit_part(&self, staging: PartStaging, adoption: Adoption) -> Result<UploadPart> {
+    pub(crate) fn commit_part(
+        &self,
+        staging: PartStaging,
+        adoption: Adoption,
+    ) -> Result<UploadPart> {
         let size = adoption.written();
         if size > MAX_PART_SIZE {
             return Err(EngineError::invalid(format!(
@@ -721,7 +725,7 @@ impl Node {
     /// supersedes an attempt a completion might still have had open — those sit
     /// inside a directory that is very much still live, so no directory-level
     /// sweep would ever see them.
-    pub fn sweep_uploads(&self, ttl: std::time::Duration) -> Result<usize> {
+    pub(crate) fn sweep_uploads(&self, ttl: std::time::Duration) -> Result<usize> {
         let ttl_ns = i64::try_from(ttl.as_nanos()).unwrap_or(i64::MAX);
         let cutoff = synch_core::now_ns().saturating_sub(ttl_ns);
         let mut collected = 0;

@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// How long `synch recover` collects peer summaries by default (§3.4).
-pub const DEFAULT_RECOVERY_QUIESCE: Duration = Duration::from_secs(3600);
+pub(crate) const DEFAULT_RECOVERY_QUIESCE: Duration = Duration::from_secs(3600);
 
 /// How far past this node's own next seq one recovery may lift the publishing
 /// floor (§3.4).
@@ -52,11 +52,11 @@ pub const DEFAULT_RECOVERY_QUIESCE: Duration = Duration::from_secs(3600);
 /// one per publish, so a gap of this size already covers any real divergence
 /// between what this node last held and what its peers have seen since;
 /// anything past it is a claim to be clamped and logged rather than obeyed.
-pub const MAX_RECOVERY_STEP: u64 = 1_000_000;
+pub(crate) const MAX_RECOVERY_STEP: u64 = 1_000_000;
 
 /// How far above the highest observed seq publishing resumes, by default
 /// (§3.4).
-pub const DEFAULT_SEQ_GAP: u64 = 1_000;
+pub(crate) const DEFAULT_SEQ_GAP: u64 = 1_000;
 
 /// Where this node stands with respect to key-loss recovery (§3.4 step 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub struct RecoveryOptions {
 
 /// What one collection round saw.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ObserveRound {
+pub(crate) struct ObserveRound {
     /// Peers that answered a `Hello` exchange.
     pub reached: Vec<NodeId>,
     /// Peers that could not be reached, or failed mid-exchange.
@@ -383,7 +383,7 @@ impl Node {
 
     /// Runs one collection round: a `Hello` exchange with every dialable peer,
     /// adopting nothing (§3.4 step 2).
-    pub async fn observe_peers(&self) -> Result<ObserveRound> {
+    pub(crate) async fn observe_peers(&self) -> Result<ObserveRound> {
         let mut round = ObserveRound::default();
         for (peer, addr) in self.dial_targets().await? {
             match self.net().connect_mpt(addr).await {
@@ -584,7 +584,10 @@ impl Node {
     /// key has not spoken for. On a peer that was partitioned through someone
     /// else's recovery, that is the fork evidence — retained *with* its
     /// signature, so it is provable rather than merely asserted.
-    pub fn unreconciled_history(&self, origin: &OriginId) -> Result<Vec<UnreconciledHistory>> {
+    pub(crate) fn unreconciled_history(
+        &self,
+        origin: &OriginId,
+    ) -> Result<Vec<UnreconciledHistory>> {
         let now = now_ns();
         let current_seq = self.store().complete_head(origin)?.map(|h| h.seq);
         let mut out = Vec::new();

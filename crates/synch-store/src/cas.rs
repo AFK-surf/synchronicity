@@ -32,7 +32,7 @@ use crate::{
 };
 
 /// The bao block size synchronicity uses everywhere: 16 KiB chunk groups.
-pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(CHUNK_GROUP_LOG2);
+pub(crate) const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(CHUNK_GROUP_LOG2);
 
 /// Flushes a file's contents to stable storage. A blob row is only ever written
 /// after this returns, so a crash cannot leave a `complete=1` index row whose
@@ -265,7 +265,7 @@ impl BlobRow {
     }
 
     /// The advertisement this holder should publish for the object (§6.3).
-    pub fn to_ad(&self) -> BlobAd {
+    pub(crate) fn to_ad(&self) -> BlobAd {
         if self.complete || self.durable {
             return BlobAd::complete(self.size);
         }
@@ -739,7 +739,13 @@ impl Store {
     ///
     /// No local groups are claimed: a cold cloud cache is still a complete
     /// holder because `durable=1`, and the backend refills it on demand.
-    pub fn record_remote_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn record_remote_durable_blob(
+        &self,
+        root: &Hash,
+        size: u64,
+        now: i64,
+    ) -> Result<()> {
         self.with_immediate_tx(|tx| {
             tx.execute(
                 "INSERT INTO blobs
@@ -928,7 +934,8 @@ impl Store {
     }
 
     /// True if the whole object is present and verified locally.
-    pub fn has_complete_blob(&self, root: &Hash) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) fn has_complete_blob(&self, root: &Hash) -> Result<bool> {
         Ok(self.blob(root)?.is_some_and(|b| b.complete || b.durable))
     }
 
@@ -939,7 +946,7 @@ impl Store {
 
     /// Records that the configured backend has promoted a complete object to
     /// stable storage. Call only after the backend's durability promise.
-    pub fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
+    pub(crate) fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
         let changed = self.conn().execute(
             "UPDATE blobs SET durable = 1 WHERE root = ?1",
             params![root.as_bytes().to_vec()],
@@ -984,7 +991,7 @@ impl Store {
     ///
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
-    pub fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
+    pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
         self.with_immediate_tx(|tx| {
             let key = root.as_bytes().to_vec();
             // Read before anything is written: this row is the most
@@ -1299,7 +1306,13 @@ impl Store {
     /// keeps its original instant rather than being pushed further out by a
     /// second observation of the same departure, so a path that churns cannot
     /// hold a superseded root forever.
-    pub fn schedule_release(&self, root: &Hash, holder: &PinHolder, at: i64) -> Result<bool> {
+    #[cfg(test)]
+    pub(crate) fn schedule_release(
+        &self,
+        root: &Hash,
+        holder: &PinHolder,
+        at: i64,
+    ) -> Result<bool> {
         let touched = self.conn().execute(
             "UPDATE pins SET release_after = ?3
                WHERE root = ?1 AND holder = ?2 AND release_after IS NULL",

@@ -31,7 +31,7 @@ use crate::{
 };
 
 /// The directory under the data dir that holds every open upload's parts.
-pub const UPLOADS_DIR: &str = "s3-uploads";
+pub(crate) const UPLOADS_DIR: &str = "s3-uploads";
 
 /// The largest part number S3 defines.
 pub const MAX_PART_NUMBER: u32 = 10_000;

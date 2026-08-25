@@ -88,7 +88,7 @@ pub async fn write_frame<T: Serialize>(send: &mut SendStream, msg: &T) -> Result
 }
 
 /// Writes one length-framed raw payload (used for bao slice bodies, §6.4).
-pub async fn write_bytes(send: &mut SendStream, bytes: &[u8]) -> Result<(), NetError> {
+pub(crate) async fn write_bytes(send: &mut SendStream, bytes: &[u8]) -> Result<(), NetError> {
     if bytes.len() > MAX_FRAME_LEN {
         return Err(NetError::FrameTooLarge(bytes.len()));
     }
@@ -104,7 +104,7 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T,
 }
 
 /// Reads one length-framed raw payload.
-pub async fn read_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
+pub(crate) async fn read_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
     read_bounded(recv, MAX_FRAME_LEN).await
 }
 
@@ -114,7 +114,7 @@ pub async fn read_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
 /// protocol with a tighter bound than [`MAX_FRAME_LEN`] — `sync/sock/1`'s
 /// `Open`, at nine kilobytes — never pays a 16 MiB allocation to find out it
 /// was sent one.
-pub async fn read_bounded(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, NetError> {
+pub(crate) async fn read_bounded(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, NetError> {
     let mut header = [0u8; 4];
     recv.read_exact(&mut header).await?;
     let len = u32::from_le_bytes(header) as usize;

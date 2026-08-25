@@ -27,7 +27,7 @@ pub const PREFIX_FILE: u8 = b'f';
 /// The `b:` key prefix: "I hold (part of) this object".
 pub const PREFIX_BLOB: u8 = b'b';
 /// The `m:` key prefix: node manifest.
-pub const PREFIX_MANIFEST: u8 = b'm';
+pub(crate) const PREFIX_MANIFEST: u8 = b'm';
 /// The `d:` key prefix: a delegation this origin has issued (§3.5).
 pub const PREFIX_DELEGATION: u8 = b'd';
 /// The `r:` key prefix: what this origin replicates (`docs/REPLICATION.md` §4.1).
@@ -176,11 +176,6 @@ impl FileEntry {
     /// True if this entry marks a deletion.
     pub fn is_tombstone(&self) -> bool {
         self.kind == EntryKind::Tombstone
-    }
-
-    /// True if this entry is a socket (`docs/SOCKETS.md` §2).
-    pub fn is_socket(&self) -> bool {
-        self.kind == EntryKind::Socket
     }
 }
 
@@ -620,7 +615,7 @@ pub fn parse_blob_key(key: &[u8]) -> Result<Hash, KeyError> {
 }
 
 /// The `b:` prefix used for range scans over all of an origin's ads.
-pub fn blob_prefix() -> Vec<u8> {
+pub(crate) fn blob_prefix() -> Vec<u8> {
     vec![PREFIX_BLOB, b':']
 }
 
@@ -638,17 +633,6 @@ pub fn space_info_key(space: &str) -> Result<Vec<u8>, KeyError> {
     key.extend_from_slice(b"space/");
     key.extend_from_slice(space.as_bytes());
     Ok(key)
-}
-
-/// Parses `m:space/<space-id>`.
-pub fn parse_space_info_key(key: &[u8]) -> Result<String, KeyError> {
-    let prefix = b"m:space/";
-    if key.len() <= prefix.len() || !key.starts_with(prefix) {
-        return Err(KeyError::Malformed);
-    }
-    let space = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| KeyError::Malformed)?;
-    validate_space(space)?;
-    Ok(space.to_string())
 }
 
 /// Builds the trie key `r:<space>`.
@@ -690,7 +674,7 @@ pub fn parse_delegation_key(key: &[u8]) -> Result<crate::NodeId, KeyError> {
 }
 
 /// The `d:` prefix used for range scans over an origin's delegations.
-pub fn delegation_prefix() -> Vec<u8> {
+pub(crate) fn delegation_prefix() -> Vec<u8> {
     vec![PREFIX_DELEGATION, b':']
 }
 
@@ -779,9 +763,7 @@ mod tests {
     #[test]
     fn space_and_delegation_keys_round_trip() {
         let key = space_info_key("photos").unwrap();
-        assert_eq!(parse_space_info_key(&key).unwrap(), "photos");
-        assert!(parse_space_info_key(b"m:space/").is_err());
-        assert!(parse_space_info_key(b"m:self").is_err());
+        assert_eq!(key, b"m:space/photos");
         assert!(space_info_key("bad/id").is_err());
 
         let subject = iroh_base::SecretKey::generate().public();

@@ -24,7 +24,7 @@ use crate::{classify::KnownKeys, MonitorError};
 /// fresh keys and each is a genuine new authorization. The cap makes the file
 /// bounded outright; the oldest indices go first and the run says so, because
 /// silently dropping evidence would be the same mistake in a quieter place.
-pub const MAX_STORED_ENTRIES: usize = 1024;
+pub(crate) const MAX_STORED_ENTRIES: usize = 1024;
 
 /// Where a monitor got to in one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

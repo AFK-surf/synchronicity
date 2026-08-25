@@ -62,7 +62,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// diff would descend into a subtree it was never sent and fail on an
     /// absence that is the design working (§5.5). Promotion's materialization
     /// is scoped exactly as the fetch that filled the trie was.
-    pub fn diff_scoped(
+    pub(crate) fn diff_scoped(
         &self,
         old_root: Hash,
         new_root: Hash,
@@ -77,21 +77,12 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         Ok(out)
     }
 
-    /// Diffs two roots, handing each [`Change`] to `emit` as it is found.
+    /// Diffs two roots within `scope`, handing each [`Change`] to `emit` as it
+    /// is found.
     ///
     /// Unordered, unlike [`Trie::diff`]: sorting needs the whole set in memory,
     /// which is the thing a streaming walk exists not to need.
-    pub fn diff_each(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        emit: impl FnMut(Change) -> Result<(), MptError>,
-    ) -> Result<(), MptError> {
-        self.diff_each_scoped(old_root, new_root, &Scope::full(), emit)
-    }
-
-    /// The same streaming diff, confined to `scope`.
-    pub fn diff_each_scoped(
+    pub(crate) fn diff_each_scoped(
         &self,
         old_root: Hash,
         new_root: Hash,
@@ -192,7 +183,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     }
 
     /// The same, confined to `scope`.
-    pub fn diff_resolved_scoped(
+    pub(crate) fn diff_resolved_scoped(
         &self,
         old_root: Hash,
         new_root: Hash,

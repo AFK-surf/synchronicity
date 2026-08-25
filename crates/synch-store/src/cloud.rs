@@ -192,13 +192,13 @@ impl CloudStore {
     }
 
     /// Returns the immutable payload key for `root`.
-    pub fn payload_key(root: &Hash) -> String {
+    pub(crate) fn payload_key(root: &Hash) -> String {
         let hex = root.to_hex();
         format!("cas/{}/{hex}", &hex[..2])
     }
 
     /// Returns the immutable bao outboard key for `root`.
-    pub fn outboard_key(root: &Hash) -> String {
+    pub(crate) fn outboard_key(root: &Hash) -> String {
         format!("{}.obao", Self::payload_key(root))
     }
 
@@ -257,7 +257,12 @@ impl CloudStore {
     /// Stores a payload/outboard pair under an already assigned content
     /// address. The caller produced the address when it accepted the object;
     /// storage is trusted after that boundary and is not re-hashed here.
-    pub async fn put_pair_files(&self, root: &Hash, payload: &Path, outboard: &Path) -> Result<()> {
+    pub(crate) async fn put_pair_files(
+        &self,
+        root: &Hash,
+        payload: &Path,
+        outboard: &Path,
+    ) -> Result<()> {
         self.write_object_file(&Self::payload_key(root), payload)
             .await?;
         self.write_object_file(&Self::outboard_key(root), outboard)
@@ -265,7 +270,12 @@ impl CloudStore {
     }
 
     /// Stores an in-memory payload/outboard pair under an assigned address.
-    pub async fn put_pair_bytes(&self, root: &Hash, payload: &[u8], outboard: &[u8]) -> Result<()> {
+    pub(crate) async fn put_pair_bytes(
+        &self,
+        root: &Hash,
+        payload: &[u8],
+        outboard: &[u8],
+    ) -> Result<()> {
         let payload_key = Self::payload_key(root);
         self.operator
             .write(&payload_key, Bytes::copy_from_slice(payload))
@@ -305,7 +315,7 @@ impl CloudStore {
     }
 
     /// Reads the complete outboard object.
-    pub async fn read_outboard(&self, root: &Hash) -> Result<Bytes> {
+    pub(crate) async fn read_outboard(&self, root: &Hash) -> Result<Bytes> {
         let key = Self::outboard_key(root);
         let buffer = self
             .operator
@@ -330,7 +340,7 @@ impl CloudStore {
     }
 
     /// Streams a local file into an arbitrary backend-private object key.
-    pub async fn write_object_file(&self, key: &str, source: &Path) -> Result<()> {
+    pub(crate) async fn write_object_file(&self, key: &str, source: &Path) -> Result<()> {
         let mut input = tokio::fs::File::open(source).await?;
         let mut writer = self
             .operator
@@ -356,7 +366,11 @@ impl CloudStore {
     }
 
     /// Reads a byte range from an arbitrary backend-private object key.
-    pub async fn read_object_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+    pub(crate) async fn read_object_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes> {
         let buffer = self
             .operator
             .read_with(key)
@@ -376,7 +390,7 @@ impl CloudStore {
     }
 
     /// Recursively deletes every object under a backend-private prefix.
-    pub async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
+    pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
         let entries = self
             .operator
             .list_with(prefix)

@@ -78,16 +78,8 @@ impl Nibbles {
         self.0.is_empty()
     }
 
-    /// A new sequence with `nibble` prepended.
-    pub fn prepend(&self, nibble: u8) -> Nibbles {
-        let mut v = Vec::with_capacity(self.0.len() + 1);
-        v.push(nibble & 0x0f);
-        v.extend_from_slice(&self.0);
-        Nibbles(v)
-    }
-
     /// A new sequence with `prefix` prepended.
-    pub fn prepend_all(&self, prefix: &[u8]) -> Nibbles {
+    pub(crate) fn prepend_all(&self, prefix: &[u8]) -> Nibbles {
         let mut v = Vec::with_capacity(self.0.len() + prefix.len());
         v.extend(prefix.iter().map(|n| n & 0x0f));
         v.extend_from_slice(&self.0);
@@ -102,7 +94,7 @@ impl From<&[u8]> for Nibbles {
 }
 
 /// The length of the longest common prefix of two nibble slices.
-pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
@@ -123,7 +115,6 @@ mod tests {
         // Odd lengths have no byte form; helpers used by collect.
         assert!(Nibbles::from_nibbles(&[1, 2, 3]).to_bytes().is_none());
         let m = Nibbles::from_nibbles(&[3, 4]);
-        assert_eq!(m.prepend(2).as_slice(), &[2, 3, 4]);
         assert_eq!(m.prepend_all(&[0, 1]).as_slice(), &[0, 1, 3, 4]);
         assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1], &[2]), 0);

@@ -71,7 +71,7 @@ const MAX_TRACKED_SIGHTINGS: usize = 4096;
 
 /// The `sync/mpt/1` protocol handler.
 #[derive(Debug, Clone)]
-pub struct MptProtocol {
+pub(crate) struct MptProtocol {
     store: Arc<Store>,
     heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
@@ -82,7 +82,7 @@ pub struct MptProtocol {
 
 impl MptProtocol {
     /// Builds a handler over a store and the reconciler that owns head state.
-    pub fn new(store: Arc<Store>, heads: Arc<dyn HeadSink>) -> Self {
+    pub(crate) fn new(store: Arc<Store>, heads: Arc<dyn HeadSink>) -> Self {
         MptProtocol {
             store,
             heads,
@@ -95,7 +95,7 @@ impl MptProtocol {
     /// peer whose key this node has not resolved yet (the far side of a key
     /// rotation, typically) arrives exactly this way, and §3.4 makes that
     /// refusal a trigger for an immediate DNS re-resolution.
-    pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+    pub(crate) fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_unknown_key = wake;
         self
     }

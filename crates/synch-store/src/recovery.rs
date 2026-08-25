@@ -118,7 +118,8 @@ impl Store {
     }
 
     /// Every origin some peer has advertised a head for.
-    pub fn observed_heads(&self) -> Result<Vec<ObservedHead>> {
+    #[cfg(test)]
+    pub(crate) fn observed_heads(&self) -> Result<Vec<ObservedHead>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT origin_id, seq, root, complete, claimed_by, observed_at FROM observed_heads

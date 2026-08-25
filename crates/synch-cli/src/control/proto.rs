@@ -58,16 +58,16 @@ pub const CHUNK_SIZE: usize = 256 * 1024;
 /// A chunk is [`CHUNK_SIZE`] and nothing else in the protocol is close, so the
 /// ceiling bounds what a malformed length can make the other side allocate
 /// rather than being reached.
-pub const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
 /// The header carrying the client's [`CONTROL_VERSION`].
-pub const VERSION_HEADER: &str = "x-synch-control-version";
+pub(crate) const VERSION_HEADER: &str = "x-synch-control-version";
 
 /// The header carrying the datadir token.
-pub const TOKEN_HEADER: &str = "x-synch-control-token-bin";
+pub(crate) const TOKEN_HEADER: &str = "x-synch-control-token-bin";
 
 /// The trailer naming the [`ErrorCode`] of a failed call.
-pub const ERROR_CODE_HEADER: &str = "x-synch-error-code";
+pub(crate) const ERROR_CODE_HEADER: &str = "x-synch-error-code";
 
 /// Why a request failed.
 ///
@@ -133,7 +133,7 @@ impl ErrorCode {
 
     /// The gRPC status code a client that does not know this protocol would
     /// see.
-    pub fn grpc(self) -> Code {
+    pub(crate) fn grpc(self) -> Code {
         match self {
             ErrorCode::Unauthorized => Code::Unauthenticated,
             ErrorCode::VersionMismatch | ErrorCode::NotInitialized => Code::FailedPrecondition,
@@ -360,7 +360,7 @@ fn kind_from_pb(kind: pb::EntryKind) -> Result<EntryKind, ControlError> {
 }
 
 /// Compares two tokens without leaking their contents through timing.
-pub fn tokens_match(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn tokens_match(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

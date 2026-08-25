@@ -35,12 +35,12 @@ pub mod scope;
 pub mod store;
 pub mod trie;
 
-pub use diff::{Change, ChangeKind, ChangeView, ResolvedChange};
+pub use diff::{Change, ChangeKind, ChangeView};
 pub use error::MptError;
-pub use nibbles::{common_prefix_len, Nibbles};
-pub use node::{TrieNode, ValueRef, BRANCH_TAG, EXT_TAG, LEAF_TAG};
+pub use nibbles::Nibbles;
+pub use node::{TrieNode, ValueRef};
 #[cfg(feature = "proofs")]
 pub use proof::Proof;
 pub use scope::Scope;
 pub use store::{MemStore, NodeStore};
-pub use trie::{root_opt, Entry, Missing, MissingWalk, Reachable, Trie};
+pub use trie::{Entry, Missing, MissingWalk, Reachable, Trie};

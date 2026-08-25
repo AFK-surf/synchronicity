@@ -33,7 +33,7 @@ pub fn data_dir(cli: &Cli) -> Result<PathBuf> {
 }
 
 /// Builds the node configuration from the CLI flags.
-pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
+pub(crate) fn node_config(cli: &Cli) -> Result<NodeConfig> {
     let mut config = NodeConfig::new(data_dir(cli)?);
     config.net.offline = cli.offline;
     if let Some(bind) = &cli.bind {

@@ -96,7 +96,7 @@ pub fn framing(payload_hash: &str, content_encoding: Option<&str>) -> S3Result<F
 /// request that sends it without either framing header disagrees with this
 /// gateway about the shape of its own body, and the safe reading of that
 /// disagreement is to refuse rather than to pick one.
-pub fn check_declared_length(framing: Framing, declared_length: bool) -> S3Result<()> {
+pub(crate) fn check_declared_length(framing: Framing, declared_length: bool) -> S3Result<()> {
     if declared_length && framing == Framing::Plain {
         return Err(S3Error::invalid(
             "x-amz-decoded-content-length names a length for a body that declares no framing",
@@ -200,7 +200,7 @@ enum State {
 /// framing never has to be whole in memory, so a 5 GiB part costs the same here
 /// as a 5 KiB one.
 #[derive(Debug)]
-pub struct Decoder {
+pub(crate) struct Decoder {
     state: State,
     line: Vec<u8>,
     trailer_bytes: usize,
@@ -213,7 +213,7 @@ pub struct Decoder {
 
 impl Decoder {
     /// A decoder for a body whose payload length the client declared.
-    pub fn new(expected: Option<u64>) -> Decoder {
+    pub(crate) fn new(expected: Option<u64>) -> Decoder {
         Decoder {
             state: State::Size,
             line: Vec::new(),
@@ -225,13 +225,8 @@ impl Decoder {
         }
     }
 
-    /// How many payload bytes have been decoded so far.
-    pub fn decoded(&self) -> u64 {
-        self.decoded
-    }
-
     /// Feeds one piece of the wire body, returning the payload it yielded.
-    pub fn push(&mut self, mut input: &[u8]) -> S3Result<Vec<u8>> {
+    pub(crate) fn push(&mut self, mut input: &[u8]) -> S3Result<Vec<u8>> {
         let mut out = Vec::with_capacity(input.len());
         while !input.is_empty() {
             match self.state {
@@ -349,7 +344,7 @@ impl Decoder {
 
     /// Checks that the body ended where it said it would, and that the payload
     /// matches whatever checksum the trailer carried.
-    pub fn finish(mut self) -> S3Result<()> {
+    pub(crate) fn finish(mut self) -> S3Result<()> {
         if self.state != State::Done {
             return Err(S3Error::invalid(
                 "the chunked body ended in the middle of a frame",

@@ -129,7 +129,7 @@ impl Node {
     /// Ranking is by latency EWMA, then by advertised coverage, then randomly
     /// (§6.4). Span summaries are hints: a stale one costs one wasted round
     /// trip, never correctness.
-    pub fn providers_for(&self, root: &Hash, start: u64, end: u64) -> Result<Vec<Provider>> {
+    pub(crate) fn providers_for(&self, root: &Hash, start: u64, end: u64) -> Result<Vec<Provider>> {
         let now = now_ns();
         let peers = self.store().peers_seen()?;
         let mut out = Vec::new();
@@ -205,7 +205,7 @@ impl Node {
     /// slice is verified against the object root before any byte is committed,
     /// and verified groups survive a restart because they land in the bitmap
     /// immediately.
-    pub async fn fetch_range(
+    pub(crate) async fn fetch_range(
         &self,
         root: &Hash,
         size: u64,
@@ -225,7 +225,7 @@ impl Node {
 
     /// Fetches an object in full, offering donors it might be assembled from
     /// (`docs/DELTA-SYNC.md` §3.2).
-    pub async fn fetch_all_from(
+    pub(crate) async fn fetch_all_from(
         &self,
         root: &Hash,
         size: u64,
@@ -323,7 +323,7 @@ impl Node {
     /// of it. Failures do not end the fetch — the surviving ranges go back into
     /// the pool and the next batch of candidates is tried, so a fourth provider
     /// that holds what the first three did not is still reached.
-    pub async fn fetch_groups(
+    pub(crate) async fn fetch_groups(
         &self,
         root: &Hash,
         size: u64,
@@ -574,7 +574,7 @@ impl Node {
     ///
     /// The object being fetched is never its own donor: the groups it already
     /// holds are subtracted from the fetch before the descent starts.
-    pub fn donor_roots(&self, selected: &EntryRow, versions: &VersionSet) -> Vec<Hash> {
+    pub(crate) fn donor_roots(&self, selected: &EntryRow, versions: &VersionSet) -> Vec<Hash> {
         let mut roots: Vec<Hash> = Vec::new();
         let mut push = |root: Option<Hash>| {
             if let Some(root) = root {
@@ -595,7 +595,11 @@ impl Node {
     ///
     /// [`Node::donor_roots`] narrowed to the roots the CAS holds something of:
     /// a donor with no bytes is a wasted pass over the proof list.
-    pub fn donors_for(&self, selected: &EntryRow, versions: &VersionSet) -> Result<Vec<Donor>> {
+    pub(crate) fn donors_for(
+        &self,
+        selected: &EntryRow,
+        versions: &VersionSet,
+    ) -> Result<Vec<Donor>> {
         let mut donors = Vec::new();
         for root in self.donor_roots(selected, versions) {
             if self.holds_any_of(&root)? {
@@ -606,7 +610,7 @@ impl Node {
     }
 
     /// True if the CAS holds any verified group of an object.
-    pub fn holds_any_of(&self, root: &Hash) -> Result<bool> {
+    pub(crate) fn holds_any_of(&self, root: &Hash) -> Result<bool> {
         Ok(self
             .store()
             .blob(root)?
@@ -1171,7 +1175,10 @@ impl Node {
 
     /// Publishes an updated `b:` advertisement if a milestone was reached
     /// (§6.3).
-    pub fn on_content_progress(&self, root: &Hash) -> Result<Option<synch_core::SignedHead>> {
+    pub(crate) fn on_content_progress(
+        &self,
+        root: &Hash,
+    ) -> Result<Option<synch_core::SignedHead>> {
         if !self.ad_update_due(root)? {
             return Ok(None);
         }
@@ -1208,7 +1215,7 @@ impl Node {
     ///
     /// A durable row remains a complete holder after scratch loss. This is the
     /// bridge from that metadata promise back to verified LocalFs cache bytes.
-    pub async fn ensure_blob_cached(&self, root: &Hash, size: u64) -> Result<()> {
+    pub(crate) async fn ensure_blob_cached(&self, root: &Hash, size: u64) -> Result<()> {
         Ok(self.cas_backend().ensure_cached(*root, size).await?)
     }
 
@@ -1396,7 +1403,7 @@ impl Node {
     /// rather than in a file (§6.2) and are written straight out of it.
     ///
     /// Returns which of those happened, which is what a mirror reports.
-    pub async fn materialize_blob(
+    pub(crate) async fn materialize_blob(
         &self,
         root: &Hash,
         size: u64,

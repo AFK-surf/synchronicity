@@ -30,10 +30,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// datadir as this node's signing key — anyone who can read it can already sign
 /// as the node. A secret that has been handed out and withdrawn should be
 /// treated as spent regardless.
-pub const KEYS_CONFIG: &str = "s3.keys";
+pub(crate) const KEYS_CONFIG: &str = "s3.keys";
 
 /// The SigV4 algorithm string.
-pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+pub(crate) const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
 /// The payload-hash sentinel clients send when they do not hash the body.
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -118,7 +118,7 @@ pub struct SigV4Header {
 }
 
 /// Parses the `Authorization` header.
-pub fn parse_authorization(header: &str) -> S3Result<SigV4Header> {
+pub(crate) fn parse_authorization(header: &str) -> S3Result<SigV4Header> {
     let rest = header
         .strip_prefix(ALGORITHM)
         .ok_or_else(|| S3Error::unsupported_algorithm(header))?
@@ -173,7 +173,7 @@ pub struct SignedRequest<'a> {
 }
 
 /// Builds the SigV4 canonical request string.
-pub fn canonical_request(request: &SignedRequest<'_>, signed_headers: &[String]) -> String {
+pub(crate) fn canonical_request(request: &SignedRequest<'_>, signed_headers: &[String]) -> String {
     let mut query: Vec<(String, String)> = request
         .query
         .iter()
@@ -224,7 +224,7 @@ fn canonical_uri(path: &str) -> String {
 
 /// The SigV4 URI encoding: unreserved characters pass through, everything else
 /// is percent-encoded uppercase. `/` survives only outside query strings.
-pub fn uri_encode(value: &str, encode_slash: bool) -> String {
+pub(crate) fn uri_encode(value: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -239,7 +239,7 @@ pub fn uri_encode(value: &str, encode_slash: bool) -> String {
 }
 
 /// Builds the string that gets signed.
-pub fn string_to_sign(
+pub(crate) fn string_to_sign(
     amz_date: &str,
     scope_date: &str,
     region: &str,
@@ -251,7 +251,7 @@ pub fn string_to_sign(
 }
 
 /// Derives the SigV4 signing key.
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let mut key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     key = hmac(&key, region.as_bytes());
     key = hmac(&key, service.as_bytes());
@@ -287,7 +287,7 @@ pub fn expected_signature(
 /// How far a request's `x-amz-date` may sit from the gateway clock before it is
 /// rejected. This window is the only thing bounding replay of a captured signed
 /// request, so it is kept tight — the AWS default is the same 15 minutes.
-pub const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
+pub(crate) const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
 /// Verifies a request against the configured mode.
 ///
@@ -345,7 +345,7 @@ pub fn verify(
 
 /// Parses an ISO8601 basic `x-amz-date` (`YYYYMMDDTHHMMSSZ`) into Unix seconds.
 /// Returns `None` on any structural or range error.
-pub fn parse_amz_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_amz_date(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
         return None;

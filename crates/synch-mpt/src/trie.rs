@@ -179,7 +179,7 @@ pub(crate) enum Step<T> {
 }
 
 /// Maps the empty-trie sentinel onto `None`.
-pub fn root_opt(root: Hash) -> Option<Hash> {
+pub(crate) fn root_opt(root: Hash) -> Option<Hash> {
     if root.is_empty_sentinel() {
         None
     } else {

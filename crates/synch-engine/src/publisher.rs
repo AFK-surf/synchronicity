@@ -24,10 +24,10 @@ use crate::{
 };
 
 /// How long staging must go quiet before a batch is published (§7.1).
-pub const DEFAULT_PUBLISH_QUIESCE: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_PUBLISH_QUIESCE: Duration = Duration::from_secs(2);
 
 /// How many staged entries force a batch out without waiting (§7.1).
-pub const DEFAULT_PUBLISH_BATCH_MAX: usize = 1000;
+pub(crate) const DEFAULT_PUBLISH_BATCH_MAX: usize = 1000;
 
 /// The buffer between staging and one signed root.
 ///
@@ -55,11 +55,6 @@ impl Publisher {
     /// How long staging must go quiet before the batch is published.
     pub fn quiesce(&self) -> Duration {
         self.quiesce
-    }
-
-    /// How many staged entries force the batch out without waiting.
-    pub fn batch_max(&self) -> usize {
-        self.batch_max
     }
 
     /// Adds changes to the current batch.

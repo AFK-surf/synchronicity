@@ -6,11 +6,11 @@ use synch_core::{Hash, INLINE_VALUE_MAX, MAX_KEY_LEN};
 use crate::{error::MptError, nibbles::Nibbles};
 
 /// Domain-separation tag for [`TrieNode::Leaf`] hashing.
-pub const LEAF_TAG: &[u8] = b"synch-mpt/1/leaf";
+pub(crate) const LEAF_TAG: &[u8] = b"synch-mpt/1/leaf";
 /// Domain-separation tag for [`TrieNode::Ext`] hashing.
-pub const EXT_TAG: &[u8] = b"synch-mpt/1/ext";
+pub(crate) const EXT_TAG: &[u8] = b"synch-mpt/1/ext";
 /// Domain-separation tag for [`TrieNode::Branch`] hashing.
-pub const BRANCH_TAG: &[u8] = b"synch-mpt/1/branch";
+pub(crate) const BRANCH_TAG: &[u8] = b"synch-mpt/1/branch";
 
 /// How a leaf's value is carried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +34,7 @@ impl ValueRef {
     }
 
     /// The out-of-line value hash, if this reference is not inline.
-    pub fn out_of_line(&self) -> Option<Hash> {
+    pub(crate) fn out_of_line(&self) -> Option<Hash> {
         match self {
             ValueRef::Inline(_) => None,
             ValueRef::Hash(h) => Some(*h),
@@ -196,7 +196,7 @@ impl TrieNode {
     }
 
     /// The hashes of this node's child nodes.
-    pub fn child_hashes(&self) -> Vec<Hash> {
+    pub(crate) fn child_hashes(&self) -> Vec<Hash> {
         match self {
             TrieNode::Leaf { .. } => Vec::new(),
             TrieNode::Ext { child, .. } => vec![*child],
@@ -238,7 +238,7 @@ pub fn hash_encoded(tag: &[u8], encoded: &[u8]) -> Hash {
 }
 
 /// An empty child array, for building branches.
-pub const NO_CHILDREN: [Option<Hash>; 16] = [None; 16];
+pub(crate) const NO_CHILDREN: [Option<Hash>; 16] = [None; 16];
 
 #[cfg(test)]
 mod tests {

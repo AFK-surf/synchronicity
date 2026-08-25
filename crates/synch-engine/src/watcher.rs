@@ -38,7 +38,7 @@ fn changes_something(event: &notify::Event) -> bool {
 
 /// A debounced rescan trigger over every configured space.
 #[derive(Debug)]
-pub struct SpaceWatcher {
+pub(crate) struct SpaceWatcher {
     watcher: RecommendedWatcher,
     hints: mpsc::Receiver<()>,
     debounce: Duration,
@@ -48,14 +48,8 @@ pub struct SpaceWatcher {
 }
 
 impl SpaceWatcher {
-    /// Starts watching every configured space root.
-    pub fn start(node: &Node) -> Result<SpaceWatcher> {
-        let configured = Self::configured_spaces(node)?;
-        Self::start_with(node, &configured)
-    }
-
-    /// The same, over a configured set the caller has already read.
-    pub fn start_with(node: &Node, configured: &HashSet<PathBuf>) -> Result<SpaceWatcher> {
+    /// Starts watching a configured set of space roots the caller has read.
+    pub(crate) fn start_with(node: &Node, configured: &HashSet<PathBuf>) -> Result<SpaceWatcher> {
         let (tx, rx) = mpsc::channel(64);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if event.is_ok_and(|event| changes_something(&event)) {
@@ -76,24 +70,12 @@ impl SpaceWatcher {
         Ok(out)
     }
 
-    /// Registers spaces added since the last pass and drops ones removed.
-    ///
-    /// A daemon runs for weeks and `synch space add` lands whenever an
-    /// operator says so, so the watched set cannot be fixed at startup: an
-    /// unregistered space would be covered only by the hourly rescan, and a
-    /// removed one would keep waking the watcher for a directory nobody
-    /// indexes. Failing to watch a root is not fatal — the periodic scan is
-    /// the guarantee (§7.1).
-    pub fn resync(&mut self, node: &Node) -> Result<usize> {
-        Ok(self.resync_to(&Self::configured_spaces(node)?))
-    }
-
     /// The space roots the store currently names.
     ///
-    /// Split out from [`SpaceWatcher::resync`] so the standing loop can read it
-    /// on the blocking pool: this is a `spaces` query and the loop runs on a
-    /// runtime worker (§10).
-    pub fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
+    /// Split out from [`SpaceWatcher::resync_to`] so the standing loop can
+    /// read it on the blocking pool: this is a `spaces` query and the loop
+    /// runs on a runtime worker (§10).
+    pub(crate) fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
         Ok(node
             .store()
             .spaces()?
@@ -102,8 +84,16 @@ impl SpaceWatcher {
             .collect())
     }
 
-    /// Applies a configured set that has already been read.
-    pub fn resync_to(&mut self, configured: &HashSet<PathBuf>) -> usize {
+    /// Registers spaces added since the last pass and drops ones removed,
+    /// given a configured set that has already been read.
+    ///
+    /// A daemon runs for weeks and `synch space add` lands whenever an
+    /// operator says so, so the watched set cannot be fixed at startup: an
+    /// unregistered space would be covered only by the hourly rescan, and a
+    /// removed one would keep waking the watcher for a directory nobody
+    /// indexes. Failing to watch a root is not fatal — the periodic scan is
+    /// the guarantee (§7.1).
+    pub(crate) fn resync_to(&mut self, configured: &HashSet<PathBuf>) -> usize {
         let mut changed = 0;
         for path in configured.difference(&self.watching.clone()) {
             match self.watcher.watch(path, RecursiveMode::Recursive) {
@@ -124,18 +114,11 @@ impl SpaceWatcher {
         changed
     }
 
-    /// The space roots currently registered.
-    pub fn watched(&self) -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = self.watching.iter().cloned().collect();
-        out.sort();
-        out
-    }
-
     /// Waits for at least one hint, then swallows further hints for the
     /// debounce window so a burst of writes costs one rescan.
     ///
     /// Returns `false` once the watcher has shut down.
-    pub async fn next_rescan(&mut self) -> bool {
+    pub(crate) async fn next_rescan(&mut self) -> bool {
         if self.hints.recv().await.is_none() {
             return false;
         }
@@ -283,18 +266,22 @@ mod tests {
         let second = tempfile::tempdir().unwrap();
         node.add_space("one", first.path()).unwrap();
 
-        let mut watcher = SpaceWatcher::start(&node).unwrap();
-        assert_eq!(watcher.watched().len(), 1);
+        let resync = |watcher: &mut SpaceWatcher, node: &Node| {
+            watcher.resync_to(&SpaceWatcher::configured_spaces(node).unwrap())
+        };
+        let configured = SpaceWatcher::configured_spaces(&node).unwrap();
+        let mut watcher = SpaceWatcher::start_with(&node, &configured).unwrap();
+        assert_eq!(watcher.watching.len(), 1);
 
         node.add_space("two", second.path()).unwrap();
-        assert_eq!(watcher.resync(&node).unwrap(), 1);
-        assert_eq!(watcher.watched().len(), 2);
+        assert_eq!(resync(&mut watcher, &node), 1);
+        assert_eq!(watcher.watching.len(), 2);
         // Re-registering an unchanged set is a no-op.
-        assert_eq!(watcher.resync(&node).unwrap(), 0);
+        assert_eq!(resync(&mut watcher, &node), 0);
 
         node.remove_space("two", false).unwrap();
-        assert_eq!(watcher.resync(&node).unwrap(), 1);
-        assert_eq!(watcher.watched().len(), 1);
+        assert_eq!(resync(&mut watcher, &node), 1);
+        assert_eq!(watcher.watching.len(), 1);
         node.shutdown().await.unwrap();
     }
 }

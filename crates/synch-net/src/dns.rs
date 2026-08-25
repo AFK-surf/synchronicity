@@ -33,15 +33,15 @@ use crate::{
 };
 
 /// The label the membership TXT records live under.
-pub const TXT_PREFIX: &str = "_synchronicity";
+pub(crate) const TXT_PREFIX: &str = "_synchronicity";
 
 /// The version tag every accepted record must carry.
-pub const RECORD_VERSION_TAG: &str = "sync1";
+pub(crate) const RECORD_VERSION_TAG: &str = "sync1";
 
 /// Lower clamp on the re-resolution interval (§3.2).
 pub const MIN_TTL: Duration = Duration::from_secs(60);
 /// Upper clamp on the re-resolution interval (§3.2).
-pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The control plane's zone-key watch cadence
 /// (`control-plane/src/jobs/zonekey_watch.gleam`): how long a rotated provider
@@ -87,22 +87,22 @@ pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
 
 /// The query name for a membership domain.
-pub fn query_name(domain: &str) -> String {
+pub(crate) fn query_name(domain: &str) -> String {
     format!("{TXT_PREFIX}.{domain}")
 }
 
 /// The query name a zone's key-transparency proofs live under (§3): one name
 /// per zone at the apex, held between the signing zone and the domain by
 /// `apex_of` — the RRSIG signer is the *bound*, not the lookup.
-pub fn rekor_query_name(zone: &str) -> String {
+pub(crate) fn rekor_query_name(zone: &str) -> String {
     format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
 }
 
 /// The label a base's control-plane attach record lives under.
-pub const CP_TXT_PREFIX: &str = "_synchronicity-cp";
+pub(crate) const CP_TXT_PREFIX: &str = "_synchronicity-cp";
 
 /// The version tag a control-plane attach record opens with.
-pub const CP_RECORD_VERSION_TAG: &str = "synccp1";
+pub(crate) const CP_RECORD_VERSION_TAG: &str = "synccp1";
 
 /// How many attach endpoints one apex may name.
 ///
@@ -114,14 +114,14 @@ pub const CP_RECORD_VERSION_TAG: &str = "synccp1";
 /// control plane refuses to publish more than this
 /// (`config.max_browse_endpoints`), so the two ends agree on the bound and
 /// an operator hears about it at boot rather than by counting sockets.
-pub const MAX_CP_ENDPOINTS: usize = 8;
+pub(crate) const MAX_CP_ENDPOINTS: usize = 8;
 
 /// The query name a base's control-plane attach record lives under.
 ///
 /// One per apex, beside the transparency declaration and the proof set,
 /// because it states the same kind of fact — which control plane covers this
 /// base — under the same bounds.
-pub fn control_plane_query_name(apex: &str) -> String {
+pub(crate) fn control_plane_query_name(apex: &str) -> String {
     format!("{CP_TXT_PREFIX}.{apex}")
 }
 
@@ -130,7 +130,7 @@ pub fn control_plane_query_name(apex: &str) -> String {
 /// 8192 wire-format bytes), so parts are spread one per name: part 1 at the
 /// base name — the only one derivable before reading anything — and later
 /// parts at `_synchronicity-rekor-<index>`. Part 1 says how many there are.
-pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
+pub(crate) fn rekor_part_query_name(zone: &str, index: usize) -> String {
     match index {
         0 | 1 => rekor_query_name(zone),
         n => format!("{}-{n}.{}", rekor::REKOR_TXT_PREFIX, zone),
@@ -221,7 +221,7 @@ pub fn clamp_ttl(ttl: Duration) -> Duration {
 
 /// One parsed `v=sync1` TXT record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberRecord {
+pub(crate) struct MemberRecord {
     /// The member label, lowercased. `None` for the id-less backward-simple
     /// form, which binds `OriginId::Key(nk)`.
     pub id: Option<String>,
@@ -243,7 +243,7 @@ pub struct MemberRecord {
 
 impl MemberRecord {
     /// The origin this record binds its key to, within `domain`.
-    pub fn origin(&self, domain: &str) -> Result<OriginId, NetError> {
+    pub(crate) fn origin(&self, domain: &str) -> Result<OriginId, NetError> {
         match &self.id {
             Some(id) => OriginId::named(id, domain).map_err(|e| NetError::Dns(e.to_string())),
             None => Ok(OriginId::Key(self.node_key)),
@@ -275,7 +275,7 @@ pub enum RecordError {
 ///
 /// Fields are whitespace-separated `key=value` pairs. `v=sync1` must come
 /// first; unknown fields are ignored so the format can grow.
-pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
+pub(crate) fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
     let mut fields = text.split_whitespace();
     match fields.next() {
         Some(first) if first == format!("v={RECORD_VERSION_TAG}") => {}
@@ -350,7 +350,7 @@ pub struct ControlPlaneRecord {
 
 /// Why a control-plane attach record was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CpRecordError {
+pub(crate) enum CpRecordError {
     /// The record did not start with `v=synccp1`.
     #[error("not a v=synccp1 record")]
     NotSyncCp1,
@@ -377,7 +377,7 @@ pub enum CpRecordError {
 /// Fields are whitespace-separated `key=value` pairs, `v=synccp1` first, and
 /// unknown fields are ignored — the same grammar and the same growth rule as
 /// the membership record beside it.
-pub fn parse_control_plane_record(text: &str) -> Result<ControlPlaneRecord, CpRecordError> {
+pub(crate) fn parse_control_plane_record(text: &str) -> Result<ControlPlaneRecord, CpRecordError> {
     let mut fields = text.split_whitespace();
     match fields.next() {
         Some(first) if first == format!("v={CP_RECORD_VERSION_TAG}") => {}
@@ -532,8 +532,10 @@ impl MemberSet {
     }
 
     /// Every device key bound to `origin` in this set. Several keys for one
-    /// origin is the rotation window (§3.4), not an error.
-    pub fn keys_for(&self, origin: &OriginId) -> Vec<NodeId> {
+    /// origin is the rotation window (§3.4), not an error. Production reads
+    /// `bindings` directly; the tests state their expectations through this.
+    #[cfg(test)]
+    pub(crate) fn keys_for(&self, origin: &OriginId) -> Vec<NodeId> {
         self.bindings
             .iter()
             .filter(|(o, _)| o == origin)
@@ -561,8 +563,10 @@ impl MemberSet {
         }
     }
 
-    /// Dialing hints published for a device key (§3.3).
-    pub fn hints_for(&self, key: &NodeId) -> &[DialHint] {
+    /// Dialing hints published for a device key (§3.3). Production reads
+    /// `hints` directly; the tests state their expectations through this.
+    #[cfg(test)]
+    pub(crate) fn hints_for(&self, key: &NodeId) -> &[DialHint] {
         self.hints
             .get(key.as_bytes())
             .map(Vec::as_slice)
@@ -752,35 +756,26 @@ enum GateApex<'a> {
 /// `DnssecResolver::gated_txt` can build one, so a value of this type is
 /// evidence the gate ran.
 #[derive(Debug, Clone)]
-pub struct GatedTxt {
-    /// The apex the gate held this answer against, or `None` under a policy
-    /// that asked for no gate.
-    apex: Option<Name>,
+pub(crate) struct GatedTxt {
     /// The validated answer itself.
     answer: DnssecTxt,
 }
 
 impl GatedTxt {
     /// The TXT strings, safe to act on.
-    pub fn records(&self) -> &[String] {
+    pub(crate) fn records(&self) -> &[String] {
         &self.answer.records
     }
 
     /// How long the answer may be believed, already held to the signature's
     /// own expiration.
-    pub fn ttl(&self) -> Duration {
+    pub(crate) fn ttl(&self) -> Duration {
         self.answer.ttl
     }
 
     /// The zone whose RRSIG covered the answer.
-    pub fn signer(&self) -> &Name {
+    pub(crate) fn signer(&self) -> &Name {
         &self.answer.signer
-    }
-
-    /// The apex the gate held this answer against — `None` when the policy in
-    /// force asked for no gate, which is the only way to get one.
-    pub fn apex(&self) -> Option<&Name> {
-        self.apex.as_ref()
     }
 }
 
@@ -1107,10 +1102,7 @@ impl DnssecResolver {
             // Off and Prefer make no demand of the signer, so there is no apex
             // to derive and no proof to read. The answer is DNSSEC-validated
             // and that is the whole of what this policy asked for.
-            return Ok(GatedTxt {
-                apex: None,
-                answer: validated,
-            });
+            return Ok(GatedTxt { answer: validated });
         }
         let apex = match apex {
             // A membership answer names its own apex, and `apex_of` holds it
@@ -1148,10 +1140,7 @@ impl DnssecResolver {
             ),
         }
         self.verify_zone_key(domain, &apex, &validated).await?;
-        Ok(GatedTxt {
-            apex: Some(apex),
-            answer: validated,
-        })
+        Ok(GatedTxt { answer: validated })
     }
 
     /// Applies the §3.2 acceptance rules to one answer, holding the TTL it
@@ -1440,7 +1429,7 @@ impl DnssecResolver {
 
     /// Verifies that the zone key which signed an answer is on the public
     /// record (§4.2). Two more validated lookups, then no network at all.
-    pub async fn verify_zone_key(
+    pub(crate) async fn verify_zone_key(
         &self,
         domain: &str,
         apex: &Name,

@@ -150,7 +150,7 @@ impl std::str::FromStr for ReplicaPolicy {
 /// One: a replica will not be the last holder to let go of something. It does
 /// not try to enforce a cluster-wide floor either — that is the deferred half
 /// of §4.3, and the hazard is written down there.
-pub const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
+pub(crate) const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 
 /// How long a released root outlives the last entry naming it, when a space
 /// does not say (`docs/REPLICATION.md` §5).
@@ -160,7 +160,7 @@ pub const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 /// long a read cache keeps what nobody references, while this is the entire
 /// recovery story for an accidental deletion under the `tree` policy. The one
 /// an operator regrets is the short one.
-pub const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
+pub(crate) const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
 
 /// A configured space (§4.1, `docs/SERVERLESS.md` §10, `docs/REPLICATION.md`).
 ///
@@ -451,7 +451,8 @@ impl Store {
     }
 
     /// Deletes one provider row.
-    pub fn delete_provider(&self, root: &Hash, origin: &OriginId) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn delete_provider(&self, root: &Hash, origin: &OriginId) -> Result<()> {
         self.conn().execute(
             "DELETE FROM blob_providers WHERE object_root = ?1 AND origin_id = ?2",
             params![root.as_bytes().to_vec(), origin.canonical()],
@@ -1125,7 +1126,7 @@ impl Txn<'_> {
     /// The third table `materialize_diff` writes, and the one a rebuild used
     /// to leave standing. Scoped by `issuer`, so it removes what this origin
     /// granted and never a binding some other origin issued for the same key.
-    pub fn delete_origin_delegations(&self, issuer: &OriginId) -> Result<usize> {
+    pub(crate) fn delete_origin_delegations(&self, issuer: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM bindings WHERE source = 'delegated' AND issuer = ?1",
             params![issuer.canonical()],

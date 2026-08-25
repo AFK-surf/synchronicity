@@ -76,7 +76,7 @@ impl Node {
 
 /// How a path reads back under a policy: origin-pinned reads name the origin,
 /// unified ones do not.
-pub fn reference_of(policy: &VersionPolicy, space: &str, path: &str) -> String {
+pub(crate) fn reference_of(policy: &VersionPolicy, space: &str, path: &str) -> String {
     match policy.pinned_origin() {
         Some(origin) => format!("{origin}:{space}/{path}"),
         None => format!("{space}/{path}"),

@@ -201,7 +201,7 @@ impl Node {
     }
 
     /// The next anti-entropy delay: the configured interval with ±50 % jitter.
-    pub fn next_aae_delay(&self) -> Duration {
+    pub(crate) fn next_aae_delay(&self) -> Duration {
         jittered(self.config().aae_interval)
     }
 
@@ -605,7 +605,7 @@ fn contained<T, E: std::fmt::Display>(what: &str, result: std::result::Result<T,
 ///
 /// Jitter is what keeps a cluster from synchronizing its rounds into a
 /// thundering herd.
-pub fn jittered(base: Duration) -> Duration {
+pub(crate) fn jittered(base: Duration) -> Duration {
     let base_ms = base.as_millis().max(1) as u64;
     let spread = base_ms; // ±50 % is a full base-width window centered on base
     let offset = jitter_seed() % spread.max(1);
@@ -618,7 +618,7 @@ pub fn jittered(base: Duration) -> Duration {
 /// can halve it, and a reconnect delay below the minimum backoff defeats the
 /// backoff. The two used to share one name across this crate with different
 /// semantics, which is a trap for whoever reaches for the wrong one.
-pub fn jittered_floor(base: Duration) -> Duration {
+pub(crate) fn jittered_floor(base: Duration) -> Duration {
     let span_ms = (base.as_millis() as u64) / 2;
     if span_ms == 0 {
         return base;

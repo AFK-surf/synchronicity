@@ -23,7 +23,7 @@ pub fn reference_root(leaves: &[Vec<u8>], lo: u64, hi: u64) -> [u8; 32] {
 }
 
 /// Parses a tlog-tiles path into (level, tile index, width); 256 is a full tile.
-pub fn parse_tile_path(path: &str) -> Option<(&str, u64, u64)> {
+pub(crate) fn parse_tile_path(path: &str) -> Option<(&str, u64, u64)> {
     let rest = path.strip_prefix("api/v2/tile/")?;
     let (level, rest) = rest.split_once('/')?;
     let (digits, width) = match rest.split_once(".p/") {
