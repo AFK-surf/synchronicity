@@ -686,9 +686,9 @@ impl Node {
         // pointer no reading surface follows (§5.3).
         let pending_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone())
-            .on_change(Some(mirror_wake.clone()))
-            .on_replica(Some(replica_wake.clone()))
-            .on_pending(Some(pending_wake.clone()));
+            .on_change(mirror_wake.clone())
+            .on_replica(replica_wake.clone())
+            .on_pending(pending_wake.clone());
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
         let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {
             (Some(objects), Some(cloud)) => Arc::new(
@@ -844,8 +844,7 @@ impl Node {
     /// forcing compilation early is half the point of running it, and that is
     /// real CPU on a thread the reactor is not waiting for.
     pub(crate) fn declare_program(&self, elf: &[u8]) -> Result<synch_core::Declaration> {
-        let host: Arc<dyn synch_sock::SocketHost> = Arc::new(crate::sockets::NoTree);
-        crate::sockets::declare_blocking(elf, host)
+        crate::sockets::declare_blocking(elf)
     }
 
     /// The batch between staging and one signed root (§7.1).

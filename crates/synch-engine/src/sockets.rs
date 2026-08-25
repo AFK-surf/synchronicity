@@ -951,9 +951,12 @@ impl SocketHost for NoTree {
 }
 
 /// Runs a declaration hook on a thread that is allowed to block.
-pub(crate) fn declare_blocking(elf: &[u8], host: Arc<dyn SocketHost>) -> Result<Declaration> {
+///
+/// The hook always runs against [`NoTree`]: a declaration names intent, and
+/// granting it a tree to read would let the arming step observe state.
+pub(crate) fn declare_blocking(elf: &[u8]) -> Result<Declaration> {
     let _scope = synch_core::BlockingScope::enter();
-    pool::declare(elf, host).map_err(|e| EngineError::invalid(e.to_string()))
+    pool::declare(elf, Arc::new(NoTree)).map_err(|e| EngineError::invalid(e.to_string()))
 }
 
 impl Node {

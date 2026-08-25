@@ -68,8 +68,6 @@ pub struct RecoveryState {
     pub in_recovery: bool,
     /// The highest seq any peer has advertised for our origin.
     pub observed_seq: Option<u64>,
-    /// The root advertised at that seq, for the operator to recognize.
-    pub observed_root: Option<Hash>,
     /// Which peer claimed that seq, when it is known (§3.4).
     ///
     /// Detection rests on peers' unauthenticated summaries — deliberately,
@@ -78,8 +76,6 @@ pub struct RecoveryState {
     /// a fresh node in recovery. The attribution is what lets an operator judge
     /// the claim rather than merely obey it.
     pub observed_by: Option<NodeId>,
-    /// The seq of this node's own complete head, if it holds one.
-    pub own_seq: Option<u64>,
     /// The durable publishing floor, once `synch recover` has set one.
     pub floor: Option<u64>,
     /// The seq this node's next publish would carry.
@@ -352,9 +348,7 @@ impl Node {
             origin: self.origin().clone(),
             in_recovery,
             observed_seq: observed.as_ref().map(|o| o.seq),
-            observed_root: observed.as_ref().map(|o| o.root),
             observed_by: observed.as_ref().and_then(|o| o.claimed_by),
-            own_seq,
             floor: self.store().publish_floor()?,
             next_seq,
         })

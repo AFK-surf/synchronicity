@@ -63,8 +63,6 @@ pub struct CloudDomainStatus {
     pub attached: bool,
     /// The last failure, kept until something succeeds.
     pub last_error: Option<String>,
-    /// When this state was last changed, unix nanoseconds.
-    pub since_ns: i64,
 }
 
 /// What one row of the status map is keyed by: the domain, and the endpoint
@@ -123,7 +121,6 @@ impl Node {
                 endpoint,
                 attached,
                 last_error,
-                since_ns: synch_core::now_ns(),
             },
         );
     }

@@ -1018,7 +1018,7 @@ impl Node {
         &self,
         space_id: &str,
         path: &str,
-    ) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
+    ) -> Result<(PathBuf, (PathBuf, String))> {
         let space = self
             .store()
             .space(space_id)?
@@ -1042,7 +1042,7 @@ pub(crate) fn target_within_checked(
     root: &Path,
     space_id: &str,
     path: &str,
-) -> Result<(PathBuf, Option<(PathBuf, String)>)> {
+) -> Result<(PathBuf, (PathBuf, String))> {
     let normalized = normalized_adoption_path(path)?;
     // Lexical safety is still not enough. A space root is canonicalized when
     // it is added but its *interior* never is, so a symlinked directory
@@ -1055,10 +1055,7 @@ pub(crate) fn target_within_checked(
             "{space_id}/{path} resolves through a symlinked directory and would leave the space"
         )));
     }
-    Ok((
-        root.join(&normalized),
-        Some((root.to_path_buf(), normalized)),
-    ))
+    Ok((root.join(&normalized), (root.to_path_buf(), normalized)))
 }
 
 /// The guard itself, over a space root already in hand.
@@ -1068,19 +1065,7 @@ pub(crate) fn target_within_checked(
 /// paths in a row (`synch fill`, fill.rs), where re-reading that row per path
 /// would be one store acquisition per file in the space.
 pub(crate) fn target_within(root: &Path, space_id: &str, path: &str) -> Result<PathBuf> {
-    let normalized = normalized_adoption_path(path)?;
-    // Lexical safety is still not enough. A space root is canonicalized when
-    // it is added but its *interior* never is, so a symlinked directory
-    // inside the space resolves through to wherever it points, and the write
-    // or the delete lands outside every space as whatever uid the daemon
-    // runs as. The mirror loop has always checked this; every other writer
-    // needs the same check, and a deletion needs it as much as a write does.
-    if crate::mirror::escapes_via_symlink(root, &normalized) {
-        return Err(EngineError::invalid(format!(
-            "{space_id}/{path} resolves through a symlinked directory and would leave the space"
-        )));
-    }
-    Ok(root.join(&normalized))
+    Ok(target_within_checked(root, space_id, path)?.0)
 }
 
 /// Normalizes a write path and applies the host platform's relative-path rules.
@@ -1197,11 +1182,8 @@ impl Adoption {
         // time with `O_NOFOLLOW` from the space root, so the staging file is
         // created inside the directory the commit rename will resolve against
         // — a directory swapped for a symlink cannot redirect either.
-        let (target, escape) = node.adoption_target_checked(space_id, path)?;
-        let mut adoption = match escape {
-            Some((root, rel)) => Adoption::in_space(&root, &rel)?,
-            None => Adoption::open(target)?,
-        };
+        let (_target, (root, rel)) = node.adoption_target_checked(space_id, path)?;
+        let mut adoption = Adoption::in_space(&root, &rel)?;
         adoption.space = Some(SpaceWrite {
             node: node.clone(),
             space: space_id.to_string(),

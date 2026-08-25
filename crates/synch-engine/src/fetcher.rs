@@ -1189,10 +1189,10 @@ impl Node {
     }
 
     /// Reads a byte range of the policy-selected version of a path, fetching
-    /// whatever is missing first — the engine half of `synch cat --range`
-    /// (§7.2, §8).
+    /// whatever is missing first (§7.2, §8).
     ///
-    /// Buffers the whole range: callers streaming a large object want
+    /// Buffers the whole range: callers streaming a large object — the
+    /// control server behind `synch cat --range` among them — use
     /// [`Node::prepare_range`] and then chunked
     /// [`CasBackend::read_range`](synch_store::backend::CasBackend::read_range)
     /// calls instead.
