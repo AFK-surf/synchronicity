@@ -33,6 +33,7 @@ pub enum EngineError {
     /// A record could not be encoded or decoded.
     #[error("record: {0}")]
     Record(String),
+
     /// A path or key was invalid.
     #[error(transparent)]
     Key(#[from] synch_core::KeyError),
@@ -112,6 +113,12 @@ impl EngineError {
     /// Builds a not-found error.
     pub fn not_found(msg: impl Into<String>) -> Self {
         EngineError::NotFound(msg.into())
+    }
+}
+
+impl From<synch_core::record::CodecError> for EngineError {
+    fn from(e: synch_core::record::CodecError) -> Self {
+        EngineError::Record(e.0)
     }
 }
 

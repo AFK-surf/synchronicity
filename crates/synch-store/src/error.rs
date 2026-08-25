@@ -81,6 +81,12 @@ pub enum StoreError {
     Invalid(String),
 }
 
+impl From<synch_core::record::CodecError> for StoreError {
+    fn from(e: synch_core::record::CodecError) -> Self {
+        StoreError::Decode(e.0)
+    }
+}
+
 impl synch_core::TaskLost for StoreError {
     fn task_lost(reason: String) -> Self {
         StoreError::Blocking(reason)

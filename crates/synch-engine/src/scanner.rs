@@ -227,10 +227,7 @@ impl Node {
             let tombstone = FileEntry::tombstone(now_ns(), seq, prev);
             report.staged.push((
                 file_key(space_id, &known)?,
-                Some(
-                    postcard::to_stdvec(&tombstone)
-                        .map_err(|e| EngineError::Record(e.to_string()))?,
-                ),
+                Some(synch_core::record::encode(&tombstone)?),
             ));
             self.store().remove_local_file(space_id, &known)?;
             report.deleted += 1;
@@ -288,7 +285,7 @@ impl Node {
         entry.size = size;
         report.staged.push((
             file_key(space_id, rel)?,
-            Some(postcard::to_stdvec(&entry).map_err(|e| EngineError::Record(e.to_string()))?),
+            Some(synch_core::record::encode(&entry)?),
         ));
         report.hashed += 1;
 
@@ -396,13 +393,12 @@ impl Node {
 
         report.staged.push((
             file_key(space_id, rel)?,
-            Some(postcard::to_stdvec(&entry).map_err(|e| EngineError::Record(e.to_string()))?),
+            Some(synch_core::record::encode(&entry)?),
         ));
         if let Some(ad) = self.store().local_ad(&content)? {
-            report.staged.push((
-                blob_key(&content),
-                Some(postcard::to_stdvec(&ad).map_err(|e| EngineError::Record(e.to_string()))?),
-            ));
+            report
+                .staged
+                .push((blob_key(&content), Some(synch_core::record::encode(&ad)?)));
         }
 
         self.store().put_local_file(&LocalFile {
@@ -848,8 +844,7 @@ impl Node {
                 .entry(self.origin(), space_id, &normalized)?
                 .and_then(|entry| entry.content);
             let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
-            let encoded =
-                postcard::to_stdvec(&tombstone).map_err(|e| EngineError::Record(e.to_string()))?;
+            let encoded = synch_core::record::encode(&tombstone)?;
             self.stage([(file_key(space_id, &normalized)?, Some(encoded))]);
             return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
         }
@@ -974,13 +969,13 @@ impl Node {
             .and_then(|entry| entry.content);
         let mut entry = FileEntry::file(size, mtime_ns, root, self.next_seq()?);
         entry.prev = previous.filter(|previous| *previous != root);
-        let entry = postcard::to_stdvec(&entry).map_err(|e| EngineError::Record(e.to_string()))?;
+        let entry = synch_core::record::encode(&entry)?;
         let ad = self.store().local_ad(&root)?.ok_or_else(|| {
             EngineError::invalid(format!(
                 "the durable ingest of {root} produced no local advertisement"
             ))
         })?;
-        let ad = postcard::to_stdvec(&ad).map_err(|e| EngineError::Record(e.to_string()))?;
+        let ad = synch_core::record::encode(&ad)?;
         self.stage([
             (file_key(space_id, &normalized)?, Some(entry)),
             (blob_key(&root), Some(ad)),
@@ -2395,7 +2390,7 @@ fn unix_mode(metadata: &std::fs::Metadata) -> Option<u32> {
 
 /// Reads a `FileEntry` out of a published entry row's origin trie.
 pub fn decode_entry(bytes: &[u8]) -> Result<FileEntry> {
-    postcard::from_bytes(bytes).map_err(|e| EngineError::Record(e.to_string()))
+    Ok(synch_core::record::decode(bytes)?)
 }
 
 /// The content root a staged file entry points at, if any.
