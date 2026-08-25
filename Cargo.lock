@@ -4900,7 +4900,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "tracing",
- "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 
@@ -5015,6 +5014,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5040,7 +5040,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

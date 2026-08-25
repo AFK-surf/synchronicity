@@ -268,15 +268,21 @@ struct EntryArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Before anything builds a TLS client: reqwest, built without a baked-in
-    // provider, refuses to construct a `Client` until one is installed.
-    synch_net::tls::install_crypto_provider();
-    let result = match Args::parse().command {
+    let args = Args::parse();
+    // The shared preamble, which this binary used to carry only half of: it
+    // installed the TLS provider by hand and no subscriber at all, so
+    // `SYNCH_LOG` silently did nothing here.
+    synch_net::process::init("warn");
+    let result = match args.command {
         Command::Run(args) => run(&args).await,
         Command::Entry(args) => dump_entry(&args),
     };
     match result {
         Ok(code) => std::process::exit(code),
+        // A reader that hung up (`entry ... | head`) is not an incomplete
+        // run: exiting 30 for it read as "the monitor could not finish"
+        // against the documented severity-ordered codes.
+        Err(e) if synch_net::process::reader_hung_up(&e) => std::process::exit(0),
         Err(e) => {
             eprintln!("synch-monitor: {e}");
             std::process::exit(EXIT_INCOMPLETE);
