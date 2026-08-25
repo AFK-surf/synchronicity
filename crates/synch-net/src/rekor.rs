@@ -1709,6 +1709,7 @@ pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
 }
 
 /// base64url without padding — how a proof travels in a TXT record.
+#[cfg(any(test, feature = "sim"))]
 pub(crate) fn base64url_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

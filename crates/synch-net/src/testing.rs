@@ -83,11 +83,6 @@ impl StalledPeer {
     }
 }
 
-/// A peer that answers every stream it is given with one canned frame.
-///
-/// What a client's own validation has to be exercised against: a well-formed
-/// answer that is not one an honest responder would ever send.
-#[allow(missing_debug_implementations)]
 /// A pair of endpoints that trust each other, for exercising a real exchange.
 ///
 /// Membership is unilateral per node (§3.2), so both stores are told about
@@ -142,40 +137,4 @@ pub(crate) fn trust(store: &synch_store::Store, key: synch_core::NodeId) {
             expires_at: None,
         })
         .expect("a static binding");
-}
-
-/// A [`ResolverOptions`](crate::dns::ResolverOptions) builder for resolver
-/// tests: knobs unset and TUF off by default, chainable overrides on top.
-#[derive(Debug, Clone)]
-pub(crate) struct ResolverOptionsBuilder {
-    options: crate::dns::ResolverOptions,
-}
-
-impl ResolverOptionsBuilder {
-    /// Every knob unset and TUF off.
-    pub(crate) fn new() -> Self {
-        Self {
-            options: crate::dns::ResolverOptions {
-                no_tuf: true,
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A DNSKEY file replacing the ICANN root trust anchor.
-    pub(crate) fn trust_anchor(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.options.trust_anchor = Some(path.into());
-        self
-    }
-
-    /// The built options.
-    pub(crate) fn build(self) -> crate::dns::ResolverOptions {
-        self.options
-    }
-}
-
-impl Default for ResolverOptionsBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }

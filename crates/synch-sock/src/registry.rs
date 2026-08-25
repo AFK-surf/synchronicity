@@ -249,6 +249,7 @@ impl Registry {
     }
 
     /// How many invocations of one socket are running.
+    #[cfg(test)]
     pub fn running(&self, socket: &str) -> usize {
         self.live
             .lock()

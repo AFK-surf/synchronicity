@@ -44,9 +44,6 @@ pub struct SimZone {
     pkcs8: Vec<u8>,
     txt: Vec<String>,
     ttl: u32,
-    /// When true, answers carry no signatures: syntactically fine,
-    /// cryptographically nothing — the tamper case.
-    pub unsigned: bool,
     /// Proof records served at `_synchronicity-rekor.<origin>`, each one
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
@@ -155,7 +152,6 @@ impl SimZone {
             pkcs8: pkcs8.secret_pkcs8_der().to_vec(),
             txt,
             ttl: 300,
-            unsigned: false,
             rekor_txt: Vec::new(),
             cp_txt: Vec::new(),
             extra_dnskeys: Vec::new(),
@@ -802,32 +798,30 @@ impl SimZone {
             }
             _ => return response,
         };
-        if !self.unsigned {
-            // Inception an hour ago: RRSIG validity has to bracket "now".
-            let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
-            let qname = query.name();
-            let membership_txt = query.query_type() == RecordType::TXT
-                && (*qname == self.txt_name()
-                    || self
-                        .impersonate
-                        .as_ref()
-                        .is_some_and(|(owner, _)| owner == qname));
-            let cp_txt = query.query_type() == RecordType::TXT && *qname == self.cp_name();
-            let signer = if membership_txt {
-                self.txt_signer.as_ref().unwrap_or(&self.signer)
-            } else if cp_txt {
-                self.cp_signer.as_ref().unwrap_or(&self.signer)
-            } else {
-                &self.signer
-            };
-            let rrsig =
-                RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign rrset");
-            set.insert_rrsig(Record::from_rdata(
-                set.name().clone(),
-                self.ttl,
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
-            ));
-        }
+        // Inception an hour ago: RRSIG validity has to bracket "now".
+        let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let qname = query.name();
+        let membership_txt = query.query_type() == RecordType::TXT
+            && (*qname == self.txt_name()
+                || self
+                    .impersonate
+                    .as_ref()
+                    .is_some_and(|(owner, _)| owner == qname));
+        let cp_txt = query.query_type() == RecordType::TXT && *qname == self.cp_name();
+        let signer = if membership_txt {
+            self.txt_signer.as_ref().unwrap_or(&self.signer)
+        } else if cp_txt {
+            self.cp_signer.as_ref().unwrap_or(&self.signer)
+        } else {
+            &self.signer
+        };
+        let rrsig = RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign rrset");
+        set.insert_rrsig(Record::from_rdata(
+            set.name().clone(),
+            self.ttl,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+
         response.add_answers(set.records(true).cloned());
         // Spliced in *after* signing and outside the RecordSet entirely, at
         // the queried name but in another class: the record an attacker adds

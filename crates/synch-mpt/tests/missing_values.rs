@@ -26,7 +26,7 @@ fn a_missing_out_of_line_value_is_asked_for_until_it_arrives() {
 
     // Drop the value row, keeping every node: a peer that relayed the structure
     // but GC'd (or never held) the out-of-line payload.
-    store.retain(&store.node_hashes(), &[]);
+    store.clear_values();
 
     let mut walk = MissingWalk::new(root);
     let first = walk.next_batch(&trie, 256).unwrap();

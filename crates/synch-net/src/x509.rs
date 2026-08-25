@@ -48,14 +48,18 @@ impl From<&str> for X509Error {
 // ------------------------------------------------------------------- OIDs
 
 /// `id-ce-basicConstraints` (2.5.29.19).
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 /// `id-ce-keyUsage` (2.5.29.15).
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 /// `id-ce-subjectAltName` (2.5.29.17).
 pub(crate) const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 /// `id-at-commonName` (2.5.4.3).
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
 /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 
 // ---------------------------------------------------------------- parsing

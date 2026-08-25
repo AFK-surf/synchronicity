@@ -79,41 +79,6 @@ pub trait NodeStore {
     }
 }
 
-impl<S: NodeStore + ?Sized> NodeStore for &S {
-    type Error = S::Error;
-
-    fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Self::Error> {
-        (**self).get_node(hash)
-    }
-    fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<(), Self::Error> {
-        (**self).put_node(hash, data)
-    }
-    fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Self::Error> {
-        (**self).get_value(hash)
-    }
-    fn put_value(&self, hash: &Hash, data: &[u8]) -> Result<(), Self::Error> {
-        (**self).put_value(hash, data)
-    }
-    fn has_node(&self, hash: &Hash) -> Result<bool, Self::Error> {
-        (**self).has_node(hash)
-    }
-    fn has_value(&self, hash: &Hash) -> Result<bool, Self::Error> {
-        (**self).has_value(hash)
-    }
-    fn is_known_complete(&self, root: &Hash) -> Result<bool, Self::Error> {
-        (**self).is_known_complete(root)
-    }
-    fn note_complete(&self, root: &Hash) -> Result<(), Self::Error> {
-        (**self).note_complete(root)
-    }
-    fn is_redacted(&self, hash: &Hash) -> Result<bool, Self::Error> {
-        (**self).is_redacted(hash)
-    }
-    fn note_redacted(&self, hash: &Hash) -> Result<(), Self::Error> {
-        (**self).note_redacted(hash)
-    }
-}
-
 /// An in-memory node store, for tests and for verifying a proof against a
 /// root without touching any durable store.
 #[derive(Debug, Default)]
@@ -136,28 +101,13 @@ impl MemStore {
             .len()
     }
 
-    /// Every stored node hash.
-    pub fn node_hashes(&self) -> Vec<Hash> {
-        self.nodes
+    /// Drops every out-of-line value, keeping the nodes: a store that relayed
+    /// the structure but GC'd (or never held) the payloads.
+    pub fn clear_values(&self) {
+        self.values
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .copied()
-            .collect()
-    }
-
-    /// Removes every node and value not in `keep`, returning how many were swept.
-    pub fn retain(&self, keep_nodes: &[Hash], keep_values: &[Hash]) -> usize {
-        let mut swept = 0;
-        let mut nodes = self.nodes.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = nodes.len();
-        nodes.retain(|h, _| keep_nodes.contains(h));
-        swept += before - nodes.len();
-        let mut values = self.values.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = values.len();
-        values.retain(|h, _| keep_values.contains(h));
-        swept += before - values.len();
-        swept
+            .clear();
     }
 }
 

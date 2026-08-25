@@ -1418,7 +1418,7 @@ impl DnssecResolver {
         let walked = crate::blocking::offload(move || {
             Ok(match &owned {
                 TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
-                TufSource::Url(url) => tuf::HttpRepo::new(url)
+                TufSource::Url(url) => tuf::HttpRepo::new(url, None)
                     .map_err(|e| TufError::Malformed(format!("TUF client: {e}")))
                     .and_then(|repo| tuf::fetch_metadata(&repo, from_root)),
             })
@@ -2231,20 +2231,20 @@ mod tests {
     fn resolver_options_build_and_fail_closed() {
         // A missing or empty trust anchor is refused by name: an anchor set
         // with no keys would validate nothing, forever, quietly.
-        let err = DnssecResolver::with_options(
-            &crate::testing::ResolverOptionsBuilder::new()
-                .trust_anchor("/does/not/exist.key")
-                .build(),
-        )
+        let err = DnssecResolver::with_options(&ResolverOptions {
+            no_tuf: true,
+            trust_anchor: Some("/does/not/exist.key".into()),
+            ..Default::default()
+        })
         .unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "{err}");
 
         let empty = tempfile::NamedTempFile::new().unwrap();
-        let err = DnssecResolver::with_options(
-            &crate::testing::ResolverOptionsBuilder::new()
-                .trust_anchor(empty.path())
-                .build(),
-        )
+        let err = DnssecResolver::with_options(&ResolverOptions {
+            no_tuf: true,
+            trust_anchor: Some(empty.path().into()),
+            ..Default::default()
+        })
         .unwrap_err();
         assert!(err.to_string().contains("no DNSKEY records"), "{err}");
     }

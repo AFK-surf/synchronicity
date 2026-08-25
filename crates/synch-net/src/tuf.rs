@@ -770,17 +770,9 @@ pub struct HttpRepo {
 }
 
 impl HttpRepo {
-    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]).
-    pub fn new(base: &str) -> Result<HttpRepo, String> {
-        HttpRepo::build(base, None)
-    }
-
-    /// The same repository, with requests identified by `user_agent`.
-    pub fn with_user_agent(base: &str, user_agent: &str) -> Result<HttpRepo, String> {
-        HttpRepo::build(base, Some(user_agent))
-    }
-
-    fn build(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
+    /// A repository at `base` (e.g. [`SIGSTORE_TUF_URL`]), with requests
+    /// identified by `user_agent` when one is given.
+    pub fn new(base: &str, user_agent: Option<&str>) -> Result<HttpRepo, String> {
         let mut builder = reqwest::blocking::Client::builder().timeout(TUF_TIMEOUT);
         if let Some(user_agent) = user_agent {
             builder = builder.user_agent(user_agent);
@@ -1299,6 +1291,7 @@ fn pem_body(pem: &str) -> Result<Vec<u8>, TufError> {
 /// that agree with this for every key in every root but one — root 11 kept a
 /// key's id while editing a `x-tuf-on-ci-online-uri` member inside it — so
 /// this is how a fixture test says the two normally agree.
+#[cfg(any(test, feature = "sim"))]
 pub(crate) fn key_id(key: &serde_json::Value) -> Result<String, TufError> {
     Ok(hex::encode(sha256(
         &canonical_json(key).map_err(TufError::Malformed)?,

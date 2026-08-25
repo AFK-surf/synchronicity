@@ -256,20 +256,16 @@ pub struct MissingWalk {
 impl MissingWalk {
     /// A walk over everything reachable from `root`, pruning nothing.
     pub fn new(root: Hash) -> MissingWalk {
-        MissingWalk::since(None, root)
+        MissingWalk::scoped(None, root, Scope::full())
     }
 
-    /// A walk that skips every subtree `root` shares with `known_complete`.
+    /// A walk confined to `scope` that skips every subtree `root` shares with
+    /// `known_complete`.
     ///
     /// The reference root must be one this store holds in full; pass `None`
     /// when there is no such root, or when it has not been established. A
     /// wrong reference would have the walk skip subtrees it does not hold, and
     /// report a trie complete that it cannot serve.
-    pub fn since(known_complete: Option<Hash>, root: Hash) -> MissingWalk {
-        MissingWalk::scoped(known_complete, root, Scope::full())
-    }
-
-    /// The same walk, confined to `scope`.
     ///
     /// Pruning against the reference root survives the confinement: a hash
     /// matching one in a trie held whole *within this scope* is a subtree held
@@ -1212,15 +1208,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     }
 
     // ---- completeness and reachability ------------------------------------
-
-    /// Which hashes reachable from `root` are absent from the store.
-    ///
-    /// A one-shot walk from scratch. A fetch wants [`MissingWalk`] instead: it
-    /// keeps its place between batches, and can prune against a trie it
-    /// already holds whole.
-    pub fn missing(&self, root: Hash, max: usize) -> Result<Missing, MptError> {
-        MissingWalk::new(root).next_batch(self, max)
-    }
 
     /// True if the whole trie under `root` is present locally and servable.
     ///

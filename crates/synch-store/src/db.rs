@@ -325,7 +325,7 @@ impl Store {
             .store(remote, std::sync::atomic::Ordering::Release);
     }
 
-    pub(crate) fn complete_is_durable(&self, _inline: bool) -> bool {
+    pub(crate) fn complete_is_durable(&self) -> bool {
         !self.remote_cas.load(std::sync::atomic::Ordering::Acquire)
     }
 

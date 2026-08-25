@@ -719,7 +719,7 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
-        let durable = self.complete_is_durable(inline.is_some());
+        let durable = self.complete_is_durable();
         upsert_blob_row(
             &self.conn(),
             BlobRowWrite {
@@ -817,7 +817,7 @@ impl Store {
             };
             let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
             let complete = verified.count() >= total;
-            let durable = self.complete_is_durable(inline.is_some());
+            let durable = self.complete_is_durable();
             upsert_blob_row(
                 tx,
                 BlobRowWrite {
@@ -1915,12 +1915,12 @@ impl bao_tree::io::sync::OutboardMut for MemOutboard {
 
 /// A reader that copies everything it yields into a sink, so hashing a file and
 /// writing it into the CAS take one pass over the bytes.
-pub(crate) struct TeeReader<R, W> {
-    pub(crate) inner: R,
-    pub(crate) sink: W,
+pub(crate) struct TeeReader {
+    pub(crate) inner: std::fs::File,
+    pub(crate) sink: std::fs::File,
 }
 
-impl<R: Read, W: Write> Read for TeeReader<R, W> {
+impl Read for TeeReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.sink.write_all(&buf[..n])?;

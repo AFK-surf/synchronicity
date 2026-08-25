@@ -1327,7 +1327,9 @@ mod tests {
                     .unwrap();
                 synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
             }
-            let missing = Trie::new(bare.as_ref()).missing(root, MAX_BATCH).unwrap();
+            let missing = synch_mpt::MissingWalk::new(root)
+                .next_batch(&Trie::new(bare.as_ref()), MAX_BATCH)
+                .unwrap();
             assert!(missing.nodes.is_empty(), "every node was copied across");
             (dir, missing.values)
         };

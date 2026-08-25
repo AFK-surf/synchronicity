@@ -23,8 +23,6 @@ pub struct Limits {
     pub max_handles: usize,
     /// The most outbound TCP connections one invocation may open.
     pub max_egress: usize,
-    /// The most objects — cursors, hash states — one invocation may hold.
-    pub max_objects: usize,
     /// Bytes buffered per endpoint, each direction.
     ///
     /// A full rx ring stops the host reading, which backpressures the far side
@@ -51,7 +49,6 @@ impl Default for Limits {
         Limits {
             max_handles: 16,
             max_egress: 8,
-            max_objects: 32,
             ring_bytes: 256 * 1024,
             max_footprint: 1024 * 1024,
             max_streams: 64,

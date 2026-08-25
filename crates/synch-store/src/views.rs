@@ -1106,7 +1106,7 @@ impl Txn<'_> {
         // changes there can be and says nothing about how large each one is, so
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
-        // in ([`Trie::for_each_resolved_change`]).
+        // in (`Trie::for_each_resolved_change_scoped`).
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
             apply_change(self.conn(), origin, &change, now, release_now, &replicas)
         })

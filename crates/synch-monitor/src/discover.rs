@@ -41,7 +41,7 @@ pub fn pins_beside(state: &Path) -> PathBuf {
 /// cap, which guards against the party this program audits — is
 /// [`synch_net::tuf`]'s, not a second copy of it.
 pub fn http_repo(base: &str) -> Result<HttpRepo, MonitorError> {
-    HttpRepo::with_user_agent(base, "synch-monitor").map_err(MonitorError::Transport)
+    HttpRepo::new(base, Some("synch-monitor")).map_err(MonitorError::Transport)
 }
 
 /// The logs a run should read, and the keys their checkpoints must verify

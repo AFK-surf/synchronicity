@@ -144,17 +144,9 @@ impl NetOptions {
     /// Options for a loopback-only, fully offline endpoint.
     pub fn loopback() -> Self {
         NetOptions {
-            cas: None,
             bind_addr: Some("127.0.0.1:0".parse().expect("valid loopback address")),
             offline: true,
-            relay_urls: Vec::new(),
-            discovery_url: None,
-            dht: false,
-            dht_bootstrap: Vec::new(),
-            dht_publish_direct_addrs: false,
-            on_unknown_key: None,
-            heads: None,
-            sockets: None,
+            ..NetOptions::default()
         }
     }
 }
