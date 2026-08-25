@@ -14,6 +14,7 @@ pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod mpt;
+pub mod process;
 mod pubkey;
 pub mod rekor;
 mod serve;

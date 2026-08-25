@@ -61,22 +61,17 @@ pub enum AuthMode {
 /// A record nobody can read is skipped rather than fatal, for the reason the
 /// bucket log skips one: a malformed line must not lock every client out.
 pub fn fold(records: &[String]) -> Vec<AccessKey> {
-    let mut out: Vec<AccessKey> = Vec::new();
-    for record in records {
-        let mut fields = record.split('\t');
-        let Some(id) = fields.next().filter(|id| !id.is_empty()) else {
-            continue;
-        };
-        let secret = fields.next();
-        out.retain(|k| k.id != id);
-        if let Some(secret) = secret {
-            out.push(AccessKey {
+    crate::record_log::fold(
+        records,
+        |key: &AccessKey| &key.id,
+        |id, rest| {
+            let [secret, ..] = rest else { return None };
+            Some(AccessKey {
                 id: id.to_string(),
                 secret: secret.to_string(),
-            });
-        }
-    }
-    out
+            })
+        },
+    )
 }
 
 /// Reads the configured access keys from the daemon.

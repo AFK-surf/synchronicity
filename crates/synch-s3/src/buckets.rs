@@ -136,38 +136,24 @@ pub fn validate_name(name: &str) -> S3Result<()> {
     }
 }
 
-/// Folds the append-only record log into the bucket map it describes.
-///
-/// Later records win, which is what makes both "replace this mapping" and
-/// "remove it" expressible without ever rewriting what is already stored. A
-/// record nobody can read is skipped rather than fatal: one malformed line
-/// must not cost every other bucket its mapping.
+/// Folds the append-only record log into the bucket map it describes
+/// (`record_log`: later records win, a lone name is a removal, a
+/// malformed record costs only itself).
 pub fn fold(records: &[String]) -> Vec<Bucket> {
-    let mut out: Vec<Bucket> = Vec::new();
-    for record in records {
-        let mut fields = record.split('\t');
-        let Some(name) = fields.next().filter(|n| !n.is_empty()) else {
-            continue;
-        };
-        let mapping = match (fields.next(), fields.next()) {
-            (Some(space), Some(policy)) => match Policy::parse(policy) {
-                Ok(policy) => Some(Bucket {
-                    name: name.to_string(),
-                    space: space.to_string(),
-                    policy,
-                }),
-                Err(_) => continue,
-            },
-            // One field alone is a removal: the bucket the record names stops
-            // existing from here on.
-            (None, _) => None,
-            _ => continue,
-        };
-        out.retain(|b| b.name != name);
-        if let Some(bucket) = mapping {
-            out.push(bucket);
-        }
-    }
+    let mut out = crate::record_log::fold(
+        records,
+        |bucket: &Bucket| &bucket.name,
+        |name, rest| {
+            let [space, policy, ..] = rest else {
+                return None;
+            };
+            Policy::parse(policy).ok().map(|policy| Bucket {
+                name: name.to_string(),
+                space: space.to_string(),
+                policy,
+            })
+        },
+    );
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }

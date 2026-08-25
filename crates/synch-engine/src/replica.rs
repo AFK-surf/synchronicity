@@ -606,8 +606,7 @@ impl Node {
                 // reads to find out whether coverage exists.
                 complete: coverage.wanted == 0 && coverage.held > 0,
             };
-            let bytes =
-                postcard::to_stdvec(&claim).map_err(|e| EngineError::Record(e.to_string()))?;
+            let bytes = synch_core::record::encode(&claim)?;
             out.push((synch_core::replica_claim_key(&space.id)?, Some(bytes)));
             claimed.insert(space.id.clone());
         }
@@ -650,8 +649,7 @@ impl Node {
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
                 (Some(bytes), Some(published)) => {
-                    let claim: synch_core::ReplicaClaim = postcard::from_bytes(bytes)
-                        .map_err(|e| EngineError::Record(e.to_string()))?;
+                    let claim: synch_core::ReplicaClaim = synch_core::record::decode(bytes)?;
                     claim.policy != published.policy
                         || claim.grace_secs != published.grace_secs
                         || claim.complete != published.complete
@@ -701,8 +699,7 @@ impl Node {
         let Some(bytes) = trie.get(head.root, &synch_core::replica_claim_key(space)?)? else {
             return Ok(None);
         };
-        let claim: synch_core::ReplicaClaim =
-            postcard::from_bytes(&bytes).map_err(|e| EngineError::Record(e.to_string()))?;
+        let claim: synch_core::ReplicaClaim = synch_core::record::decode(&bytes)?;
         // A record from a future schema is refused rather than half-read, for
         // the reason `f:` and `b:` refuse one: postcard ignores trailing bytes,
         // so a v2 claim decodes as a v1 claim with the new field silently
@@ -740,17 +737,13 @@ impl Node {
     /// running while it is making progress: one pass takes at most
     /// `replica_concurrency` objects, and a cold replica has millions.
     pub async fn run_replicas(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
-        let wake = self.replica_wake();
-        loop {
-            self.replica_pass_logged().await;
-            tokio::select! {
-                _ = &mut shutdown => return,
-                _ = wake.notified() => {}
-                _ = tokio::time::sleep(crate::aae::jittered(self.config().replica_interval)) => {}
-            }
-        }
+        crate::aae::run_standing(
+            shutdown,
+            self.replica_wake(),
+            self.config().replica_interval,
+            || self.replica_pass_logged(),
+        )
+        .await
     }
 
     /// One sweep and as much fetching as it turns up, logged rather than

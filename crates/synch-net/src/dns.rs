@@ -1423,16 +1423,18 @@ impl DnssecResolver {
     /// whose every step is load-bearing.
     async fn walk_tuf(&self, source: &TufSource, from_root: u64) -> Result<TufMetadata, NetError> {
         let owned = source.clone();
-        let walked = tokio::task::spawn_blocking(move || match &owned {
-            TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
-            TufSource::Url(url) => tuf::fetch_metadata(
-                &tuf::HttpRepo::new(url)
-                    .map_err(|e| TufError::Malformed(format!("TUF client: {e}")))?,
-                from_root,
-            ),
+        // The shared handoff rather than a raw `spawn_blocking`: `offload`
+        // enters the `BlockingScope` that marks this thread as allowed to
+        // block, which is what `assert_off_runtime` checks in debug builds.
+        let walked = crate::blocking::offload(move || {
+            Ok(match &owned {
+                TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
+                TufSource::Url(url) => tuf::HttpRepo::new(url)
+                    .map_err(|e| TufError::Malformed(format!("TUF client: {e}")))
+                    .and_then(|repo| tuf::fetch_metadata(&repo, from_root)),
+            })
         })
-        .await
-        .map_err(|e| NetError::Dns(format!("the TUF walk did not finish: {e}")))?;
+        .await?;
         walked.map_err(|e| tuf_error(source, e))
     }
 

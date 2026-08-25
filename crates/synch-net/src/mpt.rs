@@ -291,24 +291,14 @@ impl MptProtocol {
                 let (nodes, missing, redacted) = crate::blocking::offload(move || {
                     let scope = store.scope_for_key(&peer, now_ns())?;
                     let admitted = admit(&store, peer, root, &wants)?;
-                    let mut nodes = Vec::new();
+                    let mut answer = Answer::new();
                     let mut missing = Vec::new();
                     let mut redacted = Vec::new();
-                    let mut budget = ANSWER_BYTE_BUDGET;
-                    // One answer per *distinct* hash. A requester may only ask
-                    // once — `take_served` refuses a repeated payload as a
-                    // protocol violation and ends the exchange — so answering a
-                    // duplicated request literally would make this node look
-                    // hostile for a fault on the asking side. Deduplicating
-                    // here also stops a repeated hash from turning one bounded
-                    // batch into `MAX_BATCH` copies of the same payload.
-                    //
-                    // After `admit`, never instead of it: the request is
-                    // authorized by position and only then deduplicated by what
-                    // those positions resolved to.
-                    let mut answered = std::collections::HashSet::new();
+                    // Deduplicated after `admit`, never instead of it: the
+                    // request is authorized by position and only then
+                    // deduplicated by what those positions resolved to.
                     for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
-                        if !answered.insert(*claimed) {
+                        if !answer.wants(*claimed) {
                             continue;
                         }
                         // A position holding nothing is reported against the
@@ -337,24 +327,12 @@ impl MptProtocol {
                         }
                         // A short answer is an ordinary answer: the requester's
                         // walk defers everything it asked for and re-offers what
-                        // did not come back (`MissingWalk::resume`). What is not
-                        // ordinary is discovering the frame is too large *after*
-                        // building it — `write_frame` serializes the whole
-                        // message before it can check `MAX_FRAME_LEN`, so the
-                        // cap has to be applied while the answer is assembled.
-                        match budget.checked_sub(data.len()) {
-                            Some(left) => {
-                                budget = left;
-                                nodes.push((hash, data));
-                            }
-                            None if nodes.is_empty() => {
-                                nodes.push((hash, data));
-                                break;
-                            }
-                            None => break,
+                        // did not come back (`MissingWalk::resume`).
+                        if !answer.push(hash, data) {
+                            break;
                         }
                     }
-                    Ok((nodes, missing, redacted))
+                    Ok((answer.into_payloads(), missing, redacted))
                 })
                 .await?;
                 write_frame(
@@ -391,13 +369,10 @@ impl MptProtocol {
                         true => None,
                         false => Some(admit(&store, peer, root, &wants)?),
                     };
-                    let mut values = Vec::new();
+                    let mut answer = Answer::new();
                     let mut missing = Vec::new();
-                    let mut budget = ANSWER_BYTE_BUDGET;
-                    // One answer per distinct hash, as `GetNodes` above.
-                    let mut answered = std::collections::HashSet::new();
                     for (i, wanted) in wants.iter().enumerate() {
-                        if !answered.insert(wanted.1) {
+                        if !answer.wants(wanted.1) {
                             continue;
                         }
                         if let Some(holders) = &holders {
@@ -430,30 +405,15 @@ impl MptProtocol {
                             }
                         }
                         match store.get_value(&wanted.1)? {
-                            Some(data) => match budget.checked_sub(data.len()) {
-                                Some(left) => {
-                                    budget = left;
-                                    values.push((wanted.1, data));
-                                }
-                                // One payload always goes, whatever its size:
-                                // a stored value larger than the whole budget
-                                // predates the ceiling, and answering nothing
-                                // would stall the requester's walk forever.
-                                // It is the whole answer, though — anything
-                                // after it would push the frame past
-                                // `MAX_FRAME_LEN`, and then the requester gets
-                                // an error instead of the payload, every round,
-                                // without ever advancing `unproductive`.
-                                None if values.is_empty() => {
-                                    values.push((wanted.1, data));
+                            Some(data) => {
+                                if !answer.push(wanted.1, data) {
                                     break;
                                 }
-                                None => break,
-                            },
+                            }
                             None => missing.push(wanted.1),
                         }
                     }
-                    Ok((values, missing))
+                    Ok((answer.into_payloads(), missing))
                 })
                 .await?;
                 write_frame(send, &MptMessage::Values { values, missing }).await?;
@@ -508,6 +468,67 @@ impl MptProtocol {
 /// Half a frame, so the postcard framing and the `missing` list have room and a
 /// short answer is never produced for lack of a few hundred bytes.
 const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
+
+/// Assembles one bounded batch answer: at most [`ANSWER_BYTE_BUDGET`] payload
+/// bytes, one payload per distinct hash.
+///
+/// The one holder of the two rules `Nodes` and `Values` answers share — and
+/// must share, because each is a §12 bound the other restating is a second
+/// place to lose it:
+///
+/// - **One answer per distinct hash.** A requester may only ask once —
+///   `take_served` refuses a repeated payload as a protocol violation and ends
+///   the exchange — so answering a duplicated request literally would make
+///   this node look hostile for a fault on the asking side. Deduplicating also
+///   stops a repeated hash from turning one bounded batch into [`MAX_BATCH`]
+///   copies of the same payload.
+/// - **One payload always goes, whatever its size.** A stored payload larger
+///   than the whole budget predates the ceiling, and answering nothing would
+///   stall the requester's walk forever. It is the whole answer, though:
+///   anything after it would push the frame past `MAX_FRAME_LEN`, and then the
+///   requester gets an error instead of the payload, every round, without ever
+///   advancing `unproductive`.
+struct Answer {
+    budget: usize,
+    answered: std::collections::HashSet<Hash>,
+    payloads: Vec<(Hash, Vec<u8>)>,
+}
+
+impl Answer {
+    fn new() -> Answer {
+        Answer {
+            budget: ANSWER_BYTE_BUDGET,
+            answered: std::collections::HashSet::new(),
+            payloads: Vec::new(),
+        }
+    }
+
+    /// Whether `hash` still needs an answer — `false` from its second naming.
+    fn wants(&mut self, hash: Hash) -> bool {
+        self.answered.insert(hash)
+    }
+
+    /// Adds one payload under the budget; `false` once the answer is full and
+    /// the assembling loop should stop.
+    fn push(&mut self, hash: Hash, data: Vec<u8>) -> bool {
+        match self.budget.checked_sub(data.len()) {
+            Some(left) => {
+                self.budget = left;
+                self.payloads.push((hash, data));
+                true
+            }
+            None if self.payloads.is_empty() => {
+                self.payloads.push((hash, data));
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn into_payloads(self) -> Vec<(Hash, Vec<u8>)> {
+        self.payloads
+    }
+}
 
 /// Resolves a batch of claimed positions and returns what stands at each,
 /// refusing the whole request if any position lies outside the peer's scope.

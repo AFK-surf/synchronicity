@@ -705,8 +705,7 @@ impl Node {
         resolver: &dyn MemberResolver,
         shutdown: impl std::future::Future<Output = ()>,
     ) {
-        let shutdown = std::pin::pin!(shutdown);
-        let mut shutdown = shutdown;
+        let mut shutdown = std::pin::pin!(shutdown);
         let wake = self.dns_wake();
         loop {
             // The configured domain list is a `config` read, so working out the

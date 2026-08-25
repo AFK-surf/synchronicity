@@ -42,6 +42,65 @@ impl crate::frame::Answer for BlobMessage {
 /// fetch gives up on it and lets the caller try someone else.
 const MAX_BARREN_WINDOWS: u32 = 4;
 
+/// The window-retirement rule of a windowed fetch, held once because it must
+/// hold on both paths — `fetch_into` and `fetch_proof_into` each documented
+/// that their copy retires exactly as the other's does.
+///
+/// A window is retired whether or not the provider served it, and that is
+/// what puts a ceiling on the exchange: one round trip per window,
+/// `ceil(ranges / window)` of them, rather than one per *group the provider
+/// felt like serving*. Retiring only what came back would leave no ceiling at
+/// all — a provider answering each request with one valid group is never
+/// barren, so [`MAX_BARREN_WINDOWS`] never fires and the deadline is per
+/// exchange: the loop would run once per group of the object, millions of
+/// times for a large one, and each turn costs the victim disk work and a
+/// write-connection transaction (`docs/DELTA-SYNC.md` §3.3).
+///
+/// Nothing honest needs a second look at a window: a partial holder answers
+/// `requested ∩ held` for the whole of it in one exchange, and what it did
+/// not hold this time it will not hold on the next ask either. Ranges it left
+/// behind stay visible to the caller through the outcome it accumulates, so
+/// another provider still gets asked.
+struct WindowedWalk {
+    remaining: ChunkRanges,
+    barren: u32,
+}
+
+/// What retiring one window tells the fetch loop to do.
+enum WalkStep {
+    /// The provider served something: commit it, then take the next window.
+    Commit,
+    /// An empty answer, not yet enough of them to give up.
+    NextWindow,
+    /// [`MAX_BARREN_WINDOWS`] consecutive empty answers: a provider that
+    /// claims an object and serves none of it must not hold a fetch in an
+    /// unbounded walk across the whole thing; the caller has other candidates.
+    GiveUp,
+}
+
+impl WindowedWalk {
+    fn over(ranges: &ChunkRanges) -> WindowedWalk {
+        WindowedWalk {
+            remaining: ChunkRanges::from_ranges(ranges.ranges.iter().copied()),
+            barren: 0,
+        }
+    }
+
+    /// Retires `window` — either way — given what the provider served in it.
+    fn retire(&mut self, window: &ChunkRanges, served: &ChunkRanges) -> WalkStep {
+        self.remaining = self.remaining.difference(window);
+        if !served.is_empty() {
+            self.barren = 0;
+            return WalkStep::Commit;
+        }
+        self.barren += 1;
+        match self.barren >= MAX_BARREN_WINDOWS {
+            true => WalkStep::GiveUp,
+            false => WalkStep::NextWindow,
+        }
+    }
+}
+
 /// The largest prefix of `remaining` whose proof fits one exchange.
 ///
 /// Sized by [`proof_nodes_upper_bound`], so a provider holding everything
@@ -438,9 +497,8 @@ impl BlobClient {
         level: u8,
         out: &mut ProofOutcome,
     ) -> Result<(), NetError> {
-        let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
-        let mut barren = 0u32;
-        while !remaining.is_empty() {
+        let mut walk = WindowedWalk::over(ranges);
+        while !walk.remaining.is_empty() {
             // The window is the *requester's* to choose, and it is chosen so
             // the provider never has to truncate.
             //
@@ -455,38 +513,15 @@ impl BlobClient {
             // `requested ∩ what it holds` — which we cannot know — a subset
             // never costs more than the whole. Sizing the window to fit
             // assuming a full holder therefore fits for every holder.
-            let window = proof_window(&remaining, level);
+            let window = proof_window(&walk.remaining, level);
             let proof = self.get_proof(root, &window, level).await?;
             // Already clamped to the window by `check_served`.
             let served = proof.served.clone();
-            // The window is retired either way, exactly as `fetch_into` retires
-            // a slice window, and that is what puts a ceiling on the exchange:
-            // one round trip per window, `ceil(ranges / window)` of them, rather
-            // than one per *group the provider felt like serving*.
-            //
-            // Retiring only what came back would leave no ceiling at all. A
-            // provider answering each request with a valid proof of a single
-            // group is never barren, so `MAX_BARREN_WINDOWS` never fires and
-            // the deadline is per exchange — the loop would run once per group
-            // of the object, millions of times for a large one, and each turn
-            // would cost the victim an outboard write, an fsync and an
-            // immediate transaction on its one write connection
-            // (`docs/DELTA-SYNC.md` §3.3).
-            //
-            // Nothing honest needs a second look at a window: a partial holder
-            // answers `requested ∩ held` for the whole of it in one walk, and
-            // what it did not hold this time it will not hold on the next ask
-            // either. Ranges it left behind stay in the caller's `remaining`
-            // through `out.served`, so another provider still gets asked.
-            remaining = remaining.difference(&window);
-            if served.is_empty() {
-                barren += 1;
-                if barren >= MAX_BARREN_WINDOWS {
-                    break;
-                }
-                continue;
+            match walk.retire(&window, &served) {
+                WalkStep::GiveUp => break,
+                WalkStep::NextWindow => continue,
+                WalkStep::Commit => {}
             }
-            barren = 0;
             let backend = backend.clone();
             let encoded = proof.encoded;
             let for_store = served.clone();
@@ -529,26 +564,15 @@ impl BlobClient {
         ranges: &ChunkRanges,
         got: &mut ChunkRanges,
     ) -> Result<(), NetError> {
-        let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
-        let mut barren = 0u32;
-        while !remaining.is_empty() {
-            let window = remaining.take(MAX_SLICE_GROUPS);
+        let mut walk = WindowedWalk::over(ranges);
+        while !walk.remaining.is_empty() {
+            let window = walk.remaining.take(MAX_SLICE_GROUPS);
             let slice = self.get_slice(root, &window).await?;
-            // The window is retired either way: an empty answer is the
-            // provider telling us its advertised spans overstate what it has,
-            // and asking again would only repeat the round trip.
-            remaining = remaining.difference(&window);
-            if slice.served.is_empty() {
-                barren += 1;
-                if barren >= MAX_BARREN_WINDOWS {
-                    // A provider that claims an object and serves none of it
-                    // must not be able to hold a fetch in an unbounded walk
-                    // across the whole thing; the caller has other candidates.
-                    break;
-                }
-                continue;
+            match walk.retire(&window, &slice.served) {
+                WalkStep::GiveUp => break,
+                WalkStep::NextWindow => continue,
+                WalkStep::Commit => {}
             }
-            barren = 0;
             // Committing a window decodes it against the object root and
             // writes both the sparse payload and its outboard, then fsyncs
             // them before the bitmap advances — the heaviest disk work a fetch

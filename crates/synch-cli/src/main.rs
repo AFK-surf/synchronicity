@@ -42,29 +42,12 @@ fn run() -> anyhow::Result<()> {
 }
 
 async fn main_thread() -> anyhow::Result<()> {
-    // Before anything builds a TLS client: reqwest, built without a baked-in
-    // provider, refuses to construct a `Client` until one is installed.
-    synch_net::tls::install_crypto_provider();
     let args = Cli::parse();
     let default = if args.verbose { "debug" } else { "warn" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("SYNCH_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    synch_net::process::init(default);
 
     if let Err(e) = commands::run(args).await {
-        // Rust starts processes with SIGPIPE ignored, so a reader that hung
-        // up early (`synch ls | head`) surfaces as a broken-pipe write error.
-        // That is the reader saying "enough", not a failure to report.
-        let reader_hung_up = e.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
-        });
-        if reader_hung_up {
+        if synch_net::process::reader_hung_up(e.as_ref()) {
             std::process::exit(0);
         }
         eprintln!("synch: {e:#}");

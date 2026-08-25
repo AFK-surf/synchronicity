@@ -93,27 +93,11 @@ enum KeyCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Before anything builds a TLS client: reqwest, built without a baked-in
-    // provider, refuses to construct a `Client` until one is installed.
-    synch_net::tls::install_crypto_provider();
     let args = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("SYNCH_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    synch_net::process::init("warn");
 
     if let Err(e) = run(args).await {
-        // A reader that hung up early (`bucket ls | head`) surfaces as a
-        // broken-pipe write error: the reader saying "enough", not a failure.
-        let reader_hung_up = e.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
-        });
-        if reader_hung_up {
+        if synch_net::process::reader_hung_up(e.as_ref()) {
             std::process::exit(0);
         }
         eprintln!("synch-s3: {e:#}");

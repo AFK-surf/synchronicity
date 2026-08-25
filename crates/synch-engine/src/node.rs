@@ -1072,8 +1072,7 @@ impl Node {
                 "a delegation must expire in the future",
             ));
         }
-        let bytes =
-            postcard::to_stdvec(&delegation).map_err(|e| EngineError::Record(e.to_string()))?;
+        let bytes = synch_core::record::encode(&delegation)?;
         Ok((synch_core::delegation_key(&subject), Some(bytes)))
     }
 
@@ -1497,8 +1496,7 @@ impl Node {
             name: self.inner.config.name.clone(),
             software: SOFTWARE.to_string(),
         };
-        let bytes =
-            postcard::to_stdvec(&manifest).map_err(|e| EngineError::Record(e.to_string()))?;
+        let bytes = synch_core::record::encode(&manifest)?;
         Ok((manifest_key(), Some(bytes)))
     }
 
@@ -1535,8 +1533,7 @@ impl Node {
                 description: String::new(),
                 entry_count,
             };
-            let bytes =
-                postcard::to_stdvec(&info).map_err(|e| EngineError::Record(e.to_string()))?;
+            let bytes = synch_core::record::encode(&info)?;
             out.push((synch_core::space_info_key(&space.id)?, Some(bytes)));
         }
         Ok(out)
@@ -1561,9 +1558,9 @@ impl Node {
         let Some(bytes) = trie.get(head.root, &synch_core::space_info_key(space)?)? else {
             return Ok(None);
         };
-        postcard::from_bytes(&bytes)
+        synch_core::record::decode(&bytes)
             .map(Some)
-            .map_err(|e| EngineError::Record(e.to_string()))
+            .map_err(EngineError::from)
     }
 
     /// Reads an origin's published manifest.
@@ -1575,9 +1572,9 @@ impl Node {
         let Some(bytes) = trie.get(head.root, &manifest_key())? else {
             return Ok(None);
         };
-        postcard::from_bytes(&bytes)
+        synch_core::record::decode(&bytes)
             .map(Some)
-            .map_err(|e| EngineError::Record(e.to_string()))
+            .map_err(EngineError::from)
     }
 
     // ---- blob advertisements ---------------------------------------------
@@ -1600,7 +1597,7 @@ impl Node {
         let Some(ad) = self.store().local_ad(root)? else {
             return Ok(None);
         };
-        let bytes = postcard::to_stdvec(&ad).map_err(|e| EngineError::Record(e.to_string()))?;
+        let bytes = synch_core::record::encode(&ad)?;
         Ok(Some((blob_key(root), Some(bytes))))
     }
 
@@ -1748,9 +1745,9 @@ impl Node {
         let Some(bytes) = trie.get(head_root, &blob_key(root))? else {
             return Ok(None);
         };
-        postcard::from_bytes(&bytes)
+        synch_core::record::decode(&bytes)
             .map(Some)
-            .map_err(|e| EngineError::Record(e.to_string()))
+            .map_err(EngineError::from)
     }
 
     // ---- entry helpers ----------------------------------------------------

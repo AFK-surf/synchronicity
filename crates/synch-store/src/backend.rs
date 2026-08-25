@@ -228,21 +228,34 @@ impl Cloud {
         .await
     }
 
+    /// The blob row for `root`, adopting a cold remote object into one first
+    /// when storage holds the pair (the restored-database path). `None` when
+    /// neither the database nor remote storage knows the root — what that
+    /// means is the caller's question, which is why both callers answered the
+    /// same `match` differently and now answer this `Option` differently.
+    async fn row_or_adopt(&self, root: Hash, size: u64) -> Result<Option<crate::cas::BlobRow>> {
+        let store = self.store.clone();
+        if let Some(row) = blocking(move || store.blob(&root)).await? {
+            return Ok(Some(row));
+        }
+        if !self.adopt_remote_if_present(root, size).await? {
+            return Ok(None);
+        }
+        let store = self.store.clone();
+        Ok(Some(
+            blocking(move || store.blob(&root))
+                .await?
+                .ok_or(StoreError::MissingBlob(root))?,
+        ))
+    }
+
     async fn adopt_remote_if_present(&self, root: Hash, size: u64) -> Result<bool> {
         let store = self.store.clone();
         let mut replace_claim = false;
         if let Some(row) = blocking(move || store.blob(&root)).await? {
             if row.size != size {
-                let attested = row.durable
-                    || row.complete
-                    || row
-                        .verified_groups()
-                        .contains(group_count(row.size).saturating_sub(1));
-                if attested {
-                    return Err(StoreError::invalid(format!(
-                        "size mismatch for {root}: have {}, offered {size}",
-                        row.size
-                    )));
+                if attests_size(&row) {
+                    return Err(size_mismatch(root, "have", row.size, "offered", size));
                 }
                 replace_claim = true;
             }
@@ -253,9 +266,13 @@ impl Cloud {
         match self.objects.require_pair(&root).await {
             Ok(stored_size) => {
                 if stored_size != size {
-                    return Err(StoreError::invalid(format!(
-                        "size mismatch for {root}: storage has {stored_size}, offered {size}"
-                    )));
+                    return Err(size_mismatch(
+                        root,
+                        "storage has",
+                        stored_size,
+                        "offered",
+                        size,
+                    ));
                 }
                 if replace_claim {
                     let store = self.store.clone();
@@ -306,9 +323,13 @@ impl Cloud {
         .ok_or(StoreError::MissingBlob(root))?;
         let stored_size = self.objects.require_pair(&root).await?;
         if stored_size != size {
-            return Err(StoreError::invalid(format!(
-                "size mismatch for {root}: storage has {stored_size}, advertised {size}"
-            )));
+            return Err(size_mismatch(
+                root,
+                "storage has",
+                stored_size,
+                "advertised",
+                size,
+            ));
         }
         let store = self.store.clone();
         blocking(move || store.adopt_durable_blob(&root, size, synch_core::now_ns())).await?;
@@ -582,24 +603,10 @@ impl CasBackend for Cloud {
     }
 
     async fn ensure_cached(&self, root: Hash, size: u64) -> Result<()> {
-        let store = self.store.clone();
-        let row = blocking(move || store.blob(&root)).await?;
-        let row = match row {
-            Some(row) => row,
-            None if self.adopt_remote_if_present(root, size).await? => {
-                let store = self.store.clone();
-                blocking(move || store.blob(&root))
-                    .await?
-                    .ok_or(StoreError::MissingBlob(root))?
-            }
-            None => return Err(StoreError::MissingBlob(root)),
+        let Some(row) = self.row_or_adopt(root, size).await? else {
+            return Err(StoreError::MissingBlob(root));
         };
-        if row.durable && row.size != size {
-            return Err(StoreError::invalid(format!(
-                "size mismatch for {root}: have {}, offered {size}",
-                row.size
-            )));
-        }
+        check_durable_size(&row, root, size)?;
         if row.inline.is_some() {
             return Ok(());
         }
@@ -628,26 +635,10 @@ impl CasBackend for Cloud {
     }
 
     async fn ensure_ranges(&self, root: Hash, size: u64, ranges: ChunkRanges) -> Result<()> {
-        let row = {
-            let store = self.store.clone();
-            blocking(move || store.blob(&root)).await?
+        let Some(row) = self.row_or_adopt(root, size).await? else {
+            return Ok(());
         };
-        let row = match row {
-            Some(row) => row,
-            None if self.adopt_remote_if_present(root, size).await? => {
-                let store = self.store.clone();
-                blocking(move || store.blob(&root))
-                    .await?
-                    .ok_or(StoreError::MissingBlob(root))?
-            }
-            None => return Ok(()),
-        };
-        if row.durable && row.size != size {
-            return Err(StoreError::invalid(format!(
-                "size mismatch for {root}: have {}, offered {size}",
-                row.size
-            )));
-        }
+        check_durable_size(&row, root, size)?;
         if !row.durable && !self.adopt_remote_if_present(root, size).await? {
             return Ok(());
         }
@@ -1053,6 +1044,35 @@ fn reflink_file(source: &std::fs::File, dest: &std::fs::File) -> std::io::Result
             "reflink is not available on this platform",
         ))
     }
+}
+
+/// Whether this row's size is one the node has *attested* — durable, complete,
+/// or holding the final group verified — and therefore not a claim an offer
+/// may replace. An unattested cache row's size is just what somebody once
+/// said, and `adopt_remote_if_present` replaces it instead of refusing.
+fn attests_size(row: &crate::cas::BlobRow) -> bool {
+    row.durable
+        || row.complete
+        || row
+            .verified_groups()
+            .contains(group_count(row.size).saturating_sub(1))
+}
+
+/// Refuses an offered size that contradicts a durable row: a durable size is
+/// attested, so the offer is describing some other object.
+fn check_durable_size(row: &crate::cas::BlobRow, root: Hash, size: u64) -> Result<()> {
+    if row.durable && row.size != size {
+        return Err(size_mismatch(root, "have", row.size, "offered", size));
+    }
+    Ok(())
+}
+
+/// The one wording of the size-mismatch refusal, whichever pair of claims
+/// disagreed.
+fn size_mismatch(root: Hash, held: &str, have: u64, claim: &str, offered: u64) -> StoreError {
+    StoreError::invalid(format!(
+        "size mismatch for {root}: {held} {have}, {claim} {offered}"
+    ))
 }
 
 /// The blocking-pool handoff, pinned to this crate's error type. The

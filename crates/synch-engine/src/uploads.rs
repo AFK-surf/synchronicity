@@ -587,8 +587,7 @@ impl Node {
                 })
                 .await?
             };
-            let encoded =
-                postcard::to_stdvec(&tombstone).map_err(|e| EngineError::Record(e.to_string()))?;
+            let encoded = synch_core::record::encode(&tombstone)?;
             self.stage([(synch_core::file_key(space, path)?, Some(encoded))]);
             self.flush_staged().await?;
         }

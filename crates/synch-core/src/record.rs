@@ -487,6 +487,28 @@ impl Delegation {
     }
 }
 
+/// One failed record encode or decode.
+///
+/// The ~20 sites that serialize or parse a stored record each restated the
+/// same `map_err` onto their crate's error; this is the one body, and each
+/// crate's `From` impl decides which of its variants a codec failure is —
+/// `synch-store` classifies it as a corrupt record (an origin's fault in
+/// reconciliation), `synch-engine` as a record error — exactly as the
+/// restatements did.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{0}")]
+pub struct CodecError(pub String);
+
+/// Encodes a record as postcard bytes.
+pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+    postcard::to_stdvec(value).map_err(|e| CodecError(e.to_string()))
+}
+
+/// Decodes a record from postcard bytes.
+pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    postcard::from_bytes(bytes).map_err(|e| CodecError(e.to_string()))
+}
+
 /// Error building or parsing a trie key.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyError {

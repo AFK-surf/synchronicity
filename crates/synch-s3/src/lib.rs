@@ -23,6 +23,7 @@ pub mod buckets;
 pub mod chunked;
 pub mod daemon;
 pub mod error;
+mod record_log;
 pub mod xml;
 
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};

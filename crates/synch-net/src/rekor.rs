@@ -1679,19 +1679,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Part of the canonical Statement *writer*, which is publisher-side.
 #[cfg(any(test, feature = "sim"))]
 fn json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    synch_core::json::json_string_into(out, value);
 }
 
 /// Standard base64 with padding.

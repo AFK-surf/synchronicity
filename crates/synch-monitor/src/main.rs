@@ -268,10 +268,12 @@ struct EntryArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Before anything builds a TLS client: reqwest, built without a baked-in
-    // provider, refuses to construct a `Client` until one is installed.
-    synch_net::tls::install_crypto_provider();
-    let result = match Args::parse().command {
+    let args = Args::parse();
+    // The shared preamble, which this binary used to carry only half of: it
+    // installed the TLS provider by hand and no subscriber at all, so
+    // `SYNCH_LOG` silently did nothing here.
+    synch_net::process::init("warn");
+    let result = match args.command {
         Command::Run(args) => run(&args).await,
         Command::Entry(args) => dump_entry(&args),
     };
@@ -327,9 +329,16 @@ fn dump_entry(args: &EntryArgs) -> Result<i32, MonitorError> {
             args.state.display()
         ))
     })?;
-    std::io::stdout()
-        .write_all(&body)
-        .map_err(|e| MonitorError::State(format!("writing stdout: {e}")))?;
+    match std::io::stdout().write_all(&body) {
+        Ok(()) => {}
+        // The reader hanging up (`entry … | head`) is the reader saying
+        // "enough", not an incomplete run. Decided here, where the io error
+        // still carries its kind: `MonitorError` stringifies what it wraps
+        // (its variants are `Clone + Eq`), so by the time `main` sees the
+        // error there is nothing left to classify.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(MonitorError::State(format!("writing stdout: {e}"))),
+    }
     Ok(0)
 }
 
@@ -591,7 +600,10 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         args.skip_log.clone(),
         now_unix(),
     );
-    let found = tokio::task::spawn_blocking(move || {
+    // The shared handoff rather than a raw `spawn_blocking`: `offload` enters
+    // the `BlockingScope` that marks this thread as allowed to block, which is
+    // the contract `assert_off_runtime` checks in debug builds.
+    let found = synch_core::offload(move || {
         let repo = match no_tuf {
             true => None,
             false => Some(discover::http_repo(&tuf)?),
@@ -606,8 +618,7 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
             &mut |warning| eprintln!("synch-monitor: {warning}"),
         )
     })
-    .await
-    .map_err(|e| MonitorError::Transport(format!("discovery: {e}")))??;
+    .await?;
     eprintln!(
         "synch-monitor: reading {} log(s) (via {}): {}",
         found.base_urls.len(),

@@ -261,7 +261,7 @@ async fn attach_forever(
                 wait
             }
         };
-        tokio::time::sleep(jittered(wait)).await;
+        tokio::time::sleep(crate::aae::jittered_floor(wait)).await;
     }
 }
 
@@ -282,20 +282,9 @@ async fn attach_endpoint_forever(node: Node, domain: String, endpoint: String) {
         if started.elapsed() > MAX_BACKOFF {
             backoff = MIN_BACKOFF;
         }
-        tokio::time::sleep(jittered(backoff)).await;
+        tokio::time::sleep(crate::aae::jittered_floor(backoff)).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
-}
-
-/// Spreads reconnects so a control plane restart is not answered by every
-/// node in the fleet at the same instant.
-fn jittered(base: Duration) -> Duration {
-    let span = base.as_millis() as u64 / 2;
-    if span == 0 {
-        return base;
-    }
-    let noise = (synch_core::now_ns() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % span;
-    base + Duration::from_millis(noise)
 }
 
 /// Connects to one endpoint, proves, and serves one session to its end.

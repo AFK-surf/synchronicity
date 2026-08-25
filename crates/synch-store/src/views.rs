@@ -533,9 +533,7 @@ impl Store {
             // Reading it as a bare `Vec` is what would let a row hold millions
             // of spans.
             let state: AdState = match spans {
-                Some(bytes) => {
-                    postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?
-                }
+                Some(bytes) => synch_core::record::decode(&bytes)?,
                 None if complete != 0 && size > 0 => AdState {
                     spans: vec![(0, size as u64)],
                 },
@@ -1639,8 +1637,7 @@ fn put_provider_in(
     // The spans are the record; `complete` is derived from them on the way in
     // rather than tracked beside them, so the two cannot disagree.
     let complete = i64::from(ad.is_complete());
-    let spans =
-        Some(postcard::to_stdvec(&ad.state.spans).map_err(|e| StoreError::Decode(e.to_string()))?);
+    let spans = Some(synch_core::record::encode(&ad.state.spans)?);
     conn.execute(
         "INSERT INTO blob_providers (object_root, origin_id, size, complete, spans)
          VALUES (?1, ?2, ?3, ?4, ?5)

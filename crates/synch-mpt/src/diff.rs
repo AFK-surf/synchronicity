@@ -13,7 +13,7 @@ use crate::{
     node::ValueRef,
     scope::Scope,
     store::NodeStore,
-    trie::{root_opt, Cursor, FanoutGuard, Frame, Trie, MAX_DEPTH_NIBBLES},
+    trie::{root_opt, Cursor, Step, Trie},
 };
 
 /// What happened to one key between two roots.
@@ -106,14 +106,11 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         self.diff_walk(a, b, scope, &mut emit)
     }
 
-    /// Walks both tries in lockstep with an explicit heap stack.
-    ///
-    /// The new root is a peer's and nothing the fetch checks canonicalizes its
-    /// *shape*, so a hostile peer can chain extensions to any depth; recursion
-    /// would meet that with a stack overflow — an abort rather than an error —
-    /// inside head promotion (§5.2). The frames live on the heap and the
-    /// descent stops at [`MAX_DEPTH_NIBBLES`], past which no valid key can
-    /// begin (§12).
+    /// Walks both tries in lockstep ([`Trie::descend`]), which is what holds
+    /// the hostile-shape defences: this runs inside the head-promotion
+    /// transaction (§5.2), holding the write lock, so an unbounded or
+    /// overflowing walk here is a cluster-wide outage rather than a slow
+    /// query.
     fn diff_walk(
         &self,
         a: Cursor,
@@ -122,61 +119,34 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
     ) -> Result<(), MptError> {
         let mut path: Vec<u8> = Vec::new();
-        let mut stack: Vec<(Frame, Cursor)> = Vec::new();
-        // Keeps the diff proportional to the two tries. This runs inside the
-        // head-promotion transaction, holding the write lock, so an unbounded
-        // walk here is a cluster-wide outage rather than a slow query.
-        let mut guard = FanoutGuard::default();
-
         if !self.enter(&a, &b, &path, emit)? {
             return Ok(());
         }
-        stack.push((Frame { cursor: a, next: 0 }, b));
-
-        while let Some(top) = stack.len().checked_sub(1) {
-            let nibble = stack[top].0.next;
-            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
-                stack.pop();
-                path.pop();
-                continue;
-            }
-            stack[top].0.next += 1;
-            path.push(nibble);
+        self.descend((a, b), &mut path, &mut |pair, nibble, path| {
             // The same boundary the fetch stopped at: an out-of-scope position
             // holds nothing this node was sent, so descending it would fail on
             // an absence that is the design working. Tested before the cursors
             // are taken, since taking them reads the absent node (§5.5).
-            if !scope.admits_path(&path) {
-                path.pop();
-                continue;
+            if !scope.admits_path(path) {
+                return Ok(Step::Skip);
             }
-            let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
-            let cb = self.cursor_child(&stack[top].1, nibble)?;
+            let ca = self.cursor_child(&pair.0, nibble)?;
+            let cb = self.cursor_child(&pair.1, nibble)?;
             // Charged only where something is actually there, as `collect`
-            // charges only a non-empty child: a branch has sixteen slots and an
-            // ordinary trie leaves most empty, so billing all sixteen measured
-            // *frames entered* — sixteen times per real position — against the
-            // ceiling the scan walk is measured by, and refused the first-
-            // adoption diff of ~57 k files at §14's shape, well inside the
-            // 100 k initial index §7.1 names.
+            // charges only a non-empty child: a branch has sixteen slots and
+            // an ordinary trie leaves most empty, so billing all sixteen
+            // measured *frames entered* — sixteen times per real position —
+            // against the ceiling the scan walk is measured by, and refused
+            // the first-adoption diff of ~57 k files at §14's shape, well
+            // inside the 100 k initial index §7.1 names.
             if ca.is_empty() && cb.is_empty() {
-                path.pop();
-                continue;
+                return Ok(Step::Skip);
             }
-            guard.visit()?;
-            if self.enter(&ca, &cb, &path, emit)? {
-                stack.push((
-                    Frame {
-                        cursor: ca,
-                        next: 0,
-                    },
-                    cb,
-                ));
-            } else {
-                path.pop();
+            match self.enter(&ca, &cb, path, emit)? {
+                true => Ok(Step::Descend((ca, cb))),
+                false => Ok(Step::Visited),
             }
-        }
-        Ok(())
+        })
     }
 
     /// Records the difference between the values at one position, and reports
