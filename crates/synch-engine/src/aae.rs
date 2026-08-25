@@ -614,6 +614,20 @@ pub fn jittered(base: Duration) -> Duration {
     Duration::from_millis(base_ms / 2 + offset)
 }
 
+/// Applies +0–50 % jitter to a duration — never shorter than `base`.
+///
+/// The variant for backoff, where `base` is a floor: the centered [`jittered`]
+/// can halve it, and a reconnect delay below the minimum backoff defeats the
+/// backoff. The two used to share one name across this crate with different
+/// semantics, which is a trap for whoever reaches for the wrong one.
+pub fn jittered_floor(base: Duration) -> Duration {
+    let span_ms = (base.as_millis() as u64) / 2;
+    if span_ms == 0 {
+        return base;
+    }
+    base + Duration::from_millis(jitter_seed() % span_ms)
+}
+
 /// A cheap non-cryptographic source of jitter, seeded from the clock.
 fn jitter_seed() -> u64 {
     let mut state = (now_ns() as u64) ^ 0x9e37_79b9_7f4a_7c15;
