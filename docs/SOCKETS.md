@@ -616,7 +616,7 @@ SY_ENTRY sy_s64 entry(void) {
       nfds = fds[1].events == 0 ? 1 : 2;
     }
 
-    if (sy_poll(fds, nfds, 30000) <= 0) break; /* 0 = idle; negative = deadline */
+    if (sy_poll(fds, nfds, -1) <= 0) break; /* host idle deadline, or all quiet */
 
     if (!caller_done) {
       sy_s64 n = sy_pump(SY_SELF, up, upward, sizeof upward, &to_upstream);

@@ -94,7 +94,9 @@ SY_ENTRY sy_s64 entry(void) {
       nfds = fds[1].events == 0 ? 1 : 2;
     }
 
-    if (sy_poll(fds, nfds, 30000) <= 0) break;
+    /* A proxy is expected to be long-lived. Defer idle policy to the host's
+       progress-based deadline instead of imposing a shorter timeout here. */
+    if (sy_poll(fds, nfds, -1) <= 0) break;
 
     /* Each direction ends on its own. A loop that stopped the moment either
        side hung up would cut off the reply to the last request it forwarded,
