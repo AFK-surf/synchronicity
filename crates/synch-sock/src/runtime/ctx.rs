@@ -146,7 +146,81 @@ pub(crate) struct Ctx {
     pub(crate) inner: Rc<Inner>,
 }
 
+/// How long a declaration run may sit idle before it is abandoned.
+const DECLARE_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A key-shaped placeholder for the declaration run, which has no caller.
+///
+/// The init hook has no peer — nobody has connected, and nothing about a
+/// caller is knowable at arm time — so the identity helpers are given a
+/// delegate with an empty space list rather than a member. A hook that asked
+/// about its caller gets "not you", which is the true answer.
+fn zero_key() -> synch_core::NodeId {
+    synch_core::NodeId::from_bytes(&crate::policy::NOBODY).expect("the base point is a valid key")
+}
+
 impl Inner {
+    /// A run over nothing: no handles, no caller, no output, an idle deadline
+    /// `idle` from `started` — and the *serving*-mode flags, so the arming
+    /// path is the one that must flip what it differs in ([`Inner::declaring`])
+    /// and a forgotten override breaks the declaration run loudly rather than
+    /// widening what a served guest may do.
+    ///
+    /// Both constructions build on this one base, so a new field gets one
+    /// default here rather than one hand-written spelling per path — the
+    /// divergence that would let arming show an operator one thing while
+    /// serving runs another.
+    pub(crate) fn bare(
+        host: Arc<dyn SocketHost>,
+        started: Instant,
+        idle: std::time::Duration,
+    ) -> Inner {
+        Inner {
+            slots: RefCell::new(Vec::new()),
+            ready: Rc::new(Readiness::default()),
+            policy: EffectivePolicy::default(),
+            peer: PeerIdentity {
+                origin: synch_core::OriginId::Key(zero_key()),
+                device_key: zero_key(),
+                spaces: Some(Vec::new()),
+                addr: String::new(),
+                stream_index: 0,
+            },
+            socket: SocketId::new("", ""),
+            self_origin: String::new(),
+            meta: Vec::new(),
+            host,
+            maps: SocketMaps::new(),
+            limits: Limits::default(),
+            started,
+            deadline: Cell::new(started + idle),
+            program_root: Hash::EMPTY,
+            id: 0,
+            log_buf: RefCell::new(Vec::new()),
+            metrics: RefCell::new(Vec::new()),
+            labels: RefCell::new(Vec::new()),
+            footprint: Cell::new(0),
+            egress_open: Cell::new(0),
+            async_tasks: RefCell::new(Vec::new()),
+            init_mode: false,
+            declaration: RefCell::new(Declaration::default()),
+            live: Default::default(),
+            // No registry: only a served invocation appears in `socket ps` and
+            // keeps a log tail; the base is a run nobody is watching.
+            registry: None,
+        }
+    }
+
+    /// The declaration run's state: [`Inner::bare`] with the init hook's one
+    /// flag set. What its hook logs belongs to the operator who asked for the
+    /// arming rather than to a socket's tail, so the registry stays `None`.
+    pub(crate) fn declaring(host: Arc<dyn SocketHost>, started: Instant) -> Inner {
+        Inner {
+            init_mode: true,
+            ..Inner::bare(host, started, DECLARE_IDLE)
+        }
+    }
+
     /// Starts helper work and makes invocation cleanup its owner.
     pub(crate) fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         let task = tokio::task::spawn_local(future);

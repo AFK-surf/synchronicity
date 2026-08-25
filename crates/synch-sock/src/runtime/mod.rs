@@ -20,7 +20,7 @@ pub(crate) mod helpers;
 pub(crate) mod map;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     rc::Rc,
     sync::{
@@ -566,27 +566,17 @@ async fn run_job(
         socket: invocation.socket,
         self_origin: invocation.self_origin.canonical(),
         meta: invocation.meta,
-        host: invocation.host,
         maps: maps.clone(),
         limits: limits.clone(),
-        started,
-        deadline: Cell::new(started + limits.idle_deadline),
         program_root: invocation.program_root,
         id: invocation.id,
-        log_buf: RefCell::new(Vec::new()),
-        metrics: RefCell::new(Vec::new()),
-        labels: RefCell::new(Vec::new()),
-        footprint: Cell::new(0),
-        egress_open: Cell::new(0),
-        async_tasks: RefCell::new(Vec::new()),
-        init_mode: false,
-        declaration: RefCell::new(Declaration::default()),
         live: invocation
             .slot
             .as_ref()
             .map(|slot| slot.stats())
             .unwrap_or_default(),
         registry: Some(registry.clone()),
+        ..Inner::bare(invocation.host, started, limits.idle_deadline)
     });
     let self_reader =
         tokio::task::spawn_local(reader_task(self_ep.clone(), invocation.stream.reader));
@@ -756,42 +746,7 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         return Ok(Declaration::default());
     }
 
-    let started = Instant::now();
-    let inner = Rc::new(Inner {
-        slots: RefCell::new(Vec::new()),
-        ready: Rc::new(Readiness::default()),
-        policy: crate::EffectivePolicy::default(),
-        peer: crate::PeerIdentity {
-            origin: synch_core::OriginId::Key(zero_key()),
-            device_key: zero_key(),
-            spaces: Some(Vec::new()),
-            addr: String::new(),
-            stream_index: 0,
-        },
-        socket: crate::SocketId::new("", ""),
-        self_origin: String::new(),
-        meta: Vec::new(),
-        host,
-        maps: SocketMaps::new(),
-        limits: Limits::default(),
-        started,
-        deadline: Cell::new(started + Duration::from_secs(5)),
-        program_root: Hash::EMPTY,
-        id: 0,
-        log_buf: RefCell::new(Vec::new()),
-        metrics: RefCell::new(Vec::new()),
-        labels: RefCell::new(Vec::new()),
-        footprint: Cell::new(0),
-        egress_open: Cell::new(0),
-        async_tasks: RefCell::new(Vec::new()),
-        init_mode: true,
-        declaration: RefCell::new(Declaration::default()),
-        live: Default::default(),
-        // No registry: a declaration run is not an invocation, and what its
-        // hook logs belongs to the operator who asked for it rather than to a
-        // socket's tail.
-        registry: None,
-    });
+    let inner = Rc::new(Inner::declaring(host, Instant::now()));
     let mut ctx = Ctx {
         inner: inner.clone(),
     };
@@ -822,16 +777,6 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
         declaration.guarded_stack_frames,
     )?;
     Ok(declaration)
-}
-
-/// A key-shaped placeholder for the declaration run, which has no caller.
-///
-/// The init hook has no peer — nobody has connected, and nothing about a
-/// caller is knowable at arm time — so the identity helpers are given a
-/// delegate with an empty space list rather than a member. A hook that asked
-/// about its caller gets "not you", which is the true answer.
-fn zero_key() -> synch_core::NodeId {
-    synch_core::NodeId::from_bytes(&crate::policy::NOBODY).expect("the base point is a valid key")
 }
 
 /// Every helper name, for the SDK-header agreement test.
