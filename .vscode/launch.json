@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:synchronicity}/apps/Hecatia",
+            "name": "Debug Hecatia (apps/Hecatia)",
+            "target": "Hecatia",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Hecatia (apps/Hecatia)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:synchronicity}/apps/Hecatia",
+            "name": "Release Hecatia (apps/Hecatia)",
+            "target": "Hecatia",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Hecatia (apps/Hecatia)"
+        }
+    ]
+}
