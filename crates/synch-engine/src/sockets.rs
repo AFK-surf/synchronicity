@@ -111,14 +111,26 @@ impl Node {
     }
 
     async fn inspect_socket_current(&self, space: &str, path: &str) -> Result<CurrentInspection> {
-        let resolved = self.resolve_socket(space, path)?.ok_or_else(|| {
-            EngineError::invalid(format!(
+        // Resolution opens the SQLite store. This method is reached directly
+        // from the daemon's async control handler, so it belongs on the
+        // blocking pool rather than on a Tokio worker.
+        let node = self.clone();
+        let (space_owned, path_owned) = (space.to_string(), path.to_string());
+        let resolved =
+            crate::blocking::offload(move || node.resolve_socket(&space_owned, &path_owned))
+                .await?
+                .ok_or_else(|| {
+                    EngineError::invalid(format!(
                 "`{space}/{path}` is declared a socket but this node publishes no entry for it \
                  — run `synch scan` first"
             ))
-        })?;
+                })?;
         let elf = self.socket_program(&resolved).await?;
-        let declared = self.declare_program(&elf)?;
+        // The declaration hook JIT-compiles the program and joins its isolated
+        // worker thread. It is deliberately synchronous, so hand that wait to
+        // the blocking pool too.
+        let node = self.clone();
+        let declared = crate::blocking::offload(move || node.declare_program(&elf)).await?;
         let review = socket_review(&resolved.root, &resolved.state.generation, &declared);
         Ok(CurrentInspection {
             public: SocketInspection {
@@ -142,27 +154,32 @@ impl Node {
                 "the socket's content, declaration, or init result changed after review; inspect it again",
             ));
         }
-        let _authorization = self.socket_authorization_write();
-        let armed = self.store().arm_socket_reviewed(
-            self.origin(),
-            space,
-            path,
-            ArmCandidate {
-                generation: &inspected.generation,
-                root: &inspected.public.root,
-                declared: &inspected.public.declaration.render(),
-                armed_at: synch_core::now_ns(),
-            },
-        )?;
-        if !armed {
-            return Err(EngineError::invalid(
-                "the socket's declaration or published content changed while it was being armed; inspect it again",
-            ));
-        }
-        // A re-arm is a different program; a session table minted by the old
-        // one is not state the new one agreed to inherit.
-        self.clear_socket_map(&format!("{space}/{path}"));
-        Ok(())
+        let node = self.clone();
+        let (space, path) = (space.to_string(), path.to_string());
+        crate::blocking::offload(move || {
+            let _authorization = node.socket_authorization_write();
+            let armed = node.store().arm_socket_reviewed(
+                node.origin(),
+                &space,
+                &path,
+                ArmCandidate {
+                    generation: &inspected.generation,
+                    root: &inspected.public.root,
+                    declared: &inspected.public.declaration.render(),
+                    armed_at: synch_core::now_ns(),
+                },
+            )?;
+            if !armed {
+                return Err(EngineError::invalid(
+                    "the socket's declaration or published content changed while it was being armed; inspect it again",
+                ));
+            }
+            // A re-arm is a different program; a session table minted by the
+            // old one is not state the new one agreed to inherit.
+            node.clear_socket_map(&format!("{space}/{path}"));
+            Ok(())
+        })
+        .await
     }
 
     /// Withdraws an approval, leaving the declaration standing.
@@ -280,10 +297,14 @@ impl Node {
             ));
         }
 
-        let scope = self
-            .store()
-            .socket_scope_for_key(&peer, synch_core::now_ns())
-            .map_err(|e| (RefuseCode::Unauthorized, e.to_string()))?;
+        let node = self.clone();
+        let scope = crate::blocking::offload(move || {
+            Ok(node
+                .store()
+                .socket_scope_for_key(&peer, synch_core::now_ns())?)
+        })
+        .await
+        .map_err(|e| (RefuseCode::Unauthorized, e.to_string()))?;
         let Some((origin, scope)) = scope else {
             return Err((
                 RefuseCode::Unauthorized,
@@ -299,19 +320,32 @@ impl Node {
             }
         }
 
-        let resolved = match self.resolve_socket(&open.space, &open.path) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
+        let node = self.clone();
+        let (space, path) = (open.space.clone(), open.path.clone());
+        let resolved = crate::blocking::offload(move || {
+            let resolved = node.resolve_socket(&space, &path)?;
+            let ordinary = if resolved.is_none() {
+                node.store().entry(node.origin(), &space, &path)?.is_some()
+            } else {
+                false
+            };
+            Ok((resolved, ordinary))
+        })
+        .await
+        .map_err(|e| (RefuseCode::NoSuchPath, e.to_string()))?;
+        let resolved = match resolved {
+            (Some(resolved), _) => resolved,
+            (None, ordinary) => {
                 // Told apart so the caller learns something: a path this node
                 // publishes as an ordinary file is a different mistake from a
                 // path it publishes nothing for.
-                let code = match self.store().entry(self.origin(), &open.space, &open.path) {
-                    Ok(Some(_)) => RefuseCode::NotASocket,
-                    _ => RefuseCode::NoSuchPath,
+                let code = if ordinary {
+                    RefuseCode::NotASocket
+                } else {
+                    RefuseCode::NoSuchPath
                 };
                 return Err((code, format!("{}/{}", open.space, open.path)));
             }
-            Err(e) => return Err((RefuseCode::NoSuchPath, e.to_string())),
         };
 
         if !resolved.state.is_armed_for(&resolved.root) {
@@ -336,50 +370,59 @@ impl Node {
         // while the registry slot is made live. Arm/disarm/redeclare take the
         // write side of this gate, so either this admission becomes in-flight
         // first or the revocation wins and this request is refused.
-        let _authorization = self.socket_authorization_read();
-        let current = match self.resolve_socket(&open.space, &open.path) {
-            Ok(Some(current)) => current,
-            Ok(None) => {
-                return Err((
-                    RefuseCode::NotArmed,
-                    "the socket was removed or republished during admission".into(),
-                ))
-            }
-            Err(e) => return Err((RefuseCode::NotArmed, e.to_string())),
-        };
-        if !authorization_unchanged(&resolved, &current) {
-            return Err((
-                RefuseCode::NotArmed,
-                "the socket was disarmed, redeclared, or changed during admission".into(),
-            ));
-        }
-
-        let policy = self.socket_policy(&current.state);
         let qualified = format!("{}/{}", open.space, open.path);
-        let id = self.next_socket_id();
+        let node = self.clone();
+        let (space, path) = (open.space.clone(), open.path.clone());
+        let checked = resolved.clone();
+        let qualified_for_slot = qualified.clone();
+        let peer_name = origin.canonical();
+        // The store read and the registry reservation are one blocking-pool
+        // closure so the authorization read guard spans both. A concurrent
+        // disarm therefore wins before admission or waits until the live slot
+        // exists; there is no unchecked gap between them.
+        let prepared = crate::blocking::offload(move || {
+            let _authorization = node.socket_authorization_read();
+            let current = match node.resolve_socket(&space, &path)? {
+                Some(current) => current,
+                None => {
+                    return Ok(Err((
+                        RefuseCode::NotArmed,
+                        "the socket was removed or republished during admission".into(),
+                    )))
+                }
+            };
+            if !authorization_unchanged(&checked, &current) {
+                return Ok(Err((
+                    RefuseCode::NotArmed,
+                    "the socket was disarmed, redeclared, or changed during admission".into(),
+                )));
+            }
 
-        // The concurrency cap, finally enforced somewhere it can be: the
-        // registry counts what is running and hands back a slot or refuses.
-        // Taken here rather than when the guest starts, because the window
-        // between answering `Opened` and the first instruction running is one
-        // the caller controls.
-        let slot = self.reserve_socket_slot(
-            id,
-            &qualified,
-            &origin.canonical(),
-            peer,
-            resolved.root,
-            policy.max_streams,
-        );
-        let Some(slot) = slot else {
-            return Err((
-                RefuseCode::Busy,
-                format!(
-                    "{qualified} is at its limit of {} concurrent invocations",
-                    policy.max_streams
-                ),
-            ));
-        };
+            let policy = node.socket_policy(&current.state);
+            let id = node.next_socket_id();
+            // The concurrency cap is taken at admission, before the guest
+            // starts, so a caller cannot open idle streams past the cap.
+            let Some(slot) = node.reserve_socket_slot(
+                id,
+                &qualified_for_slot,
+                &peer_name,
+                peer,
+                checked.root,
+                policy.max_streams,
+            ) else {
+                return Ok(Err((
+                    RefuseCode::Busy,
+                    format!(
+                        "{qualified_for_slot} is at its limit of {} concurrent invocations",
+                        policy.max_streams
+                    ),
+                )));
+            };
+            Ok(Ok((policy, id, slot)))
+        })
+        .await
+        .map_err(|e| (RefuseCode::NotArmed, e.to_string()))?;
+        let (policy, id, slot) = prepared?;
 
         Ok(Admission {
             program: Arc::new(program),
@@ -425,7 +468,8 @@ impl Node {
         // The pool has already recorded this outcome against the socket's
         // fault history; what it cannot do is disarm, which is a store write.
         if pool.should_quarantine(&socket.qualified(), program_root) {
-            self.quarantine_socket(&socket.space, &socket.path, program_root);
+            self.quarantine_socket(&socket.space, &socket.path, program_root)
+                .await;
         }
         status
     }
@@ -437,18 +481,27 @@ impl Node {
     /// from their users. Disarmed rather than undeclared — the declaration and
     /// its policy are the operator's and survive; what is withdrawn is the
     /// approval of *these bytes*, which have proved they do not work.
-    fn quarantine_socket(&self, space: &str, path: &str, root: Hash) {
-        let _authorization = self.socket_authorization_write();
-        match self.store().disarm_socket_root(space, path, &root) {
-            Ok(true) => tracing::error!(
-                socket = format!("{space}/{path}"),
-                "socket disarmed: it faulted on most of its recent invocations.                  Fix the program and `synch socket arm` it again."
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                socket = format!("{space}/{path}"),
-                "could not disarm a faulting socket: {e}"
-            ),
+    async fn quarantine_socket(&self, space: &str, path: &str, root: Hash) {
+        let node = self.clone();
+        let (space, path) = (space.to_string(), path.to_string());
+        if let Err(e) = crate::blocking::offload(move || {
+            let _authorization = node.socket_authorization_write();
+            match node.store().disarm_socket_root(&space, &path, &root) {
+                Ok(true) => tracing::error!(
+                    socket = format!("{space}/{path}"),
+                    "socket disarmed: it faulted on most of its recent invocations.                  Fix the program and `synch socket arm` it again."
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    socket = format!("{space}/{path}"),
+                    "could not disarm a faulting socket: {e}"
+                ),
+            }
+            Ok(())
+        })
+        .await
+        {
+            tracing::warn!("could not schedule fault quarantine: {e}");
         }
     }
 
@@ -1118,7 +1171,14 @@ impl Node {
             });
         }
 
-        let keys = self.store().keys_for_origin(origin, synch_core::now_ns())?;
+        let node = self.clone();
+        let remote = origin.clone();
+        let keys = crate::blocking::offload(move || {
+            Ok(node
+                .store()
+                .keys_for_origin(&remote, synch_core::now_ns())?)
+        })
+        .await?;
         if keys.is_empty() {
             return Err(EngineError::not_found(format!(
                 "no live binding for {} — this node does not know its device key",

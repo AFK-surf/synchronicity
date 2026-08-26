@@ -344,6 +344,76 @@ async fn a_self_connection_runs_the_armed_program() {
     node.shutdown().await.unwrap();
 }
 
+/// The daemon uses a multi-thread Tokio runtime, whose workers must never open
+/// the synchronous SQLite store. Keep the fixture setup outside that runtime,
+/// then exercise the complete async arm/admit/run path inside it. A regression
+/// here aborts in debug builds at `Store::conn`, exactly as a real daemon does.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn a_daemon_style_runtime_can_arm_and_run_a_self_socket() {
+    use synch_core::SockStatus;
+    use synch_engine::sockets::SocketConnection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let data = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    Node::init(data.path(), None).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = runtime
+        .block_on(Node::open(NodeConfig::loopback(data.path())))
+        .unwrap();
+
+    // These are the daemon command handler's synchronous operations; that
+    // handler already offloads them. Here setup happens outside any runtime.
+    node.add_space("code", space.path()).unwrap();
+    let elf = synch_cc::compile(
+        include_str!("../../synch-sock/examples/echo.c"),
+        "echo.c",
+        &[("synch.h", synch_sock::sdk::HEADER)],
+        &[],
+    )
+    .unwrap();
+    write(space.path(), "echo.sock", &elf);
+    node.socket_add(&declaration("code", "echo.sock")).unwrap();
+    node.scan_and_publish().unwrap();
+
+    runtime.block_on(async {
+        let inspected = node.socket_inspect("code", "echo.sock").await.unwrap();
+        node.socket_approve("code", "echo.sock", &inspected.review)
+            .await
+            .unwrap();
+        let connection = node
+            .connect_socket(node.origin(), "code", "echo.sock", Vec::new())
+            .await
+            .unwrap();
+        let SocketConnection::Local {
+            mut stream,
+            completion,
+            ..
+        } = connection
+        else {
+            panic!("a self-connection used the remote transport");
+        };
+        stream.write_all(b"daemon runtime").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        stream.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"daemon runtime");
+        assert_eq!(
+            completion.await.unwrap(),
+            SockStatus::Ok(echoed.len() as i64)
+        );
+        node.shutdown().await.unwrap();
+    });
+}
+
 #[cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
