@@ -178,6 +178,22 @@ enum Versions {
     return PathVersions(space: lossless.space, path: lossless.path, versions: merged)
   }
 
+  /// Whether a structured Resolve entry and a rendered status version describe
+  /// the same assertion.
+  ///
+  /// Resolve no longer carries a publishing seq. The content identity is the
+  /// stable join key instead: exact in strict-refusal data, or a 16-character
+  /// root prefix in `status`'s human rendering. Kind and size keep a truncated
+  /// prefix from being accepted on its own.
+  static func matches(_ entry: RemoteEntry, version: EntryVersion) -> Bool {
+    guard entry.kind == version.kind, entry.size == version.size else { return false }
+    let resolved = entry.versionIdentity
+    if resolved == version.identity { return true }
+    return entry.rootHex != nil
+      && version.identity.count == 16
+      && resolved.hasPrefix(version.identity)
+  }
+
   private struct Key: Hashable { let seq: UInt64; let size: UInt64 }
 
   // MARK: - Undoing OriginId::short()

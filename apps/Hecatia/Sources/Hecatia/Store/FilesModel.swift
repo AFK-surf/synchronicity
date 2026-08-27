@@ -736,10 +736,10 @@ final class FilesModel {
 
   /// Loads the selected path's versions.
   ///
-  /// The lossless source first: a `strict` resolve refuses a divergent path by
-  /// returning every version with full origins, untruncated roots and raw
-  /// seqs. `status` is then read only for the attestor lists, which `Resolve`
-  /// has no field for.
+  /// The lossless source first for a divergent path: a `strict` resolve refuses
+  /// it with every version, full origins, untruncated roots and raw seqs.
+  /// A successful structured Resolve no longer carries a seq, so the unanimous
+  /// case comes from `status`, which is also where attestor lists live.
   func loadVersions(for entry: RemoteEntry) async {
     // A synthesised folder row is not a published path, so it has no versions
     // and no history — and asking anyway is what surfaced somebody else's.
@@ -753,25 +753,12 @@ final class FilesModel {
     versionsLoading = true
     defer { if mine == versionGeneration { versionsLoading = false } }
 
-    var lossless: PathVersions?
+    var strictVersions: PathVersions?
     do {
-      let resolved = try await store.client.resolve(
+      _ = try await store.client.resolve(
         space: entry.space, path: entry.path, policy: .strict)
-      lossless = PathVersions(
-        space: entry.space,
-        path: entry.path,
-        versions: [
-          EntryVersion(
-            identity: RemoteEntry(resolved).rootHex ?? "(no content)",
-            kind: RemoteEntry(resolved).kind,
-            size: resolved.size,
-            seq: resolved.seq,
-            attestors: [resolved.origin]
-          )
-        ]
-      )
     } catch let failure as DaemonFailure where failure.code == .divergent {
-      lossless = Versions.fromStrictRefusal(
+      strictVersions = Versions.fromStrictRefusal(
         failure.detail, space: entry.space, path: entry.path)
     } catch {
       // Not fatal: the inspector degrades to what the listing already knows.
@@ -811,8 +798,8 @@ final class FilesModel {
       unresolvedAttestors = []
     }
 
-    if let lossless {
-      versions = Versions.merge(lossless: lossless, attestorsFrom: attestors)
+    if let strictVersions {
+      versions = Versions.merge(lossless: strictVersions, attestorsFrom: attestors)
     } else {
       versions = attestors
     }
@@ -840,17 +827,17 @@ final class FilesModel {
   /// Asks each known origin whether it publishes this path, which recovers the
   /// full canonical name that `status` truncated away.
   private func probeOrigins(for entry: RemoteEntry, generation mine: Int) async {
-    var found: [String: UInt64] = [:]
+    var found: [String: RemoteEntry] = [:]
     for origin in knownOrigins(for: entry) {
       guard mine == versionGeneration else { return }
       guard let resolved = try? await store.client.resolve(
         space: entry.space, path: entry.path, policy: .origin(origin))
       else { continue }
-      found[origin] = resolved.seq
+      found[origin] = RemoteEntry(resolved)
     }
     guard mine == versionGeneration, let current = versions, !found.isEmpty else { return }
     let repaired = current.versions.map { version -> EntryVersion in
-      let matches = found.filter { $0.value == version.seq }.keys.sorted()
+      let matches = found.filter { Versions.matches($0.value, version: version) }.keys.sorted()
       guard !matches.isEmpty else { return version }
       return EntryVersion(
         identity: version.identity, kind: version.kind, size: version.size,
@@ -939,9 +926,9 @@ final class FilesModel {
 // MARK: - Proto bridging
 
 extension RemoteEntry {
-  /// Every field the daemon sends is kept. `content`, `seq` and
-  /// `symlinkTarget` used to be dropped here, which is what left the version
-  /// badge with nothing behind it.
+  /// Every field the daemon sends is kept. `content` and `symlinkTarget` used
+  /// to be dropped here, which is what left the version badge with nothing
+  /// behind it.
   init(_ entry: Synch_Control_V1_Entry) {
     let kind: Kind
     switch entry.kind {
@@ -971,7 +958,6 @@ extension RemoteEntry {
         : .distantPast,
       versions: entry.versions,
       contentRoot: entry.hasContent ? entry.content : nil,
-      seq: entry.seq,
       symlinkTarget: entry.hasSymlinkTarget ? entry.symlinkTarget : nil
     )
   }
@@ -1003,7 +989,7 @@ struct DeleteProgress: Equatable, Sendable {
 ///
 /// Declared beside the model rather than inside `FileInspector`, because the
 /// menu bar and two context menus choose it and none of them can see a view.
-enum InspectorSection: String, CaseIterable, Identifiable {
+enum InspectorSection: String, CaseIterable, Identifiable, Hashable {
   case info = "Info", versions = "Versions", history = "History"
   var id: String { rawValue }
 }

@@ -44,20 +44,19 @@ helps.
 ## The protocol copy
 
 `Sources/Hecatia/control.proto` is a copy of the daemon's
-`crates/synch-cli/proto/control.proto`. The daemon owns it; this repo keeps a
-copy so it can build alone. The copy can drift silently, so:
+`crates/synch-cli/proto/control.proto`. The daemon owns it; Hecatia keeps a
+copy so SwiftPM can build without generating sources from another package.
+The default check resolves both files from this monorepo:
 
 ```sh
-Scripts/sync-proto.sh check  /Users/cirno/workspace/synchronicity
-Scripts/sync-proto.sh update /Users/cirno/workspace/synchronicity
+Scripts/sync-proto.sh check
+Scripts/sync-proto.sh update
 ```
 
-**The default path no longer resolves.** `sync-proto.sh` falls back to
-`../synchronicity`, which was right when this was a sibling checkout and now
-points at `apps/synchronicity`, which does not exist — so a bare
-`make check-proto`, and the copy of it inside `make test`, prints SKIPPED and
-exits 0. Until that default is fixed, `make test` has no drift gate and the
-path has to be passed by hand.
+Pass a repository path explicitly when checking against another checkout.
+Missing repositories and drift are hard failures. `make test` first exercises
+those failure modes and then checks the real copy, so the gate cannot silently
+turn into a skip again.
 
 ## What it covers
 

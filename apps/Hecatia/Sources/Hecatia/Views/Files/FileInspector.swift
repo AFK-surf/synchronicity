@@ -54,7 +54,7 @@ struct FileInspector: View {
         // version set — and the "Opens now" marker then compared the new
         // root against the old list. Reachable now that a refresh of the
         // folder you are in keeps its rows.
-        .task(id: "\(entry.id)|\(entry.seq)|\(entry.versions)|\(entry.rootHex ?? "")|\(section.rawValue)") {
+        .task(id: LoadID(entry: entry, section: section)) {
           switch section {
           case .history: await model.loadHistory(for: entry)
           case .versions: await model.loadVersions(for: entry)
@@ -68,6 +68,13 @@ struct FileInspector: View {
           description: Text("Select one file to see where its contents came from."))
       }
     }
+  }
+
+  /// Reload whenever any transport-backed entry field changes, without
+  /// depending on the publishing seq removed from the structured protocol.
+  private struct LoadID: Hashable {
+    let entry: RemoteEntry
+    let section: InspectorSection
   }
 
   // MARK: - History

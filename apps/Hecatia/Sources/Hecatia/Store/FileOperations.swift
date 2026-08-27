@@ -111,7 +111,7 @@ extension FilesModel {
         let resuming = store.transfers.resumable.first {
           $0.space == space && $0.path == path
         }?.id
-        let result = try await store.client.multipartPut(
+        try await store.client.multipartPut(
           space: space, path: path, from: source, totalBytes: size, resuming: resuming,
           onOpen: { uploadID in
             Task { @MainActor in queue.update(id) { $0.uploadID = uploadID } }
@@ -122,16 +122,14 @@ extension FilesModel {
         }
         store.transfers.update(id) {
           $0.bytes = $0.total
-          $0.state = .completed(detail: result.replayed ? "Already uploaded" : "Uploaded")
+          $0.state = .completed(detail: "Uploaded")
         }
       } else {
-        let written = try await store.client.put(
+        _ = try await store.client.put(
           space: space, path: path, from: source, onProgress: onProgress)
         store.transfers.update(id) {
           $0.bytes = $0.total
-          // What the daemon actually published, which the old client drained
-          // and discarded.
-          $0.state = .completed(detail: written.map { "Published seq \($0.entry.seq)" } ?? "Uploaded")
+          $0.state = .completed(detail: "Uploaded")
         }
       }
       // Not `await reload()`: every file in a batch finishes separately, and
@@ -403,6 +401,33 @@ extension FilesModel {
     var incomplete = false
   }
 
+  /// The notice a completed delete batch owes the person who started it.
+  ///
+  /// Delete is idempotent and the current daemon deliberately does not report
+  /// whether a local copy existed. A successful response with nothing still
+  /// published is therefore success, not evidence for a missing-copy warning.
+  static func deleteNotice(
+    stopped: Bool, attempted: Int, total: Int, stillPublished: [String]
+  ) -> DaemonFailure? {
+    if stopped {
+      var detail = "Stopped after \(attempted) of \(total). "
+        + "What was already deleted stays deleted."
+      if !stillPublished.isEmpty {
+        detail += stillPublished.count == 1
+          ? " This Mac’s copy of \(stillPublished[0]) is gone, but another device still publishes it, so it stays in the list."
+          : " \(stillPublished.count) of them are still published by another device, so they stay in the list."
+      }
+      return DaemonFailure(code: .invalid, detail: detail, operation: nil)
+    }
+    guard !stillPublished.isEmpty else { return nil }
+    return DaemonFailure(
+      code: .invalid,
+      detail: stillPublished.count == 1
+        ? "This Mac’s copy of \(stillPublished[0]) is gone, but another device still publishes it, so it stays in the list."
+        : "This Mac’s copies are gone, but \(stillPublished.count) of them are still published by another device, so they stay in the list.",
+      operation: nil)
+  }
+
   func deletePlan(for entries: [RemoteEntry]) async -> DeletePlan {
     var paths: [(String, String)] = []
     var folders: [String] = []
@@ -493,8 +518,8 @@ extension FilesModel {
     guard !plan.paths.isEmpty else { return }
     store.enqueue { [weak self] in
       guard let self else { return }
-      var removed = 0
       var stillPublished: [String] = []
+      var failed = false
       // Said out loud, because it is not quick: the daemon has no bulk delete
       // — `DeleteRequest` carries one path — and it rescans every configured
       // folder and signs a head after each one. A hundred-file delete is a
@@ -526,9 +551,8 @@ extension FilesModel {
           stopped = true
           break
         }
-        // Attempted, not removed: `removed` counts the paths the daemon
-        // actually had a local copy of, so deleting content published only by
-        // another device read "Deleting 0 of 12…" for the whole run.
+        // Progress counts requests that reached a terminal response. Delete is
+        // idempotent; the daemon no longer claims whether a local copy existed.
         defer {
           attempted += 1
           self.deleteProgress = DeleteProgress(done: attempted, total: plan.paths.count)
@@ -536,10 +560,8 @@ extension FilesModel {
         do {
           let response = try await self.store.client.delete(
             space: target.space, path: target.path)
-          if response.removed { removed += 1 }
-          // The two answers the old client threw away. Without them, deleting a
-          // path another machine also publishes looked like the app had simply
-          // ignored the request.
+          // Without this answer, deleting a path another machine also publishes
+          // looks like the app simply ignored the request.
           if response.stillPublished { stillPublished.append(target.path) }
         } catch {
           // How far it got, not just where it stopped. A delete that failed
@@ -552,48 +574,19 @@ extension FilesModel {
             detail: "\(failure.detail)\n\n\(done) of \(plan.paths.count) had already been deleted.",
             operation: failure.operation,
             suggestion: failure.recoverySuggestion)
+          failed = true
           break
         }
       }
       await self.reload()
       await self.store.refresh([.status])
-      if stopped {
-        // A stop is not a failure, and it is not silence either. What it
-        // leaves behind is a half-deleted folder, and the only way to know
-        // which half is to be told how far it got — the same reason the
-        // failure branch above counts rather than just naming a path. It also
-        // has to come first: without it the `removed == 0` branch below would
-        // answer a stop with "There was no copy on this Mac to remove.", which
-        // is a statement about the folder rather than about what just
-        // happened.
-        //
-        // Composed rather than chosen, because a stop does not make the other
-        // two facts untrue: the paths the loop did reach can still be ones
-        // another device publishes, and answering that with the stop sentence
-        // alone would leave those rows sitting in the listing with nothing
-        // said about why. `attempted` is at least one — the flag is cleared
-        // immediately above and the first check runs before any `await`, so a
-        // stop cannot land before the first path.
-        var detail = "Stopped after \(attempted) of \(plan.paths.count). "
-          + "What was already deleted stays deleted."
-        if !stillPublished.isEmpty {
-          detail += stillPublished.count == 1
-            ? " This Mac’s copy of \(stillPublished[0]) is gone, but another device still publishes it, so it stays in the list."
-            : " \(stillPublished.count) of them are still published by another device, so they stay in the list."
-        }
-        self.store.alert = DaemonFailure(code: .invalid, detail: detail, operation: nil)
-      } else if !stillPublished.isEmpty {
-        self.store.alert = DaemonFailure(
-          code: .invalid,
-          detail: stillPublished.count == 1
-            ? "This Mac’s copy of \(stillPublished[0]) is gone, but another device still publishes it, so it stays in the list."
-            : "This Mac’s copies are gone, but \(stillPublished.count) of them are still published by another device, so they stay in the list.",
-          operation: nil)
-      } else if removed == 0 {
-        self.store.alert = DaemonFailure(
-          code: .notFound,
-          detail: "There was no copy on this Mac to remove.",
-          operation: nil)
+      // Keep an RPC failure as the primary notice. Otherwise compose the stop
+      // boundary with any paths another device still publishes.
+      if !failed, let notice = Self.deleteNotice(
+        stopped: stopped, attempted: attempted, total: plan.paths.count,
+        stillPublished: stillPublished)
+      {
+        self.store.alert = notice
       }
     }
   }

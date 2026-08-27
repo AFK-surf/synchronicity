@@ -48,7 +48,7 @@ enum SampleData {
     RemoteEntry(
       origin: origin, space: space, path: path, kind: kind, size: size,
       modified: modified, versions: versions,
-      contentRoot: Data(repeating: 0xa1, count: 32), seq: 88)
+      contentRoot: Data(repeating: 0xa1, count: 32))
   }
 
   static let readme = entry(path: "README.md", size: 4_218, modified: day(-1))

@@ -226,6 +226,31 @@ struct DeletePlanTests {
   }
 }
 
+/// What a successful Delete response is allowed to claim.
+@Suite("Delete results")
+@MainActor
+struct DeleteResultTests {
+  @Test("Idempotent success does not become a false missing-copy warning")
+  func successfulDeleteIsSilent() {
+    #expect(FilesModel.deleteNotice(
+      stopped: false, attempted: 1, total: 1, stillPublished: []) == nil)
+  }
+
+  @Test("A copy still published elsewhere is explained")
+  func stillPublishedIsExplained() {
+    let notice = FilesModel.deleteNotice(
+      stopped: false, attempted: 1, total: 1, stillPublished: ["notes.txt"])
+    #expect(notice?.detail.contains("another device still publishes it") == true)
+  }
+
+  @Test("A stopped batch reports its boundary")
+  func stoppedBatchReportsProgress() {
+    let notice = FilesModel.deleteNotice(
+      stopped: true, attempted: 2, total: 5, stillPublished: [])
+    #expect(notice?.detail.hasPrefix("Stopped after 2 of 5.") == true)
+  }
+}
+
 /// The queue's own invariants, which two crashes have already depended on.
 @Suite("Transfer queue")
 @MainActor

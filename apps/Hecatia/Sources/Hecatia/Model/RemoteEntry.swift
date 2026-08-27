@@ -2,10 +2,9 @@ import Foundation
 
 /// One path of the unified tree, as `List` and `Resolve` answer it.
 ///
-/// Every field the daemon sends is kept, including the ones a listing does not
-/// render: `contentRoot` and `seq` are what the Versions inspector is built
-/// from, and dropping them at the transport boundary is what made the old
-/// conflict badge a dead end.
+/// Every field the daemon sends is kept, including `contentRoot`, which a
+/// listing does not render but the Versions inspector uses to identify the
+/// selected contents.
 struct RemoteEntry: Identifiable, Hashable, Sendable {
   /// `unknown` is this app's word for a parse failure — an `EntryKind` this
   /// build has never heard of — so a kind the daemon *does* define needs a
@@ -35,8 +34,6 @@ struct RemoteEntry: Identifiable, Hashable, Sendable {
   let versions: UInt32
   /// The 32-byte object root, for files. Rendered as hex where it is shown.
   let contentRoot: Data?
-  /// The publishing origin's trie sequence number.
-  let seq: UInt64
   let symlinkTarget: String?
   /// True for the rows this app synthesises for a directory level; the daemon
   /// publishes leaves only.
@@ -51,7 +48,6 @@ struct RemoteEntry: Identifiable, Hashable, Sendable {
     modified: Date,
     versions: UInt32,
     contentRoot: Data? = nil,
-    seq: UInt64 = 0,
     symlinkTarget: String? = nil,
     isSynthesizedDirectory: Bool = false
   ) {
@@ -63,7 +59,6 @@ struct RemoteEntry: Identifiable, Hashable, Sendable {
     self.modified = modified
     self.versions = versions
     self.contentRoot = contentRoot
-    self.seq = seq
     self.symlinkTarget = symlinkTarget
     self.isSynthesizedDirectory = isSynthesizedDirectory
     self.id = "\(space)/\(path)#\(kind == .directory ? "d" : "f")"
@@ -118,4 +113,15 @@ extension RemoteEntry {
   }
 
   var rootHex: String? { contentRoot.map { $0.map { String(format: "%02x", $0) }.joined() } }
+
+  /// The same identity text the daemon uses for a version. Structured Resolve
+  /// responses no longer carry a publishing sequence number, so origin probes
+  /// are matched by the actual version identity instead.
+  var versionIdentity: String {
+    switch kind {
+    case .tombstone: return "(deleted)"
+    case .symlink: return "-> \(symlinkTarget ?? "(unknown target)")"
+    default: return rootHex ?? "(no content)"
+    }
+  }
 }

@@ -158,6 +158,31 @@ struct OriginRecoveryTests {
       seq: 91, attestors: [truncated])
     #expect(unreachable.actionableAttestor == nil)
   }
+
+  @Test func aResolvedEntryMatchesAStatusVersionWithoutATransportSeq() {
+    let root = Data(repeating: 0xab, count: 32)
+    let entry = RemoteEntry(
+      origin: full, space: "notes", path: "a.md", kind: .file, size: 42,
+      modified: .distantPast, versions: 1, contentRoot: root)
+    let rendered = EntryVersion(
+      identity: String(repeating: "ab", count: 8), kind: .file, size: 42,
+      seq: 91, attestors: [truncated])
+    #expect(Versions.matches(entry, version: rendered))
+  }
+
+  @Test func identityMatchingStillRejectsADifferentVersion() {
+    let entry = RemoteEntry(
+      origin: full, space: "notes", path: "a.md", kind: .file, size: 42,
+      modified: .distantPast, versions: 1, contentRoot: Data(repeating: 0xab, count: 32))
+    let wrongRoot = EntryVersion(
+      identity: String(repeating: "cd", count: 8), kind: .file, size: 42,
+      seq: 91, attestors: [truncated])
+    let wrongSize = EntryVersion(
+      identity: String(repeating: "ab", count: 8), kind: .file, size: 43,
+      seq: 91, attestors: [truncated])
+    #expect(!Versions.matches(entry, version: wrongRoot))
+    #expect(!Versions.matches(entry, version: wrongSize))
+  }
 }
 
 /// `mirror sync` stops at the first failure and says nothing about the rest.

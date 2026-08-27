@@ -89,24 +89,21 @@ do not run them unprompted. `probe`'s `upload`/`add`/`external`/`connection`
 suites mutate a real daemon and a real shared folder, and the driver terminates
 the app when it finishes.
 
-### The proto copy — currently unguarded
+### The proto copy
 
 `Sources/Hecatia/control.proto` is a copy of the daemon's
-`crates/synch-cli/proto/control.proto`. **`sync-proto.sh` defaults to
-`../synchronicity`, which after the move into `apps/` resolves to
-`apps/synchronicity` and does not exist** — so the check prints `SKIPPED` and
-exits 0, and `make test` therefore has no working drift gate. Pass the real
-path:
+`crates/synch-cli/proto/control.proto`. The script resolves that canonical file
+from the monorepo by default:
 
 ```sh
-Scripts/sync-proto.sh check  /Users/cirno/workspace/synchronicity
-Scripts/sync-proto.sh update /Users/cirno/workspace/synchronicity
+Scripts/sync-proto.sh check
+Scripts/sync-proto.sh update
 ```
 
-Run today, `check` fails: the daemon has `reserved` three fields the app still
-reads — `Entry.seq` (`Store/FilesModel.swift:768`), `DeleteResponse.removed`
-(`Store/FileOperations.swift:539`) and `CompleteUploadResponse.replayed`
-(`Store/FileOperations.swift:125`). An `update` right now would not compile.
+`Scripts/test-proto-sync.sh` verifies the default path and proves missing and
+drifting repositories fail closed. `make test` runs it before the Swift suite.
+When the daemon reserves a field, update the copy and adapt Hecatia in the same
+change; do not preserve a client-only compatibility field.
 
 ## Architecture
 

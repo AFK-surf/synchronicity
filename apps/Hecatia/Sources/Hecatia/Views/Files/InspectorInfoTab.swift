@@ -36,7 +36,6 @@ struct InspectorInfoTab: View {
           DetailRow(
             label: "Device", value: node.label(forOrigin: entry.origin),
             copyable: entry.origin.isEmpty ? nil : entry.origin)
-          DetailRow(label: "Published", value: "seq \(entry.seq)")
         }
         if let target = entry.symlinkTarget {
           DetailRow(label: "Links to", value: target, mono: true, copyable: target)
@@ -122,8 +121,8 @@ private struct InfoTabPreview: View {
 }
 
 #Preview("A folder") {
-  // A synthesised row: no size, mtime, device or seq of its own, and neither
-  // of the two actions — a prefix is not something this Mac can keep offline.
+  // A synthesised row: no size, mtime or device of its own, and neither of the
+  // two actions — a prefix is not something this Mac can keep offline.
   InfoTabPreview(entry: SampleData.folder)
 }
 
@@ -133,6 +132,6 @@ private struct InfoTabPreview: View {
   InfoTabPreview(entry: RemoteEntry(
     origin: "nas@x.example", space: "notes", path: "journal/current",
     kind: .symlink, size: 0, modified: SampleData.day(-4), versions: 1,
-    seq: 91, symlinkTarget: "/Volumes/Big Disk/notes/journal/2026-01-15.md"))
+    symlinkTarget: "/Volumes/Big Disk/notes/journal/2026-01-15.md"))
 }
 #endif

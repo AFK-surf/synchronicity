@@ -14,8 +14,7 @@ run:
 run-release:
 	@Scripts/run-app.sh release
 
-# The unit tests, then the two audits a unit test cannot do — and, between
-# them, the proto check that was the missing link.
+# The protocol contract, unit tests, then the two audits a unit test cannot do.
 #
 # `audit-coverage.sh` counts the registry against Sources/Hecatia/control.proto
 # and says so in its own header: counting that file is counting the daemon
@@ -25,15 +24,13 @@ run-release:
 # and this recipe stayed green through the whole of it, because `check-proto`
 # sat below as a target nothing invoked.
 #
-# Before the audit rather than after it, and fatal on drift: a coverage count
-# taken from a stale proto is not a weaker check, it is a wrong one that
-# reports success. Fatal on drift only, though — a clone with no synchronicity
-# checkout beside it gets a SKIPPED and the rest of this recipe, because a
-# missing sibling is not drift and taking the other two audits down with it
-# would buy nothing.
+# Before compilation rather than after it, and fatal on drift: a coverage count
+# or a generated client taken from a stale proto is not a weaker check, it is a
+# wrong one that reports success. The end-to-end script also proves that a
+# missing canonical monorepo proto and a deliberately drifted copy both fail.
 test:
+	@Scripts/test-proto-sync.sh
 	@. Scripts/env.sh && swift test
-	@Scripts/sync-proto.sh check
 	@Scripts/audit-coverage.sh
 	@Scripts/design-audit.sh
 
