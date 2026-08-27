@@ -778,7 +778,7 @@ own.
 | Bound | Default | Note |
 | --- | --- | --- |
 | Concurrent invocations per socket | 64 | Intersected with `sy_declare_max_streams`. Over it: `Refused{Busy}`. |
-| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound: every worker carrying its cap of invocations refuses new admissions with `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
+| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
 | Endpoint handles per invocation | 16 | Including `SY_SELF`. Also the `sy_poll` array cap. |
 | Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. |

@@ -102,11 +102,7 @@ struct NodeInner {
     /// (`docs/DELTA-SYNC.md` §3.5).
     mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
     /// Socket program bytes, shared across the admissions of one content root.
-    ///
-    /// Sixty-four streams into one socket must not mean sixty-four copies of
-    /// its program. The entries are weak: when the last invocation holding a
-    /// root ends, its bytes are freed and the next admission re-reads them.
-    program_bytes: std::sync::Mutex<std::collections::HashMap<Hash, std::sync::Weak<Vec<u8>>>>,
+    program_bytes: crate::sockets::ProgramBytesCache,
     /// The socket worker pool, or `None` where this build has no eBPF runtime
     /// (`docs/SOCKETS.md` §5.1).
     ///
@@ -736,7 +732,7 @@ impl Node {
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
-                program_bytes: std::sync::Mutex::new(Default::default()),
+                program_bytes: crate::sockets::ProgramBytesCache::new(),
                 sockets: socket_pool,
                 socket_authorization: std::sync::RwLock::new(()),
                 dns: std::sync::Mutex::new(Default::default()),
@@ -807,25 +803,21 @@ impl Node {
         self.inner.sockets.as_ref().is_some_and(|pool| pool.full())
     }
 
-    /// The shared socket-program bytes for `root`, if any live admission
-    /// still holds them.
-    pub(crate) fn socket_program_shared(&self, root: &Hash) -> Option<Arc<Vec<u8>>> {
-        self.inner
-            .program_bytes
-            .lock()
-            .expect("socket program cache")
-            .get(root)
-            .and_then(|weak| weak.upgrade())
+    /// Claims a place in the socket-program cache for `root`: the cached
+    /// bytes if they are already loaded, a seat on an in-flight load if one
+    /// is under way, or the loader role if this admission reads the CAS.
+    pub(crate) fn socket_program_load(&self, root: &Hash) -> crate::sockets::ProgramLoad {
+        self.inner.program_bytes.begin_load(root)
     }
 
-    /// Remembers the socket-program bytes for `root`, so the next admission
-    /// of the same root shares the allocation.
-    pub(crate) fn remember_socket_program(&self, root: Hash, bytes: Arc<Vec<u8>>) {
-        self.inner
-            .program_bytes
-            .lock()
-            .expect("socket program cache")
-            .insert(root, Arc::downgrade(&bytes));
+    /// Publishes a completed (or failed) load to its waiters.
+    pub(crate) fn socket_program_finish(
+        &self,
+        root: Hash,
+        tx: tokio::sync::watch::Sender<Option<std::result::Result<Arc<Vec<u8>>, String>>>,
+        outcome: std::result::Result<Arc<Vec<u8>>, String>,
+    ) {
+        self.inner.program_bytes.finish_load(root, tx, outcome);
     }
 
     /// The limits every socket invocation on this node runs under.

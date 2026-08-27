@@ -343,5 +343,8 @@ fn tree_read_root_and_empty_prefixes_are_refused_as_declarations() {
     assert_eq!(Declaration::parse(&honest.render()), honest);
 
     // The boundary check the docs promise still holds for honest prefixes.
-    assert!(!synch_core::sock::path_prefix_matches("code", "codex/secret"));
+    assert!(!synch_core::sock::path_prefix_matches(
+        "code",
+        "codex/secret"
+    ));
 }

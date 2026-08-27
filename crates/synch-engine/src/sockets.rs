@@ -245,21 +245,37 @@ impl Node {
                 resolved.size, limits.max_program_bytes
             )));
         }
-        if let Some(bytes) = self.socket_program_shared(&resolved.root) {
-            return Ok(bytes);
+        match self.socket_program_load(&resolved.root) {
+            ProgramLoad::Ready(bytes) => Ok(bytes),
+            ProgramLoad::InFlight(mut receiver) => {
+                receiver.wait_for(Option::is_some).await.map_err(|_| {
+                    EngineError::invalid("a concurrent socket program load was interrupted")
+                })?;
+                match receiver.borrow().clone().expect("the loader published") {
+                    Ok(bytes) => Ok(bytes),
+                    Err(text) => Err(EngineError::invalid(text)),
+                }
+            }
+            ProgramLoad::Loader(sender) => {
+                // Its own CAS: the bytes were published by this node, so they
+                // are held here. `ensure_cached` covers the one case where
+                // they are not — a cloud-backed node whose scratch cache has
+                // been replaced.
+                let outcome: ProgramBytes = (async {
+                    self.ensure_blob_cached(&resolved.root, resolved.size)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.cas_backend()
+                        .read_range(resolved.root, 0, resolved.size)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .map(Arc::new)
+                })
+                .await;
+                self.socket_program_finish(resolved.root, sender, outcome.clone());
+                outcome.map_err(EngineError::invalid)
+            }
         }
-        // Its own CAS: the bytes were published by this node, so they are held
-        // here. `ensure_cached` covers the one case where they are not — a
-        // cloud-backed node whose scratch cache has been replaced.
-        self.ensure_blob_cached(&resolved.root, resolved.size)
-            .await?;
-        let bytes = Arc::new(
-            self.cas_backend()
-                .read_range(resolved.root, 0, resolved.size)
-                .await?,
-        );
-        self.remember_socket_program(resolved.root, bytes.clone());
-        Ok(bytes)
     }
 
     /// Builds the policy one invocation runs under.
@@ -658,14 +674,20 @@ impl SocketHost for TreeHost {
         const PAGE: usize = 4096;
         // The scan runs synchronously on the socket worker's thread — the one
         // store access in the host that is not offloaded — so it is bounded
-        // both ways: by how much it may collect, and by how many pages it may
+        // both ways: by how much it may collect, and by how many rows it may
         // walk to collect it. The byte cap is the same footprint budget
         // `sy_list_open` charges the names against afterwards; a listing that
         // would blow it is refused rather than materialized.
+        //
+        // Every scanned row counts toward the row cap, tombstones included:
+        // they are skipped for the collection, but the scan still paid a row
+        // to learn they were there, and a prefix full of them must not be a
+        // way to make the worker walk an unbounded number of pages.
         const MAX_ROWS: usize = 65536;
         let max_bytes = self.node.socket_limits().max_footprint as usize;
         let mut after = None;
         let mut names = Vec::new();
+        let mut scanned = 0usize;
         let mut bytes = 0usize;
         loop {
             let rows = self
@@ -682,12 +704,20 @@ impl SocketHost for TreeHost {
             let done = rows.len() < PAGE;
             after = rows.last().map(|row| row.path.clone());
             for row in rows {
+                scanned += 1;
+                if scanned > MAX_ROWS {
+                    return Err(HostError::NotReadable(
+                        "the listing exceeds a socket invocation's footprint; \
+                         narrow the prefix"
+                            .into(),
+                    ));
+                }
                 if row.kind == EntryKind::Tombstone {
                     continue;
                 }
                 bytes += row.path.len();
                 names.push(row.path);
-                if bytes > max_bytes || names.len() >= MAX_ROWS {
+                if bytes > max_bytes {
                     return Err(HostError::NotReadable(
                         "the listing exceeds a socket invocation's footprint; \
                          narrow the prefix"
@@ -1065,6 +1095,96 @@ pub(crate) fn declare_blocking(elf: &[u8]) -> Result<Declaration> {
     pool::declare(elf, Arc::new(NoTree)).map_err(|e| EngineError::invalid(e.to_string()))
 }
 
+/// How many socket programs the node keeps in memory after their
+/// invocations end.
+///
+/// A bound on the cache's strong entries: each holds up to
+/// `max_program_bytes` (4 MiB), so the whole cache is at most
+/// `MAX_CACHED_PROGRAMS * 4 MiB`. Oldest first, like the workers' compiled-
+/// program cache.
+const MAX_CACHED_PROGRAMS: usize = 4;
+
+/// One root's program bytes, or why the load failed.
+type ProgramBytes = std::result::Result<Arc<Vec<u8>>, String>;
+
+/// The watch channel an in-flight load publishes its outcome on.
+type LoadWatch = tokio::sync::watch::Sender<Option<ProgramBytes>>;
+
+/// What a claim on [`ProgramBytesCache`] for one root came back as.
+pub(crate) enum ProgramLoad {
+    /// The bytes were already loaded; share them.
+    Ready(Arc<Vec<u8>>),
+    /// Another admission is reading this root from the CAS; wait for it.
+    InFlight(tokio::sync::watch::Receiver<Option<ProgramBytes>>),
+    /// This admission is the one that reads the CAS.
+    Loader(LoadWatch),
+}
+
+/// Socket program bytes, shared across the admissions of one content root.
+///
+/// Sixty-four streams into one socket must not mean sixty-four copies of
+/// its program, and the sharing has to survive *concurrent* cold admissions
+/// — the first admission of a root is still reading the CAS while the
+/// fifty-ninth arrives. Two structures make it one copy per root:
+///
+/// * `loading` coalesces those concurrent cold admissions: the first claims
+///   the loader role and publishes the outcome on a watch channel; the rest
+///   subscribe and share the allocation.
+/// * `ready` holds completed programs strongly, FIFO-evicted at
+///   [`MAX_CACHED_PROGRAMS`], so a burst of admissions re-reads nothing and
+///   memory stays bounded now that the entries are not weak.
+#[derive(Debug, Default)]
+pub(crate) struct ProgramBytesCache {
+    inner: std::sync::Mutex<ProgramBytesInner>,
+}
+
+#[derive(Debug, Default)]
+struct ProgramBytesInner {
+    ready: std::collections::HashMap<Hash, Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<Hash>,
+    loading: std::collections::HashMap<Hash, LoadWatch>,
+}
+
+impl ProgramBytesCache {
+    pub(crate) fn new() -> Self {
+        ProgramBytesCache::default()
+    }
+
+    /// Claims the cache for one root: the loaded bytes, a seat on an
+    /// in-flight load, or the loader role. The lock is held only for the
+    /// claim — the CAS read happens outside it, which is what lets the other
+    /// admissions wait on the watch channel instead of on the cache.
+    pub(crate) fn begin_load(&self, root: &Hash) -> ProgramLoad {
+        let mut inner = self.inner.lock().expect("socket program cache");
+        if let Some(bytes) = inner.ready.get(root) {
+            return ProgramLoad::Ready(bytes.clone());
+        }
+        if let Some(sender) = inner.loading.get(root) {
+            return ProgramLoad::InFlight(sender.subscribe());
+        }
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        inner.loading.insert(*root, sender.clone());
+        ProgramLoad::Loader(sender)
+    }
+
+    /// Publishes the outcome of a load to its waiters, and remembers the
+    /// bytes for the next admission.
+    pub(crate) fn finish_load(&self, root: Hash, sender: LoadWatch, outcome: ProgramBytes) {
+        let mut inner = self.inner.lock().expect("socket program cache");
+        inner.loading.remove(&root);
+        if let Ok(bytes) = &outcome {
+            inner.ready.insert(root, bytes.clone());
+            inner.order.push_back(root);
+            while inner.order.len() > MAX_CACHED_PROGRAMS {
+                if let Some(oldest) = inner.order.pop_front() {
+                    inner.ready.remove(&oldest);
+                }
+            }
+        }
+        let _ = sender.send(Some(outcome));
+    }
+}
+
 impl Node {
     /// Keeps a socket's arming record in step with the bytes the scanner just
     /// published (`docs/SOCKETS.md` §3).
@@ -1322,6 +1442,62 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_loads_coalesce_onto_one_allocation() {
+        let cache = ProgramBytesCache::new();
+        let root = Hash::new(b"program");
+
+        // The first claim is the loader.
+        let ProgramLoad::Loader(sender) = cache.begin_load(&root) else {
+            panic!("the first claim should be the loader");
+        };
+        // A concurrent admission of the same root waits on the watch channel
+        // instead of reading the CAS itself.
+        let ProgramLoad::InFlight(receiver) = cache.begin_load(&root) else {
+            panic!("a concurrent claim should be in flight, not a fresh load");
+        };
+        let waiter = tokio::spawn(async move {
+            let mut receiver = receiver;
+            receiver.wait_for(Option::is_some).await.unwrap();
+            let outcome = receiver.borrow().clone();
+            outcome.unwrap().unwrap()
+        });
+
+        // The loader publishes one allocation...
+        let bytes = Arc::new(b"the program".to_vec());
+        cache.finish_load(root, sender, Ok(bytes.clone()));
+        // ...which the waiter shares, pointer and all.
+        let seen = waiter.await.unwrap();
+        assert!(
+            Arc::ptr_eq(&seen, &bytes),
+            "the waiting admission allocated its own copy"
+        );
+
+        // And the next admission is served from the ready cache.
+        let ProgramLoad::Ready(bytes) = cache.begin_load(&root) else {
+            panic!("a loaded root should be ready");
+        };
+        assert_eq!(&*bytes, b"the program");
+    }
+
+    #[test]
+    fn the_ready_cache_is_fifo_bounded() {
+        let cache = ProgramBytesCache::new();
+        for i in 0..MAX_CACHED_PROGRAMS + 4 {
+            let root = Hash::new(format!("program {i}").as_bytes());
+            let (sender, _) = tokio::sync::watch::channel(None);
+            cache.finish_load(root, sender, Ok(Arc::new(vec![i as u8])));
+        }
+        // The oldest roots are gone; the newest are served from memory.
+        let oldest = Hash::new(b"program 0");
+        assert!(
+            !matches!(cache.begin_load(&oldest), ProgramLoad::Ready(_)),
+            "the oldest program was not evicted"
+        );
+        let newest = Hash::new(format!("program {}", MAX_CACHED_PROGRAMS + 3).as_bytes());
+        assert!(matches!(cache.begin_load(&newest), ProgramLoad::Ready(_)));
     }
 
     #[test]

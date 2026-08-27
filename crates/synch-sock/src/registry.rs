@@ -25,9 +25,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use synch_core::{Hash, NodeId};
+use synch_core::{Hash, NodeId, OriginId};
 
 use crate::limits::{FAULT_QUARANTINE, FAULT_WINDOW};
+
+/// The last [`FAULT_WINDOW`] outcomes for one socket's program, each with the
+/// caller's origin.
+type FaultWindow = VecDeque<(OriginId, bool)>;
 
 /// Recent `sy_log` lines kept per socket.
 ///
@@ -123,13 +127,13 @@ struct Live {
 }
 
 /// Everything running, everything just said, and what has been failing.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Registry {
     live: Mutex<BTreeMap<u64, Live>>,
     logs: Mutex<HashMap<String, VecDeque<LogLine>>>,
     /// Per socket, how each of the last [`FAULT_WINDOW`] invocations ended,
-    /// and which caller's device key it ran for. `true` is a fault.
-    faults: Mutex<HashMap<(String, Hash), VecDeque<(NodeId, bool)>>>,
+    /// and which caller's origin it ran for. `true` is a fault.
+    faults: Mutex<HashMap<(String, Hash), FaultWindow>>,
     /// Sockets whose fault history has tripped the threshold and which nobody
     /// has acted on yet.
     ///
@@ -138,6 +142,32 @@ pub struct Registry {
     /// the store, and disarming is a store write. The worker sets it; the
     /// engine takes it and disarms.
     quarantined: Mutex<std::collections::HashSet<(String, Hash)>>,
+    /// How many invocations are admitted across the whole pool, and the
+    /// daemon-wide ceiling on that number.
+    ///
+    /// The pool-wide bound (`docs/SOCKETS.md` §10), taken as a token at
+    /// admission and given back when the invocation ends or the admission is
+    /// dropped. Counting here — not worker load — is what makes it a bound:
+    /// the load counters only move when a worker picks a job up, and
+    /// admissions that have not reached a worker yet would otherwise be
+    /// invisible to each other.
+    pool: AtomicU64,
+    pool_cap: u64,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Registry {
+            live: Mutex::new(BTreeMap::new()),
+            logs: Mutex::new(HashMap::new()),
+            faults: Mutex::new(HashMap::new()),
+            quarantined: Mutex::new(std::collections::HashSet::new()),
+            pool: AtomicU64::new(0),
+            // A registry that is not attached to a pool has no daemon-wide
+            // bound: the pools that matter set one at construction.
+            pool_cap: u64::MAX,
+        }
+    }
 }
 
 impl std::fmt::Debug for Live {
@@ -153,6 +183,14 @@ impl Registry {
     /// A fresh, empty registry.
     pub fn new() -> Arc<Registry> {
         Arc::new(Registry::default())
+    }
+
+    /// A registry with a daemon-wide admission ceiling.
+    pub fn with_pool_cap(pool_cap: u64) -> Arc<Registry> {
+        Arc::new(Registry {
+            pool_cap,
+            ..Registry::default()
+        })
     }
 
     /// Takes a concurrency slot for one invocation, or reports the socket full.
@@ -181,6 +219,17 @@ impl Registry {
         let mut live = self.live.lock().expect("registry");
         let running = live.values().filter(|l| l.socket == socket).count();
         if running >= max_streams {
+            return None;
+        }
+        // The pool token, taken and returned atomically under the same lock
+        // that keeps the live table coherent. Every admission counts, from
+        // any socket, and the token is held until the invocation ends or the
+        // admission is dropped — so concurrent opens across different sockets
+        // cannot walk past the daemon-wide ceiling between the check here and
+        // a worker ever seeing the job.
+        let admitted = self.pool.fetch_add(1, Ordering::Relaxed);
+        if admitted >= self.pool_cap {
+            self.pool.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         let stats = Arc::new(LiveStats::default());
@@ -292,7 +341,7 @@ impl Registry {
     /// is short because the signal is unambiguous.
     ///
     /// Faults are attributed to the caller whose invocation faulted, and the
-    /// threshold fires only when *different* callers are faulting the
+    /// threshold fires only when *different callers* are faulting the
     /// program. The distinction is what keeps one member from disarming a
     /// shared socket for everyone: any input-triggered bug in a program is a
     /// contained fault, and a caller who finds one can repeat it as often as
@@ -301,6 +350,11 @@ impl Registry {
     /// genuinely broken faults for whoever asks, so a second caller's fault
     /// is all the breadth the window needs.
     ///
+    /// Callers are counted by *origin*, not by device key: during a key
+    /// rotation one origin legitimately controls two live keys, and breadth
+    /// counted in keys would let that single caller satisfy the threshold by
+    /// itself. The origin is the identity delegation is built on.
+    ///
     /// The counter is cleared when it fires, so a socket that is re-armed and
     /// still broken gets a full window again rather than tripping on its first
     /// fault forever.
@@ -308,7 +362,7 @@ impl Registry {
         &self,
         socket: &str,
         program: Hash,
-        caller: NodeId,
+        caller: OriginId,
         faulted: bool,
     ) -> bool {
         let mut faults = self.faults.lock().expect("registry faults");
@@ -322,7 +376,7 @@ impl Registry {
         let faulting_callers = ring
             .iter()
             .filter(|(_, faulted)| *faulted)
-            .map(|(caller, _)| *caller)
+            .map(|(caller, _)| caller.clone())
             .collect::<std::collections::HashSet<_>>();
         if failing >= FAULT_QUARANTINE && faulting_callers.len() >= 2 {
             ring.clear();
@@ -366,6 +420,14 @@ impl Registry {
 
     fn release(&self, id: u64) {
         self.live.lock().expect("registry").remove(&id);
+        // The pool token every admission took; the guard that dropped is the
+        // only thing that gives it back.
+        self.pool.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Whether the pool-wide admission ceiling has been reached.
+    pub(crate) fn pool_full(&self) -> bool {
+        self.pool.load(Ordering::Relaxed) >= self.pool_cap
     }
 }
 
@@ -418,20 +480,21 @@ mod tests {
         NodeId::from_bytes(&crate::policy::NOBODY).expect("a valid key")
     }
 
-    /// A second valid device key: the negation of the base point.
-    fn other_key() -> NodeId {
-        let mut bytes = crate::policy::NOBODY;
-        bytes[31] ^= 0x80;
-        NodeId::from_bytes(&bytes).expect("a valid key")
+    fn origin() -> OriginId {
+        OriginId::named("laptop", "cluster.example").unwrap()
     }
 
-    /// The two keys, alternately, so a test that spreads faults across
+    fn other_origin() -> OriginId {
+        OriginId::named("other", "cluster.example").unwrap()
+    }
+
+    /// The two origins, alternately, so a test that spreads faults across
     /// callers does not accidentally trip the breadth rule.
-    fn caller_at(round: usize) -> NodeId {
-        if round % 2 == 0 {
-            key()
+    fn caller_at(round: usize) -> OriginId {
+        if round.is_multiple_of(2) {
+            origin()
         } else {
-            other_key()
+            other_origin()
         }
     }
 
@@ -590,7 +653,7 @@ mod tests {
         assert!(!registry.take_quarantine("code/git.sock", program()));
 
         // And a re-arm clears the record the old program earned.
-        registry.record_outcome("code/other.sock", program(), key(), true);
+        registry.record_outcome("code/other.sock", program(), origin(), true);
         registry.forget("code/other.sock");
         assert!(!registry.take_quarantine("code/other.sock", program()));
     }
@@ -605,17 +668,40 @@ mod tests {
         let registry = Registry::new();
         for i in 0..FAULT_WINDOW * 2 {
             assert!(
-                !registry.record_outcome("code/git.sock", program(), key(), true),
+                !registry.record_outcome("code/git.sock", program(), origin(), true),
                 "a lone caller's fault {i} quarantined the socket"
             );
         }
         assert!(!registry.take_quarantine("code/git.sock", program()));
 
-        // A second caller's genuine fault is the breadth the rule needs:
-        // whatever makes the program fault for two different devices is
-        // broken, not picky.
-        assert!(registry.record_outcome("code/git.sock", program(), other_key(), true));
+        // A second origin's genuine fault is the breadth the rule needs:
+        // whatever makes the program fault for two different origins is
+        // broken, not picky. (Breadth is counted in origins, not device
+        // keys: an origin in a rotation overlap controls several keys and is
+        // still one caller.)
+        assert!(registry.record_outcome("code/git.sock", program(), other_origin(), true));
         assert!(registry.take_quarantine("code/git.sock", program()));
+    }
+
+    #[test]
+    fn the_pool_token_bounds_admissions_across_sockets() {
+        // The daemon-wide ceiling is a pool property: no socket is near its
+        // own cap, yet the pool as a whole refuses once its tokens are out —
+        // and gives one back when an admission ends or is dropped.
+        let registry = Registry::with_pool_cap(2);
+        let first = reserve(&registry, 1, "code/a.sock", 4).unwrap();
+        let second = reserve(&registry, 2, "code/b.sock", 4).unwrap();
+        assert!(
+            reserve(&registry, 3, "code/c.sock", 4).is_none(),
+            "the pool ceiling admitted a third invocation across sockets"
+        );
+        drop(second);
+        assert!(
+            reserve(&registry, 4, "code/c.sock", 4).is_some(),
+            "a released token did not come back"
+        );
+        drop(first);
+        assert!(reserve(&registry, 5, "code/d.sock", 4).is_some());
     }
 
     #[test]

@@ -43,7 +43,7 @@ use crate::{
         Limits, PREEMPTION_INTERVAL, TEARDOWN_DRAIN, THROTTLE_AFTER, THROTTLE_FOR, YIELD_AFTER,
     },
     runtime::{
-        ctx::{Ctx, DECLARE_IDLE, Inner, Slot},
+        ctx::{Ctx, Inner, Slot, DECLARE_IDLE},
         endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
         map::SocketMaps,
     },
@@ -295,7 +295,11 @@ impl WorkerHandle {
         // before the handlers that contain its faults are in place.
         let global = global_env();
         let maps = SocketMaps::new();
-        let registry = crate::registry::Registry::new();
+        // The daemon-wide admission ceiling: every worker's cap of
+        // invocations, in flight or queued, before new admissions are
+        // refused (`docs/SOCKETS.md` §10).
+        let pool_cap = limits.max_streams.saturating_mul(count.max(1)) as u64;
+        let registry = crate::registry::Registry::with_pool_cap(pool_cap);
         let shutdown = Arc::new(ShutdownSignal::default());
         let workers = (0..count)
             .map(|index| {
@@ -346,17 +350,16 @@ impl WorkerHandle {
         self.registry.forget(socket);
     }
 
-    /// Whether every worker is carrying its cap of invocations.
+    /// Whether the pool-wide admission ceiling has been reached.
     ///
-    /// The pool-wide bound that keeps one caller — who may reach every armed
-    /// socket in the cluster — from filling the workers' queues past the
-    /// documented daemon limit. The engine checks it at admission, so an
-    /// over-capacity pool refuses with `Busy` rather than queueing.
+    /// The ceiling is the registry's admission-token count (`docs/SOCKETS.md`
+    /// §10): every admitted invocation holds a token from admission until it
+    /// ends, so the check cannot be walked by opens that have not reached a
+    /// worker yet. The engine refuses with `Busy` when it is reached; the
+    /// registry's own `reserve` enforces the same ceiling atomically, so the
+    /// check here only picks the refusal message.
     pub fn full(&self) -> bool {
-        let cap = self.limits.max_streams as u64;
-        self.workers
-            .iter()
-            .all(|worker| worker.load.load(Ordering::Relaxed) >= cap)
+        self.registry.pool_full()
     }
 
     /// Runs one invocation on the least-loaded worker.
@@ -701,7 +704,10 @@ async fn run_job(
     // while one was scheduled still postpones the ending.
     let idle = async {
         loop {
-            let remaining = inner.deadline.get().saturating_duration_since(Instant::now());
+            let remaining = inner
+                .deadline
+                .get()
+                .saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return;
             }
@@ -789,7 +795,7 @@ async fn run_job(
         registry.record_outcome(
             slot.socket(),
             inner.program_root,
-            inner.peer.device_key,
+            inner.peer.origin.clone(),
             matches!(status, SockStatus::Fault(_)),
         );
     }
@@ -899,14 +905,17 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
     // hook that never polls would otherwise spin past it and hang the arming
     // thread (and, with `--auto`, the scanner) forever.
     let outcome = local.block_on(&runtime, async {
-        tokio::time::timeout(DECLARE_IDLE, program.run(
-            &timeslice,
-            &TokioTimeslicer,
-            SECTION_INIT,
-            &mut resources,
-            &[],
-            &preemption,
-        ))
+        tokio::time::timeout(
+            DECLARE_IDLE,
+            program.run(
+                &timeslice,
+                &TokioTimeslicer,
+                SECTION_INIT,
+                &mut resources,
+                &[],
+                &preemption,
+            ),
+        )
         .await
     });
     match outcome {
