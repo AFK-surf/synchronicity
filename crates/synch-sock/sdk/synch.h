@@ -164,10 +164,40 @@ extern sy_s64 sy_stream_index(void);
 extern sy_s64 sy_read(sy_s64 handle, void *buf, sy_u64 len);
 /* Bytes accepted. A short count is normal and is the backpressure signal. */
 extern sy_s64 sy_write(sy_s64 handle, const void *buf, sy_u64 len);
+/* Moves up to `max` bytes from `from`'s receive side straight into `to`'s send
+ * side, without them passing through this program's memory. Returns the bytes
+ * moved, 0 at a clean EOF on `from`, SY_EAGAIN when neither side could make
+ * progress, or a negative error: `to`'s if the destination is the broken one,
+ * which is checked before any bytes are taken from anywhere, and otherwise
+ * `from`'s, exactly as `sy_read` would have reported it. A destination that has
+ * been shut or closed is SY_EPIPE, which a read alone never returns.
+ *
+ * What `sy_pump` does with a buffer and a remainder, in one call and with
+ * neither. Bytes that do not fit are never picked up: they stay where they
+ * were, so there is nothing to hold between calls and nothing to drop. A short
+ * move is backpressure, exactly as a short write is, and the answer to it is
+ * the same poll.
+ *
+ * Reach for it in either direction of a proxy that does not need to look at
+ * what it forwards, and for `sy_pump` where it does. `max` bounds one call, so
+ * one busy direction cannot monopolise a loop; pass something large to move
+ * whatever the two sides allow. Zero is SY_EINVAL, because zero already means
+ * EOF. Both handles must be endpoints — an object from `sy_open` is read with
+ * `sy_pread`. */
+extern sy_s64 sy_splice(sy_s64 from, sy_s64 to, sy_u64 max);
 extern sy_s64 sy_readable(sy_s64 handle);
 extern sy_s64 sy_writable(sy_s64 handle);
 /* Half-closes the write side once what is buffered has drained. */
 extern sy_s64 sy_shutdown(sy_s64 handle);
+/* Releases the handle. What you had already written to it still goes out: the
+ * write side drains and half-closes in the background, here and again when the
+ * program returns, within one bounded window for the whole teardown. Closing an
+ * endpoint that never finished connecting abandons it instead — there is
+ * nowhere to flush it to.
+ *
+ * Draining endpoints are bounded like open ones: hold more than the outbound
+ * limit of them at once — closing one whose peer has stopped reading, over and
+ * over — and the oldest is dropped where it stands, unsent bytes and all. */
 extern sy_s64 sy_close(sy_s64 handle);
 extern sy_s64 sy_errno(sy_s64 handle);
 
@@ -348,9 +378,11 @@ SY_MAYBE_UNUSED static int sy_pump_blocked(const struct sy_pump *st) {
  * clean EOF on `from`, SY_EAGAIN when it could make no progress, or a negative
  * error.
  *
- * The shape almost every proxying socket wants, written once so it is written
- * right. A short write is backpressure, not failure, and the remainder stays in
- * `buf` under `st` until the next call can place it — which is why `st` and
+ * The shape almost every proxying socket wants that also wants to *see* what
+ * it is proxying, written once so it is written right. Where the bytes are
+ * only passing through, `sy_splice` moves them with no buffer and no remainder
+ * at all. A short write is backpressure, not failure, and the remainder stays
+ * in `buf` under `st` until the next call can place it — which is why `st` and
  * `buf` must be the same pair every time, and why nothing is read while
  * anything is pending. Dropping that remainder is the quiet way to corrupt
  * whatever is being proxied, and it is invisible until the payload is large

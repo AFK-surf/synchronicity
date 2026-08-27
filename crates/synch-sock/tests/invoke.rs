@@ -68,6 +68,55 @@ async fn a_program_echoes_a_stream_and_returns_cleanly() {
     assert_eq!(out, b"hello sockets");
 }
 
+const SPLICE_ECHO: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* Refused before anything moves, and answerable without a buffer either
+     way: zero would have to mean both "moved nothing" and "the source ended",
+     and an object handle is not something a splice can wait on. */
+  if (sy_splice(SY_SELF, SY_SELF, 0) != SY_EINVAL) return 20;
+  if (sy_splice(SY_SELF, 9, 4096) != SY_EBADF) return 21;
+  if (sy_splice(9, SY_SELF, 4096) != SY_EBADF) return 22;
+
+  /* An echo with no buffer at all: the bytes go from the stream's receive
+     side to its send side without this program ever holding one. */
+  for (;;) {
+    struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+    if (sy_poll(fds, 1, 5000) <= 0) return 23;
+    if (fds[0].revents & SY_POLL_ERR) return 24;
+    sy_s64 n = sy_splice(SY_SELF, SY_SELF, 4096);
+    if (n == 0) break;
+    if (n == SY_EAGAIN) {
+      /* Bytes waiting with nowhere to put them: wait for room, not for more.
+         Nothing was picked up, so there is nothing to hold meanwhile. */
+      struct sy_pollfd out[1] = { { SY_SELF, SY_POLL_OUT, 0 } };
+      if (sy_poll(out, 1, 5000) <= 0) return 25;
+      continue;
+    }
+    if (n < 0) return 26;
+  }
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn a_splice_moves_bytes_without_them_entering_the_program() {
+    let elf = compile(SPLICE_ECHO, "splice-echo.c");
+    // A ring smaller than the payload, so the move is short and the loop has
+    // to come back for the rest — the case a dropped remainder would show up
+    // in, if there were a remainder for anybody to drop.
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let payload: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+    let (status, out) = harness::converse(&harness, &elf, payload.clone(), 8192).await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, payload, "a spliced echo lost or reordered bytes");
+}
+
 const POLL_IMMEDIATE_ONE: &str = r#"
 #include <synch.h>
 
@@ -330,6 +379,99 @@ async fn undeclared_egress_is_refused() {
     .await;
     assert_eq!(status, SockStatus::Ok(0));
     assert_eq!(out, b"refused");
+}
+
+const QUEUE_AND_GO: &str = r#"
+#include <synch.h>
+
+SY_INIT_ENTRY sy_s64 declare(void) {
+  sy_declare_name(SY_STR("queue-and-go"));
+  sy_declare_egress(SY_STR("127.0.0.1"), UPSTREAM_PORT);
+  return 0;
+}
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 up = sy_tcp_connect_ip(SY_STR("127.0.0.1"), UPSTREAM_PORT);
+  if (up < 0) return -1;
+  struct sy_pollfd fds[1] = { { up, SY_POLL_OUT, 0 } };
+  if (sy_poll(fds, 1, 5000) <= 0) return -2;
+
+  char chunk[1024];
+  for (sy_u64 i = 0; i < sizeof chunk; i++) chunk[i] = (char)(i % 251);
+
+  /* Fill the whole path — the tx ring, and the host's own send buffer behind
+     it — until a quarter second passes with nothing moving, which is what an
+     upstream that is not reading yet looks like from in here. */
+  sy_s64 total = 0;
+  for (;;) {
+    sy_s64 n = sy_write(up, chunk, sizeof chunk);
+    if (n > 0) { total += n; continue; }
+    if (n != SY_EAGAIN) return -3;
+    struct sy_pollfd out[1] = { { up, SY_POLL_OUT, 0 } };
+    sy_s64 r = sy_poll(out, 1, 250);
+    if (r < 0) return -4;
+    if (r == 0) break;
+  }
+
+  /* And leave immediately, with everything above still queued. Every byte of
+     it was accepted by the host, and the caller was told so. */
+  sy_close(up);
+  return total;
+}
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_program_queued_upstream_survives_the_end_of_the_invocation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().unwrap().port();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        // Nothing is read while the program runs, so what it wrote is still in
+        // the ring and in the send buffer when it returns. An upstream that
+        // read along the way would flush the evidence.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut seen = Vec::new();
+        socket.read_to_end(&mut seen).await.expect("the request");
+        seen
+    });
+
+    let elf = harness::compile_with(
+        QUEUE_AND_GO,
+        "queue-and-go.c",
+        &[("UPSTREAM_PORT", &port.to_string())],
+    );
+    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+        .expect("the program loads");
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::armed(&declared, vec![], None, 64),
+        peer(None),
+        vec![],
+    )
+    .await;
+
+    let SockStatus::Ok(queued) = status else {
+        panic!("the program did not finish: {status:?}");
+    };
+    assert!(queued > 4096, "nothing was queued to test with: {queued}");
+    let seen = upstream.await.unwrap();
+    assert_eq!(
+        seen.len() as i64,
+        queued,
+        "the teardown dropped bytes the host had already accepted"
+    );
+    assert_eq!(
+        &seen[..1024],
+        &(0..1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>()[..]
+    );
 }
 
 const TREE: &str = r#"

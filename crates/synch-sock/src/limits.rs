@@ -78,6 +78,18 @@ pub(crate) const THROTTLE_FOR: Duration = Duration::from_millis(100);
 /// makes a program with no `sy_poll` in it still interruptible.
 pub(crate) const PREEMPTION_INTERVAL: Duration = Duration::from_micros(500);
 
+/// How long a finished invocation may spend getting queued bytes onto the wire.
+///
+/// A program returning is not the same as its last write landing: what it wrote
+/// is in a ring the host owns, and the host told the guest it had taken it. So
+/// every endpoint that still owes bytes — the caller's stream and everything
+/// the program connected to — half-closes and drains before the teardown drops
+/// them, and this is the whole budget for all of it, spent by all of them at
+/// once. It is a bound rather than a promise: an upstream that has stopped
+/// reading would otherwise hold an invocation's concurrency slot open with
+/// nothing to show for it.
+pub(crate) const TEARDOWN_DRAIN: Duration = Duration::from_secs(5);
+
 /// The most bytes one `sy_log` line may carry before it is flushed.
 pub(crate) const MAX_LOG_LINE: usize = 512;
 
