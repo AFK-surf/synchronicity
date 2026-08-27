@@ -20,7 +20,7 @@ mod harness;
 use std::sync::Arc;
 
 use harness::{compile, exchange, peer, Harness};
-use synch_core::{FaultKind, SockStatus};
+use synch_core::{FaultKind, ProcessCapability, SockStatus};
 use synch_sock::{DuplexStream, EffectivePolicy, Limits, SocketId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1344,4 +1344,74 @@ async fn a_short_list_buffer_can_retry_the_same_entry() {
     .await;
     assert_eq!(status, SockStatus::Ok(0));
     assert_eq!(out, b"code/a-long-name");
+}
+
+const PROCESS_STATUS_CONTRACT: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 process = sy_process_spawn(1);
+  if (process < 0) return 70;
+  struct sy_process_status status;
+  for (;;) {
+    sy_s64 result = sy_process_status(process, &status, sizeof status);
+    if (result == 1) break;
+    if (result != SY_EAGAIN) return 71;
+    struct sy_pollfd wait[1] = {{ process, SY_POLL_IN, 0 }};
+    if (sy_poll(wait, 1, 5000) <= 0) return 72;
+  }
+  if (!status.exited || status.signaled || status.exit_code != 0) return 73;
+  if (sy_process_status(process, &status, sizeof status) != 1) return 74;
+  sy_close(process);
+  return 0;
+}
+"#;
+
+const PER_CAPABILITY_PROCESS_LIMIT: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 first = sy_process_spawn(1);
+  if (first < 0) return 80;
+  sy_s64 independent = sy_process_spawn(2);
+  if (independent < 0) return 81;
+  if (sy_process_spawn(1) != SY_ELIMIT) return 82;
+  sy_close(first);
+  sy_close(independent);
+  return 0;
+}
+"#;
+
+fn process_capability(id: u32) -> ProcessCapability {
+    ProcessCapability {
+        id,
+        flags: 0x02,
+        executable: "/bin/sh".into(),
+        argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
+        allowed_signals: 0,
+        max_processes: 1,
+        max_runtime_ms: 5_000,
+        max_memory_bytes: 128 * 1024 * 1024,
+    }
+}
+
+#[tokio::test]
+async fn process_status_uses_eagain_then_one_and_is_repeatable() {
+    let elf = compile(PROCESS_STATUS_CONTRACT, "process-status.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(process_capability(1));
+    let (status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
+async fn process_limits_are_accounted_per_capability() {
+    let elf = compile(PER_CAPABILITY_PROCESS_LIMIT, "process-limits.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(process_capability(1));
+    policy.processes.push(process_capability(2));
+    let (status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(status, SockStatus::Ok(0));
 }

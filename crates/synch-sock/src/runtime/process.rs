@@ -36,6 +36,7 @@ pub(crate) enum Child {
 pub(crate) struct ProcessSlot {
     pub(crate) child: RefCell<Option<Child>>,
     pub(crate) status: RefCell<ProcessStatus>,
+    pub(crate) capability: u32,
     pub(crate) allowed_signals: u64,
     pub(crate) main: i64,
     pub(crate) stderr: Option<i64>,
@@ -89,6 +90,30 @@ impl ProcessSlot {
         // descendants as well as the direct child.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+
+    /// Kills the process group only while this slot still owns the child whose
+    /// pid was observed when a watchdog was armed.
+    ///
+    /// Keeping the child borrowed across `kill` is intentional. A completed
+    /// child that has not yet been reaped still reserves its pid; a child that
+    /// `refresh` already reaped leaves the slot and cannot be mistaken for a
+    /// later process which reused the same numeric pid.
+    pub(crate) fn kill_if_pid(&self, expected: u32) {
+        let child = self.child.borrow();
+        let pid = match child.as_ref() {
+            Some(Child::Pipe(child)) => child.id(),
+            Some(Child::Pty(child)) => Some(child.id()),
+            None => None,
+        };
+        if pid != Some(expected) {
+            return;
+        }
+        if let Ok(pid) = i32::try_from(expected) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
     }
 }
@@ -563,6 +588,40 @@ mod tests {
         assert!(child.wait().await.unwrap().success());
         assert_eq!(output, b"exact-process");
         assert!(error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_watchdog_cannot_signal_after_its_child_was_reaped() {
+        let capability = synch_core::ProcessCapability {
+            id: 7,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 5_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (child, stdout, stdin, stderr) = spawn_pipe(&capability).unwrap();
+        drop((stdout, stdin, stderr));
+        let pid = child.id().unwrap();
+        let slot = ProcessSlot {
+            child: RefCell::new(Some(Child::Pipe(child))),
+            status: RefCell::new(ProcessStatus::default()),
+            capability: capability.id,
+            allowed_signals: 0,
+            main: -1,
+            stderr: None,
+        };
+        loop {
+            if slot.refresh().unwrap().exited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(slot.pid(), None);
+        slot.kill_if_pid(pid);
+        assert_eq!(slot.pid(), None);
     }
 
     #[cfg(target_os = "macos")]

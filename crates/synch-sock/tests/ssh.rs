@@ -216,6 +216,100 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const REQUEST_POLICY: &str = r#"
+#include <synch.h>
+
+static int equal(const char *left, sy_s64 len, const char *right, sy_u64 right_len) {
+  if (len != (sy_s64)right_len) return 0;
+  for (sy_s64 i = 0; i < len; i++) if (left[i] != right[i]) return 0;
+  return 1;
+}
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 50;
+  struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  for (;;) {
+    if (sy_poll(conn, 1, 5000) < 0) return 51;
+    if (conn[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 52;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          if (sy_ssh_channel_accept(event.id) < 0) return 53;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+          char type[64];
+          sy_s64 n = sy_ssh_event_data(event.id, SY_SSH_FIELD_REQUEST_TYPE,
+                                       type, sizeof type);
+          if (n < 0) return 54;
+          sy_u32 result = SY_SSH_REQUEST_FAILURE;
+          if (equal(type, n, "env", 3)) {
+            if (event.flags & SY_SSH_EVENT_WANT_REPLY) return 55;
+            result = SY_SSH_REQUEST_SUCCESS;
+          } else if (equal(type, n, "exec", 4)) {
+            if (!(event.flags & SY_SSH_EVENT_WANT_REPLY)) return 56;
+          } else if (equal(type, n, "x11-req", 7)) {
+            if (event.a != 7 || event.b != 1) return 57;
+            result = SY_SSH_REQUEST_SUCCESS;
+          } else if (equal(type, n, "auth-agent-req@openssh.com", 26)) {
+            result = SY_SSH_REQUEST_SUCCESS;
+          }
+          if (sy_ssh_request_reply(event.id, result) < 0) return 58;
+        } else if (sy_ssh_event_done(event.id) < 0) {
+          return 59;
+        }
+      }
+    }
+    if (conn[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
+const LANE_CLOSE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 60;
+  sy_s64 channel = -1;
+  struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  sy_u64 count = 1;
+  for (;;) {
+    if (sy_poll(fds, count, 5000) < 0) return 61;
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 62;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          channel = sy_ssh_channel_accept(event.id);
+          if (channel < 0) return 63;
+          fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
+          count = 2;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+          sy_s64 lane = sy_ssh_channel_lane(channel, SY_SSH_EXTENDED_STDERR);
+          if (lane < 0 || sy_close(lane) < 0) return 64;
+          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+            return 65;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_EXTENDED_DATA) {
+          if (event.fd != channel || event.a != SY_SSH_EXTENDED_STDERR) return 66;
+          if (sy_ssh_event_done(event.id) < 0) return 67;
+        } else if (sy_ssh_event_done(event.id) < 0) {
+          return 68;
+        }
+      }
+    }
+    if (count == 2 && (fds[1].revents & SY_POLL_IN)) {
+      char buffer[64];
+      sy_s64 n = sy_read(channel, buffer, sizeof buffer);
+      if (n > 0 && sy_write(channel, buffer, (sy_u64)n) != n) return 69;
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
 #[derive(Clone)]
 struct Client;
 
@@ -322,6 +416,116 @@ async fn none_auth_and_multiple_session_channels_share_one_connection() {
 }
 
 #[tokio::test]
+async fn pipelined_request_replies_retain_their_own_want_reply_bit() {
+    let elf = compile(REQUEST_POLICY, "ssh-request-policy.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let mut channel = client.channel_open_session().await.unwrap();
+
+    channel.set_env(false, "IGNORED", "yes").await.unwrap();
+    channel.exec(true, b"must-fail".to_vec()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+            .await
+            .unwrap(),
+        Some(russh::ChannelMsg::Failure)
+    ));
+    channel
+        .request_x11(true, true, "MIT-MAGIC-COOKIE-1", "00", 7)
+        .await
+        .expect("X11 request reached eBPF and was accepted");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+            .await
+            .unwrap(),
+        Some(russh::ChannelMsg::Success)
+    ));
+    channel
+        .agent_forward(true)
+        .await
+        .expect("agent request reached eBPF and was accepted");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+            .await
+            .unwrap(),
+        Some(russh::ChannelMsg::Success)
+    ));
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
+async fn closing_an_extended_data_lane_does_not_close_the_connection() {
+    let elf = compile(LANE_CLOSE, "ssh-lane-close.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    channel.request_shell(true).await.unwrap();
+    channel
+        .extended_data_bytes(1, b"discard me".as_slice())
+        .await
+        .unwrap();
+    assert_eq!(
+        round_trip(channel.into_stream(), b"connection survived").await,
+        b"connection survived"
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
 async fn public_key_auth_can_consult_authorized_keys_in_the_virtual_tree() {
     use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 
@@ -408,6 +612,71 @@ async fn sftp_runs_as_a_declared_backend_over_an_ordinary_channel() {
         .await
         .unwrap();
     assert_eq!(sftp.read("hello.txt").await.unwrap(), b"hello over sftp");
+    drop(sftp);
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
+async fn sftp_directory_reads_are_paginated_and_complete() {
+    let owned: Vec<(String, String)> = (0..300)
+        .map(|index| (format!("files/item-{index:03}"), format!("body-{index}")))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    let elf = compile(SFTP_SERVER, "ssh-sftp-list.c");
+    let harness = Harness::with_tree(&borrowed);
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let mut policy = EffectivePolicy::default();
+    policy.file_transfers.push(FileTransferCapability {
+        id: 1,
+        protocol: 1,
+        access: 0x01 | 0x04,
+        scope: "files".into(),
+    });
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        policy,
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    channel.request_subsystem(true, "sftp").await.unwrap();
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .unwrap();
+    let mut entries = sftp
+        .read_dir(".")
+        .await
+        .unwrap()
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries.len(), 300);
+    assert_eq!(entries.first().map(String::as_str), Some("item-000"));
+    assert_eq!(entries.last().map(String::as_str), Some("item-299"));
     drop(sftp);
 
     client

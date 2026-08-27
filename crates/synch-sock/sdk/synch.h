@@ -334,6 +334,8 @@ struct sy_process_status {
   char signal[32];
   sy_u32 signal_len;
 };
+/* Returns SY_EAGAIN while running and 1 after filling `out`; terminal status
+ * is repeatable until the process handle is closed. */
 extern sy_s64 sy_process_status(sy_s64 process,
                                 struct sy_process_status *out,
                                 sy_u64 out_len);

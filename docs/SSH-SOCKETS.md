@@ -971,6 +971,13 @@ authority. As §1.2 explains, it does not claim that an armed program lacking
 the service is unable to export bytes manually through the existing `sy_open`
 API.
 
+Directory enumeration is paged from the virtual-tree storage API upward. An
+open directory handle retains only its storage cursor and last emitted child,
+never a complete subtree. Each `readdir` response is bounded to 64 entries and
+64 KiB of conservatively estimated encoded data, and scans at most 32 pages of
+128 storage rows. A directory whose next child cannot be found within that
+work bound fails the request instead of consuming unbounded memory or CPU.
+
 SFTP support is separate from the SSH adapter. A guest may implement a small
 subsystem itself or proxy a session to a declared TCP backend before the
 built-in SFTP service exists.
@@ -1045,6 +1052,7 @@ Proposed initial bounds:
 | Authentication attempts | 8 | disconnect |
 | Authentication decision | 60 s | disconnect |
 | `authorized_keys` object | 256 KiB, 16 KiB per line | matcher returns `SY_ELIMIT`; no prefix match is accepted |
+| SFTP directory response | 64 entries, 64 KiB, 4096 scanned storage rows | enumeration continues from its bounded cursor or fails closed at the scan bound |
 | SSH packet size | conservative library configuration, at most 64 KiB initially | protocol error |
 | SSH connection idle | existing invocation idle deadline | invocation ends `Deadline` |
 

@@ -792,6 +792,21 @@ pub trait Handler: Sized {
         async { Ok(false) }
     }
 
+    /// Variant of [`Handler::agent_request`] that permits a handler to retain
+    /// the request's reply right and answer asynchronously. Returning `None`
+    /// means the handler took responsibility for the reply; the default keeps
+    /// the upstream immediate boolean behavior.
+    fn agent_request_deferred(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> impl Future<Output = Result<Option<bool>, Self::Error>> + Send
+    where
+        Self: Send,
+    {
+        async move { self.agent_request(channel, session).await.map(Some) }
+    }
+
     /// The client is sending a signal (usually to pass to the
     /// currently running process).
     #[allow(unused_variables)]

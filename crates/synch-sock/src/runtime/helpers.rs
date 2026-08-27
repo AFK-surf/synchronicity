@@ -1424,7 +1424,9 @@ fn process_capacity(inner: &Inner, capability: &synch_core::ProcessCapability) -
         .slots
         .borrow()
         .iter()
-        .filter(|slot| matches!(slot, Some(Slot::Process(_))))
+        .filter(|slot| {
+            matches!(slot, Some(Slot::Process(process)) if process.capability == capability.id)
+        })
         .count() as u64;
     let limit = if capability.max_processes == 0 {
         crate::runtime::process::DEFAULT_MAX_PROCESSES
@@ -1577,6 +1579,7 @@ fn h_process_spawn_pty(
     let process = Rc::new(crate::runtime::process::ProcessSlot {
         child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pty(child))),
         status: std::cell::RefCell::new(Default::default()),
+        capability: capability.id,
         allowed_signals: capability.allowed_signals,
         main: pty.endpoint,
         stderr: None,
@@ -1658,6 +1661,7 @@ fn h_process_spawn(
     let process = Rc::new(crate::runtime::process::ProcessSlot {
         child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pipe(child))),
         status: std::cell::RefCell::new(Default::default()),
+        capability: capability.id,
         allowed_signals: capability.allowed_signals,
         main,
         stderr: Some(stderr_handle),
@@ -1689,10 +1693,11 @@ fn schedule_process_deadline(
         max_runtime_ms.min(crate::runtime::process::DEFAULT_MAX_RUNTIME_MS)
     };
     let Some(pid) = process.pid() else { return };
+    let process = Rc::downgrade(process);
     inner.spawn(async move {
         tokio::time::sleep(Duration::from_millis(max_runtime_ms)).await;
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+        if let Some(process) = process.upgrade() {
+            process.kill_if_pid(pid);
         }
     });
 }
@@ -1793,6 +1798,9 @@ fn h_process_status(
         Ok(status) => status,
         Err(error) => return ret(error),
     };
+    if !status.exited {
+        return ret(errno::EAGAIN);
+    }
     let Ok(mut region) = scope.user_memory_mut(out, PROCESS_STATUS_SIZE) else {
         return ret(errno::EINVAL);
     };
@@ -1811,7 +1819,7 @@ fn h_process_status(
         region[16..16 + n].copy_from_slice(&bytes[..n]);
         region[48..52].copy_from_slice(&(n as u32).to_le_bytes());
     }
-    ret(0)
+    ret(1)
 }
 
 fn h_process_signal(
@@ -2276,6 +2284,8 @@ fn h_pread(
 }
 
 fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    const PAGE_ENTRIES: usize = 256;
+    const MAX_LIST_PAGES: usize = 256;
     let prefix = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&prefix) {
         return ret(errno::EINVAL);
@@ -2284,21 +2294,52 @@ fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) 
     if inner.init_mode {
         return ret(errno::EPERM);
     }
-    let names = match inner.host.list(&prefix) {
-        Ok(names) => names,
-        Err(e) => return ret(host_errno(&e)),
-    };
-    // Charged at the same rate the release pays back
-    // (`CursorSlot::footprint`): each entry costs its name's bytes plus the
-    // per-entry host overhead — the `String` header and the heap allocation
-    // behind it. A name-byte sum alone would let a listing of short names
-    // hold several times the footprint the meter reports.
-    let bytes: u64 = names
-        .iter()
-        .map(|n| n.len() as u64 + CURSOR_ENTRY_OVERHEAD)
-        .sum();
-    if inner.charge(bytes).is_err() {
-        return ret(errno::ELIMIT);
+    let mut names = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut bytes = 0u64;
+    let mut pages = 0usize;
+    loop {
+        if pages == MAX_LIST_PAGES {
+            inner.release(bytes);
+            return ret(errno::ELIMIT);
+        }
+        pages += 1;
+        let page = match inner
+            .host
+            .list_page(&prefix, cursor.as_deref(), PAGE_ENTRIES)
+        {
+            Ok(page) if page.entries.len() <= PAGE_ENTRIES => page,
+            Ok(_) => {
+                inner.release(bytes);
+                return ret(errno::ECONNRESET);
+            }
+            Err(error) => {
+                inner.release(bytes);
+                return ret(host_errno(&error));
+            }
+        };
+        let page_bytes = page
+            .entries
+            .iter()
+            .fold(0u64, |total, name| {
+                total.saturating_add(name.len() as u64 + CURSOR_ENTRY_OVERHEAD)
+            });
+        if inner.charge(page_bytes).is_err() {
+            inner.release(bytes);
+            return ret(errno::ELIMIT);
+        }
+        bytes = bytes.saturating_add(page_bytes);
+        names.extend(page.entries);
+        match page.next {
+            Some(next) if cursor.as_ref().is_none_or(|before| next > *before) => {
+                cursor = Some(next);
+            }
+            Some(_) => {
+                inner.release(bytes);
+                return ret(errno::ECONNRESET);
+            }
+            None => break,
+        }
     }
     let slot = CursorSlot {
         names,

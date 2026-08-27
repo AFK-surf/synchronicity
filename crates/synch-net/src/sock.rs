@@ -585,7 +585,12 @@ mod tests {
             Err(HostError::NotFound)
         }
 
-        fn list(&self, _prefix: &str) -> Result<Vec<String>, HostError> {
+        fn list_page(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _limit: usize,
+        ) -> Result<synch_sock::ListPage, HostError> {
             Err(HostError::NotFound)
         }
 

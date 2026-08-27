@@ -1486,11 +1486,14 @@ impl Session {
                         }
                         debug!("handler.agent_request {channel_num:?}");
 
-                        let response = handler.agent_request(channel_num, self).await?;
-                        if response {
-                            self.request_success()
-                        } else {
-                            self.request_failure()
+                        if let Some(response) =
+                            handler.agent_request_deferred(channel_num, self).await?
+                        {
+                            if response {
+                                self.channel_success(channel_num)?;
+                            } else {
+                                self.channel_failure(channel_num)?;
+                            }
                         }
                         Ok(())
                     }

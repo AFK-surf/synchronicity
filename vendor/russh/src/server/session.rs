@@ -88,6 +88,10 @@ pub enum Msg {
         language_tag: String,
     },
     Channel(ChannelId, ChannelMsg),
+    ChannelRequestReply {
+        channel: ChannelId,
+        success: bool,
+    },
     ChannelOpenReply {
         pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
@@ -117,6 +121,41 @@ pub struct Handle {
     pub(crate) priority_sender: UnboundedSender<Msg>,
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+}
+
+/// The reply right for one inbound channel request.
+///
+/// Unlike [`Session::channel_success`] and [`Session::channel_failure`], this
+/// token retains the `want-reply` bit from the packet that created it. It may
+/// therefore be used after the handler returns, even when later requests have
+/// arrived on the same channel.
+#[derive(Debug)]
+pub struct ChannelRequestReply {
+    handle: Handle,
+    channel: ChannelId,
+    wants_reply: bool,
+}
+
+impl ChannelRequestReply {
+    /// Whether this request asked for a reply on the wire.
+    pub fn wants_reply(&self) -> bool {
+        self.wants_reply
+    }
+
+    /// Completes this request. No packet is sent when `want-reply` was false.
+    pub async fn reply(self, success: bool) -> Result<(), ()> {
+        if !self.wants_reply {
+            return Ok(());
+        }
+        self.handle
+            .sender
+            .send(Msg::ChannelRequestReply {
+                channel: self.channel,
+                success,
+            })
+            .await
+            .map_err(|_| ())
+    }
 }
 
 impl Handle {
@@ -540,6 +579,9 @@ impl Session {
             Msg::Channel(id, ChannelMsg::Failure) => {
                 self.channel_failure(id)?;
             }
+            Msg::ChannelRequestReply { channel, success } => {
+                self.channel_request_reply(channel, success)?;
+            }
             Msg::Channel(id, ChannelMsg::XonXoff { client_can_do }) => {
                 self.xon_xoff_request(id, client_can_do)?;
             }
@@ -879,6 +921,29 @@ impl Session {
         self.sender.clone()
     }
 
+    /// Takes the reply right for the channel request currently being handled.
+    ///
+    /// A handler that answers asynchronously must call this before returning
+    /// from its request callback. This detaches the packet's `want-reply` bit
+    /// from mutable per-channel parser state.
+    pub fn take_channel_request_reply(
+        &mut self,
+        id: ChannelId,
+    ) -> Result<ChannelRequestReply, Error> {
+        let wants_reply = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|encrypted| encrypted.channels.get_mut(&id))
+            .ok_or(Error::WrongChannel)?;
+        let wants_reply = std::mem::take(&mut wants_reply.wants_reply);
+        Ok(ChannelRequestReply {
+            handle: self.handle(),
+            channel: id,
+            wants_reply,
+        })
+    }
+
     pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
         if let Some(ref enc) = self.common.encrypted {
             if let Some(channel) = enc.channels.get(channel) {
@@ -1044,6 +1109,30 @@ impl Session {
                         channel.recipient_channel.encode(&mut enc.write)?;
                     })
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends the reply represented by a detached channel-request token.
+    fn channel_request_reply(
+        &mut self,
+        channel: ChannelId,
+        success: bool,
+    ) -> Result<(), crate::Error> {
+        if let Some(ref mut encrypted) = self.common.encrypted {
+            if let Some(channel) = encrypted.channels.get(&channel) {
+                if !channel.confirmed {
+                    return Err(crate::Error::WrongChannel);
+                }
+                push_packet!(encrypted.write, {
+                    encrypted.write.push(if success {
+                        msg::CHANNEL_SUCCESS
+                    } else {
+                        msg::CHANNEL_FAILURE
+                    });
+                    channel.recipient_channel.encode(&mut encrypted.write)?;
+                });
             }
         }
         Ok(())

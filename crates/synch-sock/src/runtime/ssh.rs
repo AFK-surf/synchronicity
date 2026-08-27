@@ -378,7 +378,7 @@ impl SshState {
         self.lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|(parent, _), _| *parent != fd);
+            .retain(|(parent, _), (lane, _)| *parent != fd && *lane != fd);
         self.discarded_lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -478,6 +478,24 @@ impl SshState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(fd, data_type))
             .map(|(_, sender)| sender.clone())
+    }
+
+    fn remove_lane_if(
+        &self,
+        fd: i64,
+        data_type: u32,
+        expected: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lanes
+            .get(&(fd, data_type))
+            .is_some_and(|(_, current)| current.same_channel(expected))
+        {
+            lanes.remove(&(fd, data_type));
+        }
     }
 
     fn extended_event(&self, fd: i64, data_type: u32) -> Option<u64> {
@@ -670,15 +688,23 @@ impl SshHandler {
         dims: [u32; 4],
         session: &mut Session,
     ) -> Result<(), russh::Error> {
+        let reply = session.take_channel_request_reply(channel)?;
         let Some(fd) = self.state.fd_for_channel(channel) else {
-            session.channel_failure(channel)?;
+            reply
+                .reply(false)
+                .await
+                .map_err(|_| russh::Error::Disconnect)?;
             return Ok(());
         };
         let mut event = Event {
             id: 0,
             fd,
             kind: EVENT_CHANNEL_REQUEST,
-            flags: EVENT_WANT_REPLY,
+            flags: if reply.wants_reply() {
+                EVENT_WANT_REPLY
+            } else {
+                0
+            },
             a: dims[0],
             b: dims[1],
             c: dims[2],
@@ -692,22 +718,21 @@ impl SshHandler {
             .insert(FIELD_REQUEST_TYPE, request_type.as_bytes().to_vec());
         let (tx, rx) = oneshot::channel();
         event.response = Some(tx);
-        let handle = session.handle();
         let state = self.state.clone();
         let order = state.request_order(channel);
         self.state.spawn(async move {
             let _ordered = order.lock().await;
             let Ok(event_id) = state.push(event) else {
-                let _ = handle.channel_failure(channel).await;
+                let _ = reply.reply(false).await;
                 return;
             };
             match tokio::time::timeout(Duration::from_secs(60), rx).await {
                 Ok(Ok(Decision::Request(true))) => {
-                    let _ = handle.channel_success(channel).await;
+                    let _ = reply.reply(true).await;
                 }
                 _ => {
                     state.cancel_event(event_id);
-                    let _ = handle.channel_failure(channel).await;
+                    let _ = reply.reply(false).await;
                 }
             }
         });
@@ -957,11 +982,20 @@ impl Handler for SshHandler {
         let Some(fd) = self.state.fd_for_channel(channel) else {
             return Ok(());
         };
+        let mut data = data.to_vec();
         if let Some(lane) = self.state.lane(fd, data_type) {
-            lane.send(data.to_vec())
-                .await
-                .map_err(|_| russh::Error::Disconnect)?;
-            return Ok(());
+            let expected = lane.clone();
+            match lane.send(data).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // The guest may close a lane independently of its parent.
+                    // Treat a racing send exactly like the next packet after
+                    // that close: forget the stale mapping and offer the bytes
+                    // through a fresh extended-data event.
+                    self.state.remove_lane_if(fd, data_type, &expected);
+                    data = error.0;
+                }
+            }
         }
         if self.state.lane_discarded(fd, data_type) {
             return Ok(());
@@ -984,7 +1018,6 @@ impl Handler for SshHandler {
             })
             .map_err(|_| russh::Error::Disconnect)?;
         let state = self.state.clone();
-        let data = data.to_vec();
         self.state.spawn(async move {
             if tokio::time::timeout(Duration::from_secs(60), rx)
                 .await
@@ -1034,6 +1067,32 @@ impl Handler for SshHandler {
             fields,
             Some(pty),
             [columns, rows, pixel_width, pixel_height],
+            session,
+        )
+        .await
+    }
+
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        single_connection: bool,
+        authentication_protocol: &str,
+        authentication_cookie: &str,
+        screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let mut payload = vec![u8::from(single_connection)];
+        encode_ssh_string(&mut payload, authentication_protocol.as_bytes());
+        encode_ssh_string(&mut payload, authentication_cookie.as_bytes());
+        payload.extend_from_slice(&screen_number.to_be_bytes());
+        let mut fields = BTreeMap::new();
+        fields.insert(FIELD_REQUEST_DATA, payload);
+        self.request(
+            channel,
+            "x11-req",
+            fields,
+            None,
+            [screen_number, u32::from(single_connection), 0, 0],
             session,
         )
         .await
@@ -1106,6 +1165,23 @@ impl Handler for SshHandler {
         .await
     }
 
+    async fn agent_request_deferred(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<Option<bool>, Self::Error> {
+        self.request(
+            channel,
+            "auth-agent-req@openssh.com",
+            BTreeMap::new(),
+            None,
+            [0; 4],
+            session,
+        )
+        .await?;
+        Ok(None)
+    }
+
     async fn signal(
         &mut self,
         channel: ChannelId,
@@ -1140,10 +1216,29 @@ impl Handler for SshHandler {
         payload: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let dims = match unknown_request_dimensions(request_type, payload) {
+            Ok(dims) => dims,
+            Err(()) => {
+                session
+                    .take_channel_request_reply(channel)?
+                    .reply(false)
+                    .await
+                    .map_err(|_| russh::Error::Disconnect)?;
+                return Ok(());
+            }
+        };
         let mut fields = BTreeMap::new();
         fields.insert(FIELD_REQUEST_DATA, payload.to_vec());
-        self.request(channel, request_type, fields, None, [0; 4], session)
+        self.request(channel, request_type, fields, None, dims, session)
             .await
+    }
+}
+
+fn unknown_request_dimensions(request_type: &str, payload: &[u8]) -> Result<[u32; 4], ()> {
+    match (request_type, payload) {
+        ("break", [a, b, c, d]) => Ok([u32::from_be_bytes([*a, *b, *c, *d]), 0, 0, 0]),
+        ("break", _) => Err(()),
+        _ => Ok([0; 4]),
     }
 }
 
@@ -1278,4 +1373,22 @@ pub(crate) async fn serve(
 
 pub(crate) fn generate_host_key() -> Result<PrivateKey, russh::keys::ssh_key::Error> {
     PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unknown_request_dimensions;
+
+    #[test]
+    fn break_requests_expose_their_typed_duration() {
+        assert_eq!(
+            unknown_request_dimensions("break", &12_345u32.to_be_bytes()),
+            Ok([12_345, 0, 0, 0])
+        );
+        assert_eq!(
+            unknown_request_dimensions("other", &[0, 0, 0, 1]),
+            Ok([0; 4])
+        );
+        assert_eq!(unknown_request_dimensions("break", &[0, 1]), Err(()));
+    }
 }

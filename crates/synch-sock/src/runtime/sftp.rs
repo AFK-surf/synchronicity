@@ -6,17 +6,29 @@ use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 
-use crate::{HostError, ObjectInfo, SocketHost};
+use crate::{HostError, ListPage, ObjectInfo, SocketHost};
 
 const ACCESS_READ: u32 = 0x01;
 const ACCESS_RECURSIVE: u32 = 0x04;
 const MAX_READ: u32 = 64 * 1024;
 const MAX_OPEN_HANDLES: usize = 64;
+const LIST_PAGE_ENTRIES: usize = 128;
+const MAX_READDIR_ENTRIES: usize = 64;
+const MAX_READDIR_BYTES: usize = 64 * 1024;
+const MAX_READDIR_PAGES: usize = 32;
+
+#[derive(Debug)]
+struct DirectoryCursor {
+    prefix: String,
+    after: Option<String>,
+    last_child: Option<String>,
+    eof: bool,
+}
 
 #[derive(Debug)]
 enum OpenHandle {
     File(ObjectInfo),
-    Directory { entries: Vec<File>, read: bool },
+    Directory(DirectoryCursor),
 }
 
 pub(crate) struct TreeSftp {
@@ -79,12 +91,114 @@ impl TreeSftp {
             .map_err(host_error)
     }
 
-    async fn list(&self, prefix: String) -> Result<Vec<String>, StatusCode> {
+    async fn list(&self, prefix: String, after: Option<String>) -> Result<ListPage, StatusCode> {
         let host = self.host.clone();
-        tokio::task::spawn_blocking(move || host.list(&prefix))
-            .await
-            .map_err(|_| StatusCode::Failure)?
-            .map_err(host_error)
+        tokio::task::spawn_blocking(move || {
+            host.list_page(&prefix, after.as_deref(), LIST_PAGE_ENTRIES)
+        })
+        .await
+        .map_err(|_| StatusCode::Failure)?
+        .map_err(host_error)
+    }
+
+    async fn read_directory(
+        &self,
+        id: u32,
+        cursor: &mut DirectoryCursor,
+    ) -> Result<Name, StatusCode> {
+        if cursor.eof {
+            return Err(StatusCode::Eof);
+        }
+        let start = format!("{}/", cursor.prefix);
+        let mut files = Vec::new();
+        let mut response_bytes = 0usize;
+
+        for _ in 0..MAX_READDIR_PAGES {
+            let page = self
+                .list(cursor.prefix.clone(), cursor.after.clone())
+                .await?;
+            if page.entries.len() > LIST_PAGE_ENTRIES
+                || page
+                    .next
+                    .as_ref()
+                    .is_some_and(|next| cursor.after.as_ref().is_some_and(|after| next <= after))
+            {
+                return Err(StatusCode::Failure);
+            }
+
+            let mut consumed_page = true;
+            for full in page.entries {
+                if cursor.after.as_ref().is_some_and(|after| full <= *after) {
+                    return Err(StatusCode::Failure);
+                }
+                let Some(rest) = full.strip_prefix(&start) else {
+                    cursor.after = Some(full);
+                    continue;
+                };
+                let Some(name) = rest.split('/').next() else {
+                    cursor.after = Some(full);
+                    continue;
+                };
+                if name.is_empty() || cursor.last_child.as_deref() == Some(name) {
+                    cursor.after = Some(full);
+                    continue;
+                }
+                let encoded_bound = name.len().saturating_mul(2).saturating_add(256);
+                if !files.is_empty()
+                    && (files.len() >= MAX_READDIR_ENTRIES
+                        || response_bytes.saturating_add(encoded_bound) > MAX_READDIR_BYTES)
+                {
+                    consumed_page = false;
+                    break;
+                }
+                if encoded_bound > MAX_READDIR_BYTES {
+                    return Err(StatusCode::Failure);
+                }
+                let child = format!("{start}{name}");
+                let attributes = match self.open_info(child).await {
+                    Ok(info) => attrs(&info),
+                    Err(_) => {
+                        let mut attrs = FileAttributes {
+                            permissions: Some(0o040555),
+                            ..Default::default()
+                        };
+                        attrs.set_dir(true);
+                        attrs
+                    }
+                };
+                response_bytes = response_bytes.saturating_add(encoded_bound);
+                files.push(File::new(name, attributes));
+                cursor.last_child = Some(name.to_string());
+                cursor.after = Some(full);
+            }
+
+            if !consumed_page {
+                break;
+            }
+            match page.next {
+                Some(next) => cursor.after = Some(next),
+                None => {
+                    cursor.eof = true;
+                    break;
+                }
+            }
+            if files.len() >= MAX_READDIR_ENTRIES || response_bytes >= MAX_READDIR_BYTES {
+                break;
+            }
+        }
+
+        if files.is_empty() {
+            if cursor.eof {
+                Err(StatusCode::Eof)
+            } else {
+                // A pathological directory can contain an enormous nested
+                // subtree under one child. Bound work per request rather than
+                // scanning it all merely to discover the next sibling.
+                Err(StatusCode::Failure)
+            }
+        } else {
+            Ok(Name { id, files })
+        }
     }
 }
 
@@ -213,53 +327,26 @@ impl russh_sftp::server::Handler for TreeSftp {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let prefix = self.path(&path)?;
-        let listed = self.list(prefix.clone()).await?;
-        let start = format!("{prefix}/");
-        let mut entries = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for full in listed {
-            let Some(rest) = full.strip_prefix(&start) else {
-                continue;
-            };
-            let Some(name) = rest.split('/').next() else {
-                continue;
-            };
-            if name.is_empty() || !seen.insert(name.to_string()) {
-                continue;
-            }
-            let child = format!("{start}{name}");
-            let attributes = match self.open_info(child).await {
-                Ok(info) => attrs(&info),
-                Err(_) => {
-                    let mut attrs = FileAttributes {
-                        permissions: Some(0o040555),
-                        ..Default::default()
-                    };
-                    attrs.set_dir(true);
-                    attrs
-                }
-            };
-            entries.push(File::new(name, attributes));
-        }
-        let handle = self.allocate(OpenHandle::Directory {
-            entries,
-            read: false,
-        })?;
+        let handle = self.allocate(OpenHandle::Directory(DirectoryCursor {
+            prefix,
+            after: None,
+            last_child: None,
+            eof: false,
+        }))?;
         Ok(Handle { id, handle })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        match self.handles.get_mut(&handle) {
-            Some(OpenHandle::Directory { read, .. }) if *read => Err(StatusCode::Eof),
-            Some(OpenHandle::Directory { entries, read }) => {
-                *read = true;
-                Ok(Name {
-                    id,
-                    files: entries.clone(),
-                })
-            }
-            _ => Err(StatusCode::Failure),
-        }
+        let Some(open) = self.handles.remove(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        let OpenHandle::Directory(mut cursor) = open else {
+            self.handles.insert(handle, open);
+            return Err(StatusCode::Failure);
+        };
+        let result = self.read_directory(id, &mut cursor).await;
+        self.handles.insert(handle, OpenHandle::Directory(cursor));
+        result
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
