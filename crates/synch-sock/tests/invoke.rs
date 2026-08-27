@@ -405,7 +405,18 @@ SY_ENTRY sy_s64 entry(void) {
   sy_s64 total = 0;
   for (;;) {
     sy_s64 n = sy_write(up, chunk, sizeof chunk);
-    if (n > 0) { total += n; continue; }
+    if (n > 0) {
+      total += n;
+      /* The stall below is the interesting way out, and on any machine that
+         fills before the upstream starts reading it is the one taken. This is
+         the other one: an upstream that began draining first would keep the
+         write above succeeding forever, and a loop whose only exit is "nothing
+         moved" would never reach it. The cap costs nothing when the stall
+         happens and is the difference between a slow machine and a hung one
+         when it does not. */
+      if (total >= 32 * 1024 * 1024) break;
+      continue;
+    }
     if (n != SY_EAGAIN) return -3;
     struct sy_pollfd out[1] = { { up, SY_POLL_OUT, 0 } };
     sy_s64 r = sy_poll(out, 1, 250);
@@ -431,6 +442,14 @@ async fn what_a_program_queued_upstream_survives_the_end_of_the_invocation() {
         // Nothing is read while the program runs, so what it wrote is still in
         // the ring and in the send buffer when it returns. An upstream that
         // read along the way would flush the evidence.
+        //
+        // The wait has to land inside the teardown drain, not after it: the
+        // drain runs before `exchange` returns and gives up after
+        // `TEARDOWN_DRAIN`, so an upstream that only started reading once the
+        // invocation was over would find the window shut and the tail dropped
+        // — by design, and with nothing left to assert against. Half a second
+        // against a five-second window leaves that margin whichever way the
+        // fill above went.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let mut seen = Vec::new();
         socket.read_to_end(&mut seen).await.expect("the request");

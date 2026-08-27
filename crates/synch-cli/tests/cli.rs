@@ -487,3 +487,100 @@ fn the_cli_parses_within_the_smallest_main_thread_stack_we_ship_on() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The one end-to-end check of `synch mcp` driving the real binary: the
+/// protocol goes out on stdout and nothing else does.
+///
+/// The bridge's own behaviour is covered in `tests/mcp.rs`, over the same
+/// dispatcher against an in-process daemon. What only a spawned process can
+/// prove is the stdio contract itself — that no `println!`, no banner, and no
+/// log line shares the channel the protocol is framed on.
+#[test]
+fn mcp_writes_protocol_to_stdout_and_diagnostics_to_stderr() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Cli::new(dir.path());
+    cli.run(&["init"]);
+    let daemon = cli.daemon();
+
+    let mut child = cli
+        .command(&["mcp"])
+        // Verbose on purpose: the logging that would corrupt the stream if it
+        // went anywhere near stdout is exactly what this turns on.
+        .arg("--verbose")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("synch mcp starts");
+
+    let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+    let script = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{{{meta}}}}}\n\
+         {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{{{meta}}}}}\n\
+         {{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"synch_spaces\",\"arguments\":{{}},{meta}}}}}\n"
+    );
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(script.as_bytes())
+        .expect("the script is written");
+    // Closing stdin is the shutdown signal, and the server still answers what
+    // it already accepted before it exits.
+
+    // Bounded, because closing stdin being the shutdown signal is part of what
+    // this test asserts: a build where it stops working should fail here in a
+    // minute rather than hang until the CI job's own timeout kills it, which
+    // reads as an infrastructure problem rather than the regression it is.
+    // Safe to poll rather than drain because the three responses above are far
+    // inside the pipe buffer, so the child is never blocked writing them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child
+        .try_wait()
+        .expect("the child's state is readable")
+        .is_none()
+    {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            daemon.stop(&cli);
+            panic!("`synch mcp` did not exit within 60s of its stdin closing");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("synch mcp exits");
+    // The child is gone, so nothing below needs the daemon. Stopped here so an
+    // assertion that fails does not leave it running for the rest of the run.
+    daemon.stop(&cli);
+    assert!(
+        output.status.success(),
+        "synch mcp exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let mut ids = Vec::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        // Every line, not just the ones we care about: one stray byte on this
+        // channel breaks the client's framing for good.
+        let message: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("stdout line {line:?}: {e}"));
+        assert_eq!(message["jsonrpc"], "2.0", "{line}");
+        ids.push(
+            message["id"]
+                .as_i64()
+                .expect("every response carries its id"),
+        );
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3], "one response per request:\n{stdout}");
+
+    // And the logging went where logging goes.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("serving MCP over stdio"),
+        "the startup log should be on stderr:\n{stderr}"
+    );
+}

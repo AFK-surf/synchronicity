@@ -22,7 +22,14 @@ service Control {
   // Paths the policy refuses — divergent under `strict`, unpublished by the
   // pinned origin under `origin=` — are left out rather than answered with one
   // side's metadata; a direct Resolve of such a path still says what is wrong.
-  rpc List(ListRequest) returns (stream Entry);
+  //
+  // `limit` bounds entries, not the paths scanned to find them. A page thinned
+  // by the filters above is refilled by scanning on, because a caller cannot
+  // tell a short page from a finished one and would stop early. The refill is
+  // budgeted, so a page can still end short of `limit` with more behind it: the
+  // end of a listing is an *empty* page, and a caller that stops on a short one
+  // truncates it.
+  rpc List(ListRequest) returns (stream ListItem);
 
   // The version a policy selects for one path, with no content fetched — what
   // HeadObject answers from (§9.4).
@@ -54,6 +61,15 @@ service Control {
   // already has a `connect` constructor, and a method that shadowed it would
   // make the client unbuildable.
   rpc OpenSocket(stream ConnectRequest) returns (stream ConnectResponse);
+
+  // Every space this node has configured, and what it is doing about each.
+  //
+  // `Run(SpaceLs)` answers the same question for a person, in a column-aligned
+  // line. This answers it for a program (§9.4): the MCP bridge publishes one
+  // resource per space and has to know their ids, and a caller that recovered
+  // them by splitting a rendered line would be coupled to the width of that
+  // column rather than to the data.
+  rpc ListSpaces(ListSpacesRequest) returns (stream SpaceInfo);
 
   // Reads a config value from the `s3.*` namespace.
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
@@ -569,6 +585,27 @@ message Entry {
   uint32 versions = 10;
 }
 
+// One item in a listing stream.
+//
+// The scan runs past the paths its filters drop, so a page can end for two
+// reasons that look identical from the outside: the prefix ran out, or the
+// scan spent its budget. Only the first is the end of the listing, and a
+// caller that cannot tell them apart stops early on the second — for good,
+// since a run of dropped paths longer than the budget yields a page with
+// nothing in it to resume from. So the daemon says which happened rather than
+// leaving it to be inferred from what arrived.
+message ListItem {
+  oneof item {
+    // A resolved entry, in path order.
+    Entry entry = 1;
+    // The scan stopped on its budget with the prefix unfinished, having
+    // scanned this far. Sent last and at most once, and only when there is
+    // more behind it: resume from here, exclusive. Its absence is the end of
+    // the listing.
+    string scan_cursor = 2;
+  }
+}
+
 // A piece of a byte payload.
 message Chunk {
   bytes data = 1;
@@ -581,7 +618,9 @@ message ListRequest {
   string prefix = 2;
   // Resume after this path, exclusive — a listing cursor.
   optional string start_after = 3;
-  // At most this many paths, before the policy filters them.
+  // At most this many entries. See `List`: the scan runs past what the filters
+  // drop to fill the page, within a budget, so a short page is not necessarily
+  // the last one.
   optional uint64 limit = 4;
   // The version policy, as `newest`, `origin=<id>`, or `strict`.
   optional string policy = 5;
@@ -646,6 +685,29 @@ message Written {
   string path = 1;
   // The published entry.
   Entry entry = 2;
+}
+
+message ListSpacesRequest {}
+
+// One configured space, as a program reads it.
+message SpaceInfo {
+  // The space id.
+  string id = 1;
+  // The local directory being indexed, unset for a detached space.
+  optional string local_path = 2;
+  // The replication policy — `tree` or `archive` — unset when this node holds
+  // only what it publishes and reads.
+  optional string replicate = 3;
+  // Seconds a released root is still held. Only meaningful under `tree`.
+  int64 grace_secs = 4;
+  // A ceiling on bytes held for this space, unset for no ceiling.
+  optional uint64 budget = 5;
+  // Bytes this space's replication holds. Unset when not replicating —
+  // which is not the same as zero, and the difference is the whole reason
+  // it is optional.
+  optional uint64 held_bytes = 6;
+  // Objects wanted and not yet held, when replicating.
+  optional uint64 wanted = 7;
 }
 
 message GetConfigRequest {

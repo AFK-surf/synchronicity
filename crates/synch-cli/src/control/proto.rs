@@ -45,7 +45,13 @@ pub use pb::{
 ///
 /// v3 changes socket arming from approval by content root to approval by an
 /// opaque token that also binds the authorization revision and init result.
-pub const CONTROL_VERSION: u32 = 3;
+///
+/// v4 adds `ListSpaces` for the MCP bridge (`crate::mcp`), which needs the
+/// space list as data rather than as the line `space ls` prints. A call
+/// addition, so it takes a bump for the reason above. It also changes what
+/// `List` means by `limit` — entries rather than paths scanned — which is a
+/// change to an existing request and takes one on its own.
+pub const CONTROL_VERSION: u32 = 4;
 
 /// How many payload bytes one chunk carries.
 ///

@@ -42,6 +42,27 @@ regenerated on every daemon start and sent as a header on every call. The servic
 schema is `crates/synch-cli/proto/control.proto`. With no daemon running, every
 operational/client command fails with a message naming that socket.
 
+## MCP
+
+`synch mcp` serves the Model Context Protocol over stdin and stdout, so an
+editor or agent runner can browse and publish into the tree. It is a client of
+the daemon like every other command — it holds no key, no store and no endpoint
+— and the daemon does not have to be running when it starts.
+
+```sh
+synch mcp                    # read-only, every space
+synch mcp --allow-write      # plus the tools that change state
+synch mcp --space media      # confined to one space
+```
+
+The surface is read-only by default and the tool list says so, so a client is
+shown exactly the authority it was given. Paths are also addressable as
+resources at `synch://<space>/<path>`. Both protocol eras are served: the
+stateless `2026-07-28` revision and the older `initialize` handshake.
+
+[docs/MCP.md](docs/MCP.md) has the tool table, the failure semantics, and the
+bounds.
+
 ## Serverless mode
 
 Serverless mode runs the daemon on an ephemeral local volume while keeping file
@@ -442,7 +463,7 @@ async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 | `synch-store` | the SQLite schema and the content-addressed blob store |
 | `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver, and the zone-key transparency verifier |
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
-| `synch-cli` | the `synch` binary: the daemon, the control service, and the CLI client |
+| `synch-cli` | the `synch` binary: the daemon, the control service, the CLI client, and the MCP bridge |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
 | `synch-sock` | the socket runtime: the eBPF host APIs, the endpoint reactor, the program cache |
 | `synch-cc` | the embedded C-to-eBPF compiler, so writing a socket needs no toolchain |
