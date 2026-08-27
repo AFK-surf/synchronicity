@@ -1391,9 +1391,7 @@ fn process_capability(id: u32) -> ProcessCapability {
         allowed_signals: 0,
         max_processes: 1,
         max_runtime_ms: 5_000,
-        // Memory enforcement is not under test here. Use the portable default;
-        // Darwin's resident accounting includes shared runtime pages.
-        max_memory_bytes: 0,
+        max_memory_bytes: 128 * 1024 * 1024,
     }
 }
 

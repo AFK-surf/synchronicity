@@ -390,12 +390,12 @@ fn configure_unix_command(
     }
 }
 
-/// Returns the aggregate resident bytes in a Darwin process group.
+/// Returns the aggregate physical footprint in a Darwin process group.
 ///
 /// A full PID buffer is reported as `u64::MAX`, so process fan-out fails
 /// closed instead of hiding memory beyond the fixed accounting bound.
 #[cfg(target_os = "macos")]
-pub(crate) fn process_group_resident_bytes(pgid: u32) -> Result<Option<u64>, ()> {
+pub(crate) fn process_group_footprint_bytes(pgid: u32) -> Result<Option<u64>, ()> {
     const MAX_GROUP_PROCESSES: usize = 4_096;
 
     let pgid = libc::pid_t::try_from(pgid).map_err(|_| ())?;
@@ -421,22 +421,14 @@ pub(crate) fn process_group_resident_bytes(pgid: u32) -> Result<Option<u64>, ()>
         if pid <= 0 {
             continue;
         }
-        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
-        let expected = std::mem::size_of::<libc::proc_taskinfo>();
-        let size = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTASKINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                expected as libc::c_int,
-            )
-        };
-        if usize::try_from(size).ok() != Some(expected) {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v0>::uninit();
+        let result =
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, info.as_mut_ptr().cast()) };
+        if result != 0 {
             continue;
         }
         measured = true;
-        total = total.saturating_add(unsafe { info.assume_init() }.pti_resident_size);
+        total = total.saturating_add(unsafe { info.assume_init() }.ri_phys_footprint);
     }
     if measured {
         Ok(Some(total))
@@ -626,8 +618,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn darwin_can_measure_its_process_group() {
+    fn darwin_can_measure_its_process_group_footprint() {
         let pgid = u32::try_from(unsafe { libc::getpgrp() }).unwrap();
-        assert!(process_group_resident_bytes(pgid).unwrap().unwrap() > 0);
+        assert!(process_group_footprint_bytes(pgid).unwrap().unwrap() > 0);
     }
 }

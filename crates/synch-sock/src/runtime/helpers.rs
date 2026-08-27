@@ -1714,24 +1714,29 @@ fn schedule_process_memory_limit(
         max_memory_bytes.min(crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES)
     };
     let Some(pgid) = process.pid() else { return };
-    let Ok(signal_pgid) = i32::try_from(pgid) else {
+    if i32::try_from(pgid).is_err() {
         process.kill();
         return;
-    };
+    }
+    let process = Rc::downgrade(process);
     inner.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match crate::runtime::process::process_group_resident_bytes(pgid) {
+            let Some(process) = process.upgrade() else {
+                break;
+            };
+            if process.pid() != Some(pgid) {
+                break;
+            }
+            match crate::runtime::process::process_group_footprint_bytes(pgid) {
                 Ok(Some(bytes)) if bytes <= limit => {}
                 Ok(None) => break,
                 Ok(Some(_)) | Err(()) => {
                     // Accounting failure is a policy failure: do not leave an
                     // unbounded declared process running.
-                    unsafe {
-                        libc::kill(-signal_pgid, libc::SIGKILL);
-                    }
+                    process.kill_if_pid(pgid);
                     break;
                 }
             }
