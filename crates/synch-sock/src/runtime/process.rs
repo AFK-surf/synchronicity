@@ -380,7 +380,7 @@ fn configure_unix_command(
             };
             // Darwin's RLIMIT_RSS is an alias for RLIMIT_AS, and a useful
             // address-space ceiling prevents dyld from loading even tiny
-            // programs. The parent monitors aggregate resident memory there.
+            // programs. The parent monitors aggregate physical footprint there.
             #[cfg(not(target_os = "macos"))]
             if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
                 return Err(std::io::Error::last_os_error());

@@ -1722,6 +1722,10 @@ fn schedule_process_memory_limit(
     inner.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Tokio intervals tick immediately. Darwin may report a newly-created
+        // process group before proc_pid_rusage can account for any member, so
+        // leave one sampling interval for process accounting to become ready.
+        interval.tick().await;
         loop {
             interval.tick().await;
             let Some(process) = process.upgrade() else {
@@ -1729,6 +1733,14 @@ fn schedule_process_memory_limit(
             };
             if process.pid() != Some(pgid) {
                 break;
+            }
+            match process.refresh() {
+                Ok(status) if status.exited => break,
+                Ok(_) => {}
+                Err(_) => {
+                    process.kill_if_pid(pgid);
+                    break;
+                }
             }
             match crate::runtime::process::process_group_footprint_bytes(pgid) {
                 Ok(Some(bytes)) if bytes <= limit => {}
