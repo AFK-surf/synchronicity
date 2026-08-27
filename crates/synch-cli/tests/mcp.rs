@@ -282,9 +282,17 @@ async fn the_tree_is_listed_read_and_described_through_the_typed_calls() {
     let spaces = client.tool("synch_spaces", json!({})).await;
     let listed = &spaces["structuredContent"]["spaces"];
     assert_eq!(listed[0]["id"], "media");
+    // Canonicalized on both sides, because the engine stores the canonical
+    // path and the platforms disagree about what that is: macOS resolves
+    // /var to /private/var, and Windows turns an 8.3 short name into a
+    // verbatim \\?\ path. Comparing against the tempdir as handed out passes
+    // on Linux and fails on the other two.
     assert_eq!(
         listed[0]["local_path"],
-        checkout.path().to_string_lossy().as_ref()
+        std::fs::canonicalize(checkout.path())
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
     );
 
     let listing = client.tool("synch_list", json!({ "space": "media" })).await;

@@ -19,7 +19,9 @@
 //! MCP dropped the `initialize` handshake in revision `2026-07-28`: the
 //! protocol is now stateless and every request declares its own version. Most
 //! installed clients still handshake. This server answers both, selecting by
-//! how the client opens; [`rpc`] holds the mechanics and the reasoning.
+//! how the client opens; the `rpc` submodule holds the mechanics and the
+//! reasoning. (Named rather than linked: this module is public and that one is
+//! not, and rustdoc refuses the link rather than emitting a dead one.)
 //!
 //! # Concurrency
 //!
