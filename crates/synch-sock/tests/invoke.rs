@@ -404,6 +404,10 @@ SY_ENTRY sy_s64 entry(void) {
      upstream that is not reading yet looks like from in here. */
   sy_s64 total = 0;
   for (;;) {
+    /* A broken fixture must fail rather than write forever once its reader
+       wakes. The listener's bounded receive window should stop us far below
+       this guard. */
+    if (total >= 64 * 1024 * 1024) return -5;
     sy_s64 n = sy_write(up, chunk, sizeof chunk);
     if (n > 0) {
       total += n;
@@ -433,9 +437,16 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_a_program_queued_upstream_survives_the_end_of_the_invocation() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a loopback listener");
+    // Bound the receive window before the handshake so the program reaches
+    // backpressure regardless of interpreter speed or host TCP autotuning.
+    let listener = tokio::net::TcpSocket::new_v4().expect("an IPv4 socket");
+    listener
+        .set_recv_buffer_size(4096)
+        .expect("a bounded receive window");
+    listener
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("a loopback address");
+    let listener = listener.listen(1).expect("a loopback listener");
     let port = listener.local_addr().unwrap().port();
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("a connection");

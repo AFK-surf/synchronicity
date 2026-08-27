@@ -461,7 +461,6 @@ are:
 #define SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM      4
 #define SY_SSH_FIELD_PUBLIC_KEY_BLOB           5
 #define SY_SSH_FIELD_PUBLIC_KEY_SHA256         6
-#define SY_SSH_FIELD_SIGNATURE_ALGORITHM       7
 #define SY_SSH_FIELD_COMMAND                   8
 #define SY_SSH_FIELD_SUBSYSTEM                 9
 #define SY_SSH_FIELD_CHANNEL_TYPE             10
@@ -471,6 +470,9 @@ are:
 #define SY_SSH_FIELD_DESTINATION_HOST         14
 #define SY_SSH_FIELD_ORIGINATOR_HOST          15
 #define SY_SSH_FIELD_SIGNAL                   16
+#define SY_SSH_FIELD_TERMINAL                 17
+#define SY_SSH_FIELD_ENV_NAME                 18
+#define SY_SSH_FIELD_ENV_VALUE                19
 ```
 
 The channel lifecycle uses three event kinds:
@@ -487,10 +489,9 @@ control events. This keeps byte-stream lifecycle in the ordinary endpoint ABI.
 `PUBLIC_KEY_SHA256` has length exactly 32. All other fields are
 length-delimited bytes; they are not implicitly NUL-terminated and the guest
 must not treat them as C strings without making its own bounded copy.
-`SIGNATURE_ALGORITHM` records the signature scheme actually verified, which
-may differ from the public-key blob's key type. The password field exists only
-on `AUTH_PASSWORD`, is covered by the credential zeroization rules, and is
-invalid after the event token is consumed. `COMMAND` and `SUBSYSTEM` are the
+The password field exists only on `AUTH_PASSWORD`, is covered by the credential
+zeroization rules, and is invalid after the event token is consumed. `COMMAND`
+and `SUBSYSTEM` are the
 exact bounded request payloads and have no shell interpretation in the SSH
 adapter. Ports and other small numeric fields are stored in the fixed event
 header; variable-length addresses use the named fields above.
@@ -923,9 +924,7 @@ or operator configuration:
 #define SY_FILE_TRANSFER_SFTP             0x01
 
 #define SY_FILE_TRANSFER_READ             0x01
-#define SY_FILE_TRANSFER_WRITE            0x02
 #define SY_FILE_TRANSFER_RECURSIVE        0x04
-#define SY_FILE_TRANSFER_PRESERVE_METADATA 0x08
 
 struct sy_file_transfer_capability {
   sy_u32 id;
@@ -963,13 +962,14 @@ tree policy, replies success, and pumps `session <-> sftp`. The SFTP engine
 does not know which SSH connection carries it, and the SSH engine does not
 know that the session bytes are SFTP.
 
-The service declaration is required even for read-only operation and is shown
-during arming. It gates creation of this host service endpoint. The service
-also intersects its scope with the invocation's underlying tree authority:
-write access, live-filesystem access, and foreign-tree scopes require their
-own explicit grants. As §1.2 explains, the service declaration does not claim
-that an armed program lacking it is unable to export bytes manually through
-the existing `sy_open` API.
+Version 1 is deliberately read-only because the published virtual tree is
+immutable. Uploading needs a separate design for staging, atomic publication,
+conflicts, and attribution; pretending an SFTP close is a tree commit would be
+an implicit and unsafe mutation API. The service declaration is shown during
+arming and intersects its scope with the invocation's underlying tree-read
+authority. As §1.2 explains, it does not claim that an armed program lacking
+the service is unable to export bytes manually through the existing `sy_open`
+API.
 
 SFTP support is separate from the SSH adapter. A guest may implement a small
 subsystem itself or proxy a session to a declared TCP backend before the
@@ -1026,7 +1026,7 @@ bytes. Optional wire-byte metrics may be reported separately.
 
 ## 9. Limits
 
-SSH multiplexing needs more than the current sixteen handles. One attached
+SSH multiplexing needs more than the former sixteen-handle default. One attached
 pipe-backed channel can consume a channel fd, backend stdin/stdout, backend
 stderr and an SSH extended-data lane before counting the control fd or any tree
 objects. A limit that advertises eight channels but cannot represent them is
@@ -1037,13 +1037,13 @@ Proposed initial bounds:
 | Resource | Default / hard bound | Behavior at the bound |
 | --- | --- | --- |
 | Handles and poll entries | 32 | helper fails `SY_ELIMIT`; incoming channel is rejected if it cannot reserve its fd |
-| Simultaneous SSH channels | 8 / 15 | bounded independently of handles; runtime argument may lower it |
+| Simultaneous SSH channels | 8 | bounded independently of handles; a full handle table may lower the effective count |
 | SSH channel ring | 64 KiB per direction | stops reading or writing the SSH channel and applies window backpressure |
 | Outstanding control events | 32 | channel request is deferred where possible; otherwise rejected or connection closed by protocol class |
 | Total event payload | 64 KiB | oversized request rejected; no partial credential or command is delivered |
 | One event payload | 16 KiB, with smaller field-specific limits | request rejected |
 | Authentication attempts | 8 | disconnect |
-| Authentication time | 60 s | disconnect |
+| Authentication decision | 60 s | disconnect |
 | `authorized_keys` object | 256 KiB, 16 KiB per line | matcher returns `SY_ELIMIT`; no prefix match is accepted |
 | SSH packet size | conservative library configuration, at most 64 KiB initially | protocol error |
 | SSH connection idle | existing invocation idle deadline | invocation ends `Deadline` |
@@ -1053,16 +1053,14 @@ default 16 KiB eBPF local-call frame. Expanding the handle table must still be
 paired with per-role limits and an explicit memory charge; a larger integer
 alone would let thirty-one endpoints each allocate today's 512 KiB of rings.
 
-An invocation's aggregate memory budget includes:
+The following allocations all have explicit individual bounds, and their
+maximum composition is bounded by the channel, handle, and event-count caps:
 
 - SSH library connection and channel buffers;
 - every endpoint ring;
 - queued and outstanding event payloads;
 - bounded `authorized_keys` scan cursors attached to outstanding auth tokens;
 - host-side object and cursor data already charged today.
-
-The program may request a lower channel limit in `sy_ssh_start` or a subsequent
-configuration helper. This is resource policy, not an arming declaration.
 
 ## 10. Host key
 
@@ -1084,9 +1082,8 @@ reuse would couple SSH host identity to device rotation and turn a compromise
 or implementation error in one signature context into a problem for the
 other.
 
-The CLI should print the public key and SHA-256 fingerprint through a read-only
-command such as `synch socket ssh-key`. A stock client can use the existing
-byte pump directly:
+The daemon logs the SHA-256 fingerprint when it loads or creates the key. A
+stock client can use the existing byte pump directly:
 
 ```sh
 ssh -o 'ProxyCommand=synch connect %h:code/ssh.sock' nas
@@ -1103,11 +1100,10 @@ The SSH implementation belongs in `synch-sock`, beside the endpoint reactor,
 not in `synch-net`. The network layer continues handing it an opaque
 `DuplexStream` and knows nothing about the bytes after `Opened::Ok`.
 
-A candidate implementation is `russh`, using its server-over-arbitrary-stream
-entrypoint and handler callbacks. It must be pinned to a release containing all
-known server authentication and channel-lifecycle fixes, and those historical
-failures should become local regression tests rather than assumptions left to
-the dependency.
+The implementation uses `russh` through its server-over-arbitrary-stream
+entrypoint. A small reviewed in-tree patch exposes opaque server-side channel
+types and their opening payloads instead of rejecting them inside the library;
+that patch is pinned and covered locally with the rest of the channel adapter.
 
 The runtime integration is:
 
@@ -1283,7 +1279,7 @@ is added.
   accepts `none` for the right device, allocates a PTY without starting a
   process, starts exactly one declared shell after `shell`, applies resize and
   signal events, and delivers final PTY output before exit status;
-- SFTP subsystem transfers in every declared access mode;
+- SFTP subsystem reads in flat and recursive declared scopes;
 - host-key persistence is checked across daemon restarts and device-key
   rotation;
 - Linux and macOS exercise the same eBPF example through the embedded compiler.

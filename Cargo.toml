@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/russh"]
 
 [workspace.package]
 version = "0.1.7"
@@ -83,6 +84,10 @@ rustls-platform-verifier = "0.7.0"
 # the shape the signing and hashing call sites here are written against.
 aws-lc-rs = { version = "1.18.0", features = ["ring-io"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The in-tree patch exposes opaque server channels to socket programs; keeping
+# this as a path dependency makes that ABI follow the crate into nested builds.
+russh = { path = "vendor/russh", version = "0.63.1", default-features = false, features = ["aws-lc-rs"] }
+russh-sftp = "2.4.0"
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
@@ -90,7 +95,7 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 time = "0.3"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "process", "signal"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 # `rustls-tls-native-roots`, not `rustls-tls-webpki-roots`: the cloud-attach
 # tunnel hands it a config built from the host's trust store

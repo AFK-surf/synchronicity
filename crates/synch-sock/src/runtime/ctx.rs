@@ -21,11 +21,20 @@ use crate::{
     limits::{Limits, MAX_LABELS, MAX_METRIC_NAMES},
     policy::{EffectivePolicy, PeerIdentity, SocketId},
     runtime::{
-        endpoint::{Endpoint, Readiness, State},
+        endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
         map::SocketMaps,
+        process::{ProcessSlot, PtySlot},
+        ssh::SshState,
     },
     ObjectInfo, SocketHost,
 };
+
+/// The inbound stream before its first raw operation or SSH activation.
+#[derive(Debug)]
+pub(crate) struct UnselectedStream {
+    pub(crate) stream: RefCell<Option<crate::DuplexStream>>,
+    pub(crate) peer: String,
+}
 
 /// An object the guest opened for reading.
 #[derive(Debug)]
@@ -39,7 +48,7 @@ pub(crate) struct ObjectSlot {
     /// that asks for a different range gets a fresh read rather than the
     /// previous answer.
     pub(crate) want: Cell<(u64, u64)>,
-    pub(crate) ready: Rc<Readiness>,
+    pub(crate) ready: Arc<Readiness>,
 }
 
 impl ObjectSlot {
@@ -78,7 +87,10 @@ impl CursorSlot {
 /// What one handle refers to.
 #[derive(Debug)]
 pub(crate) enum Slot {
+    Unselected(Rc<UnselectedStream>),
     Endpoint(Rc<Endpoint>),
+    SshControl(Arc<SshState>),
+    Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
 }
@@ -86,7 +98,13 @@ pub(crate) enum Slot {
 impl Slot {
     pub(crate) fn revents(&self) -> u32 {
         match self {
+            Slot::Unselected(_) => 0,
             Slot::Endpoint(ep) => ep.revents(),
+            Slot::SshControl(ssh) => ssh.revents(),
+            Slot::Process(process) => process
+                .refresh()
+                .map(|status| if status.exited { poll::IN } else { 0 })
+                .unwrap_or(poll::ERR),
             Slot::Object(obj) => obj.revents(),
             // A cursor is always ready: every answer it can give is already in
             // memory, so a program that polls one is told to go ahead.
@@ -98,7 +116,7 @@ impl Slot {
 /// The state behind every helper.
 pub(crate) struct Inner {
     pub(crate) slots: RefCell<Vec<Option<Slot>>>,
-    pub(crate) ready: Rc<Readiness>,
+    pub(crate) ready: Arc<Readiness>,
     pub(crate) policy: EffectivePolicy,
     pub(crate) peer: PeerIdentity,
     pub(crate) socket: SocketId,
@@ -139,6 +157,10 @@ pub(crate) struct Inner {
     pub(crate) draining: RefCell<Vec<Rc<Endpoint>>>,
     /// Detached helper work owned by this invocation.
     pub(crate) async_tasks: RefCell<Vec<tokio::task::AbortHandle>>,
+    /// The pristine stream's writer is retained separately so invocation
+    /// teardown can await bytes already removed from the userspace ring.
+    pub(crate) raw_writer: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) ptys: RefCell<std::collections::HashMap<i64, Rc<PtySlot>>>,
 
     /// Set while the `synchronicity.init` hook is running.
     ///
@@ -148,6 +170,7 @@ pub(crate) struct Inner {
     /// is nothing for it to reach even if the check were missed.
     pub(crate) init_mode: bool,
     pub(crate) declaration: RefCell<Declaration>,
+    pub(crate) ssh_host_key: Option<Arc<russh::keys::PrivateKey>>,
 
     /// Counters an operator reads while this is running.
     ///
@@ -223,7 +246,7 @@ impl Inner {
     ) -> Inner {
         Inner {
             slots: RefCell::new(Vec::new()),
-            ready: Rc::new(Readiness::default()),
+            ready: Arc::new(Readiness::default()),
             policy: EffectivePolicy::default(),
             peer: PeerIdentity {
                 origin: synch_core::OriginId::Key(zero_key()),
@@ -249,8 +272,11 @@ impl Inner {
             egress_open: Cell::new(0),
             draining: RefCell::new(Vec::new()),
             async_tasks: RefCell::new(Vec::new()),
+            raw_writer: RefCell::new(None),
+            ptys: RefCell::new(std::collections::HashMap::new()),
             init_mode: false,
             declaration: RefCell::new(Declaration::default()),
+            ssh_host_key: None,
             live: Default::default(),
             // No registry: only a served invocation appears in `socket ps` and
             // keeps a log tail; the base is a run nobody is watching.
@@ -303,7 +329,10 @@ impl Inner {
         }
         let slots = self.slots.borrow();
         match slots.get(handle as usize).and_then(|s| s.as_ref()) {
+            Some(Slot::Unselected(stream)) => Some(Slot2::Unselected(stream.clone())),
             Some(Slot::Endpoint(ep)) => Some(Slot2::Endpoint(ep.clone())),
+            Some(Slot::SshControl(ssh)) => Some(Slot2::SshControl(ssh.clone())),
+            Some(Slot::Process(process)) => Some(Slot2::Process(process.clone())),
             Some(Slot::Object(obj)) => Some(Slot2::Object(obj.clone())),
             Some(Slot::Cursor(cur)) => Some(Slot2::Cursor(cur.clone())),
             None => None,
@@ -316,6 +345,50 @@ impl Inner {
             Some(Slot2::Endpoint(ep)) => Some(ep),
             _ => None,
         }
+    }
+
+    /// Selects raw mode for the pristine inbound stream and starts its pumps.
+    pub(crate) fn select_raw(&self) -> Result<Rc<Endpoint>, i64> {
+        match self.slot(crate::abi::SY_SELF) {
+            Some(Slot2::Endpoint(endpoint)) => Ok(endpoint),
+            Some(Slot2::SshControl(_)) => Err(errno::ESTATE),
+            Some(Slot2::Unselected(unselected)) => {
+                let stream = unselected.stream.borrow_mut().take().ok_or(errno::ESTATE)?;
+                let endpoint = Endpoint::new(
+                    self.limits.ring_bytes,
+                    self.ready.clone(),
+                    State::Open,
+                    unselected.peer.clone(),
+                );
+                let mut slots = self.slots.borrow_mut();
+                let Some(slot) = slots.get_mut(0) else {
+                    return Err(errno::EBADF);
+                };
+                *slot = Some(Slot::Endpoint(endpoint.clone()));
+                drop(slots);
+                self.spawn(reader_task(endpoint.clone(), stream.reader));
+                let writer = tokio::task::spawn_local(writer_task(endpoint.clone(), stream.writer));
+                self.async_tasks.borrow_mut().push(writer.abort_handle());
+                *self.raw_writer.borrow_mut() = Some(writer);
+                Ok(endpoint)
+            }
+            _ => Err(errno::EBADF),
+        }
+    }
+
+    /// Atomically consumes the pristine inbound stream into SSH mode.
+    pub(crate) fn select_ssh(&self, state: Arc<SshState>) -> Result<crate::DuplexStream, i64> {
+        let Some(Slot2::Unselected(unselected)) = self.slot(crate::abi::SY_SELF) else {
+            return Err(errno::ESTATE);
+        };
+        let stream = unselected.stream.borrow_mut().take().ok_or(errno::ESTATE)?;
+        let mut slots = self.slots.borrow_mut();
+        let Some(slot) = slots.get_mut(0) else {
+            return Err(errno::EBADF);
+        };
+        *slot = Some(Slot::SshControl(state));
+        drop(slots);
+        Ok(stream)
     }
 
     /// Puts a slot in the table, returning its handle.
@@ -358,6 +431,7 @@ impl Inner {
             return false;
         };
         match entry.take() {
+            Some(Slot::Unselected(_)) => true,
             Some(Slot::Endpoint(ep)) => {
                 // The handle is gone; the bytes behind it are not. The write
                 // side drains and half-closes on its own from here.
@@ -367,11 +441,17 @@ impl Inner {
                     // writer's join handle and waits on that.
                     return true;
                 }
-                // An outbound endpoint frees its place in the egress budget:
-                // the bound is on how many are open at once, not on how many
-                // were ever opened.
-                self.egress_open
-                    .set(self.egress_open.get().saturating_sub(1));
+                // Only an outbound endpoint frees a place in the egress
+                // budget. SSH channels, PTYs and service pipes are endpoints
+                // too, but never consumed that quota.
+                if ep.take_egress_charge() {
+                    self.egress_open
+                        .set(self.egress_open.get().saturating_sub(1));
+                }
+                if let Some(Slot::SshControl(ssh)) = slots.first().and_then(Option::as_ref) {
+                    ssh.remove_channel_fd(handle);
+                }
+                self.ptys.borrow_mut().remove(&handle);
                 let mut draining = self.draining.borrow_mut();
                 // Endpoints that have finished draining are let go of here
                 // rather than at the end, so a program that opens and closes
@@ -388,6 +468,14 @@ impl Inner {
                     }
                     draining.push(ep);
                 }
+                true
+            }
+            Some(Slot::SshControl(ssh)) => {
+                ssh.close(0);
+                true
+            }
+            Some(Slot::Process(process)) => {
+                process.kill();
                 true
             }
             Some(Slot::Object(obj)) => {
@@ -546,6 +634,7 @@ impl Inner {
     pub(crate) fn all_quiet(&self) -> bool {
         let slots = self.slots.borrow();
         slots.iter().flatten().all(|slot| match slot {
+            Slot::Unselected(_) => false,
             Slot::Endpoint(ep) => match ep.state() {
                 State::Failed | State::Closed => true,
                 State::Connecting => false,
@@ -566,7 +655,10 @@ impl Inner {
 /// A handle's target, cloned out of the table so the borrow can be dropped.
 #[derive(Debug)]
 pub(crate) enum Slot2 {
+    Unselected(Rc<UnselectedStream>),
     Endpoint(Rc<Endpoint>),
+    SshControl(Arc<SshState>),
+    Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
 }

@@ -82,6 +82,7 @@ typedef unsigned char sy_u8;
 #define SY_ELIMIT     -7  /* a documented bound was hit                      */
 #define SY_ENOENT     -8  /* no such path, key or object                     */
 #define SY_EPIPE      -9  /* wrote after the peer's read side went away      */
+#define SY_ESTATE    -10  /* valid operation, wrong selected protocol state  */
 
 /* ---- poll -------------------------------------------------------------- */
 
@@ -210,9 +211,142 @@ extern sy_s64 sy_tcp_connect(const char *host, sy_u64 host_len, sy_u64 port);
 extern sy_s64 sy_tcp_connect_ip(const void *addr, sy_u64 addr_len, sy_u64 port);
 extern sy_s64 sy_endpoint_info(sy_s64 handle, char *out, sy_u64 out_len);
 
+/* ---- SSH protocol termination ------------------------------------------ */
+
+#define SY_SSH_AUTH_NONE      0x01
+#define SY_SSH_AUTH_PUBLICKEY 0x02
+#define SY_SSH_AUTH_PASSWORD  0x04
+
+#define SY_SSH_AUTH_ACCEPT       1
+#define SY_SSH_AUTH_REJECT       2
+#define SY_SSH_AUTH_PARTIAL      3
+#define SY_SSH_AUTH_OFFER_ACCEPT 4
+
+#define SY_SSH_EVENT_AUTH_NONE               1
+#define SY_SSH_EVENT_AUTH_PASSWORD           2
+#define SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER    3
+#define SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED 4
+#define SY_SSH_EVENT_AUTHENTICATED           5
+#define SY_SSH_EVENT_CHANNEL_OPEN            6
+#define SY_SSH_EVENT_CHANNEL_REQUEST         7
+#define SY_SSH_EVENT_CHANNEL_EXTENDED_DATA   8
+
+#define SY_SSH_EVENT_WANT_REPLY 0x01
+
+#define SY_SSH_FIELD_USERNAME             1
+#define SY_SSH_FIELD_SERVICE              2
+#define SY_SSH_FIELD_PASSWORD             3
+#define SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM 4
+#define SY_SSH_FIELD_PUBLIC_KEY_BLOB      5
+#define SY_SSH_FIELD_PUBLIC_KEY_SHA256    6
+#define SY_SSH_FIELD_COMMAND              8
+#define SY_SSH_FIELD_SUBSYSTEM            9
+#define SY_SSH_FIELD_CHANNEL_TYPE        10
+#define SY_SSH_FIELD_CHANNEL_OPEN_DATA   11
+#define SY_SSH_FIELD_REQUEST_TYPE        12
+#define SY_SSH_FIELD_REQUEST_DATA        13
+#define SY_SSH_FIELD_DESTINATION_HOST    14
+#define SY_SSH_FIELD_ORIGINATOR_HOST     15
+#define SY_SSH_FIELD_SIGNAL              16
+#define SY_SSH_FIELD_TERMINAL            17
+#define SY_SSH_FIELD_ENV_NAME            18
+#define SY_SSH_FIELD_ENV_VALUE           19
+
+struct sy_ssh_event {
+  sy_u64 id;
+  sy_s64 fd;
+  sy_u32 kind;
+  sy_u32 flags;
+  sy_u32 data_len;
+  sy_u32 aux_len;
+  sy_u32 a;
+  sy_u32 b;
+  sy_u32 c;
+  sy_u32 d;
+};
+
+extern sy_s64 sy_ssh_start(sy_s64 stream, sy_u64 initial_auth_methods);
+extern sy_s64 sy_ssh_next(sy_s64 conn, struct sy_ssh_event *out,
+                          sy_u64 out_len);
+extern sy_s64 sy_ssh_event_data(sy_u64 event_id, sy_u32 field, void *out,
+                                sy_u64 out_len);
+extern sy_s64 sy_ssh_event_done(sy_u64 event_id);
+extern sy_s64 sy_ssh_auth_reply(sy_u64 event_id, sy_u32 result,
+                                sy_u64 next_methods);
+/* Matches only option-free authorized_keys records. A cold immutable object
+ * returns SY_EAGAIN and becomes pollable; retry with the same event token. */
+extern sy_s64 sy_ssh_authorized_keys_match(sy_u64 event_id, sy_s64 object);
+
+#define SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED 1
+#define SY_SSH_OPEN_CONNECT_FAILED              2
+#define SY_SSH_OPEN_UNKNOWN_CHANNEL_TYPE        3
+#define SY_SSH_OPEN_RESOURCE_SHORTAGE           4
+
+extern sy_s64 sy_ssh_channel_accept(sy_u64 event_id);
+extern sy_s64 sy_ssh_channel_reject(sy_u64 event_id, sy_u32 reason);
+extern sy_s64 sy_ssh_channel_open(sy_s64 conn, const char *type,
+                                  sy_u64 type_len, const void *open_data,
+                                  sy_u64 open_data_len);
+extern sy_s64 sy_ssh_channel_type(sy_s64 channel, char *out, sy_u64 out_len);
+#define SY_SSH_EXTENDED_STDERR 1
+extern sy_s64 sy_ssh_channel_lane(sy_s64 channel, sy_u32 data_type);
+
+#define SY_SSH_REQUEST_FAILURE 0
+#define SY_SSH_REQUEST_SUCCESS 1
+extern sy_s64 sy_ssh_request_reply(sy_u64 event_id, sy_u32 result);
+extern sy_s64 sy_ssh_exit_status(sy_s64 channel, sy_u32 status);
+extern sy_s64 sy_ssh_exit_signal(sy_s64 channel, const char *name,
+                                 sy_u64 name_len, sy_u32 core_dumped);
+
+struct sy_pty_mode { sy_u32 opcode; sy_u32 value; };
+#define SY_PTY_MAX_MODES 64
+struct sy_pty_spec {
+  char term[64];
+  sy_u32 term_len;
+  sy_u32 columns;
+  sy_u32 rows;
+  sy_u32 pixel_width;
+  sy_u32 pixel_height;
+  sy_u32 mode_count;
+  struct sy_pty_mode modes[SY_PTY_MAX_MODES];
+};
+extern sy_s64 sy_ssh_pty_spec(sy_u64 event_id, struct sy_pty_spec *out,
+                              sy_u64 out_len);
+
+/* ---- declared process and PTY backing ---------------------------------- */
+
+extern sy_s64 sy_pty_open(sy_u32 process_capability,
+                          const struct sy_pty_spec *spec, sy_u64 spec_len);
+extern sy_s64 sy_process_spawn_pty(sy_u32 process_capability, sy_s64 pty);
+extern sy_s64 sy_process_spawn(sy_u32 process_capability);
+
+#define SY_PROCESS_STDIO_MAIN   0
+#define SY_PROCESS_STDIO_STDERR 1
+extern sy_s64 sy_process_stdio(sy_s64 process, sy_u32 stream);
+extern sy_s64 sy_pty_resize(sy_s64 pty, sy_u32 columns, sy_u32 rows,
+                            sy_u32 pixel_width, sy_u32 pixel_height);
+
+struct sy_process_status {
+  sy_u32 exited;
+  sy_u32 exit_code;
+  sy_u32 signaled;
+  sy_u32 core_dumped;
+  char signal[32];
+  sy_u32 signal_len;
+};
+extern sy_s64 sy_process_status(sy_s64 process,
+                                struct sy_process_status *out,
+                                sy_u64 out_len);
+extern sy_s64 sy_process_signal(sy_s64 process, const char *name,
+                                sy_u64 name_len);
+
+/* Starts the scope-confined SFTP engine as an ordinary byte-stream endpoint.
+ * The guest chooses which protocol channel carries those bytes. */
+extern sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
+
 /* ---- poll: the only helper that suspends -------------------------------- */
 
-/* Waits for readiness on up to 16 handles. Returns how many are ready, 0 on
+/* Waits for readiness on up to 32 handles. Returns how many are ready, 0 on
  * timeout, negative on error. A negative timeout means "until something
  * happens", clamped by the host to this invocation's idle deadline. */
 extern sy_s64 sy_poll(struct sy_pollfd *fds, sy_u64 n, sy_s64 timeout_ms);
@@ -294,6 +428,54 @@ extern sy_s64 sy_declare_stack_frame_size(sy_u64 bytes);
  * page is at most 16 KiB; larger-page hosts warn and default to contiguous
  * frames. Disabling guards permits sizes not aligned to the host page. */
 extern sy_s64 sy_declare_guarded_stack_frames(sy_u64 enabled);
+
+/* Backing-service declarations are complete values embedded in the object.
+ * Their ids are nonzero and local to this exact program root; no operator-side
+ * registry or mutable named configuration is consulted at runtime. */
+#define SY_PROCESS_MAX_ARGS 8
+#define SY_PROCESS_ARG_MAX 128
+#define SY_PROCESS_EXECUTABLE_MAX 256
+
+#define SY_PROCESS_ALLOW_PTY  0x01
+#define SY_PROCESS_ALLOW_PIPE 0x02
+
+#define SY_PROCESS_SIGNAL_HUP  (1ull << 0)
+#define SY_PROCESS_SIGNAL_INT  (1ull << 1)
+#define SY_PROCESS_SIGNAL_TERM (1ull << 2)
+
+struct sy_process_capability {
+  sy_u32 id;
+  sy_u32 flags;
+  char executable[SY_PROCESS_EXECUTABLE_MAX];
+  sy_u32 executable_len;
+  sy_u32 argc;
+  char argv[SY_PROCESS_MAX_ARGS][SY_PROCESS_ARG_MAX];
+  sy_u32 argv_len[SY_PROCESS_MAX_ARGS];
+  sy_u64 allowed_signals;
+  sy_u64 max_processes;
+  sy_u64 max_runtime_ms;
+  sy_u64 max_memory_bytes;
+};
+
+extern sy_s64 sy_declare_process(
+    const struct sy_process_capability *capability, sy_u64 capability_len);
+
+#define SY_FILE_TRANSFER_SFTP              0x01
+#define SY_FILE_TRANSFER_READ              0x01
+#define SY_FILE_TRANSFER_RECURSIVE         0x04
+#define SY_FILE_TRANSFER_SCOPE_MAX 256
+
+struct sy_file_transfer_capability {
+  sy_u32 id;
+  sy_u32 protocol;
+  sy_u32 access;
+  char scope[SY_FILE_TRANSFER_SCOPE_MAX];
+  sy_u32 scope_len;
+};
+
+extern sy_s64 sy_declare_file_transfer(
+    const struct sy_file_transfer_capability *capability,
+    sy_u64 capability_len);
 
 /* ---- what the compiler calls whether you write it or not ---------------- */
 

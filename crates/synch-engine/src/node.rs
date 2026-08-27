@@ -710,6 +710,42 @@ impl Node {
         // refusal, and a build that cannot run a program never advertises that
         // it can (`docs/SOCKETS.md` §5.1).
         let socket_workers = config.socket_workers;
+        #[cfg(all(
+            any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let socket_pool = {
+            const SSH_HOST_KEY_CONFIG: &str = "ssh.host_key.ed25519";
+            let key_store = store.clone();
+            let host_key =
+                crate::blocking::offload(move || match key_store.config(SSH_HOST_KEY_CONFIG)? {
+                    Some(encoded) => Ok(synch_sock::SshHostKey::from_openssh(&encoded)
+                        .map_err(|error| EngineError::invalid(error.to_string()))?),
+                    None => {
+                        let key = synch_sock::SshHostKey::generate()
+                            .map_err(|error| EngineError::invalid(error.to_string()))?;
+                        let encoded = key
+                            .to_openssh()
+                            .map_err(|error| EngineError::invalid(error.to_string()))?;
+                        key_store.set_config(SSH_HOST_KEY_CONFIG, &encoded)?;
+                        Ok(key)
+                    }
+                })
+                .await?;
+            tracing::info!(
+                fingerprint = %host_key.fingerprint(),
+                "SSH socket host key ready"
+            );
+            crate::sockets::SocketPool::start_with_ssh_host_key(
+                socket_workers,
+                crate::sockets::default_limits(),
+                host_key,
+            )
+        };
+        #[cfg(not(all(
+            any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         let socket_pool =
             crate::sockets::SocketPool::start(socket_workers, crate::sockets::default_limits());
         let dispatch = crate::sockets::SocketDispatch::new();

@@ -32,6 +32,8 @@ pub mod errno {
     pub const ENOENT: i64 = -8;
     /// Written to after the peer's read side went away.
     pub(crate) const EPIPE: i64 = -9;
+    /// The operation is invalid in the handle's selected protocol state.
+    pub(crate) const ESTATE: i64 = -10;
 }
 
 /// Readiness bits, for `sy_poll`'s `events` and `revents`.
@@ -60,6 +62,21 @@ pub(crate) const POLLFD_SIZE: u64 = 16;
 
 /// `struct sy_stat { sy_u64 size; sy_s64 mtime_ns; sy_u32 mode; sy_u32 kind; sy_u8 root[32]; }`.
 pub(crate) const STAT_SIZE: u64 = 56;
+
+/// `sizeof(struct sy_process_capability)` in the C SDK ABI.
+pub(crate) const PROCESS_CAPABILITY_SIZE: u64 = 1360;
+
+/// `sizeof(struct sy_file_transfer_capability)` in the C SDK ABI.
+pub(crate) const FILE_TRANSFER_CAPABILITY_SIZE: u64 = 272;
+
+/// `sizeof(struct sy_ssh_event)` in the C SDK ABI.
+pub(crate) const SSH_EVENT_SIZE: u64 = 48;
+
+/// `sizeof(struct sy_pty_spec)` in the C SDK ABI.
+pub(crate) const PTY_SPEC_SIZE: u64 = 600;
+
+/// `sizeof(struct sy_process_status)` in the C SDK ABI.
+pub(crate) const PROCESS_STATUS_SIZE: u64 = 52;
 
 /// What `sy_peer_kind` returns.
 pub mod peer_kind {

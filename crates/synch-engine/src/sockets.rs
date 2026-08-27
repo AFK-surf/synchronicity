@@ -879,9 +879,15 @@ mod pool {
     pub(crate) struct SocketPool(synch_sock::WorkerHandle);
 
     impl SocketPool {
-        /// Starts `workers` threads.
-        pub(crate) fn start(workers: usize, limits: Limits) -> Option<SocketPool> {
-            Some(SocketPool(synch_sock::WorkerHandle::start(workers, limits)))
+        /// Starts workers with the node's persistent SSH host key.
+        pub(crate) fn start_with_ssh_host_key(
+            workers: usize,
+            limits: Limits,
+            host_key: synch_sock::SshHostKey,
+        ) -> Option<SocketPool> {
+            Some(SocketPool(
+                synch_sock::WorkerHandle::start_with_ssh_host_key(workers, limits, host_key),
+            ))
         }
 
         /// The limits every invocation runs under.

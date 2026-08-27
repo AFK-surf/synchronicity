@@ -25,7 +25,11 @@ use async_ebpf::{
 use base64::Engine as _;
 
 use crate::{
-    abi::{base64_kind, errno, poll, POLLFD_SIZE, STAT_SIZE, SY_SELF},
+    abi::{
+        base64_kind, errno, poll, FILE_TRANSFER_CAPABILITY_SIZE, POLLFD_SIZE,
+        PROCESS_CAPABILITY_SIZE, PROCESS_STATUS_SIZE, PTY_SPEC_SIZE, SSH_EVENT_SIZE, STAT_SIZE,
+        SY_SELF,
+    },
     limits::{CURSOR_ENTRY_OVERHEAD, MAX_COPY, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
         ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
@@ -73,6 +77,31 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_tcp_connect", h_tcp_connect),
     ("sy_tcp_connect_ip", h_tcp_connect_ip),
     ("sy_endpoint_info", h_endpoint_info),
+    // SSH protocol termination
+    ("sy_ssh_start", h_ssh_start),
+    ("sy_ssh_next", h_ssh_next),
+    ("sy_ssh_event_data", h_ssh_event_data),
+    ("sy_ssh_event_done", h_ssh_event_done),
+    ("sy_ssh_auth_reply", h_ssh_auth_reply),
+    ("sy_ssh_authorized_keys_match", h_ssh_authorized_keys_match),
+    ("sy_ssh_channel_accept", h_ssh_channel_accept),
+    ("sy_ssh_channel_reject", h_ssh_channel_reject),
+    ("sy_ssh_channel_open", h_ssh_channel_open),
+    ("sy_ssh_channel_type", h_ssh_channel_type),
+    ("sy_ssh_channel_lane", h_ssh_channel_lane),
+    ("sy_ssh_request_reply", h_ssh_request_reply),
+    ("sy_ssh_exit_status", h_ssh_exit_status),
+    ("sy_ssh_exit_signal", h_ssh_exit_signal),
+    ("sy_ssh_pty_spec", h_ssh_pty_spec),
+    // process and PTY backing
+    ("sy_pty_open", h_pty_open),
+    ("sy_process_spawn_pty", h_process_spawn_pty),
+    ("sy_process_spawn", h_process_spawn),
+    ("sy_process_stdio", h_process_stdio),
+    ("sy_pty_resize", h_pty_resize),
+    ("sy_process_status", h_process_status),
+    ("sy_process_signal", h_process_signal),
+    ("sy_sftp_open", h_sftp_open),
     // the one that suspends
     ("sy_poll", h_poll),
     // the tree
@@ -111,6 +140,8 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
         "sy_declare_guarded_stack_frames",
         h_declare_guarded_stack_frames,
     ),
+    ("sy_declare_process", h_declare_process),
+    ("sy_declare_file_transfer", h_declare_file_transfer),
 ];
 
 /// Every helper name, for the SDK-header agreement test.
@@ -407,8 +438,15 @@ fn h_stream_index(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -
 
 fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) -> Result<u64, ()> {
     let len = len.min(MAX_COPY);
-    let Some(ep) = with(scope, |inner| inner.endpoint(handle as i64))? else {
-        return ret(errno::EBADF);
+    let ep = match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
     };
     if len == 0 {
         return ret(0);
@@ -443,8 +481,15 @@ fn h_write(
     _: u64,
 ) -> Result<u64, ()> {
     let data = guest!(bytes(scope, ptr, len.min(MAX_COPY)));
-    let Some(ep) = with(scope, |inner| inner.endpoint(handle as i64))? else {
-        return ret(errno::EBADF);
+    let ep = match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
     };
     let n = ep.write(&data);
     if n > 0 {
@@ -510,26 +555,44 @@ fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -
 }
 
 fn h_readable(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| inner.endpoint(handle as i64))? {
-        Some(ep) => ret(ep.readable() as i64),
-        None => ret(errno::EBADF),
+    match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(ep) => ret(ep.readable() as i64),
+        Err(error) => ret(error),
     }
 }
 
 fn h_writable(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| inner.endpoint(handle as i64))? {
-        Some(ep) => ret(ep.writable() as i64),
-        None => ret(errno::EBADF),
+    match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(ep) => ret(ep.writable() as i64),
+        Err(error) => ret(error),
     }
 }
 
 fn h_shutdown(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| inner.endpoint(handle as i64))? {
-        Some(ep) => {
+    match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(ep) => {
             ep.shutdown();
             ret(0)
         }
-        None => ret(errno::EBADF),
+        Err(error) => ret(error),
     }
 }
 
@@ -548,7 +611,9 @@ fn h_close(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
 
 fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
     match with(scope, |inner| inner.slot(handle as i64))? {
+        Some(Slot2::Unselected(_)) => ret(0),
         Some(Slot2::Endpoint(ep)) => ret(ep.errno()),
+        Some(Slot2::SshControl(ssh)) => ret(ssh.errno()),
         Some(Slot2::Object(obj)) => {
             let code = match &*obj.result.borrow() {
                 Some(Err(e)) => *e,
@@ -557,6 +622,7 @@ fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
             ret(code)
         }
         Some(Slot2::Cursor(_)) => ret(0),
+        Some(Slot2::Process(process)) => ret(process.refresh().err().unwrap_or(0)),
         None => ret(errno::EBADF),
     }
 }
@@ -601,6 +667,7 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
         Err(e) => return e,
     };
     inner.egress_open.set(inner.egress_open.get() + 1);
+    ep.charge_egress();
     inner.publish_handles();
     inner.spawn(connect_task(ep, host, port));
     handle
@@ -653,8 +720,15 @@ fn h_endpoint_info(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let Some(ep) = with(scope, |inner| inner.endpoint(handle as i64))? else {
-        return ret(errno::EBADF);
+    let ep = match with(scope, |inner| {
+        if handle as i64 == SY_SELF {
+            inner.select_raw()
+        } else {
+            inner.endpoint(handle as i64).ok_or(errno::EBADF)
+        }
+    })? {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
     };
     let state = match ep.state() {
         State::Connecting => "connecting",
@@ -663,6 +737,1162 @@ fn h_endpoint_info(
         State::Closed => "closed",
     };
     out_str(scope, ptr, len, &format!("{} {state}", ep.peer()))
+}
+
+// ---- SSH protocol --------------------------------------------------------
+
+fn ssh_state(inner: &Inner) -> Result<std::sync::Arc<crate::runtime::ssh::SshState>, i64> {
+    match inner.slot(SY_SELF) {
+        Some(Slot2::SshControl(state)) => Ok(state),
+        Some(_) => Err(errno::ESTATE),
+        None => Err(errno::EBADF),
+    }
+}
+
+fn h_ssh_start(
+    scope: &HelperScope,
+    stream: u64,
+    methods: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if stream as i64 != SY_SELF || methods == 0 || methods & !crate::runtime::ssh::AUTH_ALL != 0 {
+        return ret(errno::EINVAL);
+    }
+    with(scope, |inner| {
+        if let Some(error) = mode_check(inner, false) {
+            return error;
+        }
+        let Some(host_key) = inner.ssh_host_key.clone() else {
+            return errno::EPERM;
+        };
+        let state = crate::runtime::ssh::SshState::new(inner.ready.clone());
+        let stream = match inner.select_ssh(state.clone()) {
+            Ok(stream) => stream,
+            Err(error) => return error,
+        };
+        inner.spawn(crate::runtime::ssh::serve(stream, state, host_key, methods));
+        0
+    })
+    .and_then(ret)
+}
+
+fn h_ssh_next(
+    scope: &HelperScope,
+    conn: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if conn as i64 != SY_SELF || out_len < SSH_EVENT_SIZE {
+        return ret(errno::EINVAL);
+    }
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some(event) = state.next() else {
+        return ret(if state.revents() & poll::HUP != 0 {
+            0
+        } else {
+            errno::EAGAIN
+        });
+    };
+    let Ok(mut region) = scope.user_memory_mut(out, SSH_EVENT_SIZE) else {
+        return ret(errno::EINVAL);
+    };
+    region[0..8].copy_from_slice(&event.id.to_le_bytes());
+    region[8..16].copy_from_slice(&event.fd.to_le_bytes());
+    for (offset, value) in [
+        (16, event.kind),
+        (20, event.flags),
+        (24, event.data_len),
+        (28, event.aux_len),
+        (32, event.a),
+        (36, event.b),
+        (40, event.c),
+        (44, event.d),
+    ] {
+        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    ret(1)
+}
+
+fn h_ssh_event_data(
+    scope: &HelperScope,
+    event_id: u64,
+    field: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some(value) = state.field(event_id, field as u32) else {
+        return ret(errno::ENOENT);
+    };
+    let n = value.len().min(out_len as usize);
+    if n > 0 {
+        let Ok(mut region) = scope.user_memory_mut(out, n as u64) else {
+            return ret(errno::EINVAL);
+        };
+        region.copy_from_slice(&value[..n]);
+    }
+    ret(value.len() as i64)
+}
+
+fn h_ssh_event_done(
+    scope: &HelperScope,
+    event_id: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    match state.reply(event_id, crate::runtime::ssh::Decision::Done) {
+        Ok(()) => ret(0),
+        Err(()) => ret(errno::ESTATE),
+    }
+}
+
+fn h_ssh_auth_reply(
+    scope: &HelperScope,
+    event_id: u64,
+    result: u64,
+    next_methods: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if !(1..=4).contains(&result) || next_methods & !crate::runtime::ssh::AUTH_ALL != 0 {
+        return ret(errno::EINVAL);
+    }
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some(kind) = state.event_kind(event_id) else {
+        return ret(errno::ESTATE);
+    };
+    if !matches!(
+        kind,
+        crate::runtime::ssh::EVENT_AUTH_NONE
+            | crate::runtime::ssh::EVENT_AUTH_PASSWORD
+            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER
+            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED
+    ) {
+        return ret(errno::ESTATE);
+    }
+    // OFFER_ACCEPT maps to the SSH library's pre-signature Accept. It is not
+    // authentication completion because this result is valid only on offers.
+    let result = if result == 4 {
+        if kind != crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER {
+            return ret(errno::ESTATE);
+        }
+        1
+    } else {
+        result as u32
+    };
+    match state.reply(
+        event_id,
+        crate::runtime::ssh::Decision::Auth {
+            result,
+            next_methods,
+        },
+    ) {
+        Ok(()) => ret(0),
+        Err(()) => ret(errno::ESTATE),
+    }
+}
+
+fn h_ssh_authorized_keys_match(
+    scope: &HelperScope,
+    event_id: u64,
+    object: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    const MAX_AUTHORIZED_KEYS: u64 = 256 * 1024;
+    const MAX_AUTHORIZED_KEY_LINE: usize = 16 * 1024;
+
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    if !matches!(
+        state.event_kind(event_id),
+        Some(
+            crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER
+                | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED
+        )
+    ) {
+        return ret(errno::ESTATE);
+    }
+    let Some(wanted) = state.field(event_id, crate::runtime::ssh::FIELD_PUBLIC_KEY_BLOB) else {
+        return ret(errno::ESTATE);
+    };
+    let Some(Slot2::Object(object)) = inner.slot(object as i64) else {
+        return ret(errno::EBADF);
+    };
+    let size = object.info.size;
+    if size > MAX_AUTHORIZED_KEYS {
+        return ret(errno::ELIMIT);
+    }
+    if object.want.get() == (0, size) {
+        if let Some(result) = object.result.borrow_mut().take() {
+            object.want.set((0, 0));
+            return match result {
+                Err(error) => ret(error),
+                Ok(data) => {
+                    let mut matched = false;
+                    for line in data.split(|byte| *byte == b'\n') {
+                        if line.len() > MAX_AUTHORIZED_KEY_LINE {
+                            inner.release(data.len() as u64);
+                            return ret(errno::ELIMIT);
+                        }
+                        let Ok(line) = std::str::from_utf8(line) else {
+                            continue;
+                        };
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        let mut fields = line.split_ascii_whitespace();
+                        let Some(key_type) = fields.next() else {
+                            continue;
+                        };
+                        // An options prefix necessarily occupies the first
+                        // field. Recognizing only key-type-shaped first fields
+                        // makes every option-bearing line fail closed.
+                        if !(key_type.starts_with("ssh-")
+                            || key_type.starts_with("ecdsa-")
+                            || key_type.starts_with("sk-"))
+                        {
+                            continue;
+                        }
+                        let Some(encoded) = fields.next() else {
+                            continue;
+                        };
+                        let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(encoded)
+                        else {
+                            continue;
+                        };
+                        if blob == wanted {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    inner.release(data.len() as u64);
+                    ret(matched as i64)
+                }
+            };
+        }
+    }
+    if object.pending.get() {
+        return ret(errno::EAGAIN);
+    }
+    if inner.charge(size).is_err() {
+        return ret(errno::ELIMIT);
+    }
+    object.pending.set(true);
+    object.want.set((0, size));
+    *object.result.borrow_mut() = None;
+    let host = inner.host.clone();
+    let slot = object.clone();
+    let root = object.info.root;
+    let task_inner = inner.clone();
+    inner.spawn(async move {
+        let result = host.pread(root, 0, size).await;
+        slot.pending.set(false);
+        match result {
+            Ok(data) => {
+                task_inner.release(size.saturating_sub(data.len() as u64));
+                *slot.result.borrow_mut() = Some(Ok(data));
+            }
+            Err(error) => {
+                task_inner.release(size);
+                *slot.result.borrow_mut() = Some(Err(host_errno(&error)));
+            }
+        }
+        slot.ready.bump();
+    });
+    ret(errno::EAGAIN)
+}
+
+fn h_ssh_channel_accept(
+    scope: &HelperScope,
+    event_id: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_OPEN) {
+        return ret(errno::ESTATE);
+    }
+    if !state.reserve_channel() {
+        return ret(errno::ELIMIT);
+    }
+    let channel_type = state
+        .field(event_id, crate::runtime::ssh::FIELD_CHANNEL_TYPE)
+        .and_then(|value| String::from_utf8(value).ok())
+        .unwrap_or_else(|| "unknown".into());
+    let endpoint = Endpoint::new(
+        inner.limits.ring_bytes.min(64 * 1024),
+        inner.ready.clone(),
+        State::Open,
+        format!("ssh:{channel_type}"),
+    );
+    let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => {
+            state.release_channel();
+            return ret(error);
+        }
+    };
+    let (local, bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
+    let (reader, writer) = tokio::io::split(local);
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        endpoint.clone(),
+        Box::new(reader),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        endpoint,
+        Box::new(writer),
+    ));
+    if state
+        .reply(
+            event_id,
+            crate::runtime::ssh::Decision::Channel { fd: handle, bridge },
+        )
+        .is_err()
+    {
+        state.release_channel();
+        inner.remove(handle);
+        return ret(errno::ESTATE);
+    }
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_ssh_channel_reject(
+    scope: &HelperScope,
+    event_id: u64,
+    reason: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let reason = match reason {
+        1 => russh::ChannelOpenFailure::AdministrativelyProhibited,
+        2 => russh::ChannelOpenFailure::ConnectFailed,
+        3 => russh::ChannelOpenFailure::UnknownChannelType,
+        4 => russh::ChannelOpenFailure::ResourceShortage,
+        _ => return ret(errno::EINVAL),
+    };
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    match state.reply(
+        event_id,
+        crate::runtime::ssh::Decision::ChannelReject(reason),
+    ) {
+        Ok(()) => ret(0),
+        Err(()) => ret(errno::ESTATE),
+    }
+}
+
+fn h_ssh_channel_open(
+    scope: &HelperScope,
+    conn: u64,
+    type_ptr: u64,
+    type_len: u64,
+    data_ptr: u64,
+    data_len: u64,
+) -> Result<u64, ()> {
+    if conn as i64 != SY_SELF {
+        return ret(errno::EINVAL);
+    }
+    let channel_type = guest!(string(scope, type_ptr, type_len));
+    let data = guest!(bytes(scope, data_ptr, data_len));
+    if channel_type.is_empty()
+        || channel_type.len() > 256
+        || !channel_type
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
+        || data.len() > 16 * 1024
+    {
+        return ret(errno::EINVAL);
+    }
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some(session) = state.session() else {
+        return ret(errno::ESTATE);
+    };
+    if !state.reserve_channel() {
+        return ret(errno::ELIMIT);
+    }
+    let endpoint = Endpoint::new(
+        inner.limits.ring_bytes.min(64 * 1024),
+        inner.ready.clone(),
+        State::Connecting,
+        format!("ssh:{channel_type}"),
+    );
+    let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => {
+            state.release_channel();
+            return ret(error);
+        }
+    };
+    let (local, mut bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
+    let (reader, writer) = tokio::io::split(local);
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        endpoint.clone(),
+        Box::new(reader),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        endpoint.clone(),
+        Box::new(writer),
+    ));
+    inner.spawn(async move {
+        let opened = session
+            .channel_open_unknown(channel_type.clone(), data)
+            .await;
+        match opened {
+            Ok(channel) => {
+                state.add_outbound_channel(handle, channel.id(), &channel_type);
+                endpoint.set_open();
+                let mut stream = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut bridge).await;
+            }
+            Err(_) => {
+                state.release_channel();
+                endpoint.fail(errno::ECONNRESET);
+            }
+        }
+    });
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_ssh_channel_type(
+    scope: &HelperScope,
+    channel: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let Some(endpoint) = with(scope, |inner| inner.endpoint(channel as i64))? else {
+        return ret(errno::EBADF);
+    };
+    let peer = endpoint.peer();
+    let Some(channel_type) = peer.strip_prefix("ssh:") else {
+        return ret(errno::ESTATE);
+    };
+    out_str(scope, out, out_len, channel_type)
+}
+
+fn h_ssh_channel_lane(
+    scope: &HelperScope,
+    channel: u64,
+    data_type: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some((session, channel_id, _)) = state.channel(channel as i64) else {
+        return ret(errno::ESTATE);
+    };
+    let data_type = data_type.min(u32::MAX as u64) as u32;
+    if let Some(handle) = state.lane_handle(channel as i64, data_type) {
+        if inner.endpoint(handle).is_some() {
+            return ret(handle);
+        }
+    }
+    let endpoint = Endpoint::new(
+        inner.limits.ring_bytes.min(64 * 1024),
+        inner.ready.clone(),
+        State::Open,
+        format!("ssh-lane:{}:{data_type}", channel),
+    );
+    let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => return ret(error),
+    };
+    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(8);
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.register_lane(channel as i64, data_type, handle, incoming_tx);
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        endpoint.clone(),
+        Box::new(crate::runtime::process::ChannelReader::new(incoming_rx)),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        endpoint,
+        Box::new(crate::runtime::process::ChannelWriter(outgoing_tx)),
+    ));
+    inner.spawn(async move {
+        while let Some(bytes) = outgoing_rx.recv().await {
+            if session
+                .extended_data(channel_id, data_type, bytes)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_ssh_request_reply(
+    scope: &HelperScope,
+    event_id: u64,
+    result: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if result > 1 {
+        return ret(errno::EINVAL);
+    }
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_REQUEST) {
+        return ret(errno::ESTATE);
+    }
+    match state.reply(
+        event_id,
+        crate::runtime::ssh::Decision::Request(result == 1),
+    ) {
+        Ok(()) => ret(0),
+        Err(()) => ret(errno::ESTATE),
+    }
+}
+
+fn h_ssh_exit_status(
+    scope: &HelperScope,
+    channel: u64,
+    status: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some((session, channel_id, kind)) = state.channel(channel as i64) else {
+        return ret(errno::ESTATE);
+    };
+    if kind != "session" || status > u32::MAX as u64 {
+        return ret(errno::ESTATE);
+    }
+    inner.spawn(async move {
+        let _ = session.exit_status_request(channel_id, status as u32).await;
+    });
+    ret(0)
+}
+
+fn h_ssh_exit_signal(
+    scope: &HelperScope,
+    channel: u64,
+    name_ptr: u64,
+    name_len: u64,
+    core_dumped: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if core_dumped > 1 {
+        return ret(errno::EINVAL);
+    }
+    let name = guest!(string(scope, name_ptr, name_len));
+    if name.is_empty() || name.len() > 32 || !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return ret(errno::EINVAL);
+    }
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some((session, channel_id, kind)) = state.channel(channel as i64) else {
+        return ret(errno::ESTATE);
+    };
+    if kind != "session" {
+        return ret(errno::ESTATE);
+    }
+    inner.spawn(async move {
+        let _ = session
+            .exit_signal_request(
+                channel_id,
+                russh::Sig::Custom(name),
+                core_dumped == 1,
+                String::new(),
+                String::new(),
+            )
+            .await;
+    });
+    ret(0)
+}
+
+fn h_ssh_pty_spec(
+    scope: &HelperScope,
+    event_id: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if out_len < PTY_SPEC_SIZE {
+        return ret(errno::EINVAL);
+    }
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    let Some(pty) = state.pty(event_id) else {
+        return ret(errno::ESTATE);
+    };
+    if pty.term.len() > 64 || pty.modes.len() > 64 {
+        return ret(errno::ELIMIT);
+    }
+    let Ok(mut region) = scope.user_memory_mut(out, PTY_SPEC_SIZE) else {
+        return ret(errno::EINVAL);
+    };
+    region.fill(0);
+    region[..pty.term.len()].copy_from_slice(pty.term.as_bytes());
+    for (offset, value) in [
+        (64, pty.term.len() as u32),
+        (68, pty.columns),
+        (72, pty.rows),
+        (76, pty.pixel_width),
+        (80, pty.pixel_height),
+        (84, pty.modes.len() as u32),
+    ] {
+        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (index, (opcode, value)) in pty.modes.iter().enumerate() {
+        let offset = 88 + index * 8;
+        region[offset..offset + 4].copy_from_slice(&(*opcode as u32).to_le_bytes());
+        region[offset + 4..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    ret(0)
+}
+
+// ---- declared process and PTY backing -----------------------------------
+
+fn process_capability(inner: &Inner, id: u32) -> Result<synch_core::ProcessCapability, i64> {
+    inner
+        .policy
+        .processes
+        .iter()
+        .find(|capability| capability.id == id)
+        .cloned()
+        .ok_or(errno::EPERM)
+}
+
+fn process_capacity(inner: &Inner, capability: &synch_core::ProcessCapability) -> Result<(), i64> {
+    let open = inner
+        .slots
+        .borrow()
+        .iter()
+        .filter(|slot| matches!(slot, Some(Slot::Process(_))))
+        .count() as u64;
+    let limit = if capability.max_processes == 0 {
+        crate::runtime::process::DEFAULT_MAX_PROCESSES
+    } else {
+        capability
+            .max_processes
+            .min(crate::runtime::process::DEFAULT_MAX_PROCESSES)
+    };
+    (open < limit).then_some(()).ok_or(errno::ELIMIT)
+}
+
+fn parse_pty_spec(
+    scope: &HelperScope,
+    ptr: u64,
+    len: u64,
+) -> Result<crate::runtime::ssh::PtyRequest, i64> {
+    if len != PTY_SPEC_SIZE {
+        return Err(errno::EINVAL);
+    }
+    let raw = bytes(scope, ptr, len)?;
+    let term_len = le_u32(&raw, 64) as usize;
+    let mode_count = le_u32(&raw, 84) as usize;
+    if term_len > 64 || mode_count > 64 {
+        return Err(errno::EINVAL);
+    }
+    let term = String::from_utf8(raw[..term_len].to_vec()).map_err(|_| errno::EINVAL)?;
+    if term.is_empty()
+        || !term
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
+    {
+        return Err(errno::EINVAL);
+    }
+    let mut modes = Vec::with_capacity(mode_count);
+    for index in 0..mode_count {
+        let offset = 88 + index * 8;
+        modes.push((le_u32(&raw, offset) as u8, le_u32(&raw, offset + 4)));
+    }
+    Ok(crate::runtime::ssh::PtyRequest {
+        term,
+        columns: le_u32(&raw, 68),
+        rows: le_u32(&raw, 72),
+        pixel_width: le_u32(&raw, 76),
+        pixel_height: le_u32(&raw, 80),
+        modes,
+    })
+}
+
+fn h_pty_open(
+    scope: &HelperScope,
+    capability_id: u64,
+    spec_ptr: u64,
+    spec_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let spec = guest!(parse_pty_spec(scope, spec_ptr, spec_len));
+    let inner = with(scope, Rc::clone)?;
+    if inner.init_mode {
+        return ret(errno::EPERM);
+    }
+    let capability = match process_capability(&inner, capability_id as u32) {
+        Ok(capability) if capability.flags & 0x01 != 0 => capability,
+        Ok(_) | Err(_) => return ret(errno::EPERM),
+    };
+    if let Err(error) = process_capacity(&inner, &capability) {
+        return ret(error);
+    }
+    let (master, slave) = match crate::runtime::process::open_pty(
+        spec.columns,
+        spec.rows,
+        spec.pixel_width,
+        spec.pixel_height,
+    ) {
+        Ok(pair) => pair,
+        Err(error) => return ret(error),
+    };
+    if let Err(error) = crate::runtime::process::apply_pty_modes(&slave, &spec.modes) {
+        return ret(error);
+    }
+    let (reader, writer) = match crate::runtime::process::pty_adapters(&master) {
+        Ok(adapters) => adapters,
+        Err(error) => return ret(error),
+    };
+    let endpoint = Endpoint::new(
+        inner.limits.ring_bytes,
+        inner.ready.clone(),
+        State::Open,
+        format!("pty:{}", capability.id),
+    );
+    let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => return ret(error),
+    };
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        endpoint.clone(),
+        Box::new(reader),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        endpoint,
+        Box::new(writer),
+    ));
+    inner.ptys.borrow_mut().insert(
+        handle,
+        Rc::new(crate::runtime::process::PtySlot {
+            master,
+            slave: std::cell::RefCell::new(Some(slave)),
+            endpoint: handle,
+            capability: capability.id,
+            spawned: std::cell::Cell::new(false),
+            term: spec.term,
+        }),
+    );
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_process_spawn_pty(
+    scope: &HelperScope,
+    capability_id: u64,
+    pty_handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let capability = match process_capability(&inner, capability_id as u32) {
+        Ok(capability) if capability.flags & 0x01 != 0 => capability,
+        Ok(_) | Err(_) => return ret(errno::EPERM),
+    };
+    if let Err(error) = process_capacity(&inner, &capability) {
+        return ret(error);
+    }
+    let Some(pty) = inner.ptys.borrow().get(&(pty_handle as i64)).cloned() else {
+        return ret(errno::EBADF);
+    };
+    if pty.capability != capability.id || pty.spawned.replace(true) {
+        return ret(errno::ESTATE);
+    }
+    let Some(slave) = pty.slave.borrow_mut().take() else {
+        return ret(errno::ESTATE);
+    };
+    let child = match crate::runtime::process::spawn_pty(&capability, slave, &pty.term) {
+        Ok(child) => child,
+        Err(error) => {
+            pty.spawned.set(false);
+            return ret(error);
+        }
+    };
+    let process = Rc::new(crate::runtime::process::ProcessSlot {
+        child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pty(child))),
+        status: std::cell::RefCell::new(Default::default()),
+        allowed_signals: capability.allowed_signals,
+        main: pty.endpoint,
+        stderr: None,
+    });
+    let handle = match inner.insert(Slot::Process(process.clone())) {
+        Ok(handle) => handle,
+        Err(error) => {
+            process.kill();
+            return ret(error);
+        }
+    };
+    schedule_process_deadline(&inner, &process, capability.max_runtime_ms);
+    #[cfg(target_os = "macos")]
+    schedule_process_memory_limit(&inner, &process, capability.max_memory_bytes);
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_process_spawn(
+    scope: &HelperScope,
+    capability_id: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let capability = match process_capability(&inner, capability_id as u32) {
+        Ok(capability) if capability.flags & 0x02 != 0 => capability,
+        Ok(_) | Err(_) => return ret(errno::EPERM),
+    };
+    if let Err(error) = process_capacity(&inner, &capability) {
+        return ret(error);
+    }
+    let (child, stdout, stdin, stderr) = match crate::runtime::process::spawn_pipe(&capability) {
+        Ok(parts) => parts,
+        Err(error) => return ret(error),
+    };
+    let main_endpoint = Endpoint::new(
+        inner.limits.ring_bytes,
+        inner.ready.clone(),
+        State::Open,
+        format!("process:{}:stdio", capability.id),
+    );
+    let main = match inner.insert(Slot::Endpoint(main_endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => return ret(error),
+    };
+    let stderr_endpoint = Endpoint::new(
+        inner.limits.ring_bytes,
+        inner.ready.clone(),
+        State::Open,
+        format!("process:{}:stderr", capability.id),
+    );
+    stderr_endpoint.set_read_only();
+    let stderr_handle = match inner.insert(Slot::Endpoint(stderr_endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => {
+            inner.remove(main);
+            return ret(error);
+        }
+    };
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        main_endpoint.clone(),
+        Box::new(stdout),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        main_endpoint,
+        Box::new(stdin),
+    ));
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        stderr_endpoint.clone(),
+        Box::new(stderr),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        stderr_endpoint,
+        Box::new(tokio::io::sink()),
+    ));
+    let process = Rc::new(crate::runtime::process::ProcessSlot {
+        child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pipe(child))),
+        status: std::cell::RefCell::new(Default::default()),
+        allowed_signals: capability.allowed_signals,
+        main,
+        stderr: Some(stderr_handle),
+    });
+    let handle = match inner.insert(Slot::Process(process.clone())) {
+        Ok(handle) => handle,
+        Err(error) => {
+            process.kill();
+            inner.remove(main);
+            inner.remove(stderr_handle);
+            return ret(error);
+        }
+    };
+    schedule_process_deadline(&inner, &process, capability.max_runtime_ms);
+    #[cfg(target_os = "macos")]
+    schedule_process_memory_limit(&inner, &process, capability.max_memory_bytes);
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn schedule_process_deadline(
+    inner: &Rc<Inner>,
+    process: &Rc<crate::runtime::process::ProcessSlot>,
+    max_runtime_ms: u64,
+) {
+    let max_runtime_ms = if max_runtime_ms == 0 {
+        crate::runtime::process::DEFAULT_MAX_RUNTIME_MS
+    } else {
+        max_runtime_ms.min(crate::runtime::process::DEFAULT_MAX_RUNTIME_MS)
+    };
+    let Some(pid) = process.pid() else { return };
+    inner.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(max_runtime_ms)).await;
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_process_memory_limit(
+    inner: &Rc<Inner>,
+    process: &Rc<crate::runtime::process::ProcessSlot>,
+    max_memory_bytes: u64,
+) {
+    let limit = if max_memory_bytes == 0 {
+        crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES
+    } else {
+        max_memory_bytes.min(crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES)
+    };
+    let Some(pgid) = process.pid() else { return };
+    let Ok(signal_pgid) = i32::try_from(pgid) else {
+        process.kill();
+        return;
+    };
+    inner.spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match crate::runtime::process::process_group_resident_bytes(pgid) {
+                Ok(Some(bytes)) if bytes <= limit => {}
+                Ok(None) => break,
+                Ok(Some(_)) | Err(()) => {
+                    // Accounting failure is a policy failure: do not leave an
+                    // unbounded declared process running.
+                    unsafe {
+                        libc::kill(-signal_pgid, libc::SIGKILL);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn h_process_stdio(
+    scope: &HelperScope,
+    process: u64,
+    stream: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let Some(Slot2::Process(process)) = with(scope, |inner| inner.slot(process as i64))? else {
+        return ret(errno::EBADF);
+    };
+    match stream {
+        0 => ret(process.main),
+        1 => process.stderr.map_or_else(|| ret(errno::ENOENT), ret),
+        _ => ret(errno::EINVAL),
+    }
+}
+
+fn h_pty_resize(
+    scope: &HelperScope,
+    pty: u64,
+    columns: u64,
+    rows: u64,
+    pixel_width: u64,
+    pixel_height: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let Some(pty) = inner.ptys.borrow().get(&(pty as i64)).cloned() else {
+        return ret(errno::EBADF);
+    };
+    match pty.resize(
+        columns.min(u32::MAX as u64) as u32,
+        rows.min(u32::MAX as u64) as u32,
+        pixel_width.min(u32::MAX as u64) as u32,
+        pixel_height.min(u32::MAX as u64) as u32,
+    ) {
+        Ok(()) => ret(0),
+        Err(error) => ret(error),
+    }
+}
+
+fn h_process_status(
+    scope: &HelperScope,
+    process: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if out_len < PROCESS_STATUS_SIZE {
+        return ret(errno::EINVAL);
+    }
+    let Some(Slot2::Process(process)) = with(scope, |inner| inner.slot(process as i64))? else {
+        return ret(errno::EBADF);
+    };
+    let status = match process.refresh() {
+        Ok(status) => status,
+        Err(error) => return ret(error),
+    };
+    let Ok(mut region) = scope.user_memory_mut(out, PROCESS_STATUS_SIZE) else {
+        return ret(errno::EINVAL);
+    };
+    region.fill(0);
+    for (offset, value) in [
+        (0, status.exited as u32),
+        (4, status.exit_code),
+        (8, status.signal.is_some() as u32),
+        (12, status.core_dumped as u32),
+    ] {
+        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    if let Some(signal) = status.signal {
+        let bytes = signal.as_bytes();
+        let n = bytes.len().min(32);
+        region[16..16 + n].copy_from_slice(&bytes[..n]);
+        region[48..52].copy_from_slice(&(n as u32).to_le_bytes());
+    }
+    ret(0)
+}
+
+fn h_process_signal(
+    scope: &HelperScope,
+    process: u64,
+    name_ptr: u64,
+    name_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let name = guest!(string(scope, name_ptr, name_len));
+    let Some((bit, signal)) = crate::runtime::process::signal_number(&name) else {
+        return ret(errno::EINVAL);
+    };
+    let Some(Slot2::Process(process)) = with(scope, |inner| inner.slot(process as i64))? else {
+        return ret(errno::EBADF);
+    };
+    if process.allowed_signals & bit == 0 {
+        return ret(errno::EPERM);
+    }
+    let Some(pid) = process.pid() else {
+        return ret(errno::ESTATE);
+    };
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    ret(if result == 0 { 0 } else { errno::ECONNRESET })
+}
+
+fn h_sftp_open(
+    scope: &HelperScope,
+    capability_id: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    if inner.init_mode {
+        return ret(errno::EPERM);
+    }
+    let Some(capability) = inner
+        .policy
+        .file_transfers
+        .iter()
+        .find(|capability| capability.id == capability_id as u32)
+        .cloned()
+    else {
+        return ret(errno::EPERM);
+    };
+    if capability.protocol != 1 || capability.access & 0x01 == 0 {
+        return ret(errno::EPERM);
+    }
+    let endpoint = Endpoint::new(
+        inner.limits.ring_bytes,
+        inner.ready.clone(),
+        State::Open,
+        format!("sftp:{}", capability.scope),
+    );
+    let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
+        Ok(handle) => handle,
+        Err(error) => return ret(error),
+    };
+    let (local, service) = tokio::io::duplex(inner.limits.ring_bytes.min(256 * 1024));
+    let (reader, writer) = tokio::io::split(local);
+    inner.spawn(crate::runtime::endpoint::reader_task(
+        endpoint.clone(),
+        Box::new(reader),
+    ));
+    inner.spawn(crate::runtime::endpoint::writer_task(
+        endpoint,
+        Box::new(writer),
+    ));
+    let handler = crate::runtime::sftp::TreeSftp::new(
+        inner.host.clone(),
+        capability.scope,
+        capability.access,
+    );
+    inner.spawn(async move {
+        russh_sftp::server::run(service, handler).await;
+    });
+    inner.publish_handles();
+    ret(handle)
 }
 
 // ---- poll: the only helper that suspends ---------------------------------
@@ -706,6 +1936,16 @@ fn h_poll(
                 return ret(errno::EINVAL);
             }
             watch.push((handle, events));
+        }
+        // Poll is itself the first ordinary endpoint operation. Selecting raw
+        // mode here starts the pumps before readiness is sampled; fd zero in
+        // SSH mode remains a control object and is deliberately left alone.
+        if watch.iter().any(|(handle, _)| *handle == SY_SELF)
+            && matches!(inner.slot(SY_SELF), Some(Slot2::Unselected(_)))
+        {
+            if let Err(error) = inner.select_raw() {
+                return ret(error);
+            }
         }
 
         let now = std::time::Instant::now();
@@ -796,7 +2036,9 @@ fn ready_now(inner: &Inner, watch: &[(i64, u32)]) -> Option<u64> {
 /// beside it.
 fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
     match inner.slot(handle) {
+        Some(Slot2::Unselected(_)) => 0,
         Some(Slot2::Endpoint(ep)) => ep.poll_revents(events),
+        Some(Slot2::SshControl(ssh)) => ssh.revents() & (events | poll::ERR | poll::HUP),
         Some(Slot2::Object(obj)) => {
             let bits = match &*obj.result.borrow() {
                 Some(Ok(_)) => poll::IN,
@@ -806,6 +2048,11 @@ fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
             bits & (events | poll::ERR)
         }
         Some(Slot2::Cursor(_)) => poll::IN & events,
+        Some(Slot2::Process(process)) => match process.refresh() {
+            Ok(status) if status.exited => poll::IN & events,
+            Ok(_) => 0,
+            Err(_) => poll::ERR,
+        },
         None => poll::ERR,
     }
 }
@@ -1563,6 +2810,158 @@ fn h_declare_guarded_stack_frames(
         };
         inner.declaration.borrow_mut().guarded_stack_frames = Some(enabled);
         0
+    })
+    .and_then(ret)
+}
+
+fn le_u32(raw: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        raw[offset..offset + 4]
+            .try_into()
+            .expect("validated ABI field"),
+    )
+}
+
+fn le_u64(raw: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        raw[offset..offset + 8]
+            .try_into()
+            .expect("validated ABI field"),
+    )
+}
+
+fn fixed_string(raw: &[u8], offset: usize, capacity: usize, len: u32) -> Result<String, i64> {
+    let len = len as usize;
+    if len > capacity {
+        return Err(errno::EINVAL);
+    }
+    String::from_utf8(raw[offset..offset + len].to_vec()).map_err(|_| errno::EINVAL)
+}
+
+fn h_declare_process(
+    scope: &HelperScope,
+    ptr: u64,
+    len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if len != PROCESS_CAPABILITY_SIZE {
+        return ret(errno::EINVAL);
+    }
+    let raw = guest!(bytes(scope, ptr, len));
+    let executable = guest!(fixed_string(&raw, 8, 256, le_u32(&raw, 264)));
+    let argc = le_u32(&raw, 268) as usize;
+    if argc == 0 || argc > synch_core::sock::MAX_PROCESS_ARGS {
+        return ret(errno::EINVAL);
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for index in 0..argc {
+        argv.push(guest!(fixed_string(
+            &raw,
+            272 + index * synch_core::sock::MAX_PROCESS_ARG_BYTES,
+            synch_core::sock::MAX_PROCESS_ARG_BYTES,
+            le_u32(&raw, 1296 + index * 4),
+        )));
+    }
+    let canonical = match std::fs::canonicalize(&executable) {
+        Ok(path) => path,
+        Err(_) => return ret(errno::ENOENT),
+    };
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return ret(errno::ENOENT);
+    };
+    if !metadata.is_file() {
+        return ret(errno::EINVAL);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return ret(errno::EPERM);
+        }
+    }
+    let Some(executable) = canonical.to_str().map(str::to_owned) else {
+        return ret(errno::EINVAL);
+    };
+    let capability = synch_core::ProcessCapability {
+        id: le_u32(&raw, 0),
+        flags: le_u32(&raw, 4),
+        executable,
+        argv,
+        allowed_signals: le_u64(&raw, 1328),
+        max_processes: le_u64(&raw, 1336),
+        max_runtime_ms: le_u64(&raw, 1344),
+        max_memory_bytes: le_u64(&raw, 1352),
+    };
+    with(scope, |inner| {
+        if let Some(error) = mode_check(inner, true) {
+            return error;
+        }
+        let mut declaration = inner.declaration.borrow_mut();
+        if declaration.processes.len() >= synch_core::MAX_DECLARED_PROCESSES {
+            return errno::ELIMIT;
+        }
+        if declaration
+            .processes
+            .iter()
+            .any(|item| item.id == capability.id)
+        {
+            return errno::EINVAL;
+        }
+        declaration.processes.push(capability);
+        match declaration.validate() {
+            Ok(()) => 0,
+            Err(_) => {
+                declaration.processes.pop();
+                errno::EINVAL
+            }
+        }
+    })
+    .and_then(ret)
+}
+
+fn h_declare_file_transfer(
+    scope: &HelperScope,
+    ptr: u64,
+    len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if len != FILE_TRANSFER_CAPABILITY_SIZE {
+        return ret(errno::EINVAL);
+    }
+    let raw = guest!(bytes(scope, ptr, len));
+    let capability = synch_core::FileTransferCapability {
+        id: le_u32(&raw, 0),
+        protocol: le_u32(&raw, 4),
+        access: le_u32(&raw, 8),
+        scope: guest!(fixed_string(&raw, 12, 256, le_u32(&raw, 268))),
+    };
+    with(scope, |inner| {
+        if let Some(error) = mode_check(inner, true) {
+            return error;
+        }
+        let mut declaration = inner.declaration.borrow_mut();
+        if declaration.file_transfers.len() >= synch_core::MAX_DECLARED_FILE_TRANSFERS {
+            return errno::ELIMIT;
+        }
+        if declaration
+            .file_transfers
+            .iter()
+            .any(|item| item.id == capability.id)
+        {
+            return errno::EINVAL;
+        }
+        declaration.file_transfers.push(capability);
+        match declaration.validate() {
+            Ok(()) => 0,
+            Err(_) => {
+                declaration.file_transfers.pop();
+                errno::EINVAL
+            }
+        }
     })
     .and_then(ret)
 }

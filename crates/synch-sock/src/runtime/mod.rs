@@ -18,6 +18,9 @@ pub(crate) mod ctx;
 pub(crate) mod endpoint;
 pub(crate) mod helpers;
 pub(crate) mod map;
+pub(crate) mod process;
+pub(crate) mod sftp;
+pub(crate) mod ssh;
 
 use std::{
     cell::RefCell,
@@ -44,11 +47,57 @@ use crate::{
     },
     runtime::{
         ctx::{Ctx, Inner, Slot, DECLARE_IDLE},
-        endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
+        endpoint::Readiness,
         map::SocketMaps,
     },
     Invocation, Outcome, SockError,
 };
+
+/// The persistent Ed25519 SSH host key shared by every socket invocation on a node.
+#[derive(Clone)]
+pub struct SshHostKey(russh::keys::PrivateKey);
+
+impl std::fmt::Debug for SshHostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshHostKey")
+            .field("fingerprint", &self.fingerprint())
+            .finish()
+    }
+}
+
+impl SshHostKey {
+    /// Generates a fresh Ed25519 host key.
+    pub fn generate() -> Result<Self, SockError> {
+        ssh::generate_host_key()
+            .map(Self)
+            .map_err(|error| SockError::Load(format!("cannot generate SSH host key: {error}")))
+    }
+
+    /// Parses an unencrypted OpenSSH private-key document.
+    pub fn from_openssh(encoded: &str) -> Result<Self, SockError> {
+        let key = russh::keys::PrivateKey::from_openssh(encoded)
+            .map_err(|error| SockError::Load(format!("invalid SSH host key: {error}")))?;
+        if key.algorithm() != russh::keys::Algorithm::Ed25519 {
+            return Err(SockError::Load("SSH host key is not Ed25519".into()));
+        }
+        Ok(Self(key))
+    }
+
+    /// Encodes the key for protected storage in the node database.
+    pub fn to_openssh(&self) -> Result<String, SockError> {
+        self.0
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .map(|encoded| encoded.to_string())
+            .map_err(|error| SockError::Load(format!("cannot encode SSH host key: {error}")))
+    }
+
+    /// The conventional SHA-256 host-key fingerprint.
+    pub fn fingerprint(&self) -> String {
+        self.0
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string()
+    }
+}
 
 /// Ties yielding and sleeping to tokio.
 struct TokioTimeslicer;
@@ -101,39 +150,10 @@ fn global_env() -> GlobalEnv {
 /// One invocation, plus where to send the answer.
 struct Job {
     invocation: Invocation,
+    ssh_host_key: Arc<russh::keys::PrivateKey>,
     reply: oneshot::Sender<Result<Outcome, SockError>>,
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
-}
-
-/// Aborts the invocation's detached tasks when this drops — including on
-/// unwinding.
-///
-/// A panic inside the guest or its helpers would otherwise leave the reader
-/// and writer tasks pumping an invocation nobody is collecting, with its
-/// rings and its stream held open. Aborting an already-finished task is a
-/// no-op, so the normal path is unaffected: the teardown aborts or joins
-/// these same tasks at its own pace, and this is the backstop.
-struct TaskGuard {
-    tasks: Vec<tokio::task::AbortHandle>,
-}
-
-impl TaskGuard {
-    fn new() -> Self {
-        TaskGuard { tasks: Vec::new() }
-    }
-
-    fn push(&mut self, task: &tokio::task::JoinHandle<()>) {
-        self.tasks.push(task.abort_handle());
-    }
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
 }
 
 type StackConfig = (usize, bool);
@@ -282,6 +302,7 @@ pub struct WorkerHandle {
     limits: Limits,
     next_id: Arc<AtomicU64>,
     shutdown: Arc<ShutdownSignal>,
+    ssh_host_key: Arc<russh::keys::PrivateKey>,
 }
 
 impl WorkerHandle {
@@ -290,6 +311,17 @@ impl WorkerHandle {
     /// Zero is rounded up to one: a pool that exists but can run nothing is a
     /// configuration mistake that would surface as a hang rather than an error.
     pub fn start(count: usize, limits: Limits) -> WorkerHandle {
+        let host_key =
+            SshHostKey::generate().expect("the platform can generate an Ed25519 SSH key");
+        Self::start_with_ssh_host_key(count, limits, host_key)
+    }
+
+    /// Starts workers with a persistent node-wide SSH host key.
+    pub fn start_with_ssh_host_key(
+        count: usize,
+        limits: Limits,
+        ssh_host_key: SshHostKey,
+    ) -> WorkerHandle {
         let count = count.max(1);
         warn_if_default_stack_is_contiguous();
         // Installed before any worker exists, so no thread can start a guest
@@ -321,6 +353,7 @@ impl WorkerHandle {
             limits,
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown,
+            ssh_host_key: Arc::new(ssh_host_key.0),
         }
     }
 
@@ -408,6 +441,7 @@ impl WorkerHandle {
         let load = worker.load.clone();
         let sent = worker.jobs.send(Job {
             invocation,
+            ssh_host_key: self.ssh_host_key.clone(),
             reply,
             cancel,
             peer_gone,
@@ -517,6 +551,7 @@ impl Worker {
                                             &registry,
                                             &shutdown,
                                             job.invocation,
+                                            job.ssh_host_key,
                                             job.cancel,
                                             job.peer_gone,
                                         )
@@ -634,6 +669,7 @@ async fn run_job(
     registry: &Arc<crate::registry::Registry>,
     shutdown: &Arc<ShutdownSignal>,
     invocation: Invocation,
+    ssh_host_key: Arc<russh::keys::PrivateKey>,
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
 ) -> Result<Outcome, SockError> {
@@ -647,19 +683,17 @@ async fn run_job(
         invocation.policy.guarded_stack_frames,
     )?;
 
-    let ready = Rc::new(Readiness::default());
-    let self_ep = Endpoint::new(
-        limits.ring_bytes,
-        ready.clone(),
-        State::Open,
-        invocation.peer.addr.clone(),
-    );
+    let ready = Arc::new(Readiness::default());
+    let unselected = Rc::new(ctx::UnselectedStream {
+        stream: RefCell::new(Some(invocation.stream)),
+        peer: invocation.peer.addr.clone(),
+    });
     let started = Instant::now();
     // Built by mutation rather than struct update: `Inner` has a `Drop` that
     // aborts its tasks, so moving fields out of another `Inner` is not
     // allowed.
     let mut inner = Inner::bare(invocation.host, started, limits.idle_deadline);
-    inner.slots = RefCell::new(vec![Some(Slot::Endpoint(self_ep.clone()))]);
+    inner.slots = RefCell::new(vec![Some(Slot::Unselected(unselected))]);
     inner.ready = ready;
     inner.policy = invocation.policy;
     inner.peer = invocation.peer;
@@ -676,17 +710,8 @@ async fn run_job(
         .map(|slot| slot.stats())
         .unwrap_or_default();
     inner.registry = Some(registry.clone());
+    inner.ssh_host_key = Some(ssh_host_key);
     let inner = Rc::new(inner);
-    // The caller's pump tasks are the invocation's own: what the teardown
-    // aborts or joins, and what must die with the invocation even if the
-    // guest's execution panics somewhere it was not supposed to.
-    let mut task_guard = TaskGuard::new();
-    let self_reader =
-        tokio::task::spawn_local(reader_task(self_ep.clone(), invocation.stream.reader));
-    let mut self_writer =
-        tokio::task::spawn_local(writer_task(self_ep.clone(), invocation.stream.writer));
-    task_guard.push(&self_reader);
-    task_guard.push(&self_writer);
     debug_assert_eq!(SY_SELF, 0, "SY_SELF must be the first slot");
     inner.publish_handles();
 
@@ -760,10 +785,14 @@ async fn run_job(
     // the transport's own verdict, not something the guest can provoke.
     let caller_gone = async {
         let ready = inner.ready.clone();
-        let self_ep = self_ep.clone();
         loop {
             let epoch = ready.epoch();
-            if self_ep.state() == State::Failed {
+            let failed = match inner.slot(SY_SELF) {
+                Some(ctx::Slot2::Endpoint(endpoint)) => endpoint.state() == State::Failed,
+                Some(ctx::Slot2::SshControl(ssh)) => ssh.errno() != 0,
+                _ => false,
+            };
+            if failed {
                 return;
             }
             // `fail` bumps readiness, so the wait wakes on the state change;
@@ -827,13 +856,20 @@ async fn run_job(
     // One window for all of them, and the flushes run inside it at once, so
     // teardown costs what it always cost rather than a window per endpoint.
     let deadline = Instant::now() + TEARDOWN_DRAIN;
-    self_ep.shutdown();
+    let raw_writer = if let Some(ctx::Slot2::Endpoint(endpoint)) = inner.slot(SY_SELF) {
+        endpoint.shutdown();
+        inner.raw_writer.borrow_mut().take()
+    } else {
+        None
+    };
     let draining = inner.begin_drain();
-    if tokio::time::timeout_at(deadline.into(), &mut self_writer)
-        .await
-        .is_err()
-    {
-        self_writer.abort();
+    if let Some(mut writer) = raw_writer {
+        if tokio::time::timeout_at(deadline.into(), &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
     }
     for ep in draining {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -844,7 +880,6 @@ async fn run_job(
             break;
         }
     }
-    self_reader.abort();
     inner.abort_tasks();
     // The length is read into a local first: a `for` loop's iterator
     // expression keeps its temporaries alive for the whole loop, so borrowing
@@ -868,7 +903,8 @@ async fn run_job(
     }
     drop(invocation.slot);
 
-    let (bytes_in, bytes_out) = (self_ep.bytes_in.get(), self_ep.bytes_out.get());
+    let bytes_in = inner.live.bytes_in.load(Ordering::Relaxed);
+    let bytes_out = inner.live.bytes_out.load(Ordering::Relaxed);
     let metrics = inner.metrics.borrow().clone();
     let labels = inner.labels.borrow().clone();
     Ok(Outcome {
@@ -1042,5 +1078,14 @@ mod stack_tests {
     fn the_stack_keeps_at_least_eight_frames() {
         assert_eq!(guest_stack_size(512).unwrap(), 32 * 1024 + 512);
         assert_eq!(guest_stack_size(16 * 1024).unwrap(), 128 * 1024 + 512);
+    }
+
+    #[test]
+    fn an_ssh_host_key_round_trips_without_changing_identity() {
+        let key = SshHostKey::generate().unwrap();
+        let fingerprint = key.fingerprint();
+        let encoded = key.to_openssh().unwrap();
+        let decoded = SshHostKey::from_openssh(&encoded).unwrap();
+        assert_eq!(decoded.fingerprint(), fingerprint);
     }
 }

@@ -47,7 +47,7 @@ mod runtime;
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use runtime::{declare, Worker, WorkerHandle};
+pub use runtime::{declare, SshHostKey, Worker, WorkerHandle};
 
 use std::sync::Arc;
 

@@ -254,6 +254,60 @@ pub const MAX_DECLARED_EGRESS: usize = 32;
 /// The most tree-read prefixes one program may declare.
 pub const MAX_DECLARED_TREE_READS: usize = 32;
 
+/// The most exact process capabilities one program may declare.
+pub const MAX_DECLARED_PROCESSES: usize = 16;
+
+/// The most file-transfer capabilities one program may declare.
+pub const MAX_DECLARED_FILE_TRANSFERS: usize = 16;
+
+/// The most arguments in an exact process declaration.
+pub const MAX_PROCESS_ARGS: usize = 8;
+
+/// The most bytes in one process argument.
+pub const MAX_PROCESS_ARG_BYTES: usize = 128;
+
+/// The most bytes in an exact executable path or file-transfer scope.
+pub const MAX_CAPABILITY_PATH_BYTES: usize = 256;
+
+/// An exact process capability embedded in a socket program.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessCapability {
+    /// Program-local, nonzero identifier.
+    pub id: u32,
+    /// `SY_PROCESS_ALLOW_*` bits.
+    pub flags: u32,
+    /// Exact absolute executable path.
+    pub executable: String,
+    /// Exact argv, including `argv[0]`.
+    pub argv: Vec<String>,
+    /// `SY_PROCESS_SIGNAL_*` bits.
+    pub allowed_signals: u64,
+    /// Self-imposed simultaneous-process limit; zero selects the host default.
+    pub max_processes: u64,
+    /// Self-imposed runtime limit in milliseconds; zero selects the host default.
+    pub max_runtime_ms: u64,
+    /// Self-imposed process-memory limit; zero selects the host default.
+    ///
+    /// Hosts enforce an address-space limit where the kernel supports a useful
+    /// one. macOS instead monitors the spawned process group's aggregate
+    /// resident memory and kills the group when it crosses this limit, because
+    /// its loader reserves a large sparse address space at exec time.
+    pub max_memory_bytes: u64,
+}
+
+/// A scoped built-in file-transfer capability embedded in a socket program.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileTransferCapability {
+    /// Program-local, nonzero identifier.
+    pub id: u32,
+    /// Protocol selector, initially `SY_FILE_TRANSFER_SFTP`.
+    pub protocol: u32,
+    /// `SY_FILE_TRANSFER_*` access bits.
+    pub access: u32,
+    /// Exact normalized tree scope.
+    pub scope: String,
+}
+
 /// The most UTF-8 bytes one human-readable declaration value may carry.
 ///
 /// Declaration text is both an approval surface and persisted policy input.
@@ -312,6 +366,14 @@ pub enum DeclarationError {
     /// in every origin.
     #[error("a tree-read prefix must name a directory: an empty prefix or `/` is the everything-spelling")]
     InvalidTreeReadPrefix,
+    /// A structured backing capability was malformed or duplicated.
+    #[error("invalid {kind} capability: {reason}")]
+    InvalidCapability {
+        /// Capability family.
+        kind: &'static str,
+        /// Validation failure.
+        reason: &'static str,
+    },
 }
 
 /// Whether text may be displayed verbatim in an operator-facing line.
@@ -379,6 +441,10 @@ pub struct Declaration {
     pub egress: Vec<String>,
     /// Path prefixes the program intends to read from other origins' views.
     pub tree_reads: Vec<String>,
+    /// Exact process capabilities local to this program root.
+    pub processes: Vec<ProcessCapability>,
+    /// Exact file-transfer capabilities local to this program root.
+    pub file_transfers: Vec<FileTransferCapability>,
     /// A self-imposed concurrency cap, bounded by operator and daemon caps.
     pub max_streams: Option<u32>,
     /// Bytes in each eBPF local-call frame; absent means the 16 KiB default.
@@ -397,6 +463,14 @@ impl Declaration {
         if self.tree_reads.len() > MAX_DECLARED_TREE_READS {
             return Err(DeclarationError::TooMany { field: "tree-read" });
         }
+        if self.processes.len() > MAX_DECLARED_PROCESSES {
+            return Err(DeclarationError::TooMany { field: "process" });
+        }
+        if self.file_transfers.len() > MAX_DECLARED_FILE_TRANSFERS {
+            return Err(DeclarationError::TooMany {
+                field: "file-transfer",
+            });
+        }
         validate_declaration_value("name", &self.name)?;
         for host in &self.egress {
             validate_declaration_value("egress", host)?;
@@ -405,6 +479,79 @@ impl Declaration {
             validate_declaration_value("tree-read", prefix)?;
             if !tree_read_prefix_grants_something(prefix) {
                 return Err(DeclarationError::InvalidTreeReadPrefix);
+            }
+        }
+        let mut process_ids = std::collections::BTreeSet::new();
+        for process in &self.processes {
+            if process.id == 0 || !process_ids.insert(process.id) {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "id must be nonzero and unique",
+                });
+            }
+            if process.flags == 0 || process.flags & !0x03 != 0 {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "unsupported flags",
+                });
+            }
+            if process.allowed_signals & !0x07 != 0 {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "unsupported signal",
+                });
+            }
+            if !process.executable.starts_with('/')
+                || process.executable.len() > MAX_CAPABILITY_PATH_BYTES
+                || !display_text_is_safe(&process.executable)
+            {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "executable must be a safe absolute path of at most 256 bytes",
+                });
+            }
+            if process.argv.is_empty() || process.argv.len() > MAX_PROCESS_ARGS {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "argv must contain one through eight arguments",
+                });
+            }
+            if process.argv.iter().any(|arg| {
+                arg.len() > MAX_PROCESS_ARG_BYTES
+                    || arg.as_bytes().contains(&0)
+                    || !display_text_is_safe(arg)
+            }) {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "process",
+                    reason: "argument is unsafe or longer than 128 bytes",
+                });
+            }
+        }
+        let mut transfer_ids = std::collections::BTreeSet::new();
+        for transfer in &self.file_transfers {
+            if transfer.id == 0 || !transfer_ids.insert(transfer.id) {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "file-transfer",
+                    reason: "id must be nonzero and unique",
+                });
+            }
+            if transfer.protocol != 0x01
+                || transfer.access & 0x01 == 0
+                || transfer.access & !0x05 != 0
+            {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "file-transfer",
+                    reason: "unsupported protocol or access flags",
+                });
+            }
+            if transfer.scope.len() > MAX_CAPABILITY_PATH_BYTES
+                || !display_text_is_safe(&transfer.scope)
+                || crate::normalize_path(&transfer.scope).as_deref() != Ok(transfer.scope.as_str())
+            {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "file-transfer",
+                    reason: "scope must be a safe normalized tree path of at most 256 bytes",
+                });
             }
         }
         if self
@@ -438,6 +585,20 @@ impl Declaration {
         reads.dedup();
         for prefix in reads {
             out.push(format!("tree-read {}", escaped_declaration_value(&prefix)));
+        }
+        let mut processes = self.processes.clone();
+        processes.sort_by_key(|capability| capability.id);
+        for capability in processes {
+            let encoded = serde_json::to_string(&capability)
+                .expect("a process declaration contains only serializable values");
+            out.push(format!("process {encoded}"));
+        }
+        let mut transfers = self.file_transfers.clone();
+        transfers.sort_by_key(|capability| capability.id);
+        for capability in transfers {
+            let encoded = serde_json::to_string(&capability)
+                .expect("a file-transfer declaration contains only serializable values");
+            out.push(format!("file-transfer {encoded}"));
         }
         if let Some(n) = self.max_streams {
             out.push(format!("max-streams {n}"));
@@ -477,6 +638,18 @@ impl Declaration {
                         && tree_read_prefix_grants_something(v) =>
                 {
                     out.tree_reads.push(v.to_string())
+                }
+                Some(("process", v)) if out.processes.len() < MAX_DECLARED_PROCESSES => {
+                    if let Ok(capability) = serde_json::from_str(v) {
+                        out.processes.push(capability);
+                    }
+                }
+                Some(("file-transfer", v))
+                    if out.file_transfers.len() < MAX_DECLARED_FILE_TRANSFERS =>
+                {
+                    if let Ok(capability) = serde_json::from_str(v) {
+                        out.file_transfers.push(capability);
+                    }
                 }
                 Some(("max-streams", v)) => out.max_streams = v.parse().ok(),
                 Some(("stack-frame-size", v)) => {
@@ -795,6 +968,8 @@ mod tests {
             name: "git-http".into(),
             egress: vec!["git.internal:9418".into(), "cache.internal".into()],
             tree_reads: vec!["code".into()],
+            processes: vec![],
+            file_transfers: vec![],
             max_streams: Some(32),
             stack_frame_size: Some(512),
             guarded_stack_frames: Some(false),
@@ -932,6 +1107,72 @@ mod tests {
             Declaration::parse("guarded-stack-frames perhaps").guarded_stack_frames,
             None
         );
+    }
+
+    #[test]
+    fn backing_capabilities_round_trip_and_sort_by_local_id() {
+        let declaration = Declaration {
+            processes: vec![
+                ProcessCapability {
+                    id: 9,
+                    flags: 2,
+                    executable: "/usr/bin/printf".into(),
+                    argv: vec!["printf".into(), "hello world".into()],
+                    allowed_signals: 0,
+                    max_processes: 1,
+                    max_runtime_ms: 1000,
+                    max_memory_bytes: 16 * 1024 * 1024,
+                },
+                ProcessCapability {
+                    id: 2,
+                    flags: 1,
+                    executable: "/bin/sh".into(),
+                    argv: vec!["sh".into(), "-l".into()],
+                    allowed_signals: 7,
+                    max_processes: 0,
+                    max_runtime_ms: 0,
+                    max_memory_bytes: 0,
+                },
+            ],
+            file_transfers: vec![FileTransferCapability {
+                id: 3,
+                protocol: 1,
+                access: 5,
+                scope: "code/releases".into(),
+            }],
+            ..Declaration::default()
+        };
+        declaration.validate().unwrap();
+        let rendered = declaration.render();
+        assert!(rendered.lines().next().unwrap().contains("\"id\":2"));
+        let parsed = Declaration::parse(&rendered);
+        assert_eq!(parsed.render(), rendered);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn duplicate_capability_ids_are_rejected_within_their_family() {
+        let process = ProcessCapability {
+            id: 1,
+            flags: 2,
+            executable: "/bin/true".into(),
+            argv: vec!["true".into()],
+            allowed_signals: 0,
+            max_processes: 0,
+            max_runtime_ms: 0,
+            max_memory_bytes: 0,
+        };
+        let declaration = Declaration {
+            processes: vec![process.clone(), process],
+            ..Declaration::default()
+        };
+        assert!(matches!(
+            declaration.validate(),
+            Err(DeclarationError::InvalidCapability {
+                kind: "process",
+                ..
+            })
+        ));
     }
 
     #[test]
