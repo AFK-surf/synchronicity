@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+dist/
+XcodeGenerated/
+*.xcuserdatad/
+xcuserdata/
+.swiftpm/
+build/
+.vscode/
+docs/

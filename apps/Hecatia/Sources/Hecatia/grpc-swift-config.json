@@ -1,0 +1,12 @@
+{
+  "invocations": [
+    {
+      "protoFiles": [
+        "control.proto"
+      ],
+      "visibility": "public",
+      "client": true,
+      "server": false
+    }
+  ]
+}
