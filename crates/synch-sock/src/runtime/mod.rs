@@ -39,7 +39,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     abi::{SECTION_INIT, SECTION_STREAM, SY_SELF},
-    limits::{Limits, PREEMPTION_INTERVAL, THROTTLE_AFTER, THROTTLE_FOR, YIELD_AFTER},
+    limits::{
+        Limits, PREEMPTION_INTERVAL, TEARDOWN_DRAIN, THROTTLE_AFTER, THROTTLE_FOR, YIELD_AFTER,
+    },
     runtime::{
         ctx::{Ctx, Inner, Slot},
         endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
@@ -633,14 +635,31 @@ async fn run_job(
     };
 
     inner.flush_log();
-    // Let whatever the guest wrote reach the wire before the stream is torn
+    // Let whatever the guest wrote reach the wire before anything is torn
     // down: the program returning is not the same as its last write landing.
+    // That holds for every endpoint it wrote to, not only for the caller's
+    // stream — a proxy's last upstream bytes are as much accepted-and-owed as
+    // its last reply, and the host told the guest so when it took them.
+    //
+    // One window for all of them, and the flushes run inside it at once, so
+    // teardown costs what it always cost rather than a window per endpoint.
+    let deadline = Instant::now() + TEARDOWN_DRAIN;
     self_ep.shutdown();
-    if tokio::time::timeout(Duration::from_secs(5), &mut self_writer)
+    let draining = inner.begin_drain();
+    if tokio::time::timeout_at(deadline.into(), &mut self_writer)
         .await
         .is_err()
     {
         self_writer.abort();
+    }
+    for ep in draining {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Out of time is out of time: what has not reached the wire by here is
+        // dropped, as it would be by a process that exited. The alternative is
+        // an invocation whose slot an unreachable peer can hold open.
+        if left.is_zero() || tokio::time::timeout(left, ep.wait_tx_done()).await.is_err() {
+            break;
+        }
     }
     self_reader.abort();
     inner.abort_tasks();

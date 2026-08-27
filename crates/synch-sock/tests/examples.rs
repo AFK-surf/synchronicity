@@ -589,18 +589,21 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
     let port = listener.local_addr().unwrap().port();
     let sent = response.clone();
     let upstream = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("a connection");
-        // The request first, in full, and only then the reply — the shape
-        // `tcp-proxy.c`'s test uses, and for a reason that is about neither
-        // example: an endpoint the guest opened gets no drain window when the
-        // invocation ends (`runtime::run`), so a proxy that reaches both EOFs
-        // while bytes are still queued upstream loses them on the way out. An
-        // upstream that answered before it had read would let this test assert
-        // that hazard away instead of the forwarding it is about.
+        let (socket, _) = listener.accept().await.expect("a connection");
+        let (mut reader, mut writer) = tokio::io::split(socket);
+        // Both halves at once, and the reply deliberately does not wait for the
+        // request: an upstream that answers early can reach EOF downstream
+        // while the proxy still has request bytes queued upstream, so the
+        // invocation ends owing bytes in a direction it has stopped watching.
+        // That is `runtime::run`'s teardown drain, not this example's problem,
+        // and an upstream that read first would never put it to the test.
+        let replying = tokio::spawn(async move {
+            writer.write_all(&sent).await.expect("the reply");
+            writer.shutdown().await.expect("a clean close");
+        });
         let mut seen = Vec::new();
-        socket.read_to_end(&mut seen).await.expect("the request");
-        socket.write_all(&sent).await.expect("the reply");
-        socket.shutdown().await.expect("a clean close");
+        reader.read_to_end(&mut seen).await.expect("the request");
+        replying.await.unwrap();
         seen
     });
 

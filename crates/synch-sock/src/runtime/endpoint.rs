@@ -98,8 +98,24 @@ pub(crate) struct Endpoint {
     rx_room: Notify,
     /// Woken when the guest writes or half-closes, so the writer may continue.
     tx_data: Notify,
-    /// Wakes real I/O operations that are blocked outside the rings.
-    closed: Notify,
+    /// Nothing more will be received: the reader stops wherever it is.
+    ///
+    /// Separate from [`Endpoint::abandoned`] because the two halves of a
+    /// released endpoint are not released alike. A guest that lets go of an
+    /// endpoint is done reading it immediately, and is *not* done writing it:
+    /// what it queued is still owed to the far side ([`Endpoint::close_flushing`]).
+    rx_stop: Notify,
+    /// Set with `rx_stop`, for a reader parked between two of its own checks.
+    rx_closed: Cell<bool>,
+    /// The endpoint is being dropped where it stands: an in-flight write is
+    /// cancelled and a connect attempt is abandoned. The hard counterpart to
+    /// `rx_stop`, and what [`Endpoint::close`] and [`Endpoint::fail`] raise.
+    abandoned: Notify,
+    /// The writer task has stopped, so what was queued has either reached the
+    /// stream or been given up on. What a teardown drain waits for.
+    tx_done: Cell<bool>,
+    /// See [`Endpoint::tx_done`].
+    tx_finished: Notify,
     /// Woken when anything the guest could poll on changes.
     ready: Rc<Readiness>,
     /// What `sy_endpoint_info` reports.
@@ -122,7 +138,11 @@ impl Endpoint {
             tx_shutdown: Cell::new(false),
             rx_room: Notify::new(),
             tx_data: Notify::new(),
-            closed: Notify::new(),
+            rx_stop: Notify::new(),
+            rx_closed: Cell::new(false),
+            abandoned: Notify::new(),
+            tx_done: Cell::new(false),
+            tx_finished: Notify::new(),
             ready,
             peer: RefCell::new(peer),
             bytes_in: Cell::new(0),
@@ -161,22 +181,99 @@ impl Endpoint {
         self.state.set(State::Failed);
         // Both pumps are waiting on one of these; wake them so they can see
         // the state and stop rather than parking forever on a dead endpoint.
+        self.stop_both();
+    }
+
+    /// Drops the endpoint where it stands, queued bytes and all.
+    ///
+    /// For an endpoint there is nothing left to send *to*: one that failed, one
+    /// that never finished connecting, and the final teardown after
+    /// [`Endpoint::close_flushing`] has been given its window. A guest closing
+    /// a live endpoint goes through `close_flushing` instead.
+    pub(crate) fn close(&self) {
+        self.state.set(State::Closed);
+        self.stop_both();
+    }
+
+    /// Releases the endpoint while letting what is queued reach the wire.
+    ///
+    /// The guest has let go of this endpoint, which says two different things
+    /// about its two halves: nothing will ever read it again, and the bytes it
+    /// already accepted for sending are still owed to the far side. So the
+    /// receive half stops at once and the send half finishes on its own terms —
+    /// drain, then FIN — exactly as `sy_shutdown` would have it.
+    ///
+    /// The invocation's own stream has been treated this way since sockets
+    /// landed (`runtime::run` half-closes it and waits); an endpoint the
+    /// program opened was not, and a proxy that queued its last bytes upstream
+    /// and returned in the next line had them dropped by the teardown.
+    ///
+    /// An endpoint that is not open has nothing to flush and nowhere to flush
+    /// it: a connecting one is abandoned rather than completed, since the guest
+    /// has stopped waiting for the connection it would be finishing.
+    pub(crate) fn close_flushing(&self) {
+        if self.state.get() != State::Open {
+            self.close();
+            return;
+        }
+        // Drain, then FIN, under the writer's own timing.
+        self.shutdown();
+        // Nothing will read this again, so stop filling a ring nobody will
+        // drain and give back what is already in it.
+        self.rx.borrow_mut().clear();
+        self.rx_eof.set(true);
+        self.rx_closed.set(true);
         self.rx_room.notify_waiters();
-        self.tx_data.notify_waiters();
-        self.closed.notify_waiters();
+        self.rx_stop.notify_waiters();
         self.ready.bump();
     }
 
-    pub(crate) fn close(&self) {
-        self.state.set(State::Closed);
+    /// Wakes both pumps for a state they are meant to stop on.
+    fn stop_both(&self) {
+        self.rx_closed.set(true);
         self.rx_room.notify_waiters();
         self.tx_data.notify_waiters();
-        self.closed.notify_waiters();
+        self.rx_stop.notify_waiters();
+        self.abandoned.notify_waiters();
         self.ready.bump();
     }
 
     fn finished(&self) -> bool {
         matches!(self.state.get(), State::Failed | State::Closed)
+    }
+
+    /// Whether the reader should stop, whatever the endpoint's state is.
+    fn rx_stopped(&self) -> bool {
+        self.finished() || self.rx_closed.get()
+    }
+
+    /// Notes that the writer task has stopped.
+    fn mark_tx_done(&self) {
+        self.tx_done.set(true);
+        self.tx_finished.notify_waiters();
+    }
+
+    pub(crate) fn tx_done(&self) -> bool {
+        self.tx_done.get()
+    }
+
+    /// Waits until nothing more is owed to the far side.
+    ///
+    /// Unbounded on purpose: the caller owns the deadline, because the window
+    /// a teardown may spend flushing is one number for the whole invocation
+    /// rather than one per endpoint.
+    pub(crate) async fn wait_tx_done(&self) {
+        loop {
+            let notified = self.tx_finished.notified();
+            tokio::pin!(notified);
+            // Registered before the check, or a writer that finishes in the
+            // window between the two is one this waits out in full.
+            notified.as_mut().enable();
+            if self.tx_done.get() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Whether both stream directions have reached shutdown for poll's HUP.
@@ -399,7 +496,7 @@ pub(crate) async fn reader_task(ep: Rc<Endpoint>, mut reader: Box<dyn AsyncRead 
     loop {
         // Park while the guest has not consumed anything.
         loop {
-            if ep.finished() {
+            if ep.rx_stopped() {
                 return;
             }
             let room = ep.cap.saturating_sub(ep.rx.borrow().len());
@@ -409,7 +506,7 @@ pub(crate) async fn reader_task(ep: Rc<Endpoint>, mut reader: Box<dyn AsyncRead 
             let notified = ep.rx_room.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if ep.cap.saturating_sub(ep.rx.borrow().len()) > 0 || ep.finished() {
+            if ep.cap.saturating_sub(ep.rx.borrow().len()) > 0 || ep.rx_stopped() {
                 continue;
             }
             notified.await;
@@ -418,15 +515,15 @@ pub(crate) async fn reader_task(ep: Rc<Endpoint>, mut reader: Box<dyn AsyncRead 
             .cap
             .saturating_sub(ep.rx.borrow().len())
             .min(scratch.len());
-        let closed = ep.closed.notified();
-        tokio::pin!(closed);
-        closed.as_mut().enable();
-        if ep.finished() {
+        let stop = ep.rx_stop.notified();
+        tokio::pin!(stop);
+        stop.as_mut().enable();
+        if ep.rx_stopped() {
             return;
         }
         let read = tokio::select! {
             read = reader.read(&mut scratch[..want]) => read,
-            _ = &mut closed => return,
+            _ = &mut stop => return,
         };
         match read {
             Ok(0) => {
@@ -443,7 +540,17 @@ pub(crate) async fn reader_task(ep: Rc<Endpoint>, mut reader: Box<dyn AsyncRead 
 }
 
 /// Moves bytes from the tx ring into the stream, and half-closes on request.
-pub(crate) async fn writer_task(ep: Rc<Endpoint>, mut writer: Box<dyn AsyncWrite + Unpin + Send>) {
+///
+/// Wrapped so that every way out of the pump — a drained half-close, a failed
+/// write, an abandoned endpoint — arrives at the same statement: nothing more
+/// is owed to the far side. That is what a teardown drain waits for, and a path
+/// that forgot to say so would be one it waited out in full.
+pub(crate) async fn writer_task(ep: Rc<Endpoint>, writer: Box<dyn AsyncWrite + Unpin + Send>) {
+    write_pump(&ep, writer).await;
+    ep.mark_tx_done();
+}
+
+async fn write_pump(ep: &Rc<Endpoint>, mut writer: Box<dyn AsyncWrite + Unpin + Send>) {
     loop {
         loop {
             if ep.finished() {
@@ -467,16 +574,16 @@ pub(crate) async fn writer_task(ep: Rc<Endpoint>, mut writer: Box<dyn AsyncWrite
             let _ = writer.shutdown().await;
             return;
         }
-        let closed = ep.closed.notified();
-        tokio::pin!(closed);
-        closed.as_mut().enable();
+        let abandoned = ep.abandoned.notified();
+        tokio::pin!(abandoned);
+        abandoned.as_mut().enable();
         if ep.finished() {
             let _ = writer.shutdown().await;
             return;
         }
         let written = tokio::select! {
             written = writer.write_all(&chunk) => written,
-            _ = &mut closed => return,
+            _ = &mut abandoned => return,
         };
         if let Err(e) = written {
             ep.fail(io_errno(&e));
@@ -491,16 +598,25 @@ pub(crate) async fn writer_task(ep: Rc<Endpoint>, mut writer: Box<dyn AsyncWrite
 /// happens here is the check the name-based list cannot make: a name is
 /// somebody else's to point wherever they like, so the address it resolved to
 /// is checked before anything is connected to it.
+/// Wrapped like [`writer_task`], and for the same reason with more paths to
+/// forget: an endpoint whose writer never ran at all — a refused name, a
+/// connection nobody answered — owes the far side nothing, and a teardown drain
+/// must be told that rather than waiting out its window on it.
 pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16) {
-    let closed = ep.closed.notified();
-    tokio::pin!(closed);
-    closed.as_mut().enable();
+    connect_and_pump(&ep, host, port).await;
+    ep.mark_tx_done();
+}
+
+async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16) {
+    let abandoned = ep.abandoned.notified();
+    tokio::pin!(abandoned);
+    abandoned.as_mut().enable();
     if ep.finished() {
         return;
     }
     let lookup = tokio::select! {
         lookup = tokio::net::lookup_host((host.as_str(), port)) => lookup,
-        _ = &mut closed => return,
+        _ = &mut abandoned => return,
     };
     let addrs = match lookup {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
@@ -529,15 +645,15 @@ pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16) {
 
     let mut last = errno::ECONNRESET;
     for addr in permitted {
-        let closed = ep.closed.notified();
-        tokio::pin!(closed);
-        closed.as_mut().enable();
+        let abandoned = ep.abandoned.notified();
+        tokio::pin!(abandoned);
+        abandoned.as_mut().enable();
         if ep.finished() {
             return;
         }
         let connected = tokio::select! {
             connected = tokio::net::TcpStream::connect(addr) => connected,
-            _ = &mut closed => return,
+            _ = &mut abandoned => return,
         };
         match connected {
             Ok(stream) => {
@@ -771,6 +887,78 @@ mod tests {
         assert_eq!(ep.revents() & poll::OUT, 0);
         ep.set_open();
         assert_ne!(ep.revents() & poll::OUT, 0);
+    }
+
+    #[test]
+    fn releasing_a_live_endpoint_keeps_what_it_accepted_and_drops_what_it_did_not_read() {
+        let ep = endpoint(64);
+        assert_eq!(ep.write(b"queued"), 6);
+        ep.push_rx(b"never read");
+        ep.close_flushing();
+
+        // The send half finishes on its own terms — drain, then FIN — so the
+        // bytes the host told the guest it had taken are still going out.
+        assert_eq!(ep.state(), State::Open);
+        assert_eq!(ep.take_tx(), b"queued");
+        assert!(!ep.tx_done(), "the writer had not finished");
+        // The receive half is over at once: nothing will read it again, and a
+        // ring nobody will drain is a quarter megabyte held for no one.
+        assert!(ep.rx_stopped());
+        assert_eq!(ep.readable(), 0);
+    }
+
+    #[test]
+    fn releasing_an_endpoint_that_never_connected_abandons_it() {
+        let ep = Endpoint::new(
+            64,
+            Rc::new(Readiness::default()),
+            State::Connecting,
+            String::new(),
+        );
+        // A request prepared before the connection landed. There is nowhere to
+        // flush it to, and finishing the connect to send it would be finishing
+        // something the guest has stopped waiting for.
+        assert_eq!(ep.write(b"request"), 7);
+        ep.close_flushing();
+        assert_eq!(ep.state(), State::Closed);
+    }
+
+    /// The writer's two endings, side by side, because the difference between
+    /// them is the whole of what a released endpoint costs the far side.
+    #[tokio::test]
+    async fn a_released_endpoint_flushes_and_an_abandoned_one_does_not() {
+        async fn last_words(release: impl FnOnce(&Endpoint)) -> Vec<u8> {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let ep = endpoint(64);
+                    assert_eq!(ep.write(b"last words"), 10);
+                    let (ours, mut theirs) = tokio::io::duplex(64);
+                    let (_, writer) = tokio::io::split(ours);
+                    let pump = tokio::task::spawn_local(writer_task(ep.clone(), Box::new(writer)));
+
+                    release(&ep);
+                    tokio::time::timeout(Duration::from_secs(5), ep.wait_tx_done())
+                        .await
+                        .expect("the writer never said it had stopped");
+                    pump.await.unwrap();
+
+                    let mut seen = Vec::new();
+                    theirs.read_to_end(&mut seen).await.unwrap();
+                    seen
+                })
+                .await
+        }
+
+        assert_eq!(
+            last_words(Endpoint::close_flushing).await,
+            b"last words",
+            "a released endpoint dropped bytes the host had accepted"
+        );
+        assert!(
+            last_words(Endpoint::close).await.is_empty(),
+            "an abandoned endpoint is dropped where it stands"
+        );
     }
 
     #[tokio::test]

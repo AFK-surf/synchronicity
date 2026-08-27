@@ -187,6 +187,11 @@ extern sy_s64 sy_readable(sy_s64 handle);
 extern sy_s64 sy_writable(sy_s64 handle);
 /* Half-closes the write side once what is buffered has drained. */
 extern sy_s64 sy_shutdown(sy_s64 handle);
+/* Releases the handle. What you had already written to it still goes out: the
+ * write side drains and half-closes in the background, here and again when the
+ * program returns, within one bounded window for the whole teardown. Closing an
+ * endpoint that never finished connecting abandons it instead — there is
+ * nowhere to flush it to. */
 extern sy_s64 sy_close(sy_s64 handle);
 extern sy_s64 sy_errno(sy_s64 handle);
 

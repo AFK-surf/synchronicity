@@ -422,7 +422,7 @@ serverless node the daemon's environment holds cloud credentials.
 | `sy_splice(from, to, max)` | Moves up to `max` bytes from one endpoint's rx ring into another's tx ring, host-side. Same returns as `sy_read`. |
 | `sy_readable(h)` / `sy_writable(h)` | Buffered bytes / free window, for sizing a copy without a trial call. |
 | `sy_shutdown(h)` | Half-close the write side once the tx ring drains. |
-| `sy_close(h)` | Drop the endpoint and free the slot. `SY_SELF` may be closed; the invocation continues. |
+| `sy_close(h)` | Drop the endpoint and free the slot. What is queued on its write side still drains, in the background, under §10's teardown budget. `SY_SELF` may be closed; the invocation continues. |
 | `sy_errno(h)` | Why an endpoint has `SY_POLL_ERR` set. |
 
 `sy_splice` is the one helper here that touches no guest memory at all, and
@@ -785,13 +785,14 @@ own.
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
 | Idle deadline | 300 s | Measured from the last *progress* — bytes read, written or spliced, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
+| Teardown drain | 5 s | One budget for the whole end of an invocation, spent by every endpoint that still owes bytes at once. A program returning is not its last write landing: what `sy_write` accepted is in a ring the host owns, and every endpoint — the caller's stream and everything the program connected to — half-closes and drains before it is dropped. A bound rather than a promise: an upstream that has stopped reading would otherwise hold a concurrency slot open with nothing to show for it. |
 | Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
 | Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |
 
 | What happens | Stream | And then |
 | --- | --- | --- |
-| Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. |
+| Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. Bytes still queued to any endpoint drain first, inside §10's teardown budget. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
 | Faults on ≥ 8 of the last 16 invocations | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
 | JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |

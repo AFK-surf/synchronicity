@@ -108,6 +108,15 @@ pub(crate) struct Inner {
     pub(crate) labels: RefCell<Vec<(String, String)>>,
     pub(crate) footprint: Cell<u64>,
     pub(crate) egress_open: Cell<usize>,
+    /// Endpoints the guest let go of that still owe bytes to the far side.
+    ///
+    /// A handle leaves the table the moment `sy_close` is called, but the
+    /// endpoint behind it does not: what the guest queued is still draining,
+    /// and the teardown gives it the rest of its window ([`Inner::begin_drain`]).
+    /// The alternative is what this used to do — a program that closes its
+    /// upstream and returns in the next line, which is the last two lines of
+    /// every proxy ever written, losing whatever had not reached the wire yet.
+    pub(crate) draining: RefCell<Vec<Rc<Endpoint>>>,
     /// Detached helper work owned by this invocation.
     pub(crate) async_tasks: RefCell<Vec<tokio::task::AbortHandle>>,
 
@@ -201,6 +210,7 @@ impl Inner {
             labels: RefCell::new(Vec::new()),
             footprint: Cell::new(0),
             egress_open: Cell::new(0),
+            draining: RefCell::new(Vec::new()),
             async_tasks: RefCell::new(Vec::new()),
             init_mode: false,
             declaration: RefCell::new(Declaration::default()),
@@ -293,14 +303,35 @@ impl Inner {
         };
         match entry.take() {
             Some(Slot::Endpoint(ep)) => {
+                // The handle is gone; the bytes behind it are not. The write
+                // side drains and half-closes on its own from here.
+                ep.close_flushing();
+                if handle == crate::abi::SY_SELF {
+                    // The caller's stream is not tracked below: `run` holds its
+                    // writer's join handle and waits on that.
+                    return true;
+                }
                 // An outbound endpoint frees its place in the egress budget:
                 // the bound is on how many are open at once, not on how many
                 // were ever opened.
-                if handle != crate::abi::SY_SELF {
-                    self.egress_open
-                        .set(self.egress_open.get().saturating_sub(1));
+                self.egress_open
+                    .set(self.egress_open.get().saturating_sub(1));
+                let mut draining = self.draining.borrow_mut();
+                // Endpoints that have finished draining are let go of here
+                // rather than at the end, so a program that opens and closes
+                // one endpoint after another keeps one ring, not all of them.
+                draining.retain(|held| !held.tx_done());
+                if !ep.tx_done() {
+                    // And the ones that have *not* finished are bounded like
+                    // the open ones are. A program can close an endpoint whose
+                    // peer stopped reading as often as it likes; without this
+                    // it would be holding every one of their rings, which is a
+                    // way to keep a quarter megabyte per close.
+                    while draining.len() >= self.limits.max_egress {
+                        draining.remove(0).close();
+                    }
+                    draining.push(ep);
                 }
-                ep.close();
                 true
             }
             Some(Slot::Object(obj)) => {
@@ -321,6 +352,27 @@ impl Inner {
             }
             None => false,
         }
+    }
+
+    /// Starts every endpoint's final flush, and says what to wait on.
+    ///
+    /// Both the endpoints still in the table and the ones the guest closed on
+    /// its way out, and all of them at once rather than one after another: the
+    /// teardown has a single window to spend, and endpoints draining in
+    /// parallel spend it once instead of dividing it.
+    ///
+    /// `SY_SELF` is not among them. It has always had a window of its own, and
+    /// `run` waits on its writer's join handle rather than on this.
+    pub(crate) fn begin_drain(&self) -> Vec<Rc<Endpoint>> {
+        let mut draining = std::mem::take(&mut *self.draining.borrow_mut());
+        for slot in self.slots.borrow().iter().skip(1).flatten() {
+            if let Slot::Endpoint(ep) = slot {
+                ep.close_flushing();
+                draining.push(ep.clone());
+            }
+        }
+        draining.retain(|ep| !ep.tx_done());
+        draining
     }
 
     /// Notes that something happened, and pushes the idle deadline out.
