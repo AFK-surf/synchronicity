@@ -229,8 +229,15 @@ impl Node {
         }))
     }
 
-    /// Reads a socket's ELF object out of this node's own CAS.
-    async fn socket_program(&self, resolved: &Resolved) -> Result<Vec<u8>> {
+    /// Reads a socket's ELF object out of this node's own CAS, sharing the
+    /// allocation across every admission of one content root.
+    ///
+    /// Sixty-four streams into one socket must not mean sixty-four copies of
+    /// its program: the bytes are immutable once the root is fixed, so all of
+    /// the admissions of a root get the same `Arc`. The cache is weak — when
+    /// the last invocation holding the root ends, the bytes are freed and the
+    /// next admission re-reads them.
+    async fn socket_program(&self, resolved: &Resolved) -> Result<Arc<Vec<u8>>> {
         let limits = self.socket_limits();
         if resolved.size > limits.max_program_bytes {
             return Err(EngineError::invalid(format!(
@@ -238,15 +245,21 @@ impl Node {
                 resolved.size, limits.max_program_bytes
             )));
         }
+        if let Some(bytes) = self.socket_program_shared(&resolved.root) {
+            return Ok(bytes);
+        }
         // Its own CAS: the bytes were published by this node, so they are held
         // here. `ensure_cached` covers the one case where they are not — a
         // cloud-backed node whose scratch cache has been replaced.
         self.ensure_blob_cached(&resolved.root, resolved.size)
             .await?;
-        Ok(self
-            .cas_backend()
-            .read_range(resolved.root, 0, resolved.size)
-            .await?)
+        let bytes = Arc::new(
+            self.cas_backend()
+                .read_range(resolved.root, 0, resolved.size)
+                .await?,
+        );
+        self.remember_socket_program(resolved.root, bytes.clone());
+        Ok(bytes)
     }
 
     /// Builds the policy one invocation runs under.
@@ -399,6 +412,15 @@ impl Node {
             }
 
             let policy = node.socket_policy(&current.state);
+            // The pool-wide bound, before the socket's own cap: one caller
+            // who can reach many sockets must not be able to fill every
+            // worker's queue past the documented daemon limit.
+            if node.socket_pool_full() {
+                return Ok(Err((
+                    RefuseCode::Busy,
+                    "the node's socket workers are at capacity; try again shortly".into(),
+                )));
+            }
             let id = node.next_socket_id();
             // The concurrency cap is taken at admission, before the guest
             // starts, so a caller cannot open idle streams past the cap.
@@ -425,7 +447,7 @@ impl Node {
         let (policy, id, slot) = prepared?;
 
         Ok(Admission {
-            program: Arc::new(program),
+            program,
             program_root: resolved.root,
             socket: SocketId::new(&open.space, &open.path),
             peer: PeerIdentity {
@@ -634,8 +656,17 @@ impl SocketHost for TreeHost {
             None => (prefix, ""),
         };
         const PAGE: usize = 4096;
+        // The scan runs synchronously on the socket worker's thread — the one
+        // store access in the host that is not offloaded — so it is bounded
+        // both ways: by how much it may collect, and by how many pages it may
+        // walk to collect it. The byte cap is the same footprint budget
+        // `sy_list_open` charges the names against afterwards; a listing that
+        // would blow it is refused rather than materialized.
+        const MAX_ROWS: usize = 65536;
+        let max_bytes = self.node.socket_limits().max_footprint as usize;
         let mut after = None;
         let mut names = Vec::new();
+        let mut bytes = 0usize;
         loop {
             let rows = self
                 .node
@@ -650,11 +681,20 @@ impl SocketHost for TreeHost {
                 .map_err(|e| HostError::Unavailable(e.to_string()))?;
             let done = rows.len() < PAGE;
             after = rows.last().map(|row| row.path.clone());
-            names.extend(
-                rows.into_iter()
-                    .filter(|row| row.kind != EntryKind::Tombstone)
-                    .map(|row| row.path),
-            );
+            for row in rows {
+                if row.kind == EntryKind::Tombstone {
+                    continue;
+                }
+                bytes += row.path.len();
+                names.push(row.path);
+                if bytes > max_bytes || names.len() >= MAX_ROWS {
+                    return Err(HostError::NotReadable(
+                        "the listing exceeds a socket invocation's footprint; \
+                         narrow the prefix"
+                            .into(),
+                    ));
+                }
+            }
             if done {
                 break;
             }
@@ -805,6 +845,11 @@ mod pool {
             self.0.run(invocation).await
         }
 
+        /// Whether every worker is at its queued cap.
+        pub(crate) fn full(&self) -> bool {
+            self.0.full()
+        }
+
         /// Cancels and drains every invocation, then joins all worker threads.
         pub(crate) async fn shutdown(&self) {
             self.0.shutdown().await;
@@ -910,6 +955,12 @@ mod pool {
 
         /// Nothing runs on an unsupported platform.
         pub(crate) async fn shutdown(&self) {}
+
+        /// Nothing is ever at capacity when nothing can run: admission is
+        /// refused before it reaches this.
+        pub(crate) fn full(&self) -> bool {
+            false
+        }
 
         /// Unreachable: admission refuses before it reaches this.
         #[allow(

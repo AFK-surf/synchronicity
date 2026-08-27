@@ -98,7 +98,11 @@ pub(crate) struct Inner {
     /// handle becomes ready, which is what makes it an *idle* deadline rather
     /// than a total wall-clock cap. There is deliberately no total cap: a
     /// socket that proxies is supposed to be long-lived, and its CPU is
-    /// bounded by the timeslicer instead (`docs/SOCKETS.md` §10).
+    /// bounded by the timeslicer instead (`docs/SOCKETS.md` §10). The
+    /// deadline is a real end for the invocation, not only a clamp on its
+    /// poll waits: `run_job` selects on it, so an invocation that stops
+    /// making progress is ended with `Deadline` rather than holding its slot
+    /// and its worker for as long as its caller keeps the stream open.
     pub(crate) deadline: Cell<Instant>,
     pub(crate) program_root: Hash,
     pub(crate) id: u64,
@@ -149,14 +153,31 @@ impl std::fmt::Debug for Inner {
     }
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Belt and braces for a panic that escaped the teardown: the handles
+        // are normally drained by `abort_tasks` on the way out, and aborting
+        // an already-finished task is a no-op. What this catches is the
+        // invocation that died mid-teardown, where a detached helper task —
+        // a fetch, a connect pump — would otherwise keep running, and keep
+        // its endpoint and its bytes alive, after the invocation it was
+        // helping is gone.
+        self.abort_tasks();
+    }
+}
+
 /// The resource a helper looks up.
 #[derive(Debug, Clone)]
 pub(crate) struct Ctx {
     pub(crate) inner: Rc<Inner>,
 }
 
-/// How long a declaration run may sit idle before it is abandoned.
-const DECLARE_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a declaration run may run before it is abandoned.
+///
+/// The whole hook, not just its poll waits: the serving-side idle deadline is
+/// consulted only by `sy_poll`, so a hook that never polls gets its bound
+/// here, where `declare_here` enforces it with a timeout around the run.
+pub(crate) const DECLARE_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A key-shaped placeholder for the declaration run, which has no caller.
 ///
@@ -224,11 +245,14 @@ impl Inner {
     /// The declaration run's state: [`Inner::bare`] with the init hook's one
     /// flag set. What its hook logs belongs to the operator who asked for the
     /// arming rather than to a socket's tail, so the registry stays `None`.
+    ///
+    /// Built by mutation rather than struct update: `Inner` has a `Drop` that
+    /// aborts its tasks, so moving fields out of another `Inner` is not
+    /// allowed.
     pub(crate) fn declaring(host: Arc<dyn SocketHost>, started: Instant) -> Inner {
-        Inner {
-            init_mode: true,
-            ..Inner::bare(host, started, DECLARE_IDLE)
-        }
+        let mut inner = Inner::bare(host, started, DECLARE_IDLE);
+        inner.init_mode = true;
+        inner
     }
 
     /// Starts helper work and makes invocation cleanup its owner.

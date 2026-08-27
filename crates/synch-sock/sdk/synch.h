@@ -299,8 +299,14 @@ extern sy_s64 sy_declare_guarded_stack_frames(sy_u64 enabled);
  * arm time, on somebody else's node, a long way from the line that caused it.
  * So the SDK supplies them, forwarding to the host helpers.
  *
- * `memmove` is `sy_memcpy` because the host copies through a buffer of its own
- * before writing, which makes every one of these overlap-safe already. */
+ * `memmove` is `sy_memcpy`: the host copies through a buffer of its own, so a
+ * copy is never torn. Overlap itself is refused, not papered over — the
+ * pointer cage registers the source and the destination of one call, and a
+ * destination that overlaps a source this call already read is `SY_EINVAL`.
+ * The one exception is the identity `dst == src`, which a compiler can emit
+ * for a self-assignment and which is a no-op. A `memmove` that genuinely
+ * needs to shift a buffer must stage it through two buffers or copy in the
+ * direction that does not overlap. */
 SY_MAYBE_UNUSED static void *memset(void *dst, int c, unsigned long n) {
   return sy_memset(dst, c, (sy_u64)n);
 }

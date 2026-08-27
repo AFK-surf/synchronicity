@@ -127,9 +127,9 @@ struct Live {
 pub struct Registry {
     live: Mutex<BTreeMap<u64, Live>>,
     logs: Mutex<HashMap<String, VecDeque<LogLine>>>,
-    /// Per socket, whether each of the last [`FAULT_WINDOW`] invocations
-    /// faulted. `true` is a fault.
-    faults: Mutex<HashMap<(String, Hash), VecDeque<bool>>>,
+    /// Per socket, how each of the last [`FAULT_WINDOW`] invocations ended,
+    /// and which caller's device key it ran for. `true` is a fault.
+    faults: Mutex<HashMap<(String, Hash), VecDeque<(NodeId, bool)>>>,
     /// Sockets whose fault history has tripped the threshold and which nobody
     /// has acted on yet.
     ///
@@ -291,19 +291,40 @@ impl Registry {
     /// armed means every caller gets a reset instead of an answer. The window
     /// is short because the signal is unambiguous.
     ///
+    /// Faults are attributed to the caller whose invocation faulted, and the
+    /// threshold fires only when *different* callers are faulting the
+    /// program. The distinction is what keeps one member from disarming a
+    /// shared socket for everyone: any input-triggered bug in a program is a
+    /// contained fault, and a caller who finds one can repeat it as often as
+    /// they like, so a window that counts faults alone hands whoever reached
+    /// the socket first the power to take it down. A program that is
+    /// genuinely broken faults for whoever asks, so a second caller's fault
+    /// is all the breadth the window needs.
+    ///
     /// The counter is cleared when it fires, so a socket that is re-armed and
     /// still broken gets a full window again rather than tripping on its first
     /// fault forever.
-    pub(crate) fn record_outcome(&self, socket: &str, program: Hash, faulted: bool) -> bool {
+    pub(crate) fn record_outcome(
+        &self,
+        socket: &str,
+        program: Hash,
+        caller: NodeId,
+        faulted: bool,
+    ) -> bool {
         let mut faults = self.faults.lock().expect("registry faults");
         let key = (socket.to_string(), program);
         let ring = faults.entry(key.clone()).or_default();
         if ring.len() >= FAULT_WINDOW {
             ring.pop_front();
         }
-        ring.push_back(faulted);
-        let failing = ring.iter().filter(|f| **f).count();
-        if failing >= FAULT_QUARANTINE {
+        ring.push_back((caller, faulted));
+        let failing = ring.iter().filter(|(_, faulted)| *faulted).count();
+        let faulting_callers = ring
+            .iter()
+            .filter(|(_, faulted)| *faulted)
+            .map(|(caller, _)| *caller)
+            .collect::<std::collections::HashSet<_>>();
+        if failing >= FAULT_QUARANTINE && faulting_callers.len() >= 2 {
             ring.clear();
             drop(faults);
             self.quarantined
@@ -395,6 +416,23 @@ mod tests {
 
     fn key() -> NodeId {
         NodeId::from_bytes(&crate::policy::NOBODY).expect("a valid key")
+    }
+
+    /// A second valid device key: the negation of the base point.
+    fn other_key() -> NodeId {
+        let mut bytes = crate::policy::NOBODY;
+        bytes[31] ^= 0x80;
+        NodeId::from_bytes(&bytes).expect("a valid key")
+    }
+
+    /// The two keys, alternately, so a test that spreads faults across
+    /// callers does not accidentally trip the breadth rule.
+    fn caller_at(round: usize) -> NodeId {
+        if round % 2 == 0 {
+            key()
+        } else {
+            other_key()
+        }
     }
 
     fn program() -> Hash {
@@ -523,18 +561,28 @@ mod tests {
         let registry = Registry::new();
         for i in 0..FAULT_QUARANTINE - 1 {
             assert!(
-                !registry.record_outcome("code/git.sock", program(), true),
+                !registry.record_outcome("code/git.sock", program(), caller_at(i), true),
                 "quarantined after only {} faults",
                 i + 1
             );
         }
         assert!(
-            registry.record_outcome("code/git.sock", program(), true),
+            registry.record_outcome(
+                "code/git.sock",
+                program(),
+                caller_at(FAULT_QUARANTINE - 1),
+                true
+            ),
             "the threshold did not fire"
         );
         // Cleared when it fires, so a re-armed socket gets a full window rather
         // than tripping on its first fault forever.
-        assert!(!registry.record_outcome("code/git.sock", program(), true));
+        assert!(!registry.record_outcome(
+            "code/git.sock",
+            program(),
+            caller_at(FAULT_QUARANTINE),
+            true
+        ));
 
         // The verdict latches until somebody acts on it, and then it is gone:
         // a second taker would disarm a socket that has since been repaired.
@@ -542,9 +590,32 @@ mod tests {
         assert!(!registry.take_quarantine("code/git.sock", program()));
 
         // And a re-arm clears the record the old program earned.
-        registry.record_outcome("code/other.sock", program(), true);
+        registry.record_outcome("code/other.sock", program(), key(), true);
         registry.forget("code/other.sock");
         assert!(!registry.take_quarantine("code/other.sock", program()));
+    }
+
+    #[test]
+    fn a_single_callers_faults_do_not_quarantine_a_shared_socket() {
+        // The case caller attribution exists for: one member finds an
+        // input-triggered bug in a shared program and repeats it. Eight,
+        // sixteen, twenty faults from one device key must never disarm the
+        // socket for everybody else — the program may be fine for every
+        // caller who does not send the poison bytes.
+        let registry = Registry::new();
+        for i in 0..FAULT_WINDOW * 2 {
+            assert!(
+                !registry.record_outcome("code/git.sock", program(), key(), true),
+                "a lone caller's fault {i} quarantined the socket"
+            );
+        }
+        assert!(!registry.take_quarantine("code/git.sock", program()));
+
+        // A second caller's genuine fault is the breadth the rule needs:
+        // whatever makes the program fault for two different devices is
+        // broken, not picky.
+        assert!(registry.record_outcome("code/git.sock", program(), other_key(), true));
+        assert!(registry.take_quarantine("code/git.sock", program()));
     }
 
     #[test]
@@ -556,7 +627,7 @@ mod tests {
         for round in 0..FAULT_WINDOW * 4 {
             let faulted = round % 5 == 0;
             assert!(
-                !registry.record_outcome("code/git.sock", program(), faulted),
+                !registry.record_outcome("code/git.sock", program(), caller_at(round), faulted),
                 "a 20% fault rate was quarantined at round {round}"
             );
         }
@@ -568,14 +639,19 @@ mod tests {
         let old = Hash::new(b"old program");
         let new = Hash::new(b"new program");
 
-        for _ in 0..FAULT_QUARANTINE - 1 {
-            assert!(!registry.record_outcome("code/git.sock", old, true));
+        for i in 0..FAULT_QUARANTINE - 1 {
+            assert!(!registry.record_outcome("code/git.sock", old, caller_at(i), true));
         }
         assert!(
-            !registry.record_outcome("code/git.sock", new, true),
+            !registry.record_outcome("code/git.sock", new, caller_at(0), true),
             "a new root inherited the old root's fault history"
         );
-        assert!(registry.record_outcome("code/git.sock", old, true));
+        assert!(registry.record_outcome(
+            "code/git.sock",
+            old,
+            caller_at(FAULT_QUARANTINE - 1),
+            true
+        ));
         assert!(registry.take_quarantine("code/git.sock", old));
         assert!(!registry.take_quarantine("code/git.sock", new));
     }
