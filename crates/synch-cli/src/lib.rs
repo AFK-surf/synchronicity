@@ -17,6 +17,7 @@ pub mod commands;
 pub mod connect;
 pub mod control;
 pub mod daemon;
+pub mod mcp;
 pub mod render;
 
 /// The platform data directory both binaries default to (§9.3).

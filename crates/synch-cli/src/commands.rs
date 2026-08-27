@@ -223,6 +223,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                     define,
                 },
         } => build_socket(source, output.as_deref(), *clang, define),
+        // Not a `Run` command either: it owns this process's stdin and stdout
+        // for its lifetime and answers a protocol of its own, translating each
+        // request into the control calls below (`crate::mcp`).
+        Command::Mcp {
+            allow_write,
+            spaces,
+            max_read_bytes,
+        } => {
+            crate::mcp::run(
+                &data_dir,
+                crate::mcp::Options {
+                    allow_write: *allow_write,
+                    spaces: spaces.clone(),
+                    max_read_bytes: (*max_read_bytes).max(1),
+                },
+            )
+            .await
+        }
         _ => {
             let command = to_command(&cli)?;
             deliver(&data_dir, &cli, command).await
@@ -673,6 +691,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
         Command::Connect { .. } => unreachable!("handled before dispatch"),
+        Command::Mcp { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),

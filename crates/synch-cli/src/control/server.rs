@@ -48,6 +48,19 @@ const ACCEPT_BACKLOG: usize = 16;
 /// costs bounded memory rather than a buffered response.
 const SEND_AHEAD: usize = 4;
 
+/// How many paths a listing may scan per entry the page was asked for, while
+/// filling a page the filters have thinned.
+///
+/// A page holding `limit` entries is what every caller assumes it is asking
+/// for, and filling one costs a scan past whatever the filters dropped. Eight
+/// is room for a page that is seven-eighths tombstones without a second
+/// request, and a ceiling on what one listing can be made to read.
+const SCAN_FILL_FACTOR: usize = 8;
+
+/// The floor under that budget, so a one-entry page is still willing to scan
+/// past a run of deletions rather than ending immediately.
+const MIN_SCAN_BUDGET: usize = 1024;
+
 /// The largest socket payload carried by one control response.
 ///
 /// The first read waits normally, but subsequent reads only take bytes which
@@ -546,26 +559,85 @@ impl Control for ControlService {
         };
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
         let mut stopping = self.stop.subscribe();
+        let space = request.space.clone();
+        let prefix = request.prefix.clone();
+        let limit = request.limit.map(|n| n as usize);
         tokio::spawn(async move {
-            for set in &listing {
-                // A listing of a large space outlives a stop otherwise.
-                if stopping.try_recv() != Err(broadcast::error::TryRecvError::Empty) {
-                    let _ = tx.send(Err(stopped().into())).await;
+            let mut batch = listing;
+            let mut sent = 0usize;
+            let mut scanned = 0usize;
+            loop {
+                let raw = batch.len();
+                let last_scanned = batch.last().map(|set| set.path.clone());
+                for set in &batch {
+                    // A listing of a large space outlives a stop otherwise.
+                    if stopping.try_recv() != Err(broadcast::error::TryRecvError::Empty) {
+                        let _ = tx.send(Err(stopped().into())).await;
+                        return;
+                    }
+                    scanned += 1;
+                    if !set.exists() {
+                        // Every publisher has tombstoned it: the path has left
+                        // the tree, so the tree does not list it.
+                        continue;
+                    }
+                    // A listing has no way to answer one path with an error, so
+                    // a path the policy refuses is left out rather than reported
+                    // with one side's metadata. Resolving that path still says
+                    // exactly what is wrong.
+                    let Ok(row) = node.resolve_set(set, &policy, now) else {
+                        continue;
+                    };
+                    if tx.send(Ok(entry_info(&row, set).into())).await.is_err() {
+                        return;
+                    }
+                    sent += 1;
+                    if Some(sent) == limit {
+                        return;
+                    }
+                }
+
+                // `limit` is applied by the query, before the two filters
+                // above; without this the page would come back short of what
+                // the caller asked for while more paths were waiting, and every
+                // client that stops paging on a short page — which is the
+                // obvious way to write one — would silently truncate the
+                // listing. So the page is filled: scan on until it holds
+                // `limit` entries or the prefix runs out.
+                //
+                // Bounded, because the filters can drop an unbounded run of
+                // paths — a swathe of tombstones, an `origin=` policy naming a
+                // peer that publishes little — and the S3 gateway serves this
+                // to principals who are not cluster members (§12). Past the
+                // budget the page ends short, which costs a caller one extra
+                // request and never a lost path, since the next page resumes
+                // after the last entry this one sent.
+                let Some(limit) = limit else {
+                    // No limit: the first query already returned everything.
+                    return;
+                };
+                let budget = limit.saturating_mul(SCAN_FILL_FACTOR).max(MIN_SCAN_BUDGET);
+                if raw < limit || scanned >= budget {
+                    // A short *query* means the prefix is exhausted; the budget
+                    // means it is not, and the caller pages on.
                     return;
                 }
-                if !set.exists() {
-                    // Every publisher has tombstoned it: the path has left the
-                    // tree, so the tree does not list it.
-                    continue;
-                }
-                // A listing has no way to answer one path with an error, so a
-                // path the policy refuses is left out rather than reported with
-                // one side's metadata. Resolving that path still says exactly
-                // what is wrong.
-                let Ok(row) = node.resolve_set(set, &policy, now) else {
-                    continue;
+                let Some(after) = last_scanned else {
+                    return;
                 };
-                if tx.send(Ok(entry_info(&row, set).into())).await.is_err() {
+                let (space, prefix) = (space.clone(), prefix.clone());
+                batch = match read(&node, move |n| {
+                    Ok(n.unified_listing(&space, &prefix, Some(&after), Some(limit))?)
+                })
+                .await
+                {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.into())).await;
+                        return;
+                    }
+                };
+                if batch.is_empty() {
                     return;
                 }
             }
@@ -864,6 +936,45 @@ impl Control for ControlService {
             .await
             .map_err(ControlError::from)?;
         Ok(Response::new(pb::AbortUploadResponse { existed }))
+    }
+
+    type ListSpacesStream = Pin<Box<dyn Stream<Item = Result<pb::SpaceInfo, Status>> + Send>>;
+
+    async fn list_spaces(
+        &self,
+        _request: Request<pb::ListSpacesRequest>,
+    ) -> Result<Response<Self::ListSpacesStream>, Status> {
+        let node = self.served.node()?.clone();
+        // The coverage counts come from the same reading as the rows, so a
+        // space cannot be reported as replicating with a coverage taken before
+        // it was — the shape `Run(SpaceLs)` already reads it in.
+        let spaces = read(&node, |n| {
+            let mut out = Vec::new();
+            for space in n.store().spaces()? {
+                let coverage = match space.replicate {
+                    Some(_) => Some(
+                        n.store()
+                            .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)?,
+                    ),
+                    None => None,
+                };
+                out.push((space, coverage));
+            }
+            Ok(out)
+        })
+        .await?;
+        let stream = tokio_stream::iter(spaces.into_iter().map(|(space, coverage)| {
+            Ok(pb::SpaceInfo {
+                grace_secs: space.grace_secs(),
+                id: space.id,
+                local_path: space.local_path,
+                replicate: space.replicate.map(|policy| policy.to_string()),
+                budget: space.budget,
+                held_bytes: coverage.as_ref().map(|c| c.held_bytes),
+                wanted: coverage.as_ref().map(|c| c.wanted),
+            })
+        }));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type ListUploadsStream = Pin<Box<dyn Stream<Item = Result<pb::UploadInfo, Status>> + Send>>;

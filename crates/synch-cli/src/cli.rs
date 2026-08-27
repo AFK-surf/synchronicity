@@ -526,6 +526,39 @@ pub enum Command {
         #[command(subcommand)]
         command: CasCommand,
     },
+    /// Serve the Model Context Protocol over stdin and stdout.
+    ///
+    /// An MCP client — an editor, an agent runner — launches this as a child
+    /// process and speaks newline-delimited JSON-RPC to it. Every request is
+    /// answered from the local daemon's control socket, so this is a client of
+    /// the node exactly as every other command is (§9.1).
+    ///
+    /// stdout carries protocol and nothing else; diagnostics go to stderr,
+    /// where SYNCH_LOG governs them as usual.
+    ///
+    /// The daemon does not have to be running when this starts. Tools that
+    /// need it say so, naming the command that starts one, rather than the
+    /// process failing before the client has finished launching it.
+    Mcp {
+        /// Also serve the tools that change state: writes, deletes, takes,
+        /// pins, scans, and the socket lifecycle.
+        ///
+        /// Without it the surface is read-only, and the tool list says so —
+        /// a client is shown exactly the authority it was given.
+        #[arg(long)]
+        allow_write: bool,
+        /// Confine every tool and resource to this space. Repeat for several;
+        /// without it, every space this node holds is in scope.
+        #[arg(long = "space", value_name = "ID")]
+        spaces: Vec<String>,
+        /// The largest payload one read returns, in bytes.
+        ///
+        /// A tool result is held whole in memory at both ends, so this is a
+        /// ceiling on that rather than on what can be read: reads take an
+        /// offset, and a caller walks a large object one window at a time.
+        #[arg(long, value_name = "BYTES", default_value_t = 64 * 1024)]
+        max_read_bytes: u64,
+    },
 }
 
 /// `synch cas ...`

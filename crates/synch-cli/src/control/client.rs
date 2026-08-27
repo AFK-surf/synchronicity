@@ -317,6 +317,29 @@ impl Client {
         Ok(out)
     }
 
+    /// Every space this node has configured, as data rather than as the line
+    /// `synch space ls` prints (§9.4).
+    pub async fn list_spaces(&mut self) -> Result<Vec<SpaceInfo>, ControlError> {
+        let mut stream = self
+            .inner
+            .list_spaces(pb::ListSpacesRequest {})
+            .await?
+            .into_inner();
+        let mut out = Vec::new();
+        while let Some(space) = stream.message().await? {
+            out.push(SpaceInfo {
+                id: space.id,
+                local_path: space.local_path,
+                replicate: space.replicate,
+                grace_secs: space.grace_secs,
+                budget: space.budget,
+                held_bytes: space.held_bytes,
+                wanted: space.wanted,
+            });
+        }
+        Ok(out)
+    }
+
     /// Reads one config value from the `s3.*` namespace, a record per line.
     pub async fn config(&mut self, key: &str) -> Result<Vec<String>, ControlError> {
         let request = pb::GetConfigRequest {
@@ -647,6 +670,26 @@ pub struct CompletedUpload {
 fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
     Hash::from_slice(bytes)
         .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))
+}
+
+/// One configured space, as a program reads it (§9.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceInfo {
+    /// The space id.
+    pub id: String,
+    /// The local directory being indexed, or `None` for a detached space.
+    pub local_path: Option<String>,
+    /// The replication policy — `tree` or `archive` — or `None` when this node
+    /// holds only what it publishes and reads.
+    pub replicate: Option<String>,
+    /// Seconds a released root is still held, under `tree`.
+    pub grace_secs: i64,
+    /// A ceiling on bytes held for this space, or `None` for no ceiling.
+    pub budget: Option<u64>,
+    /// Bytes this space's replication holds, or `None` when not replicating.
+    pub held_bytes: Option<u64>,
+    /// Objects wanted and not yet held, or `None` when not replicating.
+    pub wanted: Option<u64>,
 }
 
 /// What a delete left behind.
