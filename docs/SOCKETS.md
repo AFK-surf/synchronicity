@@ -465,7 +465,10 @@ address by way of a name that resolves to it.
 `sy_poll(fds, n, timeout_ms)` waits for readiness on up to 16 handles. Returns
 the number ready, `0` on timeout, negative on error; `timeout_ms < 0` means
 "until something happens", clamped by the host to the invocation's idle
-deadline. One validated mutable region regardless of `n`.
+deadline — and the deadline is the end of the invocation itself (§10): a poll
+that comes back `0` is the runtime telling the program to finish, and a
+program that goes around again is ended with `Closed{Deadline}`. One validated
+mutable region regardless of `n`.
 
 Endpoint shutdown uses Linux's level-triggered `HUP`/`RDHUP` distinction and
 filtering, rather than reproducing every bit returned by Linux `tcp_poll`.
@@ -775,6 +778,7 @@ own.
 | Bound | Default | Note |
 | --- | --- | --- |
 | Concurrent invocations per socket | 64 | Intersected with `sy_declare_max_streams`. Over it: `Refused{Busy}`. |
+| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
 | Endpoint handles per invocation | 16 | Including `SY_SELF`. Also the `sy_poll` array cap. |
 | Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. |
@@ -782,9 +786,9 @@ own.
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |
 | Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Frames are 16 KiB and guarded by default on hosts with pages up to 16 KiB; larger-page hosts warn and fall back to contiguous frames. Sizes from 16 B through 32 KiB may be declared. |
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
-| Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
+| Program ELF size | 4 MiB | Checked at arm time and again at admission, so a synced or re-armed tree cannot serve an object past the bound. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
-| Idle deadline | 300 s | Measured from the last *progress* — bytes read, written or spliced, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
+| Idle deadline | 300 s | Measured from the last *progress* — bytes read, written or spliced, or a poll that came back with a handle ready — not from the start of the invocation. Progress pushes it out, so there is still **no total wall-clock cap**: a proxy with steady traffic is long-lived. But the deadline is a deadline: an invocation that stops making progress is ended with `Closed{Deadline}`, because an idle invocation is a stream and a slot a caller can hold open forever while its guest spins a throttled loop into a worker. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
 | Teardown drain | 5 s | One budget for the whole end of an invocation, spent by every endpoint that still owes bytes at once. A program returning is not its last write landing: what `sy_write` accepted is in a ring the host owns, and every endpoint — the caller's stream and everything the program connected to — half-closes and drains before it is dropped. A bound rather than a promise: an upstream that has stopped reading would otherwise hold a concurrency slot open with nothing to show for it. |
 | Endpoints draining at once | 8 | The outbound cap again, applied to the ones the guest has closed. A closed endpoint keeps its socket and its tx ring until it drains, so an invocation can hold up to twice the outbound limit of them; past this, the oldest is dropped where it stands rather than accumulating rings. |
 | Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
@@ -794,8 +798,9 @@ own.
 | What happens | Stream | And then |
 | --- | --- | --- |
 | Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. Bytes still queued to any endpoint drain first, inside §10's teardown budget. |
+| Idle deadline reached | clean FIN | `Closed{Deadline}`, exit 73. The deadline is measured from the last progress, so a proxy with traffic never sees it; a caller holding a stream open with nothing happening is ended and told to come back. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
-| Faults on ≥ 8 of the last 16 invocations | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
+| Faults on ≥ 8 of the last 16 invocations, from ≥ 2 different callers | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. Faults are attributed to the caller whose invocation faulted, and the breadth is the point: any input-triggered bug in a program is a contained fault, and a caller who finds one can repeat it, so a window that counted faults alone would hand whoever reached the socket first the power to disarm it for everyone. A program that is genuinely broken faults for whoever asks. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
 | JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |
 | Bytes changed under an armed socket | refused | `Refused{NotArmed}` naming both roots. In-flight invocations keep their root. |
 | Egress to an unarmed destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |

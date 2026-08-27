@@ -807,10 +807,13 @@ async fn a_wait_with_nothing_happening_ends_at_the_idle_deadline() {
     .expect("the program ran");
     drop(mine);
 
-    assert_eq!(
-        outcome.status,
-        SockStatus::Ok(42),
-        "the wait should have come back as a timeout, not as readiness"
+    // The wait ends at the deadline either way: the guest's own poll returns
+    // 0 and it returns 42, or the runtime's idle deadline ends the invocation
+    // itself. Both are "the idle deadline fired" — which of them wins the
+    // same-instant race is not the behavior under test.
+    assert!(
+        matches!(outcome.status, SockStatus::Ok(42) | SockStatus::Deadline),
+        "the wait should have ended at the idle deadline, not as readiness: {outcome:?}"
     );
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(250),

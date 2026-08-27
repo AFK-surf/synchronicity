@@ -1204,6 +1204,12 @@ fn h_memcpy(scope: &HelperScope, dst: u64, src: u64, n: u64, _: u64, _: u64) -> 
     if n == 0 {
         return Ok(dst);
     }
+    if dst == src {
+        // A compiler can emit `memcpy(p, p, n)` for a self-assignment, and
+        // the cage would refuse the identical region read-then-written. It
+        // is the identity, whatever the length says.
+        return Ok(dst);
+    }
     let data = guest!(bytes(scope, src, n));
     let Ok(mut region) = scope.user_memory_mut(dst, n) else {
         return ret(errno::EINVAL);
@@ -1310,19 +1316,27 @@ fn h_base64_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = guest!(bytes(scope, ptr, len));
+    if len > MAX_COPY {
+        return ret(errno::EINVAL);
+    }
     let Some(engine) = engine(kind) else {
         return ret(errno::EINVAL);
     };
+    // One registration, read and write through it. The cage refuses to write
+    // a region this call has already read, so the encoded bytes are taken out
+    // of the single mutable view rather than read separately — the two
+    // register as the same region, which is the whole point of "in place".
+    let mut region = match scope.user_memory_mut(ptr, len) {
+        Ok(region) => region,
+        Err(()) => return ret(errno::EINVAL),
+    };
+    let data = region.to_vec();
     let Ok(decoded) = engine.decode(&data) else {
         return ret(errno::EINVAL);
     };
     // In place because there is no heap to decode into. The decoded form is
     // always shorter, so it always fits where the encoded form was.
-    let Ok(mut region) = scope.user_memory_mut(ptr, decoded.len() as u64) else {
-        return ret(errno::EINVAL);
-    };
-    region.copy_from_slice(&decoded);
+    region[..decoded.len()].copy_from_slice(&decoded);
     ret(decoded.len() as i64)
 }
 
@@ -1351,14 +1365,22 @@ fn h_hex_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = guest!(bytes(scope, ptr, len));
+    if len > MAX_COPY {
+        return ret(errno::EINVAL);
+    }
+    // One registration, read and write through it, as in
+    // [`h_base64_decode_in_place`].
+    let mut region = match scope.user_memory_mut(ptr, len) {
+        Ok(region) => region,
+        Err(()) => return ret(errno::EINVAL),
+    };
+    let data = region.to_vec();
     let Ok(decoded) = hex::decode(&data) else {
         return ret(errno::EINVAL);
     };
-    let Ok(mut region) = scope.user_memory_mut(ptr, decoded.len() as u64) else {
-        return ret(errno::EINVAL);
-    };
-    region.copy_from_slice(&decoded);
+    // The decoded form is always shorter, so it always fits where the encoded
+    // form was.
+    region[..decoded.len()].copy_from_slice(&decoded);
     ret(decoded.len() as i64)
 }
 
@@ -1431,6 +1453,11 @@ fn h_declare_tree_read(
 ) -> Result<u64, ()> {
     let prefix = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&prefix) {
+        return ret(errno::EINVAL);
+    }
+    // The everything-spelling is not a declaration: an operator approving
+    // `tree-read /` would be approving every path in every origin.
+    if !synch_core::sock::tree_read_prefix_grants_something(&prefix) {
         return ret(errno::EINVAL);
     }
     with(scope, |inner| {

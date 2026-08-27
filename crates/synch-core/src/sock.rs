@@ -308,6 +308,10 @@ pub enum DeclarationError {
          {MIN_EBPF_STACK_FRAME_SIZE} through {MAX_EBPF_STACK_FRAME_SIZE} bytes"
     )]
     InvalidStackFrameSize,
+    /// A tree-read prefix names nothing: `""` or `"/"` would grant every path
+    /// in every origin.
+    #[error("a tree-read prefix must name a directory: an empty prefix or `/` is the everything-spelling")]
+    InvalidTreeReadPrefix,
 }
 
 /// Whether text may be displayed verbatim in an operator-facing line.
@@ -399,6 +403,9 @@ impl Declaration {
         }
         for prefix in &self.tree_reads {
             validate_declaration_value("tree-read", prefix)?;
+            if !tree_read_prefix_grants_something(prefix) {
+                return Err(DeclarationError::InvalidTreeReadPrefix);
+            }
         }
         if self
             .stack_frame_size
@@ -463,7 +470,11 @@ impl Declaration {
                 }
                 Some(("tree-read", v))
                     if out.tree_reads.len() < MAX_DECLARED_TREE_READS
-                        && display_text_is_safe(v) =>
+                        && display_text_is_safe(v)
+                        // The everything-spelling is not a permission: an
+                        // approval that carries it is read as no grant, the
+                        // way an unknown directive is.
+                        && tree_read_prefix_grants_something(v) =>
                 {
                     out.tree_reads.push(v.to_string())
                 }
@@ -512,6 +523,10 @@ pub fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
 /// Boundary-aware: `code` admits `code` and `code/x`, and does not admit
 /// `codex/secret`. A plain `starts_with` would, which is the difference between
 /// naming a directory and naming a string.
+///
+/// The everything-spellings — `""` and `"/"` — match every path, which is why
+/// [`tree_read_prefix_grants_something`] refuses them as declarations: the
+/// matcher itself treats them as the root of the whole tree.
 pub fn path_prefix_matches(prefix: &str, path: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
@@ -522,6 +537,17 @@ pub fn path_prefix_matches(prefix: &str, path: &str) -> bool {
         Some(rest) => rest.starts_with('/'),
         None => false,
     }
+}
+
+/// Whether a tree-read prefix names something at all.
+///
+/// A prefix that trims to nothing — `""` or `"/"` — is the everything-spelling
+/// to [`path_prefix_matches`]: it admits every path in every origin, which is
+/// not a prefix an operator approving a bounded list can be expected to have
+/// meant. Declarations must not carry it, and a persisted approval that does
+/// is read as no permission rather than as everything.
+pub fn tree_read_prefix_grants_something(prefix: &str) -> bool {
+    !prefix.trim_end_matches('/').is_empty()
 }
 
 /// Decodes [`SockOpen::meta`] under [`MAX_OPEN_META_PAIRS`].
@@ -830,6 +856,46 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(Declaration::parse(&text).egress.len(), MAX_DECLARED_EGRESS);
+    }
+
+    #[test]
+    fn tree_reads_must_name_something() {
+        // The everything-spellings are not declarations: an operator
+        // approving `tree-read /` would be approving every path in every
+        // origin.
+        let root = Declaration {
+            tree_reads: vec!["/".into()],
+            ..Declaration::default()
+        };
+        assert!(matches!(
+            root.validate(),
+            Err(DeclarationError::InvalidTreeReadPrefix)
+        ));
+        let empty = Declaration {
+            tree_reads: vec!["".into()],
+            ..Declaration::default()
+        };
+        assert!(matches!(
+            empty.validate(),
+            Err(DeclarationError::InvalidTreeReadPrefix)
+        ));
+
+        // And they are not read back as permissions from stored text.
+        assert_eq!(
+            Declaration::parse("tree-read /").tree_reads,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            Declaration::parse("tree-read ").tree_reads,
+            Vec::<String>::new()
+        );
+
+        // An honest prefix still round-trips.
+        let honest = Declaration {
+            tree_reads: vec!["code/pub".into()],
+            ..Declaration::default()
+        };
+        assert_eq!(Declaration::parse(&honest.render()), honest);
     }
 
     #[test]

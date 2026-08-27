@@ -101,6 +101,8 @@ struct NodeInner {
     /// skip re-hashing every file it has already written or read
     /// (`docs/DELTA-SYNC.md` §3.5).
     mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
+    /// Socket program bytes, shared across the admissions of one content root.
+    program_bytes: Arc<crate::sockets::ProgramBytesCache>,
     /// The socket worker pool, or `None` where this build has no eBPF runtime
     /// (`docs/SOCKETS.md` §5.1).
     ///
@@ -730,6 +732,7 @@ impl Node {
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
+                program_bytes: crate::sockets::ProgramBytesCache::new(),
                 sockets: socket_pool,
                 socket_authorization: std::sync::RwLock::new(()),
                 dns: std::sync::Mutex::new(Default::default()),
@@ -792,6 +795,19 @@ impl Node {
     /// The socket worker pool, or `None` where this build serves no sockets.
     pub(crate) fn socket_workers(&self) -> Option<&crate::sockets::SocketPool> {
         self.inner.sockets.as_ref()
+    }
+
+    /// Whether the socket pool is at its daemon-wide bound (`docs/SOCKETS.md`
+    /// §10).
+    pub(crate) fn socket_pool_full(&self) -> bool {
+        self.inner.sockets.as_ref().is_some_and(|pool| pool.full())
+    }
+
+    /// Claims a place in the socket-program cache for `root`: the cached
+    /// bytes if they are already loaded, a seat on an in-flight load if one
+    /// is under way, or the loader role if this admission reads the CAS.
+    pub(crate) fn socket_program_load(&self, root: &Hash) -> crate::sockets::ProgramLoad {
+        self.inner.program_bytes.begin_load(root)
     }
 
     /// The limits every socket invocation on this node runs under.

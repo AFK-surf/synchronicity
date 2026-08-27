@@ -229,8 +229,16 @@ impl Node {
         }))
     }
 
-    /// Reads a socket's ELF object out of this node's own CAS.
-    async fn socket_program(&self, resolved: &Resolved) -> Result<Vec<u8>> {
+    /// Reads a socket's ELF object out of this node's own CAS, sharing the
+    /// allocation across every admission of one content root.
+    ///
+    /// Sixty-four streams into one socket must not mean sixty-four copies of
+    /// its program: the bytes are immutable once the root is fixed, so all of
+    /// the admissions of a root get the same `Arc` — including the concurrent
+    /// ones, which wait on the first load's watch channel rather than each
+    /// reading the CAS themselves. The [`ProgramBytesCache`] retains up to
+    /// [`MAX_CACHED_PROGRAMS`] of them strongly, oldest first.
+    async fn socket_program(&self, resolved: &Resolved) -> Result<Arc<Vec<u8>>> {
         let limits = self.socket_limits();
         if resolved.size > limits.max_program_bytes {
             return Err(EngineError::invalid(format!(
@@ -238,15 +246,39 @@ impl Node {
                 resolved.size, limits.max_program_bytes
             )));
         }
-        // Its own CAS: the bytes were published by this node, so they are held
-        // here. `ensure_cached` covers the one case where they are not — a
-        // cloud-backed node whose scratch cache has been replaced.
-        self.ensure_blob_cached(&resolved.root, resolved.size)
-            .await?;
-        Ok(self
-            .cas_backend()
-            .read_range(resolved.root, 0, resolved.size)
-            .await?)
+        match self.socket_program_load(&resolved.root) {
+            ProgramLoad::Ready(bytes) => Ok(bytes),
+            ProgramLoad::InFlight(mut receiver) => {
+                receiver.wait_for(Option::is_some).await.map_err(|_| {
+                    EngineError::invalid("a concurrent socket program load was interrupted")
+                })?;
+                match receiver.borrow().clone().expect("the loader published") {
+                    Ok(bytes) => Ok(bytes),
+                    Err(text) => Err(EngineError::invalid(text)),
+                }
+            }
+            ProgramLoad::Loader(guard) => {
+                // Its own CAS: the bytes were published by this node, so they
+                // are held here. `ensure_cached` covers the one case where
+                // they are not — a cloud-backed node whose scratch cache has
+                // been replaced. If this future is cancelled or panics before
+                // `finish`, the guard's drop publishes the failure and frees
+                // the root for a fresh load.
+                let outcome: ProgramBytes = (async {
+                    self.ensure_blob_cached(&resolved.root, resolved.size)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.cas_backend()
+                        .read_range(resolved.root, 0, resolved.size)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .map(Arc::new)
+                })
+                .await;
+                guard.finish(outcome.clone());
+                outcome.map_err(EngineError::invalid)
+            }
+        }
     }
 
     /// Builds the policy one invocation runs under.
@@ -360,11 +392,6 @@ impl Node {
             return Err((RefuseCode::NotArmed, message));
         }
 
-        let program = match self.socket_program(&resolved).await {
-            Ok(bytes) => bytes,
-            Err(e) => return Err((RefuseCode::ProgramInvalid, e.to_string())),
-        };
-
         // Program loading may fetch from a remote CAS. Authorization is
         // deliberately not held across that wait, but it must be checked again
         // while the registry slot is made live. Arm/disarm/redeclare take the
@@ -399,6 +426,15 @@ impl Node {
             }
 
             let policy = node.socket_policy(&current.state);
+            // The pool-wide bound, before the socket's own cap: one caller
+            // who can reach many sockets must not be able to fill every
+            // worker's queue past the documented daemon limit.
+            if node.socket_pool_full() {
+                return Ok(Err((
+                    RefuseCode::Busy,
+                    "the node's socket workers are at capacity; try again shortly".into(),
+                )));
+            }
             let id = node.next_socket_id();
             // The concurrency cap is taken at admission, before the guest
             // starts, so a caller cannot open idle streams past the cap.
@@ -424,8 +460,23 @@ impl Node {
         .map_err(|e| (RefuseCode::NotArmed, e.to_string()))?;
         let (policy, id, slot) = prepared?;
 
+        // The pool token is taken *before* the program's bytes are read: the
+        // CAS fetch can be the expensive part of an admission (up to 4 MiB,
+        // possibly from a remote CAS), and concurrent opens for distinct
+        // roots must not bypass the daemon-wide bound during it. A load that
+        // fails — the size check, the fetch, the read — gives the token back
+        // by dropping the slot, and the admission is refused as it would have
+        // been before.
+        let program = match self.socket_program(&resolved).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                drop(slot);
+                return Err((RefuseCode::ProgramInvalid, e.to_string()));
+            }
+        };
+
         Ok(Admission {
-            program: Arc::new(program),
+            program,
             program_root: resolved.root,
             socket: SocketId::new(&open.space, &open.path),
             peer: PeerIdentity {
@@ -634,8 +685,23 @@ impl SocketHost for TreeHost {
             None => (prefix, ""),
         };
         const PAGE: usize = 4096;
+        // The scan runs synchronously on the socket worker's thread — the one
+        // store access in the host that is not offloaded — so it is bounded
+        // both ways: by how much it may collect, and by how many rows it may
+        // walk to collect it. The byte cap is the same footprint budget
+        // `sy_list_open` charges the names against afterwards; a listing that
+        // would blow it is refused rather than materialized.
+        //
+        // Every scanned row counts toward the row cap, tombstones included:
+        // they are skipped for the collection, but the scan still paid a row
+        // to learn they were there, and a prefix full of them must not be a
+        // way to make the worker walk an unbounded number of pages.
+        const MAX_ROWS: usize = 65536;
+        let max_bytes = self.node.socket_limits().max_footprint as usize;
         let mut after = None;
         let mut names = Vec::new();
+        let mut scanned = 0usize;
+        let mut bytes = 0usize;
         loop {
             let rows = self
                 .node
@@ -650,11 +716,28 @@ impl SocketHost for TreeHost {
                 .map_err(|e| HostError::Unavailable(e.to_string()))?;
             let done = rows.len() < PAGE;
             after = rows.last().map(|row| row.path.clone());
-            names.extend(
-                rows.into_iter()
-                    .filter(|row| row.kind != EntryKind::Tombstone)
-                    .map(|row| row.path),
-            );
+            for row in rows {
+                scanned += 1;
+                if scanned > MAX_ROWS {
+                    return Err(HostError::NotReadable(
+                        "the listing exceeds a socket invocation's footprint; \
+                         narrow the prefix"
+                            .into(),
+                    ));
+                }
+                if row.kind == EntryKind::Tombstone {
+                    continue;
+                }
+                bytes += row.path.len();
+                names.push(row.path);
+                if bytes > max_bytes {
+                    return Err(HostError::NotReadable(
+                        "the listing exceeds a socket invocation's footprint; \
+                         narrow the prefix"
+                            .into(),
+                    ));
+                }
+            }
             if done {
                 break;
             }
@@ -805,6 +888,11 @@ mod pool {
             self.0.run(invocation).await
         }
 
+        /// Whether every worker is at its queued cap.
+        pub(crate) fn full(&self) -> bool {
+            self.0.full()
+        }
+
         /// Cancels and drains every invocation, then joins all worker threads.
         pub(crate) async fn shutdown(&self) {
             self.0.shutdown().await;
@@ -911,6 +999,12 @@ mod pool {
         /// Nothing runs on an unsupported platform.
         pub(crate) async fn shutdown(&self) {}
 
+        /// Nothing is ever at capacity when nothing can run: admission is
+        /// refused before it reaches this.
+        pub(crate) fn full(&self) -> bool {
+            false
+        }
+
         /// Unreachable: admission refuses before it reaches this.
         #[allow(
             clippy::too_many_arguments,
@@ -1012,6 +1106,142 @@ impl SocketHost for NoTree {
 pub(crate) fn declare_blocking(elf: &[u8]) -> Result<Declaration> {
     let _scope = synch_core::BlockingScope::enter();
     pool::declare(elf, Arc::new(NoTree)).map_err(|e| EngineError::invalid(e.to_string()))
+}
+
+/// How many socket programs the node keeps in memory after their
+/// invocations end.
+///
+/// A bound on the cache's strong entries: each holds up to
+/// `max_program_bytes` (4 MiB), so the whole cache is at most
+/// `MAX_CACHED_PROGRAMS * 4 MiB`. Oldest first, like the workers' compiled-
+/// program cache.
+const MAX_CACHED_PROGRAMS: usize = 4;
+
+/// One root's program bytes, or why the load failed.
+type ProgramBytes = std::result::Result<Arc<Vec<u8>>, String>;
+
+/// The watch channel an in-flight load publishes its outcome on.
+type LoadWatch = tokio::sync::watch::Sender<Option<ProgramBytes>>;
+
+/// What a claim on [`ProgramBytesCache`] for one root came back as.
+pub(crate) enum ProgramLoad {
+    /// The bytes were already loaded; share them.
+    Ready(Arc<Vec<u8>>),
+    /// Another admission is reading this root from the CAS; wait for it.
+    InFlight(tokio::sync::watch::Receiver<Option<ProgramBytes>>),
+    /// This admission is the one that reads the CAS.
+    Loader(LoadGuard),
+}
+
+/// The loader's claim on [`ProgramBytesCache`] for one root.
+///
+/// The claim is released when the load ends, *however* it ends. The happy
+/// path calls [`LoadGuard::finish`], which publishes the outcome and
+/// remembers the bytes. A load that is cancelled or panics during the CAS
+/// await drops the guard instead: the drop removes the root from the
+/// in-flight table and publishes the failure to every waiter, so the root's
+/// later admissions start a fresh load rather than waiting forever on a
+/// sender nobody will ever fill.
+#[derive(Debug)]
+pub(crate) struct LoadGuard {
+    cache: Arc<ProgramBytesCache>,
+    root: Hash,
+    sender: LoadWatch,
+    finished: bool,
+}
+
+impl LoadGuard {
+    /// Publishes the outcome and releases the loader role.
+    pub(crate) fn finish(mut self, outcome: ProgramBytes) {
+        self.finished = true;
+        self.cache
+            .finish_load(self.root, self.sender.clone(), outcome);
+    }
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut inner = self.cache.inner.lock().expect("socket program cache");
+        inner.loading.remove(&self.root);
+        // Wake the waiters with the failure rather than leaving them parked
+        // on a sender that will never send.
+        let _ = self
+            .sender
+            .send(Some(Err("socket program load was interrupted".to_string())));
+    }
+}
+
+/// Socket program bytes, shared across the admissions of one content root.
+///
+/// Sixty-four streams into one socket must not mean sixty-four copies of
+/// its program, and the sharing has to survive *concurrent* cold admissions
+/// — the first admission of a root is still reading the CAS while the
+/// fifty-ninth arrives. Two structures make it one copy per root:
+///
+/// * `loading` coalesces those concurrent cold admissions: the first claims
+///   the loader role and publishes the outcome on a watch channel; the rest
+///   subscribe and share the allocation.
+/// * `ready` holds completed programs strongly, FIFO-evicted at
+///   [`MAX_CACHED_PROGRAMS`], so a burst of admissions re-reads nothing and
+///   memory stays bounded now that the entries are not weak.
+#[derive(Debug, Default)]
+pub(crate) struct ProgramBytesCache {
+    inner: std::sync::Mutex<ProgramBytesInner>,
+}
+
+#[derive(Debug, Default)]
+struct ProgramBytesInner {
+    ready: std::collections::HashMap<Hash, Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<Hash>,
+    loading: std::collections::HashMap<Hash, LoadWatch>,
+}
+
+impl ProgramBytesCache {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(ProgramBytesCache::default())
+    }
+
+    /// Claims the cache for one root: the loaded bytes, a seat on an
+    /// in-flight load, or the loader role. The lock is held only for the
+    /// claim — the CAS read happens outside it, which is what lets the other
+    /// admissions wait on the watch channel instead of on the cache.
+    pub(crate) fn begin_load(self: &Arc<Self>, root: &Hash) -> ProgramLoad {
+        let mut inner = self.inner.lock().expect("socket program cache");
+        if let Some(bytes) = inner.ready.get(root) {
+            return ProgramLoad::Ready(bytes.clone());
+        }
+        if let Some(sender) = inner.loading.get(root) {
+            return ProgramLoad::InFlight(sender.subscribe());
+        }
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        inner.loading.insert(*root, sender.clone());
+        ProgramLoad::Loader(LoadGuard {
+            cache: self.clone(),
+            root: *root,
+            sender,
+            finished: false,
+        })
+    }
+
+    /// Publishes the outcome of a load to its waiters, and remembers the
+    /// bytes for the next admission. Called by [`LoadGuard::finish`].
+    fn finish_load(&self, root: Hash, sender: LoadWatch, outcome: ProgramBytes) {
+        let mut inner = self.inner.lock().expect("socket program cache");
+        inner.loading.remove(&root);
+        if let Ok(bytes) = &outcome {
+            inner.ready.insert(root, bytes.clone());
+            inner.order.push_back(root);
+            while inner.order.len() > MAX_CACHED_PROGRAMS {
+                if let Some(oldest) = inner.order.pop_front() {
+                    inner.ready.remove(&oldest);
+                }
+            }
+        }
+        let _ = sender.send(Some(outcome));
+    }
 }
 
 impl Node {
@@ -1271,6 +1501,102 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_loads_coalesce_onto_one_allocation() {
+        let cache = ProgramBytesCache::new();
+        let root = Hash::new(b"program");
+
+        // The first claim is the loader.
+        let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
+            panic!("the first claim should be the loader");
+        };
+        // A concurrent admission of the same root waits on the watch channel
+        // instead of reading the CAS itself.
+        let ProgramLoad::InFlight(receiver) = cache.begin_load(&root) else {
+            panic!("a concurrent claim should be in flight, not a fresh load");
+        };
+        let waiter = tokio::spawn(async move {
+            let mut receiver = receiver;
+            receiver.wait_for(Option::is_some).await.unwrap();
+            let outcome = receiver.borrow().clone();
+            outcome.unwrap().unwrap()
+        });
+
+        // The loader publishes one allocation...
+        let bytes = Arc::new(b"the program".to_vec());
+        guard.finish(Ok(bytes.clone()));
+        // ...which the waiter shares, pointer and all.
+        let seen = waiter.await.unwrap();
+        assert!(
+            Arc::ptr_eq(&seen, &bytes),
+            "the waiting admission allocated its own copy"
+        );
+
+        // And the next admission is served from the ready cache.
+        let ProgramLoad::Ready(bytes) = cache.begin_load(&root) else {
+            panic!("a loaded root should be ready");
+        };
+        assert_eq!(&*bytes, b"the program");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_load_wakes_its_waiters_and_frees_the_root() {
+        let cache = ProgramBytesCache::new();
+        let root = Hash::new(b"program");
+
+        let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
+            panic!("the first claim should be the loader");
+        };
+        let ProgramLoad::InFlight(receiver) = cache.begin_load(&root) else {
+            panic!("a concurrent claim should be in flight");
+        };
+        let waiter = tokio::spawn(async move {
+            let mut receiver = receiver;
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                receiver.wait_for(Option::is_some).await.unwrap();
+                receiver.borrow().clone()
+            })
+            .await
+            .expect("the interrupted load never woke its waiter");
+            outcome
+        });
+
+        // The loader dies — cancellation, a panic — without finishing.
+        drop(guard);
+
+        // The waiter is told the load failed, not left parked forever...
+        let outcome = waiter.await.unwrap();
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "waiters should see the failure, got {outcome:?}"
+        );
+        // ...and the root is free for a fresh load.
+        assert!(
+            matches!(cache.begin_load(&root), ProgramLoad::Loader(_)),
+            "an interrupted load left its in-flight entry behind"
+        );
+    }
+
+    #[test]
+    fn the_ready_cache_is_fifo_bounded() {
+        let cache = ProgramBytesCache::new();
+        for i in 0..MAX_CACHED_PROGRAMS + 4 {
+            let root = Hash::new(format!("program {i}").as_bytes());
+            let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
+                panic!("a fresh root should claim the loader role");
+            };
+            guard.finish(Ok(Arc::new(vec![i as u8])));
+        }
+        // The oldest roots are gone; the newest are served from memory.
+        let oldest = Hash::new(b"program 0");
+        assert!(
+            !matches!(cache.begin_load(&oldest), ProgramLoad::Ready(_)),
+            "the oldest program was not evicted"
+        );
+        let newest = Hash::new(format!("program {}", MAX_CACHED_PROGRAMS + 3).as_bytes());
+        assert!(matches!(cache.begin_load(&newest), ProgramLoad::Ready(_)));
     }
 
     #[test]

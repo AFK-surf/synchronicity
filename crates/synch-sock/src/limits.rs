@@ -6,9 +6,13 @@
 //! same kind of sanity bound §12 already permits — a cap on the cost of any
 //! *single* invocation, so that one stream cannot take a worker with it.
 //!
-//! The one that is not a cap at all is [`Limits::idle_deadline`]. There is
-//! deliberately no total wall-clock bound: a socket that proxies is supposed to
-//! be long-lived, and CPU is bounded by the timeslicer rather than by a clock.
+//! [`Limits::idle_deadline`] is a cap on the same footing as the rest, on
+//! time rather than on bytes: an invocation that stops making progress —
+//! no bytes moved, no handle ready — is ended with `Deadline` when the
+//! deadline expires, so a caller cannot hold a stream and a slot forever by
+//! sending nothing. There is still no *total* wall-clock bound: progress
+//! pushes the deadline out, so a proxy with steady traffic never notices it.
+//! CPU is bounded by the timeslicer rather than by a clock.
 
 use std::time::Duration;
 
@@ -105,6 +109,15 @@ pub(crate) const MAX_LABELS: usize = 8;
 /// guest's own stack, so a larger request simply fails validation. It is here
 /// so that an absurd length argument is refused as an argument rather than
 /// walked.
+///
+/// Two ways of meeting it, and the difference is what a short answer means.
+/// The stream helpers — `sy_read`, `sy_write`, `sy_pread`, `sy_log` — clamp
+/// to it: a short count is the documented outcome of a stream call, the
+/// guest's next call continues where it left off, and a large request on a
+/// small stream is normal. The byte-copy helpers — `sy_memcpy`, `sy_memset`,
+/// `sy_getrandom`, the decoders — refuse an over-cap length with `SY_EINVAL`
+/// instead, because a short copy is not a short stream read; it is a silently
+/// different answer.
 pub(crate) const MAX_COPY: u64 = 64 * 1024;
 
 /// Consecutive faults, out of the last [`FAULT_WINDOW`] invocations, that

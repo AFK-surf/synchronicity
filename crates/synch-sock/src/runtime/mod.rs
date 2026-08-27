@@ -21,7 +21,7 @@ pub(crate) mod map;
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -43,7 +43,7 @@ use crate::{
         Limits, PREEMPTION_INTERVAL, TEARDOWN_DRAIN, THROTTLE_AFTER, THROTTLE_FOR, YIELD_AFTER,
     },
     runtime::{
-        ctx::{Ctx, Inner, Slot},
+        ctx::{Ctx, Inner, Slot, DECLARE_IDLE},
         endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
         map::SocketMaps,
     },
@@ -105,9 +105,55 @@ struct Job {
     cancel: oneshot::Receiver<()>,
 }
 
+/// Aborts the invocation's detached tasks when this drops — including on
+/// unwinding.
+///
+/// A panic inside the guest or its helpers would otherwise leave the reader
+/// and writer tasks pumping an invocation nobody is collecting, with its
+/// rings and its stream held open. Aborting an already-finished task is a
+/// no-op, so the normal path is unaffected: the teardown aborts or joins
+/// these same tasks at its own pace, and this is the backstop.
+struct TaskGuard {
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl TaskGuard {
+    fn new() -> Self {
+        TaskGuard { tasks: Vec::new() }
+    }
+
+    fn push(&mut self, task: &tokio::task::JoinHandle<()>) {
+        self.tasks.push(task.abort_handle());
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 type StackConfig = (usize, bool);
 type LoaderCache = RefCell<HashMap<StackConfig, Rc<ProgramLoader>>>;
-type ProgramCache = RefCell<HashMap<(Hash, StackConfig), Rc<Program>>>;
+
+/// How many compiled programs one worker may hold.
+///
+/// A bound on what content churn can make a worker accumulate: every distinct
+/// content root ever served would otherwise stay JIT-compiled here forever,
+/// one worker at a time (`--auto` re-arms make that a real stream). The
+/// oldest is evicted first; an invocation that is still running holds its
+/// program through its own `Rc`, so eviction only releases programs nothing
+/// is executing.
+const MAX_CACHED_PROGRAMS: usize = 32;
+
+/// The compiled-program cache: insertion order alongside the entries, for
+/// oldest-first eviction.
+type ProgramCache = RefCell<(
+    HashMap<(Hash, StackConfig), Rc<Program>>,
+    VecDeque<(Hash, StackConfig)>,
+)>;
 
 fn host_page_size() -> Option<usize> {
     // SAFETY: `sysconf` reads a process-wide platform constant and has no
@@ -249,7 +295,11 @@ impl WorkerHandle {
         // before the handlers that contain its faults are in place.
         let global = global_env();
         let maps = SocketMaps::new();
-        let registry = crate::registry::Registry::new();
+        // The daemon-wide admission ceiling: every worker's cap of
+        // invocations, in flight or queued, before new admissions are
+        // refused (`docs/SOCKETS.md` §10).
+        let pool_cap = limits.max_streams.saturating_mul(count.max(1)) as u64;
+        let registry = crate::registry::Registry::with_pool_cap(pool_cap);
         let shutdown = Arc::new(ShutdownSignal::default());
         let workers = (0..count)
             .map(|index| {
@@ -298,6 +348,18 @@ impl WorkerHandle {
     pub fn clear_map(&self, socket: &str) {
         self.maps.clear(socket);
         self.registry.forget(socket);
+    }
+
+    /// Whether the pool-wide admission ceiling has been reached.
+    ///
+    /// The ceiling is the registry's admission-token count (`docs/SOCKETS.md`
+    /// §10): every admitted invocation holds a token from admission until it
+    /// ends, so the check cannot be walked by opens that have not reached a
+    /// worker yet. The engine refuses with `Busy` when it is reached; the
+    /// registry's own `reserve` enforces the same ceiling atomically, so the
+    /// check here only picks the refusal message.
+    pub fn full(&self) -> bool {
+        self.registry.pool_full()
     }
 
     /// Runs one invocation on the least-loaded worker.
@@ -404,7 +466,8 @@ impl Worker {
                 };
                 let thread_env = global.init_thread(PREEMPTION_INTERVAL);
                 let loaders: Rc<LoaderCache> = Rc::new(RefCell::new(HashMap::new()));
-                let cache: Rc<ProgramCache> = Rc::new(RefCell::new(HashMap::new()));
+                let cache: Rc<ProgramCache> =
+                    Rc::new(RefCell::new((HashMap::new(), VecDeque::new())));
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     let mut running = tokio::task::JoinSet::new();
@@ -412,9 +475,19 @@ impl Worker {
                         tokio::select! {
                             _ = worker_shutdown.cancelled() => break,
                             job = rx.recv() => match job {
-                                Some(job) => {
+                                Some(mut job) => {
                                     if worker_shutdown.is_stopping() {
                                         let _ = job.reply.send(Ok(shutdown_outcome()));
+                                        continue;
+                                    }
+                                    // A kill that landed while the job queued
+                                    // ends it before it starts: the cancel
+                                    // receiver is otherwise only read once the
+                                    // guest runs, so `synch socket kill` could
+                                    // not reach a stream that was still waiting
+                                    // for a worker.
+                                    if job.cancel.try_recv().is_ok() {
+                                        let _ = job.reply.send(Ok(killed_outcome()));
                                         continue;
                                     }
                                     let loaders = loaders.clone();
@@ -510,7 +583,7 @@ fn program_for(
 ) -> Result<Rc<Program>, SockError> {
     let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
     let key = (*root, config);
-    if let Some(program) = cache.borrow().get(&key) {
+    if let Some(program) = cache.borrow().0.get(&key) {
         return Ok(program.clone());
     }
     let existing_loader = loaders.borrow().get(&config).cloned();
@@ -522,7 +595,16 @@ fn program_for(
         loader
     };
     let program = Rc::new(load_pinned(&loader, elf, thread_env)?);
-    cache.borrow_mut().insert(key, program.clone());
+    let mut cache = cache.borrow_mut();
+    cache.0.insert(key, program.clone());
+    cache.1.push_back(key);
+    while cache.1.len() > MAX_CACHED_PROGRAMS {
+        let oldest = cache
+            .1
+            .pop_front()
+            .expect("a non-empty eviction queue stays non-empty");
+        cache.0.remove(&oldest);
+    }
     Ok(program)
 }
 
@@ -560,30 +642,38 @@ async fn run_job(
         invocation.peer.addr.clone(),
     );
     let started = Instant::now();
-    let inner = Rc::new(Inner {
-        slots: RefCell::new(vec![Some(Slot::Endpoint(self_ep.clone()))]),
-        ready,
-        policy: invocation.policy,
-        peer: invocation.peer,
-        socket: invocation.socket,
-        self_origin: invocation.self_origin.canonical(),
-        meta: invocation.meta,
-        maps: maps.clone(),
-        limits: limits.clone(),
-        program_root: invocation.program_root,
-        id: invocation.id,
-        live: invocation
-            .slot
-            .as_ref()
-            .map(|slot| slot.stats())
-            .unwrap_or_default(),
-        registry: Some(registry.clone()),
-        ..Inner::bare(invocation.host, started, limits.idle_deadline)
-    });
+    // Built by mutation rather than struct update: `Inner` has a `Drop` that
+    // aborts its tasks, so moving fields out of another `Inner` is not
+    // allowed.
+    let mut inner = Inner::bare(invocation.host, started, limits.idle_deadline);
+    inner.slots = RefCell::new(vec![Some(Slot::Endpoint(self_ep.clone()))]);
+    inner.ready = ready;
+    inner.policy = invocation.policy;
+    inner.peer = invocation.peer;
+    inner.socket = invocation.socket;
+    inner.self_origin = invocation.self_origin.canonical();
+    inner.meta = invocation.meta;
+    inner.maps = maps.clone();
+    inner.limits = limits.clone();
+    inner.program_root = invocation.program_root;
+    inner.id = invocation.id;
+    inner.live = invocation
+        .slot
+        .as_ref()
+        .map(|slot| slot.stats())
+        .unwrap_or_default();
+    inner.registry = Some(registry.clone());
+    let inner = Rc::new(inner);
+    // The caller's pump tasks are the invocation's own: what the teardown
+    // aborts or joins, and what must die with the invocation even if the
+    // guest's execution panics somewhere it was not supposed to.
+    let mut task_guard = TaskGuard::new();
     let self_reader =
         tokio::task::spawn_local(reader_task(self_ep.clone(), invocation.stream.reader));
     let mut self_writer =
         tokio::task::spawn_local(writer_task(self_ep.clone(), invocation.stream.writer));
+    task_guard.push(&self_reader);
+    task_guard.push(&self_writer);
     debug_assert_eq!(SY_SELF, 0, "SY_SELF must be the first slot");
     inner.publish_handles();
 
@@ -605,6 +695,30 @@ async fn run_job(
     };
     tokio::pin!(cancelled);
 
+    // The idle deadline ends the invocation itself, not just the next poll
+    // wait. `made_progress` pushes the deadline out whenever bytes move or a
+    // handle becomes ready, so a proxy with steady traffic never notices it —
+    // but an invocation that stops making progress is a slot and a stream a
+    // caller can hold open forever, spinning a throttled loop into the
+    // worker. The deadline is re-read after every sleep, so progress made
+    // while one was scheduled still postpones the ending.
+    let idle = async {
+        loop {
+            let remaining = inner
+                .deadline
+                .get()
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining).await;
+        }
+    };
+    tokio::pin!(idle);
+
+    // `biased` with the run branch first: a program that returns at the same
+    // instant its idle deadline expires has ended itself, and its own ending
+    // is the one the caller is told about.
     let status = {
         let run = program.run(
             &timeslice,
@@ -616,6 +730,7 @@ async fn run_job(
         );
         tokio::pin!(run);
         tokio::select! {
+            biased;
             outcome = &mut run => match outcome {
                 Ok(value) => SockStatus::Ok(value),
                 Err(e) => {
@@ -630,6 +745,7 @@ async fn run_job(
             // A kill or shutdown drops the guest where it stands. That is safe
             // because everything it can hold is host-side and owned by `inner`.
             _ = &mut cancelled => SockStatus::Killed,
+            _ = &mut idle => SockStatus::Deadline,
             _ = shutdown.cancelled() => SockStatus::Shutdown,
         }
     };
@@ -678,7 +794,8 @@ async fn run_job(
     if let Some(slot) = &invocation.slot {
         registry.record_outcome(
             slot.socket(),
-            invocation.program_root,
+            inner.program_root,
+            inner.peer.origin.clone(),
             matches!(status, SockStatus::Fault(_)),
         );
     }
@@ -699,6 +816,16 @@ async fn run_job(
 fn shutdown_outcome() -> Outcome {
     Outcome {
         status: SockStatus::Shutdown,
+        bytes_in: 0,
+        bytes_out: 0,
+        metrics: Vec::new(),
+        labels: Vec::new(),
+    }
+}
+
+fn killed_outcome() -> Outcome {
+    Outcome {
+        status: SockStatus::Killed,
         bytes_in: 0,
         bytes_out: 0,
         metrics: Vec::new(),
@@ -773,19 +900,33 @@ fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declarat
     let preemption = PreemptionEnabled::new(thread_env);
     let mut resources: [&mut dyn std::any::Any; 1] = [&mut ctx];
     let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, async {
-        program
-            .run(
+    // A hard deadline on the whole hook, not just on its poll waits: the idle
+    // deadline a declaration run carries is only consulted by `sy_poll`, and a
+    // hook that never polls would otherwise spin past it and hang the arming
+    // thread (and, with `--auto`, the scanner) forever.
+    let outcome = local.block_on(&runtime, async {
+        tokio::time::timeout(
+            DECLARE_IDLE,
+            program.run(
                 &timeslice,
                 &TokioTimeslicer,
                 SECTION_INIT,
                 &mut resources,
                 &[],
                 &preemption,
-            )
-            .await
-            .map_err(|e| SockError::Fault(e.to_string()))
-    })?;
+            ),
+        )
+        .await
+    });
+    match outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(SockError::Fault(e.to_string())),
+        Err(_) => {
+            return Err(SockError::Load(
+                "the declaration hook exceeded its idle deadline".into(),
+            ))
+        }
+    }
     inner.flush_log();
     let declaration = inner.declaration.borrow().clone();
     declaration
