@@ -173,9 +173,16 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, Error> {
         ));
     };
 
+    // JSON-RPC 2.0 allows a null id; MCP forbids it, so it is not an id — but
+    // it is still distinguishable from having sent none, and the two are
+    // answered differently below.
+    let mut null_id = false;
     let id = match object.remove("id") {
-        // JSON-RPC 2.0 allows a null id; MCP forbids it, so it is not an id.
-        None | Some(Value::Null) => None,
+        None => None,
+        Some(Value::Null) => {
+            null_id = true;
+            None
+        }
         Some(Value::Number(n)) => Some(RequestId::Number(n.as_i64().ok_or_else(|| {
             Error::new(INVALID_REQUEST, "a numeric request id must be an integer")
         })?)),
@@ -211,8 +218,29 @@ pub(crate) fn parse(line: &str) -> Result<Incoming, Error> {
             params,
             meta,
         }),
+        // A null id is not an id, but it is not an omission either: the sender
+        // wrote one and is waiting on it. Answering with `-32600` tells it
+        // why, where treating the message as a notification would leave it
+        // waiting for a response that is never coming.
+        (None, Some(_)) if null_id => {
+            return Err(Error::new(
+                INVALID_REQUEST,
+                "a request id may not be null; omit it entirely for a notification",
+            ));
+        }
         (None, Some(method)) => Incoming::Notification { method, params },
-        (Some(_), None) | (None, None) => Incoming::Stray,
+        // An id and no method is a response to something this server sent.
+        // Nothing here asks the client questions, so there is nothing it can
+        // be a response to, and a response is never itself answered.
+        (Some(_), None) => Incoming::Stray,
+        // Neither: not a response, and not a request either. That is an
+        // invalid request rather than something to drop on the floor.
+        (None, None) => {
+            return Err(Error::new(
+                INVALID_REQUEST,
+                "a JSON-RPC message carries a method, or an id if it is a response",
+            ));
+        }
     })
 }
 
@@ -369,12 +397,22 @@ mod tests {
         ));
         assert_eq!(parse("not json").unwrap_err().code, PARSE_ERROR);
         assert_eq!(parse("[1,2]").unwrap_err().code, INVALID_REQUEST);
-        assert!(
-            matches!(
-                parse(r#"{"jsonrpc":"2.0","id":null,"method":"x"}"#).unwrap(),
-                Incoming::Notification { .. }
-            ),
-            "MCP forbids a null id, so it is not an id"
+        // MCP forbids a null id, so it is not an id — but the sender wrote one
+        // and is waiting on it, and treating the message as a notification
+        // leaves it waiting for a response that never comes. Refusing it says
+        // why, and costs nothing with a client that never sends one.
+        assert_eq!(
+            parse(r#"{"jsonrpc":"2.0","id":null,"method":"x"}"#)
+                .unwrap_err()
+                .code,
+            INVALID_REQUEST,
+        );
+        // Neither a request nor a response to one. Dropping it silently is the
+        // one answer JSON-RPC does not allow.
+        assert_eq!(parse("{}").unwrap_err().code, INVALID_REQUEST);
+        assert_eq!(
+            parse(r#"{"jsonrpc":"2.0"}"#).unwrap_err().code,
+            INVALID_REQUEST
         );
     }
 

@@ -68,6 +68,14 @@ const DEFAULT_PAGE: u64 = 200;
 /// The largest page a listing will return.
 const MAX_PAGE: u64 = 1000;
 
+/// The most C source one `synch_socket_build` may carry.
+///
+/// A socket program is a page or two of C; this is orders of magnitude above
+/// anything that compiles into one. The line ceiling alone would let a request
+/// carry megabytes into a compiler that holds a process-wide lock while it
+/// runs, and the compile is not something a caller can be given back partway.
+const MAX_SOURCE_BYTES: usize = 256 * 1024;
+
 /// Which authority a tool needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tier {
@@ -100,6 +108,44 @@ impl Context {
         Err(ToolError::execution(format!(
             "space {space:?} is out of scope for this server; it was started with \
              --space {}",
+            self.options.spaces.join(" --space ")
+        )))
+    }
+
+    /// The space to send for a request that named none.
+    ///
+    /// An omitted space means *every* space to the daemon, which is the one
+    /// thing `--space` exists to prevent: the filter it builds is `None`, and
+    /// the answer covers the whole node. So an unconfined server keeps the
+    /// wildcard, a server confined to exactly one space fills it in, and one
+    /// confined to several asks which — the daemon's filter names a single
+    /// space, and there is no way to say "these three" that does not also say
+    /// "and the rest".
+    fn scoped_default(&self) -> Result<String, ToolError> {
+        match self.options.spaces.as_slice() {
+            [] => Ok(String::new()),
+            [only] => Ok(only.clone()),
+            several => Err(ToolError::execution(format!(
+                "this server is confined to more than one space, and a request \
+                 naming none would reach every space on the node; name one of: {}",
+                several.join(", ")
+            ))),
+        }
+    }
+
+    /// Refuses an operation that has no space to be confined to.
+    ///
+    /// Some commands take no space at all and act on everything the node
+    /// holds. There is nothing to narrow, so under `--space` the only honest
+    /// answers are to refuse or to act outside the confinement, and a
+    /// confinement that the write tools step around is not one.
+    fn whole_node(&self, what: &str) -> Result<(), ToolError> {
+        if self.options.spaces.is_empty() {
+            return Ok(());
+        }
+        Err(ToolError::execution(format!(
+            "{what} acts on every space this node holds and cannot be narrowed \
+             to one, so it is refused by a server started with --space {}",
             self.options.spaces.join(" --space ")
         )))
     }
@@ -1085,7 +1131,7 @@ pub(crate) async fn call(
         "synch_socket_ps" => socket_ps(ctx, args, reporter).await,
         "synch_socket_log" => socket_log(ctx, args, reporter).await,
         "synch_socket_sdk" => rendered(ctx, Cmd::SocketSdk(pb::SocketSdk {}), reporter).await,
-        "synch_socket_build" => socket_build(args),
+        "synch_socket_build" => socket_build(args).await,
         "synch_socket_review" => socket_arm(ctx, args, reporter, None).await,
         "synch_connect" => connect(ctx, args).await,
 
@@ -1094,8 +1140,14 @@ pub(crate) async fn call(
         "synch_take" => take(ctx, args, reporter).await,
         "synch_fill" => fill(ctx, args, reporter).await,
         "synch_pin" => pin(ctx, args, reporter).await,
-        "synch_scan" => rendered(ctx, Cmd::Scan(pb::Scan {}), reporter).await,
-        "synch_sync" => rendered(ctx, Cmd::SyncNow(pb::SyncNow {}), reporter).await,
+        "synch_scan" => {
+            ctx.whole_node("synch_scan")?;
+            rendered(ctx, Cmd::Scan(pb::Scan {}), reporter).await
+        }
+        "synch_sync" => {
+            ctx.whole_node("synch_sync")?;
+            rendered(ctx, Cmd::SyncNow(pb::SyncNow {}), reporter).await
+        }
         "synch_socket_add" => socket_add(ctx, args, reporter).await,
         "synch_socket_arm" => {
             let token = need_str(args, "review_token")?.to_string();
@@ -1251,7 +1303,7 @@ async fn list(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
         .clamp(1, MAX_PAGE);
     let policy = opt_policy(args)?;
 
-    let entries = ctx
+    let (entries, scan_cursor) = ctx
         .session
         .call(|mut client| {
             let request = pb::ListRequest {
@@ -1267,18 +1319,27 @@ async fn list(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
                 while let Some(entry) = stream.next().await? {
                     entries.push(entry);
                 }
-                Ok(entries)
+                // Read once the stream is drained, which is the only point it
+                // is settled.
+                let scan_cursor = stream.scan_cursor().map(str::to_owned);
+                Ok((entries, scan_cursor))
             }
         })
         .await?;
 
-    // A cursor comes back for every page that had anything in it, not only for
-    // a full one — so the end of a listing is an *empty* page, never a short
-    // one. The daemon fills a page past the paths its filters drop, but only
-    // within a scan budget, so a page that came back short may still have more
-    // behind it. Stopping on a short page would silently truncate the listing;
-    // stopping on an empty one costs at most one extra call and cannot.
-    let next_cursor = entries.last().map(|entry| entry.path.clone());
+    // The daemon fills a page past the paths its filters drop, but only within
+    // a scan budget, so a page that came back short — empty included — may
+    // still have more behind it. When it stopped there rather than at the end
+    // of the listing it says where, and that is the cursor: a run of dropped
+    // paths longer than the budget leaves no entry to resume from, and this is
+    // the case where reading the end off what arrived loses the rest of the
+    // space entirely.
+    //
+    // Otherwise a cursor comes back for every page that had anything in it,
+    // not only for a full one, so the end of a listing is an *empty* page with
+    // no cursor. Stopping on a short page would silently truncate it; stopping
+    // on that costs at most one extra call and cannot.
+    let next_cursor = scan_cursor.or_else(|| entries.last().map(|entry| entry.path.clone()));
 
     Ok(Outcome::structured(json!({
         "entries": entries.iter().map(entry_json).collect::<Vec<_>>(),
@@ -1324,6 +1385,16 @@ async fn read(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
     let policy = opt_policy(args)?;
     let offset = opt_u64(args, "offset")?.unwrap_or(0);
     let requested = opt_u64(args, "length")?.unwrap_or(ctx.options.max_read_bytes);
+    if requested == 0 {
+        // The schema says `minimum: 1`, but nothing here validates against the
+        // schema, and a zero-length window is worse than useless: it comes
+        // back empty with `eof: false`, so a caller walking the object by
+        // `offset += length` never advances and asks again forever.
+        return Err(ToolError::execution(
+            "length must be at least 1; omit it to read up to the server's \
+             --max-read-bytes",
+        ));
+    }
     let length = requested.min(ctx.options.max_read_bytes);
 
     // Resolved first, so the result can report the whole object's size and the
@@ -1472,22 +1543,34 @@ async fn socket_list(
     args: &Value,
     reporter: &Reporter,
 ) -> Result<Outcome, ToolError> {
-    let space = opt_str(args, "space")?.unwrap_or_default().to_string();
-    if !space.is_empty() {
-        ctx.scope(&space)?;
-    }
+    let space = match opt_str(args, "space")?.filter(|s| !s.is_empty()) {
+        Some(space) => {
+            ctx.scope(space)?;
+            space.to_string()
+        }
+        // An empty space is the daemon's wildcard, so a confined server has to
+        // put its own space there rather than pass the omission through.
+        None => ctx.scoped_default()?,
+    };
     let long = opt_bool(args, "long")?;
     rendered(ctx, Cmd::SocketLs(pb::SocketLs { space, long }), reporter).await
 }
 
 /// `synch_socket_ps`.
 async fn socket_ps(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
-    let target = match opt_str(args, "space")? {
+    let target = match opt_str(args, "space")?.filter(|s| !s.is_empty()) {
         Some(space) => {
             ctx.scope(space)?;
             reference(space, need_str(args, "path")?, None)?
         }
-        None => String::new(),
+        // The daemon filters invocations by an exact `space/path`, so there is
+        // no narrowing to a space alone: either this names one socket or it
+        // answers for every space on the node, and the second is not something
+        // a confined server may do.
+        None => {
+            ctx.whole_node("synch_socket_ps without a space")?;
+            String::new()
+        }
     };
     rendered(ctx, Cmd::SocketPs(pb::SocketPs { target }), reporter).await
 }
@@ -1518,9 +1601,9 @@ async fn socket_target(
 }
 
 /// `synch_socket_build` — no daemon involved, and nothing written to disk.
-fn socket_build(args: &Value) -> Result<Outcome, ToolError> {
-    let source = need_str(args, "source")?;
-    let name = opt_str(args, "name")?.unwrap_or("socket.c");
+async fn socket_build(args: &Value) -> Result<Outcome, ToolError> {
+    let source = need_str(args, "source")?.to_string();
+    let name = opt_str(args, "name")?.unwrap_or("socket.c").to_string();
     if !synch_cc::SUPPORTED {
         return Err(ToolError::execution(
             "this build has no embedded C compiler, and the system-clang path \
@@ -1528,14 +1611,33 @@ fn socket_build(args: &Value) -> Result<Outcome, ToolError> {
              --clang` instead",
         ));
     }
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(ToolError::execution(format!(
+            "the source is {} bytes, over the {MAX_SOURCE_BYTES}-byte ceiling \
+             on a build over this bridge",
+            source.len()
+        )));
+    }
     let defines = string_map(args, "defines")?;
-    let defines: Vec<(&str, &str)> = defines
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    let headers = [("synch.h", synch_sock::sdk::HEADER)];
-    let object = synch_cc::compile(source, name, &headers, &defines)
-        .map_err(|e| ToolError::execution(format!("compiling {name}: {e}")))?;
+    // Off the runtime: the compiler writes its headers to a tempdir, takes a
+    // process-wide lock and runs to completion through FFI, none of which
+    // yields. Left on a worker it stops the reader loop and the writer with
+    // it, so requests already in flight go unanswered and a `cancelled`
+    // notification cannot even be read until the compile is over.
+    let compiled = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || {
+            let defines: Vec<(&str, &str)> = defines
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let headers = [("synch.h", synch_sock::sdk::HEADER)];
+            synch_cc::compile(&source, &name, &headers, &defines).map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| ToolError::execution(format!("the compile of {name} did not finish: {e}")))?;
+    let object = compiled.map_err(|e| ToolError::execution(format!("compiling {name}: {e}")))?;
     Ok(Outcome::both(
         format!("compiled {name}: {} bytes of eBPF object", object.len()),
         json!({

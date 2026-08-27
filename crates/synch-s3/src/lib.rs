@@ -661,7 +661,7 @@ async fn list_objects(
     // know whether there is a next page; a delimiter can fold several of them
     // into one common prefix, so the loop below may ask for no more than it
     // was given and still stop short.
-    let (listing, more) = gateway
+    let (listing, more, scan_cursor) = gateway
         .daemon
         .list(
             &bucket.space,
@@ -737,7 +737,10 @@ async fn list_objects(
         result.is_truncated = true;
     }
     if result.is_truncated {
-        result.next_continuation_token = cursor;
+        // A page whose rows were all dropped by the daemon's filters has no
+        // row to resume from, and the daemon's own scan position is the only
+        // thing that moves the listing past them.
+        result.next_continuation_token = cursor.or(scan_cursor);
     }
     Ok(xml_response(StatusCode::OK, result.to_xml()))
 }

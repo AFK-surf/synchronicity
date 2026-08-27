@@ -242,7 +242,7 @@ pub(crate) async fn list(ctx: &Context, cursor: Option<&str>) -> Result<Value, T
                 return Ok(page(resources, reached));
             }
             let remaining = PAGE.saturating_sub(resources.len() as u64);
-            let entries = ctx
+            let (entries, scan_cursor) = ctx
                 .session
                 .call(|mut client| {
                     let request = pb::ListRequest {
@@ -258,16 +258,22 @@ pub(crate) async fn list(ctx: &Context, cursor: Option<&str>) -> Result<Value, T
                         while let Some(entry) = stream.next().await? {
                             entries.push(entry);
                         }
-                        Ok(entries)
+                        let scan_cursor = stream.scan_cursor().map(str::to_owned);
+                        Ok((entries, scan_cursor))
                     }
                 })
                 .await?;
 
-            // An *empty* batch is the end of this space, not a short one: the
-            // daemon fills a page past what its filters drop but only within a
-            // scan budget, so a short batch can still have paths behind it.
-            let Some(last) = entries.last().map(|entry| entry.path.clone()) else {
-                break;
+            // The daemon fills a page past what its filters drop but only
+            // within a scan budget, so a short batch — empty included — can
+            // still have paths behind it. A batch that stopped on the budget
+            // names where, and walking on from there is the only way past a
+            // run of dropped paths longer than the budget, which yields a
+            // batch with no entry to resume from. Only a batch that ended with
+            // neither is the end of this space.
+            let last = match scan_cursor.or_else(|| entries.last().map(|e| e.path.clone())) {
+                Some(last) => last,
+                None => break,
             };
             for entry in entries {
                 // A directory is not a resource: it has no bytes, and a client

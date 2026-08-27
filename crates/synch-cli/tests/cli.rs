@@ -530,7 +530,29 @@ fn mcp_writes_protocol_to_stdout_and_diagnostics_to_stderr() {
     // Closing stdin is the shutdown signal, and the server still answers what
     // it already accepted before it exits.
 
+    // Bounded, because closing stdin being the shutdown signal is part of what
+    // this test asserts: a build where it stops working should fail here in a
+    // minute rather than hang until the CI job's own timeout kills it, which
+    // reads as an infrastructure problem rather than the regression it is.
+    // Safe to poll rather than drain because the three responses above are far
+    // inside the pipe buffer, so the child is never blocked writing them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child
+        .try_wait()
+        .expect("the child's state is readable")
+        .is_none()
+    {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            daemon.stop(&cli);
+            panic!("`synch mcp` did not exit within 60s of its stdin closing");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let output = child.wait_with_output().expect("synch mcp exits");
+    // The child is gone, so nothing below needs the daemon. Stopped here so an
+    // assertion that fails does not leave it running for the rest of the run.
+    daemon.stop(&cli);
     assert!(
         output.status.success(),
         "synch mcp exited {}: {}",
@@ -561,6 +583,4 @@ fn mcp_writes_protocol_to_stdout_and_diagnostics_to_stderr() {
         stderr.contains("serving MCP over stdio"),
         "the startup log should be on stderr:\n{stderr}"
     );
-
-    daemon.stop(&cli);
 }

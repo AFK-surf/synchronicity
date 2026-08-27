@@ -277,36 +277,71 @@ impl Server {
         // Registered before the task exists, so a cancellation that arrives
         // while it is starting still reaches it, and so the task can remove
         // its own entry without racing the insert.
-        self.inflight
-            .lock()
-            .await
-            .insert(request.id.clone(), cancel.clone());
+        //
+        // An id already in flight is refused rather than allowed to overwrite
+        // the entry: the two would share one slot, the first to finish would
+        // take it, and the survivor would be left with no way to be cancelled
+        // at all. Reusing an id is a client bug either way, and one that is
+        // answered is easier to find than one that quietly disarms.
+        {
+            let mut inflight = self.inflight.lock().await;
+            if inflight.contains_key(&request.id) {
+                drop(inflight);
+                let e = rpc::Error::new(
+                    rpc::INVALID_REQUEST,
+                    "a request with this id is already in flight",
+                );
+                self.send(rpc::error_response(Some(&request.id), &e)).await;
+                return None;
+            }
+            inflight.insert(request.id.clone(), cancel.clone());
+        }
 
         let context = self.context.clone();
         let out = self.out.clone();
         let inflight = self.inflight.clone();
         let legacy = self.legacy.clone();
+        let id = request.id.clone();
         Some(tokio::spawn(async move {
-            let id = request.id.clone();
-            let reporter = Reporter::new(out.clone(), request.meta.get("progressToken").cloned());
-            let answer = tokio::select! {
+            // The handler runs as its own task so that a panic inside it comes
+            // back as a `JoinError` here instead of unwinding the task that
+            // owes the client an answer. Left inline, a panic would take the
+            // response and the `inflight` entry with it: the client would wait
+            // on an id that never comes back, and the id would stay registered
+            // for the life of the process.
+            let mut work = tokio::spawn({
+                let out = out.clone();
+                async move {
+                    let reporter = Reporter::new(out, request.meta.get("progressToken").cloned());
+                    handle(&context, &legacy, &request, &reporter).await
+                }
+            });
+            let joined = tokio::select! {
                 biased;
                 // A cancelled request is owed no further messages at all, which
-                // is why this returns rather than sending anything.
-                _ = cancel.cancelled() => {
-                    tracing::debug!("a request was cancelled");
-                    None
-                }
-                answer = handle(&context, &legacy, &request, &reporter) => Some(answer),
+                // is why this sends nothing.
+                _ = cancel.cancelled() => None,
+                joined = &mut work => Some(joined),
             };
             inflight.lock().await.remove(&id);
-            if let Some(answer) = answer {
-                let message = match answer {
-                    Ok(result) => rpc::response(&id, &era, result),
-                    Err(e) => rpc::error_response(Some(&id), &e),
-                };
-                let _ = out.send(message.to_string()).await;
-            }
+            let Some(joined) = joined else {
+                tracing::debug!("a request was cancelled");
+                work.abort();
+                return;
+            };
+            let message = match joined {
+                Ok(Ok(result)) => rpc::response(&id, &era, result),
+                Ok(Err(e)) => rpc::error_response(Some(&id), &e),
+                Err(e) => {
+                    tracing::error!(error = %e, "a request handler ended without answering");
+                    let e = rpc::Error::new(
+                        rpc::INTERNAL_ERROR,
+                        "the handler for this request failed without producing an answer",
+                    );
+                    rpc::error_response(Some(&id), &e)
+                }
+            };
+            let _ = out.send(message.to_string()).await;
         }))
     }
 

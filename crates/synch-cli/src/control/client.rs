@@ -102,7 +102,10 @@ impl Client {
     /// The unified listing under a prefix, resolved by a policy (§8).
     pub async fn list(&mut self, request: pb::ListRequest) -> Result<Entries, ControlError> {
         let stream = self.inner.list(request).await?.into_inner();
-        Ok(Entries { stream })
+        Ok(Entries {
+            stream,
+            scan_cursor: None,
+        })
     }
 
     /// The version a policy selects for one path, with no content fetched.
@@ -387,16 +390,40 @@ impl Frames {
 /// A listing, one entry at a time.
 #[derive(Debug)]
 pub struct Entries {
-    stream: Streaming<pb::Entry>,
+    stream: Streaming<pb::ListItem>,
+    scan_cursor: Option<String>,
 }
 
 impl Entries {
-    /// The next entry, or `None` at the end of the listing.
+    /// The next entry, or `None` at the end of the page.
     pub async fn next(&mut self) -> Result<Option<EntryInfo>, ControlError> {
-        match self.stream.message().await? {
-            Some(entry) => Ok(Some(EntryInfo::try_from(entry)?)),
-            None => Ok(None),
+        while let Some(item) = self.stream.message().await? {
+            match item.item {
+                Some(pb::list_item::Item::Entry(entry)) => {
+                    return Ok(Some(EntryInfo::try_from(entry)?));
+                }
+                // Recorded rather than returned: it is not an entry, and it
+                // arrives last, so the loop ends on the next poll anyway.
+                Some(pb::list_item::Item::ScanCursor(after)) => {
+                    self.scan_cursor = Some(after);
+                }
+                // A daemon newer than this client, naming something it has no
+                // word for. Skipping it loses nothing an entry was carrying.
+                None => continue,
+            }
         }
+        Ok(None)
+    }
+
+    /// Where to resume, when the page ended on the scan budget rather than at
+    /// the end of the listing.
+    ///
+    /// `None` once the stream is drained means the listing is finished, and is
+    /// the only thing that means it: a page can come back empty with more
+    /// behind it, so a caller that reads "no entries" as "no more" truncates
+    /// the listing. Read after [`Entries::next`] has returned `None`.
+    pub fn scan_cursor(&self) -> Option<&str> {
+        self.scan_cursor.as_deref()
     }
 }
 

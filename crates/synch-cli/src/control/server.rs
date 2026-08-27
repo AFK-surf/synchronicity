@@ -493,7 +493,7 @@ impl ControlService {
 #[tonic::async_trait]
 impl Control for ControlService {
     type RunStream = RunStream;
-    type ListStream = Items<pb::Entry>;
+    type ListStream = Items<pb::ListItem>;
     type ReadStream = Items<pb::Chunk>;
     type PutStream = Items<pb::Written>;
     type OpenSocketStream = Items<pb::ConnectResponse>;
@@ -588,7 +588,11 @@ impl Control for ControlService {
                     let Ok(row) = node.resolve_set(set, &policy, now) else {
                         continue;
                     };
-                    if tx.send(Ok(entry_info(&row, set).into())).await.is_err() {
+                    if tx
+                        .send(Ok(list_entry(entry_info(&row, set))))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     sent += 1;
@@ -608,23 +612,32 @@ impl Control for ControlService {
                 // Bounded, because the filters can drop an unbounded run of
                 // paths — a swathe of tombstones, an `origin=` policy naming a
                 // peer that publishes little — and the S3 gateway serves this
-                // to principals who are not cluster members (§12). Past the
-                // budget the page ends short, which costs a caller one extra
-                // request and never a lost path, since the next page resumes
-                // after the last entry this one sent.
+                // to principals who are not cluster members (§12).
+                //
+                // Past the budget the page ends short and says so, by naming
+                // the path the scan reached. It has to name it: a run of
+                // dropped paths longer than the budget ends the page with
+                // nothing in it, and a caller resuming from the last entry it
+                // received would have none to resume from — it would read the
+                // empty page as the end of the listing and stop there, with
+                // every path behind the run unreachable for good.
                 let Some(limit) = limit else {
                     // No limit: the first query already returned everything.
                     return;
                 };
                 let budget = limit.saturating_mul(SCAN_FILL_FACTOR).max(MIN_SCAN_BUDGET);
-                if raw < limit || scanned >= budget {
-                    // A short *query* means the prefix is exhausted; the budget
-                    // means it is not, and the caller pages on.
+                if raw < limit {
+                    // A short *query* means the prefix is exhausted, which is
+                    // the one ending that needs no cursor.
                     return;
                 }
                 let Some(after) = last_scanned else {
                     return;
                 };
+                if scanned >= budget {
+                    let _ = tx.send(Ok(list_scan_cursor(after))).await;
+                    return;
+                }
                 let (space, prefix) = (space.clone(), prefix.clone());
                 batch = match read(&node, move |n| {
                     Ok(n.unified_listing(&space, &prefix, Some(&after), Some(limit))?)
@@ -3535,6 +3548,20 @@ async fn receive_part(
         root: part.root.as_bytes().to_vec(),
         created_ns: part.created_ns,
     })
+}
+
+/// One listing entry, as the stream carries it.
+fn list_entry(info: EntryInfo) -> pb::ListItem {
+    pb::ListItem {
+        item: Some(pb::list_item::Item::Entry(info.into())),
+    }
+}
+
+/// The note that the scan stopped on its budget, and where.
+fn list_scan_cursor(after: String) -> pb::ListItem {
+    pb::ListItem {
+        item: Some(pb::list_item::Item::ScanCursor(after)),
+    }
 }
 
 /// Renders one selected entry as the metadata a structured client reads.

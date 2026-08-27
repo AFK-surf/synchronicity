@@ -88,6 +88,15 @@ impl Daemon {
         self.node.flush_staged().await.unwrap();
     }
 
+    /// Rescans and republishes, so files removed from disk become tombstones.
+    ///
+    /// One scan for however many were removed, where the delete tool would be
+    /// one round trip each.
+    async fn rescan(&self) {
+        self.node.scan_and_stage_async_with_reports().await.unwrap();
+        self.node.flush_staged().await.unwrap();
+    }
+
     async fn shutdown(self) {
         let _ = self.stop.send(());
         let _ = self.served.await;
@@ -382,6 +391,61 @@ async fn a_listing_pages_through_the_daemons_own_cursor() {
         }
     }
     assert_eq!(seen, names, "every path, once, in order");
+
+    client.close().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_of_deletions_longer_than_the_scan_budget_is_paged_past() {
+    // The regression this pins: the daemon's page-filling scan is bounded, and
+    // a run of dropped paths longer than that budget ends a page with nothing
+    // in it. A client that takes its next cursor from the last entry it
+    // received has none, reads the empty page as the end of the listing, and
+    // never sees anything behind the run — permanently, since asking again
+    // rescans the same rows. The budget floor is 1024, so the run has to clear
+    // that to reach the case at all.
+    let data = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(data.path()).await;
+    let names: Vec<String> = (0..1200).map(|n| format!("f{n:04}.txt")).collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x" as &[u8])).collect();
+    daemon.space_with("media", checkout.path(), &files).await;
+
+    // The first 1100 leave the tree, in one scan rather than 1100 calls. What
+    // is left is 100 live paths behind a run of tombstones the scan budget
+    // cannot cross in a single page.
+    for name in &names[..1100] {
+        std::fs::remove_file(checkout.path().join(name)).unwrap();
+    }
+    daemon.rescan().await;
+    let live: Vec<String> = names[1100..].to_vec();
+
+    let mut client = writer(data.path());
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 40, "the listing did not finish: {seen:?}");
+        let mut args = json!({ "space": "media", "limit": 10 });
+        if let Some(cursor) = &cursor {
+            args["cursor"] = json!(cursor);
+        }
+        let page = client.tool("synch_list", args).await;
+        for entry in page["structuredContent"]["entries"].as_array().unwrap() {
+            seen.push(entry["path"].as_str().unwrap().to_string());
+        }
+        match page["structuredContent"]["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            // An empty page with no cursor is the only end of a listing.
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen, live,
+        "every live path behind the run of tombstones, once, in order"
+    );
 
     client.close().await;
     daemon.shutdown().await;
@@ -872,6 +936,66 @@ async fn interleaved_requests_are_answered_independently_and_cancellation_silenc
 }
 
 #[tokio::test]
+async fn a_cancelled_request_that_was_still_running_is_never_answered() {
+    let data = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(data.path()).await;
+    // Enough files that the scan is still hashing when the next line is read.
+    // The reader takes the cancellation microseconds later, so what this
+    // depends on is only that a scan of two thousand files outlasts one
+    // iteration of the reader loop.
+    let files: Vec<(String, Vec<u8>)> = (0..2000)
+        .map(|i| {
+            (
+                format!("f{i:04}.txt"),
+                format!("contents of {i}").into_bytes(),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    daemon.space_with("media", checkout.path(), &borrowed).await;
+
+    let mut client = writer(data.path());
+    client
+        .send(
+            "tools/call",
+            json!({ "name": "synch_scan", "arguments": {} }),
+            20,
+        )
+        .await;
+    client
+        .notify("notifications/cancelled", json!({ "requestId": 20 }))
+        .await;
+    // Ordered behind the cancellation on the same pipe, so its answer is proof
+    // the cancellation has been read and acted on.
+    client.send("ping", json!({}), 21).await;
+
+    let mut seen = Vec::new();
+    loop {
+        let message = client.recv().await.expect("a message");
+        if message["id"] == json!(21) {
+            break;
+        }
+        if message["id"].is_i64() {
+            seen.push(message["id"].as_i64().unwrap());
+        }
+    }
+    // A cancelled request is owed nothing at all — not a result, and not an
+    // error either. This is the assertion that fails if the "send nothing"
+    // branch is ever dropped in favour of answering.
+    assert!(
+        !seen.contains(&20),
+        "the cancelled request was answered anyway: {seen:?}"
+    );
+
+    client.close().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_server_starts_without_a_daemon_and_recovers_when_one_appears() {
     let data = tempfile::tempdir().unwrap();
     // Initialized, but nothing serving: exactly what an MCP client that
@@ -938,20 +1062,41 @@ async fn progress_reaches_a_client_that_asked_for_it() {
         .unwrap();
 
     let mut progress = 0;
+    let mut counts = Vec::new();
+    let mut messages = Vec::new();
     loop {
         let message = client.recv().await.expect("a message");
         if message["method"] == "notifications/progress" {
             assert_eq!(message["params"]["progressToken"], "scan-1");
-            assert!(message["params"]["progress"].as_u64().unwrap() >= 1);
+            counts.push(message["params"]["progress"].as_u64().expect("a count"));
+            messages.push(
+                message["params"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
             progress += 1;
             continue;
         }
         assert_eq!(message["id"], json!(id));
         break;
     }
-    // The scanner reports as it goes; a run over one small space may report
-    // nothing at all, and either way the result arrived.
-    assert!(progress >= 0);
+    // A scan reports one line per space it scanned, so the one space above is
+    // one line — not "possibly none". Asserting a floor of zero would hold for
+    // a reporter whose body had been deleted, which is the regression this
+    // test exists to catch.
+    assert_eq!(
+        progress, 1,
+        "one space scanned is one progress line, got {progress}: {messages:?}"
+    );
+    assert!(
+        messages[0].contains("media"),
+        "the progress line names the space it scanned: {:?}",
+        messages[0]
+    );
+    // The counter is the sequence number the client correlates on, and it
+    // starts at 1 rather than 0.
+    assert_eq!(counts, vec![1]);
 
     client.close().await;
     daemon.shutdown().await;

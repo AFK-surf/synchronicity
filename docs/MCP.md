@@ -139,6 +139,16 @@ not serve should not be distinguishable from one that is not there.
 The filter applies to `synch_connect` too. A socket on a peer is still addressed
 by space, and letting one through would make the filter a local-only fiction.
 
+A tool whose space argument is optional does not inherit the wildcard: an
+omitted space means *every* space to the daemon, which is the thing the filter
+exists to prevent. So under `--space`, `synch_socket_list` fills in the confined
+space when there is exactly one and asks which when there are several.
+
+Three tools take no space at all and act on everything the node holds:
+`synch_scan`, `synch_sync`, and `synch_socket_ps` when it names no socket. There
+is nothing in them to narrow, so under `--space` they are refused rather than
+allowed to reach past the confinement. Without `--space` they behave as before.
+
 ## 3. Resources
 
 Paths are addressable as `synch://<space>/<path>`, percent-encoded outside the

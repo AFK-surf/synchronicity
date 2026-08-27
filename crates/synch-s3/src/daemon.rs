@@ -124,7 +124,7 @@ impl Daemon {
         start_after: Option<&str>,
         wanted: usize,
         policy: &str,
-    ) -> S3Result<(Vec<EntryInfo>, bool)> {
+    ) -> S3Result<(Vec<EntryInfo>, bool, Option<String>)> {
         let mut client = self.connect().await?;
         let mut entries = client
             .list(pb::ListRequest {
@@ -147,11 +147,21 @@ impl Daemon {
         let mut out = Vec::new();
         while let Some(entry) = entries.next().await? {
             if out.len() == wanted {
-                return Ok((out, true));
+                return Ok((out, true, None));
             }
             out.push(entry);
         }
-        Ok((out, false))
+        // A page that ended on the daemon's scan budget rather than at the end
+        // of the prefix is truncated too, whatever it managed to carry. Saying
+        // otherwise ends the client's listing on a run of tombstones longer
+        // than that budget — `IsTruncated: false` over a page with nothing in
+        // it, and every key behind the run silently gone from the bucket.
+        //
+        // The path it stopped on comes back with it, because a page of nothing
+        // leaves the caller no row to build a continuation token from, and a
+        // token that does not move is a listing that never finishes.
+        let scan_cursor = entries.scan_cursor().map(str::to_owned);
+        Ok((out, scan_cursor.is_some(), scan_cursor))
     }
 
     /// Streams a verified byte range straight into an HTTP response body.

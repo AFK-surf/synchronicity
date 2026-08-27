@@ -29,7 +29,7 @@ service Control {
   // budgeted, so a page can still end short of `limit` with more behind it: the
   // end of a listing is an *empty* page, and a caller that stops on a short one
   // truncates it.
-  rpc List(ListRequest) returns (stream Entry);
+  rpc List(ListRequest) returns (stream ListItem);
 
   // The version a policy selects for one path, with no content fetched — what
   // HeadObject answers from (§9.4).
@@ -583,6 +583,27 @@ message Entry {
   // How many versions the path carries in the unified tree (§8). One means
   // every publisher agrees; more means the selection above chose a side.
   uint32 versions = 10;
+}
+
+// One item in a listing stream.
+//
+// The scan runs past the paths its filters drop, so a page can end for two
+// reasons that look identical from the outside: the prefix ran out, or the
+// scan spent its budget. Only the first is the end of the listing, and a
+// caller that cannot tell them apart stops early on the second — for good,
+// since a run of dropped paths longer than the budget yields a page with
+// nothing in it to resume from. So the daemon says which happened rather than
+// leaving it to be inferred from what arrived.
+message ListItem {
+  oneof item {
+    // A resolved entry, in path order.
+    Entry entry = 1;
+    // The scan stopped on its budget with the prefix unfinished, having
+    // scanned this far. Sent last and at most once, and only when there is
+    // more behind it: resume from here, exclusive. Its absence is the end of
+    // the listing.
+    string scan_cursor = 2;
+  }
 }
 
 // A piece of a byte payload.
