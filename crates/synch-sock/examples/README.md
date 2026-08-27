@@ -1,6 +1,6 @@
 # Socket examples
 
-Seven programs, each demonstrating one thing, each a program you could arm as it
+Eight programs, each demonstrating one thing, each a program you could arm as it
 stands. `docs/SOCKETS.md` is the design; this is what it looks like written
 down.
 
@@ -34,6 +34,7 @@ synch connect nas:code/echo.sock
 | [`tree-cat.c`](tree-cat.c) | serves one directory of the tree | validating caller input before it reaches a path, and cold reads as poll waits |
 | [`http-status.c`](http-status.c) | a status page over HTTP | speaking a real protocol, and state that outlives the invocation |
 | [`tcp-proxy.c`](tcp-proxy.c) | forwards to one upstream | declared egress, per-caller rate limits, and a bidirectional loop that ends correctly |
+| [`splice-proxy.c`](splice-proxy.c) | the same, without a buffer | `sy_splice`, and what a proxy stops needing when the bytes never enter it |
 | [`token-gate.c`](token-gate.c) | checks a shared secret | config as a secret store, and a constant-time comparison |
 | [`compact-frames.c`](compact-frames.c) | uses 512-byte contiguous call frames | declaring a compiler-matched frame size and explicitly disabling guarded frames |
 
@@ -53,7 +54,10 @@ stopped working would fail the build rather than fail a reader.
 2. **Nothing blocks except `sy_poll`.** Every read and write returns
    immediately, with a short count or `SY_EAGAIN`. A short write is
    backpressure, not failure. Write an event loop; `sy_pump` and `sy_write_all`
-   in the header are the two shapes almost every socket wants.
+   in the header are the two shapes almost every socket wants, and `sy_splice`
+   is the one for bytes that are only passing through — it moves them between
+   two endpoints without a buffer, and a short move leaves what did not fit
+   where it already was.
 
 3. **Authorization is the handshake.** `sy_peer_origin`, `sy_peer_kind` and
    `sy_peer_has_space` read an identity iroh authenticated before the program

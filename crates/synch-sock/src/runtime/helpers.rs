@@ -63,6 +63,7 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     // endpoint I/O
     ("sy_read", h_read),
     ("sy_write", h_write),
+    ("sy_splice", h_splice),
     ("sy_readable", h_readable),
     ("sy_writable", h_writable),
     ("sy_shutdown", h_shutdown),
@@ -459,6 +460,51 @@ fn h_write(
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             }
         })?;
+    }
+    ret(n)
+}
+
+/// Moves bytes between two endpoints without them entering guest memory.
+///
+/// The one helper here that touches no guest memory at all, which is what it is
+/// for: a proxy that does not need to look at what it forwards pays neither the
+/// two copies through the pointer cage nor the stack buffer they would need,
+/// and — because the bytes are never picked up out of the rx ring — has no
+/// remainder to carry between calls. [`MAX_COPY`] therefore does not apply; the
+/// move is bounded by the two rings and by what the guest asked for.
+fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -> Result<u64, ()> {
+    // Zero would have to mean either "nothing moved" or "the source is at its
+    // end", and telling those two apart is the whole of a caller's control
+    // flow. So it is refused as the malformed argument it is.
+    if max == 0 {
+        return ret(errno::EINVAL);
+    }
+    let inner = with(scope, Rc::clone)?;
+    let (Some(src), Some(dst)) = (inner.endpoint(from as i64), inner.endpoint(to as i64)) else {
+        // Including an object or a cursor handle: the tree is read with
+        // `sy_pread`, whose answer may not be here yet, and a splice that could
+        // block is not the helper this is.
+        return ret(errno::EBADF);
+    };
+    let n = src.splice_to(&dst, usize::try_from(max).unwrap_or(usize::MAX));
+    if n > 0 {
+        inner.made_progress();
+        // Counted as `sy_read` and `sy_write` count: only the caller's own
+        // stream, so a proxy is not reported as having moved twice the bytes it
+        // moved. A splice between two egress endpoints is neither, and shows up
+        // in neither total.
+        if from as i64 == SY_SELF {
+            inner
+                .live
+                .bytes_in
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if to as i64 == SY_SELF {
+            inner
+                .live
+                .bytes_out
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     ret(n)
 }

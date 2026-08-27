@@ -574,6 +574,89 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn splice_proxy_forwards_both_directions_without_a_buffer() {
+    // A payload several rings deep in each direction: a spliced proxy moves
+    // what fits and comes back for the rest, and bytes it could not place stay
+    // in the ring they were in. Anything less than the whole of it arriving,
+    // in order, would mean the host lost the part it did not move.
+    let request: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+    let response: Vec<u8> = (0..40_000).map(|i| (i % 241) as u8).collect();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().unwrap().port();
+    let sent = response.clone();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        // The request first, in full, and only then the reply — the shape
+        // `tcp-proxy.c`'s test uses, and for a reason that is about neither
+        // example: an endpoint the guest opened gets no drain window when the
+        // invocation ends (`runtime::run`), so a proxy that reaches both EOFs
+        // while bytes are still queued upstream loses them on the way out. An
+        // upstream that answered before it had read would let this test assert
+        // that hazard away instead of the forwarding it is about.
+        let mut seen = Vec::new();
+        socket.read_to_end(&mut seen).await.expect("the request");
+        socket.write_all(&sent).await.expect("the reply");
+        socket.shutdown().await.expect("a clean close");
+        seen
+    });
+
+    let elf = build_with(
+        "splice-proxy.c",
+        &[
+            ("UPSTREAM_HOST", "\"127.0.0.1\""),
+            ("UPSTREAM_PORT", &port.to_string()),
+        ],
+    );
+    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+        .expect("the spliced proxy loads");
+    assert_eq!(declared.egress, vec![format!("127.0.0.1:{port}")]);
+
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let (mine, theirs) = tokio::io::duplex(8192);
+    let (their_r, their_w) = tokio::io::split(theirs);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(their_r, their_w),
+        EffectivePolicy::armed(&declared, vec![], None, 64),
+        peer(Some(vec!["code".into()])),
+        vec![],
+    );
+
+    let (mut reader, mut writer) = tokio::io::split(mine);
+    let sending = {
+        let request = request.clone();
+        tokio::spawn(async move {
+            writer.write_all(&request).await.expect("the request");
+            writer.shutdown().await.expect("a clean half-close");
+        })
+    };
+    let receiving = tokio::spawn(async move {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        out
+    });
+
+    let outcome = harness.pool.run(invocation).await.expect("the program ran");
+    sending.await.unwrap();
+    let out = receiving.await.unwrap();
+
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+    assert_eq!(upstream.await.unwrap(), request, "the request was mangled");
+    assert_eq!(out, response, "the response was mangled");
+    assert_eq!(
+        (outcome.bytes_in, outcome.bytes_out),
+        (request.len() as u64, response.len() as u64),
+        "a spliced proxy is not counted for `synch socket ps`"
+    );
+}
+
 /// The runtime loads an object somebody else's compiler wrote.
 ///
 /// Every other test here builds with the compiler in the binary, which would

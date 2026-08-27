@@ -196,16 +196,43 @@ impl Endpoint {
         self.cap.saturating_sub(self.tx.borrow().len())
     }
 
+    /// Why an empty rx ring cannot be read: `0` at a clean EOF, this
+    /// endpoint's errno if it failed, `EAGAIN` while it may still fill.
+    ///
+    /// Named because two helpers ask it now — a read and a splice see the same
+    /// end of the same stream, and a day on which they disagreed about it is a
+    /// program that treats an EOF as a reason to poll forever.
+    fn drained_status(&self) -> i64 {
+        match (self.rx_eof.get(), self.state.get()) {
+            (_, State::Failed) => self.errno.get(),
+            (true, _) => 0,
+            (false, State::Closed) => 0,
+            _ => errno::EAGAIN,
+        }
+    }
+
+    /// Whether the tx side would take bytes at all, before any are taken from
+    /// anywhere to give it.
+    fn tx_status(&self) -> Result<(), i64> {
+        match self.state.get() {
+            State::Failed => return Err(self.errno.get()),
+            State::Closed => return Err(errno::EPIPE),
+            // A connecting endpoint accepts writes into the ring: the guest
+            // gets to prepare a request before the connection lands, and the
+            // writer task drains it when it does.
+            State::Connecting | State::Open => {}
+        }
+        if self.tx_shutdown.get() {
+            return Err(errno::EPIPE);
+        }
+        Ok(())
+    }
+
     /// Copies out of the rx ring. `Ok(0)` is a clean EOF.
     pub(crate) fn read(&self, out: &mut [u8]) -> i64 {
         let mut rx = self.rx.borrow_mut();
         if rx.is_empty() {
-            return match (self.rx_eof.get(), self.state.get()) {
-                (_, State::Failed) => self.errno.get(),
-                (true, _) => 0,
-                (false, State::Closed) => 0,
-                _ => errno::EAGAIN,
-            };
+            return self.drained_status();
         }
         let n = out.len().min(rx.len());
         for (slot, byte) in out.iter_mut().zip(rx.drain(..n)) {
@@ -220,16 +247,8 @@ impl Endpoint {
 
     /// Copies into the tx ring. A short count is normal and is backpressure.
     pub(crate) fn write(&self, data: &[u8]) -> i64 {
-        match self.state.get() {
-            State::Failed => return self.errno.get(),
-            State::Closed => return errno::EPIPE,
-            // A connecting endpoint accepts writes into the ring: the guest
-            // gets to prepare a request before the connection lands, and the
-            // writer task drains it when it does.
-            State::Connecting | State::Open => {}
-        }
-        if self.tx_shutdown.get() {
-            return errno::EPIPE;
+        if let Err(code) = self.tx_status() {
+            return code;
         }
         let room = self.writable();
         if room == 0 {
@@ -239,6 +258,50 @@ impl Endpoint {
         self.tx.borrow_mut().extend(&data[..n]);
         self.tx_data.notify_waiters();
         self.bytes_out.set(self.bytes_out.get() + n as u64);
+        n as i64
+    }
+
+    /// Moves up to `max` bytes out of this endpoint's rx ring and into `to`'s
+    /// tx ring, without them passing through the guest at all.
+    ///
+    /// This is [`Endpoint::read`] and [`Endpoint::write`] with the guest's
+    /// buffer taken out of the middle, and taking it out is what removes the
+    /// remainder: whatever does not fit is never picked up, so it stays in this
+    /// endpoint's rx ring where the far side's flow control is already
+    /// accounting for it. A short move is backpressure and needs no state
+    /// anywhere — which is the whole reason `sy_splice` exists beside
+    /// `sy_pump`, whose `struct sy_pump` is a remainder nobody can drop only
+    /// because somebody remembered to carry it.
+    ///
+    /// `to` may be this same endpoint: `rx` and `tx` are separate cells, and
+    /// splicing an endpoint into itself is an echo.
+    pub(crate) fn splice_to(&self, to: &Endpoint, max: usize) -> i64 {
+        // The destination is asked first. Bytes drained out of the source and
+        // then refused by a broken destination would be bytes nobody has any
+        // more, which is exactly the loss this helper exists to make
+        // impossible.
+        if let Err(code) = to.tx_status() {
+            return code;
+        }
+        let avail = self.readable();
+        if avail == 0 {
+            return self.drained_status();
+        }
+        let n = avail.min(to.writable()).min(max);
+        if n == 0 {
+            return errno::EAGAIN;
+        }
+
+        let mut rx = self.rx.borrow_mut();
+        to.tx.borrow_mut().extend(rx.drain(..n));
+        drop(rx);
+        // The same two wakeups a read and a write would have posted: the reader
+        // task may have been parked on a full rx ring, and the writer task on
+        // an empty tx one.
+        self.rx_room.notify_waiters();
+        to.tx_data.notify_waiters();
+        self.bytes_in.set(self.bytes_in.get() + n as u64);
+        to.bytes_out.set(to.bytes_out.get() + n as u64);
         n as i64
     }
 
@@ -526,6 +589,64 @@ mod tests {
         assert_eq!(taken, b"abcd");
         assert_eq!(ep.write(b"gh"), 2);
         assert_eq!(ep.read(&mut out), errno::EAGAIN, "nothing was received");
+    }
+
+    #[test]
+    fn a_splice_leaves_what_did_not_fit_where_it_was() {
+        let from = endpoint(64);
+        let to = endpoint(4);
+        from.push_rx(b"abcdefgh");
+
+        // A short move, and the six bytes it could not place are still in the
+        // source: nothing was picked up that had nowhere to go, which is the
+        // difference from a read followed by a short write.
+        assert_eq!(from.splice_to(&to, 8), 4);
+        assert_eq!(to.take_tx(), b"abcd");
+        assert_eq!(from.readable(), 4);
+
+        // `max` bounds a call below what both sides could take.
+        assert_eq!(from.splice_to(&to, 1), 1);
+        assert_eq!(from.splice_to(&to, 64), 3);
+        assert_eq!(to.take_tx(), b"efgh");
+        assert_eq!(from.splice_to(&to, 64), errno::EAGAIN, "an empty source");
+    }
+
+    #[test]
+    fn a_splice_reports_the_source_eof_and_the_destinations_failure() {
+        let from = endpoint(64);
+        let to = endpoint(64);
+        from.push_rx(b"tail");
+        from.set_rx_eof();
+
+        assert_eq!(from.splice_to(&to, 64), 4);
+        assert_eq!(
+            from.splice_to(&to, 64),
+            0,
+            "a drained EOF splices as a clean zero, as it reads as one"
+        );
+
+        // A destination that cannot take bytes is asked before any are taken,
+        // so the source still has them — for a caller with somewhere else to
+        // put them, and for one that just wants to see the error again.
+        let broken = endpoint(64);
+        broken.fail(errno::ECONNRESET);
+        let live = endpoint(64);
+        live.push_rx(b"payload");
+        assert_eq!(live.splice_to(&broken, 64), errno::ECONNRESET);
+        assert_eq!(live.readable(), 7, "a refused splice consumed the source");
+
+        let closing = endpoint(64);
+        closing.shutdown();
+        assert_eq!(live.splice_to(&closing, 64), errno::EPIPE);
+        assert_eq!(live.readable(), 7);
+    }
+
+    #[test]
+    fn an_endpoint_spliced_into_itself_is_an_echo() {
+        let ep = endpoint(64);
+        ep.push_rx(b"back");
+        assert_eq!(ep.splice_to(&ep, 64), 4);
+        assert_eq!(ep.take_tx(), b"back");
     }
 
     #[test]

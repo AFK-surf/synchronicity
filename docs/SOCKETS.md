@@ -419,10 +419,34 @@ serverless node the daemon's environment holds cloud credentials.
 | --- | --- |
 | `sy_read(h, buf, len)` | Bytes out of the rx ring; `0` at clean EOF; `SY_EAGAIN` when empty and open. |
 | `sy_write(h, buf, len)` | Bytes accepted into the tx ring. A *short count is normal* and is the backpressure signal. |
+| `sy_splice(from, to, max)` | Moves up to `max` bytes from one endpoint's rx ring into another's tx ring, host-side. Same returns as `sy_read`. |
 | `sy_readable(h)` / `sy_writable(h)` | Buffered bytes / free window, for sizing a copy without a trial call. |
 | `sy_shutdown(h)` | Half-close the write side once the tx ring drains. |
 | `sy_close(h)` | Drop the endpoint and free the slot. `SY_SELF` may be closed; the invocation continues. |
 | `sy_errno(h)` | Why an endpoint has `SY_POLL_ERR` set. |
+
+`sy_splice` is the one helper here that touches no guest memory at all, and
+that is what it is for. The bytes are already in a ring the host owns (§5); a
+program that only forwards them has no reason to lift them over the pointer
+cage into a stack buffer and hand them straight back. What it saves is not
+mainly the two copies. It is the *remainder*: because nothing is picked up that
+cannot be placed, a short move leaves the bytes where they already were, in the
+source's rx ring, where the far side's flow control is already accounting for
+them. A splicing proxy therefore carries no buffer and no `struct sy_pump`
+(§7.10) — the state that exists so that a short write cannot lose what it did
+not place has nothing left to hold.
+
+The destination is checked before anything is taken from the source, so a
+failed or half-closed `to` is reported as its own error with the source
+untouched, and the bytes are still there for a program that has somewhere else
+to put them. Otherwise the returns are `sy_read`'s: a count, `0` at a clean EOF
+on `from`, `SY_EAGAIN` when neither side could move. `max` bounds one call so
+that a saturated direction cannot monopolise a loop; `0` is `SY_EINVAL`,
+because `0` already means EOF. Both handles must be endpoints — an object from
+`sy_open` is read with `sy_pread`, whose answer may not be here yet, and a
+splice that could block is not this helper. `examples/splice-proxy.c` is
+`examples/tcp-proxy.c` written this way, and the difference between the two is
+the whole argument.
 
 ### 7.4 Outbound connections
 
@@ -522,7 +546,9 @@ The `struct sy_pump` it carries is the point: a short write is backpressure,
 and the remainder stays in `buf` under `st` until a later call can place it.
 `sy_pump_blocked(st)` says whether a remainder is waiting, which is what decides
 whether to poll the far side for `SY_POLL_OUT` or the near side for
-`SY_POLL_IN`.
+`SY_POLL_IN`. It is for a program that needs to *see* what it is forwarding;
+one that does not wants `sy_splice` (§7.3), where the same short write leaves
+nothing behind to carry.
 
 `sy_write_all(handle, buf, len, timeout_ms)` is the same job for a program whose
 whole reply is one message, where waiting is the honest thing to do. Not in a
@@ -723,7 +749,8 @@ statically, under §6 of that licence.
 [tinycc]: https://github.com/losfair/tinycc
 
 Worked examples — an echo, an identity report, a read-only view of one
-directory, a status page over HTTP, a proxy, and a shared-secret gate — are in
+directory, a status page over HTTP, a proxy written twice (once copying through
+a buffer, once splicing), and a shared-secret gate — are in
 `crates/synch-sock/examples/`, compiled and *run* by the test suite on every
 build against the same runtime that serves them.
 
@@ -757,7 +784,7 @@ own.
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
 | Program ELF size | 4 MiB | Checked at arm time, not at connect time. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
-| Idle deadline | 300 s | Measured from the last *progress* — bytes copied in or out, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
+| Idle deadline | 300 s | Measured from the last *progress* — bytes read, written or spliced, or a poll that came back with a handle ready — not from the start of the invocation. There is deliberately **no total wall-clock cap**: a proxy is supposed to be long-lived, and CPU is bounded by the throttler instead. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
 | Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
 | Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |

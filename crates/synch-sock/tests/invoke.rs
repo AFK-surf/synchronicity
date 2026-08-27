@@ -68,6 +68,55 @@ async fn a_program_echoes_a_stream_and_returns_cleanly() {
     assert_eq!(out, b"hello sockets");
 }
 
+const SPLICE_ECHO: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* Refused before anything moves, and answerable without a buffer either
+     way: zero would have to mean both "moved nothing" and "the source ended",
+     and an object handle is not something a splice can wait on. */
+  if (sy_splice(SY_SELF, SY_SELF, 0) != SY_EINVAL) return 20;
+  if (sy_splice(SY_SELF, 9, 4096) != SY_EBADF) return 21;
+  if (sy_splice(9, SY_SELF, 4096) != SY_EBADF) return 22;
+
+  /* An echo with no buffer at all: the bytes go from the stream's receive
+     side to its send side without this program ever holding one. */
+  for (;;) {
+    struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
+    if (sy_poll(fds, 1, 5000) <= 0) return 23;
+    if (fds[0].revents & SY_POLL_ERR) return 24;
+    sy_s64 n = sy_splice(SY_SELF, SY_SELF, 4096);
+    if (n == 0) break;
+    if (n == SY_EAGAIN) {
+      /* Bytes waiting with nowhere to put them: wait for room, not for more.
+         Nothing was picked up, so there is nothing to hold meanwhile. */
+      struct sy_pollfd out[1] = { { SY_SELF, SY_POLL_OUT, 0 } };
+      if (sy_poll(out, 1, 5000) <= 0) return 25;
+      continue;
+    }
+    if (n < 0) return 26;
+  }
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn a_splice_moves_bytes_without_them_entering_the_program() {
+    let elf = compile(SPLICE_ECHO, "splice-echo.c");
+    // A ring smaller than the payload, so the move is short and the loop has
+    // to come back for the rest — the case a dropped remainder would show up
+    // in, if there were a remainder for anybody to drop.
+    let harness = Harness::with_limits(Limits {
+        ring_bytes: 4096,
+        ..Limits::default()
+    });
+    let payload: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+    let (status, out) = harness::converse(&harness, &elf, payload.clone(), 8192).await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, payload, "a spliced echo lost or reordered bytes");
+}
+
 const POLL_IMMEDIATE_ONE: &str = r#"
 #include <synch.h>
 
