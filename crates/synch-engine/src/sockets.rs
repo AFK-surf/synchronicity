@@ -234,9 +234,10 @@ impl Node {
     ///
     /// Sixty-four streams into one socket must not mean sixty-four copies of
     /// its program: the bytes are immutable once the root is fixed, so all of
-    /// the admissions of a root get the same `Arc`. The cache is weak — when
-    /// the last invocation holding the root ends, the bytes are freed and the
-    /// next admission re-reads them.
+    /// the admissions of a root get the same `Arc` — including the concurrent
+    /// ones, which wait on the first load's watch channel rather than each
+    /// reading the CAS themselves. The [`ProgramBytesCache`] retains up to
+    /// [`MAX_CACHED_PROGRAMS`] of them strongly, oldest first.
     async fn socket_program(&self, resolved: &Resolved) -> Result<Arc<Vec<u8>>> {
         let limits = self.socket_limits();
         if resolved.size > limits.max_program_bytes {
@@ -256,11 +257,13 @@ impl Node {
                     Err(text) => Err(EngineError::invalid(text)),
                 }
             }
-            ProgramLoad::Loader(sender) => {
+            ProgramLoad::Loader(guard) => {
                 // Its own CAS: the bytes were published by this node, so they
                 // are held here. `ensure_cached` covers the one case where
                 // they are not — a cloud-backed node whose scratch cache has
-                // been replaced.
+                // been replaced. If this future is cancelled or panics before
+                // `finish`, the guard's drop publishes the failure and frees
+                // the root for a fresh load.
                 let outcome: ProgramBytes = (async {
                     self.ensure_blob_cached(&resolved.root, resolved.size)
                         .await
@@ -272,7 +275,7 @@ impl Node {
                         .map(Arc::new)
                 })
                 .await;
-                self.socket_program_finish(resolved.root, sender, outcome.clone());
+                guard.finish(outcome.clone());
                 outcome.map_err(EngineError::invalid)
             }
         }
@@ -389,11 +392,6 @@ impl Node {
             return Err((RefuseCode::NotArmed, message));
         }
 
-        let program = match self.socket_program(&resolved).await {
-            Ok(bytes) => bytes,
-            Err(e) => return Err((RefuseCode::ProgramInvalid, e.to_string())),
-        };
-
         // Program loading may fetch from a remote CAS. Authorization is
         // deliberately not held across that wait, but it must be checked again
         // while the registry slot is made live. Arm/disarm/redeclare take the
@@ -461,6 +459,21 @@ impl Node {
         .await
         .map_err(|e| (RefuseCode::NotArmed, e.to_string()))?;
         let (policy, id, slot) = prepared?;
+
+        // The pool token is taken *before* the program's bytes are read: the
+        // CAS fetch can be the expensive part of an admission (up to 4 MiB,
+        // possibly from a remote CAS), and concurrent opens for distinct
+        // roots must not bypass the daemon-wide bound during it. A load that
+        // fails — the size check, the fetch, the read — gives the token back
+        // by dropping the slot, and the admission is refused as it would have
+        // been before.
+        let program = match self.socket_program(&resolved).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                drop(slot);
+                return Err((RefuseCode::ProgramInvalid, e.to_string()));
+            }
+        };
 
         Ok(Admission {
             program,
@@ -1117,7 +1130,48 @@ pub(crate) enum ProgramLoad {
     /// Another admission is reading this root from the CAS; wait for it.
     InFlight(tokio::sync::watch::Receiver<Option<ProgramBytes>>),
     /// This admission is the one that reads the CAS.
-    Loader(LoadWatch),
+    Loader(LoadGuard),
+}
+
+/// The loader's claim on [`ProgramBytesCache`] for one root.
+///
+/// The claim is released when the load ends, *however* it ends. The happy
+/// path calls [`LoadGuard::finish`], which publishes the outcome and
+/// remembers the bytes. A load that is cancelled or panics during the CAS
+/// await drops the guard instead: the drop removes the root from the
+/// in-flight table and publishes the failure to every waiter, so the root's
+/// later admissions start a fresh load rather than waiting forever on a
+/// sender nobody will ever fill.
+#[derive(Debug)]
+pub(crate) struct LoadGuard {
+    cache: Arc<ProgramBytesCache>,
+    root: Hash,
+    sender: LoadWatch,
+    finished: bool,
+}
+
+impl LoadGuard {
+    /// Publishes the outcome and releases the loader role.
+    pub(crate) fn finish(mut self, outcome: ProgramBytes) {
+        self.finished = true;
+        self.cache
+            .finish_load(self.root, self.sender.clone(), outcome);
+    }
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut inner = self.cache.inner.lock().expect("socket program cache");
+        inner.loading.remove(&self.root);
+        // Wake the waiters with the failure rather than leaving them parked
+        // on a sender that will never send.
+        let _ = self
+            .sender
+            .send(Some(Err("socket program load was interrupted".to_string())));
+    }
 }
 
 /// Socket program bytes, shared across the admissions of one content root.
@@ -1146,15 +1200,15 @@ struct ProgramBytesInner {
 }
 
 impl ProgramBytesCache {
-    pub(crate) fn new() -> Self {
-        ProgramBytesCache::default()
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(ProgramBytesCache::default())
     }
 
     /// Claims the cache for one root: the loaded bytes, a seat on an
     /// in-flight load, or the loader role. The lock is held only for the
     /// claim — the CAS read happens outside it, which is what lets the other
     /// admissions wait on the watch channel instead of on the cache.
-    pub(crate) fn begin_load(&self, root: &Hash) -> ProgramLoad {
+    pub(crate) fn begin_load(self: &Arc<Self>, root: &Hash) -> ProgramLoad {
         let mut inner = self.inner.lock().expect("socket program cache");
         if let Some(bytes) = inner.ready.get(root) {
             return ProgramLoad::Ready(bytes.clone());
@@ -1164,12 +1218,17 @@ impl ProgramBytesCache {
         }
         let (sender, _receiver) = tokio::sync::watch::channel(None);
         inner.loading.insert(*root, sender.clone());
-        ProgramLoad::Loader(sender)
+        ProgramLoad::Loader(LoadGuard {
+            cache: self.clone(),
+            root: *root,
+            sender,
+            finished: false,
+        })
     }
 
     /// Publishes the outcome of a load to its waiters, and remembers the
-    /// bytes for the next admission.
-    pub(crate) fn finish_load(&self, root: Hash, sender: LoadWatch, outcome: ProgramBytes) {
+    /// bytes for the next admission. Called by [`LoadGuard::finish`].
+    fn finish_load(&self, root: Hash, sender: LoadWatch, outcome: ProgramBytes) {
         let mut inner = self.inner.lock().expect("socket program cache");
         inner.loading.remove(&root);
         if let Ok(bytes) = &outcome {
@@ -1450,7 +1509,7 @@ mod tests {
         let root = Hash::new(b"program");
 
         // The first claim is the loader.
-        let ProgramLoad::Loader(sender) = cache.begin_load(&root) else {
+        let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
             panic!("the first claim should be the loader");
         };
         // A concurrent admission of the same root waits on the watch channel
@@ -1467,7 +1526,7 @@ mod tests {
 
         // The loader publishes one allocation...
         let bytes = Arc::new(b"the program".to_vec());
-        cache.finish_load(root, sender, Ok(bytes.clone()));
+        guard.finish(Ok(bytes.clone()));
         // ...which the waiter shares, pointer and all.
         let seen = waiter.await.unwrap();
         assert!(
@@ -1482,13 +1541,53 @@ mod tests {
         assert_eq!(&*bytes, b"the program");
     }
 
+    #[tokio::test]
+    async fn an_interrupted_load_wakes_its_waiters_and_frees_the_root() {
+        let cache = ProgramBytesCache::new();
+        let root = Hash::new(b"program");
+
+        let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
+            panic!("the first claim should be the loader");
+        };
+        let ProgramLoad::InFlight(receiver) = cache.begin_load(&root) else {
+            panic!("a concurrent claim should be in flight");
+        };
+        let waiter = tokio::spawn(async move {
+            let mut receiver = receiver;
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                receiver.wait_for(Option::is_some).await.unwrap();
+                receiver.borrow().clone()
+            })
+            .await
+            .expect("the interrupted load never woke its waiter");
+            outcome
+        });
+
+        // The loader dies — cancellation, a panic — without finishing.
+        drop(guard);
+
+        // The waiter is told the load failed, not left parked forever...
+        let outcome = waiter.await.unwrap();
+        assert!(
+            matches!(outcome, Some(Err(_))),
+            "waiters should see the failure, got {outcome:?}"
+        );
+        // ...and the root is free for a fresh load.
+        assert!(
+            matches!(cache.begin_load(&root), ProgramLoad::Loader(_)),
+            "an interrupted load left its in-flight entry behind"
+        );
+    }
+
     #[test]
     fn the_ready_cache_is_fifo_bounded() {
         let cache = ProgramBytesCache::new();
         for i in 0..MAX_CACHED_PROGRAMS + 4 {
             let root = Hash::new(format!("program {i}").as_bytes());
-            let (sender, _) = tokio::sync::watch::channel(None);
-            cache.finish_load(root, sender, Ok(Arc::new(vec![i as u8])));
+            let ProgramLoad::Loader(guard) = cache.begin_load(&root) else {
+                panic!("a fresh root should claim the loader role");
+            };
+            guard.finish(Ok(Arc::new(vec![i as u8])));
         }
         // The oldest roots are gone; the newest are served from memory.
         let oldest = Hash::new(b"program 0");

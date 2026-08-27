@@ -102,7 +102,7 @@ struct NodeInner {
     /// (`docs/DELTA-SYNC.md` §3.5).
     mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
     /// Socket program bytes, shared across the admissions of one content root.
-    program_bytes: crate::sockets::ProgramBytesCache,
+    program_bytes: Arc<crate::sockets::ProgramBytesCache>,
     /// The socket worker pool, or `None` where this build has no eBPF runtime
     /// (`docs/SOCKETS.md` §5.1).
     ///
@@ -808,16 +808,6 @@ impl Node {
     /// is under way, or the loader role if this admission reads the CAS.
     pub(crate) fn socket_program_load(&self, root: &Hash) -> crate::sockets::ProgramLoad {
         self.inner.program_bytes.begin_load(root)
-    }
-
-    /// Publishes a completed (or failed) load to its waiters.
-    pub(crate) fn socket_program_finish(
-        &self,
-        root: Hash,
-        tx: tokio::sync::watch::Sender<Option<std::result::Result<Arc<Vec<u8>>, String>>>,
-        outcome: std::result::Result<Arc<Vec<u8>>, String>,
-    ) {
-        self.inner.program_bytes.finish_load(root, tx, outcome);
     }
 
     /// The limits every socket invocation on this node runs under.
