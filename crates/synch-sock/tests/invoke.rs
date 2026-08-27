@@ -1391,7 +1391,9 @@ fn process_capability(id: u32) -> ProcessCapability {
         allowed_signals: 0,
         max_processes: 1,
         max_runtime_ms: 5_000,
-        max_memory_bytes: 128 * 1024 * 1024,
+        // This fixture exercises process control, not memory enforcement.
+        // Zero selects the runtime's portable default ceiling.
+        max_memory_bytes: 0,
     }
 }
 
