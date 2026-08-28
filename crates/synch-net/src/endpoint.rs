@@ -126,6 +126,18 @@ pub struct NetOptions {
     /// negotiation rather than after a handshake and a refusal, and a build
     /// with no eBPF runtime never advertises something it cannot do.
     pub sockets: Option<Arc<dyn crate::sock::SocketService>>,
+    /// How long a stream may take to complete its `Open` handshake, per
+    /// stream, before the callee drops it.
+    ///
+    /// The bound the shared accept path applies to every request
+    /// ([`crate::serve::STREAM_TIMEOUT`]) applied to the one phase of a
+    /// socket stream that has no runtime of its own: a stream that never
+    /// becomes an invocation would otherwise own a task and a buffer for as
+    /// long as the peer keeps the connection. Once the invocation is
+    /// admitted, its life is the socket runtime's deadlines, not this one —
+    /// a socket that proxies is supposed to be long-lived. `None` is the
+    /// default bound.
+    pub sockets_open_timeout: Option<std::time::Duration>,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -370,8 +382,12 @@ impl Net {
                 .on_unknown_key(options.on_unknown_key.clone()),
             );
         let sockets = options.sockets.clone().map(|service| {
-            crate::sock::SockProtocol::new(store.clone(), service)
-                .on_unknown_key(options.on_unknown_key.clone())
+            crate::sock::SockProtocol::new(
+                store.clone(),
+                service,
+                options.sockets_open_timeout.unwrap_or(crate::serve::STREAM_TIMEOUT),
+            )
+            .on_unknown_key(options.on_unknown_key.clone())
         });
         let router = match &sockets {
             Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),

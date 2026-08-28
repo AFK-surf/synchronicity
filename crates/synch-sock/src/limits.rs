@@ -8,9 +8,12 @@
 //!
 //! [`Limits::idle_deadline`] is a cap on the same footing as the rest, on
 //! time rather than on bytes: an invocation that stops making progress —
-//! no bytes moved, no handle ready — is ended with `Deadline` when the
-//! deadline expires, so a caller cannot hold a stream and a slot forever by
-//! sending nothing. There is still no *total* wall-clock bound: progress
+//! no bytes moved — is ended with `Deadline` when the deadline expires, so a
+//! caller cannot hold a stream and a slot forever by sending nothing.
+//! Progress is bytes moved, deliberately and only: readiness is not
+//! progress, because a terminal or bogus handle is ready forever and
+//! counting that would let a guest re-poll a dead handle with the deadline
+//! never arriving. There is still no *total* wall-clock bound: progress
 //! pushes the deadline out, so a proxy with steady traffic never notices it.
 //! CPU is bounded by the timeslicer rather than by a clock.
 
@@ -102,6 +105,32 @@ pub(crate) const MAX_METRIC_NAMES: usize = 32;
 
 /// The most labels one invocation may carry.
 pub(crate) const MAX_LABELS: usize = 8;
+
+/// The most milliseconds a guest may name for a rate-limit window or a map
+/// TTL.
+///
+/// Clamped, not refused: a window beyond it is a program asking the
+/// memory-only map to remember something no memory-resident store should
+/// promise, and the clamp keeps the value inside every duration computation
+/// the runtime performs. That matters twice: `Duration::as_nanos()` for a
+/// window of `2^58` ms is a multiple of `2^64`, which truncates to zero in
+/// the limiter's `as u64` and would divide by zero; and `Instant + Duration`
+/// overflows on the nanosecond-repr platforms (macOS, OpenBSD) for values
+/// near `u64::MAX` ms. `u32::MAX` ms is ~49.7 days — long enough that the
+/// clamp is indistinguishable from the program's intent.
+pub(crate) const MAX_GUEST_DURATION_MS: u64 = u32::MAX as u64;
+
+/// Host bytes one cursor entry costs beyond its name's bytes.
+///
+/// `sy_list_open` retains a `Vec<String>`: 24 bytes of `String` header per
+/// entry in the vector, plus one heap allocation per name whose size is the
+/// name rounded up by the allocator. Measured against a counting allocator,
+/// 65 536 fifteen-byte names retained ~2.8 MiB for ~0.98 MiB of payload —
+/// ~28 bytes of overhead per entry. Charged as 32, with headroom so the
+/// bound holds across allocators; the footprint meter counts each entry at
+/// `len + 32`, which is what keeps the documented 1 MiB per-invocation
+/// footprint a number that means something.
+pub const CURSOR_ENTRY_OVERHEAD: u64 = 32;
 
 /// The most bytes a single helper will copy in one call.
 ///

@@ -236,6 +236,10 @@ extern sy_s64 sy_list_open(const char *prefix, sy_u64 prefix_len);
 extern sy_s64 sy_list_next(sy_s64 cursor, char *out, sy_u64 out_len);
 
 /* ---- state that outlives an invocation ---------------------------------- */
+/* ttl_ms and the rate-limit window_ms are clamped to u32::MAX (about 49.7
+ * days): a longer value is held at the clamp, which is indistinguishable
+ * from the program's intent and keeps every host-side duration computation
+ * in range. */
 
 extern sy_s64 sy_map_get(const void *key, sy_u64 key_len, void *out,
                          sy_u64 out_len);

@@ -22,8 +22,8 @@ use synch_core::{
     Declaration, EntryKind, Hash, NodeId, OriginId, RefuseCode, SockOpen, SockStatus,
 };
 use synch_sock::{
-    Admission, DuplexStream, EffectivePolicy, HostError, Limits, ObjectInfo, PeerIdentity,
-    SocketHost, SocketId,
+    limits::CURSOR_ENTRY_OVERHEAD, Admission, DuplexStream, EffectivePolicy, HostError, Limits,
+    ObjectInfo, PeerIdentity, SocketHost, SocketId,
 };
 use synch_store::{ArmCandidate, SocketRow, SocketState};
 
@@ -728,7 +728,12 @@ impl SocketHost for TreeHost {
                 if row.kind == EntryKind::Tombstone {
                     continue;
                 }
-                bytes += row.path.len();
+                // Counted the way `sy_list_open` will charge the listing: name
+                // bytes plus the per-entry host overhead the cursor retains.
+                // A name-byte sum alone would materialize listings the
+                // runtime then refuses, and would let a listing of short
+                // names exceed the footprint this cap exists to protect.
+                bytes += row.path.len() + CURSOR_ENTRY_OVERHEAD as usize;
                 names.push(row.path);
                 if bytes > max_bytes {
                     return Err(HostError::NotReadable(

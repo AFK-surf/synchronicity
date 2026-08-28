@@ -26,7 +26,7 @@ use base64::Engine as _;
 
 use crate::{
     abi::{base64_kind, errno, poll, POLLFD_SIZE, STAT_SIZE, SY_SELF},
-    limits::{MAX_COPY, MAX_LOG_LINE},
+    limits::{CURSOR_ENTRY_OVERHEAD, MAX_COPY, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
         ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
         endpoint::{connect_task, Endpoint, State},
@@ -723,7 +723,13 @@ fn h_poll(
 
         let epoch = inner.ready.epoch();
         if let Some(count) = ready_now(&inner, &watch) {
-            inner.made_progress();
+            // Not progress: readiness on a terminal or bogus handle is
+            // permanent with no work behind it, and counting it as progress
+            // would let a guest re-poll a dead handle forever and keep the
+            // idle deadline at arm's length. Progress is bytes moved
+            // (`sy_read`/`sy_write`/`sy_splice`), which the helpers that move
+            // them record. A poll that comes back ready with real work to do
+            // records that work on the call that does it.
             return finish_poll(&mut region, &inner, &watch, count);
         }
         // Nothing can ever become ready, so waiting is waiting for nothing.
@@ -757,9 +763,9 @@ fn h_poll(
             }
         }
         let count = ready_now(&posted, &watch_for_task).unwrap_or(0);
-        if count > 0 {
-            posted.made_progress();
-        }
+        // Not progress, for the same reason as the immediate path above:
+        // readiness alone says nothing about work done, and a readiness that
+        // never goes away must not postpone the idle deadline forever.
         move |scope: &HelperScope| {
             write_revents(scope, fds_ptr, &posted, &watch_for_task)?;
             Ok(count)
@@ -1035,7 +1041,15 @@ fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) 
         Ok(names) => names,
         Err(e) => return ret(host_errno(&e)),
     };
-    let bytes: u64 = names.iter().map(|n| n.len() as u64).sum();
+    // Charged at the same rate the release pays back
+    // (`CursorSlot::footprint`): each entry costs its name's bytes plus the
+    // per-entry host overhead — the `String` header and the heap allocation
+    // behind it. A name-byte sum alone would let a listing of short names
+    // hold several times the footprint the meter reports.
+    let bytes: u64 = names
+        .iter()
+        .map(|n| n.len() as u64 + CURSOR_ENTRY_OVERHEAD)
+        .sum();
     if inner.charge(bytes).is_err() {
         return ret(errno::ELIMIT);
     }
@@ -1116,7 +1130,10 @@ fn h_map_set(
     let key = guest!(bytes(scope, key_ptr, key_len));
     let value = guest!(bytes(scope, val_ptr, val_len));
     with(scope, |inner| {
-        let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
+        // Clamped, not refused: a TTL beyond ~49.7 days is indistinguishable
+        // from the program's intent, and the clamp keeps the expiry inside
+        // every duration computation the store performs.
+        let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms.min(MAX_GUEST_DURATION_MS)));
         match inner.maps.set(
             &inner.map_namespace(),
             &key,
@@ -1157,7 +1174,9 @@ fn h_map_incr(
 ) -> Result<u64, ()> {
     let key = guest!(bytes(scope, key_ptr, key_len));
     with(scope, |inner| {
-        let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms));
+        // Clamped as in `h_map_set`: the expiry must stay inside every
+        // duration computation the store performs.
+        let ttl = (ttl_ms > 0).then(|| Duration::from_millis(ttl_ms.min(MAX_GUEST_DURATION_MS)));
         match inner.maps.incr(
             &inner.map_namespace(),
             &key,
@@ -1183,11 +1202,17 @@ fn h_rate_limit(
 ) -> Result<u64, ()> {
     let key = guest!(bytes(scope, key_ptr, key_len));
     with(scope, |inner| {
+        // Clamped: a window whose nanoseconds truncate to zero in the
+        // limiter's `as u64` would divide by zero (2^58 ms is 15625 * 2^64
+        // ns exactly), and one near `u64::MAX` ms overflows the internal
+        // `Instant + Duration` on nanosecond-repr platforms. The clamp keeps
+        // the width positive and the arithmetic in range.
+        let window = Duration::from_millis(window_ms.clamp(1, MAX_GUEST_DURATION_MS));
         match inner.maps.rate_limit(
             &inner.map_namespace(),
             &key,
             limit,
-            Duration::from_millis(window_ms.max(1)),
+            window,
             std::time::Instant::now(),
             &inner.limits,
         ) {

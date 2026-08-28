@@ -716,6 +716,33 @@ async fn run_job(
     };
     tokio::pin!(idle);
 
+    // The caller's stream is the invocation's reason to exist. When the
+    // transport fails it — the peer's connection died, a stream reset, a
+    // relay that went away — nothing the guest is talking to can be
+    // delivered anywhere, and an invocation that keeps running is a slot, a
+    // worker placement and a set of rings held for a caller that is gone.
+    // What triggers the end is the `Failed` state, and only that: a caller's
+    // clean FIN is a normal half-close a proxy works past, and the guest's
+    // own `sy_shutdown`/`sy_close` of `SY_SELF` must not end the invocation
+    // either — its slot is deliberately not reused. `fail` is called by the
+    // two pumps exactly when the stream underneath errors, so the state is
+    // the transport's own verdict, not something the guest can provoke.
+    let caller_gone = async {
+        let ready = inner.ready.clone();
+        let self_ep = self_ep.clone();
+        loop {
+            let epoch = ready.epoch();
+            if self_ep.state() == State::Failed {
+                return;
+            }
+            // `fail` bumps readiness, so the wait wakes on the state change;
+            // the timeout is only a bound on how long a quiet invocation may
+            // hold the worker before the check comes round again.
+            let _ = ready.wait(epoch, Duration::from_millis(100)).await;
+        }
+    };
+    tokio::pin!(caller_gone);
+
     // `biased` with the run branch first: a program that returns at the same
     // instant its idle deadline expires has ended itself, and its own ending
     // is the one the caller is told about.
@@ -746,6 +773,12 @@ async fn run_job(
             // because everything it can hold is host-side and owned by `inner`.
             _ = &mut cancelled => SockStatus::Killed,
             _ = &mut idle => SockStatus::Deadline,
+            // The caller is gone: nothing the guest produces can be
+            // delivered, and holding the slot for it would let one caller
+            // pin every stream on a socket and drop the connection. `Deadline`
+            // is the non-fault ending — this is not a program fault, and it
+            // must not feed the auto-disarm counter.
+            _ = &mut caller_gone => SockStatus::Deadline,
             _ = shutdown.cancelled() => SockStatus::Shutdown,
         }
     };
