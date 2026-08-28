@@ -19,8 +19,8 @@
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
-    any(target_arch = "x86_64", target_arch = "aarch64"))
-)]
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod harness;
 
@@ -53,7 +53,12 @@ impl SocketHost for DirTree {
         };
         Ok((0..n).map(|i| format!("{prefix}entry-{i:05}")).collect())
     }
-    async fn pread(&self, _root: synch_core::Hash, _offset: u64, _len: u64) -> Result<Vec<u8>, HostError> {
+    async fn pread(
+        &self,
+        _root: synch_core::Hash,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<Vec<u8>, HostError> {
         Err(HostError::NotFound)
     }
 }
@@ -82,13 +87,10 @@ async fn run_list(elf: &[u8], host: Arc<dyn SocketHost>) -> i64 {
     // The guest returns its handle immediately and reads nothing; keep the
     // caller half alive so dropping it is not what ends the run.
     std::mem::forget(mine);
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        harness.pool.run(inv),
-    )
-    .await
-    .expect("the invocation finished")
-    .expect("the invocation ran");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), harness.pool.run(inv))
+        .await
+        .expect("the invocation finished")
+        .expect("the invocation ran");
     match outcome.status {
         synch_core::SockStatus::Ok(n) => n,
         other => panic!("guest did not return a status: {other:?}"),

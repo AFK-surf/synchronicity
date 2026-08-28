@@ -130,7 +130,7 @@ pub struct NetOptions {
     /// stream, before the callee drops it.
     ///
     /// The bound the shared accept path applies to every request
-    /// ([`crate::serve::STREAM_TIMEOUT`]) applied to the one phase of a
+    /// (`crate::serve::STREAM_TIMEOUT`, 120 s) applied to the one phase of a
     /// socket stream that has no runtime of its own: a stream that never
     /// becomes an invocation would otherwise own a task and a buffer for as
     /// long as the peer keeps the connection. Once the invocation is
@@ -385,7 +385,9 @@ impl Net {
             crate::sock::SockProtocol::new(
                 store.clone(),
                 service,
-                options.sockets_open_timeout.unwrap_or(crate::serve::STREAM_TIMEOUT),
+                options
+                    .sockets_open_timeout
+                    .unwrap_or(crate::serve::STREAM_TIMEOUT),
             )
             .on_unknown_key(options.on_unknown_key.clone())
         });

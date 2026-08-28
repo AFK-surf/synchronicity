@@ -499,17 +499,26 @@ impl Node {
     }
 
     /// Runs an admitted invocation.
+    ///
+    /// `peer_gone` is the caller's connection closing, as the net layer
+    /// observed it: the invocation ends with `Deadline` when it fires — the
+    /// same non-fault ending as a failed stream — while `synch socket kill`
+    /// keeps its own channel and its `Killed` ending.
     pub(crate) async fn run_socket(
         &self,
         admission: Admission,
         stream: DuplexStream,
+        peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
     ) -> SockStatus {
         let socket = admission.socket.clone();
         let program_root = admission.program_root;
         let Some(pool) = self.socket_workers() else {
             return SockStatus::Shutdown;
         };
-        let status = match pool.run(admission.with_stream(stream)).await {
+        let status = match pool
+            .run_cancellable(admission.with_stream(stream), peer_gone)
+            .await
+        {
             Ok(outcome) => outcome.status,
             Err(e) => {
                 tracing::warn!("socket invocation failed: {e}");
@@ -830,11 +839,16 @@ impl synch_net::sock::SocketService for SocketDispatch {
         node.admit_socket(peer, addr, stream_index, open).await
     }
 
-    async fn run(&self, admission: Admission, stream: DuplexStream) -> SockStatus {
+    async fn run(
+        &self,
+        admission: Admission,
+        stream: DuplexStream,
+        peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+    ) -> SockStatus {
         match self.node() {
             // A node that has gone away between admission and here is a node
             // shutting down, which is exactly what the caller should be told.
-            Some(node) => node.run_socket(admission, stream).await,
+            Some(node) => node.run_socket(admission, stream, peer_gone).await,
             None => SockStatus::Shutdown,
         }
     }
@@ -885,12 +899,22 @@ mod pool {
             self.0.clear_map(socket);
         }
 
-        /// Runs one invocation.
-        pub(crate) async fn run(
+        /// Runs one invocation that may be cut short by `synch socket kill`
+        /// or by the caller's connection closing (`peer_gone`).
+        ///
+        /// The kill sender is attached to the registry here, exactly as
+        /// [`SocketPool::run`] does; the peer-gone receiver is the
+        /// connection-close signal the net layer watched.
+        pub(crate) async fn run_cancellable(
             &self,
             invocation: synch_sock::Invocation,
+            peer_gone: tokio::sync::oneshot::Receiver<synch_core::SockStatus>,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
-            self.0.run(invocation).await
+            let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+            if invocation.slot.is_some() {
+                self.0.registry().attach_cancel(invocation.id, kill_tx);
+            }
+            self.0.run_cancellable(invocation, kill_rx, peer_gone).await
         }
 
         /// Whether every worker is at its queued cap.
@@ -994,9 +1018,10 @@ mod pool {
         pub(crate) fn clear_map(&self, _socket: &str) {}
 
         /// Unreachable: nothing admits an invocation without a pool.
-        pub(crate) async fn run(
+        pub(crate) async fn run_cancellable(
             &self,
             _invocation: synch_sock::Invocation,
+            _peer_gone: tokio::sync::oneshot::Receiver<synch_core::SockStatus>,
         ) -> std::result::Result<synch_sock::Outcome, synch_sock::SockError> {
             Err(synch_sock::SockError::Unsupported)
         }
@@ -1395,7 +1420,8 @@ impl Node {
             let (caller, guest) = tokio::io::duplex(self.socket_limits().ring_bytes);
             let node = self.clone();
             let completion = tokio::spawn(async move {
-                node.run_socket(admission, DuplexStream::from_split(guest))
+                let (_, peer_gone) = tokio::sync::oneshot::channel();
+                node.run_socket(admission, DuplexStream::from_split(guest), peer_gone)
                     .await
             });
             return Ok(SocketConnection::Local {

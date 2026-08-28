@@ -19,8 +19,8 @@
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
-    any(target_arch = "x86_64", target_arch = "aarch64"))
-)]
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod harness;
 
@@ -123,7 +123,11 @@ async fn connect_close_churn_with_a_fast_resolver_holds_no_threads_or_slots() {
         outcome.status
     );
 
-    assert_eq!(outcome.status, synch_core::SockStatus::Ok(0), "guest status");
+    assert_eq!(
+        outcome.status,
+        synch_core::SockStatus::Ok(0),
+        "guest status"
+    );
     assert!(
         after_threads <= before_threads + 32,
         "the fast path parked blocking threads: {before_threads} -> {after_threads}"

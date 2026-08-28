@@ -15,6 +15,14 @@
 //! FIN. A dropped tokio duplex would not do — it surfaces as a clean EOF,
 //! which is the half-close case and must *not* end the invocation.
 //!
+//! There is a third ending, for the case the stream never fails at all: a
+//! caller that FINs cleanly (the reader pump exits on the EOF) and *then*
+//! closes the connection leaves `SY_SELF` looking open forever, with egress
+//! progress keeping the idle deadline at bay. That death is only visible to
+//! the transport, so `sync/sock/1` watches `Connection::closed` and signals
+//! the invocation through the peer-gone channel — covered by
+//! `connection_closure_after_a_clean_fin_ends_the_invocation` below.
+//!
 //! Break signature (before the fix): with `idle_deadline = 300 ms` and an
 //! upstream that keeps streaming bytes, an invocation whose caller is gone
 //! runs past 3 s (10x the deadline), because egress progress keeps resetting
@@ -68,7 +76,9 @@ async fn caller_transport_death_ends_an_invocation_making_egress_progress() {
     let port = listener.local_addr().unwrap().port();
     let dripper = tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 loop {
                     if sock.write_all(b"x").await.is_err() {
@@ -129,8 +139,10 @@ async fn caller_transport_death_ends_an_invocation_making_egress_progress() {
     let ran = tokio::time::timeout(Duration::from_secs(3), harness.pool.run(invocation));
     let outcome = ran
         .await
-        .expect("BREAK: the invocation survived 3s (10x the 300ms idle deadline) after its \
-                 caller's transport died — a dead caller's invocation still pins its slot")
+        .expect(
+            "BREAK: the invocation survived 3s (10x the 300ms idle deadline) after its \
+                 caller's transport died — a dead caller's invocation still pins its slot",
+        )
         .expect("the invocation ran");
     assert_eq!(
         outcome.status,
@@ -152,7 +164,9 @@ async fn a_clean_fin_does_not_end_the_invocation() {
     let port = listener.local_addr().unwrap().port();
     let dripper = tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 loop {
                     if sock.write_all(b"x").await.is_err() {
@@ -212,6 +226,99 @@ async fn a_clean_fin_does_not_end_the_invocation() {
             // the egress dripper is gone and the idle deadline arrives.
         }
     }
+    harness.pool.shutdown().await;
+    dripper.abort();
+}
+
+/// The reviewer's P1 scenario: the caller FINs cleanly (a half-close the
+/// runtime works past — the reader pump exits on the EOF), and *then* the
+/// connection closes. The stream itself never fails, so the `Failed`-state
+/// watcher cannot see the death; only the transport can, and it signals
+/// through the peer-gone channel. The guest keeps moving bytes between
+/// egress endpoints, so the idle deadline alone would never end it.
+#[tokio::test]
+async fn connection_closure_after_a_clean_fin_ends_the_invocation() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a dripper");
+    let port = listener.local_addr().unwrap().port();
+    let dripper = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                loop {
+                    if sock.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        }
+    });
+
+    let caller_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let caller_addr = caller_listener.local_addr().unwrap();
+    let mut caller_stream = TcpStream::connect(caller_addr).await.unwrap();
+    let (worker_stream, _) = caller_listener.accept().await.unwrap();
+
+    let source = DRIP_CONSUMER.replace("PORT_PLACEHOLDER", &port.to_string());
+    let elf = compile(&source, "drip-consumer.c");
+    let harness = Harness::with_limits(Limits {
+        idle_deadline: Duration::from_millis(300),
+        ..Limits::default()
+    });
+    let policy = EffectivePolicy {
+        egress: vec![format!("127.0.0.1:{port}")],
+        ..EffectivePolicy::default()
+    };
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::from_split(worker_stream),
+        policy,
+        peer(None),
+        vec![],
+    );
+
+    // FIN first, then the connection is gone: the order matters — the EOF is
+    // observed (reader pump exits), so no stream error ever follows.
+    #[allow(deprecated)] // SO_LINGER(0) is the RST this test exists for
+    let caller = tokio::spawn(async move {
+        let _ = caller_stream.write_all(b"hello").await;
+        let _ = caller_stream.shutdown().await; // clean FIN
+        let _ = caller_stream.set_linger(Some(Duration::ZERO));
+        drop(caller_stream); // connection closes
+    });
+    caller.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await; // the EOF is observed
+
+    // The peer-gone signal: what `sync/sock/1` sends when it sees the
+    // connection close. The invocation must end on it.
+    let (peer_gone_tx, peer_gone_rx) = tokio::sync::oneshot::channel();
+    let (_kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+    // The signal, sent before the run starts: what `sync/sock/1` delivers
+    // the moment it sees the connection close.
+    let _ = peer_gone_tx.send(synch_core::SockStatus::Deadline);
+    let ran = tokio::time::timeout(
+        Duration::from_secs(3),
+        harness
+            .pool
+            .run_cancellable(invocation, kill_rx, peer_gone_rx),
+    );
+    let outcome = ran
+        .await
+        .expect(
+            "BREAK: the invocation survived the peer-gone signal with egress progress \
+                 flowing — a FIN-then-connection-close still pins the slot forever",
+        )
+        .expect("the invocation ran");
+    assert_eq!(
+        outcome.status,
+        synch_core::SockStatus::Deadline,
+        "connection closure must end the invocation with Deadline, not {:?}",
+        outcome.status
+    );
     harness.pool.shutdown().await;
     dripper.abort();
 }

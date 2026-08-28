@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh_base::SecretKey;
-use synch_core::{ALPN_SOCK, RefuseCode, SockOpen, SockOpened, SockStatus};
+use synch_core::{RefuseCode, SockOpen, SockOpened, SockStatus, ALPN_SOCK};
 use synch_net::endpoint::{Net, NetOptions};
 use synch_net::sock::SocketService;
 use synch_sock::{
@@ -52,15 +52,31 @@ impl SocketHost for NoTree {
     fn list(&self, _prefix: &str) -> Result<Vec<String>, HostError> {
         Err(HostError::NotFound)
     }
-    async fn pread(&self, _root: synch_core::Hash, _offset: u64, _len: u64) -> Result<Vec<u8>, HostError> {
+    async fn pread(
+        &self,
+        _root: synch_core::Hash,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<Vec<u8>, HostError> {
         Err(HostError::NotFound)
     }
 }
 
-/// Admits everything and returns at once: any *completed* Open succeeds. The
-/// probe is about streams that never complete.
+/// What an admitted invocation's run came to, for the test to observe.
+#[derive(Debug, Default)]
+struct OutcomeRecorder {
+    last: std::sync::Mutex<Option<SockStatus>>,
+    done: tokio::sync::Notify,
+}
+
+/// Admits everything; `run` parks until the peer-gone signal, standing in
+/// for the engine forwarding the connection-close into the socket runtime.
+/// The probe is about streams that never complete — and about the one
+/// complete stream that must end when its connection closes.
 #[derive(Debug)]
-struct InstantService;
+struct InstantService {
+    recorded: Arc<OutcomeRecorder>,
+}
 
 #[async_trait::async_trait]
 impl SocketService for InstantService {
@@ -91,8 +107,21 @@ impl SocketService for InstantService {
         })
     }
 
-    async fn run(&self, _admission: Admission, _stream: DuplexStream) -> SockStatus {
-        SockStatus::Ok(0)
+    async fn run(
+        &self,
+        _admission: Admission,
+        _stream: DuplexStream,
+        peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+    ) -> SockStatus {
+        // Park until the invocation would end: this service stands in for the
+        // engine, which forwards the signal into the socket runtime.
+        let status = match peer_gone.await {
+            Ok(status) => status,
+            Err(_) => SockStatus::Ok(0),
+        };
+        *self.recorded.last.lock().unwrap() = Some(status);
+        self.recorded.done.notify_one();
+        status
     }
 }
 
@@ -127,11 +156,14 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
     let client_store = Arc::new(synch_store::Store::open(client_dir.path()).unwrap());
     trust(&client_store, server_secret.public());
 
+    let recorded = Arc::new(OutcomeRecorder::default());
     let server = Net::bind(
         server_store,
         server_secret,
         NetOptions {
-            sockets: Some(Arc::new(InstantService)),
+            sockets: Some(Arc::new(InstantService {
+                recorded: recorded.clone(),
+            })),
             sockets_open_timeout: Some(OPEN_TIMEOUT),
             ..NetOptions::loopback()
         },
@@ -154,10 +186,7 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
     // the one that must give up on them.
     let mut recv_halves = Vec::new();
     for _ in 0..N {
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .expect("a bi-stream opens");
+        let (mut send, recv) = connection.open_bi().await.expect("a bi-stream opens");
         send.write_all(&9216u32.to_le_bytes()).await.unwrap();
         std::mem::forget(send);
         recv_halves.push(recv);
@@ -174,10 +203,10 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
     for mut recv in recv_halves {
         let mut buf = [0u8; 4];
         match tokio::time::timeout(OPEN_TIMEOUT, recv.read(&mut buf)).await {
-            Ok(Ok(None)) => dropped += 1,  // clean EOF: the callee ended the stream
-            Ok(Ok(Some(_))) => {}          // unexpected data
-            Ok(Err(_)) => dropped += 1,    // reset: the callee ended the stream
-            Err(_) => {}                   // still open: the callee never gave up
+            Ok(Ok(None)) => dropped += 1, // clean EOF: the callee ended the stream
+            Ok(Ok(Some(_))) => {}         // unexpected data
+            Ok(Err(_)) => dropped += 1,   // reset: the callee ended the stream
+            Err(_) => {}                  // still open: the callee never gave up
         }
     }
     assert_eq!(
@@ -189,17 +218,16 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
 
     // A complete Open on a fresh stream is still answered: the cap and the
     // timeout never touch admitted invocations.
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .expect("a fresh bi-stream opens");
+    let (mut send, mut recv) = connection.open_bi().await.expect("a fresh bi-stream opens");
     let open = SockOpen::new(
         synch_core::OriginId::Key(server.id()),
         "code",
         "hold.sock",
         vec![],
     );
-    synch_net::frame::write_frame(&mut send, &open).await.unwrap();
+    synch_net::frame::write_frame(&mut send, &open)
+        .await
+        .unwrap();
     let _ = send.finish();
     let answered = tokio::time::timeout(
         Duration::from_secs(3),
@@ -212,4 +240,86 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
         SockOpened::Ok { .. } => {}
         other => panic!("the fresh Open was not admitted: {other:?}"),
     }
+}
+
+/// The P1 propagation: closing the caller's connection must reach the
+/// invocation even when the stream itself never fails. The service's `run`
+/// stands in for the engine and reports what the peer-gone channel delivered
+/// — a clean FIN would not fire it; the connection closing does.
+#[tokio::test]
+async fn connection_closure_signals_the_invocation() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server_store = Arc::new(synch_store::Store::open(server_dir.path()).unwrap());
+    let server_secret = SecretKey::generate();
+    let client_secret = SecretKey::generate();
+    trust(&server_store, client_secret.public());
+    let client_dir = tempfile::tempdir().unwrap();
+    let client_store = Arc::new(synch_store::Store::open(client_dir.path()).unwrap());
+    trust(&client_store, server_secret.public());
+
+    let recorded = Arc::new(OutcomeRecorder::default());
+    let server = Net::bind(
+        server_store,
+        server_secret,
+        NetOptions {
+            sockets: Some(Arc::new(InstantService {
+                recorded: recorded.clone(),
+            })),
+            ..NetOptions::loopback()
+        },
+    )
+    .await
+    .unwrap();
+    let client = Net::bind(client_store, client_secret, NetOptions::loopback())
+        .await
+        .unwrap();
+
+    // One complete Open; the invocation parks in the service's run, which
+    // awaits the peer-gone channel.
+    let connection = client
+        .endpoint()
+        .connect(server.direct_addr(), ALPN_SOCK)
+        .await
+        .expect("the socket ALPN connection opens");
+    let (mut send, mut recv) = connection.open_bi().await.expect("a bi-stream opens");
+    let open = SockOpen::new(
+        synch_core::OriginId::Key(server.id()),
+        "code",
+        "hold.sock",
+        vec![],
+    );
+    synch_net::frame::write_frame(&mut send, &open)
+        .await
+        .unwrap();
+    let _ = send.finish();
+    let answered = tokio::time::timeout(
+        Duration::from_secs(3),
+        synch_net::frame::read_frame::<SockOpened>(&mut recv),
+    )
+    .await
+    .expect("the Open is admitted")
+    .expect("the Open frame decodes");
+    assert!(matches!(answered, SockOpened::Ok { .. }));
+
+    // The caller's connection closes. The stream itself never failed (the
+    // caller's side finished cleanly), so nothing but the connection signal
+    // can end the invocation — and it must arrive with the Deadline the
+    // watcher sends.
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), recorded.done.notified())
+        .await
+        .expect(
+            "BREAK: the connection closed but the invocation never learned — the \
+             peer-gone signal did not reach the service's run",
+        );
+    let status = recorded
+        .last
+        .lock()
+        .unwrap()
+        .expect("the service recorded no ending");
+    assert_eq!(
+        status,
+        SockStatus::Deadline,
+        "connection closure must reach the invocation as Deadline, got {status:?}"
+    );
 }

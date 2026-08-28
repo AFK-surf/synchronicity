@@ -41,11 +41,7 @@ use synch_core::{
 use synch_sock::{Admission, DuplexStream};
 use synch_store::Store;
 
-use crate::{
-    error::NetError,
-    frame,
-    serve::MAX_CONCURRENT_STREAMS,
-};
+use crate::{error::NetError, frame, serve::MAX_CONCURRENT_STREAMS};
 
 /// Makes the control uni-stream observable before the first invocation ends.
 /// QUIC does not announce an opened uni-stream to its receiver until bytes are
@@ -71,7 +67,19 @@ pub trait SocketService: std::fmt::Debug + Send + Sync + 'static {
     ) -> Result<Admission, (RefuseCode, String)>;
 
     /// Runs an admitted invocation to completion.
-    async fn run(&self, admission: Admission, stream: DuplexStream) -> SockStatus;
+    ///
+    /// `peer_gone` fires when the caller's connection closes. The invocation
+    /// must end on it: the stream itself may never fail — after a clean FIN
+    /// the runtime's reader has already exited, so a connection that closes
+    /// afterwards leaves the guest's stream looking open — but the caller is
+    /// gone all the same, and an invocation that keeps running is a slot held
+    /// for nobody.
+    async fn run(
+        &self,
+        admission: Admission,
+        stream: DuplexStream,
+        peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+    ) -> SockStatus;
 }
 
 /// Serves `sync/sock/1`.
@@ -298,6 +306,7 @@ impl ProtocolHandler for SockProtocol {
             let addr = remote.to_string();
             let handler = self.clone();
             let control = control.clone();
+            let conn = connection.clone();
             let this_index = index;
             index += 1;
 
@@ -324,10 +333,24 @@ impl ProtocolHandler for SockProtocol {
                     }
                 };
                 drop(permit);
+                // The caller's connection closing must end the invocation
+                // even when the stream itself never fails — after a clean
+                // FIN the runtime's reader has already exited, so the
+                // connection dying afterwards leaves the guest's stream
+                // looking open, and nothing else would ever end it. The
+                // watcher only sends: the invocation's ending status is the
+                // same non-fault `Deadline` a failed stream produces, and the
+                // receiver lives or dies with the run below.
+                let (peer_gone_tx, peer_gone_rx) = tokio::sync::oneshot::channel();
+                let watcher = tokio::spawn(async move {
+                    let _ = conn.closed().await;
+                    let _ = peer_gone_tx.send(SockStatus::Deadline);
+                });
                 let status = handler
                     .service
-                    .run(admission, DuplexStream::new(recv, send))
+                    .run(admission, DuplexStream::new(recv, send), peer_gone_rx)
                     .await;
+                watcher.abort();
                 let mut control = control.lock().await;
                 let _ = frame::write_frame(&mut control, &SockClosed { stream_id, status }).await;
             });
@@ -605,7 +628,12 @@ mod tests {
             })
         }
 
-        async fn run(&self, _admission: Admission, _stream: DuplexStream) -> SockStatus {
+        async fn run(
+            &self,
+            _admission: Admission,
+            _stream: DuplexStream,
+            _peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+        ) -> SockStatus {
             self.release.notified().await;
             SockStatus::Shutdown
         }

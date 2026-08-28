@@ -355,7 +355,7 @@ async fn open_root_reads_socket_code_that_sy_open_refuses() {
     assert!(
         data.starts_with(b"\x7fELF"),
         "BREAK: socket ELF bytes crossed the stream; first bytes: {:?}",
-        &data.get(..16)
+        data.get(..16)
     );
     assert_eq!(
         data.len(),
