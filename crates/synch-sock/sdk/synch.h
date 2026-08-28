@@ -266,6 +266,8 @@ struct sy_ssh_event {
 };
 
 extern sy_s64 sy_ssh_start(sy_s64 stream, sy_u64 initial_auth_methods);
+/* 1 with one event copied out, SY_EAGAIN while the queue is empty on a live
+ * connection, 0 once it is empty after HUP: no further event will arrive. */
 extern sy_s64 sy_ssh_next(sy_s64 conn, struct sy_ssh_event *out,
                           sy_u64 out_len);
 extern sy_s64 sy_ssh_event_data(sy_u64 event_id, sy_u32 field, void *out,

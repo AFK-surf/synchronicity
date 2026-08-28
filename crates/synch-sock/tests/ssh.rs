@@ -310,6 +310,40 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const METHOD_POLICY: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF,
+                   SY_SSH_AUTH_NONE | SY_SSH_AUTH_PUBLICKEY) < 0) return 70;
+  struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  for (;;) {
+    if (sy_poll(conn, 1, 5000) < 0) return 71;
+    if (conn[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_PASSWORD) return 72;
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE ||
+            event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER ||
+            event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED) {
+          /* A channel decision helper must not consume an auth token. */
+          if (sy_ssh_channel_reject(
+                  event.id,
+                  SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED) != SY_ESTATE)
+            return 75;
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_REJECT,
+                                SY_SSH_AUTH_NONE | SY_SSH_AUTH_PUBLICKEY) < 0)
+            return 73;
+        } else if (sy_ssh_event_done(event.id) < 0) {
+          return 74;
+        }
+      }
+    }
+    if (conn[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
 #[derive(Clone)]
 struct Client;
 
@@ -411,6 +445,74 @@ async fn none_auth_and_multiple_session_channels_share_one_connection() {
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
         .await
         .expect("invocation stopped after disconnect")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+    // SSH invocations count channel cleartext, once per direction: each byte
+    // the echo read and each byte it wrote back (`docs/SSH-SOCKETS.md` §8).
+    let moved = (b"first channel".len() + b"second channel".len()) as u64;
+    assert_eq!(outcome.bytes_in, moved);
+    assert_eq!(outcome.bytes_out, moved);
+}
+
+#[tokio::test]
+async fn none_is_accepted_by_policy_but_never_advertised() {
+    use russh::MethodKind;
+
+    let elf = compile(METHOD_POLICY, "ssh-method-policy.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+
+    // The guest rejects the `none` attempt with next_methods naming both
+    // `none` and `publickey`; RFC 4252 requires the failure's advertised
+    // name-list to omit `none` all the same.
+    let rejected = client.authenticate_none("test").await.unwrap();
+    let russh::client::AuthResult::Failure {
+        remaining_methods, ..
+    } = rejected
+    else {
+        panic!("the guest rejects none authentication here");
+    };
+    assert!(
+        remaining_methods.contains(&MethodKind::PublicKey),
+        "publickey stays advertised"
+    );
+    assert!(
+        !remaining_methods.contains(&MethodKind::None),
+        "none must never appear in the advertised method name-list"
+    );
+
+    // Password is outside the guest's method set. The host rejects the
+    // attempt on its own: the program exits nonzero if the event reaches it.
+    assert!(!client
+        .authenticate_password("test", "swordfish")
+        .await
+        .unwrap()
+        .success());
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(outcome.status, SockStatus::Ok(0));
 }

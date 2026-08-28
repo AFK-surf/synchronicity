@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::abi::errno;
 
@@ -456,11 +456,13 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
-pub(crate) fn pty_adapters(master: &File) -> Result<(ChannelReader, ChannelWriter), i64> {
+/// Starts the blocking read side of a PTY master and returns its adapter.
+///
+/// The channel between the thread and the adapter is bounded, so a guest
+/// that stops reading parks the thread rather than growing a queue.
+pub(crate) fn pty_reader(master: &File) -> Result<ChannelReader, i64> {
     let mut reader = master.try_clone().map_err(|_| errno::ECONNRESET)?;
-    let mut writer = master.try_clone().map_err(|_| errno::ECONNRESET)?;
     let (read_tx, read_rx) = tokio::sync::mpsc::channel(8);
-    let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::Builder::new()
         .name("synch-pty-read".into())
         .spawn(move || {
@@ -474,17 +476,20 @@ pub(crate) fn pty_adapters(master: &File) -> Result<(ChannelReader, ChannelWrite
             }
         })
         .map_err(|_| errno::ELIMIT)?;
-    std::thread::Builder::new()
-        .name("synch-pty-write".into())
-        .spawn(move || {
-            while let Some(bytes) = write_rx.blocking_recv() {
-                if writer.write_all(&bytes).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|_| errno::ELIMIT)?;
-    Ok((ChannelReader::new(read_rx), ChannelWriter(write_tx)))
+    Ok(ChannelReader::new(read_rx))
+}
+
+/// A clone of the PTY master for the bounded write bridge in the helper.
+pub(crate) fn pty_writer(master: &File) -> Result<std::sync::Arc<File>, i64> {
+    master
+        .try_clone()
+        .map(std::sync::Arc::new)
+        .map_err(|_| errno::ECONNRESET)
+}
+
+/// One blocking write of a chunk to the PTY master, for `spawn_blocking`.
+pub(crate) fn pty_write_all(master: &std::sync::Arc<File>, chunk: &[u8]) -> bool {
+    (&**master).write_all(chunk).is_ok()
 }
 
 pub(crate) struct ChannelReader {
@@ -522,34 +527,6 @@ impl AsyncRead for ChannelReader {
         let n = out.remaining().min(self.current.len() - self.offset);
         out.put_slice(&self.current[self.offset..self.offset + n]);
         self.offset += n;
-        Poll::Ready(Ok(()))
-    }
-}
-
-pub(crate) struct ChannelWriter(pub(crate) tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
-
-impl AsyncWrite for ChannelWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0
-            .send(data.to_vec())
-            .map(|()| Poll::Ready(Ok(data.len())))
-            .unwrap_or_else(|_| {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "PTY closed",
-                )))
-            })
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }

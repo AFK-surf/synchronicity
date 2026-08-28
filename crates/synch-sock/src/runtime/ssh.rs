@@ -181,10 +181,12 @@ impl SshState {
         })
     }
 
-    fn push(&self, mut event: Event) -> Result<u64, ()> {
+    /// The refused event comes back boxed so the caller can retry it when the
+    /// budget is transient backpressure rather than a hard refusal.
+    fn push(&self, mut event: Event) -> Result<u64, Box<Event>> {
         let bytes = event.payload_len();
         if bytes > MAX_EVENT_BYTES {
-            return Err(());
+            return Err(Box::new(event));
         }
         let mut store = self
             .events
@@ -193,7 +195,8 @@ impl SshState {
         if store.queued.len() + store.outstanding.len() >= MAX_EVENTS
             || store.payload_bytes.saturating_add(bytes) > MAX_TOTAL_EVENT_BYTES
         {
-            return Err(());
+            drop(store);
+            return Err(Box::new(event));
         }
         event.id = self.next_event.fetch_add(1, Ordering::Relaxed).max(1);
         let id = event.id;
@@ -297,6 +300,25 @@ impl SshState {
 
     pub(crate) fn errno(&self) -> i64 {
         self.errno.load(Ordering::Acquire)
+    }
+
+    /// Sends a best-effort orderly SSH disconnect to the peer.
+    ///
+    /// What `sy_close` on the control fd asks for: the SSH counterpart of
+    /// closing the raw stream. The message races connection teardown and may
+    /// be lost; the local state is authoritative either way.
+    pub(crate) fn disconnect(&self) {
+        if let Some(session) = self.session() {
+            tokio::spawn(async move {
+                let _ = session
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        String::new(),
+                        String::new(),
+                    )
+                    .await;
+            });
+        }
     }
 
     pub(crate) fn close(&self, errno: i64) {
@@ -557,7 +579,12 @@ impl From<&Event> for EventHeader {
     }
 }
 
-fn method_set(bits: u64) -> russh::MethodSet {
+/// The method name-list advertised to the client in `USERAUTH_FAILURE`.
+///
+/// `none` is deliberately never in it: RFC 4252 §5.2 forbids listing `none`
+/// as a supported method. The `SY_SSH_AUTH_NONE` bit controls only whether a
+/// `none` *attempt* may reach the guest and be accepted.
+fn advertised_methods(bits: u64) -> russh::MethodSet {
     let mut methods = russh::MethodSet::empty();
     if bits & AUTH_PUBLICKEY != 0 {
         methods.push(russh::MethodKind::PublicKey);
@@ -565,41 +592,37 @@ fn method_set(bits: u64) -> russh::MethodSet {
     if bits & AUTH_PASSWORD != 0 {
         methods.push(russh::MethodKind::Password);
     }
-    if bits & AUTH_NONE != 0 {
-        methods.push(russh::MethodKind::None);
-    }
     methods
 }
 
-fn auth_from_decision(decision: Decision) -> Result<Auth, russh::Error> {
-    let Decision::Auth {
-        result,
-        next_methods,
-    } = decision
-    else {
-        return Err(russh::Error::Disconnect);
-    };
-    Ok(match result {
-        1 => Auth::Accept,
-        3 => Auth::Reject {
-            proceed_with_methods: Some(method_set(next_methods)),
-            partial_success: true,
-        },
-        _ => Auth::Reject {
-            proceed_with_methods: Some(method_set(next_methods)),
-            partial_success: false,
-        },
-    })
+/// The method bit an authentication event kind belongs to.
+fn method_bit(kind: u32) -> u64 {
+    match kind {
+        EVENT_AUTH_NONE => AUTH_NONE,
+        EVENT_AUTH_PASSWORD => AUTH_PASSWORD,
+        _ => AUTH_PUBLICKEY,
+    }
 }
 
 #[derive(Debug)]
 struct SshHandler {
     state: Arc<SshState>,
     username: Option<String>,
+    /// The methods the guest currently permits: `sy_ssh_start`'s initial set,
+    /// then whatever `next_methods` the last rejection or partial success
+    /// named. An attempt outside this set is rejected without waking the
+    /// guest — the guest, not the client, chooses what may be attempted.
+    methods: u64,
 }
 
 impl SshHandler {
     async fn auth(&mut self, event: Event) -> Result<Auth, russh::Error> {
+        if self.methods & method_bit(event.kind) == 0 {
+            return Ok(Auth::Reject {
+                proceed_with_methods: Some(advertised_methods(self.methods)),
+                partial_success: false,
+            });
+        }
         if self
             .username
             .as_ref()
@@ -624,7 +647,30 @@ impl SshHandler {
                 return Err(russh::Error::Disconnect);
             }
         };
-        auth_from_decision(decision)
+        let Decision::Auth {
+            result,
+            next_methods,
+        } = decision
+        else {
+            return Err(russh::Error::Disconnect);
+        };
+        Ok(match result {
+            1 => Auth::Accept,
+            3 => {
+                self.methods = next_methods;
+                Auth::Reject {
+                    proceed_with_methods: Some(advertised_methods(next_methods)),
+                    partial_success: true,
+                }
+            }
+            _ => {
+                self.methods = next_methods;
+                Auth::Reject {
+                    proceed_with_methods: Some(advertised_methods(next_methods)),
+                    partial_success: false,
+                }
+            }
+        })
     }
 
     async fn open_channel(
@@ -654,10 +700,16 @@ impl SshHandler {
             .insert(FIELD_CHANNEL_TYPE, channel_type.as_bytes().to_vec());
         let (tx, rx) = oneshot::channel();
         event.response = Some(tx);
-        let event_id = self
-            .state
-            .push(event)
-            .map_err(|_| russh::Error::Disconnect)?;
+        // A full event budget rejects this one open rather than ending the
+        // connection: the client is told "resource shortage", exactly as if
+        // the guest had run out of channel slots (§9).
+        let event_id = match self.state.push(event) {
+            Ok(id) => id,
+            Err(_) => {
+                reply.reject(ChannelOpenFailure::ResourceShortage).await;
+                return Ok(());
+            }
+        };
         let state = self.state.clone();
         let channel_type = channel_type.to_owned();
         self.state.spawn(async move {
@@ -1000,40 +1052,55 @@ impl Handler for SshHandler {
         if self.state.lane_discarded(fd, data_type) {
             return Ok(());
         }
-        let (tx, rx) = oneshot::channel();
-        let event_id = self
-            .state
-            .push(Event {
-                id: 0,
-                fd,
-                kind: EVENT_CHANNEL_EXTENDED_DATA,
-                flags: 0,
-                a: data_type,
-                b: 0,
-                c: 0,
-                d: 0,
-                fields: BTreeMap::new(),
-                pty: None,
-                response: Some(tx),
-            })
-            .map_err(|_| russh::Error::Disconnect)?;
-        let state = self.state.clone();
-        self.state.spawn(async move {
-            if tokio::time::timeout(Duration::from_secs(60), rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .is_none()
-            {
-                state.cancel_event(event_id);
-                return;
+        // The decision is awaited here, in the connection's own read loop, so
+        // an unanswered event stops the transport being read and the sender
+        // runs out of window (§6.2) instead of growing a queue of unclaimed
+        // packets. At most one packet is held, and the event deadline bounds
+        // the wait: a guest that never answers selects bounded discard for
+        // this data type rather than ending the connection.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (tx, mut rx) = oneshot::channel();
+        let mut event = Event {
+            id: 0,
+            fd,
+            kind: EVENT_CHANNEL_EXTENDED_DATA,
+            flags: 0,
+            a: data_type,
+            b: 0,
+            c: 0,
+            d: 0,
+            fields: BTreeMap::new(),
+            pty: None,
+            response: Some(tx),
+        };
+        let event_id = loop {
+            match self.state.push(event) {
+                Ok(id) => break id,
+                Err(back) => {
+                    // The event budget is full of other work. Wait it out
+                    // within the same deadline rather than disconnecting;
+                    // the packet in hand is the backpressure.
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    event = *back;
+                }
             }
-            if let Some(lane) = state.lane(fd, data_type) {
-                let _ = lane.send(data).await;
-            } else {
-                state.discard_lane(fd, data_type);
+        };
+        match tokio::time::timeout_at(deadline, &mut rx).await {
+            Ok(Ok(_)) => {
+                if let Some(lane) = self.state.lane(fd, data_type) {
+                    let _ = lane.send(data).await;
+                } else {
+                    self.state.discard_lane(fd, data_type);
+                }
             }
-        });
+            _ => {
+                self.state.cancel_event(event_id);
+                self.state.discard_lane(fd, data_type);
+            }
+        }
         Ok(())
     }
 
@@ -1340,9 +1407,10 @@ pub(crate) async fn serve(
     state: Arc<SshState>,
     host_key: Arc<PrivateKey>,
     methods: u64,
+    idle: Duration,
 ) {
     let config = russh::server::Config {
-        methods: method_set(methods),
+        methods: advertised_methods(methods),
         auth_rejection_time: Duration::from_millis(250),
         auth_rejection_time_initial: Some(Duration::ZERO),
         keys: vec![(*host_key).clone()],
@@ -1351,12 +1419,15 @@ pub(crate) async fn serve(
         channel_buffer_size: 16,
         event_buffer_size: 32,
         max_auth_attempts: 8,
-        inactivity_timeout: Some(Duration::from_secs(300)),
+        // The invocation's own idle deadline (`docs/SOCKETS.md` §10), so the
+        // SSH transport and the invocation agree about when idle is over.
+        inactivity_timeout: Some(idle),
         ..Default::default()
     };
     let handler = SshHandler {
         state: state.clone(),
         username: None,
+        methods,
     };
     let outcome =
         match russh::server::run_stream(Arc::new(config), JoinedStream::new(stream), handler).await
@@ -1364,11 +1435,24 @@ pub(crate) async fn serve(
             Ok(session) => session.await,
             Err(error) => Err(error),
         };
-    state.close(if outcome.is_ok() {
-        0
-    } else {
-        crate::abi::errno::ECONNRESET
-    });
+    state.close(classify_outcome(outcome));
+}
+
+/// The guest errno for how the SSH connection ended (`docs/SSH-SOCKETS.md`
+/// §13): zero for an orderly end — a disconnect message from either side,
+/// which includes a guest decision deadline expiring — `SY_ETIMEDOUT` for
+/// the transport deadlines, and `SY_ECONNRESET` for everything that broke.
+fn classify_outcome(outcome: Result<(), russh::Error>) -> i64 {
+    match outcome {
+        Ok(()) => 0,
+        Err(russh::Error::Disconnect) => 0,
+        Err(
+            russh::Error::ConnectionTimeout
+            | russh::Error::KeepaliveTimeout
+            | russh::Error::InactivityTimeout,
+        ) => crate::abi::errno::ETIMEDOUT,
+        Err(_) => crate::abi::errno::ECONNRESET,
+    }
 }
 
 pub(crate) fn generate_host_key() -> Result<PrivateKey, russh::keys::ssh_key::Error> {

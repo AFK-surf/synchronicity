@@ -296,9 +296,11 @@ impl std::fmt::Debug for Invocation {
 pub struct Outcome {
     /// How it ended, as the caller is told.
     pub status: SockStatus,
-    /// Bytes the guest wrote to the inbound stream.
+    /// Bytes the guest wrote to the caller-facing side: the inbound stream
+    /// in raw mode, or SSH channel and lane cleartext after `sy_ssh_start`
+    /// (`docs/SSH-SOCKETS.md` §8).
     pub bytes_out: u64,
-    /// Bytes the guest read from it.
+    /// Bytes the guest read from the same side.
     pub bytes_in: u64,
     /// Counters the program bumped with `sy_metric_add`.
     pub metrics: Vec<(String, i64)>,

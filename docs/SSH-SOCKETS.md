@@ -1,7 +1,9 @@
 # SSH over sockets
 
-Status: **proposed**. This document designs a built-in SSH protocol adapter for
-Synchronicity sockets. Nothing described here is implemented yet.
+Status: **implemented**. This document is the design of the built-in SSH
+protocol adapter for Synchronicity sockets, and is kept consistent with the
+implementation in `crates/synch-sock` (`runtime/ssh.rs`, the `sy_ssh_*`
+helpers, `runtime/sftp.rs`, and `runtime/process.rs`).
 
 The short version is:
 
@@ -137,7 +139,7 @@ without dropping a short write.
 
 ## 3. Activating SSH
 
-The proposed entrypoint is:
+The entrypoint is:
 
 ```c
 sy_s64 sy_ssh_start(sy_s64 stream, sy_u64 initial_auth_methods);
@@ -155,7 +157,10 @@ It has these semantics:
    hook, like every other I/O helper.
 6. It requires no program declaration.
 7. Calling a raw endpoint helper on fd zero after the transition returns
-   `SY_ESTATE`. Polling it remains valid, with the control-fd semantics in §5.
+   `SY_ESTATE`, with one deliberate exception: `sy_close` on the control fd
+   is the SSH counterpart of closing the raw stream — it sends a best-effort
+   orderly SSH disconnect and tears down the connection's local state.
+   Polling fd zero remains valid, with the control-fd semantics in §5.
 
 `SY_ESTATE` is a new negative result for an operation that is valid in the ABI
 but invalid in the handle's current protocol state. Reusing `SY_EINVAL` would
@@ -164,12 +169,12 @@ upgrade safely.
 
 ### 3.1 Lazy selection of raw mode
 
-Today the runtime constructs an `Endpoint` for `SY_SELF` and immediately starts
-reader and writer tasks before entering the guest. Recovering the underlying
-halves from those tasks after an SSH call would be racy and would need another
-pair of rings and a bridge.
+The runtime used to construct an `Endpoint` for `SY_SELF` and immediately
+start reader and writer tasks before entering the guest. Recovering the
+underlying halves from those tasks after an SSH call would be racy and would
+need another pair of rings and a bridge.
 
-Instead, `SY_SELF` becomes a small unselected slot holding the original
+Instead, `SY_SELF` is a small unselected slot holding the original
 `DuplexStream`. Its first operation selects exactly one mode:
 
 - `sy_ssh_start` consumes it directly into the SSH engine;
@@ -250,7 +255,7 @@ factor. The outer Iroh principal and inner SSH principal remain distinct facts.
 The SSH adapter has no user database. Authentication requests become events,
 and the guest's reply completes the host library's authentication callback.
 
-The first ABI should support:
+The first ABI supports:
 
 ```c
 #define SY_SSH_AUTH_NONE       0x01
@@ -293,10 +298,15 @@ sy_s64 sy_ssh_auth_reply(
 #define SY_SSH_AUTH_OFFER_ACCEPT  4  /* ask client to prove key possession */
 ```
 
-`next_methods` determines the methods advertised after rejection or partial
-success. Unsupported bits are refused. The host keeps the protocol's partial
-authentication state; the guest may keep application state in its invocation
-stack.
+`next_methods` determines both which methods may be attempted after a
+rejection or partial success — an attempt outside the set is rejected by the
+host without waking the guest — and which appear in the advertised name-list,
+always minus `none` per RFC 4252. Unsupported bits are refused. On a
+public-key *offer* only `REJECT` and `OFFER_ACCEPT` are valid results;
+`ACCEPT` and `PARTIAL` on an offer return `SY_ESTATE`, because an offer
+proves nothing that could complete a factor. The host keeps the protocol's
+partial authentication state; the guest may keep application state in its
+invocation stack.
 
 For the first implementation, changing username or service after the first
 authentication request disconnects the client. SSH permits a change only when
@@ -377,15 +387,16 @@ sy_s64 sy_ssh_authorized_keys_match(
 ```
 
 It is valid only for `AUTH_PUBLICKEY_OFFER` and
-`AUTH_PUBLICKEY_VERIFIED`. It canonically decodes each option-free key record
-and compares its public-key blob with the canonical blob on the event. It
+`AUTH_PUBLICKEY_VERIFIED`. It decodes each option-free key record's base64
+field — the SSH wire-format blob — and compares it byte for byte with the
+canonical blob on the event, so a match means the exact verified key. It
 returns `1` for a match, `0` after a complete scan with no match,
 `SY_EAGAIN` when object bytes are not resident, or another negative error.
-On `SY_EAGAIN` the object becomes pollable; the guest retains the generational
-event token, polls the object alongside fd zero, and retries.
-The host retains a bounded scan cursor keyed by the event token and object
-generation, so retry does not rescan earlier bytes. Consuming the event token
-discards that cursor.
+On `SY_EAGAIN` the host starts one bounded read of the whole object — the
+size limit below is what makes reading it whole safe — charged against the
+invocation's ordinary host-byte footprint, and the object becomes pollable;
+the guest retains the generational event token, polls the object alongside
+fd zero, and retries. The scan itself then runs once over resident bytes.
 
 Version 1 deliberately recognizes only option-free records of the form
 `key-type base64-key [comment]`, plus blank and comment lines. A record with
@@ -393,7 +404,8 @@ options such as `command=`, `from=`, or `restrict` does not match. Silently
 matching while ignoring an option would widen the policy expressed by the
 file. A later typed option API may expose restrictions, but it must not start a
 command or grant a backing capability automatically. Unsupported key types,
-malformed base64, and malformed records are skipped and counted diagnostically.
+malformed base64, and malformed records are skipped; skipping can only fail
+to match, never authorize.
 A line over 16 KiB or file over 256 KiB fails the whole match with `SY_ELIMIT`
 rather than authorizing from a prefix or suffix.
 
@@ -410,9 +422,14 @@ After activation, fd zero is not a byte stream. It is a pollable control
 object:
 
 - `SY_POLL_IN`: at least one event can be taken;
-- `SY_POLL_HUP`: the SSH connection ended cleanly;
-- `SY_POLL_ERR`: parsing, cryptography or the underlying stream failed;
-- `sy_errno(SY_SELF)`: the stable guest errno for that failure;
+- `SY_POLL_HUP`: the SSH connection ended; alone it ended cleanly — a
+  disconnect message from either side, including one a guest decision
+  deadline produced;
+- `SY_POLL_ERR`, always alongside `HUP`: parsing, cryptography or the
+  underlying stream failed;
+- `sy_errno(SY_SELF)`: the stable guest errno for that failure —
+  `SY_ETIMEDOUT` for a transport deadline, `SY_ECONNRESET` for everything
+  that broke, `0` for a clean end;
 - `SY_POLL_OUT` and `SY_POLL_RDHUP`: never reported.
 
 Events have a fixed header and bounded host-side payloads:
@@ -447,9 +464,11 @@ sy_s64 sy_ssh_event_data(
 sy_s64 sy_ssh_event_done(sy_u64 event_id);
 ```
 
-`sy_ssh_next` returns `1` after copying and popping one event,
-`SY_EAGAIN` when the ready queue is empty, or another negative error. This
-makes it safe to drain the control fd after one readiness notification.
+`sy_ssh_next` returns `1` after copying and popping one event, `SY_EAGAIN`
+when the ready queue is empty but the connection is live, `0` when it is
+empty and the connection has reached `HUP` — no further event will ever
+arrive — or another negative error. This makes it safe to drain the control
+fd after one readiness notification.
 
 The initial field identifiers relevant to authentication and channel routing
 are:
@@ -545,12 +564,13 @@ sy_s64 sy_ssh_channel_type(
 ```
 
 Accepting an inbound open reserves a handle slot before confirming it and
-returns the new channel fd. `sy_ssh_channel_open` performs the symmetric
-server-initiated operation and returns a channel fd immediately. In either
-case the fd begins in the existing connecting state, becomes `SY_POLL_OUT`
-when confirmation arrives, and reports rejection through `SY_POLL_ERR` and
-`sy_errno`. Failure to reserve a slot rejects the inbound open or returns
-`SY_ELIMIT` for an outbound one.
+returns the new channel fd already open: sending the confirmation completes
+locally and the peer cannot refuse it. `sy_ssh_channel_open` performs the
+symmetric server-initiated operation and returns a channel fd immediately;
+that fd begins in the existing connecting state, becomes `SY_POLL_OUT` when
+the peer's confirmation arrives, and reports the peer's rejection through
+`SY_POLL_ERR` and `sy_errno`. Failure to reserve a slot rejects the inbound
+open or returns `SY_ELIMIT` for an outbound one.
 
 The type and opening data are protocol inputs, not authority. Accepting a
 `direct-tcpip` channel does not connect to its requested destination;
@@ -613,13 +633,17 @@ channel. A PTY normally combines output and needs no stderr lane, while a
 pipe-backed process can be pumped to the type-1 lane.
 
 The guest may create an outbound lane proactively. When inbound extended data
-arrives for a type without a lane, the host buffers only the configured lane
-ring and emits `SY_SSH_EVENT_CHANNEL_EXTENDED_DATA`. Creating the lane makes
-those bytes readable. Completing the event without creating it selects bounded
-discard for that data type on that channel; SSH has no per-type rejection
-message. Leaving the event unanswered applies ordinary channel-window
-backpressure and remains subject to the event deadline. Thus an unknown data
-type can neither allocate handles automatically nor grow an unbounded queue.
+arrives for a type without a lane, the host holds that one packet and emits
+`SY_SSH_EVENT_CHANNEL_EXTENDED_DATA`, then waits for the decision in the
+connection's own read loop before reading further from the transport.
+Creating the lane makes those bytes readable. Completing the event without
+creating it selects bounded discard for that data type on that channel; SSH
+has no per-type rejection message. Leaving the event unanswered therefore
+stops the transport being read — window backpressure that, with one read
+loop per connection, is connection-wide — until the event deadline expires,
+which also selects bounded discard rather than ending the connection. Thus
+an unknown data type can neither allocate handles automatically nor grow an
+unbounded queue, and a flood of it never costs the connection.
 
 ### 6.3 Channel requests
 
@@ -891,8 +915,8 @@ use the PTY endpoint for combined stdin/stdout and the process handle for
 signals and status. In either shape, session bytes move only because the guest
 pumps them.
 
-Process/PTY support is a separate design and implementation layer. SSH can be
-completed and tested without it.
+Process/PTY support is a separate design and implementation layer from the
+SSH adapter, and the adapter is tested without it.
 
 #### Selecting a forced command by authenticated key
 
@@ -978,9 +1002,9 @@ never a complete subtree. Each `readdir` response is bounded to 64 entries and
 128 storage rows. A directory whose next child cannot be found within that
 work bound fails the request instead of consuming unbounded memory or CPU.
 
-SFTP support is separate from the SSH adapter. A guest may implement a small
-subsystem itself or proxy a session to a declared TCP backend before the
-built-in SFTP service exists.
+SFTP support is separate from the SSH adapter. A guest may also implement a
+small subsystem itself, or proxy a session to a declared TCP backend, without
+touching the built-in SFTP service.
 
 ### 7.3 Multiple channels and control masters
 
@@ -1002,14 +1026,14 @@ data or opening backends.
 
 ## 8. Handle types and accounting
 
-The current runtime treats an endpoint at any handle other than `SY_SELF` as
-outbound egress in parts of its accounting and cleanup. SSH invalidates that
-shortcut. Endpoints need an explicit role:
+The runtime once treated an endpoint at any handle other than `SY_SELF` as
+outbound egress in parts of its accounting and cleanup. SSH invalidated that
+shortcut, so every endpoint now carries an explicit role:
 
 ```rust
 enum EndpointRole {
     RawInbound,
-    SshChannel,
+    SshChannel { channel_type: String },
     SshExtendedData,
     TcpEgress,
     ProcessStdio,
@@ -1027,9 +1051,11 @@ The role decides:
 - how peer and endpoint information is rendered.
 
 For SSH invocations, `bytes_in` and `bytes_out` count cleartext bytes the guest
-reads from and writes to SSH channel fds. SSH handshakes, encrypted framing and
-control messages are transport overhead and are not charged as application
-bytes. Optional wire-byte metrics may be reported separately.
+reads from and writes to SSH channel and lane fds. SSH handshakes, encrypted
+framing and control messages are transport overhead and are not charged as
+application bytes; neither are the backends the guest pumps into, or a proxy
+would report twice the bytes it moved. Optional wire-byte metrics may be
+reported separately.
 
 ## 9. Limits
 
@@ -1039,7 +1065,7 @@ stderr and an SSH extended-data lane before counting the control fd or any tree
 objects. A limit that advertises eight channels but cannot represent them is
 not a limit; it is a delayed refusal.
 
-Proposed initial bounds:
+The initial bounds:
 
 | Resource | Default / hard bound | Behavior at the bound |
 | --- | --- | --- |
@@ -1119,8 +1145,9 @@ The runtime integration is:
    and write halves into one async I/O object, and starts the SSH task.
 2. The SSH handler owns only `Send` state and communicates through bounded
    channels. It never captures the worker's `Rc<Inner>`.
-3. A small local bridge task receives handler events, inserts them into the
-   invocation's bounded control queue and bumps the existing readiness epoch.
+3. Handler callbacks insert events directly into the invocation's bounded,
+   lock-protected control queue and bump the existing readiness epoch; no
+   separate bridge task is needed.
 4. Authentication handlers await one-shot guest replies. Channel opens keep a
    deferred reply handle, so waiting for eBPF policy does not block traffic on
    established channels.
@@ -1183,7 +1210,7 @@ that the callee published and armed the exact program root being run.
 | `sy_ssh_start` after raw I/O | `SY_ESTATE`; raw stream remains selected | unchanged raw stream |
 | Unsupported auth method selected | `SY_EINVAL` or rejected reply | method not advertised / attempt rejected |
 | Auth event times out | control fd reaches `HUP` | authentication disconnect |
-| Malformed SSH packet or failed crypto | control fd `ERR`, classified `sy_errno` | protocol disconnect |
+| Malformed SSH packet or failed crypto | control fd `ERR` beside `HUP`; `sy_errno` is `SY_ECONNRESET`, or `SY_ETIMEDOUT` for a transport deadline | protocol disconnect |
 | Channel handle cap | `sy_ssh_channel_accept` returns `SY_ELIMIT` | channel-open failure |
 | Request token is stale | response helper returns `SY_ESTATE` | current channel is untouched |
 | `authorized_keys` object is cold | matcher returns `SY_EAGAIN`; object fd becomes pollable | authentication remains pending within its deadline |
@@ -1191,6 +1218,7 @@ that the callee published and armed the exact program root being run.
 | Backing capability refused | its existing helper error, commonly `SY_EPERM` | guest chooses request failure or channel close |
 | Channel peer sends EOF | channel `IN`/`RDHUP`, then `sy_read == 0` after drain | local write half remains usable |
 | Guest closes channel | fd becomes invalid | SSH EOF/close after queued output as requested |
+| Guest closes fd zero | connection state torn down; later SSH helpers fail | best-effort orderly SSH disconnect |
 | SSH connection closes | control fd `HUP`; all channel fds converge to `HUP` | normal disconnect |
 | Operator kills invocation | final `SockStatus::Killed` | SSH disconnect/EOF and closed underlying stream |
 | Daemon stops | final `SockStatus::Shutdown` | SSH disconnect/EOF inside daemon shutdown budget |
@@ -1294,9 +1322,11 @@ is added.
 
 ## 15. Example socket programs
 
-These examples target the proposed SDK in this document; they are normative ABI
-and policy sketches, not code that the current SDK can compile yet. The first
-shows the complete control/data reactor. Later examples reuse that reactor and
+These examples are normative ABI and policy sketches against the SDK in this
+document; the shared reactor pieces they name (`struct attached`,
+`run_interactive_reactor`) are shorthand for the §15.1 loop rather than
+shipped SDK code. The first shows the complete control/data reactor. Later
+examples reuse that reactor and
 show only the declaration and policy branches that change. In all cases the
 guest, not the SSH adapter, owns every call to `sy_pump`.
 
@@ -1798,7 +1828,7 @@ reject:
 }
 
 /* `channel` was accepted only after CHANNEL_TYPE compared equal to "session".
-   This uses the single-stdio-endpoint process shape proposed in §7.1. */
+   This uses the single-stdio-endpoint process shape from §7.1. */
 static sy_s64 start_for_request(
     enum principal principal,
     sy_s64 channel,
@@ -1994,6 +2024,9 @@ The destination named in SSH data grants nothing. Both the guest comparison
 and the existing armed egress declaration must permit the connection.
 
 ## 16. Implementation order
+
+The adapter was built in this order, and the separation remains load-bearing
+for reviewing any change to it:
 
 1. **Endpoint roles and resource accounting.** Remove the assumption that every
    nonzero endpoint is TCP egress; charge rings and raise the handle/poll bound.

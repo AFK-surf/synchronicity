@@ -21,7 +21,7 @@ use crate::{
     limits::{Limits, MAX_LABELS, MAX_METRIC_NAMES},
     policy::{EffectivePolicy, PeerIdentity, SocketId},
     runtime::{
-        endpoint::{reader_task, writer_task, Endpoint, Readiness, State},
+        endpoint::{reader_task, writer_task, Endpoint, EndpointRole, Readiness, State},
         map::SocketMaps,
         process::{ProcessSlot, PtySlot},
         ssh::SshState,
@@ -359,6 +359,7 @@ impl Inner {
                     self.ready.clone(),
                     State::Open,
                     unselected.peer.clone(),
+                    EndpointRole::RawInbound,
                 );
                 let mut slots = self.slots.borrow_mut();
                 let Some(slot) = slots.get_mut(0) else {
@@ -443,8 +444,9 @@ impl Inner {
                 }
                 // Only an outbound endpoint frees a place in the egress
                 // budget. SSH channels, PTYs and service pipes are endpoints
-                // too, but never consumed that quota.
-                if ep.take_egress_charge() {
+                // too, but never consumed that quota — the role, not the
+                // handle number, is what decides (`docs/SSH-SOCKETS.md` §8).
+                if *ep.role() == EndpointRole::TcpEgress {
                     self.egress_open
                         .set(self.egress_open.get().saturating_sub(1));
                 }
@@ -471,6 +473,11 @@ impl Inner {
                 true
             }
             Some(Slot::SshControl(ssh)) => {
+                // Closing the control fd is the SSH counterpart of closing the
+                // raw stream: an orderly end of the whole connection. The
+                // disconnect message goes out on a best-effort basis before
+                // the local state is torn down.
+                ssh.disconnect();
                 ssh.close(0);
                 true
             }

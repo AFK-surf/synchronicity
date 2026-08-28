@@ -45,6 +45,52 @@ pub(crate) enum State {
     Closed,
 }
 
+/// What an endpoint stands in front of (`docs/SSH-SOCKETS.md` §8).
+///
+/// SSH removed the old shortcut that any endpoint other than `SY_SELF` is
+/// outbound TCP egress. The role decides which independent resource cap a
+/// close releases, whether the endpoint's bytes count as the invocation's
+/// application traffic, and which protocol helpers accept the handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndpointRole {
+    /// The caller's own `sync/sock/1` stream, selected into raw mode.
+    RawInbound,
+    /// One SSH channel's ordinary-data lane; carries the exact channel type.
+    SshChannel {
+        /// The SSH channel-type string this fd was accepted or opened with.
+        channel_type: String,
+    },
+    /// One SSH extended-data lane on a channel.
+    SshExtendedData,
+    /// A declared outbound TCP connection; closing it frees an egress slot.
+    TcpEgress,
+    /// A declared process's stdio pipe.
+    ProcessStdio,
+    /// A declared PTY master.
+    Pty,
+    /// A declared built-in file-transfer service.
+    FileTransfer,
+}
+
+impl EndpointRole {
+    /// Whether bytes moved through this endpoint are the invocation's
+    /// application bytes for `synch socket ps`.
+    ///
+    /// The raw inbound stream always is. In SSH mode fd zero is a control
+    /// object nobody reads, so the cleartext the guest moves through channel
+    /// and lane fds is the application traffic instead; backends the guest
+    /// merely pumps into are not counted, or a proxy would report twice the
+    /// bytes it moved.
+    pub(crate) fn counts_stream_bytes(&self) -> bool {
+        matches!(
+            self,
+            EndpointRole::RawInbound
+                | EndpointRole::SshChannel { .. }
+                | EndpointRole::SshExtendedData
+        )
+    }
+}
+
 /// The readiness signal shared by every endpoint of one invocation.
 ///
 /// An epoch beside the [`Notify`] is what makes the wait race-free without
@@ -124,8 +170,8 @@ pub(crate) struct Endpoint {
     ready: Arc<Readiness>,
     /// What `sy_endpoint_info` reports.
     peer: RefCell<String>,
-    /// Whether closing this endpoint returns one outbound-connect slot.
-    egress_charge: Cell<bool>,
+    /// What this endpoint stands in front of; fixed at creation.
+    role: EndpointRole,
     /// Whether guest writes are meaningful for this endpoint.
     write_enabled: Cell<bool>,
     /// Bytes moved, for `synch socket ps`.
@@ -135,7 +181,13 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    pub(crate) fn new(cap: usize, ready: Arc<Readiness>, state: State, peer: String) -> Rc<Self> {
+    pub(crate) fn new(
+        cap: usize,
+        ready: Arc<Readiness>,
+        state: State,
+        peer: String,
+        role: EndpointRole,
+    ) -> Rc<Self> {
         Rc::new(Endpoint {
             rx: RefCell::new(VecDeque::new()),
             tx: RefCell::new(VecDeque::new()),
@@ -153,7 +205,7 @@ impl Endpoint {
             tx_finished: Notify::new(),
             ready,
             peer: RefCell::new(peer),
-            egress_charge: Cell::new(false),
+            role,
             write_enabled: Cell::new(true),
             bytes_in: Cell::new(0),
             bytes_out: Cell::new(0),
@@ -176,12 +228,8 @@ impl Endpoint {
         *self.peer.borrow_mut() = peer;
     }
 
-    pub(crate) fn charge_egress(&self) {
-        self.egress_charge.set(true);
-    }
-
-    pub(crate) fn take_egress_charge(&self) -> bool {
-        self.egress_charge.replace(false)
+    pub(crate) fn role(&self) -> &EndpointRole {
+        &self.role
     }
 
     pub(crate) fn set_read_only(&self) {
@@ -747,6 +795,7 @@ mod tests {
             Arc::new(Readiness::default()),
             State::Open,
             String::new(),
+            EndpointRole::TcpEgress,
         )
     }
 
@@ -938,6 +987,7 @@ mod tests {
             Arc::new(Readiness::default()),
             State::Connecting,
             String::new(),
+            EndpointRole::TcpEgress,
         );
         // The guest may prepare a request before the connection lands.
         assert_eq!(ep.write(b"GET /"), 5);
@@ -1009,6 +1059,7 @@ mod tests {
             Arc::new(Readiness::default()),
             State::Connecting,
             String::new(),
+            EndpointRole::TcpEgress,
         );
         // A request prepared before the connection landed. There is nowhere to
         // flush it to, and finishing the connect to send it would be finishing
