@@ -8,16 +8,27 @@
 //! the control uni-stream, and the decision to let a stream live as long as it
 //! likes.
 //!
-//! That last one is why this ALPN does not reuse `serve::serve_connection` the
-//! way the other two do. Their connection loop bounds a stream at two minutes and a
-//! connection at eight in flight, and both are right for a request/response
-//! protocol and wrong here: a socket that proxies is *supposed* to be
-//! long-lived, and its concurrency bound is the socket's own armed
-//! `max_streams` rather than a number this layer picks.
+//! That last one is why this ALPN does not reuse `serve::serve_connection`
+//! the way the other two do. Their connection loop bounds a stream at two
+//! minutes and a connection at eight in flight, and both are right for a
+//! request/response protocol and wrong here: a socket that proxies is
+//! *supposed* to be long-lived, and its concurrency bound is the socket's
+//! own armed `max_streams` rather than a number this layer picks.
+//!
+//! The two bounds still apply to the one phase they are right for. A stream
+//! that never finishes its `Open` handshake is not an invocation — it has no
+//! runtime, no admission, and no deadline of its own, and without a bound it
+//! owns a task and a buffer for as long as the peer keeps the connection. So
+//! the handshake is covered by the shared accept path's per-stream timeout
+//! and per-connection in-flight cap, and the bound ends the moment the
+//! invocation is admitted.
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use iroh::{
@@ -30,7 +41,7 @@ use synch_core::{
 use synch_sock::{Admission, DuplexStream};
 use synch_store::Store;
 
-use crate::{error::NetError, frame};
+use crate::{error::NetError, frame, serve::MAX_CONCURRENT_STREAMS};
 
 /// Makes the control uni-stream observable before the first invocation ends.
 /// QUIC does not announce an opened uni-stream to its receiver until bytes are
@@ -56,7 +67,19 @@ pub trait SocketService: std::fmt::Debug + Send + Sync + 'static {
     ) -> Result<Admission, (RefuseCode, String)>;
 
     /// Runs an admitted invocation to completion.
-    async fn run(&self, admission: Admission, stream: DuplexStream) -> SockStatus;
+    ///
+    /// `peer_gone` fires when the caller's connection closes. The invocation
+    /// must end on it: the stream itself may never fail — after a clean FIN
+    /// the runtime's reader has already exited, so a connection that closes
+    /// afterwards leaves the guest's stream looking open — but the caller is
+    /// gone all the same, and an invocation that keeps running is a slot held
+    /// for nobody.
+    async fn run(
+        &self,
+        admission: Admission,
+        stream: DuplexStream,
+        peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+    ) -> SockStatus;
 }
 
 /// Serves `sync/sock/1`.
@@ -66,6 +89,14 @@ pub(crate) struct SockProtocol {
     service: Arc<dyn SocketService>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
     state: Arc<ProtocolState>,
+    /// How long a stream may take to complete its `Open` handshake.
+    ///
+    /// The shared accept path's per-stream bound, applied to the handshake
+    /// only: a stream that never becomes an invocation has no runtime of its
+    /// own, and without this it owns a task and a buffer for as long as the
+    /// peer keeps the connection. An admitted invocation runs unbounded —
+    /// the socket runtime's own deadlines govern it.
+    open_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -149,12 +180,17 @@ impl std::fmt::Debug for SockProtocol {
 
 impl SockProtocol {
     /// Builds a handler over a store and a service.
-    pub(crate) fn new(store: Arc<Store>, service: Arc<dyn SocketService>) -> Self {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        service: Arc<dyn SocketService>,
+        open_timeout: Duration,
+    ) -> Self {
         SockProtocol {
             store,
             service,
             on_unknown_key: None,
             state: Arc::new(ProtocolState::default()),
+            open_timeout,
         }
     }
 
@@ -217,12 +253,18 @@ impl ProtocolHandler for SockProtocol {
         };
 
         let mut index = 0u64;
+        // The shared accept path's in-flight cap, scoped to handshakes. A
+        // permit is held only until the `Open` is admitted: from then on the
+        // stream is an invocation governed by the socket runtime's own
+        // bounds, and a `--listen` client multiplexing many long-lived
+        // invocations over one connection must not be capped by this layer.
+        let handshake = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
         loop {
             let accepted = tokio::select! {
                 _ = self.state.cancelled() => break,
                 accepted = connection.accept_bi() => accepted,
             };
-            let Ok((mut send, recv)) = accepted else {
+            let Ok((mut send, mut recv)) = accepted else {
                 break;
             };
             let Some(active) = self.state.enter() else {
@@ -244,6 +286,17 @@ impl ProtocolHandler for SockProtocol {
             if !crate::serve::still_admitted(&self.store, &connection, &remote).await {
                 break;
             }
+            // A stream whose handshake never completes must not pile up
+            // beyond the shared path's cap. The permit is taken before the
+            // task, so the stream sits unread in the accept queue rather
+            // than owning a task, once the cap is reached.
+            let permit = tokio::select! {
+                _ = self.state.cancelled() => break,
+                permit = handshake.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
 
             let stream_id = send.id().index();
             // The endpoint id rather than a socket address: iroh may be
@@ -253,19 +306,53 @@ impl ProtocolHandler for SockProtocol {
             let addr = remote.to_string();
             let handler = self.clone();
             let control = control.clone();
+            let conn = connection.clone();
             let this_index = index;
             index += 1;
 
             tokio::spawn(async move {
                 let _active = active;
+                // The handshake is bounded: an `Open` that never arrives is
+                // dropped after `open_timeout`, permit and all. What is
+                // dropped is a stream that was never an invocation — nothing
+                // is on the control stream for it, and nothing is owed.
+                let admission = match tokio::time::timeout(
+                    handler.open_timeout,
+                    handler.open_stream(remote, addr, this_index, &mut send, &mut recv),
+                )
+                .await
+                {
+                    Ok(Some(admission)) => admission,
+                    Ok(None) => return, // a refusal is already on the wire
+                    Err(_) => {
+                        tracing::debug!(
+                            peer = %remote.fmt_short(),
+                            "socket Open timed out; the stream never became an invocation"
+                        );
+                        return;
+                    }
+                };
+                drop(permit);
+                // The caller's connection closing must end the invocation
+                // even when the stream itself never fails — after a clean
+                // FIN the runtime's reader has already exited, so the
+                // connection dying afterwards leaves the guest's stream
+                // looking open, and nothing else would ever end it. The
+                // watcher only sends: the invocation's ending status is the
+                // same non-fault `Deadline` a failed stream produces, and the
+                // receiver lives or dies with the run below.
+                let (peer_gone_tx, peer_gone_rx) = tokio::sync::oneshot::channel();
+                let watcher = tokio::spawn(async move {
+                    let _ = conn.closed().await;
+                    let _ = peer_gone_tx.send(SockStatus::Deadline);
+                });
                 let status = handler
-                    .serve_stream(remote, addr, this_index, send, recv)
+                    .service
+                    .run(admission, DuplexStream::new(recv, send), peer_gone_rx)
                     .await;
-                if let Some(status) = status {
-                    let mut control = control.lock().await;
-                    let _ =
-                        frame::write_frame(&mut control, &SockClosed { stream_id, status }).await;
-                }
+                watcher.abort();
+                let mut control = control.lock().await;
+                let _ = frame::write_frame(&mut control, &SockClosed { stream_id, status }).await;
             });
         }
         // Router treats the handler future as the lifetime of the connection.
@@ -280,24 +367,26 @@ impl ProtocolHandler for SockProtocol {
 }
 
 impl SockProtocol {
-    /// Handles one stream: the handshake, then the guest.
+    /// The `Open` handshake: read the frame, admit, answer.
     ///
-    /// Returns the status to publish on the control stream, or `None` when the
-    /// stream never became an invocation — a refusal is already on the wire in
-    /// its own frame, and repeating it as a status would say the same thing
-    /// twice in two vocabularies.
-    async fn serve_stream(
+    /// Returns the admission, or `None` when the stream never became an
+    /// invocation — a refusal is already on the wire in its own frame, and
+    /// repeating it as a status would say the same thing twice in two
+    /// vocabularies. This is the phase the caller's timeout and in-flight
+    /// permit cover: a stream that never completes it has no runtime of its
+    /// own, so it must not own a task for as long as the peer likes.
+    async fn open_stream(
         &self,
         peer: NodeId,
         addr: String,
         index: u64,
-        mut send: iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
-    ) -> Option<SockStatus> {
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<Admission> {
         let open = match tokio::select! {
             _ = self.state.cancelled() => {
                 let _ = frame::write_frame(
-                    &mut send,
+                    send,
                     &SockOpened::Refused {
                         code: RefuseCode::Busy,
                         message: "the node is shutting down".into(),
@@ -306,13 +395,13 @@ impl SockProtocol {
                 let _ = send.finish();
                 return None;
             }
-            open = read_open(&mut recv) => open,
+            open = read_open(recv) => open,
         } {
             Ok(open) => open,
             Err(e) => {
                 tracing::debug!(peer = %peer.fmt_short(), "bad socket Open: {e}");
                 let _ = frame::write_frame(
-                    &mut send,
+                    send,
                     &SockOpened::Refused {
                         code: RefuseCode::NoSuchPath,
                         message: format!("malformed Open: {e}"),
@@ -327,7 +416,7 @@ impl SockProtocol {
         let admission = match tokio::select! {
             _ = self.state.cancelled() => {
                 let _ = frame::write_frame(
-                    &mut send,
+                    send,
                     &SockOpened::Refused {
                         code: RefuseCode::Busy,
                         message: "the node is shutting down".into(),
@@ -345,7 +434,7 @@ impl SockProtocol {
                     socket = format!("{}/{}", open.space, open.path),
                     "socket refused: {} ({message})", code.as_str()
                 );
-                let _ = frame::write_frame(&mut send, &SockOpened::Refused { code, message }).await;
+                let _ = frame::write_frame(send, &SockOpened::Refused { code, message }).await;
                 let _ = send.finish();
                 return None;
             }
@@ -355,17 +444,10 @@ impl SockProtocol {
             program: admission.program_root,
             invocation: admission.id,
         };
-        if frame::write_frame(&mut send, &accepted).await.is_err() {
+        if frame::write_frame(send, &accepted).await.is_err() {
             return None;
         }
-
-        // From here the stream is opaque bytes in both directions. Nothing in
-        // this layer looks at them again.
-        let status = self
-            .service
-            .run(admission, DuplexStream::new(recv, send))
-            .await;
-        Some(status)
+        Some(admission)
     }
 }
 
@@ -546,7 +628,12 @@ mod tests {
             })
         }
 
-        async fn run(&self, _admission: Admission, _stream: DuplexStream) -> SockStatus {
+        async fn run(
+            &self,
+            _admission: Admission,
+            _stream: DuplexStream,
+            _peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+        ) -> SockStatus {
             self.release.notified().await;
             SockStatus::Shutdown
         }

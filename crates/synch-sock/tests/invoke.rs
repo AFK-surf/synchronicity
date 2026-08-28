@@ -560,14 +560,16 @@ async fn a_spinning_program_is_preempted_rather_than_holding_its_worker() {
     );
 
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let (_, peer_gone) = tokio::sync::oneshot::channel();
     let pool = harness.pool.clone();
-    let run = tokio::spawn(async move { pool.run_cancellable(invocation, cancelled).await });
+    let run =
+        tokio::spawn(async move { pool.run_cancellable(invocation, cancelled, peer_gone).await });
 
     // The guest never yields on its own. If the watcher were not signalling the
     // worker thread, this cancel would never be observed and the test would
     // hang rather than fail.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    cancel.send(()).unwrap();
+    cancel.send(synch_core::SockStatus::Killed).unwrap();
 
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run)
         .await

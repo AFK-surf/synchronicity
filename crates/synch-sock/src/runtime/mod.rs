@@ -102,7 +102,8 @@ fn global_env() -> GlobalEnv {
 struct Job {
     invocation: Invocation,
     reply: oneshot::Sender<Result<Outcome, SockError>>,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<SockStatus>,
+    peer_gone: oneshot::Receiver<SockStatus>,
 }
 
 /// Aborts the invocation's detached tasks when this drops — including on
@@ -373,17 +374,26 @@ impl WorkerHandle {
         if invocation.slot.is_some() {
             self.registry.attach_cancel(invocation.id, cancel_tx);
         }
-        self.run_cancellable(invocation, cancel_rx).await
+        // No connection to watch: the peer-gone channel never fires.
+        let (_, peer_gone) = oneshot::channel();
+        self.run_cancellable(invocation, cancel_rx, peer_gone).await
     }
 
-    /// Runs one invocation, with a channel that ends it early.
+    /// Runs one invocation, with channels that end it early.
     ///
-    /// Operator cancellation is separate from the pool-wide shutdown signal,
-    /// so callers can distinguish `Killed` from `Shutdown`.
+    /// `cancel` is what `synch socket kill` pulls, and ends the invocation
+    /// with `Killed`. `peer_gone` is the caller's connection closing
+    /// (`sync/sock/1` observes `Connection::closed`), which ends it with
+    /// `Deadline` — the same non-fault ending as a failed stream, because the
+    /// two say the same thing about the caller: it is gone, and nothing the
+    /// guest produces can be delivered. Both are separate from the pool-wide
+    /// shutdown signal, so callers can distinguish `Killed`, `Deadline` and
+    /// `Shutdown`.
     pub async fn run_cancellable(
         &self,
         invocation: Invocation,
-        cancel: oneshot::Receiver<()>,
+        cancel: oneshot::Receiver<SockStatus>,
+        peer_gone: oneshot::Receiver<SockStatus>,
     ) -> Result<Outcome, SockError> {
         if self.shutdown.is_stopping() {
             return Ok(shutdown_outcome());
@@ -400,6 +410,7 @@ impl WorkerHandle {
             invocation,
             reply,
             cancel,
+            peer_gone,
         });
         if sent.is_err() {
             load.fetch_sub(1, Ordering::Relaxed);
@@ -507,6 +518,7 @@ impl Worker {
                                             &shutdown,
                                             job.invocation,
                                             job.cancel,
+                                            job.peer_gone,
                                         )
                                         .await;
                                         let _ = job.reply.send(outcome);
@@ -622,7 +634,8 @@ async fn run_job(
     registry: &Arc<crate::registry::Registry>,
     shutdown: &Arc<ShutdownSignal>,
     invocation: Invocation,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<SockStatus>,
+    peer_gone: oneshot::Receiver<SockStatus>,
 ) -> Result<Outcome, SockError> {
     let program = program_for(
         loaders,
@@ -687,13 +700,31 @@ async fn run_job(
     // A *dropped* sender means nobody holds a way to cancel this invocation —
     // not that somebody just cancelled it. Reading the two the same way is how
     // a missing registry entry turns into every invocation being killed the
-    // instant it starts, which is a failure that looks like the network.
+    // instant it starts, which is a failure that looks like the network. The
+    // payload is the ending to report: `synch socket kill` says `Killed`, and
+    // the caller's connection closing says `Deadline` — both are endings the
+    // select below turns into statuses directly.
     let cancelled = async move {
-        if cancel.await.is_err() {
-            std::future::pending::<()>().await;
+        match cancel.await {
+            Ok(status) => status,
+            Err(_) => std::future::pending::<SockStatus>().await,
         }
     };
     tokio::pin!(cancelled);
+
+    // The caller's connection closing (`sync/sock/1` watches
+    // `Connection::closed` and signals it here). The stream itself may never
+    // fail — after a clean FIN the reader pump has already exited, so a
+    // connection that closes afterwards leaves `SY_SELF` looking open — but
+    // the caller is gone all the same, and the invocation must not hold its
+    // slot for it. Same dropped-sender rule as `cancelled`.
+    let peer_gone = async move {
+        match peer_gone.await {
+            Ok(status) => status,
+            Err(_) => std::future::pending::<SockStatus>().await,
+        }
+    };
+    tokio::pin!(peer_gone);
 
     // The idle deadline ends the invocation itself, not just the next poll
     // wait. `made_progress` pushes the deadline out whenever bytes move or a
@@ -715,6 +746,33 @@ async fn run_job(
         }
     };
     tokio::pin!(idle);
+
+    // The caller's stream is the invocation's reason to exist. When the
+    // transport fails it — the peer's connection died, a stream reset, a
+    // relay that went away — nothing the guest is talking to can be
+    // delivered anywhere, and an invocation that keeps running is a slot, a
+    // worker placement and a set of rings held for a caller that is gone.
+    // What triggers the end is the `Failed` state, and only that: a caller's
+    // clean FIN is a normal half-close a proxy works past, and the guest's
+    // own `sy_shutdown`/`sy_close` of `SY_SELF` must not end the invocation
+    // either — its slot is deliberately not reused. `fail` is called by the
+    // two pumps exactly when the stream underneath errors, so the state is
+    // the transport's own verdict, not something the guest can provoke.
+    let caller_gone = async {
+        let ready = inner.ready.clone();
+        let self_ep = self_ep.clone();
+        loop {
+            let epoch = ready.epoch();
+            if self_ep.state() == State::Failed {
+                return;
+            }
+            // `fail` bumps readiness, so the wait wakes on the state change;
+            // the timeout is only a bound on how long a quiet invocation may
+            // hold the worker before the check comes round again.
+            let _ = ready.wait(epoch, Duration::from_millis(100)).await;
+        }
+    };
+    tokio::pin!(caller_gone);
 
     // `biased` with the run branch first: a program that returns at the same
     // instant its idle deadline expires has ended itself, and its own ending
@@ -744,8 +802,17 @@ async fn run_job(
             },
             // A kill or shutdown drops the guest where it stands. That is safe
             // because everything it can hold is host-side and owned by `inner`.
-            _ = &mut cancelled => SockStatus::Killed,
+            // The payloads carry the ending: `synch socket kill` says `Killed`;
+            // the caller's connection closing says `Deadline`.
+            cancelled = &mut cancelled => cancelled,
+            gone = &mut peer_gone => gone,
             _ = &mut idle => SockStatus::Deadline,
+            // The caller is gone: nothing the guest produces can be
+            // delivered, and holding the slot for it would let one caller
+            // pin every stream on a socket and drop the connection. `Deadline`
+            // is the non-fault ending — this is not a program fault, and it
+            // must not feed the auto-disarm counter.
+            _ = &mut caller_gone => SockStatus::Deadline,
             _ = shutdown.cancelled() => SockStatus::Shutdown,
         }
     };

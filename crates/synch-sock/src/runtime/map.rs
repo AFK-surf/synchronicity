@@ -165,7 +165,13 @@ impl SocketMaps {
             return Err(());
         }
         let elapsed = now.saturating_duration_since(self.epoch).as_nanos() as u64;
-        let width = window.as_nanos().max(1) as u64;
+        // A width must be positive and fit the division below. The helpers
+        // clamp guest durations, but the store is also called directly: a
+        // window of 2^58 ms is 15625 * 2^64 ns, which truncates to exactly
+        // zero, and `elapsed / 0` would panic on the worker. Saturating to
+        // `u64::MAX` keeps a pathologically large window a legal, enormous
+        // window instead of a crash.
+        let width = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX).max(1);
         let index = elapsed / width;
         let into = elapsed % width;
 
@@ -200,11 +206,12 @@ impl SocketMaps {
             return Err(());
         }
         // Two windows of TTL, so the previous window is still there to be
-        // prorated when the next one starts counting.
+        // prorated when the next one starts counting. Saturating: a window
+        // large enough to overflow the double must not be a panic.
         store.set(
             &slot(index),
             &(current + 1).to_le_bytes(),
-            Some(window * 2),
+            Some(window.saturating_mul(2)),
             now,
             limits,
         )

@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use synch_core::{Hash, NodeId, OriginId};
+use synch_core::{Hash, NodeId, OriginId, SockStatus};
 
 use crate::limits::{FAULT_QUARANTINE, FAULT_WINDOW};
 
@@ -123,7 +123,7 @@ struct Live {
     stats: Arc<LiveStats>,
     /// Dropping this ends the invocation. `None` once it has been used, or for
     /// an invocation nobody can cancel.
-    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    cancel: Option<tokio::sync::oneshot::Sender<SockStatus>>,
 }
 
 /// Everything running, everything just said, and what has been failing.
@@ -254,7 +254,10 @@ impl Registry {
     }
 
     /// Records the channel `synch socket kill` pulls.
-    pub(crate) fn attach_cancel(&self, id: u64, cancel: tokio::sync::oneshot::Sender<()>) {
+    ///
+    /// Public because the engine attaches it for every admitted invocation
+    /// (`run_socket`); the runtime's own `WorkerHandle::run` does the same.
+    pub fn attach_cancel(&self, id: u64, cancel: tokio::sync::oneshot::Sender<SockStatus>) {
         if let Some(entry) = self.live.lock().expect("registry").get_mut(&id) {
             entry.cancel = Some(cancel);
         }
@@ -268,7 +271,7 @@ impl Registry {
     pub fn kill(&self, id: u64) -> bool {
         let mut live = self.live.lock().expect("registry");
         match live.get_mut(&id).and_then(|entry| entry.cancel.take()) {
-            Some(cancel) => cancel.send(()).is_ok(),
+            Some(cancel) => cancel.send(SockStatus::Killed).is_ok(),
             None => false,
         }
     }

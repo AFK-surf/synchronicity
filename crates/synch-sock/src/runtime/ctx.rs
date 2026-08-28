@@ -59,6 +59,22 @@ pub(crate) struct CursorSlot {
     pub(crate) at: Cell<usize>,
 }
 
+impl CursorSlot {
+    /// Host bytes this cursor holds, as the footprint meter counts them.
+    ///
+    /// The meter charges each entry at its name's length plus
+    /// [`CURSOR_ENTRY_OVERHEAD`](crate::limits::CURSOR_ENTRY_OVERHEAD) —
+    /// the `String` header in the vector and the per-name heap allocation
+    /// that a name-byte sum ignores. Charging and releasing must agree, so
+    /// both go through here.
+    pub(crate) fn footprint(&self) -> u64 {
+        self.names
+            .iter()
+            .map(|n| n.len() as u64 + crate::limits::CURSOR_ENTRY_OVERHEAD)
+            .sum()
+    }
+}
+
 /// What one handle refers to.
 #[derive(Debug)]
 pub(crate) enum Slot {
@@ -386,7 +402,7 @@ impl Inner {
                 true
             }
             Some(Slot::Cursor(cur)) => {
-                let held: u64 = cur.names.iter().map(|n| n.len() as u64).sum();
+                let held = cur.footprint();
                 self.release(held);
                 true
             }
@@ -417,10 +433,13 @@ impl Inner {
 
     /// Notes that something happened, and pushes the idle deadline out.
     ///
-    /// Called from the places progress is observable: bytes copied in or out,
-    /// and a poll that came back with a handle ready. A program blocked on a
-    /// slow upstream is not idle, and one that has been parked in `sy_poll`
-    /// for five minutes with nothing happening is.
+    /// Called from the places progress is observable: bytes copied in or out.
+    /// Readiness alone — a poll that came back with a handle ready — is not
+    /// progress: a terminal or bogus handle is ready forever, and counting
+    /// that as progress would let a guest re-poll a dead handle and keep the
+    /// deadline at arm's length indefinitely. A program blocked on a slow
+    /// upstream is not idle, and one that has been parked in `sy_poll` for
+    /// five minutes with nothing happening is.
     pub(crate) fn made_progress(&self) {
         self.deadline
             .set(Instant::now() + self.limits.idle_deadline);
