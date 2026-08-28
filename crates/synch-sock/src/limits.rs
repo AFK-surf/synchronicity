@@ -25,8 +25,8 @@ pub struct Limits {
     /// The most endpoint handles one invocation may hold, `SY_SELF` included.
     ///
     /// Also the `sy_poll` array cap, and deliberately the same number: a
-    /// program that can hold sixteen endpoints must be able to wait on all
-    /// sixteen, or the last one it opened is one it can never learn about.
+    /// program that can hold 32 endpoints must be able to wait on all 32, or
+    /// the last one it opened is one it can never learn about.
     pub max_handles: usize,
     /// The most outbound TCP connections one invocation may open.
     pub max_egress: usize,
@@ -54,7 +54,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_handles: 16,
+            max_handles: 32,
             max_egress: 8,
             ring_bytes: 256 * 1024,
             max_footprint: 1024 * 1024,

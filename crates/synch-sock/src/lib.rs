@@ -47,7 +47,7 @@ mod runtime;
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use runtime::{declare, Worker, WorkerHandle};
+pub use runtime::{declare, SshHostKey, Worker, WorkerHandle};
 
 use std::sync::Arc;
 
@@ -123,8 +123,19 @@ pub trait SocketHost: Send + Sync + 'static {
     /// Metadata for a content root already known.
     fn open_root(&self, root: &Hash) -> Result<ObjectInfo, HostError>;
 
-    /// Entry names under `space/prefix` in this node's own view.
-    fn list(&self, prefix: &str) -> Result<Vec<String>, HostError>;
+    /// One bounded page of entry names under `space/prefix` in this node's own
+    /// view, ordered lexicographically and strictly after `start_after`.
+    ///
+    /// Returned names remain space-qualified. Implementations must return at
+    /// most `limit` entries. The bounded storage API prevents protocol services
+    /// from materializing an arbitrarily large tree before applying their own
+    /// response and footprint limits.
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, HostError>;
 
     /// A verified read of `len` bytes at `offset`.
     ///
@@ -133,6 +144,18 @@ pub trait SocketHost: Send + Sync + 'static {
     /// async and why the helper that calls it returns `SY_EAGAIN` and makes the
     /// handle pollable rather than stalling the whole program.
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError>;
+}
+
+/// One bounded storage page returned by [`SocketHost::list_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPage {
+    /// Live, space-qualified entry names encountered in this page.
+    pub entries: Vec<String>,
+    /// Cursor for the next page, or `None` when the prefix is exhausted.
+    ///
+    /// This can name a filtered entry such as a tombstone, so consumers must
+    /// retain it separately from `entries`.
+    pub next: Option<String>,
 }
 
 /// Why a [`SocketHost`] call failed.

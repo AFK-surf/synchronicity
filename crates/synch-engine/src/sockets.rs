@@ -22,8 +22,8 @@ use synch_core::{
     Declaration, EntryKind, Hash, NodeId, OriginId, RefuseCode, SockOpen, SockStatus,
 };
 use synch_sock::{
-    limits::CURSOR_ENTRY_OVERHEAD, Admission, DuplexStream, EffectivePolicy, HostError, Limits,
-    ObjectInfo, PeerIdentity, SocketHost, SocketId,
+    Admission, DuplexStream, EffectivePolicy, HostError, Limits, ObjectInfo, PeerIdentity,
+    SocketHost, SocketId,
 };
 use synch_store::{ArmCandidate, SocketRow, SocketState};
 
@@ -688,75 +688,40 @@ impl SocketHost for TreeHost {
         })
     }
 
-    fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, HostError> {
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> std::result::Result<synch_sock::ListPage, HostError> {
         let (space, rest) = match prefix.split_once('/') {
             Some((space, rest)) => (space, rest),
             None => (prefix, ""),
         };
-        const PAGE: usize = 4096;
-        // The scan runs synchronously on the socket worker's thread — the one
-        // store access in the host that is not offloaded — so it is bounded
-        // both ways: by how much it may collect, and by how many rows it may
-        // walk to collect it. The byte cap is the same footprint budget
-        // `sy_list_open` charges the names against afterwards; a listing that
-        // would blow it is refused rather than materialized.
-        //
-        // Every scanned row counts toward the row cap, tombstones included:
-        // they are skipped for the collection, but the scan still paid a row
-        // to learn they were there, and a prefix full of them must not be a
-        // way to make the worker walk an unbounded number of pages.
-        const MAX_ROWS: usize = 65536;
-        let max_bytes = self.node.socket_limits().max_footprint as usize;
-        let mut after = None;
-        let mut names = Vec::new();
-        let mut scanned = 0usize;
-        let mut bytes = 0usize;
-        loop {
-            let rows = self
-                .node
-                .store()
-                .list_entries(
-                    Some(&self.own_origin),
-                    space,
-                    rest,
-                    after.as_deref(),
-                    Some(PAGE),
-                )
-                .map_err(|e| HostError::Unavailable(e.to_string()))?;
-            let done = rows.len() < PAGE;
-            after = rows.last().map(|row| row.path.clone());
-            for row in rows {
-                scanned += 1;
-                if scanned > MAX_ROWS {
-                    return Err(HostError::NotReadable(
-                        "the listing exceeds a socket invocation's footprint; \
-                         narrow the prefix"
-                            .into(),
-                    ));
-                }
-                if row.kind == EntryKind::Tombstone {
-                    continue;
-                }
-                // Counted the way `sy_list_open` will charge the listing: name
-                // bytes plus the per-entry host overhead the cursor retains.
-                // A name-byte sum alone would materialize listings the
-                // runtime then refuses, and would let a listing of short
-                // names exceed the footprint this cap exists to protect.
-                bytes += row.path.len() + CURSOR_ENTRY_OVERHEAD as usize;
-                names.push(row.path);
-                if bytes > max_bytes {
-                    return Err(HostError::NotReadable(
-                        "the listing exceeds a socket invocation's footprint; \
-                         narrow the prefix"
-                            .into(),
-                    ));
-                }
-            }
-            if done {
-                break;
-            }
-        }
-        Ok(names)
+        let qualified = format!("{space}/");
+        let start_after = start_after
+            .and_then(|name| name.strip_prefix(&qualified))
+            .or(start_after);
+        let rows = self
+            .node
+            .store()
+            .list_entries(
+                Some(&self.own_origin),
+                space,
+                rest,
+                start_after,
+                Some(limit),
+            )
+            .map_err(|e| HostError::Unavailable(e.to_string()))?;
+        let next = (rows.len() == limit)
+            .then(|| rows.last().map(|row| format!("{space}/{}", row.path)))
+            .flatten();
+        let entries = rows
+            .into_iter()
+            .filter(|row| row.kind != EntryKind::Tombstone)
+            .map(|row| format!("{space}/{}", row.path))
+            .collect();
+        Ok(synch_sock::ListPage { entries, next })
     }
 
     async fn pread(
@@ -879,9 +844,15 @@ mod pool {
     pub(crate) struct SocketPool(synch_sock::WorkerHandle);
 
     impl SocketPool {
-        /// Starts `workers` threads.
-        pub(crate) fn start(workers: usize, limits: Limits) -> Option<SocketPool> {
-            Some(SocketPool(synch_sock::WorkerHandle::start(workers, limits)))
+        /// Starts workers with the node's persistent SSH host key.
+        pub(crate) fn start_with_ssh_host_key(
+            workers: usize,
+            limits: Limits,
+            host_key: synch_sock::SshHostKey,
+        ) -> Option<SocketPool> {
+            Some(SocketPool(
+                synch_sock::WorkerHandle::start_with_ssh_host_key(workers, limits, host_key),
+            ))
         }
 
         /// The limits every invocation runs under.
@@ -1111,7 +1082,12 @@ impl SocketHost for NoTree {
         ))
     }
 
-    fn list(&self, _prefix: &str) -> std::result::Result<Vec<String>, HostError> {
+    fn list_page(
+        &self,
+        _prefix: &str,
+        _start_after: Option<&str>,
+        _limit: usize,
+    ) -> std::result::Result<synch_sock::ListPage, HostError> {
         Err(HostError::NotReadable(
             "the declaration hook reads no tree".into(),
         ))

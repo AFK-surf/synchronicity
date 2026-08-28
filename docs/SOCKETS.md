@@ -462,7 +462,7 @@ address by way of a name that resolves to it.
 
 ### 7.5 Poll — the only helper that suspends
 
-`sy_poll(fds, n, timeout_ms)` waits for readiness on up to 16 handles. Returns
+`sy_poll(fds, n, timeout_ms)` waits for readiness on up to 32 handles. Returns
 the number ready, `0` on timeout, negative on error; `timeout_ms < 0` means
 "until something happens", clamped by the host to the invocation's idle
 deadline — and the deadline is the end of the invocation itself (§10): a poll

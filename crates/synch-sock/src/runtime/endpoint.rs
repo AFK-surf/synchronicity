@@ -15,6 +15,10 @@ use std::{
     collections::VecDeque,
     net::IpAddr,
     rc::Rc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -49,18 +53,18 @@ pub(crate) enum State {
 /// change that lands in the window cannot be missed.
 #[derive(Debug, Default)]
 pub(crate) struct Readiness {
-    epoch: Cell<u64>,
+    epoch: AtomicU64,
     notify: Notify,
 }
 
 impl Readiness {
     pub(crate) fn bump(&self) {
-        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.epoch.fetch_add(1, Ordering::Release);
         self.notify.notify_waiters();
     }
 
     pub(crate) fn epoch(&self) -> u64 {
-        self.epoch.get()
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// Waits for a readiness change, or for `timeout` to run out.
@@ -72,7 +76,7 @@ impl Readiness {
         // Register before re-reading the epoch, so a bump between the caller's
         // readiness check and this sleep wakes us rather than being lost.
         notified.as_mut().enable();
-        if self.epoch.get() != since {
+        if self.epoch() != since {
             return true;
         }
         tokio::select! {
@@ -117,9 +121,13 @@ pub(crate) struct Endpoint {
     /// See [`Endpoint::tx_done`].
     tx_finished: Notify,
     /// Woken when anything the guest could poll on changes.
-    ready: Rc<Readiness>,
+    ready: Arc<Readiness>,
     /// What `sy_endpoint_info` reports.
     peer: RefCell<String>,
+    /// Whether closing this endpoint returns one outbound-connect slot.
+    egress_charge: Cell<bool>,
+    /// Whether guest writes are meaningful for this endpoint.
+    write_enabled: Cell<bool>,
     /// Bytes moved, for `synch socket ps`.
     pub(crate) bytes_in: Cell<u64>,
     /// Bytes moved, for `synch socket ps`.
@@ -127,7 +135,7 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
-    pub(crate) fn new(cap: usize, ready: Rc<Readiness>, state: State, peer: String) -> Rc<Self> {
+    pub(crate) fn new(cap: usize, ready: Arc<Readiness>, state: State, peer: String) -> Rc<Self> {
         Rc::new(Endpoint {
             rx: RefCell::new(VecDeque::new()),
             tx: RefCell::new(VecDeque::new()),
@@ -145,6 +153,8 @@ impl Endpoint {
             tx_finished: Notify::new(),
             ready,
             peer: RefCell::new(peer),
+            egress_charge: Cell::new(false),
+            write_enabled: Cell::new(true),
             bytes_in: Cell::new(0),
             bytes_out: Cell::new(0),
         })
@@ -164,6 +174,19 @@ impl Endpoint {
 
     pub(crate) fn set_peer(&self, peer: String) {
         *self.peer.borrow_mut() = peer;
+    }
+
+    pub(crate) fn charge_egress(&self) {
+        self.egress_charge.set(true);
+    }
+
+    pub(crate) fn take_egress_charge(&self) -> bool {
+        self.egress_charge.replace(false)
+    }
+
+    pub(crate) fn set_read_only(&self) {
+        self.write_enabled.set(false);
+        self.ready.bump();
     }
 
     pub(crate) fn set_open(&self) {
@@ -294,7 +317,11 @@ impl Endpoint {
     }
 
     pub(crate) fn writable(&self) -> usize {
-        self.cap.saturating_sub(self.tx.borrow().len())
+        if self.write_enabled.get() {
+            self.cap.saturating_sub(self.tx.borrow().len())
+        } else {
+            0
+        }
     }
 
     /// Why an empty rx ring cannot be read: `0` at a clean EOF, this
@@ -315,6 +342,9 @@ impl Endpoint {
     /// Whether the tx side would take bytes at all, before any are taken from
     /// anywhere to give it.
     fn tx_status(&self) -> Result<(), i64> {
+        if !self.write_enabled.get() {
+            return Err(errno::EPERM);
+        }
         match self.state.get() {
             State::Failed => return Err(self.errno.get()),
             State::Closed => return Err(errno::EPIPE),
@@ -714,7 +744,7 @@ mod tests {
     fn endpoint(cap: usize) -> Rc<Endpoint> {
         Endpoint::new(
             cap,
-            Rc::new(Readiness::default()),
+            Arc::new(Readiness::default()),
             State::Open,
             String::new(),
         )
@@ -905,7 +935,7 @@ mod tests {
     fn a_connecting_endpoint_takes_writes_but_is_not_writable_yet() {
         let ep = Endpoint::new(
             64,
-            Rc::new(Readiness::default()),
+            Arc::new(Readiness::default()),
             State::Connecting,
             String::new(),
         );
@@ -976,7 +1006,7 @@ mod tests {
     fn releasing_an_endpoint_that_never_connected_abandons_it() {
         let ep = Endpoint::new(
             64,
-            Rc::new(Readiness::default()),
+            Arc::new(Readiness::default()),
             State::Connecting,
             String::new(),
         );
@@ -1052,7 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_waits_are_not_lost_between_the_check_and_the_sleep() {
-        let ready = Rc::new(Readiness::default());
+        let ready = Arc::new(Readiness::default());
         let epoch = ready.epoch();
         ready.bump();
         // The bump landed after the epoch was read, which is exactly the window
@@ -1065,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wait_with_nothing_happening_times_out() {
-        let ready = Rc::new(Readiness::default());
+        let ready = Arc::new(Readiness::default());
         assert!(!ready.wait(ready.epoch(), Duration::from_millis(10)).await);
     }
 }
