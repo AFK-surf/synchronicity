@@ -663,6 +663,161 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
     );
 }
 
+/// A stock SSH client for the shell example: the transport is already
+/// authenticated by the harness, so the host key is accepted as presented.
+struct ShellClient;
+
+impl russh::client::Handler for ShellClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+/// `ssh-shell.c` end to end: SSH `none` completes against the outer identity,
+/// `pty-req` allocates a terminal without starting anything, `shell` starts
+/// exactly the declared `/bin/bash`, the splice loop carries keystrokes and
+/// output both ways, and the shell's own exit status arrives after its last
+/// output rather than racing it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
+    use std::time::Duration;
+
+    let elf = build("ssh-shell.c");
+    let harness = Harness::new();
+
+    // The declaration is the whole approval surface: the exact executable and
+    // argv, PTY permission, and nothing an SSH client could widen.
+    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    assert_eq!(
+        declaration.processes.len(),
+        1,
+        "one exact process capability is what the operator approves"
+    );
+    let bash = &declaration.processes[0];
+    // The declared path is resolved at arm time, so a merged-/usr host shows
+    // the operator `/usr/bin/bash` for a program that named `/bin/bash`.
+    assert!(
+        bash.executable.ends_with("/bash"),
+        "the resolved shell is still bash: {}",
+        bash.executable
+    );
+    assert_eq!(bash.argv, vec!["bash".to_string()]);
+    assert_eq!(bash.flags & 0x01, 0x01, "PTY permission is declared");
+
+    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        policy,
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        ShellClient,
+    )
+    .await
+    .expect("SSH handshake completed");
+    assert!(
+        client
+            .authenticate_none("operator")
+            .await
+            .expect("none authentication got a response")
+            .success(),
+        "the outer identity is the authentication factor here"
+    );
+
+    let mut channel = client
+        .channel_open_session()
+        .await
+        .expect("a session channel");
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("the pty request was sent");
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), channel.wait())
+                .await
+                .expect("a pty-req answer"),
+            Some(russh::ChannelMsg::Success)
+        ),
+        "allocating the terminal succeeds without starting a process"
+    );
+    channel
+        .request_shell(true)
+        .await
+        .expect("the shell request was sent");
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), channel.wait())
+                .await
+                .expect("a shell answer"),
+            Some(russh::ChannelMsg::Success)
+        ),
+        "the declared shell started"
+    );
+
+    // Typed at the terminal: bash expands the arithmetic, so seeing the
+    // expansion in the output proves a real shell ran — the echoed input
+    // still spells `$((6*7))`.
+    channel
+        .data(&b"echo interactive-$((6*7)); exit 3\n"[..])
+        .await
+        .expect("keystrokes reached the channel");
+
+    // The server reports the shell's exit and half-closes; closing the
+    // channel back is the client's move, exactly as OpenSSH would.
+    let mut output = Vec::new();
+    let mut exit_status = None;
+    let mut eof = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(eof && exit_status.is_some()) {
+        let message = tokio::time::timeout_at(deadline, channel.wait())
+            .await
+            .expect("the shell session concluded");
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+            Some(russh::ChannelMsg::ExtendedData { data, .. }) => output.extend_from_slice(&data),
+            Some(russh::ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+            Some(russh::ChannelMsg::Eof) => eof = true,
+            Some(russh::ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("interactive-42"),
+        "bash did not run the command: {text:?}"
+    );
+    assert_eq!(
+        exit_status,
+        Some(3),
+        "the shell's own exit status reached the client: {text:?}"
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "logout", "en")
+        .await
+        .expect("a clean disconnect");
+    drop(client);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the invocation ended with the connection")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
 /// The runtime loads an object somebody else's compiler wrote.
 ///
 /// Every other test here builds with the compiler in the binary, which would

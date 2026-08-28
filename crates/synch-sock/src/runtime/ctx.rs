@@ -647,6 +647,11 @@ impl Inner {
                 State::Connecting => false,
                 State::Open => ep.poll_terminal(),
             },
+            // A live SSH connection can always become ready — the peer may
+            // authenticate, open a channel, or disconnect — so a program
+            // waiting on only the control fd is waiting, not finished. Quiet
+            // begins at HUP, after which no event will ever arrive.
+            Slot::SshControl(ssh) => ssh.revents() & poll::HUP != 0,
             // An object with a fetch in flight is the loudest thing here: the
             // answer is on its way. Quiet means *nothing can ever become
             // ready*, and a program told that while its read is outstanding
