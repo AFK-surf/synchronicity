@@ -212,15 +212,28 @@ impl SocketHost for KindAwareTree {
         })
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<String>, HostError> {
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<synch_sock::ListPage, HostError> {
         let mut names: Vec<String> = self
             .files
             .keys()
             .filter(|k| k.starts_with(prefix))
+            .filter(|k| start_after.is_none_or(|after| k.as_str() > after))
             .cloned()
             .collect();
         names.sort();
-        Ok(names)
+        names.truncate(limit);
+        let next = (names.len() == limit)
+            .then(|| names.last().cloned())
+            .flatten();
+        Ok(synch_sock::ListPage {
+            entries: names,
+            next,
+        })
     }
 
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {

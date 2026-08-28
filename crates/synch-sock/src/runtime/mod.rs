@@ -684,8 +684,19 @@ async fn run_job(
     )?;
 
     let ready = Arc::new(Readiness::default());
+    // Start reading before the guest selects raw or SSH mode. Besides applying
+    // transport backpressure through a bounded buffer, this preserves the
+    // caller-stream failure signal even for a guest that never touches
+    // `SY_SELF`: a dead caller must not be able to keep an invocation alive by
+    // making progress only on an upstream endpoint.
+    let incoming_failed = Arc::new(AtomicBool::new(false));
+    let (prefetched_reader, mut prefetch_writer) = tokio::io::duplex(limits.ring_bytes.max(1));
+    let mut incoming_reader = invocation.stream.reader;
     let unselected = Rc::new(ctx::UnselectedStream {
-        stream: RefCell::new(Some(invocation.stream)),
+        stream: RefCell::new(Some(crate::DuplexStream::new(
+            prefetched_reader,
+            invocation.stream.writer,
+        ))),
         peer: invocation.peer.addr.clone(),
     });
     let started = Instant::now();
@@ -712,6 +723,17 @@ async fn run_job(
     inner.registry = Some(registry.clone());
     inner.ssh_host_key = Some(ssh_host_key);
     let inner = Rc::new(inner);
+    let prefetch_failed = incoming_failed.clone();
+    let prefetch_ready = inner.ready.clone();
+    inner.spawn(async move {
+        if tokio::io::copy(&mut incoming_reader, &mut prefetch_writer)
+            .await
+            .is_err()
+        {
+            prefetch_failed.store(true, Ordering::Release);
+            prefetch_ready.bump();
+        }
+    });
     debug_assert_eq!(SY_SELF, 0, "SY_SELF must be the first slot");
     inner.publish_handles();
 
@@ -777,25 +799,20 @@ async fn run_job(
     // relay that went away — nothing the guest is talking to can be
     // delivered anywhere, and an invocation that keeps running is a slot, a
     // worker placement and a set of rings held for a caller that is gone.
-    // What triggers the end is the `Failed` state, and only that: a caller's
+    // What triggers the end is a transport read error, and only that: a caller's
     // clean FIN is a normal half-close a proxy works past, and the guest's
     // own `sy_shutdown`/`sy_close` of `SY_SELF` must not end the invocation
-    // either — its slot is deliberately not reused. `fail` is called by the
-    // two pumps exactly when the stream underneath errors, so the state is
-    // the transport's own verdict, not something the guest can provoke.
+    // either — its slot is deliberately not reused. The prefetch pump raises
+    // the flag exactly when the stream underneath errors, so the state is the
+    // transport's own verdict, not something the guest can provoke.
     let caller_gone = async {
         let ready = inner.ready.clone();
         loop {
             let epoch = ready.epoch();
-            let failed = match inner.slot(SY_SELF) {
-                Some(ctx::Slot2::Endpoint(endpoint)) => endpoint.state() == State::Failed,
-                Some(ctx::Slot2::SshControl(ssh)) => ssh.errno() != 0,
-                _ => false,
-            };
-            if failed {
+            if incoming_failed.load(Ordering::Acquire) {
                 return;
             }
-            // `fail` bumps readiness, so the wait wakes on the state change;
+            // The prefetch pump bumps readiness, so this wakes on the error;
             // the timeout is only a bound on how long a quiet invocation may
             // hold the worker before the check comes round again.
             let _ = ready.wait(epoch, Duration::from_millis(100)).await;

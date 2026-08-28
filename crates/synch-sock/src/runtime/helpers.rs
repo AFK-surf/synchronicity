@@ -2335,12 +2335,9 @@ fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) 
                 return ret(host_errno(&error));
             }
         };
-        let page_bytes = page
-            .entries
-            .iter()
-            .fold(0u64, |total, name| {
-                total.saturating_add(name.len() as u64 + CURSOR_ENTRY_OVERHEAD)
-            });
+        let page_bytes = page.entries.iter().fold(0u64, |total, name| {
+            total.saturating_add(name.len() as u64 + CURSOR_ENTRY_OVERHEAD)
+        });
         if inner.charge(page_bytes).is_err() {
             inner.release(bytes);
             return ret(errno::ELIMIT);

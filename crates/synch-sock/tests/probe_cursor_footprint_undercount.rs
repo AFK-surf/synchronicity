@@ -45,13 +45,28 @@ impl SocketHost for DirTree {
     fn open_root(&self, _root: &synch_core::Hash) -> Result<ObjectInfo, HostError> {
         Err(HostError::NotFound)
     }
-    fn list(&self, prefix: &str) -> Result<Vec<String>, HostError> {
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<synch_sock::ListPage, HostError> {
         let n = if prefix == "big/" {
             self.big
         } else {
             self.small
         };
-        Ok((0..n).map(|i| format!("{prefix}entry-{i:05}")).collect())
+        let start = start_after
+            .and_then(|name| name.strip_prefix(prefix))
+            .and_then(|name| name.strip_prefix("entry-"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .map_or(0, |index| index.saturating_add(1));
+        let end = start.saturating_add(limit).min(n);
+        let entries = (start..end)
+            .map(|index| format!("{prefix}entry-{index:05}"))
+            .collect::<Vec<_>>();
+        let next = (end < n).then(|| entries.last().cloned()).flatten();
+        Ok(synch_sock::ListPage { entries, next })
     }
     async fn pread(
         &self,
