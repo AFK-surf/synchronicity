@@ -161,9 +161,13 @@ static sy_s64 move_terminal(struct session *s) {
   if (!s->input_done) {
     sy_s64 n = sy_splice(s->channel, s->pty, CHUNK);
     if (n == 0) {
-      /* Client EOF. A PTY has no write half to shut, so ask the shell to
-         hang up and keep the master open to drain its last output. */
-      if (s->process >= 0) sy_process_signal(s->process, SY_STR("HUP"));
+      /* Client EOF: no more keystrokes, and nothing else. A PTY has no write
+         half to shut, and hanging the shell up here would kill commands the
+         client already typed — `printf 'exit\n' | ssh` sends EOF right behind
+         the keystrokes, and sshd lets the shell drain them and end itself.
+         A client that vanishes entirely still can't leak the process: the
+         channel failing or the connection closing reaches close_session,
+         which kills a live shell. */
       s->input_done = 1;
     } else if (n < 0 && n != SY_EAGAIN) {
       return n;
