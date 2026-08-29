@@ -316,9 +316,10 @@ pub(crate) fn apply_pty_modes(slave: &File, modes: &[(u8, u32)]) -> Result<(), i
             58 => set_flag(&mut attrs.c_lflag, libc::TOSTOP),
             59 => set_flag(&mut attrs.c_lflag, libc::IEXTEN),
             70 => set_flag(&mut attrs.c_oflag, libc::OPOST),
-            72 => set_flag(&mut attrs.c_oflag, libc::OCRNL),
-            73 => set_flag(&mut attrs.c_oflag, libc::ONOCR),
-            74 => set_flag(&mut attrs.c_oflag, libc::ONLRET),
+            72 => set_flag(&mut attrs.c_oflag, libc::ONLCR),
+            73 => set_flag(&mut attrs.c_oflag, libc::OCRNL),
+            74 => set_flag(&mut attrs.c_oflag, libc::ONOCR),
+            75 => set_flag(&mut attrs.c_oflag, libc::ONLRET),
             90 if enabled => {
                 attrs.c_cflag = (attrs.c_cflag & !libc::CSIZE) | libc::CS7;
             }
@@ -690,6 +691,35 @@ mod tests {
             0,
             "pty slave must be close-on-exec"
         );
+    }
+
+    #[test]
+    fn ssh_output_modes_use_their_rfc_opcodes() {
+        let (_master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        let modes = [
+            (72, libc::ONLCR),
+            (73, libc::OCRNL),
+            (74, libc::ONOCR),
+            (75, libc::ONLRET),
+        ];
+        let mask = modes.iter().fold(0, |mask, &(_, flag)| mask | flag);
+
+        apply_pty_modes(&slave, &modes.map(|(opcode, _)| (opcode, 0))).unwrap();
+        for &(opcode, flag) in &modes {
+            apply_pty_modes(&slave, &[(opcode, 1)]).unwrap();
+            let mut attrs = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), attrs.as_mut_ptr()) },
+                0
+            );
+            let attrs = unsafe { attrs.assume_init() };
+            assert_eq!(
+                attrs.c_oflag & mask,
+                flag,
+                "SSH terminal mode opcode {opcode} set the wrong output flag"
+            );
+            apply_pty_modes(&slave, &[(opcode, 0)]).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
