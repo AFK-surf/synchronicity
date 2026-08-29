@@ -40,6 +40,7 @@ rand = "0.8"
 rand_10 = { package = "rand", version = "0.10" }
 russh.workspace = true
 russh-sftp.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # The compiler the tests build their fixtures with. A dev-dependency, so the

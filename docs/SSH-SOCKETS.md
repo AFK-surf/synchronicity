@@ -234,7 +234,7 @@ stream non-pristine:
 ```c
 sy_peer_origin(...);
 sy_peer_device_key(...);
-sy_peer_kind();
+sy_peer_info();
 sy_peer_has_space(...);
 sy_peer_addr(...);
 sy_conn_meta(...);
@@ -248,8 +248,10 @@ sy_u8 peer[32];
 if (sy_peer_device_key(peer) < 0 || !peer_is_allowed(peer))
   return 1;                         /* close the raw stream */
 
-if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0)
+sy_s64 methods = sy_json_parse(SY_STR("[\"none\"]"));
+if (methods < 0 || sy_ssh_start(SY_SELF, methods) < 0)
   return 1;
+sy_close(methods);
 ```
 
 `sy_peer_device_key` is the exact 32-byte Iroh public key authenticated by the
@@ -266,34 +268,32 @@ factor. The outer Iroh principal and inner SSH principal remain distinct facts.
 The SSH adapter has no user database. Authentication requests become events,
 and the guest's reply completes the host library's authentication callback.
 
-The first ABI supports:
+Methods are named, not numbered: `sy_ssh_start` takes a JSON array of
+`"none"`, `"publickey"` and `"password"`, naming what the client may attempt
+first.
 
-```c
-#define SY_SSH_AUTH_NONE       0x01
-#define SY_SSH_AUTH_PUBLICKEY  0x02
-#define SY_SSH_AUTH_PASSWORD   0x04
-```
-
-The bit for `none` controls whether a `none` request may be accepted but is
+Naming `none` controls whether a `none` request may be accepted, but `none` is
 never included in SSH's advertised method name-list, as RFC 4252 requires.
-Keyboard-interactive and host-based authentication can be added with new bits
+Keyboard-interactive and host-based authentication can be added with new names
 and event kinds without changing the lifecycle. OpenSSH user certificates use
-the public-key method bit and their own signed-auth event kind.
+the `publickey` method name and their own signed-auth event kind.
 
-Authentication event kinds are:
+Authentication event kinds, as the `kind` of the event JSON (§5), are:
 
-```c
-SY_SSH_EVENT_AUTH_NONE
-SY_SSH_EVENT_AUTH_PASSWORD
-SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER
-SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED
-SY_SSH_EVENT_AUTH_OPENSSH_CERT
-SY_SSH_EVENT_AUTHENTICATED
+```text
+auth_none
+auth_password
+auth_publickey_offer
+auth_publickey_verified
+auth_openssh_cert
+authenticated
 ```
 
-For certificate offers and signed authentication, the event includes the
-subject public key plus the complete certificate, signing CA public-key blob
-and SHA-256 digest, key id, serial, type and principals. The host rejects host
+For certificate offers and signed authentication, the event's JSON carries a
+`cert` object — `{"ca_public_key_sha256" (hex), "key_id", "serial", "type"
+("user" | "host"), "principals"}` — and the subject key fields; the raw
+certificate, CA and subject key blobs come byte-for-byte through
+`sy_ssh_event_data` (§5). The host rejects host
 certificates, username/principal mismatches, invalid validity/signatures and
 all unsupported critical options. The guest must authorize the signing CA;
 cryptographic self-consistency alone is never a trust decision.
@@ -303,27 +303,25 @@ that the client asked whether a key might be acceptable. A verified event is
 emitted only after the host has validated proof of possession. The guest never
 parses or verifies an SSH signature.
 
-The reply is:
+The reply is a JSON handle:
 
 ```c
-sy_s64 sy_ssh_auth_reply(
-    sy_u64 event_id,
-    sy_u32 result,
-    sy_u64 next_methods
-);
+sy_s64 sy_ssh_auth_reply(sy_u64 event_id, sy_s64 reply_json);
 
-#define SY_SSH_AUTH_ACCEPT        1  /* authentication complete */
-#define SY_SSH_AUTH_REJECT        2
-#define SY_SSH_AUTH_PARTIAL       3  /* factor accepted; more required */
-#define SY_SSH_AUTH_OFFER_ACCEPT  4  /* ask client to prove key possession */
+/* {"result": "accept"        -- authentication complete
+             | "reject"
+             | "partial"      -- factor accepted; more required
+             | "offer_accept" -- ask client to prove key possession
+   ,"next_methods": ["publickey", ...]?}                            */
 ```
 
 `next_methods` determines both which methods may be attempted after a
 rejection or partial success — an attempt outside the set is rejected by the
 host without waking the guest — and which appear in the advertised name-list,
-always minus `none` per RFC 4252. Unsupported bits are refused. On a
-public-key *offer* only `REJECT` and `OFFER_ACCEPT` are valid results;
-`ACCEPT` and `PARTIAL` on an offer return `SY_ESTATE`, because an offer
+always minus `none` per RFC 4252. An unknown method name is refused; an
+absent `next_methods` leaves nothing further attemptable, fail-closed. On a
+public-key *offer* only `"reject"` and `"offer_accept"` are valid results;
+`"accept"` and `"partial"` on an offer return `SY_ESTATE`, because an offer
 proves nothing that could complete a factor. The host keeps the protocol's
 partial authentication state; the guest may keep application state in its
 invocation stack.
@@ -352,11 +350,11 @@ usual `SHA256:<base64-without-padding>` form, but policy should compare the raw
 32 bytes. The blob and algorithm are bounded by the ordinary event-payload
 limits.
 
-An `AUTH_PUBLICKEY_OFFER` carries an identity but proves nothing. Only
-`AUTH_PUBLICKEY_VERIFIED` means the host validated a signature by that exact
+An `auth_publickey_offer` carries an identity but proves nothing. Only
+`auth_publickey_verified` means the host validated a signature by that exact
 key over the current SSH authentication exchange. A guest must base key
-authentication on the verified event; `OFFER_ACCEPT` merely asks the client to
-produce that proof.
+authentication on the verified event; `"offer_accept"` merely asks the client
+to produce that proof.
 
 SSH user authentication is connection-wide. Before consuming a verified
 event token, the guest copies any policy state it needs -- normally a compact
@@ -384,7 +382,9 @@ authorization data before it emits an SSH banner:
 ```c
 sy_s64 keys = sy_open(SY_STR("code/ssh/authorized_keys"));
 if (keys < 0) return 1;
-if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY) < 0) return 1;
+sy_s64 methods = sy_json_parse(SY_STR("[\"publickey\"]"));
+if (methods < 0 || sy_ssh_start(SY_SELF, methods) < 0) return 1;
+sy_close(methods);
 ```
 
 The object handle identifies immutable verified content. A tree update affects
@@ -406,8 +406,8 @@ sy_s64 sy_ssh_authorized_keys_match(
 );
 ```
 
-It is valid only for `AUTH_PUBLICKEY_OFFER` and
-`AUTH_PUBLICKEY_VERIFIED`. It decodes each option-free key record's base64
+It is valid only for `auth_publickey_offer` and
+`auth_publickey_verified`. It decodes each option-free key record's base64
 field — the SSH wire-format blob — and compares it byte for byte with the
 canonical blob on the event, so a match means the exact verified key. It
 returns `1` for a match, `0` after a complete scan with no match,
@@ -430,11 +430,11 @@ A line over 16 KiB or file over 256 KiB fails the whole match with `SY_ELIMIT`
 rather than authorizing from a prefix or suffix.
 
 The helper is optional convenience. A guest may instead compare
-`PUBLIC_KEY_SHA256` with a compact binary allowlist, use separate key files to
+`public_key_blob`/`public_key_sha256` with a compact binary allowlist, use separate key files to
 select different principals, or implement another policy from ordinary tree
 reads. In every case it must repeat the decision on
-`AUTH_PUBLICKEY_VERIFIED`; a match on the offer only justifies returning
-`OFFER_ACCEPT`.
+`auth_publickey_verified`; a match on the offer only justifies returning
+`"offer_accept"`.
 
 ## 5. The SSH control fd and its events
 
@@ -452,93 +452,60 @@ object:
   that broke, `0` for a clean end;
 - `SY_POLL_OUT` and `SY_POLL_RDHUP`: never reported.
 
-Events have a fixed header and bounded host-side payloads:
+An event is a JSON value with bounded host-side payloads:
 
 ```c
-struct sy_ssh_event {
-  sy_u64 id;          /* opaque, generational response token */
-  sy_s64 fd;          /* channel fd, or -1 before acceptance/for connection events */
-  sy_u32 kind;
-  sy_u32 flags;
-  sy_u32 data_len;
-  sy_u32 aux_len;
-  sy_u32 a;
-  sy_u32 b;
-  sy_u32 c;
-  sy_u32 d;
-};
-
-sy_s64 sy_ssh_next(
-    sy_s64 conn,
-    struct sy_ssh_event *out,
-    sy_u64 out_len
-);
-
-sy_s64 sy_ssh_event_data(
-    sy_u64 event_id,
-    sy_u32 field,
-    void *out,
-    sy_u64 out_len
-);
-
+sy_s64 sy_ssh_next(sy_s64 conn);
+sy_s64 sy_ssh_event_data(sy_u64 event_id, const char *field,
+                         sy_u64 field_len, void *out, sy_u64 out_len);
 sy_s64 sy_ssh_event_done(sy_u64 event_id);
 ```
 
-`sy_ssh_next` returns `1` after copying and popping one event, `SY_EAGAIN`
-when the ready queue is empty but the connection is live, `0` when it is
-empty and the connection has reached `HUP` — no further event will ever
-arrive — or another negative error. This makes it safe to drain the control
-fd after one readiness notification.
+`sy_ssh_next` pops one event and returns it as a fresh JSON handle (> 0),
+`SY_EAGAIN` when the ready queue is empty but the connection is live, `0` when
+it is empty and the connection has reached `HUP` — no further event will ever
+arrive — or another negative error. This makes it safe to drain the control fd
+after one readiness notification. The JSON is a snapshot the guest closes with
+`sy_close` whenever it likes; the event itself stays outstanding, addressed by
+its `id`, until a decision helper or `sy_ssh_event_done` consumes it.
 
-The initial field identifiers relevant to authentication and channel routing
-are:
+Every event's JSON carries `"id"` (the opaque, generational response token)
+and `"kind"` (the names in §4 plus the channel kinds below); a channel event
+carries `"fd"`. The decoded fields for the kind sit beside them: `"username"`,
+`"service"`, `"password"`, `"public_key_algorithm"`, `"public_key_sha256"`
+(hex), `"auth_attempts"`, `"channel_type"`, `"request_type"`, `"want_reply"`,
+`"terminal"`, `"env_name"` / `"env_value"`, `"command"`, `"subsystem"`,
+`"signal"`, `"destination_host"` / `"originator_host"` / `"port"` /
+`"originator_port"`, `"columns"` / `"rows"` / `"pixel_width"` /
+`"pixel_height"`, `"data_type"`, and the `"cert"` object of §4.
 
-```c
-#define SY_SSH_FIELD_USERNAME                  1
-#define SY_SSH_FIELD_SERVICE                   2
-#define SY_SSH_FIELD_PASSWORD                  3
-#define SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM      4
-#define SY_SSH_FIELD_PUBLIC_KEY_BLOB           5
-#define SY_SSH_FIELD_PUBLIC_KEY_SHA256         6
-#define SY_SSH_FIELD_COMMAND                   8
-#define SY_SSH_FIELD_SUBSYSTEM                 9
-#define SY_SSH_FIELD_CHANNEL_TYPE             10
-#define SY_SSH_FIELD_CHANNEL_OPEN_DATA        11
-#define SY_SSH_FIELD_REQUEST_TYPE             12
-#define SY_SSH_FIELD_REQUEST_DATA             13
-#define SY_SSH_FIELD_DESTINATION_HOST         14
-#define SY_SSH_FIELD_ORIGINATOR_HOST          15
-#define SY_SSH_FIELD_SIGNAL                   16
-#define SY_SSH_FIELD_TERMINAL                 17
-#define SY_SSH_FIELD_ENV_NAME                 18
-#define SY_SSH_FIELD_ENV_VALUE                19
-```
+`sy_ssh_event_data` serves any raw field of an outstanding event by string
+name, byte-for-byte as the wire carried it, with the SDK's `snprintf`
+convention: it returns the complete length wanted and copies what fits. The
+names are the JSON keys above plus what the JSON deliberately leaves out —
+`"public_key_blob"`, `"ca_public_key_blob"`, `"cert_blob"`,
+`"cert_principals"`, `"open_data"`, `"request_data"`, and a `"command"` that
+is not UTF-8 (a non-UTF-8 field is simply absent from the JSON view).
 
 The channel lifecycle uses three event kinds:
 
-```c
-SY_SSH_EVENT_CHANNEL_OPEN       /* fd == -1 until accepted */
-SY_SSH_EVENT_CHANNEL_REQUEST    /* fd identifies a live channel */
-SY_SSH_EVENT_CHANNEL_EXTENDED_DATA /* event.a is an unbound data-type code */
+```text
+channel_open           /* "fd" is absent until accepted */
+channel_request        /* "fd" identifies a live channel */
+channel_extended_data  /* "data_type" is an unbound numeric code */
 ```
 
 EOF, close, and failure are fd readiness transitions rather than duplicate
 control events. This keeps byte-stream lifecycle in the ordinary endpoint ABI.
 
-`PUBLIC_KEY_SHA256` has length exactly 32. All other fields are
-length-delimited bytes; they are not implicitly NUL-terminated and the guest
-must not treat them as C strings without making its own bounded copy.
-The password field exists only on `AUTH_PASSWORD`, is covered by the credential
-zeroization rules, and is invalid after the event token is consumed. `COMMAND`
-and `SUBSYSTEM` are the
-exact bounded request payloads and have no shell interpretation in the SSH
-adapter. Ports and other small numeric fields are stored in the fixed event
-header; variable-length addresses use the named fields above.
-
-`sy_ssh_next` removes an event from the ready queue and transfers its token to
-the guest. `sy_ssh_event_data` follows the SDK's `snprintf` convention: it
-returns the complete length wanted and copies what fits. A decision helper or
-`sy_ssh_event_done` consumes the token and frees its payload.
+The raw `public_key_sha256` has length exactly 32; its JSON form is the hex
+spelling. Raw fields are length-delimited bytes, not NUL-terminated; JSON
+string reads have the ordinary snprintf semantics. The password field exists
+only on `auth_password`, is covered by the credential zeroization rules
+(which extend to the event's JSON snapshot: closing it zeroizes its strings,
+best-effort), and is invalid after the event token is consumed. `"command"`
+and `"subsystem"` are the exact bounded request payloads and have no shell
+interpretation in the SSH adapter.
 
 Tokens, rather than one globally pinned front event, avoid head-of-line
 blocking. A program may start a backend for one exec request and continue
@@ -554,19 +521,17 @@ channels continue.
 ## 6. SSH channels are generic virtual fds
 
 The fd model is generic over SSH channel type. Every peer-initiated
-`SSH_MSG_CHANNEL_OPEN` produces `SY_SSH_EVENT_CHANNEL_OPEN`; the event exposes
+`SSH_MSG_CHANNEL_OPEN` produces a `channel_open` event; the event exposes
 the channel type and its bounded type-specific opening payload. Nothing is
 accepted automatically and the SSH adapter has no allowlist containing only
 `session`.
 
 ```c
-#define SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED 1
-#define SY_SSH_OPEN_CONNECT_FAILED              2
-#define SY_SSH_OPEN_UNKNOWN_CHANNEL_TYPE        3
-#define SY_SSH_OPEN_RESOURCE_SHORTAGE           4
-
 sy_s64 sy_ssh_channel_accept(sy_u64 event_id);
-sy_s64 sy_ssh_channel_reject(sy_u64 event_id, sy_u32 reason);
+/* reason: "administratively_prohibited" | "connect_failed"
+         | "unknown_channel_type" | "resource_shortage"     */
+sy_s64 sy_ssh_channel_reject(sy_u64 event_id, const char *reason,
+                             sy_u64 reason_len);
 
 sy_s64 sy_ssh_channel_open(
     sy_s64 conn,
@@ -616,8 +581,8 @@ therefore identical for `session`, forwarding, and extension channels.
 
 ### 6.1 Opening data
 
-`SY_SSH_FIELD_CHANNEL_TYPE` is the exact channel-type string and
-`SY_SSH_FIELD_CHANNEL_OPEN_DATA` is a bounded copy of the type-specific bytes
+`"channel_type"` is the exact channel-type string and the raw `"open_data"`
+field is a bounded copy of the type-specific bytes
 following the common channel-open fields. The raw field permits a guest-defined
 extension without an SSH-library change, but standard types also receive
 validated fields so ordinary programs never parse SSH binary encoding.
@@ -626,8 +591,8 @@ The first typed opening-data view is:
 
 ```text
 direct-tcpip
-    DESTINATION_HOST, event.a = destination port
-    ORIGINATOR_HOST, event.b = originator port
+    "destination_host", "port"
+    "originator_host", "originator_port"
 ```
 
 Malformed opening data for a standard type is rejected by the host before an
@@ -654,7 +619,7 @@ pipe-backed process can be pumped to the type-1 lane.
 
 The guest may create an outbound lane proactively. When inbound extended data
 arrives for a type without a lane, the host holds that one packet and emits
-`SY_SSH_EVENT_CHANNEL_EXTENDED_DATA`, then waits for the decision in the
+a `channel_extended_data` event, then waits for the decision in the
 connection's own read loop before reading further from the transport.
 Creating the lane makes those bytes readable. Completing the event without
 creating it selects bounded discard for that data type on that channel; SSH
@@ -667,18 +632,15 @@ unbounded queue, and a flood of it never costs the connection.
 
 ### 6.3 Channel requests
 
-Every `SSH_MSG_CHANNEL_REQUEST` produces
-`SY_SSH_EVENT_CHANNEL_REQUEST`, referring to the generic channel fd. It exposes
-the request type, `want reply`, and bounded type-specific payload. Standard
-requests also expose validated typed fields; unknown requests retain their
-opaque payload.
+Every `SSH_MSG_CHANNEL_REQUEST` produces a
+`channel_request` event, referring to the generic channel fd. Its JSON exposes
+`"request_type"`, `"want_reply"`, and validated typed fields for standard
+requests; unknown requests retain their opaque payload as the raw
+`"request_data"` field.
 
 ```c
-#define SY_SSH_EVENT_WANT_REPLY 0x01
-#define SY_SSH_REQUEST_FAILURE  0
-#define SY_SSH_REQUEST_SUCCESS  1
-
-sy_s64 sy_ssh_request_reply(sy_u64 event_id, sy_u32 result);
+/* granted: 1 grants the request, 0 refuses it */
+sy_s64 sy_ssh_request_reply(sy_u64 event_id, sy_u32 granted);
 ```
 
 The host sends success or failure only when requested. Otherwise the guest
@@ -689,14 +651,16 @@ blocks unrelated channels.
 The initial typed request view covers the standard `session` vocabulary:
 
 ```text
-pty-req       terminal, dimensions, encoded terminal modes
-env           name and value
+pty-req       "terminal", "columns"/"rows"/"pixel_width"/"pixel_height",
+              and the full spec through sy_ssh_pty_spec
+env           "env_name" and "env_value"
 shell
-exec          command bytes
-subsystem     subsystem name
-window-change new character and pixel dimensions
-signal        SSH signal name
-break         duration
+exec          "command" (raw bytes through sy_ssh_event_data)
+subsystem     "subsystem"
+window-change "columns"/"rows"/"pixel_width"/"pixel_height"
+signal        "signal"
+break         "break_ms"
+x11-req       "screen_number", "single_connection"
 ```
 
 These names do not start anything. The guest decides whether each request is
@@ -767,31 +731,12 @@ root and has no daemon-wide namespace or configuration. Arming displays and
 approves the concrete declaration; there is no separate setup command.
 
 ```c
-#define SY_PROCESS_MAX_ARGS 8
-#define SY_PROCESS_ARG_MAX  128
-
-struct sy_process_capability {
-  sy_u32 id;                         /* program-local, nonzero */
-  sy_u32 flags;                      /* PTY/pipe permission and fixed options */
-  char executable[256];              /* exact absolute executable */
-  sy_u32 executable_len;
-  sy_u32 argc;
-  char argv[SY_PROCESS_MAX_ARGS][SY_PROCESS_ARG_MAX];
-  sy_u32 argv_len[SY_PROCESS_MAX_ARGS];
-  sy_u64 allowed_signals;            /* host-defined signal-name bits */
-};
-
-#define SY_PROCESS_ALLOW_PTY  0x01
-#define SY_PROCESS_ALLOW_PIPE 0x02
-
-#define SY_PROCESS_SIGNAL_HUP  (1ull << 0)
-#define SY_PROCESS_SIGNAL_INT  (1ull << 1)
-#define SY_PROCESS_SIGNAL_TERM (1ull << 2)
-
-sy_s64 sy_declare_process(
-    const struct sy_process_capability *capability,
-    sy_u64 capability_len
-);
+/* {"id"              -- program-local, nonzero
+   ,"allow"           -- ["pty" | "pipe", ...]
+   ,"executable"      -- exact absolute path, at most 256 bytes
+   ,"argv"            -- exact argv incl. argv[0]; 1..8 args of <= 128 bytes
+   ,"allowed_signals" -- ["HUP" | "INT" | "TERM", ...]?}                    */
+sy_s64 sy_declare_process(sy_s64 capability_json);
 ```
 
 The host rejects duplicate or zero ids, malformed paths and arguments, an
@@ -826,46 +771,25 @@ start a shell before a later `shell` request:
 ```c
 #define PROCESS_MAINTENANCE_SHELL 1
 
-static const struct sy_process_capability maintenance_shell = {
-  .id = PROCESS_MAINTENANCE_SHELL,
-  .flags = SY_PROCESS_ALLOW_PTY,
-  .executable = "/bin/sh",
-  .executable_len = sizeof "/bin/sh" - 1,
-  .argc = 2,
-  .argv = { "sh", "-l" },
-  .argv_len = { 2, 2 },
-  .allowed_signals = SY_PROCESS_SIGNAL_HUP |
-                     SY_PROCESS_SIGNAL_INT |
-                     SY_PROCESS_SIGNAL_TERM,
-};
-
 SY_INIT_ENTRY sy_s64 declare(void) {
-  return sy_declare_process(&maintenance_shell, sizeof maintenance_shell);
+  sy_s64 shell = sy_json_parse(SY_STR(
+      "{\"id\":1,\"allow\":[\"pty\"],"
+      "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
+      "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
+  if (shell < 0) return shell;
+  sy_s64 declared = sy_declare_process(shell);
+  sy_close(shell);
+  return declared;
 }
 
-struct sy_pty_mode { sy_u32 opcode; sy_u32 value; };
+/* {"term", "columns", "rows", "pixel_width", "pixel_height",
+    "modes": [{"opcode", "value"}, ...]} — mode opcodes are RFC 4254 §8
+   wire values, so they stay numeric.                                   */
+sy_s64 sy_ssh_pty_spec(sy_u64 event_id);  /* protocol transform; no declaration */
 
-#define SY_PTY_MAX_MODES 64
-struct sy_pty_spec {
-  char term[64];
-  sy_u32 term_len;
-  sy_u32 columns, rows;
-  sy_u32 pixel_width, pixel_height;
-  sy_u32 mode_count;
-  struct sy_pty_mode modes[SY_PTY_MAX_MODES];
-};
-
-sy_s64 sy_ssh_pty_spec(
-    sy_u64 event_id,
-    struct sy_pty_spec *out,
-    sy_u64 out_len
-);                                      /* protocol transform; no declaration */
-
-sy_s64 sy_pty_open(
-    sy_u32 process_capability,
-    const struct sy_pty_spec *spec,
-    sy_u64 spec_len
-);                                      /* returns the PTY data endpoint */
+/* spec_json is the shape sy_ssh_pty_spec returns; the same handle can be
+   passed straight through. Returns the PTY data endpoint. */
+sy_s64 sy_pty_open(sy_u32 process_capability, sy_s64 spec_json);
 
 sy_s64 sy_process_spawn_pty(
     sy_u32 process_capability,
@@ -876,12 +800,8 @@ sy_s64 sy_process_spawn(
     sy_u32 process_capability
 );                                      /* exact pipe-backed process */
 
-#define SY_PROCESS_STDIO_MAIN   0       /* write stdin, read stdout */
-#define SY_PROCESS_STDIO_STDERR 1       /* read-only */
-sy_s64 sy_process_stdio(
-    sy_s64 process,
-    sy_u32 stream
-);
+/* stream: "main" (write stdin, read stdout) | "stderr" (read-only) */
+sy_s64 sy_process_stdio(sy_s64 process, const char *stream, sy_u64 stream_len);
 
 sy_s64 sy_pty_resize(
     sy_s64 pty,
@@ -891,20 +811,9 @@ sy_s64 sy_pty_resize(
     sy_u32 pixel_height
 );
 
-struct sy_process_status {
-  sy_u32 exited;
-  sy_u32 exit_code;
-  sy_u32 signaled;
-  sy_u32 core_dumped;
-  char signal[32];
-  sy_u32 signal_len;
-};
-
-sy_s64 sy_process_status(
-    sy_s64 process,
-    struct sy_process_status *out,
-    sy_u64 out_len
-);
+/* SY_EAGAIN while running; after exit a fresh JSON handle:
+   {"exited": true, "exit_code", "signaled", "core_dumped", "signal"?} */
+sy_s64 sy_process_status(sy_s64 process);
 sy_s64 sy_process_signal(
     sy_s64 process,
     const char *name,
@@ -914,11 +823,11 @@ sy_s64 sy_process_signal(
 
 `sy_ssh_pty_spec` is valid only for a typed `pty-req` event. It bounds and
 normalizes the terminal name and RFC terminal-mode opcode/value pairs; unknown
-opcodes retain the protocol's ignore semantics. It returns `0` with a complete
-spec or a negative error; a request exceeding either fixed bound is rejected
-rather than truncated. For `window-change`, the event
-header carries columns, rows, pixel width, and pixel height in `a`, `b`, `c`,
-and `d` respectively.
+opcodes retain the protocol's ignore semantics. It returns the spec as a JSON
+handle or a negative error; a request exceeding either bound (a 64-byte
+terminal name, 64 modes) is rejected rather than truncated. A `window-change`
+event carries the new `"columns"`, `"rows"`, `"pixel_width"` and
+`"pixel_height"` in its own JSON.
 
 `sy_pty_open` creates a master/slave PTY pair but starts no process. The selected
 declaration must permit PTY allocation; the helper returns the master as an
@@ -932,9 +841,9 @@ pipe-backed child. Closing the process handle kills and reaps a live child
 under fixed host shutdown policy, while closing the PTY supplies the ordinary
 terminal hangup.
 
-`sy_process_status` returns `SY_EAGAIN` while the child is running and `1`
-after filling the terminal status; repeated reads return the same status until
-the handle closes. `sy_process_signal` accepts only names permitted by the
+`sy_process_status` returns `SY_EAGAIN` while the child is running and a
+fresh JSON handle after exit; repeated reads return the same terminal status
+until the handle closes. `sy_process_signal` accepts only names permitted by the
 declaration and never interprets a guest-provided number.
 
 Pipe-backed processes expose stdio endpoints separately. PTY-backed processes
@@ -971,37 +880,23 @@ program-local id selects that declaration at runtime; there is no named service
 or operator configuration:
 
 ```c
-#define SY_FILE_TRANSFER_SFTP             0x01
-
-#define SY_FILE_TRANSFER_READ             0x01
-#define SY_FILE_TRANSFER_RECURSIVE        0x04
-
-struct sy_file_transfer_capability {
-  sy_u32 id;
-  sy_u32 protocol;
-  sy_u32 access;
-  char scope[256];
-  sy_u32 scope_len;
-};
-
-sy_s64 sy_declare_file_transfer(
-    const struct sy_file_transfer_capability *capability,
-    sy_u64 capability_len
-);
+/* {"id", "protocol": "sftp", "access": ["read", "recursive"?],
+    "scope" -- exact normalized tree path of at most 256 bytes} */
+sy_s64 sy_declare_file_transfer(sy_s64 capability_json);
 
 sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
 
 #define FILE_TRANSFER_RELEASES 1
-static const struct sy_file_transfer_capability releases = {
-  .id = FILE_TRANSFER_RELEASES,
-  .protocol = SY_FILE_TRANSFER_SFTP,
-  .access = SY_FILE_TRANSFER_READ | SY_FILE_TRANSFER_RECURSIVE,
-  .scope = "code/releases",
-  .scope_len = sizeof "code/releases" - 1,
-};
 
 SY_INIT_ENTRY sy_s64 declare(void) {
-  return sy_declare_file_transfer(&releases, sizeof releases);
+  sy_s64 releases = sy_json_parse(SY_STR(
+      "{\"id\":1,\"protocol\":\"sftp\","
+      "\"access\":[\"read\",\"recursive\"],"
+      "\"scope\":\"code/releases\"}"));
+  if (releases < 0) return releases;
+  sy_s64 declared = sy_declare_file_transfer(releases);
+  sy_close(releases);
+  return declared;
 }
 
 sy_s64 sftp = sy_sftp_open(FILE_TRANSFER_RELEASES);
@@ -1035,7 +930,7 @@ touching the built-in SFTP service.
 
 An OpenSSH control master is a client-side multiplexer. On the wire, every new
 command requested through it is an ordinary SSH `session` channel on the
-already authenticated connection. Each `SY_SSH_EVENT_CHANNEL_OPEN` whose type
+already authenticated connection. Each `channel_open` event whose type
 is `session` is independently accepted and receives a new virtual fd; its
 shell, exec, subsystem, data, EOF, exit status, and close lifecycle are
 independent of every other session.
@@ -1270,14 +1165,14 @@ is added.
 
 ### 14.1 ABI and policy
 
-- the SDK header and Rust constants agree on every method, event, result, lane
-  and struct layout;
+- the SDK header carries no numbered SSH constants, and every method, event
+  kind and field name the runtime serves resolves through the string maps;
 - `sy_ssh_start` needs no declaration and is refused in init mode;
 - a pristine stream upgrades, while every raw endpoint operation selects raw
   mode and makes a later upgrade fail without losing bytes;
 - every `sy_peer_*` identity query remains valid before `sy_ssh_start` without
   selecting raw mode, while endpoint byte operations still select it;
-- unsupported method bits and malformed responses fail closed;
+- unknown method names and malformed responses fail closed;
 - event tokens cannot be reused across completion, close or fd recycling.
 - capability declarations are self-contained, duplicate ids fail arming, and
   an id from another program root grants nothing;
@@ -1392,6 +1287,11 @@ struct echo_channel {
   char buf[512];
 };
 
+static int str_is(const char *value, const char *want) {
+  sy_u64 len = sy_strlen(want);
+  return sy_strlen(value) == len && sy_memcmp(value, want, len) == 0;
+}
+
 static int same_key(const sy_u8 a[32], const sy_u8 b[32]) {
   sy_u8 different = 0;
   for (sy_u32 i = 0; i < 32; i++) different |= a[i] ^ b[i];
@@ -1409,7 +1309,9 @@ SY_ENTRY sy_s64 entry(void) {
   if (sy_peer_device_key(peer) < 0 || !same_key(peer, allowed_peer))
     return 1;                         /* no SSH bytes have been sent */
 
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 1;
+  sy_s64 methods = sy_json_parse(SY_STR("[\"none\"]"));
+  if (methods < 0 || sy_ssh_start(SY_SELF, methods) < 0) return 1;
+  sy_close(methods);
 
   struct echo_channel slots[MAX_CHANNELS] = {0};
   for (sy_u32 i = 0; i < MAX_CHANNELS; i++) slots[i].fd = -1;
@@ -1435,20 +1337,33 @@ SY_ENTRY sy_s64 entry(void) {
     if (ready <= 0) break;
 
     if (pollfds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        /* Capture the dispatch facts, then close the JSON snapshot: the
+           event itself stays outstanding until a decision consumes it. */
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_s64 id = 0;
+        sy_json_get_i64(event, SY_STR("id"), &id);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_close(event);
+
+        if (str_is(kind, "auth_none")) {
+          sy_s64 accept = sy_json_parse(SY_STR("{\"result\":\"accept\"}"));
+          if (accept >= 0) {
+            sy_ssh_auth_reply((sy_u64)id, accept);
+            sy_close(accept);
+          }
           continue;
         }
 
-        if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+        if (str_is(kind, "channel_open")) {
           sy_s64 slot = free_slot(slots);
           if (slot < 0) {
-            sy_ssh_channel_reject(event.id, SY_SSH_OPEN_RESOURCE_SHORTAGE);
+            sy_ssh_channel_reject((sy_u64)id, SY_STR("resource_shortage"));
             continue;
           }
-          sy_s64 channel = sy_ssh_channel_accept(event.id);
+          sy_s64 channel = sy_ssh_channel_accept((sy_u64)id);
           if (channel >= 0) {
             slots[slot].fd = channel;
             slots[slot].read_done = 0;
@@ -1457,15 +1372,15 @@ SY_ENTRY sy_s64 entry(void) {
           continue;
         }
 
-        if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
-          if (event.flags & SY_SSH_EVENT_WANT_REPLY)
-            sy_ssh_request_reply(event.id, SY_SSH_REQUEST_FAILURE);
+        if (str_is(kind, "channel_request")) {
+          if (want_reply == 1)
+            sy_ssh_request_reply((sy_u64)id, 0);
           else
-            sy_ssh_event_done(event.id);
+            sy_ssh_event_done((sy_u64)id);
           continue;
         }
 
-        sy_ssh_event_done(event.id);   /* AUTHENTICATED notification, etc. */
+        sy_ssh_event_done((sy_u64)id);  /* authenticated notification, etc. */
       }
     }
 
@@ -1532,21 +1447,16 @@ static const sy_u8 shell_peer[32] = {
 };
 
 #define PROCESS_LOCAL_LOGIN_SHELL 1
-static const struct sy_process_capability local_login_shell = {
-  .id = PROCESS_LOCAL_LOGIN_SHELL,
-  .flags = SY_PROCESS_ALLOW_PTY,
-  .executable = "/bin/sh",
-  .executable_len = sizeof "/bin/sh" - 1,
-  .argc = 2,
-  .argv = { "sh", "-l" },
-  .argv_len = { 2, 2 },
-  .allowed_signals = SY_PROCESS_SIGNAL_HUP |
-                     SY_PROCESS_SIGNAL_INT |
-                     SY_PROCESS_SIGNAL_TERM,
-};
 
 SY_INIT_ENTRY sy_s64 declare(void) {
-  return sy_declare_process(&local_login_shell, sizeof local_login_shell);
+  sy_s64 shell = sy_json_parse(SY_STR(
+      "{\"id\":1,\"allow\":[\"pty\"],"
+      "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
+      "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
+  if (shell < 0) return shell;
+  sy_s64 declared = sy_declare_process(shell);
+  sy_close(shell);
+  return declared;
 }
 
 struct terminal {
@@ -1555,7 +1465,11 @@ struct terminal {
   sy_u32 shell_started;
   sy_u32 input_done;
   sy_u32 output_done;
-  struct sy_process_status status;    /* retained until PTY output drains */
+  /* status facts, read out of the JSON and retained until output drains */
+  sy_s64 exit_code;
+  sy_u32 signaled;
+  sy_u32 core_dumped;
+  char signal[32];
   sy_u32 have_status;
 };
 
@@ -1565,121 +1479,118 @@ static int same_iroh_key(const sy_u8 a[32], const sy_u8 b[32]) {
   return different == 0;
 }
 
-static int field_is(
-    sy_u64 event_id,
-    sy_u32 field,
-    const char *expected,
-    sy_u64 expected_len
-) {
-  char value[32];
-  sy_s64 len = sy_ssh_event_data(
-      event_id, field, value, sizeof value);
-  if (len != expected_len || expected_len > sizeof value) return 0;
-  for (sy_u64 i = 0; i < expected_len; i++)
-    if (value[i] != expected[i]) return 0;
-  return 1;
+/* `event` is the JSON handle from sy_ssh_next; `id` its outstanding token. */
+static sy_s64 finish_request(sy_s64 event, sy_u64 id, sy_u32 granted) {
+  if (sy_json_get_bool(event, SY_STR("want_reply")) == 1)
+    return sy_ssh_request_reply(id, granted);
+  return sy_ssh_event_done(id);
 }
 
-static sy_s64 finish_request(
-    const struct sy_ssh_event *event,
-    sy_u32 result
-) {
-  if (event->flags & SY_SSH_EVENT_WANT_REPLY)
-    return sy_ssh_request_reply(event->id, result);
-  return sy_ssh_event_done(event->id);
-}
-
-static sy_s64 handle_inner_auth(const struct sy_ssh_event *event) {
-  if (event->kind != SY_SSH_EVENT_AUTH_NONE)
-    return sy_ssh_auth_reply(
-        event->id, SY_SSH_AUTH_REJECT, SY_SSH_AUTH_NONE);
+static sy_s64 handle_inner_auth(sy_s64 event, sy_u64 id) {
+  char kind[40] = {0};
+  sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+  if (!str_is(kind, "auth_none")) {
+    sy_s64 reject = sy_json_parse(SY_STR(
+        "{\"result\":\"reject\",\"next_methods\":[\"none\"]}"));
+    if (reject < 0) return reject;
+    sy_s64 rc = sy_ssh_auth_reply(id, reject);
+    sy_close(reject);
+    return rc;
+  }
   /* Reaching this event means the hardcoded Iroh-key check already passed. */
-  return sy_ssh_auth_reply(event->id, SY_SSH_AUTH_ACCEPT, 0);
+  sy_s64 accept = sy_json_parse(SY_STR("{\"result\":\"accept\"}"));
+  if (accept < 0) return accept;
+  sy_s64 rc = sy_ssh_auth_reply(id, accept);
+  sy_close(accept);
+  return rc;
 }
 
 static sy_s64 accept_shell_channel(
-    const struct sy_ssh_event *event,
+    sy_s64 event,
+    sy_u64 id,
     struct terminal *terminal
 ) {
-  if (terminal->io.channel >= 0 ||
-      !field_is(event->id, SY_SSH_FIELD_CHANNEL_TYPE,
-                SY_STR("session")))
-    return sy_ssh_channel_reject(
-        event->id, SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+  char type[32] = {0};
+  sy_json_get_string(event, SY_STR("channel_type"), type, sizeof type);
+  if (terminal->io.channel >= 0 || !str_is(type, "session"))
+    return sy_ssh_channel_reject(id, SY_STR("administratively_prohibited"));
 
-  sy_s64 channel = sy_ssh_channel_accept(event->id);
+  sy_s64 channel = sy_ssh_channel_accept(id);
   if (channel < 0) return channel;
   terminal->io.channel = channel;
   return 0;
 }
 
 static sy_s64 handle_shell_request(
-    const struct sy_ssh_event *event,
+    sy_s64 event,
+    sy_u64 id,
     struct terminal *terminal
 ) {
-  if (event->fd != terminal->io.channel)
-    return finish_request(event, SY_SSH_REQUEST_FAILURE);
+  sy_s64 fd = -1;
+  sy_json_get_i64(event, SY_STR("fd"), &fd);
+  if (fd != terminal->io.channel)
+    return finish_request(event, id, 0);
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-               SY_STR("pty-req"))) {
+  char type[32] = {0};
+  sy_json_get_string(event, SY_STR("request_type"), type, sizeof type);
+
+  if (str_is(type, "pty-req")) {
     if (terminal->io.backend >= 0 || terminal->shell_started)
-      return finish_request(event, SY_SSH_REQUEST_FAILURE);
+      return finish_request(event, id, 0);
 
-    struct sy_pty_spec spec;
-    if (sy_ssh_pty_spec(event->id, &spec, sizeof spec) < 0)
-      return finish_request(event, SY_SSH_REQUEST_FAILURE);
+    sy_s64 spec = sy_ssh_pty_spec(id);
+    if (spec < 0) return finish_request(event, id, 0);
 
-    sy_s64 pty = sy_pty_open(
-        PROCESS_LOCAL_LOGIN_SHELL, &spec, sizeof spec);
-    if (pty < 0) return finish_request(event, SY_SSH_REQUEST_FAILURE);
+    sy_s64 pty = sy_pty_open(PROCESS_LOCAL_LOGIN_SHELL, spec);
+    sy_close(spec);
+    if (pty < 0) return finish_request(event, id, 0);
     terminal->io.backend = pty;        /* allocation starts no process */
-    return finish_request(event, SY_SSH_REQUEST_SUCCESS);
+    return finish_request(event, id, 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-               SY_STR("shell"))) {
+  if (str_is(type, "shell")) {
     if (terminal->io.backend < 0 || terminal->shell_started)
-      return finish_request(event, SY_SSH_REQUEST_FAILURE);
+      return finish_request(event, id, 0);
 
     sy_s64 process = sy_process_spawn_pty(
         PROCESS_LOCAL_LOGIN_SHELL, terminal->io.backend);
     if (process < 0)
-      return finish_request(event, SY_SSH_REQUEST_FAILURE);
+      return finish_request(event, id, 0);
 
     terminal->process = process;
     terminal->shell_started = 1;
     terminal->io.to_backend = (struct sy_pump)SY_PUMP_INIT;
     terminal->io.to_channel = (struct sy_pump)SY_PUMP_INIT;
-    return finish_request(event, SY_SSH_REQUEST_SUCCESS);
+    return finish_request(event, id, 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-               SY_STR("window-change"))) {
+  if (str_is(type, "window-change")) {
     if (terminal->io.backend < 0)
-      return finish_request(event, SY_SSH_REQUEST_FAILURE);
+      return finish_request(event, id, 0);
+    sy_s64 columns = 0, rows = 0, width = 0, height = 0;
+    sy_json_get_i64(event, SY_STR("columns"), &columns);
+    sy_json_get_i64(event, SY_STR("rows"), &rows);
+    sy_json_get_i64(event, SY_STR("pixel_width"), &width);
+    sy_json_get_i64(event, SY_STR("pixel_height"), &height);
     sy_s64 resized = sy_pty_resize(
         terminal->io.backend,
-        event->a, event->b, event->c, event->d);
-    return finish_request(
-        event, resized < 0 ? SY_SSH_REQUEST_FAILURE
-                           : SY_SSH_REQUEST_SUCCESS);
+        (sy_u32)columns, (sy_u32)rows, (sy_u32)width, (sy_u32)height);
+    return finish_request(event, id, resized < 0 ? 0 : 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-               SY_STR("signal"))) {
-    char signal[32];
-    sy_s64 len = sy_ssh_event_data(
-        event->id, SY_SSH_FIELD_SIGNAL, signal, sizeof signal);
-    sy_s64 sent = terminal->process < 0 || len < 0 || len > sizeof signal
+  if (str_is(type, "signal")) {
+    char signal[32] = {0};
+    sy_s64 len = sy_json_get_string(
+        event, SY_STR("signal"), signal, sizeof signal);
+    sy_s64 sent = terminal->process < 0 || len < 0 ||
+                          len >= (sy_s64)sizeof signal
         ? SY_EPERM
-        : sy_process_signal(terminal->process, signal, len);
-    return finish_request(
-        event, sent < 0 ? SY_SSH_REQUEST_FAILURE
-                        : SY_SSH_REQUEST_SUCCESS);
+        : sy_process_signal(terminal->process, signal, (sy_u64)len);
+    return finish_request(event, id, sent < 0 ? 0 : 1);
   }
 
   /* This interactive socket rejects exec, subsystem, env, and agent policy. */
-  return finish_request(event, SY_SSH_REQUEST_FAILURE);
+  return finish_request(event, id, 0);
 }
 
 static sy_s64 move_terminal(struct terminal *terminal) {
@@ -1715,7 +1626,9 @@ SY_ENTRY sy_s64 entry(void) {
       !same_iroh_key(peer, shell_peer))
     return 1;                           /* reject before SSH mode */
 
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 1;
+  sy_s64 methods = sy_json_parse(SY_STR("[\"none\"]"));
+  if (methods < 0 || sy_ssh_start(SY_SELF, methods) < 0) return 1;
+  sy_close(methods);
 
   struct terminal terminal = {0};
   terminal.io.channel = -1;
@@ -1724,11 +1637,12 @@ SY_ENTRY sy_s64 entry(void) {
 
   /* The §15.1 reactor now:
      - sends authentication events to handle_inner_auth;
-     - sends CHANNEL_OPEN to accept_shell_channel;
-     - sends CHANNEL_REQUEST to handle_shell_request;
+     - sends channel_open events to accept_shell_channel;
+     - sends channel_request events to handle_shell_request;
      - polls channel, PTY, process, and fd zero;
      - calls move_terminal according to both pumps' readiness;
-     - reads sy_process_status when the process handle becomes readable. */
+     - reads sy_process_status when the process handle becomes readable,
+       copying the status JSON's fields into `struct terminal`. */
   return run_interactive_reactor(&terminal);
 }
 ```
@@ -1782,30 +1696,25 @@ struct auth_files {
 #define PROCESS_ADMIN_STATUS    1
 #define PROCESS_PUBLISH_RELEASE 2
 
-static const struct sy_process_capability admin_status = {
-  .id = PROCESS_ADMIN_STATUS,
-  .flags = SY_PROCESS_ALLOW_PIPE,
-  .executable = "/usr/local/bin/admin-status",
-  .executable_len = sizeof "/usr/local/bin/admin-status" - 1,
-  .argc = 1,
-  .argv = { "admin-status" },
-  .argv_len = { sizeof "admin-status" - 1 },
-};
-
-static const struct sy_process_capability publish_release = {
-  .id = PROCESS_PUBLISH_RELEASE,
-  .flags = SY_PROCESS_ALLOW_PIPE,
-  .executable = "/usr/local/bin/publish-release",
-  .executable_len = sizeof "/usr/local/bin/publish-release" - 1,
-  .argc = 1,
-  .argv = { "publish-release" },
-  .argv_len = { sizeof "publish-release" - 1 },
-};
+static sy_s64 declare_one(const char *capability_json) {
+  sy_s64 capability = sy_json_parse(capability_json,
+                                    sy_strlen(capability_json));
+  if (capability < 0) return capability;
+  sy_s64 declared = sy_declare_process(capability);
+  sy_close(capability);
+  return declared;
+}
 
 SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 rc = sy_declare_process(&admin_status, sizeof admin_status);
+  sy_s64 rc = declare_one(
+      "{\"id\":1,\"allow\":[\"pipe\"],"
+      "\"executable\":\"/usr/local/bin/admin-status\","
+      "\"argv\":[\"admin-status\"]}");
   if (rc < 0) return rc;
-  return sy_declare_process(&publish_release, sizeof publish_release);
+  return declare_one(
+      "{\"id\":2,\"allow\":[\"pipe\"],"
+      "\"executable\":\"/usr/local/bin/publish-release\","
+      "\"argv\":[\"publish-release\"]}");
 }
 
 /* Called at invocation start, before any endpoint operation on SY_SELF. */
@@ -1819,55 +1728,66 @@ static sy_s64 begin_ssh(struct auth_files *files) {
     return files->deploy;
   }
 
-  return sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY);
+  sy_s64 methods = sy_json_parse(SY_STR("[\"publickey\"]"));
+  if (methods < 0) return methods;
+  sy_s64 started = sy_ssh_start(SY_SELF, methods);
+  sy_close(methods);
+  return started;
 }
 
-/* Called from the control-event branch of the reactor in example 15.1.
-   SY_EAGAIN means retain `event`, poll the key objects, and retry it. */
+static sy_s64 auth_reply_with(sy_u64 id, const char *reply_json) {
+  sy_s64 reply = sy_json_parse(reply_json, sy_strlen(reply_json));
+  if (reply < 0) return reply;
+  sy_s64 rc = sy_ssh_auth_reply(id, reply);
+  sy_close(reply);
+  return rc;
+}
+
+/* Called from the control-event branch of the reactor in example 15.1, with
+   the event's JSON handle and outstanding id. SY_EAGAIN means retain the
+   event, poll the key objects, and retry it. */
 static sy_s64 handle_auth(
-    const struct sy_ssh_event *event,
+    sy_s64 event,
+    sy_u64 id,
     const struct auth_files *files,
     enum principal *principal
 ) {
   enum principal candidate = PRINCIPAL_NONE;
-  sy_s64 matched = sy_ssh_authorized_keys_match(event->id, files->admin);
+  sy_s64 matched = sy_ssh_authorized_keys_match(id, files->admin);
   if (matched == SY_EAGAIN) return SY_EAGAIN;
   if (matched < 0) goto reject;
   if (matched == 1) {
     candidate = PRINCIPAL_ADMIN;
   } else {
-    matched = sy_ssh_authorized_keys_match(event->id, files->deploy);
+    matched = sy_ssh_authorized_keys_match(id, files->deploy);
     if (matched == SY_EAGAIN) return SY_EAGAIN;
     if (matched < 0) goto reject;
     if (matched == 1) candidate = PRINCIPAL_DEPLOY;
   }
 
-  if (event->kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER) {
-    return sy_ssh_auth_reply(
-        event->id,
-        candidate == PRINCIPAL_NONE
-            ? SY_SSH_AUTH_REJECT : SY_SSH_AUTH_OFFER_ACCEPT,
-        SY_SSH_AUTH_PUBLICKEY
-    );
+  if (kind_is(event, "auth_publickey_offer")) {
+    return auth_reply_with(id, candidate == PRINCIPAL_NONE
+        ? "{\"result\":\"reject\",\"next_methods\":[\"publickey\"]}"
+        : "{\"result\":\"offer_accept\",\"next_methods\":[\"publickey\"]}");
   }
 
-  if (event->kind == SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED &&
+  if (kind_is(event, "auth_publickey_verified") &&
       candidate != PRINCIPAL_NONE) {
     *principal = candidate;            /* connection-wide guest state */
-    return sy_ssh_auth_reply(event->id, SY_SSH_AUTH_ACCEPT, 0);
+    return auth_reply_with(id, "{\"result\":\"accept\"}");
   }
 
 reject:
-  return sy_ssh_auth_reply(event->id, SY_SSH_AUTH_REJECT,
-                           SY_SSH_AUTH_PUBLICKEY);
+  return auth_reply_with(id,
+      "{\"result\":\"reject\",\"next_methods\":[\"publickey\"]}");
 }
 
-/* `channel` was accepted only after CHANNEL_TYPE compared equal to "session".
-   This uses the single-stdio-endpoint process shape from §7.1. */
+/* `channel` was accepted only after "channel_type" compared equal to
+   "session". This uses the single-stdio-endpoint process shape from §7.1. */
 static sy_s64 start_for_request(
     enum principal principal,
     sy_s64 channel,
-    const struct sy_ssh_event *event,
+    sy_u64 event_id,
     struct attached *out,
     sy_s64 *process_out
 ) {
@@ -1877,17 +1797,17 @@ static sy_s64 start_for_request(
   } else if (principal == PRINCIPAL_DEPLOY) {
     capability = PROCESS_PUBLISH_RELEASE;
   } else {
-    return sy_ssh_request_reply(event->id, SY_SSH_REQUEST_FAILURE);
+    return sy_ssh_request_reply(event_id, 0);
   }
 
   sy_s64 process = sy_process_spawn(capability);
   if (process < 0)
-    return sy_ssh_request_reply(event->id, SY_SSH_REQUEST_FAILURE);
+    return sy_ssh_request_reply(event_id, 0);
 
-  sy_s64 stdio = sy_process_stdio(process, SY_PROCESS_STDIO_MAIN);
+  sy_s64 stdio = sy_process_stdio(process, SY_STR("main"));
   if (stdio < 0) {
     sy_close(process);
-    return sy_ssh_request_reply(event->id, SY_SSH_REQUEST_FAILURE);
+    return sy_ssh_request_reply(event_id, 0);
   }
 
   out->channel = channel;
@@ -1895,7 +1815,7 @@ static sy_s64 start_for_request(
   out->to_backend = (struct sy_pump)SY_PUMP_INIT;
   out->to_channel = (struct sy_pump)SY_PUMP_INIT;
   *process_out = process;
-  sy_ssh_request_reply(event->id, SY_SSH_REQUEST_SUCCESS);
+  sy_ssh_request_reply(event_id, 1);
   return 0;
 }
 ```
@@ -1906,7 +1826,7 @@ branch it calls `sy_pump(channel, backend, ...)` and
 `sy_pump(backend, channel, ...)` with separate state and buffers. Consequently
 an OpenSSH control master can run several instances concurrently while
 authentication remains connection-wide.
-Once `AUTHENTICATED` arrives, the reactor closes both key objects and frees
+Once `authenticated` arrives, the reactor closes both key objects and frees
 their handle slots. A cold tree read does not block the worker thread: the
 outstanding auth event is generational, and the reactor polls whichever object
 returned `SY_EAGAIN` until it can retry or the host authentication deadline
@@ -1922,57 +1842,49 @@ and explicitly copies bytes in both directions.
 #include <synch.h>
 
 #define FILE_TRANSFER_RELEASES 1
-static const struct sy_file_transfer_capability releases = {
-  .id = FILE_TRANSFER_RELEASES,
-  .protocol = SY_FILE_TRANSFER_SFTP,
-  .access = SY_FILE_TRANSFER_READ,
-  .scope = "code/releases",
-  .scope_len = sizeof "code/releases" - 1,
-};
 
 SY_INIT_ENTRY sy_s64 declare(void) {
-  return sy_declare_file_transfer(&releases, sizeof releases);
+  sy_s64 releases = sy_json_parse(SY_STR(
+      "{\"id\":1,\"protocol\":\"sftp\",\"access\":[\"read\"],"
+      "\"scope\":\"code/releases\"}"));
+  if (releases < 0) return releases;
+  sy_s64 declared = sy_declare_file_transfer(releases);
+  sy_close(releases);
+  return declared;
 }
 
-static int event_field_is(
-    sy_u64 id,
-    sy_u32 field,
-    const char *expected,
-    sy_u64 expected_len
-) {
-  char value[32];
-  sy_s64 len = sy_ssh_event_data(id, field, value, sizeof value);
-  if (len != expected_len || expected_len > sizeof value) return 0;
-  for (sy_u64 i = 0; i < expected_len; i++)
-    if (value[i] != expected[i]) return 0;
-  return 1;
+static int event_text_is(sy_s64 event, const char *key, const char *want) {
+  char value[32] = {0};
+  sy_s64 len = sy_json_get_string(event, key, sy_strlen(key),
+                                  value, sizeof value);
+  if (len < 0 || len >= (sy_s64)sizeof value) return 0;
+  return str_is(value, want);
 }
 
 /* The outer reactor has already authenticated the connection and accepted
-   this channel only after CHANNEL_TYPE compared equal to "session". */
+   this channel only after "channel_type" compared equal to "session". */
 static sy_s64 accept_sftp_request(
     sy_s64 channel,
-    const struct sy_ssh_event *event,
+    sy_s64 event,
+    sy_u64 id,
     struct attached *out
 ) {
-  if (!event_field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-                      SY_STR("subsystem")) ||
-      !event_field_is(event->id, SY_SSH_FIELD_SUBSYSTEM,
-                      SY_STR("sftp"))) {
-    if (event->flags & SY_SSH_EVENT_WANT_REPLY)
-      return sy_ssh_request_reply(event->id, SY_SSH_REQUEST_FAILURE);
-    return sy_ssh_event_done(event->id);
+  if (!event_text_is(event, "request_type", "subsystem") ||
+      !event_text_is(event, "subsystem", "sftp")) {
+    if (sy_json_get_bool(event, SY_STR("want_reply")) == 1)
+      return sy_ssh_request_reply(id, 0);
+    return sy_ssh_event_done(id);
   }
 
   sy_s64 sftp = sy_sftp_open(FILE_TRANSFER_RELEASES);
   if (sftp < 0)
-    return sy_ssh_request_reply(event->id, SY_SSH_REQUEST_FAILURE);
+    return sy_ssh_request_reply(id, 0);
 
   out->channel = channel;
   out->backend = sftp;
   out->to_backend = (struct sy_pump)SY_PUMP_INIT;
   out->to_channel = (struct sy_pump)SY_PUMP_INIT;
-  sy_ssh_request_reply(event->id, SY_SSH_REQUEST_SUCCESS);
+  sy_ssh_request_reply(id, 1);
   return 0;
 }
 
@@ -2003,7 +1915,7 @@ declaration and SFTP policy, not the SSH program's channel logic.
 ### 15.5 A generic `direct-tcpip` channel with declared egress
 
 Generic channels also remove the need for a forwarding-specific byte API. A
-program handling `SY_SSH_EVENT_CHANNEL_OPEN` can compare the channel type with
+program handling a `channel_open` event can compare the channel type with
 `direct-tcpip`, inspect the host-parsed destination fields, and open an
 ordinary declared TCP fd. It accepts the SSH channel only after the backend is
 available, then uses the same two-pump `struct attached`:
@@ -2015,24 +1927,24 @@ SY_INIT_ENTRY sy_s64 declare(void) {
 }
 
 static sy_s64 begin_git_forward(
-    const struct sy_ssh_event *event,
+    sy_s64 event,
+    sy_u64 id,
     sy_u64 *pending_event,
     sy_s64 *pending_tcp
 ) {
-  if (!event_field_is(event->id, SY_SSH_FIELD_CHANNEL_TYPE,
-                      SY_STR("direct-tcpip")) ||
-      !event_field_is(event->id, SY_SSH_FIELD_DESTINATION_HOST,
-                      SY_STR("git.internal")) ||
-      event->a != 9418) {
-    return sy_ssh_channel_reject(
-        event->id, SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+  sy_s64 port = -1;
+  sy_json_get_i64(event, SY_STR("port"), &port);
+  if (!event_text_is(event, "channel_type", "direct-tcpip") ||
+      !event_text_is(event, "destination_host", "git.internal") ||
+      port != 9418) {
+    return sy_ssh_channel_reject(id, SY_STR("administratively_prohibited"));
   }
 
   sy_s64 tcp = sy_tcp_connect(SY_STR("git.internal"), 9418);
   if (tcp < 0)
-    return sy_ssh_channel_reject(event->id, SY_SSH_OPEN_CONNECT_FAILED);
+    return sy_ssh_channel_reject(id, SY_STR("connect_failed"));
 
-  *pending_event = event->id;          /* event token remains outstanding */
+  *pending_event = id;                 /* event token remains outstanding */
   *pending_tcp = tcp;
   return 0;
 }

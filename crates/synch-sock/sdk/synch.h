@@ -28,8 +28,15 @@
  *      complete write would have needed, so a value larger than your buffer is
  *      detectable without a second call.
  *
+ *   4. Structured data crosses the boundary as JSON handles (`sy_json_*`),
+ *      never as C structs or numbered enums: a stat result, an SSH event, a
+ *      process status, a backing-service declaration are all JSON values the
+ *      host owns, navigated and read through small integer handles and
+ *      released with `sy_close`. The one struct left is `sy_pollfd`, because
+ *      poll is the hot path.
+ *
  * Authorization is the handshake, not the payload. `sy_peer_origin`,
- * `sy_peer_kind` and `sy_peer_has_space` read an identity iroh authenticated
+ * `sy_peer_info` and `sy_peer_has_space` read an identity iroh authenticated
  * before your program started. `sy_conn_meta` is the caller's own text and is
  * not any of those things.
  */
@@ -101,28 +108,98 @@ struct sy_pollfd {
   sy_u32 revents;
 };
 
-/* `kind` takes the values below; `root` is the BLAKE3 content root. */
-struct sy_stat {
-  sy_u64 size;
-  sy_s64 mtime_ns;
-  sy_u32 mode;
-  sy_u32 kind;
-  sy_u8 root[32];
-};
+/* ---- JSON values --------------------------------------------------------
+ *
+ * Structured data lives host-side as JSON; the guest holds handles into the
+ * same table endpoints and objects come from, released with `sy_close` and
+ * charged against the same per-invocation footprint. Every handle owns its
+ * own value: `sy_json_get`/`sy_json_array_get` return a *copy* as a fresh
+ * handle, and `sy_json_set`/`sy_json_array_push` copy the inserted value in,
+ * so no two handles ever alias and nested documents are built bottom-up.
+ * Valid in `synchronicity.init` too — the declaration helpers take JSON. */
 
-#define SY_KIND_FILE      0
-#define SY_KIND_DIR       1
-#define SY_KIND_SYMLINK   2
-#define SY_KIND_TOMBSTONE 3
-#define SY_KIND_SOCKET    4
+#define SY_JSON_NULL   0
+#define SY_JSON_BOOL   1
+#define SY_JSON_NUMBER 2
+#define SY_JSON_STRING 3
+#define SY_JSON_ARRAY  4
+#define SY_JSON_OBJECT 5
 
-#define SY_PEER_MEMBER   1
-#define SY_PEER_DELEGATE 2
+/* Parses UTF-8 JSON text into a fresh handle. */
+extern sy_s64 sy_json_parse(const void *data, sy_u64 data_len);
+/* Serializes a handle's value; snprintf semantics. */
+extern sy_s64 sy_json_stringify(sy_s64 json, char *out, sy_u64 out_len);
+extern sy_s64 sy_json_new_object(void);
+extern sy_s64 sy_json_new_array(void);
+/* SY_JSON_*. */
+extern sy_s64 sy_json_type(sy_s64 json);
+/* Elements of an array, keys of an object, bytes of a string. */
+extern sy_s64 sy_json_len(sy_s64 json);
+/* A copy of one object member as a fresh handle; SY_ENOENT if absent. */
+extern sy_s64 sy_json_get(sy_s64 json, const char *key, sy_u64 key_len);
+/* A copy of one array element as a fresh handle; SY_ENOENT past the end. */
+extern sy_s64 sy_json_array_get(sy_s64 json, sy_u64 index);
+/* The value at the handle, which must be a string; snprintf semantics. */
+extern sy_s64 sy_json_read_string(sy_s64 json, char *out, sy_u64 out_len);
+/* Writes the number as a little-endian sy_s64 into `out` (>= 8 bytes). A
+ * number that does not fit an sy_s64 exactly is SY_EINVAL. */
+extern sy_s64 sy_json_read_i64(sy_s64 json, void *out, sy_u64 out_len);
+/* 1 or 0 for a boolean value; SY_EINVAL for anything else. */
+extern sy_s64 sy_json_read_bool(sy_s64 json);
+/* Inserts a copy of `value_json` under `key`; the target must be an object. */
+extern sy_s64 sy_json_set(sy_s64 json, const char *key, sy_u64 key_len,
+                          sy_s64 value_json);
+extern sy_s64 sy_json_remove(sy_s64 json, const char *key, sy_u64 key_len);
+/* Appends a copy of `value_json`; the target must be an array. */
+extern sy_s64 sy_json_array_push(sy_s64 json, sy_s64 value_json);
+/* The set_* helpers replace the handle's own value in place. */
+extern sy_s64 sy_json_set_string(sy_s64 json, const char *value,
+                                 sy_u64 value_len);
+extern sy_s64 sy_json_set_i64(sy_s64 json, sy_s64 value);
+extern sy_s64 sy_json_set_bool(sy_s64 json, sy_u64 value);
+extern sy_s64 sy_json_set_null(sy_s64 json);
 
-#define SY_BASE64_STANDARD        0
-#define SY_BASE64_STANDARD_NO_PAD 1
-#define SY_BASE64_URL             2
-#define SY_BASE64_URL_NO_PAD      3
+/* Declared ahead of its section: the conveniences below release their
+ * intermediate handle with it. A repeated declaration is ordinary C. */
+extern sy_s64 sy_close(sy_s64 handle);
+
+/* One object member's scalar, without keeping the intermediate handle: get,
+ * read, close. Guest-side because they are the same three calls in every
+ * program. Negative on error, including SY_ENOENT for an absent key. */
+SY_MAYBE_UNUSED static sy_s64 sy_json_get_string(sy_s64 json, const char *key,
+                                                 sy_u64 key_len, char *out,
+                                                 sy_u64 out_len) {
+  sy_s64 member = sy_json_get(json, key, key_len);
+  if (member < 0) return member;
+  sy_s64 n = sy_json_read_string(member, out, out_len);
+  sy_close(member);
+  return n;
+}
+
+SY_MAYBE_UNUSED static sy_s64 sy_json_get_i64(sy_s64 json, const char *key,
+                                              sy_u64 key_len, sy_s64 *out) {
+  sy_s64 member = sy_json_get(json, key, key_len);
+  if (member < 0) return member;
+  sy_s64 n = sy_json_read_i64(member, out, sizeof *out);
+  sy_close(member);
+  return n;
+}
+
+/* 1, 0, or negative — SY_ENOENT when absent, so a missing flag can default
+ * either way at the call site: `sy_json_get_bool(...) == 1`. */
+SY_MAYBE_UNUSED static sy_s64 sy_json_get_bool(sy_s64 json, const char *key,
+                                               sy_u64 key_len) {
+  sy_s64 member = sy_json_get(json, key, key_len);
+  if (member < 0) return member;
+  sy_s64 value = sy_json_read_bool(member);
+  sy_close(member);
+  return value;
+}
+
+/* Flags for sy_base64_encode / sy_base64_decode_in_place: two orthogonal
+ * booleans, combinable with `|`, rather than a numbered alphabet enum. */
+#define SY_BASE64_URL    0x1 /* URL-safe alphabet   */
+#define SY_BASE64_NO_PAD 0x2 /* no `=` padding      */
 
 /* ---- diagnostics and configuration ------------------------------------- */
 
@@ -148,7 +225,11 @@ extern sy_s64 sy_peer_origin(char *out, sy_u64 out_len);
 /* Writes the caller's raw 32-byte device key: the identity that survives an
  * origin rename, and the right key for a per-caller rate limit. */
 extern sy_s64 sy_peer_device_key(void *out32);
-extern sy_s64 sy_peer_kind(void);
+/* The whole authenticated identity as one JSON handle: {"origin",
+ * "device_key" (hex), "kind" ("member" | "delegate"), "addr",
+ * "stream_index"}. `sy_json_get_string(info, SY_STR("kind"), ...)` is the
+ * one-line way to ask "is this a rooted member?". */
+extern sy_s64 sy_peer_info(void);
 /* 1 if the caller may read that space: always so for a rooted member, and
  * list membership for a delegate. The one-line way to write "only the people I
  * gave `code` to". */
@@ -211,97 +292,53 @@ extern sy_s64 sy_tcp_connect(const char *host, sy_u64 host_len, sy_u64 port);
 extern sy_s64 sy_tcp_connect_ip(const void *addr, sy_u64 addr_len, sy_u64 port);
 extern sy_s64 sy_endpoint_info(sy_s64 handle, char *out, sy_u64 out_len);
 
-/* ---- SSH protocol termination ------------------------------------------ */
+/* ---- SSH protocol termination ------------------------------------------
+ *
+ * Events, replies and specs are JSON (`docs/SSH-SOCKETS.md`). An event's
+ * JSON names its kind — "auth_none", "auth_password", "auth_publickey_offer",
+ * "auth_publickey_verified", "auth_openssh_cert", "authenticated",
+ * "channel_open", "channel_request", "channel_extended_data" — and carries
+ * the decoded fields for that kind: "username", "service", "password",
+ * "channel_type", "request_type", "want_reply", "terminal", "env_name" /
+ * "env_value", "command", "subsystem", "signal", "destination_host" /
+ * "originator_host" / "port" / "originator_port", "columns" / "rows" /
+ * "pixel_width" / "pixel_height", "data_type", "auth_attempts",
+ * "public_key_algorithm", "public_key_sha256" (hex), and for certificates a
+ * "cert" object: {"ca_public_key_sha256" (hex), "key_id", "serial", "type"
+ * ("user" | "host"), "principals": [...]}. */
 
-#define SY_SSH_AUTH_NONE      0x01
-#define SY_SSH_AUTH_PUBLICKEY 0x02
-#define SY_SSH_AUTH_PASSWORD  0x04
-
-#define SY_SSH_AUTH_ACCEPT       1
-#define SY_SSH_AUTH_REJECT       2
-#define SY_SSH_AUTH_PARTIAL      3
-#define SY_SSH_AUTH_OFFER_ACCEPT 4
-
-#define SY_SSH_EVENT_AUTH_NONE               1
-#define SY_SSH_EVENT_AUTH_PASSWORD           2
-#define SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER    3
-#define SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED 4
-#define SY_SSH_EVENT_AUTHENTICATED           5
-#define SY_SSH_EVENT_CHANNEL_OPEN            6
-#define SY_SSH_EVENT_CHANNEL_REQUEST         7
-#define SY_SSH_EVENT_CHANNEL_EXTENDED_DATA   8
-/* 9, not 5: 5 is SY_SSH_EVENT_AUTHENTICATED, and event kinds are a shared
- * ABI. A certificate authentication is a real authentication (the SSH
- * library has validated its structure, validity, user principal and
- * possession signature), not an offer. The guest must still authorize the
- * signing CA through the AUTH_CERT_CA fields below. */
-#define SY_SSH_EVENT_AUTH_OPENSSH_CERT       9
-
-#define SY_SSH_EVENT_WANT_REPLY 0x01
-
-#define SY_SSH_FIELD_USERNAME             1
-#define SY_SSH_FIELD_SERVICE              2
-#define SY_SSH_FIELD_PASSWORD             3
-#define SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM 4
-#define SY_SSH_FIELD_PUBLIC_KEY_BLOB      5
-#define SY_SSH_FIELD_PUBLIC_KEY_SHA256    6
-#define SY_SSH_FIELD_COMMAND              8
-#define SY_SSH_FIELD_SUBSYSTEM            9
-#define SY_SSH_FIELD_CHANNEL_TYPE        10
-#define SY_SSH_FIELD_CHANNEL_OPEN_DATA   11
-#define SY_SSH_FIELD_REQUEST_TYPE        12
-#define SY_SSH_FIELD_REQUEST_DATA        13
-#define SY_SSH_FIELD_DESTINATION_HOST    14
-#define SY_SSH_FIELD_ORIGINATOR_HOST     15
-#define SY_SSH_FIELD_SIGNAL              16
-#define SY_SSH_FIELD_TERMINAL            17
-#define SY_SSH_FIELD_ENV_NAME            18
-#define SY_SSH_FIELD_ENV_VALUE           19
-#define SY_SSH_FIELD_AUTH_ATTEMPTS       20
-#define SY_SSH_FIELD_AUTH_CERT_FLAG      21
-#define SY_SSH_FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB 22
-#define SY_SSH_FIELD_AUTH_CERT_CA_SHA256 23
-#define SY_SSH_FIELD_AUTH_CERT_KEY_ID    24
-#define SY_SSH_FIELD_AUTH_CERT_SERIAL    25 /* little-endian u64 */
-#define SY_SSH_FIELD_AUTH_CERT_TYPE      26 /* little-endian u32: user=1 */
-/* Repeated little-endian u32 byte length followed by UTF-8 principal bytes. */
-#define SY_SSH_FIELD_AUTH_CERT_PRINCIPALS 27
-#define SY_SSH_FIELD_AUTH_CERT_BLOB      28
-
-struct sy_ssh_event {
-  sy_u64 id;
-  sy_s64 fd;
-  sy_u32 kind;
-  sy_u32 flags;
-  sy_u32 data_len;
-  sy_u32 aux_len;
-  sy_u32 a;
-  sy_u32 b;
-  sy_u32 c;
-  sy_u32 d;
-};
-
-extern sy_s64 sy_ssh_start(sy_s64 stream, sy_u64 initial_auth_methods);
-/* 1 with one event copied out, SY_EAGAIN while the queue is empty on a live
- * connection, 0 once it is empty after HUP: no further event will arrive. */
-extern sy_s64 sy_ssh_next(sy_s64 conn, struct sy_ssh_event *out,
-                          sy_u64 out_len);
-extern sy_s64 sy_ssh_event_data(sy_u64 event_id, sy_u32 field, void *out,
-                                sy_u64 out_len);
+/* Starts SSH on the inbound stream. `auth_methods_json` is a JSON array of
+ * method names — "none", "publickey", "password" — naming what the client
+ * may attempt first. */
+extern sy_s64 sy_ssh_start(sy_s64 stream, sy_s64 auth_methods_json);
+/* One event as a fresh JSON handle (> 0) — close it with sy_close whenever;
+ * the event itself stays outstanding until answered. SY_EAGAIN while the
+ * queue is empty on a live connection, 0 once it is empty after HUP: no
+ * further event will arrive. */
+extern sy_s64 sy_ssh_next(sy_s64 conn);
+/* One raw field of an outstanding event, byte-for-byte as the wire carried
+ * it, named by string: everything the JSON view decodes, plus what it leaves
+ * out on purpose — "public_key_blob", "cert_blob", "ca_public_key_blob",
+ * "open_data", "request_data", and a "command" that is not UTF-8. Returns
+ * the field's full length, snprintf-style. */
+extern sy_s64 sy_ssh_event_data(sy_u64 event_id, const char *field,
+                                sy_u64 field_len, void *out, sy_u64 out_len);
 extern sy_s64 sy_ssh_event_done(sy_u64 event_id);
-extern sy_s64 sy_ssh_auth_reply(sy_u64 event_id, sy_u32 result,
-                                sy_u64 next_methods);
+/* Answers an auth event with JSON: {"result": "accept" | "reject" |
+ * "partial" | "offer_accept", "next_methods": ["publickey", ...]?}.
+ * "offer_accept" is valid only on an "auth_publickey_offer" — it tells the
+ * client to proceed to the signed attempt, and is not an authentication.
+ * Absent "next_methods" leaves nothing further attemptable, fail-closed. */
+extern sy_s64 sy_ssh_auth_reply(sy_u64 event_id, sy_s64 reply_json);
 /* Matches only option-free authorized_keys records. A cold immutable object
  * returns SY_EAGAIN and becomes pollable; retry with the same event token. */
 extern sy_s64 sy_ssh_authorized_keys_match(sy_u64 event_id, sy_s64 object);
 
-#define SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED 1
-#define SY_SSH_OPEN_CONNECT_FAILED              2
-#define SY_SSH_OPEN_UNKNOWN_CHANNEL_TYPE        3
-#define SY_SSH_OPEN_RESOURCE_SHORTAGE           4
-
 extern sy_s64 sy_ssh_channel_accept(sy_u64 event_id);
-extern sy_s64 sy_ssh_channel_reject(sy_u64 event_id, sy_u32 reason);
+/* `reason` is "administratively_prohibited", "connect_failed",
+ * "unknown_channel_type" or "resource_shortage". */
+extern sy_s64 sy_ssh_channel_reject(sy_u64 event_id, const char *reason,
+                                    sy_u64 reason_len);
 extern sy_s64 sy_ssh_channel_open(sy_s64 conn, const char *type,
                                   sy_u64 type_len, const void *open_data,
                                   sy_u64 open_data_len);
@@ -309,27 +346,17 @@ extern sy_s64 sy_ssh_channel_type(sy_s64 channel, char *out, sy_u64 out_len);
 #define SY_SSH_EXTENDED_STDERR 1
 extern sy_s64 sy_ssh_channel_lane(sy_s64 channel, sy_u32 data_type);
 
-#define SY_SSH_REQUEST_FAILURE 0
-#define SY_SSH_REQUEST_SUCCESS 1
-extern sy_s64 sy_ssh_request_reply(sy_u64 event_id, sy_u32 result);
+/* `granted` is 1 to grant the request or 0 to refuse it. */
+extern sy_s64 sy_ssh_request_reply(sy_u64 event_id, sy_u32 granted);
 extern sy_s64 sy_ssh_exit_status(sy_s64 channel, sy_u32 status);
 extern sy_s64 sy_ssh_exit_signal(sy_s64 channel, const char *name,
                                  sy_u64 name_len, sy_u32 core_dumped);
 
-struct sy_pty_mode { sy_u32 opcode; sy_u32 value; };
-#define SY_PTY_MAX_MODES 64
-struct sy_pty_spec {
-  char term[64];
-  sy_u32 term_len;
-  sy_u32 columns;
-  sy_u32 rows;
-  sy_u32 pixel_width;
-  sy_u32 pixel_height;
-  sy_u32 mode_count;
-  struct sy_pty_mode modes[SY_PTY_MAX_MODES];
-};
-extern sy_s64 sy_ssh_pty_spec(sy_u64 event_id, struct sy_pty_spec *out,
-                              sy_u64 out_len);
+/* A `pty-req`'s terminal parameters, as a JSON handle: {"term", "columns",
+ * "rows", "pixel_width", "pixel_height", "modes": [{"opcode", "value"}, ...]}.
+ * The mode opcodes are SSH wire values (RFC 4254 §8), so they stay numeric.
+ * The same shape — the same handle, even — is what sy_pty_open takes. */
+extern sy_s64 sy_ssh_pty_spec(sy_u64 event_id);
 /* Number of exit-status/exit-signal deliveries that could not be sent to the
    SSH client since the connection started (channel closed, connection gone,
    or invocation torn down). Nonzero means the last process status may be
@@ -339,30 +366,22 @@ extern sy_s64 sy_ssh_exit_status_lost(sy_s64 conn);
 
 /* ---- declared process and PTY backing ---------------------------------- */
 
-extern sy_s64 sy_pty_open(sy_u32 process_capability,
-                          const struct sy_pty_spec *spec, sy_u64 spec_len);
+/* `spec_json` is the shape sy_ssh_pty_spec returns; that handle can be
+ * passed straight through. */
+extern sy_s64 sy_pty_open(sy_u32 process_capability, sy_s64 spec_json);
 extern sy_s64 sy_process_spawn_pty(sy_u32 process_capability, sy_s64 pty);
 extern sy_s64 sy_process_spawn(sy_u32 process_capability);
 
-#define SY_PROCESS_STDIO_MAIN   0
-#define SY_PROCESS_STDIO_STDERR 1
-extern sy_s64 sy_process_stdio(sy_s64 process, sy_u32 stream);
+/* `stream` names a stdio endpoint: "main" (stdin/stdout) or "stderr". */
+extern sy_s64 sy_process_stdio(sy_s64 process, const char *stream,
+                               sy_u64 stream_len);
 extern sy_s64 sy_pty_resize(sy_s64 pty, sy_u32 columns, sy_u32 rows,
                             sy_u32 pixel_width, sy_u32 pixel_height);
 
-struct sy_process_status {
-  sy_u32 exited;
-  sy_u32 exit_code;
-  sy_u32 signaled;
-  sy_u32 core_dumped;
-  char signal[32];
-  sy_u32 signal_len;
-};
-/* Returns SY_EAGAIN while running and 1 after filling `out`; terminal status
- * is repeatable until the process handle is closed. */
-extern sy_s64 sy_process_status(sy_s64 process,
-                                struct sy_process_status *out,
-                                sy_u64 out_len);
+/* SY_EAGAIN while running; after exit, a fresh JSON handle — {"exited":
+ * true, "exit_code", "signaled", "core_dumped", "signal"?} — repeatable
+ * until the process handle is closed. */
+extern sy_s64 sy_process_status(sy_s64 process);
 extern sy_s64 sy_process_signal(sy_s64 process, const char *name,
                                 sy_u64 name_len);
 
@@ -387,7 +406,10 @@ extern sy_s64 sy_open(const char *path, sy_u64 path_len);
 extern sy_s64 sy_open_from(const char *origin, sy_u64 origin_len,
                            const char *path, sy_u64 path_len);
 extern sy_s64 sy_open_root(const void *root32);
-extern sy_s64 sy_stat(sy_s64 obj, void *out, sy_u64 out_len);
+/* The object's metadata as a JSON handle: {"size", "mtime_ns", "mode",
+ * "kind" ("file" | "dir" | "symlink" | "tombstone" | "socket"),
+ * "root" (the BLAKE3 content root, hex)}. */
+extern sy_s64 sy_stat(sy_s64 obj);
 /* Verified range read. Bytes already held return at once; bytes that must be
  * fetched from a peer return SY_EAGAIN and the handle becomes pollable, so a
  * cold read is an ordinary poll wait rather than a hidden stall. */
@@ -437,9 +459,11 @@ extern sy_s64 sy_blake3(const void *data, sy_u64 len, void *out32);
 extern sy_s64 sy_sha256(const void *data, sy_u64 len, void *out32);
 extern sy_s64 sy_hmac_sha256(const void *key, sy_u64 key_len, const void *msg,
                              sy_u64 msg_len, void *out32);
+/* `flags` is any combination of SY_BASE64_URL and SY_BASE64_NO_PAD; 0 is
+ * the standard alphabet, padded. */
 extern sy_s64 sy_base64_encode(const void *data, sy_u64 len, void *out,
-                               sy_u64 out_len, sy_u64 alphabet);
-extern sy_s64 sy_base64_decode_in_place(void *buf, sy_u64 len, sy_u64 alphabet);
+                               sy_u64 out_len, sy_u64 flags);
+extern sy_s64 sy_base64_decode_in_place(void *buf, sy_u64 len, sy_u64 flags);
 extern sy_s64 sy_hex_encode(const void *data, sy_u64 len, void *out,
                             sy_u64 out_len, sy_u64 uppercase);
 extern sy_s64 sy_hex_decode_in_place(void *buf, sy_u64 len);
@@ -458,50 +482,28 @@ extern sy_s64 sy_declare_stack_frame_size(sy_u64 bytes);
  * frames. Disabling guards permits sizes not aligned to the host page. */
 extern sy_s64 sy_declare_guarded_stack_frames(sy_u64 enabled);
 
-/* Backing-service declarations are complete values embedded in the object.
- * Their ids are nonzero and local to this exact program root; no operator-side
- * registry or mutable named configuration is consulted at runtime. */
-#define SY_PROCESS_MAX_ARGS 8
-#define SY_PROCESS_ARG_MAX 128
-#define SY_PROCESS_EXECUTABLE_MAX 256
+/* Backing-service declarations are complete JSON values embedded in the
+ * object. Their ids are nonzero and local to this exact program root; no
+ * operator-side registry or mutable named configuration is consulted at
+ * runtime.
+ *
+ * A process capability is an object: {"id", "allow": ["pty" | "pipe", ...],
+ * "executable" (exact absolute path), "argv" (exact argv, argv[0] included,
+ * one through eight arguments of at most 128 bytes),
+ * "allowed_signals": ["HUP" | "INT" | "TERM", ...]?}.
+ *
+ *   sy_s64 shell = sy_json_parse(SY_STR(
+ *       "{\"id\":1,\"allow\":[\"pty\"],\"executable\":\"/bin/bash\","
+ *       "\"argv\":[\"bash\"],\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
+ *   sy_declare_process(shell);
+ *   sy_close(shell);
+ */
+extern sy_s64 sy_declare_process(sy_s64 capability_json);
 
-#define SY_PROCESS_ALLOW_PTY  0x01
-#define SY_PROCESS_ALLOW_PIPE 0x02
-
-#define SY_PROCESS_SIGNAL_HUP  (1ull << 0)
-#define SY_PROCESS_SIGNAL_INT  (1ull << 1)
-#define SY_PROCESS_SIGNAL_TERM (1ull << 2)
-
-struct sy_process_capability {
-  sy_u32 id;
-  sy_u32 flags;
-  char executable[SY_PROCESS_EXECUTABLE_MAX];
-  sy_u32 executable_len;
-  sy_u32 argc;
-  char argv[SY_PROCESS_MAX_ARGS][SY_PROCESS_ARG_MAX];
-  sy_u32 argv_len[SY_PROCESS_MAX_ARGS];
-  sy_u64 allowed_signals;
-};
-
-extern sy_s64 sy_declare_process(
-    const struct sy_process_capability *capability, sy_u64 capability_len);
-
-#define SY_FILE_TRANSFER_SFTP              0x01
-#define SY_FILE_TRANSFER_READ              0x01
-#define SY_FILE_TRANSFER_RECURSIVE         0x04
-#define SY_FILE_TRANSFER_SCOPE_MAX 256
-
-struct sy_file_transfer_capability {
-  sy_u32 id;
-  sy_u32 protocol;
-  sy_u32 access;
-  char scope[SY_FILE_TRANSFER_SCOPE_MAX];
-  sy_u32 scope_len;
-};
-
-extern sy_s64 sy_declare_file_transfer(
-    const struct sy_file_transfer_capability *capability,
-    sy_u64 capability_len);
+/* A file-transfer capability is an object: {"id", "protocol": "sftp",
+ * "access": ["read", "recursive"?], "scope" (exact normalized tree path of
+ * at most 256 bytes)}. */
+extern sy_s64 sy_declare_file_transfer(sy_s64 capability_json);
 
 /* ---- what the compiler calls whether you write it or not ---------------- */
 

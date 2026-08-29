@@ -219,7 +219,8 @@ pub struct ObjectInfo {
     pub mtime_ns: i64,
     /// Advisory unix mode, or zero.
     pub mode: u32,
-    /// The entry kind, as `SY_KIND_*`.
+    /// The entry kind: 0 file, 1 dir, 2 symlink, 3 tombstone, 4 socket.
+    /// `sy_stat` renders it as the corresponding name.
     pub kind: u32,
 }
 

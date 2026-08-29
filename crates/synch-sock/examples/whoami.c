@@ -47,9 +47,14 @@ SY_ENTRY sy_s64 entry(void) {
   sy_hex_encode(key, sizeof key, hex, sizeof hex, 0);
   field("peer-key:     ", hex, sy_strlen(hex));
 
-  sy_s64 kind = sy_peer_kind();
-  field("peer-kind:    ", kind == SY_PEER_MEMBER ? "member" : "delegate",
-        kind == SY_PEER_MEMBER ? 6 : 8);
+  /* The identity JSON names the kind; no numbered enum to translate. */
+  sy_s64 info = sy_peer_info();
+  char kind[16] = "unknown";
+  if (info >= 0) {
+    sy_json_get_string(info, SY_STR("kind"), kind, sizeof kind);
+    sy_close(info);
+  }
+  field("peer-kind:    ", kind, sy_strlen(kind));
 
   /* A rooted member reads every space by construction; a delegate reads the
      list its delegation names. Asking about one space is the whole of an

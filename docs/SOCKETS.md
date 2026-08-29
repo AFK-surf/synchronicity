@@ -28,8 +28,10 @@ device identity.
 
 The host API is designed against [zeroserve][zs], which runs the same runtime
 per HTTP request: flat `extern` helpers, `(ptr, len)` string pairs, `snprintf`
-return semantics, small-integer handles into host-side tables, and entrypoints
-named by ELF section.
+return semantics, small-integer handles into host-side tables, entrypoints
+named by ELF section — and JSON handles (`sy_json_*`, §7.11) for everything
+structured, so no C struct layout or numbered enum is part of the ABI beyond
+`struct sy_pollfd`.
 
 ## 1. The asymmetry everything follows from
 
@@ -253,7 +255,7 @@ with the same shape and no new mechanism.
   rooted member, the delegated list for a delegate (§3.5). A delegate that
   connects to a socket outside its list gets `SpaceNotDelegated`, which is the
   same answer §5.5 gives it for the metadata.
-- **Inside the program** — `sy_peer_origin()`, `sy_peer_kind()` and
+- **Inside the program** — `sy_peer_origin()`, `sy_peer_info()` and
   `sy_peer_has_space()` read the *handshake's* identity, never the payload's. A
   socket that wants finer rules than membership writes them itself, over facts
   the caller cannot forge.
@@ -348,7 +350,7 @@ KiB-page hosts. A program built for another value must pass that value to
 | Table | Scope | Bound |
 | --- | --- | --- |
 | endpoint table | per invocation | 32 handles, `SY_SELF` included |
-| object table | per invocation | shares the 32-handle table with endpoints, 1 MiB footprint |
+| object table | per invocation | shares the 32-handle table with endpoints, 1 MiB footprint; JSON values (§7.11) live here too |
 | socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each
@@ -396,9 +398,15 @@ automatically by `synch socket build` (§9).
 #define SY_POLL_ERR  0x8   /* sy_errno(h) says what                               */
 #define SY_POLL_RDHUP 0x10  /* peer write-half EOF; reported only when asked        */
 
+/* the one guest-visible struct: sy_poll is the hot path */
 struct sy_pollfd { sy_s64 handle; sy_u32 events; sy_u32 revents; };
-struct sy_stat   { sy_u64 size; sy_s64 mtime_ns; sy_u32 mode; sy_u32 kind; sy_u8 root[32]; };
 ```
+
+Everything else structured — a stat result, the caller's identity, an SSH
+event, a process status, a backing-service declaration — crosses the pointer
+cage as a **JSON handle** (§7.11), never as a C struct or a numbered enum. A
+guest compiled against a stale header used to read a renumbered enum wrong
+silently; a missing JSON key is an explicit `SY_ENOENT`.
 
 ### 7.1 Diagnostics and configuration
 
@@ -426,7 +434,7 @@ serverless node the daemon's environment holds cloud credentials.
 | `sy_socket_path(out, len)` | `space/path` of the socket being served, so one object can back several sockets. |
 | `sy_peer_origin(out, len)` | The caller's origin. Bound by iroh's mutual authentication, not asserted by the caller. |
 | `sy_peer_device_key(out32)` | The caller's raw 32-byte device key — stable across origin renames. |
-| `sy_peer_kind()` | `1` rooted member, `2` delegate. |
+| `sy_peer_info()` | The whole authenticated identity as one JSON handle: `{"origin", "device_key" (hex), "kind" ("member" \| "delegate"), "addr", "stream_index"}`. |
 | `sy_peer_has_space(s, len)` | Whether the caller may read that space. The one-line way to write "only people I gave `code` to". |
 | `sy_peer_addr(out, len)` | Remote transport address. Informational — it can be a relay. |
 | `sy_conn_meta(k, klen, out, olen)` | A key from the caller's `Open.meta`. **Untrusted input.** |
@@ -529,7 +537,7 @@ decided by the arming table, not by who can read an ELF.
 | `sy_open(path, len)` | Opens `space/path` **in this node's own trie** — the same scope the program came from. |
 | `sy_open_from(origin, olen, path, plen)` | Another origin's version. Needs no declaration; §8's mtime-trust caveat is why it is not the default. |
 | `sy_open_root(root32)` | By content root — how a superseded version is read, mirroring `synch cat --root`. |
-| `sy_stat(obj, out, len)` | Fills a `struct sy_stat`. |
+| `sy_stat(obj)` | The object's metadata as a JSON handle: `{"size", "mtime_ns", "mode", "kind" ("file" \| "dir" \| "symlink" \| "tombstone" \| "socket"), "root" (hex)}`. |
 | `sy_pread(obj, buf, len, off)` | Verified range read. Bytes in the CAS return immediately; bytes that must be fetched return `SY_EAGAIN` and the handle becomes pollable — a cold read is an ordinary poll wait, not a hidden stall. |
 | `sy_list_open(prefix, len)` | A cursor over `f:<space>/<prefix>`, which the trie's prefix compression makes cheap (§4.1). |
 | `sy_list_next(cur, out, len)` | Next entry name; `0` at the end. |
@@ -552,15 +560,23 @@ decided by the arming table, not by who can read an ELF.
 
 `sy_blake3` is first-class because content roots are BLAKE3: a program can
 verify what it just read against what the tree said. The in-place decoders exist
-because there is no heap to decode into.
+because there is no heap to decode into. The base64 pair takes two orthogonal
+flags — `SY_BASE64_URL` and `SY_BASE64_NO_PAD` — rather than a numbered
+four-alphabet enum.
 
 ### 7.9 Declarations — valid only inside `synchronicity.init`
 
 `sy_declare_name`, `sy_declare_egress(host, len, port)` (port `0` means any port
 on that host and is printed in red at the arm prompt), `sy_declare_max_streams`,
 `sy_declare_stack_frame_size(bytes)`,
-`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(spec, len)` and
-`sy_declare_file_transfer(spec, len)` (`docs/SSH-SOCKETS.md` §7).
+`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(json)` and
+`sy_declare_file_transfer(json)` (`docs/SSH-SOCKETS.md` §7). The two
+backing-service declarations take JSON handles —
+`{"id", "allow": ["pty" | "pipe"], "executable", "argv",
+"allowed_signals": ["HUP" | "INT" | "TERM"]}` and
+`{"id", "protocol": "sftp", "access": ["read", "recursive"], "scope"}` — built
+with the same `sy_json_*` helpers a served stream uses, which is why the JSON
+family is valid inside `synchronicity.init`.
 
 There is no `sy_declare_tree_read`: reading the tree is not a declared
 capability (§7.6).
@@ -612,6 +628,39 @@ symbol — a program that fails to *link*, at arm time, on somebody else's node,
 a long way from the line that caused it. Clang emits an intrinsic instead of a
 call, which never meets these definitions; the `--clang` build rewrites those
 to the same helpers (§9).
+
+### 7.11 JSON values
+
+Modeled on zeroserve's JSON API, and the reason the rest of §7 carries no
+struct layouts: values live host-side, the guest holds handles out of the same
+32-slot table endpoints and objects come from, charged against the same 1 MiB
+footprint and released with `sy_close`.
+
+| Helper | What it does |
+| --- | --- |
+| `sy_json_parse(data, len)` | Parses JSON text into a fresh handle. |
+| `sy_json_stringify(json, out, olen)` | Serializes a handle's value; snprintf semantics. |
+| `sy_json_new_object()` / `sy_json_new_array()` | Fresh empty containers. |
+| `sy_json_type(json)` | `SY_JSON_NULL` … `SY_JSON_OBJECT`. |
+| `sy_json_len(json)` | Elements of an array, keys of an object, bytes of a string. |
+| `sy_json_get(json, key, klen)` | A **copy** of one member as a fresh handle; `SY_ENOENT` if absent. |
+| `sy_json_array_get(json, index)` | A copy of one element as a fresh handle. |
+| `sy_json_read_string(json, out, olen)` / `sy_json_read_i64(json, out, olen)` / `sy_json_read_bool(json)` | Scalar reads. |
+| `sy_json_set(json, key, klen, value_json)` / `sy_json_array_push(json, value_json)` | Insert a **copy** of another handle's value. |
+| `sy_json_remove(json, key, klen)` | Remove a key. |
+| `sy_json_set_string` / `sy_json_set_i64` / `sy_json_set_bool` / `sy_json_set_null` | Replace the handle's own value in place. |
+
+Every handle owns its own value: navigation copies out, insertion copies in,
+and no two handles ever alias — so no mutation acts at a distance and no cycle
+can be constructed. Documents are built bottom-up and read top-down, and the
+per-value bound (64 KiB serialized, 64 levels deep) is what keeps the
+host-side walks each mutation performs cheap. `sy_json_get_string`,
+`sy_json_get_i64` and `sy_json_get_bool` in the header are the
+get-read-close spelling of the common case.
+
+The JSON family is pure data manipulation, so it is the one part of the API
+valid in `synchronicity.init` as well as in the stream entrypoint: the
+declaration helpers take JSON.
 
 ## 8. A whole socket, end to end
 

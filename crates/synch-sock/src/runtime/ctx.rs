@@ -22,6 +22,7 @@ use crate::{
     policy::{EffectivePolicy, PeerIdentity, SocketId},
     runtime::{
         endpoint::{reader_task, writer_task, Endpoint, EndpointRole, Readiness, State},
+        json::JsonSlot,
         map::SocketMaps,
         process::{ProcessSlot, PtySlot},
         ssh::SshState,
@@ -93,6 +94,7 @@ pub(crate) enum Slot {
     Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
+    Json(Rc<JsonSlot>),
 }
 
 impl Slot {
@@ -109,6 +111,9 @@ impl Slot {
             // A cursor is always ready: every answer it can give is already in
             // memory, so a program that polls one is told to go ahead.
             Slot::Cursor(_) => poll::IN,
+            // A JSON value is inert data: nothing about it will ever become
+            // ready, so it reports nothing and never keeps a poll waiting.
+            Slot::Json(_) => 0,
         }
     }
 }
@@ -343,6 +348,7 @@ impl Inner {
             Some(Slot::Process(process)) => Some(Slot2::Process(process.clone())),
             Some(Slot::Object(obj)) => Some(Slot2::Object(obj.clone())),
             Some(Slot::Cursor(cur)) => Some(Slot2::Cursor(cur.clone())),
+            Some(Slot::Json(json)) => Some(Slot2::Json(json.clone())),
             None => None,
         }
     }
@@ -532,6 +538,10 @@ impl Inner {
                 self.release(held);
                 true
             }
+            Some(Slot::Json(json)) => {
+                self.release(json.charged.get());
+                true
+            }
             None => false,
         }
     }
@@ -705,6 +715,7 @@ pub(crate) enum Slot2 {
     Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
+    Json(Rc<JsonSlot>),
 }
 
 /// Replaces anything a terminal should not be asked to render.

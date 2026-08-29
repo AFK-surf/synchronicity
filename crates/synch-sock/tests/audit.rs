@@ -266,7 +266,7 @@ const IN_PLACE_DECODERS: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   char b64[16] = "aGVsbG8=";
   char hex[16] = "aabb";
-  sy_s64 r1 = sy_base64_decode_in_place(b64, 8, SY_BASE64_STANDARD);
+  sy_s64 r1 = sy_base64_decode_in_place(b64, 8, 0);
   sy_s64 r2 = sy_hex_decode_in_place(hex, 4);
   /* The decoded forms are "hello" (5 bytes) and {0xaa, 0xbb} (2 bytes), and
      both helpers write them back into the same region they read. */

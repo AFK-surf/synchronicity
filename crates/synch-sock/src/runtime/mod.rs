@@ -27,6 +27,7 @@
 pub(crate) mod ctx;
 pub(crate) mod endpoint;
 pub(crate) mod helpers;
+pub(crate) mod json;
 pub(crate) mod map;
 pub(crate) mod process;
 pub(crate) mod sftp;

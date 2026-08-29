@@ -14,6 +14,11 @@
  * request spawns the one executable the operator approved at arm time. The
  * client's username and command bytes never choose what runs.
  *
+ * Every event arrives as a JSON handle: its `kind` is a name, its fields are
+ * members, and the whole dispatch below is string comparison rather than
+ * numbered constants. An event handle is closed as soon as it is handled; the
+ * event itself stays outstanding until it is answered.
+ *
  * Authorization is the outer handshake: whoever the cluster let reach this
  * socket gets the shell, so SSH `none` completes the inner exchange. Arm it
  * only where that is the intended policy — §15.2 of the design shows the
@@ -46,37 +51,30 @@ SY_INIT_ENTRY sy_s64 declare(void) {
   sy_declare_name(SY_STR("ssh-shell"));
   sy_declare_max_streams(4);
 
-  /* The complete capability, embedded in the object: the exact executable,
-     argv, PTY permission, and the signals the guest may relay. Built on the
-     stack because helper arguments live there. */
-  struct sy_process_capability shell = {0};
-  shell.id = SHELL_CAPABILITY;
-  shell.flags = SY_PROCESS_ALLOW_PTY;
-  sy_memcpy(shell.executable, SHELL_EXECUTABLE, sizeof SHELL_EXECUTABLE - 1);
-  shell.executable_len = sizeof SHELL_EXECUTABLE - 1;
-  shell.argc = 1;
-  sy_memcpy(shell.argv[0], SHELL_ARGV0, sizeof SHELL_ARGV0 - 1);
-  shell.argv_len[0] = sizeof SHELL_ARGV0 - 1;
-  shell.allowed_signals = SY_PROCESS_SIGNAL_HUP | SY_PROCESS_SIGNAL_INT |
-                          SY_PROCESS_SIGNAL_TERM;
-  return sy_declare_process(&shell, sizeof shell);
+  /* The complete capability, embedded in the object as JSON: the exact
+     executable, argv, PTY permission, and the signals the guest may relay.
+     Literal concatenation splices the macros in at compile time. */
+  sy_s64 shell = sy_json_parse(
+      SY_STR("{\"id\":1,\"allow\":[\"pty\"],"
+             "\"executable\":\"" SHELL_EXECUTABLE "\","
+             "\"argv\":[\"" SHELL_ARGV0 "\"],"
+             "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
+  if (shell < 0) return shell;
+  sy_s64 declared = sy_declare_process(shell);
+  sy_close(shell);
+  return declared;
 }
 
-static int field_is(sy_u64 event_id, sy_u32 field, const char *want,
-                    sy_u64 want_len) {
-  char value[32];
-  sy_s64 len = sy_ssh_event_data(event_id, field, value, sizeof value);
-  if (len < 0 || (sy_u64)len != want_len || want_len > sizeof value) return 0;
-  for (sy_u64 i = 0; i < want_len; i++)
-    if (value[i] != want[i]) return 0;
-  return 1;
+static int str_is(const char *value, const char *want) {
+  sy_u64 len = sy_strlen(want);
+  return sy_strlen(value) == len && sy_memcmp(value, want, len) == 0;
 }
 
 /* A request that asked for a reply gets one; one that did not is finished. */
-static sy_s64 finish(const struct sy_ssh_event *event, sy_u32 result) {
-  if (event->flags & SY_SSH_EVENT_WANT_REPLY)
-    return sy_ssh_request_reply(event->id, result);
-  return sy_ssh_event_done(event->id);
+static sy_s64 finish(sy_s64 event, sy_u64 id, sy_u32 granted) {
+  if (sy_json_get_bool(event, SY_STR("want_reply")) == 1)
+    return sy_ssh_request_reply(id, granted);
+  return sy_ssh_event_done(id);
 }
 
 /* Everything one shell session is. -1 handles mean "not yet". */
@@ -90,72 +88,78 @@ struct session {
   int downward_blocked; /* output waiting on SSH channel window           */
   int have_status;
   int status_sent;
-  struct sy_process_status status;
+  int signaled;
+  int core_dumped;
+  sy_s64 exit_code;
+  char signal[32];
 };
 
-static sy_s64 handle_open(const struct sy_ssh_event *event,
-                          struct session *s) {
+static sy_s64 handle_open(sy_s64 event, sy_u64 id, struct session *s) {
   /* One live session at a time keeps the example one struct; a session that
      has ended frees the slot for the next open, so sequential logins on one
      connection work (§7.3). §15.1's slot array is the shape for concurrent
      channels. */
-  if (s->channel >= 0 ||
-      !field_is(event->id, SY_SSH_FIELD_CHANNEL_TYPE, SY_STR("session")))
-    return sy_ssh_channel_reject(event->id,
-                                 SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
-  sy_s64 channel = sy_ssh_channel_accept(event->id);
+  char type[32] = {0};
+  sy_json_get_string(event, SY_STR("channel_type"), type, sizeof type);
+  if (s->channel >= 0 || !str_is(type, "session"))
+    return sy_ssh_channel_reject(id, SY_STR("administratively_prohibited"));
+  sy_s64 channel = sy_ssh_channel_accept(id);
   if (channel < 0) return channel;
   s->channel = channel;
   return 0;
 }
 
-static sy_s64 handle_request(const struct sy_ssh_event *event,
-                             struct session *s) {
-  if (event->fd != s->channel) return finish(event, SY_SSH_REQUEST_FAILURE);
+static sy_s64 handle_request(sy_s64 event, sy_u64 id, struct session *s) {
+  sy_s64 fd = -1;
+  sy_json_get_i64(event, SY_STR("fd"), &fd);
+  if (fd != s->channel) return finish(event, id, 0);
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE, SY_STR("pty-req"))) {
-    if (s->pty >= 0) return finish(event, SY_SSH_REQUEST_FAILURE);
-    struct sy_pty_spec spec;
-    if (sy_ssh_pty_spec(event->id, &spec, sizeof spec) < 0)
-      return finish(event, SY_SSH_REQUEST_FAILURE);
-    sy_s64 pty = sy_pty_open(SHELL_CAPABILITY, &spec, sizeof spec);
-    if (pty < 0) return finish(event, SY_SSH_REQUEST_FAILURE);
+  char type[32] = {0};
+  sy_json_get_string(event, SY_STR("request_type"), type, sizeof type);
+
+  if (str_is(type, "pty-req")) {
+    if (s->pty >= 0) return finish(event, id, 0);
+    sy_s64 spec = sy_ssh_pty_spec(id);
+    if (spec < 0) return finish(event, id, 0);
+    sy_s64 pty = sy_pty_open(SHELL_CAPABILITY, spec);
+    sy_close(spec);
+    if (pty < 0) return finish(event, id, 0);
     s->pty = pty; /* a terminal exists; nothing is running on it yet */
-    return finish(event, SY_SSH_REQUEST_SUCCESS);
+    return finish(event, id, 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE, SY_STR("shell"))) {
-    if (s->pty < 0 || s->process >= 0)
-      return finish(event, SY_SSH_REQUEST_FAILURE);
+  if (str_is(type, "shell")) {
+    if (s->pty < 0 || s->process >= 0) return finish(event, id, 0);
     sy_s64 process = sy_process_spawn_pty(SHELL_CAPABILITY, s->pty);
-    if (process < 0) return finish(event, SY_SSH_REQUEST_FAILURE);
+    if (process < 0) return finish(event, id, 0);
     s->process = process;
-    return finish(event, SY_SSH_REQUEST_SUCCESS);
+    return finish(event, id, 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE,
-               SY_STR("window-change"))) {
-    if (s->pty < 0) return finish(event, SY_SSH_REQUEST_FAILURE);
-    sy_s64 resized =
-        sy_pty_resize(s->pty, event->a, event->b, event->c, event->d);
-    return finish(event, resized < 0 ? SY_SSH_REQUEST_FAILURE
-                                     : SY_SSH_REQUEST_SUCCESS);
+  if (str_is(type, "window-change")) {
+    if (s->pty < 0) return finish(event, id, 0);
+    sy_s64 columns = 0, rows = 0, width = 0, height = 0;
+    sy_json_get_i64(event, SY_STR("columns"), &columns);
+    sy_json_get_i64(event, SY_STR("rows"), &rows);
+    sy_json_get_i64(event, SY_STR("pixel_width"), &width);
+    sy_json_get_i64(event, SY_STR("pixel_height"), &height);
+    sy_s64 resized = sy_pty_resize(s->pty, (sy_u32)columns, (sy_u32)rows,
+                                   (sy_u32)width, (sy_u32)height);
+    return finish(event, id, resized < 0 ? 0 : 1);
   }
 
-  if (field_is(event->id, SY_SSH_FIELD_REQUEST_TYPE, SY_STR("signal"))) {
-    char name[32];
-    sy_s64 len =
-        sy_ssh_event_data(event->id, SY_SSH_FIELD_SIGNAL, name, sizeof name);
-    sy_s64 sent = s->process < 0 || len < 0 || len > (sy_s64)sizeof name
+  if (str_is(type, "signal")) {
+    char name[32] = {0};
+    sy_s64 len = sy_json_get_string(event, SY_STR("signal"), name, sizeof name);
+    sy_s64 sent = s->process < 0 || len < 0 || len >= (sy_s64)sizeof name
                       ? SY_EPERM
                       : sy_process_signal(s->process, name, (sy_u64)len);
-    return finish(event, sent < 0 ? SY_SSH_REQUEST_FAILURE
-                                  : SY_SSH_REQUEST_SUCCESS);
+    return finish(event, id, sent < 0 ? 0 : 1);
   }
 
   /* exec, subsystem, env, forwarding: not this socket's policy. The refusal
      costs nothing — none of those names could have started anything. */
-  return finish(event, SY_SSH_REQUEST_FAILURE);
+  return finish(event, id, 0);
 }
 
 /* Both directions of the terminal, each allowed to end on its own. An error
@@ -201,8 +205,26 @@ static void close_session(struct session *s) {
   s->have_status = s->status_sent = 0;
 }
 
+/* Reads a finished process's status JSON into the session, once. */
+static void collect_status(struct session *s) {
+  sy_s64 status = sy_process_status(s->process);
+  if (status < 0) return; /* SY_EAGAIN: still running */
+  s->have_status = 1;
+  s->signaled = sy_json_get_bool(status, SY_STR("signaled")) == 1;
+  s->core_dumped = sy_json_get_bool(status, SY_STR("core_dumped")) == 1;
+  s->exit_code = 0;
+  sy_json_get_i64(status, SY_STR("exit_code"), &s->exit_code);
+  s->signal[0] = 0;
+  sy_json_get_string(status, SY_STR("signal"), s->signal, sizeof s->signal);
+  sy_close(status);
+}
+
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 1;
+  sy_s64 methods = sy_json_parse(SY_STR("[\"none\"]"));
+  if (methods < 0) return 1;
+  sy_s64 started = sy_ssh_start(SY_SELF, methods);
+  sy_close(methods);
+  if (started < 0) return 1;
 
   struct session s = {0};
   s.channel = s.pty = s.process = -1;
@@ -237,17 +259,26 @@ SY_ENTRY sy_s64 entry(void) {
     if (sy_poll(fds, nfds, -1) <= 0) break; /* idle deadline, or all quiet */
 
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[32] = {0};
+        sy_s64 id = 0;
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_json_get_i64(event, SY_STR("id"), &id);
+
         sy_s64 handled = 0;
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE)
-          handled = sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0);
-        else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN)
-          handled = handle_open(&event, &s);
-        else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST)
-          handled = handle_request(&event, &s);
-        else
-          handled = sy_ssh_event_done(event.id); /* AUTHENTICATED, lanes */
+        if (str_is(kind, "auth_none")) {
+          sy_s64 accept = sy_json_parse(SY_STR("{\"result\":\"accept\"}"));
+          handled = accept < 0 ? accept : sy_ssh_auth_reply((sy_u64)id, accept);
+          if (accept >= 0) sy_close(accept);
+        } else if (str_is(kind, "channel_open")) {
+          handled = handle_open(event, (sy_u64)id, &s);
+        } else if (str_is(kind, "channel_request")) {
+          handled = handle_request(event, (sy_u64)id, &s);
+        } else {
+          handled = sy_ssh_event_done((sy_u64)id); /* authenticated, lanes */
+        }
+        sy_close(event);
         if (handled < 0) {
           close_session(&s);
           return 2;
@@ -264,18 +295,16 @@ SY_ENTRY sy_s64 entry(void) {
         (fds[channel_at].revents & (SY_POLL_ERR | SY_POLL_HUP)))
       close_session(&s);
 
-    if (s.process >= 0 && !s.have_status &&
-        sy_process_status(s.process, &s.status, sizeof s.status) == 1)
-      s.have_status = 1;
+    if (s.process >= 0 && !s.have_status) collect_status(&s);
 
     /* Exit status goes out only after the terminal's last output: reporting
        first would race the goodbye off the screen. */
     if (s.have_status && s.output_done && !s.status_sent) {
-      if (s.status.signaled)
-        sy_ssh_exit_signal(s.channel, s.status.signal, s.status.signal_len,
-                           s.status.core_dumped);
+      if (s.signaled)
+        sy_ssh_exit_signal(s.channel, s.signal, sy_strlen(s.signal),
+                           (sy_u32)s.core_dumped);
       else
-        sy_ssh_exit_status(s.channel, s.status.exit_code);
+        sy_ssh_exit_status(s.channel, (sy_u32)s.exit_code);
       sy_shutdown(s.channel); /* EOF after the queued output drains */
       s.status_sent = 1;
       close_session(&s);

@@ -15,13 +15,64 @@ use synch_core::{FileTransferCapability, SockStatus};
 use synch_sock::{DuplexStream, EffectivePolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const SSH_ECHO: &str = r#"
+/// Guest-side plumbing shared by every SSH fixture: start the adapter with a
+/// JSON method list, answer auth events with JSON replies, and read the
+/// fields every dispatch needs out of an event's JSON.
+const SSH_COMMON: &str = r#"
 #include <synch.h>
+
+static sy_s64 ssh_start_with(const char *methods_json) {
+  sy_s64 methods = sy_json_parse(methods_json, sy_strlen(methods_json));
+  if (methods < 0) return methods;
+  sy_s64 rc = sy_ssh_start(SY_SELF, methods);
+  sy_close(methods);
+  return rc;
+}
+
+static sy_s64 auth_reply(sy_u64 id, const char *reply_json) {
+  sy_s64 reply = sy_json_parse(reply_json, sy_strlen(reply_json));
+  if (reply < 0) return reply;
+  sy_s64 rc = sy_ssh_auth_reply(id, reply);
+  sy_close(reply);
+  return rc;
+}
+
+static int text_is(const char *value, const char *want) {
+  sy_u64 len = sy_strlen(want);
+  return sy_strlen(value) == len && sy_memcmp(value, want, len) == 0;
+}
+
+static int kind_is(sy_s64 event, const char *want) {
+  char kind[40];
+  if (sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind) < 0)
+    return 0;
+  return text_is(kind, want);
+}
+
+static sy_u64 event_id(sy_s64 event) {
+  sy_s64 id = 0;
+  sy_json_get_i64(event, SY_STR("id"), &id);
+  return (sy_u64)id;
+}
+
+static sy_s64 event_fd(sy_s64 event) {
+  sy_s64 fd = -1;
+  sy_json_get_i64(event, SY_STR("fd"), &fd);
+  return fd;
+}
+"#;
+
+/// One SSH fixture, with the shared prelude in front of it.
+fn ssh_prog(body: &str) -> String {
+    format!("{SSH_COMMON}{body}")
+}
+
+const SSH_ECHO: &str = r#"
 
 SY_ENTRY sy_s64 entry(void) {
   struct sy_pollfd fds[9] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 10;
+  if (ssh_start_with("[\"none\"]") < 0) return 10;
 
   for (;;) {
     sy_s64 ready = sy_poll(fds, count, 5000);
@@ -29,26 +80,34 @@ SY_ENTRY sy_s64 entry(void) {
     if (ready == 0) continue;
 
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 12;
-        } else if (event.kind == SY_SSH_EVENT_AUTHENTICATED) {
-          if (sy_ssh_event_done(event.id) < 0) return 13;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 12;
+        } else if (text_is(kind, "authenticated")) {
+          if (sy_ssh_event_done(id) < 0) return 13;
+        } else if (text_is(kind, "channel_open")) {
           if (count == 9) {
-            sy_ssh_channel_reject(event.id, SY_SSH_OPEN_RESOURCE_SHORTAGE);
+            sy_ssh_channel_reject(id, SY_STR("resource_shortage"));
             continue;
           }
-          sy_s64 channel = sy_ssh_channel_accept(event.id);
+          sy_s64 channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 14;
           fds[count++] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+        } else if (text_is(kind, "channel_request")) {
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 15;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 16;
+          if (sy_ssh_event_done(id) < 0) return 16;
         }
       }
     }
@@ -80,7 +139,7 @@ const SSH_HALF_CLOSE: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 20;
+  if (ssh_start_with("[\"none\"]") < 0) return 20;
   sy_s64 channel = -1;
   char input[9];
   sy_u64 input_len = 0;
@@ -94,18 +153,27 @@ SY_ENTRY sy_s64 entry(void) {
     if (sy_poll(fds, count, 5000) < 0) return 21;
 
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0) < 0)
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\"}") < 0)
             return 22;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 23;
           if (sy_write(channel, SY_STR("server-eof")) != 10) return 24;
           if (sy_shutdown(channel) < 0) return 25;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 26;
+          if (sy_ssh_event_done(id) < 0) return 26;
         }
       }
     }
@@ -141,25 +209,34 @@ SY_ENTRY sy_s64 entry(void) {
   const char path[] = "keys/authorized_keys";
   sy_s64 keys = sy_open(path, sizeof(path) - 1);
   if (keys < 0) return 20;
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY) < 0) return 21;
+  if (ssh_start_with("[\"publickey\"]") < 0) return 21;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(conn, 1, 5000) < 0) return 22;
     if (conn[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER ||
-            event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED) {
-          sy_s64 matched = match_key(event.id, keys);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_publickey_offer") ||
+            text_is(kind, "auth_publickey_verified")) {
+          sy_s64 matched = match_key(id, keys);
           if (matched < 0) return 23;
-          sy_u32 result = matched
-              ? (event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER
-                     ? SY_SSH_AUTH_OFFER_ACCEPT : SY_SSH_AUTH_ACCEPT)
-              : SY_SSH_AUTH_REJECT;
-          if (sy_ssh_auth_reply(event.id, result,
-                                SY_SSH_AUTH_PUBLICKEY) < 0) return 24;
+          const char *reply = !matched
+              ? "{\"result\":\"reject\",\"next_methods\":[\"publickey\"]}"
+              : text_is(kind, "auth_publickey_offer")
+                  ? "{\"result\":\"offer_accept\",\"next_methods\":[\"publickey\"]}"
+                  : "{\"result\":\"accept\",\"next_methods\":[\"publickey\"]}";
+          if (auth_reply(id, reply) < 0) return 24;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 25;
+          if (sy_ssh_event_done(id) < 0) return 25;
         }
       }
     }
@@ -186,33 +263,41 @@ static sy_s64 copy_ready(sy_s64 from, sy_s64 to) {
 }
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 30;
+  if (ssh_start_with("[\"none\"]") < 0) return 30;
   sy_s64 channel = -1, backend = -1;
   struct sy_pollfd fds[3] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 31;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 32;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 32;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 33;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+        } else if (text_is(kind, "channel_request")) {
           if (backend >= 0) return 34;
           backend = sy_sftp_open(1);
           if (backend < 0) return 35;
           fds[2] = (struct sy_pollfd){ backend, SY_POLL_IN, 0 };
           count = 3;
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 36;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 37;
+          if (sy_ssh_event_done(id) < 0) return 37;
         }
       }
     }
@@ -232,7 +317,7 @@ static const unsigned char trusted_ca[32] = { __TRUSTED_CA_BYTES__ };
 
 static sy_s64 trusted(sy_u64 event_id) {
   unsigned char seen[32];
-  if (sy_ssh_event_data(event_id, SY_SSH_FIELD_AUTH_CERT_CA_SHA256,
+  if (sy_ssh_event_data(event_id, SY_STR("ca_public_key_sha256"),
                         seen, sizeof seen) != 32) return 0;
   for (sy_u64 i = 0; i < sizeof seen; i++)
     if (seen[i] != trusted_ca[i]) return 0;
@@ -240,29 +325,38 @@ static sy_s64 trusted(sy_u64 event_id) {
 }
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY) < 0) return 50;
+  if (ssh_start_with("[\"publickey\"]") < 0) return 50;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(conn, 1, 5000) < 0) return 51;
     if (conn[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_publickey_offer")) {
           /* The certificate probe: accept the offer so the client signs
              its possession proof, but only for the declared trusted CA. */
-          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_OFFER_ACCEPT
-                                            : SY_SSH_AUTH_REJECT;
-          if (sy_ssh_auth_reply(event.id, result,
-                                SY_SSH_AUTH_PUBLICKEY) < 0) return 52;
-        } else if (event.kind == SY_SSH_EVENT_AUTH_OPENSSH_CERT) {
+          const char *reply = trusted(id)
+              ? "{\"result\":\"offer_accept\",\"next_methods\":[\"publickey\"]}"
+              : "{\"result\":\"reject\",\"next_methods\":[\"publickey\"]}";
+          if (auth_reply(id, reply) < 0) return 52;
+        } else if (text_is(kind, "auth_openssh_cert")) {
           /* Structure, principal and possession are host-validated; the guest
              still authorizes the signing CA. */
-          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_ACCEPT
-                                            : SY_SSH_AUTH_REJECT;
-          if (sy_ssh_auth_reply(event.id, result,
-                                SY_SSH_AUTH_PUBLICKEY) < 0) return 53;
+          const char *reply = trusted(id)
+              ? "{\"result\":\"accept\",\"next_methods\":[\"publickey\"]}"
+              : "{\"result\":\"reject\",\"next_methods\":[\"publickey\"]}";
+          if (auth_reply(id, reply) < 0) return 53;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 54;
+          if (sy_ssh_event_done(id) < 0) return 54;
         }
       }
     }
@@ -278,26 +372,34 @@ SY_ENTRY sy_s64 entry(void) {
   const char type[] = "echo@example.com";
   const char opening[] = "opaque opening data";
   sy_s64 channel = -1;
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 40;
+  if (ssh_start_with("[\"none\"]") < 0) return 40;
   struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 41;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 42;
-        } else if (event.kind == SY_SSH_EVENT_AUTHENTICATED) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 42;
+        } else if (text_is(kind, "authenticated")) {
           channel = sy_ssh_channel_open(SY_SELF, type, sizeof(type) - 1,
                                         opening, sizeof(opening) - 1);
           if (channel < 0) return 43;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-          if (sy_ssh_event_done(event.id) < 0) return 44;
+          if (sy_ssh_event_done(id) < 0) return 44;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 45;
+          if (sy_ssh_event_done(id) < 0) return 45;
         }
       }
     }
@@ -321,37 +423,49 @@ static int equal(const char *left, sy_s64 len, const char *right, sy_u64 right_l
 }
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 50;
+  if (ssh_start_with("[\"none\"]") < 0) return 50;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(conn, 1, 5000) < 0) return 51;
     if (conn[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 52;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          if (sy_ssh_channel_accept(event.id) < 0) return 53;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_s64 screen_number = -1, single_connection = -1;
+        sy_json_get_i64(event, SY_STR("screen_number"), &screen_number);
+        single_connection = sy_json_get_bool(event, SY_STR("single_connection"));
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 52;
+        } else if (text_is(kind, "channel_open")) {
+          if (sy_ssh_channel_accept(id) < 0) return 53;
+        } else if (text_is(kind, "channel_request")) {
+          /* The raw field by name and the JSON view must agree. */
           char type[64];
-          sy_s64 n = sy_ssh_event_data(event.id, SY_SSH_FIELD_REQUEST_TYPE,
+          sy_s64 n = sy_ssh_event_data(id, SY_STR("request_type"),
                                        type, sizeof type);
           if (n < 0) return 54;
-          sy_u32 result = SY_SSH_REQUEST_FAILURE;
+          sy_u32 result = 0;
           if (equal(type, n, "env", 3)) {
-            if (event.flags & SY_SSH_EVENT_WANT_REPLY) return 55;
-            result = SY_SSH_REQUEST_SUCCESS;
+            if (want_reply == 1) return 55;
+            result = 1;
           } else if (equal(type, n, "exec", 4)) {
-            if (!(event.flags & SY_SSH_EVENT_WANT_REPLY)) return 56;
+            if (want_reply != 1) return 56;
           } else if (equal(type, n, "x11-req", 7)) {
-            if (event.a != 7 || event.b != 1) return 57;
-            result = SY_SSH_REQUEST_SUCCESS;
+            if (screen_number != 7 || single_connection != 1) return 57;
+            result = 1;
           } else if (equal(type, n, "auth-agent-req@openssh.com", 26)) {
-            result = SY_SSH_REQUEST_SUCCESS;
+            result = 1;
           }
-          if (sy_ssh_request_reply(event.id, result) < 0) return 58;
-        } else if (sy_ssh_event_done(event.id) < 0) {
+          if (sy_ssh_request_reply(id, result) < 0) return 58;
+        } else if (sy_ssh_event_done(id) < 0) {
           return 59;
         }
       }
@@ -365,32 +479,40 @@ const LANE_CLOSE: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 60;
+  if (ssh_start_with("[\"none\"]") < 0) return 60;
   sy_s64 channel = -1;
   struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 61;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 62;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 62;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 63;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+        } else if (text_is(kind, "channel_request")) {
           sy_s64 lane = sy_ssh_channel_lane(channel, SY_SSH_EXTENDED_STDERR);
           if (lane < 0 || sy_close(lane) < 0) return 64;
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 65;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_EXTENDED_DATA) {
-          if (event.fd != channel || event.a != SY_SSH_EXTENDED_STDERR) return 66;
-          if (sy_ssh_event_done(event.id) < 0) return 67;
-        } else if (sy_ssh_event_done(event.id) < 0) {
+        } else if (text_is(kind, "channel_extended_data")) {
+          if (fd != channel || data_type != SY_SSH_EXTENDED_STDERR) return 66;
+          if (sy_ssh_event_done(id) < 0) return 67;
+        } else if (sy_ssh_event_done(id) < 0) {
           return 68;
         }
       }
@@ -409,27 +531,34 @@ const METHOD_POLICY: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF,
-                   SY_SSH_AUTH_NONE | SY_SSH_AUTH_PUBLICKEY) < 0) return 70;
+  if (ssh_start_with("[\"none\",\"publickey\"]") < 0) return 70;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(conn, 1, 5000) < 0) return 71;
     if (conn[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_PASSWORD) return 72;
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE ||
-            event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER ||
-            event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_password")) return 72;
+        if (text_is(kind, "auth_none") ||
+            text_is(kind, "auth_publickey_offer") ||
+            text_is(kind, "auth_publickey_verified")) {
           /* A channel decision helper must not consume an auth token. */
           if (sy_ssh_channel_reject(
-                  event.id,
-                  SY_SSH_OPEN_ADMINISTRATIVELY_PROHIBITED) != SY_ESTATE)
+                  id, SY_STR("administratively_prohibited")) != SY_ESTATE)
             return 75;
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_REJECT,
-                                SY_SSH_AUTH_NONE | SY_SSH_AUTH_PUBLICKEY) < 0)
+          if (auth_reply(id,
+                         "{\"result\":\"reject\",\"next_methods\":[\"none\",\"publickey\"]}") < 0)
             return 73;
-        } else if (sy_ssh_event_done(event.id) < 0) {
+        } else if (sy_ssh_event_done(id) < 0) {
           return 74;
         }
       }
@@ -443,23 +572,31 @@ const PARTIAL_AUTH: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF,
-                   SY_SSH_AUTH_NONE | SY_SSH_AUTH_PASSWORD) < 0) return 80;
+  if (ssh_start_with("[\"none\",\"password\"]") < 0) return 80;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(conn, 1, 5000) < 0) return 81;
     if (conn[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
           /* The outer identity is one accepted factor; a password is still
              required to finish. */
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_PARTIAL,
-                                SY_SSH_AUTH_PASSWORD) < 0) return 82;
-        } else if (event.kind == SY_SSH_EVENT_AUTH_PASSWORD) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0) < 0)
+          if (auth_reply(id,
+                         "{\"result\":\"partial\",\"next_methods\":[\"password\"]}") < 0) return 82;
+        } else if (text_is(kind, "auth_password")) {
+          if (auth_reply(id, "{\"result\":\"accept\"}") < 0)
             return 83;
-        } else if (sy_ssh_event_done(event.id) < 0) {
+        } else if (sy_ssh_event_done(id) < 0) {
           return 84;
         }
       }
@@ -520,7 +657,7 @@ impl russh::client::Handler for UnknownClient {
 
 #[tokio::test]
 async fn none_auth_and_multiple_session_channels_share_one_connection() {
-    let elf = compile(SSH_ECHO, "ssh-echo.c");
+    let elf = compile(&ssh_prog(SSH_ECHO), "ssh-echo.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -581,7 +718,7 @@ async fn none_auth_and_multiple_session_channels_share_one_connection() {
 
 #[tokio::test]
 async fn guest_shutdown_sends_eof_but_keeps_channel_input_open() {
-    let elf = compile(SSH_HALF_CLOSE, "ssh-half-close.c");
+    let elf = compile(&ssh_prog(SSH_HALF_CLOSE), "ssh-half-close.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -648,7 +785,7 @@ async fn guest_shutdown_sends_eof_but_keeps_channel_input_open() {
 async fn none_is_accepted_by_policy_but_never_advertised() {
     use russh::MethodKind;
 
-    let elf = compile(METHOD_POLICY, "ssh-method-policy.c");
+    let elf = compile(&ssh_prog(METHOD_POLICY), "ssh-method-policy.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -707,14 +844,14 @@ async fn none_is_accepted_by_policy_but_never_advertised() {
     assert_eq!(outcome.status, SockStatus::Ok(0));
 }
 
-/// A guest's `SY_SSH_AUTH_PARTIAL` reaches the client as RFC 4252 partial
+/// A guest's `"partial"` auth reply reaches the client as RFC 4252 partial
 /// success — the flag in `USERAUTH_FAILURE`, not merely a narrowed method
 /// list — and the named next method then completes authentication.
 #[tokio::test]
 async fn partial_success_reaches_the_client_and_the_next_factor_completes() {
     use russh::MethodKind;
 
-    let elf = compile(PARTIAL_AUTH, "ssh-partial-auth.c");
+    let elf = compile(&ssh_prog(PARTIAL_AUTH), "ssh-partial-auth.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -769,7 +906,7 @@ async fn partial_success_reaches_the_client_and_the_next_factor_completes() {
 
 #[tokio::test]
 async fn pipelined_request_replies_retain_their_own_want_reply_bit() {
-    let elf = compile(REQUEST_POLICY, "ssh-request-policy.c");
+    let elf = compile(&ssh_prog(REQUEST_POLICY), "ssh-request-policy.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -834,7 +971,7 @@ async fn pipelined_request_replies_retain_their_own_want_reply_bit() {
 
 #[tokio::test]
 async fn closing_an_extended_data_lane_does_not_close_the_connection() {
-    let elf = compile(LANE_CLOSE, "ssh-lane-close.c");
+    let elf = compile(&ssh_prog(LANE_CLOSE), "ssh-lane-close.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -890,7 +1027,7 @@ async fn public_key_auth_can_consult_authorized_keys_in_the_virtual_tree() {
     let allowed = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
     let denied = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
     let authorized = format!("{} test key\n", allowed.public_key().to_openssh().unwrap());
-    let elf = compile(AUTHORIZED_KEYS, "ssh-authorized-keys.c");
+    let elf = compile(&ssh_prog(AUTHORIZED_KEYS), "ssh-authorized-keys.c");
     let harness = Harness::with_tree(&[("keys/authorized_keys", &authorized)]);
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -953,7 +1090,7 @@ async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
         .map(|byte| format!("0x{byte:02x}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let source = SSH_CERT_SERVER.replace("__TRUSTED_CA_BYTES__", &ca_bytes);
+    let source = ssh_prog(SSH_CERT_SERVER).replace("__TRUSTED_CA_BYTES__", &ca_bytes);
     let elf = compile(&source, "ssh-cert.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
@@ -1085,7 +1222,7 @@ async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
 
 #[tokio::test]
 async fn sftp_runs_as_a_declared_backend_over_an_ordinary_channel() {
-    let elf = compile(SFTP_SERVER, "ssh-sftp.c");
+    let elf = compile(&ssh_prog(SFTP_SERVER), "ssh-sftp.c");
     let harness = Harness::with_tree(&[("files/hello.txt", "hello over sftp")]);
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1141,7 +1278,7 @@ async fn sftp_directory_reads_are_paginated_and_complete() {
         .iter()
         .map(|(name, body)| (name.as_str(), body.as_str()))
         .collect();
-    let elf = compile(SFTP_SERVER, "ssh-sftp-list.c");
+    let elf = compile(&ssh_prog(SFTP_SERVER), "ssh-sftp-list.c");
     let harness = Harness::with_tree(&borrowed);
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1199,7 +1336,7 @@ async fn sftp_directory_reads_are_paginated_and_complete() {
 
 #[tokio::test]
 async fn sftp_listing_skips_refused_rows_and_shows_real_directory_attributes() {
-    let elf = compile(SFTP_SERVER, "ssh-sftp-list.c");
+    let elf = compile(&ssh_prog(SFTP_SERVER), "ssh-sftp-list.c");
     let harness = Harness::with_tree_and_refused(
         &[
             ("files/a.txt", "a"),
@@ -1274,7 +1411,7 @@ async fn sftp_listing_skips_refused_rows_and_shows_real_directory_attributes() {
 
 #[tokio::test]
 async fn server_initiated_extension_channels_are_generic_fds() {
-    let elf = compile(SERVER_OPEN_EXTENSION, "ssh-extension-channel.c");
+    let elf = compile(&ssh_prog(SERVER_OPEN_EXTENSION), "ssh-extension-channel.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1334,27 +1471,35 @@ const LANE_FLOOD: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 100;
+  if (ssh_start_with("[\"none\"]") < 0) return 100;
   sy_s64 channel = -1;
   struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 101;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 102;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 102;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 103;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+        } else if (text_is(kind, "channel_request")) {
           sy_s64 lane = sy_ssh_channel_lane(channel, SY_SSH_EXTENDED_STDERR);
           if (lane < 0) return 104;
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 105;
           /* Flood the outbound lane without ever reading it back. The lane
              channel is bounded (CHANNEL_LANE_CAPACITY): once the ring and
@@ -1369,7 +1514,7 @@ SY_ENTRY sy_s64 entry(void) {
           }
           return backpressured ? 0 : 107;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 108;
+          if (sy_ssh_event_done(id) < 0) return 108;
         }
       }
     }
@@ -1380,7 +1525,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn a_full_outbound_lane_backpressures_the_guest_with_eagain() {
-    let elf = compile(LANE_FLOOD, "ssh-lane-flood.c");
+    let elf = compile(&ssh_prog(LANE_FLOOD), "ssh-lane-flood.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1443,17 +1588,25 @@ const REJECTED_OPENS: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   const char type[] = "no-such-type@example.com";
   const char opening[] = "";
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 90;
+  if (ssh_start_with("[\"none\"]") < 0) return 90;
   struct sy_pollfd fds[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
   for (;;) {
     if (sy_poll(fds, 1, 5000) < 0) return 91;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 92;
-        } else if (event.kind == SY_SSH_EVENT_AUTHENTICATED) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 92;
+        } else if (text_is(kind, "authenticated")) {
           /* Every open is refused by the peer (CHANNEL_OPEN_FAILURE). The
              failed fd stays reserved until the guest closes it, so it cannot
              alias a later endpoint; closing each one must allow more than a
@@ -1471,10 +1624,10 @@ SY_ENTRY sy_s64 entry(void) {
             if (!refused) return 95;
             if (sy_close(h) < 0) return 98;
           }
-          if (sy_ssh_event_done(event.id) < 0) return 96;
+          if (sy_ssh_event_done(id) < 0) return 96;
           return 0;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 97;
+          if (sy_ssh_event_done(id) < 0) return 97;
         }
       }
     }
@@ -1506,7 +1659,7 @@ impl russh::client::Handler for RejectingClient {
 
 #[tokio::test]
 async fn rejected_server_initiated_channel_opens_release_their_handle_slots() {
-    let elf = compile(REJECTED_OPENS, "ssh-rejected-opens.c");
+    let elf = compile(&ssh_prog(REJECTED_OPENS), "ssh-rejected-opens.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1546,32 +1699,40 @@ const EXIT_STATUS_LIVE: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 70;
+  if (ssh_start_with("[\"none\"]") < 0) return 70;
   sy_s64 channel = -1;
   struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 71;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 72;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 72;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 73;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+        } else if (text_is(kind, "channel_request")) {
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 74;
           /* the channel is confirmed: deliver a status and a signal while
              the client is still there */
           if (sy_ssh_exit_status(channel, 42) < 0) return 75;
           if (sy_ssh_exit_signal(channel, "SIGX", 4, 0) < 0) return 76;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 77;
+          if (sy_ssh_event_done(id) < 0) return 77;
         }
       }
     }
@@ -1586,7 +1747,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn exit_status_and_signal_reach_the_client_and_nothing_is_counted_lost() {
-    let elf = compile(EXIT_STATUS_LIVE, "ssh-exit-status-live.c");
+    let elf = compile(&ssh_prog(EXIT_STATUS_LIVE), "ssh-exit-status-live.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -1649,28 +1810,36 @@ const EXIT_STATUS_LOST: &str = r#"
 #include <synch.h>
 
 SY_ENTRY sy_s64 entry(void) {
-  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 80;
+  if (ssh_start_with("[\"none\"]") < 0) return 80;
   sy_s64 channel = -1;
   struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
   sy_u64 count = 1;
   for (;;) {
     if (sy_poll(fds, count, 5000) < 0) return 81;
     if (fds[0].revents & SY_POLL_IN) {
-      struct sy_ssh_event event;
-      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
-        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
-                                SY_SSH_AUTH_NONE) < 0) return 82;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
-          channel = sy_ssh_channel_accept(event.id);
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_s64 fd = event_fd(event);
+        sy_s64 want_reply = sy_json_get_bool(event, SY_STR("want_reply"));
+        sy_s64 data_type = -1;
+        sy_json_get_i64(event, SY_STR("data_type"), &data_type);
+        sy_close(event);
+        (void)fd; (void)want_reply; (void)data_type;
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 82;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
           if (channel < 0) return 83;
           fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
           count = 2;
-        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
-          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+        } else if (text_is(kind, "channel_request")) {
+          if (sy_ssh_request_reply(id, 1) < 0)
             return 84;
         } else {
-          if (sy_ssh_event_done(event.id) < 0) return 85;
+          if (sy_ssh_event_done(id) < 0) return 85;
         }
       }
     }
@@ -1698,7 +1867,7 @@ SY_ENTRY sy_s64 entry(void) {
 
 #[tokio::test]
 async fn lost_exit_delivery_is_counted_and_visible_to_the_guest() {
-    let elf = compile(EXIT_STATUS_LOST, "ssh-exit-status-lost.c");
+    let elf = compile(&ssh_prog(EXIT_STATUS_LOST), "ssh-exit-status-lost.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
