@@ -95,8 +95,10 @@ struct session {
 
 static sy_s64 handle_open(const struct sy_ssh_event *event,
                           struct session *s) {
-  /* One session per connection keeps the example one struct; §15.1's slot
-     array is the multi-channel shape a control master would want. */
+  /* One live session at a time keeps the example one struct; a session that
+     has ended frees the slot for the next open, so sequential logins on one
+     connection work (§7.3). §15.1's slot array is the shape for concurrent
+     channels. */
   if (s->channel >= 0 ||
       !field_is(event->id, SY_SSH_FIELD_CHANNEL_TYPE, SY_STR("session")))
     return sy_ssh_channel_reject(event->id,
@@ -156,21 +158,21 @@ static sy_s64 handle_request(const struct sy_ssh_event *event,
   return finish(event, SY_SSH_REQUEST_FAILURE);
 }
 
-/* Both directions of the terminal, each allowed to end on its own. */
-static sy_s64 move_terminal(struct session *s) {
+/* Both directions of the terminal, each allowed to end on its own. An error
+   ends its direction rather than the session: a PTY write half failing after
+   the shell exited must not race the exit status away, and a broken channel
+   surfaces through its own ERR in the poll loop. */
+static void move_terminal(struct session *s) {
   if (!s->input_done) {
     sy_s64 n = sy_splice(s->channel, s->pty, CHUNK);
-    if (n == 0) {
+    if (n == 0 || (n < 0 && n != SY_EAGAIN)) {
       /* Client EOF: no more keystrokes, and nothing else. A PTY has no write
          half to shut, and hanging the shell up here would kill commands the
          client already typed — `printf 'exit\n' | ssh` sends EOF right behind
          the keystrokes, and sshd lets the shell drain them and end itself.
          A client that vanishes entirely still can't leak the process: the
-         channel failing or the connection closing reaches close_session,
-         which kills a live shell. */
+         connection closing reaches close_session, which kills a live shell. */
       s->input_done = 1;
-    } else if (n < 0 && n != SY_EAGAIN) {
-      return n;
     } else {
       s->upward_blocked =
           sy_readable(s->channel) > 0 && sy_writable(s->pty) == 0;
@@ -178,16 +180,13 @@ static sy_s64 move_terminal(struct session *s) {
   }
   if (!s->output_done) {
     sy_s64 n = sy_splice(s->pty, s->channel, CHUNK);
-    if (n == 0) {
+    if (n == 0 || (n < 0 && n != SY_EAGAIN)) {
       s->output_done = 1;
-    } else if (n < 0 && n != SY_EAGAIN) {
-      return n;
     } else {
       s->downward_blocked =
           sy_readable(s->pty) > 0 && sy_writable(s->channel) == 0;
     }
   }
-  return 0;
 }
 
 static void close_session(struct session *s) {
@@ -195,6 +194,11 @@ static void close_session(struct session *s) {
   if (s->pty >= 0) sy_close(s->pty);
   if (s->channel >= 0) sy_close(s->channel);
   s->process = s->pty = s->channel = -1;
+  /* A clean slate, so the next `session` open on this connection starts a
+     fresh shell instead of inheriting this one's finished lifecycle. */
+  s->input_done = s->output_done = 0;
+  s->upward_blocked = s->downward_blocked = 0;
+  s->have_status = s->status_sent = 0;
 }
 
 SY_ENTRY sy_s64 entry(void) {
@@ -207,7 +211,7 @@ SY_ENTRY sy_s64 entry(void) {
     /* fd zero, then whichever session fds still have something coming. */
     struct sy_pollfd fds[4] = {{SY_SELF, SY_POLL_IN, 0}};
     sy_u64 nfds = 1;
-    sy_u64 channel_at = 0, pty_at = 0;
+    sy_u64 channel_at = 0;
 
     if (s.channel >= 0 && s.pty >= 0) {
       sy_u32 channel_events = 0, pty_events = 0;
@@ -225,10 +229,7 @@ SY_ENTRY sy_s64 entry(void) {
         channel_at = nfds;
         fds[nfds++] = (struct sy_pollfd){s.channel, channel_events, 0};
       }
-      if (pty_events) {
-        pty_at = nfds;
-        fds[nfds++] = (struct sy_pollfd){s.pty, pty_events, 0};
-      }
+      if (pty_events) fds[nfds++] = (struct sy_pollfd){s.pty, pty_events, 0};
     }
     if (s.process >= 0 && !s.have_status)
       fds[nfds++] = (struct sy_pollfd){s.process, SY_POLL_IN, 0};
@@ -254,18 +255,14 @@ SY_ENTRY sy_s64 entry(void) {
       }
     }
 
-    if (s.channel >= 0 && s.pty >= 0 && move_terminal(&s) < 0) {
-      close_session(&s);
-      return 3;
-    }
+    if (s.channel >= 0 && s.pty >= 0) move_terminal(&s);
 
-    /* The channel failing, or reaching HUP before the shell ended, is the
-       client going away: no one is left to see an exit status. */
-    if ((channel_at && (fds[channel_at].revents & (SY_POLL_ERR | SY_POLL_HUP))) ||
-        (pty_at && (fds[pty_at].revents & SY_POLL_ERR))) {
+    /* The channel failing is the client abandoning this session: no one is
+       left to see an exit status, so reap it and keep serving — the
+       connection itself may have more sessions to open. */
+    if (channel_at &&
+        (fds[channel_at].revents & (SY_POLL_ERR | SY_POLL_HUP)))
       close_session(&s);
-      return 0;
-    }
 
     if (s.process >= 0 && !s.have_status &&
         sy_process_status(s.process, &s.status, sizeof s.status) == 1)
@@ -282,8 +279,9 @@ SY_ENTRY sy_s64 entry(void) {
       sy_shutdown(s.channel); /* EOF after the queued output drains */
       s.status_sent = 1;
       close_session(&s);
-      /* The connection stays up for the client to close: fd zero reaches
-         HUP below, and that is this invocation's clean end. */
+      /* The connection stays up for the client to close or to log in again —
+         a new `session` open reuses the freed slot — and fd zero reaching
+         HUP below is this invocation's clean end. */
     }
 
     if (fds[0].revents & (SY_POLL_ERR | SY_POLL_HUP)) break;

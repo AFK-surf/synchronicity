@@ -806,6 +806,56 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         "the shell's own exit status reached the client: {text:?}"
     );
 
+    // A second login on the same connection: the finished session freed its
+    // slot, so a fresh shell starts with a fresh lifecycle (§7.3).
+    let mut second = client
+        .channel_open_session()
+        .await
+        .expect("a second session channel");
+    second
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("the second pty request was sent");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), second.wait())
+            .await
+            .expect("a second pty-req answer"),
+        Some(russh::ChannelMsg::Success)
+    ));
+    second
+        .request_shell(true)
+        .await
+        .expect("the second shell request was sent");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), second.wait())
+            .await
+            .expect("a second shell answer"),
+        Some(russh::ChannelMsg::Success)
+    ));
+    second
+        .data(&b"exit 0\n"[..])
+        .await
+        .expect("keystrokes reached the second channel");
+    let mut second_status = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while second_status.is_none() {
+        match tokio::time::timeout_at(deadline, second.wait())
+            .await
+            .expect("the second shell concluded")
+        {
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                second_status = Some(exit_status)
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert_eq!(
+        second_status,
+        Some(0),
+        "the second session ran to completion"
+    );
+
     client
         .disconnect(russh::Disconnect::ByApplication, "logout", "en")
         .await

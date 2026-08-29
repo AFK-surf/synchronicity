@@ -153,6 +153,8 @@ pub(crate) struct SshState {
     next_event: AtomicU64,
     ready: Arc<Readiness>,
     closed: AtomicU64,
+    /// Claimed by the one close whose errno sticks; see [`SshState::close`].
+    close_claimed: AtomicU64,
     errno: AtomicI64,
     session: Mutex<Option<russh::server::Handle>>,
     channels: Mutex<HashMap<i64, (ChannelId, String)>>,
@@ -170,6 +172,7 @@ impl SshState {
             next_event: AtomicU64::new(1),
             ready,
             closed: AtomicU64::new(0),
+            close_claimed: AtomicU64::new(0),
             errno: AtomicI64::new(0),
             session: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
@@ -183,7 +186,14 @@ impl SshState {
 
     /// The refused event comes back boxed so the caller can retry it when the
     /// budget is transient backpressure rather than a hard refusal.
+    ///
+    /// A closed connection refuses everything: the guest's fd zero is gone,
+    /// so an event pushed after `close` could never be answered and would
+    /// park its handler on the full decision deadline for nothing.
     fn push(&self, mut event: Event) -> Result<u64, Box<Event>> {
+        if self.is_closed() {
+            return Err(Box::new(event));
+        }
         let bytes = event.payload_len();
         if bytes > MAX_EVENT_BYTES {
             return Err(Box::new(event));
@@ -321,7 +331,19 @@ impl SshState {
         }
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) != 0
+    }
+
+    /// The first close wins: a guest that ended the connection cleanly with
+    /// `sy_close` must not have its errno rewritten when the serve task
+    /// notices the transport going away moments later. The claim is separate
+    /// from `closed` so the errno is in place before `revents` can report
+    /// `HUP` — a reader that sees the end also sees why.
     pub(crate) fn close(&self, errno: i64) {
+        if self.close_claimed.swap(1, Ordering::AcqRel) != 0 {
+            return;
+        }
         self.errno.store(errno, Ordering::Release);
         self.closed.store(1, Ordering::Release);
         let mut store = self
@@ -1077,10 +1099,19 @@ impl Handler for SshHandler {
             match self.state.push(event) {
                 Ok(id) => break id,
                 Err(back) => {
+                    // A closed connection refuses every push; there is
+                    // nothing left to offer the packet to.
+                    if self.state.is_closed() {
+                        return Ok(());
+                    }
                     // The event budget is full of other work. Wait it out
                     // within the same deadline rather than disconnecting;
-                    // the packet in hand is the backpressure.
+                    // the packet in hand is the backpressure. The deadline
+                    // selects bounded discard (§6.2) here exactly as it does
+                    // for an unanswered event below, so a guest that never
+                    // drains its queue cannot stall this data type forever.
                     if tokio::time::Instant::now() >= deadline {
+                        self.state.discard_lane(fd, data_type);
                         return Ok(());
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;

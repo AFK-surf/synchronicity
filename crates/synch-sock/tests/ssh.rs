@@ -344,6 +344,36 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const PARTIAL_AUTH: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF,
+                   SY_SSH_AUTH_NONE | SY_SSH_AUTH_PASSWORD) < 0) return 80;
+  struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  for (;;) {
+    if (sy_poll(conn, 1, 5000) < 0) return 81;
+    if (conn[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          /* The outer identity is one accepted factor; a password is still
+             required to finish. */
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_PARTIAL,
+                                SY_SSH_AUTH_PASSWORD) < 0) return 82;
+        } else if (event.kind == SY_SSH_EVENT_AUTH_PASSWORD) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0) < 0)
+            return 83;
+        } else if (sy_ssh_event_done(event.id) < 0) {
+          return 84;
+        }
+      }
+    }
+    if (conn[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
 #[derive(Clone)]
 struct Client;
 
@@ -501,6 +531,66 @@ async fn none_is_accepted_by_policy_but_never_advertised() {
     // attempt on its own: the program exits nonzero if the event reaches it.
     assert!(!client
         .authenticate_password("test", "swordfish")
+        .await
+        .unwrap()
+        .success());
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+/// A guest's `SY_SSH_AUTH_PARTIAL` reaches the client as RFC 4252 partial
+/// success — the flag in `USERAUTH_FAILURE`, not merely a narrowed method
+/// list — and the named next method then completes authentication.
+#[tokio::test]
+async fn partial_success_reaches_the_client_and_the_next_factor_completes() {
+    use russh::MethodKind;
+
+    let elf = compile(PARTIAL_AUTH, "ssh-partial-auth.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+
+    let first = client.authenticate_none("test").await.unwrap();
+    let russh::client::AuthResult::Failure {
+        remaining_methods,
+        partial_success,
+    } = first
+    else {
+        panic!("the first factor alone must not complete authentication");
+    };
+    assert!(
+        partial_success,
+        "the guest's PARTIAL decision reaches the wire as partial success"
+    );
+    assert!(remaining_methods.contains(&MethodKind::Password));
+    assert!(!remaining_methods.contains(&MethodKind::None));
+
+    assert!(client
+        .authenticate_password("test", "second-factor")
         .await
         .unwrap()
         .success());
