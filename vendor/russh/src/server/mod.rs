@@ -849,6 +849,14 @@ pub trait Handler: Sized {
 
     /// Called for a channel request not otherwise understood by russh.
     /// `payload` is the exact bounded data following the want-reply byte.
+    ///
+    /// The request is answered exactly once. A handler that wants to answer
+    /// it may do so inline with [`Session::channel_success`] /
+    /// [`Session::channel_failure`], or detach the reply right with
+    /// [`Session::take_channel_request_reply`] and answer after returning.
+    /// When it does neither — as this default does — russh sends
+    /// `SSH_MSG_CHANNEL_FAILURE` for a request whose `want-reply` bit was set,
+    /// matching upstream's fallback.
     #[allow(unused_variables)]
     fn channel_request_unknown(
         &mut self,
