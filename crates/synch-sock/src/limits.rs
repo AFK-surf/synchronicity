@@ -31,9 +31,9 @@ pub struct Limits {
     /// The table is deliberately larger than any one resource's own bound.
     /// What stops a guest turning spare slots into host memory or OS
     /// children is not this number but the per-role caps beside it:
-    /// `max_egress`, the SSH channel cap, [`MAX_LANES_PER_CHANNEL`],
-    /// [`MAX_LIVE_PROCESSES`], [`MAX_OPEN_PTYS`],
-    /// [`MAX_OPEN_FILE_TRANSFERS`], and the footprint meter for objects,
+    /// `max_egress`, the SSH channel cap, `MAX_LANES_PER_CHANNEL`,
+    /// `MAX_LIVE_PROCESSES`, `MAX_OPEN_PTYS`,
+    /// `MAX_OPEN_FILE_TRANSFERS`, and the footprint meter for objects,
     /// cursors, and JSON values (`docs/SSH-SOCKETS.md` §9).
     pub max_handles: usize,
     /// The most outbound TCP connections one invocation may open.
