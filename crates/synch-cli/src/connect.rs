@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use synch_sock::limits::{
-    MAX_ACCEPT_CONCURRENT, MAX_ACCEPTS_PER_IP_PER_SECOND, MAX_ACCEPTS_PER_SECOND,
+    MAX_ACCEPTS_PER_IP_PER_SECOND, MAX_ACCEPTS_PER_SECOND, MAX_ACCEPT_CONCURRENT,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
@@ -92,7 +92,10 @@ struct AcceptRate {
 
 impl AcceptRate {
     fn new(window: Duration) -> Self {
-        AcceptRate { window, recent: VecDeque::new() }
+        AcceptRate {
+            window,
+            recent: VecDeque::new(),
+        }
     }
 
     /// Admits a connection from `ip` if both the global and the per-IP window

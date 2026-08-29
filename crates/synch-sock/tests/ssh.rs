@@ -741,10 +741,13 @@ async fn closing_an_extended_data_lane_does_not_close_the_connection() {
     .unwrap();
     assert!(client.authenticate_none("test").await.unwrap().success());
     let channel = client.channel_open_session().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), channel.request_shell(true))
-        .await
-        .expect("the shell request got a reply")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
     channel
         .extended_data_bytes(1, b"discard me".as_slice())
         .await
@@ -1135,7 +1138,10 @@ async fn sftp_listing_skips_refused_rows_and_shows_real_directory_attributes() {
     let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, vec!["a.txt", "sub", "z.txt"]);
     let sub = entries.iter().find(|(name, _)| name == "sub").unwrap();
-    assert!(sub.1.is_dir(), "a directory row is listed with dir attributes");
+    assert!(
+        sub.1.is_dir(),
+        "a directory row is listed with dir attributes"
+    );
     assert_eq!(sub.1.permissions, Some(0o040555));
     assert!(!entries.iter().any(|(name, _)| name == "sock"));
     drop(sftp);
@@ -1281,10 +1287,13 @@ async fn a_full_outbound_lane_backpressures_the_guest_with_eagain() {
     .unwrap();
     assert!(client.authenticate_none("test").await.unwrap().success());
     let channel = client.channel_open_session().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), channel.request_shell(true))
-        .await
-        .expect("the shell request got a reply")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
     // Do not read yet: the flood must backpressure, which is what the guest
     // asserts (SY_EAGAIN instead of an always-successful write).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1484,10 +1493,13 @@ async fn exit_status_and_signal_reach_the_client_and_nothing_is_counted_lost() {
     .unwrap();
     assert!(client.authenticate_none("test").await.unwrap().success());
     let mut channel = client.channel_open_session().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), channel.request_shell(true))
-        .await
-        .expect("the shell request got a reply")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
     let mut got_success = false;
     let mut got_status = false;
     let mut got_signal = false;
@@ -1593,10 +1605,13 @@ async fn lost_exit_delivery_is_counted_and_visible_to_the_guest() {
     .unwrap();
     assert!(client.authenticate_none("test").await.unwrap().success());
     let channel = client.channel_open_session().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), channel.request_shell(true))
-        .await
-        .expect("the shell request got a reply")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
     // Ending the connection is what makes the guest's later exit-status
     // undeliverable: the run loop is gone, so the Handle send fails, and the
     // guest must observe the failure through sy_ssh_exit_status_lost.
