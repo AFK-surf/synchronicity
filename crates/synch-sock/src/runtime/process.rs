@@ -7,13 +7,14 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, RawFd},
     pin::Pin,
     process::Stdio,
+    rc::Weak,
     sync::Mutex,
     task::{Context, Poll},
 };
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::abi::errno;
+use crate::{abi::errno, runtime::endpoint::Readiness};
 
 /// Serializes PTY descriptor creation with every declared-process fork.
 ///
@@ -126,6 +127,38 @@ impl ProcessSlot {
         // descendants as well as the direct child.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+/// Wakes a guest poll when this process changes state.
+///
+/// The signal receiver is installed before the process is spawned, and Tokio's
+/// signal stream retains a notification until it is consumed. Sampling once
+/// before each wait therefore closes both races: an exit before this task first
+/// runs is found by `refresh`, and an exit after that sample wakes `recv`.
+/// A weak reference lets closing the process handle still drop and kill it.
+pub(crate) async fn watch_exit(
+    process: Weak<ProcessSlot>,
+    ready: std::sync::Arc<Readiness>,
+    mut child_events: tokio::signal::unix::Signal,
+) {
+    loop {
+        let Some(process) = process.upgrade() else {
+            return;
+        };
+        let terminal = match process.refresh() {
+            Ok(status) => status.exited,
+            Err(_) => true,
+        };
+        drop(process);
+        if terminal {
+            ready.bump();
+            return;
+        }
+        if child_events.recv().await.is_none() {
+            ready.bump();
+            return;
         }
     }
 }

@@ -155,18 +155,34 @@ async fn openssh_logs_into_the_ssh_shell_example() {
         String::from_utf8_lossy(&output)
     );
 
-    // Typed at the terminal: bash expands the arithmetic, so seeing the
-    // expansion proves a real shell behind a real PTY, and `exit 5` proves
-    // the SSH exit-status path end to end. Stdin stays open until the remote
-    // side ends the session — a client may treat local EOF as its cue to
-    // leave, and the logout must come from the shell's own exit.
+    // Run and observe one command before typing exit separately. Sending both
+    // in one write can leave a second CHANNEL_DATA packet queued behind the
+    // shell's exit; that packet would accidentally wake a broken server in
+    // exactly the same way as pressing another key after `exit`.
     stdin
-        .write_all(b"echo interop-$((6*7))\nexit 5\n")
+        .write_all(b"echo interop-$((6*7))\n")
         .await
         .expect("keystrokes reached ssh");
     stdin.flush().await.expect("keystrokes flushed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&output).contains("interop-42") {
+        let n = tokio::time::timeout_at(deadline, stdout_pipe.read(&mut chunk))
+            .await
+            .expect("bash answered the probe")
+            .expect("ssh stdout remained readable");
+        assert_ne!(n, 0, "the session ended before bash answered");
+        output.extend_from_slice(&chunk[..n]);
+    }
+
+    // Keep stdin open after the lone exit command. The remote channel must
+    // send CLOSE on its own; client EOF or another byte must not be required.
+    stdin
+        .write_all(b"exit 5\n")
+        .await
+        .expect("exit reached ssh");
+    stdin.flush().await.expect("exit flushed");
     tokio::time::timeout(
-        Duration::from_secs(30),
+        Duration::from_secs(10),
         stdout_pipe.read_to_end(&mut output),
     )
     .await

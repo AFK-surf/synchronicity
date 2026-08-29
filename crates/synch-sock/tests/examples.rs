@@ -811,15 +811,16 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         .await
         .expect("keystrokes reached the channel");
 
-    // The server reports the shell's exit and half-closes; closing the
-    // channel back is the client's move, exactly as OpenSSH would. A shell
-    // that dies by signal concludes too, so the failure diagnostics can say
-    // who killed it rather than showing silence.
+    // The server reports the shell's exit, EOF, and CHANNEL_CLOSE without
+    // needing another client byte. A shell that dies by signal concludes too,
+    // so the failure diagnostics can say who killed it rather than showing
+    // silence.
     let mut exit_status = None;
     let mut exit_signal = None;
     let mut eof = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(eof && (exit_status.is_some() || exit_signal.is_some())) {
+    let mut closed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(eof && closed && (exit_status.is_some() || exit_signal.is_some())) {
         let message = tokio::time::timeout_at(deadline, channel.wait())
             .await
             .expect("the shell session concluded");
@@ -832,7 +833,11 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
                 exit_signal = Some(format!("{signal_name:?}"))
             }
             Some(russh::ChannelMsg::Eof) => eof = true,
-            Some(russh::ChannelMsg::Close) | None => break,
+            Some(russh::ChannelMsg::Close) => closed = true,
+            None => {
+                closed = true;
+                break;
+            }
             Some(_) => {}
         }
     }
@@ -846,6 +851,7 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         Some(3),
         "the shell's own exit status reached the client.\noutput: {text:?}\nexit signal: {exit_signal:?}"
     );
+    assert!(eof && closed, "the server did not finish the channel");
 
     // A second login on the same connection: the finished session freed its
     // slot, so a fresh shell starts with a fresh lifecycle (§7.3).
@@ -880,8 +886,9 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         .await
         .expect("keystrokes reached the second channel");
     let mut second_status = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while second_status.is_none() {
+    let mut second_closed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while second_status.is_none() || !second_closed {
         match tokio::time::timeout_at(deadline, second.wait())
             .await
             .expect("the second shell concluded")
@@ -889,8 +896,12 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
             Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                 second_status = Some(exit_status)
             }
+            Some(russh::ChannelMsg::Close) => second_closed = true,
+            None => {
+                second_closed = true;
+                break;
+            }
             Some(_) => {}
-            None => break,
         }
     }
     assert_eq!(
@@ -898,6 +909,7 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         Some(0),
         "the second session ran to completion"
     );
+    assert!(second_closed, "the second channel was never closed");
 
     client
         .disconnect(russh::Disconnect::ByApplication, "logout", "en")

@@ -76,6 +76,55 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const SSH_HALF_CLOSE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 20;
+  sy_s64 channel = -1;
+  char input[9];
+  sy_u64 input_len = 0;
+
+  for (;;) {
+    struct sy_pollfd fds[2] = {
+      { SY_SELF, SY_POLL_IN, 0 },
+      { channel, SY_POLL_IN, 0 },
+    };
+    sy_u64 count = channel < 0 ? 1 : 2;
+    if (sy_poll(fds, count, 5000) < 0) return 21;
+
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT, 0) < 0)
+            return 22;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          channel = sy_ssh_channel_accept(event.id);
+          if (channel < 0) return 23;
+          if (sy_write(channel, SY_STR("server-eof")) != 10) return 24;
+          if (sy_shutdown(channel) < 0) return 25;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 26;
+        }
+      }
+    }
+
+    if (channel >= 0 && (fds[1].revents & SY_POLL_IN)) {
+      sy_s64 n = sy_read(channel, input + input_len, sizeof input - input_len);
+      if (n <= 0) return 27;
+      input_len += (sy_u64)n;
+      if (input_len == sizeof input) {
+        const char expected[] = "after-eof";
+        for (sy_u64 i = 0; i < sizeof input; i++)
+          if (input[i] != expected[i]) return 28;
+        return 0;
+      }
+    }
+  }
+}
+"#;
+
 const AUTHORIZED_KEYS: &str = r#"
 #include <synch.h>
 
@@ -528,6 +577,71 @@ async fn none_auth_and_multiple_session_channels_share_one_connection() {
     let moved = (b"first channel".len() + b"second channel".len()) as u64;
     assert_eq!(outcome.bytes_in, moved);
     assert_eq!(outcome.bytes_out, moved);
+}
+
+#[tokio::test]
+async fn guest_shutdown_sends_eof_but_keeps_channel_input_open() {
+    let elf = compile(SSH_HALF_CLOSE, "ssh-half-close.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .expect("SSH handshake completed");
+    assert!(client
+        .authenticate_none("test")
+        .await
+        .expect("none authentication got a response")
+        .success());
+    let mut channel = client
+        .channel_open_session()
+        .await
+        .expect("session channel");
+
+    let mut output = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, channel.wait())
+            .await
+            .expect("the guest sent its half-close")
+        {
+            Some(russh::ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+            Some(russh::ChannelMsg::Eof) => break,
+            Some(russh::ChannelMsg::Close) | None => {
+                panic!("sy_shutdown closed the whole SSH channel")
+            }
+            Some(_) => {}
+        }
+    }
+    assert_eq!(output, b"server-eof");
+
+    // Server-to-client EOF is only a half-close. The guest must still receive
+    // ordinary channel data sent afterward.
+    channel
+        .data(&b"after-eof"[..])
+        .await
+        .expect("client input remained open after server EOF");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("the guest read data after its half-close")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+    drop(channel);
+    drop(client);
 }
 
 #[tokio::test]

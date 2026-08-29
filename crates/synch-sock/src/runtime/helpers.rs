@@ -1256,7 +1256,7 @@ fn h_ssh_channel_open(
             return ret(error);
         }
     };
-    let (local, mut bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
+    let (local, bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
     let (reader, writer) = tokio::io::split(local);
     inner.spawn(crate::runtime::endpoint::reader_task(
         endpoint.clone(),
@@ -1272,10 +1272,9 @@ fn h_ssh_channel_open(
             .await;
         match opened {
             Ok(channel) => {
-                state.add_outbound_channel(handle, channel.id(), &channel_type);
+                let guest_closed = state.add_outbound_channel(handle, channel.id(), &channel_type);
                 endpoint.set_open();
-                let mut stream = channel.into_stream();
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut bridge).await;
+                crate::runtime::ssh::bridge_channel(channel, bridge, guest_closed).await;
             }
             Err(_) => {
                 state.release_channel();
@@ -1717,6 +1716,13 @@ fn h_process_spawn_pty(
     if pty.capability != capability.id || pty.spawned.replace(true) {
         return ret(errno::ESTATE);
     }
+    let child_events = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
+        Ok(events) => events,
+        Err(_) => {
+            pty.spawned.set(false);
+            return ret(errno::ECONNRESET);
+        }
+    };
     let Some(slave) = pty.slave.borrow_mut().take() else {
         return ret(errno::ESTATE);
     };
@@ -1741,6 +1747,11 @@ fn h_process_spawn_pty(
             return ret(error);
         }
     };
+    inner.spawn(crate::runtime::process::watch_exit(
+        Rc::downgrade(&process),
+        inner.ready.clone(),
+        child_events,
+    ));
     inner.publish_handles();
     ret(handle)
 }
@@ -1757,6 +1768,10 @@ fn h_process_spawn(
     let capability = match process_capability(&inner, capability_id as u32) {
         Ok(capability) if capability.flags & 0x02 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
+    };
+    let child_events = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
+        Ok(events) => events,
+        Err(_) => return ret(errno::ECONNRESET),
     };
     let (child, stdout, stdin, stderr) = match crate::runtime::process::spawn_pipe(&capability) {
         Ok(parts) => parts,
@@ -1820,6 +1835,11 @@ fn h_process_spawn(
             return ret(error);
         }
     };
+    inner.spawn(crate::runtime::process::watch_exit(
+        Rc::downgrade(&process),
+        inner.ready.clone(),
+        child_events,
+    ));
     inner.publish_handles();
     ret(handle)
 }

@@ -1358,7 +1358,7 @@ SY_ENTRY sy_s64 entry(void) {
     if (result == 1) break;
     if (result != SY_EAGAIN) return 71;
     struct sy_pollfd wait[1] = {{ process, SY_POLL_IN, 0 }};
-    if (sy_poll(wait, 1, 5000) <= 0) return 72;
+    if (sy_poll(wait, 1, 1500) <= 0) return 72;
   }
   if (!status.exited || status.signaled || status.exit_code != 0) return 73;
   if (sy_process_status(process, &status, sizeof status) != 1) return 74;
@@ -1372,7 +1372,10 @@ fn process_capability(id: u32) -> ProcessCapability {
         id,
         flags: 0x02,
         executable: "/bin/sh".into(),
-        argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
+        // The direct child exits after one second, while its background child
+        // keeps stdout and stderr open for another second. Pipe EOF therefore
+        // cannot mask a missing child-exit readiness notification.
+        argv: vec!["sh".into(), "-c".into(), "sleep 1; sleep 1 &".into()],
         allowed_signals: 0,
     }
 }

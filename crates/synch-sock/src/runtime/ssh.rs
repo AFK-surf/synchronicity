@@ -15,8 +15,8 @@ use russh::{
     Channel, ChannelId, ChannelOpenFailure, Pty, Sig,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::oneshot,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    sync::{oneshot, Notify},
 };
 
 use crate::{
@@ -32,6 +32,54 @@ pub(crate) const AUTH_NONE: u64 = 0x01;
 pub(crate) const AUTH_PUBLICKEY: u64 = 0x02;
 pub(crate) const AUTH_PASSWORD: u64 = 0x04;
 pub(crate) const AUTH_ALL: u64 = AUTH_NONE | AUTH_PUBLICKEY | AUTH_PASSWORD;
+
+/// Bridges one SSH channel to its guest endpoint while keeping half-close and
+/// handle close distinct.
+///
+/// EOF in either direction leaves the other direction live. Only the explicit
+/// notification from `sy_close(channel)` stops client input early; even then,
+/// output already accepted from the guest drains before the channel is dropped
+/// and emits CHANNEL_CLOSE.
+pub(crate) async fn bridge_channel(
+    channel: Channel<Msg>,
+    bridge: tokio::io::DuplexStream,
+    guest_closed: Arc<Notify>,
+) {
+    let (mut channel_read, mut channel_write) = tokio::io::split(channel.into_stream());
+    let (mut guest_read, mut guest_write) = tokio::io::split(bridge);
+
+    let guest_to_client = async {
+        let _ = tokio::io::copy(&mut guest_read, &mut channel_write).await;
+        let _ = channel_write.shutdown().await;
+    };
+    let client_to_guest = async {
+        let _ = tokio::io::copy(&mut channel_read, &mut guest_write).await;
+        let _ = guest_write.shutdown().await;
+    };
+    tokio::pin!(guest_to_client, client_to_guest);
+    let closed = guest_closed.notified();
+    tokio::pin!(closed);
+
+    tokio::select! {
+        () = &mut guest_to_client => {
+            // `sy_shutdown` is only output EOF. Continue accepting client
+            // input until it too ends or the guest closes the handle.
+            tokio::select! {
+                () = &mut client_to_guest => {}
+                () = &mut closed => {}
+            }
+        }
+        () = &mut client_to_guest => {
+            // Client EOF is only a half-close. Keep forwarding output until
+            // the guest sends EOF; an explicit close still drains that output.
+            tokio::select! {
+                () = &mut guest_to_client => {}
+                () = &mut closed => guest_to_client.await,
+            }
+        }
+        () = &mut closed => guest_to_client.await,
+    }
+}
 
 pub(crate) const EVENT_AUTH_NONE: u32 = 1;
 pub(crate) const EVENT_AUTH_PASSWORD: u32 = 2;
@@ -177,6 +225,13 @@ struct EventStore {
     payload_bytes: usize,
 }
 
+#[derive(Debug)]
+struct ChannelBinding {
+    id: ChannelId,
+    kind: String,
+    guest_closed: Arc<Notify>,
+}
+
 /// One activated SSH connection as seen by fd zero.
 #[derive(Debug)]
 pub(crate) struct SshState {
@@ -188,7 +243,7 @@ pub(crate) struct SshState {
     close_claimed: AtomicU64,
     errno: AtomicI64,
     session: Mutex<Option<russh::server::Handle>>,
-    channels: Mutex<HashMap<i64, (ChannelId, String)>>,
+    channels: Mutex<HashMap<i64, ChannelBinding>>,
     channel_slots: AtomicU64,
     lanes: Mutex<HashMap<LaneKey, LaneBinding>>,
     discarded_lanes: Mutex<HashSet<LaneKey>>,
@@ -490,14 +545,14 @@ impl SshState {
     /// possibly reused by a different accept — so one channel's data can never
     /// be routed to another channel's fd. The outbound path (`expected: None`)
     /// registers without a token, since its registration is synchronous in its
-    /// own task. Returns whether the registration happened.
+    /// own task. Returns the close notification when registration happened.
     fn register_channel(
         &self,
         fd: i64,
         id: ChannelId,
         channel_type: &str,
         expected: Option<u64>,
-    ) -> bool {
+    ) -> Option<Arc<Notify>> {
         if let Some(expected) = expected {
             let mut accepts = self
                 .accepts
@@ -509,17 +564,25 @@ impl SshState {
                 // ran, no entry was ever installed in `channels`, so the close
                 // path had nothing from which to release that reservation.
                 self.release_channel();
-                return false;
+                return None;
             }
             // The token is single-use: consumed by the successful
             // registration, and invalidated by `remove_channel_fd` on close.
             accepts.remove(&fd);
         }
+        let guest_closed = Arc::new(Notify::new());
         self.channels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(fd, (id, channel_type.to_string()));
-        true
+            .insert(
+                fd,
+                ChannelBinding {
+                    id,
+                    kind: channel_type.to_string(),
+                    guest_closed: guest_closed.clone(),
+                },
+            );
+        Some(guest_closed)
     }
 
     /// Binds the accepted channel event `event_id` to its endpoint fd.
@@ -590,7 +653,7 @@ impl SshState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut channels = before;
         let len = channels.len();
-        channels.retain(|_, (candidate, _)| *candidate != id);
+        channels.retain(|_, binding| binding.id != id);
         if channels.len() != len {
             self.release_channel();
         }
@@ -616,17 +679,20 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&fd);
-        if let Some((id, _)) = removed {
+        if let Some(binding) = removed {
+            // `notify_one` retains a permit if registration won the race but
+            // the bridge task has not started waiting yet.
+            binding.guest_closed.notify_one();
             self.release_channel();
             self.request_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+                .remove(&binding.id);
             if let Some(tasks) = self
                 .request_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id)
+                .remove(&binding.id)
             {
                 for task in tasks {
                     task.abort();
@@ -671,13 +737,12 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()?;
-        let (id, kind) = self
+        let channels = self
             .channels
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&fd)
-            .cloned()?;
-        Some((session, id, kind))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = channels.get(&fd)?;
+        Some((session, binding.id, binding.kind.clone()))
     }
 
     fn fd_for_channel(&self, id: ChannelId) -> Option<i64> {
@@ -685,7 +750,7 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .find_map(|(fd, (candidate, _))| (*candidate == id).then_some(*fd))
+            .find_map(|(fd, binding)| (binding.id == id).then_some(*fd))
     }
 
     fn request_order(&self, id: ChannelId) -> Arc<tokio::sync::Mutex<()>> {
@@ -704,10 +769,16 @@ impl SshState {
             .clone()
     }
 
-    pub(crate) fn add_outbound_channel(&self, fd: i64, id: ChannelId, channel_type: &str) {
+    pub(crate) fn add_outbound_channel(
+        &self,
+        fd: i64,
+        id: ChannelId,
+        channel_type: &str,
+    ) -> Arc<Notify> {
         // The outbound path is synchronous in its own task; no ownership
         // token is needed (None registers unconditionally).
-        let _ = self.register_channel(fd, id, channel_type, None);
+        self.register_channel(fd, id, channel_type, None)
+            .expect("outbound registration has no ownership token to reject")
     }
 
     pub(crate) fn register_lane(
@@ -1050,8 +1121,10 @@ impl SshHandler {
         let channel_type = channel_type.to_owned();
         self.state.spawn(async move {
             match tokio::time::timeout(Duration::from_secs(60), rx).await {
-                Ok(Ok(Decision::Channel { fd, mut bridge })) => {
-                    if !state.register_channel(fd, channel.id(), &channel_type, Some(event_id)) {
+                Ok(Ok(Decision::Channel { fd, bridge })) => {
+                    let Some(guest_closed) =
+                        state.register_channel(fd, channel.id(), &channel_type, Some(event_id))
+                    else {
                         // The accepted fd was closed or reused since the
                         // accept: its ownership token is gone, so registration
                         // is dropped and the channel is rejected — fail-closed
@@ -1059,11 +1132,9 @@ impl SshHandler {
                         // channel's fd.
                         reply.reject(ChannelOpenFailure::ResourceShortage).await;
                         return;
-                    }
+                    };
                     reply.accept().await;
-                    let mut stream = channel.into_stream();
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut bridge).await;
-                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut bridge).await;
+                    bridge_channel(channel, bridge, guest_closed).await;
                 }
                 Ok(Ok(Decision::ChannelReject(reason))) => reply.reject(reason).await,
                 _ => {
@@ -2213,7 +2284,9 @@ mod tests {
         // This is the race the ownership token protects: the guest closes the
         // newly accepted fd before the SSH task consumes the accept decision.
         state.remove_channel_fd(7);
-        assert!(!state.register_channel(7, channel, "session", Some(99)));
+        assert!(state
+            .register_channel(7, channel, "session", Some(99))
+            .is_none());
 
         for _ in 0..super::MAX_CHANNELS {
             assert!(
@@ -2222,5 +2295,25 @@ mod tests {
             );
         }
         assert!(!state.reserve_channel());
+    }
+
+    #[tokio::test]
+    async fn channel_close_before_bridge_wait_is_not_lost() {
+        use russh::keys::ssh_key::encoding::Decode;
+
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let encoded = 12_u32.to_be_bytes();
+        let mut encoded = encoded.as_slice();
+        let channel = russh::ChannelId::decode(&mut encoded).unwrap();
+
+        assert!(state.reserve_channel());
+        let guest_closed = state
+            .register_channel(7, channel, "session", None)
+            .expect("outbound registration cannot be rejected");
+        state.remove_channel_fd(7);
+
+        tokio::time::timeout(Duration::from_millis(100), guest_closed.notified())
+            .await
+            .expect("a close before the bridge starts waiting retains its notification");
     }
 }
