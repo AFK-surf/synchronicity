@@ -171,6 +171,9 @@ pub(crate) struct Inner {
     pub(crate) init_mode: bool,
     pub(crate) declaration: RefCell<Declaration>,
     pub(crate) ssh_host_key: Option<Arc<russh::keys::PrivateKey>>,
+    /// Host-side auth-rejection throttle for SSH connections served by this
+    /// invocation; `None` when the invocation cannot serve SSH.
+    pub(crate) ssh_auth_throttle: Option<Arc<crate::runtime::ssh::AuthThrottle>>,
 
     /// Counters an operator reads while this is running.
     ///
@@ -277,6 +280,7 @@ impl Inner {
             init_mode: false,
             declaration: RefCell::new(Declaration::default()),
             ssh_host_key: None,
+            ssh_auth_throttle: None,
             live: Default::default(),
             // No registry: only a served invocation appears in `socket ps` and
             // keeps a log tail; the base is a run nobody is watching.

@@ -300,6 +300,34 @@ pub trait Handler: Sized {
         async { Ok(Auth::reject()) }
     }
 
+    /// Pre-authentication callback for public key authentication with an
+    /// OpenSSH certificate. This method is called when a client is probing
+    /// certificate authentication without a signature (yet), i.e. the
+    /// `is_real == 0` path where the client only asks whether the key would
+    /// be accepted.
+    ///
+    /// The default implementation delegates to
+    /// [`Handler::auth_publickey_offered`] with the certificate's embedded
+    /// public key, so handlers that do not care about certificates see
+    /// exactly the same behavior as for a plain key offer. Overriding it
+    /// lets a handler distinguish certificate-backed offers from plain key
+    /// offers (e.g. to gate them differently).
+    ///
+    /// Russh makes sure rejection takes a constant [`Config::auth_rejection_time`],
+    /// except if this method takes more than that.
+    #[allow(unused_variables)]
+    fn auth_publickey_offered_cert(
+        &mut self,
+        user: &str,
+        certificate: &Certificate,
+    ) -> impl Future<Output = Result<Auth, Self::Error>> + Send
+    where
+        Self: Send,
+    {
+        let public_key = ssh_key::PublicKey::new(certificate.public_key().clone(), "");
+        async move { self.auth_publickey_offered(user, &public_key).await }
+    }
+
     /// Check authentication using the "keyboard-interactive"
     /// method.
     ///

@@ -230,6 +230,12 @@ extern sy_s64 sy_endpoint_info(sy_s64 handle, char *out, sy_u64 out_len);
 #define SY_SSH_EVENT_CHANNEL_OPEN            6
 #define SY_SSH_EVENT_CHANNEL_REQUEST         7
 #define SY_SSH_EVENT_CHANNEL_EXTENDED_DATA   8
+/* 9, not 5: 5 is SY_SSH_EVENT_AUTHENTICATED, and event kinds are a shared
+ * ABI. A certificate authentication is a real authentication (the SSH
+ * library has validated its structure, validity, user principal and
+ * possession signature), not an offer. The guest must still authorize the
+ * signing CA through the AUTH_CERT_CA fields below. */
+#define SY_SSH_EVENT_AUTH_OPENSSH_CERT       9
 
 #define SY_SSH_EVENT_WANT_REPLY 0x01
 
@@ -251,6 +257,16 @@ extern sy_s64 sy_endpoint_info(sy_s64 handle, char *out, sy_u64 out_len);
 #define SY_SSH_FIELD_TERMINAL            17
 #define SY_SSH_FIELD_ENV_NAME            18
 #define SY_SSH_FIELD_ENV_VALUE           19
+#define SY_SSH_FIELD_AUTH_ATTEMPTS       20
+#define SY_SSH_FIELD_AUTH_CERT_FLAG      21
+#define SY_SSH_FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB 22
+#define SY_SSH_FIELD_AUTH_CERT_CA_SHA256 23
+#define SY_SSH_FIELD_AUTH_CERT_KEY_ID    24
+#define SY_SSH_FIELD_AUTH_CERT_SERIAL    25 /* little-endian u64 */
+#define SY_SSH_FIELD_AUTH_CERT_TYPE      26 /* little-endian u32: user=1 */
+/* Repeated little-endian u32 byte length followed by UTF-8 principal bytes. */
+#define SY_SSH_FIELD_AUTH_CERT_PRINCIPALS 27
+#define SY_SSH_FIELD_AUTH_CERT_BLOB      28
 
 struct sy_ssh_event {
   sy_u64 id;
@@ -314,6 +330,12 @@ struct sy_pty_spec {
 };
 extern sy_s64 sy_ssh_pty_spec(sy_u64 event_id, struct sy_pty_spec *out,
                               sy_u64 out_len);
+/* Number of exit-status/exit-signal deliveries that could not be sent to the
+   SSH client since the connection started (channel closed, connection gone,
+   or invocation torn down). Nonzero means the last process status may be
+   missing; poll after reading process status to tell "delivered" from
+   "lost". */
+extern sy_s64 sy_ssh_exit_status_lost(sy_s64 conn);
 
 /* ---- declared process and PTY backing ---------------------------------- */
 

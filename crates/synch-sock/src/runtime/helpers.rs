@@ -142,6 +142,9 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ),
     ("sy_declare_process", h_declare_process),
     ("sy_declare_file_transfer", h_declare_file_transfer),
+    // appended last: helper ids are table positions resolved by name, so this
+    // is additive and cannot collide with an existing id
+    ("sy_ssh_exit_status_lost", h_ssh_exit_status_lost),
 ];
 
 /// Every helper name, for the SDK-header agreement test.
@@ -775,21 +778,47 @@ fn h_ssh_start(
         let Some(host_key) = inner.ssh_host_key.clone() else {
             return errno::EPERM;
         };
+        let Some(throttle) = inner.ssh_auth_throttle.clone() else {
+            return errno::EPERM;
+        };
         let state = crate::runtime::ssh::SshState::new(inner.ready.clone());
         let stream = match inner.select_ssh(state.clone()) {
             Ok(stream) => stream,
             Err(error) => return error,
         };
+        // The throttle key is the peer's IP, not its "ip:port" address: a
+        // reconnect is a fresh port, and a key that included the port would
+        // never repeat, making the per-IP cap unreachable. Under `--listen`
+        // the peer is the CLI relay's control connection, so every relayed
+        // client shares one bucket — that is the intended bound: the relay
+        // is the single entry point the throttle must pace.
+        let ip = peer_ip(&inner.peer.addr).to_string();
         inner.spawn(crate::runtime::ssh::serve(
             stream,
             state,
             host_key,
             methods,
             inner.limits.idle_deadline,
+            throttle,
+            ip,
         ));
         0
     })
     .and_then(ret)
+}
+
+/// The IP half of a peer's "ip:port" address, for the per-IP auth throttle
+/// key. Bracketed IPv6 ("[v6]:port") is stripped to the address; an
+/// unbracketed v6 (which has no single colon before a port) is kept as-is;
+/// a bare address with no port passes through untouched.
+pub(crate) fn peer_ip(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(ip, _)| ip);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        _ => addr,
+    }
 }
 
 fn h_ssh_next(
@@ -883,6 +912,42 @@ fn h_ssh_event_done(
     }
 }
 
+/// The kind/result gate `h_ssh_auth_reply` applies to one auth event: which
+/// kinds a reply is valid on, and how result 4 (OFFER_ACCEPT) maps.
+///
+/// A certificate authentication (kind 9) is a real authentication — the SSH
+/// library has validated its structure, identity constraints, internal
+/// signature, and the client's possession signature. The guest must still
+/// authorize the signing CA. Results 1 (accept), 2 (reject), and 3 (partial)
+/// are valid on it, as they are on the other auth kinds. OFFER_ACCEPT maps to
+/// the SSH library's pre-signature Accept; it is not authentication completion
+/// and stays valid only on an offer (kind 3). Any other kind — a signed
+/// certificate event (9), a non-offer key event (4), a non-auth kind — is
+/// refused with ESTATE, fail-closed.
+pub(crate) fn auth_reply_result(kind: u32, result: u64) -> Result<u32, i64> {
+    if !matches!(
+        kind,
+        crate::runtime::ssh::EVENT_AUTH_NONE
+            | crate::runtime::ssh::EVENT_AUTH_PASSWORD
+            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER
+            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED
+            | crate::runtime::ssh::EVENT_AUTH_OPENSSH_CERT
+    ) {
+        return Err(errno::ESTATE);
+    }
+    if kind == crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER {
+        match result {
+            2 => Ok(2),
+            4 => Ok(1),
+            _ => Err(errno::ESTATE),
+        }
+    } else if result == 4 {
+        Err(errno::ESTATE)
+    } else {
+        Ok(result as u32)
+    }
+}
+
 fn h_ssh_auth_reply(
     scope: &HelperScope,
     event_id: u64,
@@ -901,30 +966,9 @@ fn h_ssh_auth_reply(
     let Some(kind) = state.event_kind(event_id) else {
         return ret(errno::ESTATE);
     };
-    if !matches!(
-        kind,
-        crate::runtime::ssh::EVENT_AUTH_NONE
-            | crate::runtime::ssh::EVENT_AUTH_PASSWORD
-            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER
-            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED
-    ) {
-        return ret(errno::ESTATE);
-    }
-    // An offer proves nothing, so the only decisions it can take are "ask the
-    // client for proof" and "don't": ACCEPT and PARTIAL are for attempts that
-    // could complete a factor, and OFFER_ACCEPT is for offers alone (§4.1).
-    let result = if kind == crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER {
-        match result {
-            2 => 2,
-            // OFFER_ACCEPT maps to the SSH library's pre-signature Accept.
-            4 => 1,
-            _ => return ret(errno::ESTATE),
-        }
-    } else {
-        if result == 4 {
-            return ret(errno::ESTATE);
-        }
-        result as u32
+    let result = match auth_reply_result(kind, result) {
+        Ok(result) => result,
+        Err(error) => return ret(error),
     };
     match state.reply(
         event_id,
@@ -1096,6 +1140,11 @@ fn h_ssh_channel_accept(
             return ret(error);
         }
     };
+    // Bind the accept event to this endpoint fd before replying: the
+    // registration on the ssh side is refused unless the token matches, so a
+    // closed-and-reused fd can never capture a stale registration. Forgotten
+    // below if the reply fails and by the ssh side once the channel closes.
+    state.note_accept(handle, event_id);
     let (local, bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
     let (reader, writer) = tokio::io::split(local);
     inner.spawn(crate::runtime::endpoint::reader_task(
@@ -1113,6 +1162,9 @@ fn h_ssh_channel_accept(
         )
         .is_err()
     {
+        // The reply failed, so no registration will consume the token; drop
+        // it so the next accept that reuses the fd starts from a clean slate.
+        state.forget_accept(handle);
         state.release_channel();
         inner.remove(handle);
         return ret(errno::ESTATE);
@@ -1228,6 +1280,10 @@ fn h_ssh_channel_open(
             Err(_) => {
                 state.release_channel();
                 endpoint.fail(errno::ECONNRESET);
+                // The guest owns `handle` once this helper returns it. Keep the
+                // failed endpoint in its slot until sy_close: asynchronously
+                // freeing and reusing the numeric fd could make the guest's
+                // stale handle alias an unrelated later channel.
             }
         }
     });
@@ -1369,8 +1425,21 @@ fn h_ssh_exit_status(
     if kind != "session" || status > u32::MAX as u64 {
         return ret(errno::ESTATE);
     }
+    let state = state.clone();
     inner.spawn(async move {
-        let _ = session.exit_status_request(channel_id, status as u32).await;
+        let sent = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.exit_status_request(channel_id, status as u32),
+        )
+        .await;
+        // The status can be lost three ways — the channel was already closed
+        // by the client, the connection is gone, or the invocation was torn
+        // down before the task ran. None of them should come back as an
+        // unreported success: count the loss so the guest can tell "status
+        // delivered" from "status lost".
+        if !matches!(sent, Ok(Ok(()))) {
+            state.note_lost_exit_delivery();
+        }
     });
     ret(0)
 }
@@ -1402,18 +1471,41 @@ fn h_ssh_exit_signal(
     if kind != "session" {
         return ret(errno::ESTATE);
     }
+    let state = state.clone();
     inner.spawn(async move {
-        let _ = session
-            .exit_signal_request(
+        let sent = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.exit_signal_request(
                 channel_id,
                 russh::Sig::Custom(name),
                 core_dumped == 1,
                 String::new(),
                 String::new(),
-            )
-            .await;
+            ),
+        )
+        .await;
+        // Same accounting as h_ssh_exit_status: a signal the client can never
+        // see is counted, never silently claimed as delivered.
+        if !matches!(sent, Ok(Ok(()))) {
+            state.note_lost_exit_delivery();
+        }
     });
     ret(0)
+}
+
+fn h_ssh_exit_status_lost(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let state = match with(scope, |inner| ssh_state(inner))? {
+        Ok(state) => state,
+        Err(error) => return ret(error),
+    };
+    ret(state.lost_exit_deliveries() as i64)
 }
 
 fn h_ssh_pty_spec(

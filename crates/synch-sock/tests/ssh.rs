@@ -176,6 +176,52 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const SSH_CERT_SERVER: &str = r#"
+#include <synch.h>
+
+static const unsigned char trusted_ca[32] = { __TRUSTED_CA_BYTES__ };
+
+static sy_s64 trusted(sy_u64 event_id) {
+  unsigned char seen[32];
+  if (sy_ssh_event_data(event_id, SY_SSH_FIELD_AUTH_CERT_CA_SHA256,
+                        seen, sizeof seen) != 32) return 0;
+  for (sy_u64 i = 0; i < sizeof seen; i++)
+    if (seen[i] != trusted_ca[i]) return 0;
+  return 1;
+}
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY) < 0) return 50;
+  struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  for (;;) {
+    if (sy_poll(conn, 1, 5000) < 0) return 51;
+    if (conn[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER) {
+          /* The certificate probe: accept the offer so the client signs
+             its possession proof, but only for the declared trusted CA. */
+          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_OFFER_ACCEPT
+                                            : SY_SSH_AUTH_REJECT;
+          if (sy_ssh_auth_reply(event.id, result,
+                                SY_SSH_AUTH_PUBLICKEY) < 0) return 52;
+        } else if (event.kind == SY_SSH_EVENT_AUTH_OPENSSH_CERT) {
+          /* Structure, principal and possession are host-validated; the guest
+             still authorizes the signing CA. */
+          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_ACCEPT
+                                            : SY_SSH_AUTH_REJECT;
+          if (sy_ssh_auth_reply(event.id, result,
+                                SY_SSH_AUTH_PUBLICKEY) < 0) return 53;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 54;
+        }
+      }
+    }
+    if (conn[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
 const SERVER_OPEN_EXTENSION: &str = r#"
 #include <synch.h>
 
@@ -695,7 +741,13 @@ async fn closing_an_extended_data_lane_does_not_close_the_connection() {
     .unwrap();
     assert!(client.authenticate_none("test").await.unwrap().success());
     let channel = client.channel_open_session().await.unwrap();
-    channel.request_shell(true).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
     channel
         .extended_data_bytes(1, b"discard me".as_slice())
         .await
@@ -756,6 +808,154 @@ async fn public_key_auth_can_consult_authorized_keys_in_the_virtual_tree() {
         .await
         .unwrap();
     assert!(allowed.success());
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
+async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    use russh::keys::{Algorithm, PrivateKey};
+
+    // A CA-signed user certificate, built in-process exactly as the russh
+    // server-side tests do: no ssh-keygen on the path. Its digest is compiled
+    // into the guest policy, which must make the CA trust decision.
+    let ca = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let user = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let ca_blob = ca.public_key().to_bytes().unwrap();
+    let ca_digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &ca_blob);
+    let ca_bytes = ca_digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = SSH_CERT_SERVER.replace("__TRUSTED_CA_BYTES__", &ca_bytes);
+    let elf = compile(&source, "ssh-cert.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    builder.serial(1).unwrap();
+    builder.key_id("test-user").unwrap();
+    builder.cert_type(CertType::User).unwrap();
+    builder.valid_principal("test").unwrap();
+    let cert = builder.sign(&ca).unwrap();
+
+    // Host validation rejects a certificate whose principals do not include
+    // the requested SSH username, even when the signing CA is trusted.
+    let mut wrong_principal_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    wrong_principal_builder.serial(3).unwrap();
+    wrong_principal_builder.key_id("wrong-principal").unwrap();
+    wrong_principal_builder.cert_type(CertType::User).unwrap();
+    wrong_principal_builder
+        .valid_principal("somebody-else")
+        .unwrap();
+    let wrong_principal = wrong_principal_builder.sign(&ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), wrong_principal)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "a certificate for another principal must be rejected"
+    );
+
+    // The adapter implements no OpenSSH critical options; unknown critical
+    // semantics must fail closed rather than being ignored.
+    let mut critical_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    critical_builder.serial(4).unwrap();
+    critical_builder.key_id("critical-option").unwrap();
+    critical_builder.cert_type(CertType::User).unwrap();
+    critical_builder.valid_principal("test").unwrap();
+    critical_builder
+        .critical_option("force-command", "forbidden")
+        .unwrap();
+    let critical = critical_builder.sign(&ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), critical)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "unsupported critical certificate options must be rejected"
+    );
+
+    // An internally valid certificate from an arbitrary CA is not trusted.
+    let rogue_ca = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let mut rogue_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    rogue_builder.serial(2).unwrap();
+    rogue_builder.key_id("rogue-user").unwrap();
+    rogue_builder.cert_type(CertType::User).unwrap();
+    rogue_builder.valid_principal("test").unwrap();
+    let rogue = rogue_builder.sign(&rogue_ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), rogue)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "an untrusted signing CA must be rejected"
+    );
+
+    let auth = client
+        .authenticate_openssh_cert("test", Arc::new(user), cert)
+        .await
+        .unwrap();
+    assert!(auth.success(), "certificate authentication completes");
 
     client
         .disconnect(russh::Disconnect::ByApplication, "done", "en")
@@ -884,6 +1084,81 @@ async fn sftp_directory_reads_are_paginated_and_complete() {
 }
 
 #[tokio::test]
+async fn sftp_listing_skips_refused_rows_and_shows_real_directory_attributes() {
+    let elf = compile(SFTP_SERVER, "ssh-sftp-list.c");
+    let harness = Harness::with_tree_and_refused(
+        &[
+            ("files/a.txt", "a"),
+            ("files/sub/x", "x"),
+            ("files/sock", ""),
+            ("files/z.txt", "z"),
+        ],
+        &["files/sock"],
+    );
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let mut policy = EffectivePolicy::default();
+    policy.file_transfers.push(FileTransferCapability {
+        id: 1,
+        protocol: 1,
+        access: 0x01 | 0x04,
+        scope: "files".into(),
+    });
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        policy,
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    channel.request_subsystem(true, "sftp").await.unwrap();
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .unwrap();
+    let mut entries = sftp
+        .read_dir(".")
+        .await
+        .unwrap()
+        .map(|entry| (entry.file_name(), entry.metadata()))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // The refused socket-like row is skipped -- never presented with
+    // fabricated attributes -- and the real directory row is listed with
+    // directory attributes derived from its kind.
+    let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["a.txt", "sub", "z.txt"]);
+    let sub = entries.iter().find(|(name, _)| name == "sub").unwrap();
+    assert!(
+        sub.1.is_dir(),
+        "a directory row is listed with dir attributes"
+    );
+    assert_eq!(sub.1.permissions, Some(0o040555));
+    assert!(!entries.iter().any(|(name, _)| name == "sock"));
+    drop(sftp);
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
 async fn server_initiated_extension_channels_are_generic_fds() {
     let elf = compile(SERVER_OPEN_EXTENSION, "ssh-extension-channel.c");
     let harness = Harness::new();
@@ -937,4 +1212,417 @@ async fn round_trip(
     let mut reply = vec![0; message.len()];
     stream.read_exact(&mut reply).await.unwrap();
     reply
+}
+
+// ---- F1: the outbound lane must backpressure instead of buffering -------
+
+const LANE_FLOOD: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 100;
+  sy_s64 channel = -1;
+  struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  sy_u64 count = 1;
+  for (;;) {
+    if (sy_poll(fds, count, 5000) < 0) return 101;
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 102;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          channel = sy_ssh_channel_accept(event.id);
+          if (channel < 0) return 103;
+          fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
+          count = 2;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+          sy_s64 lane = sy_ssh_channel_lane(channel, SY_SSH_EXTENDED_STDERR);
+          if (lane < 0) return 104;
+          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+            return 105;
+          /* Flood the outbound lane without ever reading it back. The lane
+             channel is bounded (CHANNEL_LANE_CAPACITY): once the ring and
+             the lane are full, sy_write must report SY_EAGAIN rather than
+             buffer forever in host memory. */
+          char block[8192];
+          sy_s64 backpressured = 0;
+          for (sy_s64 i = 0; i < 600; i++) {
+            sy_s64 n = sy_write(lane, block, sizeof block);
+            if (n == SY_EAGAIN) { backpressured = 1; break; }
+            if (n < 0) return 106;
+          }
+          return backpressured ? 0 : 107;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 108;
+        }
+      }
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
+#[tokio::test]
+async fn a_full_outbound_lane_backpressures_the_guest_with_eagain() {
+    let elf = compile(LANE_FLOOD, "ssh-lane-flood.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
+    // Do not read yet: the flood must backpressure, which is what the guest
+    // asserts (SY_EAGAIN instead of an always-successful write).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Drain whatever the lane buffered, so the invocation's teardown drain
+    // completes promptly.
+    let draining = tokio::spawn(async move {
+        let mut stream = channel.into_stream();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    let _ = client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await;
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), run)
+        .await
+        .expect("invocation stopped after the flood")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+    draining.await.ok();
+}
+
+// ---- F17: a refused outbound open must release its handle slot -----------
+
+const REJECTED_OPENS: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  const char type[] = "no-such-type@example.com";
+  const char opening[] = "";
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 90;
+  struct sy_pollfd fds[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  for (;;) {
+    if (sy_poll(fds, 1, 5000) < 0) return 91;
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 92;
+        } else if (event.kind == SY_SSH_EVENT_AUTHENTICATED) {
+          /* Every open is refused by the peer (CHANNEL_OPEN_FAILURE). The
+             failed fd stays reserved until the guest closes it, so it cannot
+             alias a later endpoint; closing each one must allow more than a
+             handle-table's worth of sequential refusals. */
+          for (sy_s64 i = 0; i < 40; i++) {
+            sy_s64 h = sy_ssh_channel_open(SY_SELF, type, sizeof(type) - 1,
+                                           opening, 0);
+            if (h < 0) return 93;
+            struct sy_pollfd wait[1] = {{ h, SY_POLL_IN, 0 }};
+            sy_s64 refused = 0;
+            for (sy_s64 tries = 0; tries < 50; tries++) {
+              if (sy_poll(wait, 1, 100) < 0) return 94;
+              if (wait[0].revents & SY_POLL_ERR) { refused = 1; break; }
+            }
+            if (!refused) return 95;
+            if (sy_close(h) < 0) return 98;
+          }
+          if (sy_ssh_event_done(event.id) < 0) return 96;
+          return 0;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 97;
+        }
+      }
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
+struct RejectingClient;
+
+impl russh::client::Handler for RejectingClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn should_accept_unknown_server_channel(
+        &mut self,
+        _id: russh::ChannelId,
+        _channel_type: &str,
+    ) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn rejected_server_initiated_channel_opens_release_their_handle_slots() {
+    let elf = compile(REJECTED_OPENS, "ssh-rejected-opens.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        RejectingClient,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    // The guest refuses nothing itself: it opens 40 outbound channels, all of
+    // which this client refuses; give the refusal round trips time.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let _ = client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await;
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("invocation stopped after the refused opens")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+// ---- F18: exit-status delivery loss must be countable, never silent -------
+
+const EXIT_STATUS_LIVE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 70;
+  sy_s64 channel = -1;
+  struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  sy_u64 count = 1;
+  for (;;) {
+    if (sy_poll(fds, count, 5000) < 0) return 71;
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 72;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          channel = sy_ssh_channel_accept(event.id);
+          if (channel < 0) return 73;
+          fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
+          count = 2;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+            return 74;
+          /* the channel is confirmed: deliver a status and a signal while
+             the client is still there */
+          if (sy_ssh_exit_status(channel, 42) < 0) return 75;
+          if (sy_ssh_exit_signal(channel, "SIGX", 4, 0) < 0) return 76;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 77;
+        }
+      }
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) {
+      /* the delivery tasks have long finished; nothing may have been lost */
+      if (sy_ssh_exit_status_lost(SY_SELF) != 0) return 78;
+      return 0;
+    }
+  }
+}
+"#;
+
+#[tokio::test]
+async fn exit_status_and_signal_reach_the_client_and_nothing_is_counted_lost() {
+    let elf = compile(EXIT_STATUS_LIVE, "ssh-exit-status-live.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let mut channel = client.channel_open_session().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
+    let mut got_success = false;
+    let mut got_status = false;
+    let mut got_signal = false;
+    while !(got_success && got_status && got_signal) {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), channel.wait())
+            .await
+            .expect("the channel delivered something")
+            .expect("the channel stayed open");
+        match msg {
+            russh::ChannelMsg::Success => got_success = true,
+            russh::ChannelMsg::ExitStatus { exit_status: 42 } => got_status = true,
+            russh::ChannelMsg::ExitSignal {
+                signal_name: russh::Sig::Custom(name),
+                ..
+            } if name == "SIGX" => got_signal = true,
+            other => panic!("unexpected channel message: {other:?}"),
+        }
+    }
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("invocation stopped after the disconnect")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+const EXIT_STATUS_LOST: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_NONE) < 0) return 80;
+  sy_s64 channel = -1;
+  struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  sy_u64 count = 1;
+  for (;;) {
+    if (sy_poll(fds, count, 5000) < 0) return 81;
+    if (fds[0].revents & SY_POLL_IN) {
+      struct sy_ssh_event event;
+      while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
+        if (event.kind == SY_SSH_EVENT_AUTH_NONE) {
+          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+                                SY_SSH_AUTH_NONE) < 0) return 82;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_OPEN) {
+          channel = sy_ssh_channel_accept(event.id);
+          if (channel < 0) return 83;
+          fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
+          count = 2;
+        } else if (event.kind == SY_SSH_EVENT_CHANNEL_REQUEST) {
+          if (sy_ssh_request_reply(event.id, SY_SSH_REQUEST_SUCCESS) < 0)
+            return 84;
+        } else {
+          if (sy_ssh_event_done(event.id) < 0) return 85;
+        }
+      }
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) {
+      /* The connection is gone, so the status can never reach the client:
+         the delivery must be counted, never silently claimed as made. */
+      if (sy_ssh_exit_status(channel, 43) < 0) return 86;
+      /* The counting happens in a task spawned by sy_ssh_exit_status, which
+         runs only while the guest is blocked. SY_SELF stays HUP-ready, so a
+         poll on it would return at once and never let the task run; a fresh
+         lane endpoint, instead, is open with no data in flight and blocks
+         its full timeout — the yield the delivery task needs. */
+      sy_s64 lane = sy_ssh_channel_lane(channel, 0);
+      if (lane < 0) return 89;
+      for (sy_s64 tries = 0; tries < 200; tries++) {
+        if (sy_ssh_exit_status_lost(SY_SELF) > 0) return 0;
+        struct sy_pollfd wait[1] = {{ lane, SY_POLL_IN, 0 }};
+        if (sy_poll(wait, 1, 20) < 0) return 87;
+      }
+      return 88;
+    }
+  }
+}
+"#;
+
+#[tokio::test]
+async fn lost_exit_delivery_is_counted_and_visible_to_the_guest() {
+    let elf = compile(EXIT_STATUS_LOST, "ssh-exit-status-lost.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
+    // Ending the connection is what makes the guest's later exit-status
+    // undeliverable: the run loop is gone, so the Handle send fails, and the
+    // guest must observe the failure through sy_ssh_exit_status_lost.
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("invocation stopped after the disconnect")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
 }

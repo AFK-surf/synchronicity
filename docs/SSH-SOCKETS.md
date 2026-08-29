@@ -265,8 +265,9 @@ The first ABI supports:
 
 The bit for `none` controls whether a `none` request may be accepted but is
 never included in SSH's advertised method name-list, as RFC 4252 requires.
-Keyboard-interactive, host-based authentication and OpenSSH certificates can
-be added with new bits and event kinds without changing the lifecycle.
+Keyboard-interactive and host-based authentication can be added with new bits
+and event kinds without changing the lifecycle. OpenSSH user certificates use
+the public-key method bit and their own signed-auth event kind.
 
 Authentication event kinds are:
 
@@ -275,8 +276,16 @@ SY_SSH_EVENT_AUTH_NONE
 SY_SSH_EVENT_AUTH_PASSWORD
 SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER
 SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED
+SY_SSH_EVENT_AUTH_OPENSSH_CERT
 SY_SSH_EVENT_AUTHENTICATED
 ```
+
+For certificate offers and signed authentication, the event includes the
+subject public key plus the complete certificate, signing CA public-key blob
+and SHA-256 digest, key id, serial, type and principals. The host rejects host
+certificates, username/principal mismatches, invalid validity/signatures and
+all unsupported critical options. The guest must authorize the signing CA;
+cryptographic self-consistency alone is never a trust decision.
 
 Every event includes the username and service. A public-key offer says only
 that the client asked whether a key might be acceptable. A verified event is
@@ -1078,7 +1087,7 @@ The initial bounds:
 | Authentication attempts | 8 | disconnect |
 | Authentication decision | 60 s | disconnect |
 | `authorized_keys` object | 256 KiB, 16 KiB per line | matcher returns `SY_ELIMIT`; no prefix match is accepted |
-| SFTP directory response | 64 entries, 64 KiB, 4096 scanned storage rows | enumeration continues from its bounded cursor or fails closed at the scan bound |
+| SFTP directory response | 64 entries, 64 KiB, 4096 scanned storage rows | enumeration continues from its bounded cursor; a scan budget containing only filtered rows fails rather than returning an empty mid-listing batch |
 | SSH packet size | conservative library configuration, at most 64 KiB initially | protocol error |
 | SSH connection idle | existing invocation idle deadline | invocation ends `Deadline` |
 

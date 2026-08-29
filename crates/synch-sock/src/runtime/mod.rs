@@ -151,6 +151,7 @@ fn global_env() -> GlobalEnv {
 struct Job {
     invocation: Invocation,
     ssh_host_key: Arc<russh::keys::PrivateKey>,
+    ssh_auth_throttle: Arc<crate::runtime::ssh::AuthThrottle>,
     reply: oneshot::Sender<Result<Outcome, SockError>>,
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
@@ -261,6 +262,9 @@ pub struct Worker {
     jobs: mpsc::UnboundedSender<Job>,
     /// How many invocations this worker is carrying, for placement.
     load: Arc<AtomicU64>,
+    /// The pool's host-side ssh auth-failure throttle (one per pool, shared
+    /// by every invocation this worker serves).
+    ssh_auth_throttle: Arc<crate::runtime::ssh::AuthThrottle>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -334,6 +338,10 @@ impl WorkerHandle {
         let pool_cap = limits.max_streams.saturating_mul(count.max(1)) as u64;
         let registry = crate::registry::Registry::with_pool_cap(pool_cap);
         let shutdown = Arc::new(ShutdownSignal::default());
+        // One throttle per pool: the auth-failure window is shared across
+        // every connection the pool serves, so an attacker cannot reset it
+        // with one fresh TCP connection per batch.
+        let ssh_auth_throttle = Arc::new(crate::runtime::ssh::AuthThrottle::new());
         let workers = (0..count)
             .map(|index| {
                 Worker::spawn(
@@ -343,6 +351,7 @@ impl WorkerHandle {
                     maps.clone(),
                     registry.clone(),
                     shutdown.clone(),
+                    ssh_auth_throttle.clone(),
                 )
             })
             .collect();
@@ -442,6 +451,7 @@ impl WorkerHandle {
         let sent = worker.jobs.send(Job {
             invocation,
             ssh_host_key: self.ssh_host_key.clone(),
+            ssh_auth_throttle: worker.ssh_auth_throttle.clone(),
             reply,
             cancel,
             peer_gone,
@@ -492,6 +502,7 @@ impl Worker {
         maps: Arc<SocketMaps>,
         registry: Arc<crate::registry::Registry>,
         shutdown: Arc<ShutdownSignal>,
+        ssh_auth_throttle: Arc<crate::runtime::ssh::AuthThrottle>,
     ) -> Worker {
         let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
         let load = Arc::new(AtomicU64::new(0));
@@ -552,6 +563,7 @@ impl Worker {
                                             &shutdown,
                                             job.invocation,
                                             job.ssh_host_key,
+                                            job.ssh_auth_throttle,
                                             job.cancel,
                                             job.peer_gone,
                                         )
@@ -582,6 +594,7 @@ impl Worker {
         Worker {
             jobs,
             load,
+            ssh_auth_throttle,
             thread: Mutex::new(Some(thread)),
         }
     }
@@ -670,6 +683,7 @@ async fn run_job(
     shutdown: &Arc<ShutdownSignal>,
     invocation: Invocation,
     ssh_host_key: Arc<russh::keys::PrivateKey>,
+    ssh_auth_throttle: Arc<crate::runtime::ssh::AuthThrottle>,
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
 ) -> Result<Outcome, SockError> {
@@ -722,6 +736,7 @@ async fn run_job(
         .unwrap_or_default();
     inner.registry = Some(registry.clone());
     inner.ssh_host_key = Some(ssh_host_key);
+    inner.ssh_auth_throttle = Some(ssh_auth_throttle);
     let inner = Rc::new(inner);
     let prefetch_failed = incoming_failed.clone();
     let prefetch_ready = inner.ready.clone();
