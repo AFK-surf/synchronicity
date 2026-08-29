@@ -306,14 +306,14 @@ the daemon's threading directly.
   same root wait on the first compile rather than each starting their own.
   The loader stays per worker: moving it to a shared compile pool would make
   one guest's discovery of a helper index worth something on every worker.
-- What remains on the worker thread is async-ebpf's *lazy* per-function JIT: a
-  function is compiled when it is first called, on the thread running the
-  guest, because async preemption cannot interrupt a thread whose PC is inside
-  the compiler. async-ebpf charges that against the run budget like any other
-  dispatch, so a program yields between functions — but a single very large
-  function is one uninterruptible compile. There is no public API to do it in
-  advance; a program that wants to be a good co-resident keeps its functions
-  small.
+- async-ebpf's *lazy* per-function JIT — a function is compiled when the guest
+  first calls it — leaves the thread the same way. It used to be pinned to the
+  thread running the guest, because async preemption cannot interrupt a thread
+  whose PC is inside the compiler; since 0.4.0-alpha.13 the runtime hands it to
+  `Timeslicer::run_blocking` instead, and this crate sends that to the same
+  blocking pool. **No compilation of either kind runs on a worker thread.**
+  Both are still charged to the compiling guest's run budget, so moving the
+  work buys that guest no extra CPU — only the rest of the worker its turn.
 - A new stream is assigned to the least-loaded worker and stays there. This is a
   placement decision, not a scheduling one: there is no work stealing, by
   construction.

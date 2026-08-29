@@ -18,10 +18,11 @@
 //! returns a `Send` `UnboundProgram` and only `pin_to_current_thread` has to
 //! run where the guest will, so the load goes to the blocking pool and the
 //! worker stays available to everything else placed on it
-//! (`ProgramCompiler::program_for`). What is left on the thread is async-ebpf's
-//! lazy per-function JIT, which is deliberately there — a thread whose PC is in
-//! the compiler cannot be async-preempted — and is charged against the guest's
-//! run budget.
+//! (`ProgramCompiler::program_for`). async-ebpf's *lazy* per-function JIT — a
+//! function is compiled when the guest first calls it — leaves the thread the
+//! same way, through `Timeslicer::run_blocking`. Neither kind of compilation
+//! runs where the guests do; both are still charged to the compiling guest's
+//! run budget, so offloading buys it no extra CPU.
 
 pub(crate) mod ctx;
 pub(crate) mod endpoint;
@@ -120,8 +121,48 @@ impl Timeslicer for TokioTimeslicer {
     fn yield_now(&self) -> impl std::future::Future<Output = ()> {
         tokio::task::yield_now()
     }
+
+    /// Runs guest-triggered CPU-bound work — a lazy JIT compilation — off the
+    /// worker thread.
+    ///
+    /// This is the other half of the compile story, and the half the runtime
+    /// could not fix on its own. `ProgramCompiler::program_for` moves the
+    /// *eager* load to the blocking pool, but async-ebpf compiles each function
+    /// lazily, when the guest first calls it, and used to do that on whichever
+    /// thread was running the guest — necessarily, since the preemption handler
+    /// only acts on a PC inside the JIT code range and a thread inside the
+    /// compiler cannot be interrupted. On a worker multiplexing up to 64
+    /// invocations, one guest's large function stopped all of them.
+    ///
+    /// async-ebpf 0.4.0-alpha.13 hands that work here instead. Sending it to
+    /// `spawn_blocking` keeps the worker's reactor live; the elapsed wall time
+    /// is still charged to the guest's run budget by the caller, so offloading
+    /// buys the guest no extra CPU, only the rest of the worker its turn.
+    ///
+    /// A `JoinError` from a blocking task is a panic in the compiler — such a
+    /// task is never cancelled once it has started — so the unwind is resumed
+    /// rather than swallowed. That reproduces what an inline compile would have
+    /// done, and async-ebpf contains a faulting run at the coroutine root.
+    async fn run_blocking<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(value) => value,
+            Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+        }
+    }
 }
 
+/// The guest's yield and throttle budget.
+///
+/// Worth knowing when reading a latency measurement here: async-ebpf's budget
+/// is **wall-clock between checkpoints**, not CPU consumed. A run that is
+/// descheduled long enough — waiting on a compile, or simply not scheduled on a
+/// busy host — arrives at its next checkpoint over `THROTTLE_AFTER` and sleeps
+/// `THROTTLE_FOR`, having burned no CPU of its own. So a co-resident's worst
+/// round-trip during a large compile is `THROTTLE_FOR`, whichever thread the
+/// compile ran on; that number is the throttle, not the compile, and moving
+/// compilation off the worker does not change it. Measure a compile's effect on
+/// co-residents by completed round-trips rather than by the worst one
+/// (`probe_compile_offthread`).
 fn timeslice() -> TimesliceConfig {
     TimesliceConfig {
         max_run_time_before_yield: YIELD_AFTER,
@@ -704,15 +745,13 @@ impl ProgramCompiler {
     /// of them. `ProgramLoader` is `Sync`, so the worker's own loader is what
     /// compiles, on whichever thread does it.
     ///
-    /// This does not make an admission free of on-thread compilation, and cannot:
-    /// async-ebpf JIT-compiles each *function* lazily, when it is first called, on
-    /// the thread running the guest — deliberately, because the SIGUSR1 preemption
-    /// handler only acts on a PC inside the JIT code range and a thread inside the
-    /// compiler cannot be interrupted. It charges that against the run budget like
-    /// any other dispatch, so a guest yields between functions, and there is no
-    /// public API to do it in advance. What moves here is the eager load, which is
-    /// the part that scales with the whole object rather than with the code a
-    /// caller actually reaches.
+    /// This is the eager half — the part that scales with the whole object rather
+    /// than with the code a caller actually reaches. async-ebpf compiles each
+    /// *function* lazily on top of it, when the guest first calls it, and that
+    /// used to be pinned to the thread running the guest. Since
+    /// 0.4.0-alpha.13 it is handed to `Timeslicer::run_blocking`, which
+    /// `TokioTimeslicer` sends to the same blocking pool. So no compilation of
+    /// either kind runs on a worker thread.
     async fn program_for(
         self: &Rc<Self>,
         thread_env: ThreadEnv,

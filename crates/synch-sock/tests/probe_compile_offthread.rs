@@ -33,10 +33,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// has real work to do. `RET` keeps each variant a distinct content root.
 fn echo_source(rounds: usize) -> String {
     // `rounds` helper functions, chained so that only `f0` is named from the
-    // entrypoint and nothing ever calls it. The ELF is large, so the eager
-    // load has real work to do; the entrypoint stays small, so the lazy
-    // per-function JIT that async-ebpf does on the running thread stays cheap
-    // and does not mask what this test is measuring.
+    // entrypoint and nothing ever calls it. The ELF is large, so the eager load
+    // has real work to do; the entrypoint stays small, so this measures the
+    // eager load specifically. (The lazy per-function JIT is offloaded too, via
+    // `Timeslicer::run_blocking` — see `TokioTimeslicer`.)
     let fns: String = (0..rounds)
         .map(|i| {
             let ops: String = (0..40)
