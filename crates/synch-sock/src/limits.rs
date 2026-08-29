@@ -158,3 +158,75 @@ pub(crate) const MAX_COPY: u64 = 64 * 1024;
 pub(crate) const FAULT_QUARANTINE: usize = 8;
 /// See [`FAULT_QUARANTINE`].
 pub(crate) const FAULT_WINDOW: usize = 16;
+
+/// Caps for `synch connect --listen` (crates/synch-cli/src/connect.rs).
+///
+/// The listener is a pre-auth front door: a connection is admitted before any
+/// authentication happens, so a flood of accept()s would hold admission slots —
+/// and the daemon's socket-pool streams behind them — for connections that may
+/// never authenticate. The semaphore caps concurrent pre-auth connections, and
+/// the sliding window caps the acceptance rate globally and per peer IP. A
+/// breach drops the connection immediately, fail-closed: refusing a legitimate
+/// burst is preferable to letting a flood starve every legitimate user.
+pub const MAX_ACCEPT_CONCURRENT: usize = 16;
+/// See [`MAX_ACCEPT_CONCURRENT`] — global accepts per second.
+pub const MAX_ACCEPTS_PER_SECOND: usize = 64;
+/// See [`MAX_ACCEPT_CONCURRENT`] — accepts per peer IP per second.
+pub const MAX_ACCEPTS_PER_IP_PER_SECOND: usize = 8;
+
+/// The capacity of an ssh lane's outbound channel, in queued messages.
+///
+/// The lane a guest registers for a channel's data is bounded at 8 queued
+/// messages, matching the inbound `channel(8)`: a client that withholds its
+/// recipient window (never sends CHANNEL_WINDOW_ADJUST) backpressures the
+/// guest (`sy_write` -> EAGAIN once the endpoint ring and this channel are
+/// full) instead of growing host memory for the lifetime of the connection.
+pub const CHANNEL_LANE_CAPACITY: usize = 8;
+
+/// The most pipelined CHANNEL_REQUEST tasks parked per channel.
+///
+/// Each request copies the client payload and parks behind the per-channel
+/// order mutex while the guest decides (up to 60s). Requests beyond the cap
+/// get an immediate `reply(false)`, fail-closed: the run loop is never
+/// blocked long by a client that floods requests faster than the guest
+/// answers them.
+pub const MAX_OUTSTANDING_REQUESTS_PER_CHANNEL: usize = 16;
+
+/// RLIMIT_NPROC ceiling applied to spawned process groups, on Linux.
+///
+/// RLIMIT_NPROC is per-real-UID on Linux, so the cap is shared by every
+/// invocation running under the daemon's service uid: a descendant that
+/// escapes the group kill (e.g. a setsid() mid-fork race) can hold at most 64
+/// processes for the uid, and fork() beyond it fails closed with EAGAIN.
+#[cfg(target_os = "linux")]
+pub const MAX_PROCESSES_PER_GROUP: u64 = 64;
+
+/// The sliding window, in seconds, over which auth rejections are throttled.
+///
+/// Host-side and cross-connection: when the window is full, further auth
+/// attempts are rejected without consulting the guest — fail-closed against
+/// online brute force that would otherwise pace itself with one fresh
+/// connection per batch.
+pub const AUTH_REJECTION_WINDOW_SECS: u64 = 60;
+/// See [`AUTH_REJECTION_WINDOW_SECS`] — rejections per window, all IPs.
+pub const MAX_AUTH_REJECTIONS_PER_WINDOW: usize = 64;
+/// See [`AUTH_REJECTION_WINDOW_SECS`] — rejections per window per peer IP.
+pub const MAX_AUTH_REJECTIONS_PER_IP: usize = 16;
+
+/// The longest auth username accepted, in bytes.
+///
+/// A wire-controlled username is copied into an event payload; beyond this
+/// the attempt is rejected as an ordinary auth failure, never a disconnect —
+/// an oversized username must not be able to kill the connection.
+pub const MAX_AUTH_USERNAME_BYTES: usize = 1024;
+
+/// The bound, in milliseconds, on handler awaits that send into a bounded
+/// lane or channel.
+///
+/// A guest that registers a lane but stops reading its lane fd would
+/// otherwise block the ssh run loop inside `lane.send(...).await` forever,
+/// starving the inactivity timer and the keepalive. On timeout the bytes are
+/// dropped under the bounded-discard contract (`docs/SSH-SOCKETS.md` §14.3);
+/// the vendored russh mirrors this value for its own `chan.send` bound
+/// (`vendor/russh/PATCHES.md`).
+pub const LANE_SEND_TIMEOUT_MS: u64 = 1000;

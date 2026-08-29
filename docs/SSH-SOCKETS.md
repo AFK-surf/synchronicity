@@ -1078,7 +1078,7 @@ The initial bounds:
 | Authentication attempts | 8 | disconnect |
 | Authentication decision | 60 s | disconnect |
 | `authorized_keys` object | 256 KiB, 16 KiB per line | matcher returns `SY_ELIMIT`; no prefix match is accepted |
-| SFTP directory response | 64 entries, 64 KiB, 4096 scanned storage rows | enumeration continues from its bounded cursor or fails closed at the scan bound |
+| SFTP directory response | 64 entries, 64 KiB per batch | enumeration continues from its bounded cursor; the scan runs until an entry is emitted or the listing ends, so an empty mid-scan batch (which OpenSSH's sftp client reads as end-of-listing) never reaches the client |
 | SSH packet size | conservative library configuration, at most 64 KiB initially | protocol error |
 | SSH connection idle | existing invocation idle deadline | invocation ends `Deadline` |
 

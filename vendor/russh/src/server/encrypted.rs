@@ -168,8 +168,11 @@ mod tests {
     use std::borrow::Cow;
     use std::num::Wrapping;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
 
     use bytes::BytesMut;
+    use ssh_key::certificate::{Builder, CertType};
+    use ssh_key::Certificate;
 
     use super::*;
     use crate::compression::{Compression, Decompress};
@@ -608,6 +611,268 @@ mod tests {
         packet
     }
 
+    /// A password authentication packet (change = false).
+    fn password_auth_packet() -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(msg::USERAUTH_REQUEST);
+        "alice".encode(&mut packet).unwrap();
+        "ssh-connection".encode(&mut packet).unwrap();
+        "password".encode(&mut packet).unwrap();
+        packet.push(0);
+        "secret".encode(&mut packet).unwrap();
+        packet
+    }
+
+    /// A probe packet (is_real == 0) carrying an OpenSSH certificate blob.
+    fn certificate_probe_packet(user: &str, cert: &Certificate) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.push(msg::USERAUTH_REQUEST);
+        user.encode(&mut packet).unwrap();
+        "ssh-connection".encode(&mut packet).unwrap();
+        "publickey".encode(&mut packet).unwrap();
+        0u8.encode(&mut packet).unwrap();
+        cert.algorithm()
+            .to_certificate_type()
+            .as_str()
+            .encode(&mut packet)
+            .unwrap();
+        let mut blob = Vec::new();
+        cert.encode(&mut blob).unwrap();
+        blob.encode(&mut packet).unwrap();
+        packet
+    }
+
+    /// A CA-signed user certificate for `subject`, valid from one hour ago
+    /// until one year from now.
+    fn user_cert(subject: &PrivateKey, signing_ca: &PrivateKey) -> Certificate {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_secs();
+        let mut builder = Builder::new_with_random_nonce(
+            &mut rand::rng(),
+            subject.public_key().clone(),
+            now - 3600,
+            now + 86400 * 365,
+        )
+        .expect("certificate builder");
+        builder.cert_type(CertType::User).unwrap();
+        builder.valid_principal("alice").unwrap();
+        builder.sign(signing_ca).unwrap()
+    }
+
+    fn method_set(variants: &[MethodKind]) -> MethodSet {
+        let mut methods = MethodSet::empty();
+        for variant in variants {
+            methods.push(*variant);
+        }
+        methods
+    }
+
+    fn reject_with(proceed_with_methods: Option<MethodSet>, partial_success: bool) -> Auth {
+        Auth::Reject {
+            proceed_with_methods,
+            partial_success,
+        }
+    }
+
+    fn auth_request_of(session: &Session) -> &AuthRequest {
+        let enc = session.common.encrypted.as_ref().expect("test session");
+        match &enc.state {
+            EncryptedState::WaitingAuthRequest(a) => a,
+            other => panic!("expected WaitingAuthRequest after rejection, got {other:?}"),
+        }
+    }
+
+    /// One decision per dispatch site, so each site can be exercised in
+    /// isolation without cross-site consumption of the stored replies.
+    #[derive(Default)]
+    struct AuthDecisionProbe {
+        password: Option<Auth>,
+        none: Option<Auth>,
+        offered: Option<Auth>,
+        publickey: Option<Auth>,
+    }
+
+    impl Handler for AuthDecisionProbe {
+        type Error = Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> Result<Auth, Self::Error> {
+            Ok(self.password.take().unwrap_or_else(Auth::reject))
+        }
+
+        async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+            Ok(self.none.take().unwrap_or_else(Auth::reject))
+        }
+
+        async fn auth_publickey_offered(
+            &mut self,
+            _user: &str,
+            _public_key: &PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(self.offered.take().unwrap_or_else(Auth::reject))
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(self.publickey.take().unwrap_or_else(Auth::reject))
+        }
+    }
+
+    /// F16: the handler's `Auth::Reject { partial_success }` bit must survive
+    /// dispatch at every USERAUTH site and reach the wire as the final octet
+    /// of USERAUTH_FAILURE. Previously each site unconditionally overwrote
+    /// `auth_request.partial_success = false`, making the guest's
+    /// SY_SSH_AUTH_PARTIAL (result 3) indistinguishable from result 2.
+    #[tokio::test]
+    async fn partial_success_reaches_auth_request_state_from_every_dispatch_site() {
+        // (1) password site: Reject{Some(next), true} keeps the bit.
+        let mut session = test_auth_session();
+        let mut handler = AuthDecisionProbe {
+            password: Some(reject_with(Some(method_set(&[MethodKind::PublicKey])), true)),
+            ..Default::default()
+        };
+        let packet = password_auth_packet();
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let auth_request = auth_request_of(&session);
+        assert!(
+            auth_request.partial_success,
+            "password site dropped the handler's partial_success",
+        );
+        assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
+
+        // (2) password site: Reject{None, false} removes the failed method
+        // and keeps partial_success false.
+        let mut session = test_auth_session();
+        let mut handler = AuthDecisionProbe {
+            password: Some(reject_with(None, false)),
+            ..Default::default()
+        };
+        let packet = password_auth_packet();
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let auth_request = auth_request_of(&session);
+        assert!(!auth_request.partial_success);
+        assert!(
+            !auth_request.methods.contains(&MethodKind::Password),
+            "password must be removed from the advertised methods on Reject{{None}}",
+        );
+
+        // (3) none site: Reject{Some(next), true} keeps the bit.
+        let mut session = test_auth_session();
+        let mut handler = AuthDecisionProbe {
+            none: Some(reject_with(Some(method_set(&[MethodKind::Password])), true)),
+            ..Default::default()
+        };
+        let mut packet = Vec::new();
+        packet.push(msg::USERAUTH_REQUEST);
+        "alice".encode(&mut packet).unwrap();
+        "ssh-connection".encode(&mut packet).unwrap();
+        "none".encode(&mut packet).unwrap();
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let auth_request = auth_request_of(&session);
+        assert!(
+            auth_request.partial_success,
+            "none site dropped the handler's partial_success",
+        );
+        assert_eq!(auth_request.methods, method_set(&[MethodKind::Password]));
+
+        // (4) publickey probe site (is_real == 0): Reject{Some(next), true}.
+        let private = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let public = private.public_key().clone();
+        let mut session = test_auth_session();
+        let mut handler = AuthDecisionProbe {
+            offered: Some(reject_with(Some(method_set(&[MethodKind::PublicKey])), true)),
+            ..Default::default()
+        };
+        let packet = publickey_probe_packet("alice", &public);
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let auth_request = auth_request_of(&session);
+        assert!(
+            auth_request.partial_success,
+            "publickey probe site dropped the handler's partial_success",
+        );
+        assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
+
+        // (5) publickey signed site (is_real == 1): the offer is accepted,
+        // the signature verifies, and the final decision is
+        // Reject{Some(next), true}.
+        let mut session = test_auth_session();
+        let mut handler = AuthDecisionProbe {
+            offered: Some(Auth::Accept),
+            publickey: Some(reject_with(Some(method_set(&[MethodKind::PublicKey])), true)),
+            ..Default::default()
+        };
+        let packet = publickey_signed_packet("alice", Arc::new(private), &public);
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let auth_request = auth_request_of(&session);
+        assert!(
+            auth_request.partial_success,
+            "publickey signed site dropped the handler's partial_success",
+        );
+        assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
+    }
+
+    /// F19: a publickey probe carrying an OpenSSH certificate must be
+    /// dispatched to `auth_publickey_offered_cert` (so a server can mark
+    /// certificate-backed offers), never to `auth_publickey_offered`.
+    #[tokio::test]
+    async fn certificate_probe_reaches_auth_publickey_offered_cert() {
+        struct CertProbe {
+            cert_offers: usize,
+            plain_offers: usize,
+        }
+
+        impl Handler for CertProbe {
+            type Error = Error;
+
+            async fn auth_publickey_offered(
+                &mut self,
+                _user: &str,
+                _public_key: &PublicKey,
+            ) -> Result<Auth, Self::Error> {
+                self.plain_offers += 1;
+                Ok(Auth::reject())
+            }
+
+            async fn auth_publickey_offered_cert(
+                &mut self,
+                _user: &str,
+                _certificate: &Certificate,
+            ) -> Result<Auth, Self::Error> {
+                self.cert_offers += 1;
+                Ok(Auth::Accept)
+            }
+        }
+
+        let ca = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let subject = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let cert = user_cert(&subject, &ca);
+
+        let mut session = test_auth_session();
+        let mut handler = CertProbe {
+            cert_offers: 0,
+            plain_offers: 0,
+        };
+        let packet = certificate_probe_packet("alice", &cert);
+        session.process_packet(&mut handler, &packet).await.unwrap();
+
+        assert_eq!(
+            handler.cert_offers, 1,
+            "certificate-backed probe did not reach auth_publickey_offered_cert",
+        );
+        assert_eq!(
+            handler.plain_offers, 0,
+            "certificate-backed probe was dispatched as a plain key offer",
+        );
+    }
+
     fn test_auth_session() -> Session {
         let mut config = Config::default();
         config.preferred = Preferred {
@@ -759,15 +1024,21 @@ impl Encrypted {
                     self.state = EncryptedState::InitCompression;
                 } else {
                     auth_user.clear();
+                    // Preserve the handler's partial-success decision: it must
+                    // reach the wire as the final octet of USERAUTH_FAILURE
+                    // (see reject_auth_request), so it is never clobbered here.
                     if let Auth::Reject {
-                        proceed_with_methods: Some(proceed_with_methods),
+                        proceed_with_methods,
                         partial_success,
                     } = auth
                     {
-                        auth_request.methods = proceed_with_methods;
                         auth_request.partial_success = partial_success;
-                    } else {
-                        auth_request.methods.remove(MethodKind::Password);
+                        match proceed_with_methods {
+                            Some(proceed_with_methods) => {
+                                auth_request.methods = proceed_with_methods
+                            }
+                            None => auth_request.methods.remove(MethodKind::Password),
+                        }
                     }
                     reject_auth_request(until, &mut self.write, auth_request).await?;
                 }
@@ -799,15 +1070,20 @@ impl Encrypted {
                     self.state = EncryptedState::InitCompression;
                 } else {
                     auth_user.clear();
+                    // Preserve the handler's partial-success decision (see
+                    // reject_auth_request): never clobber it here.
                     if let Auth::Reject {
-                        proceed_with_methods: Some(proceed_with_methods),
+                        proceed_with_methods,
                         partial_success,
                     } = auth
                     {
-                        auth_request.methods = proceed_with_methods;
                         auth_request.partial_success = partial_success;
-                    } else {
-                        auth_request.methods.remove(MethodKind::None);
+                        match proceed_with_methods {
+                            Some(proceed_with_methods) => {
+                                auth_request.methods = proceed_with_methods
+                            }
+                            None => auth_request.methods.remove(MethodKind::None),
+                        }
                     }
                     reject_auth_request(until, &mut self.write, auth_request).await?;
                 }
@@ -980,13 +1256,22 @@ impl Encrypted {
                                 server_auth_request_success(&mut self.write);
                                 self.state = EncryptedState::InitCompression;
                             } else {
+                                // Preserve the handler's partial-success
+                                // decision (see reject_auth_request).
                                 if let Auth::Reject {
-                                    proceed_with_methods: Some(proceed_with_methods),
+                                    proceed_with_methods,
                                     partial_success,
                                 } = auth
                                 {
-                                    auth_request.methods = proceed_with_methods;
                                     auth_request.partial_success = partial_success;
+                                    match proceed_with_methods {
+                                        Some(proceed_with_methods) => {
+                                            auth_request.methods = proceed_with_methods
+                                        }
+                                        None => {
+                                            auth_request.methods.remove(MethodKind::PublicKey)
+                                        }
+                                    }
                                 }
                                 auth_user.clear();
                                 reject_auth_request(until, &mut self.write, auth_request).await?;
@@ -1005,7 +1290,17 @@ impl Encrypted {
                     map_err!(ensure_end(r))?;
                     auth_user.clear();
                     auth_user.push_str(user);
-                    let auth = handler.auth_publickey_offered(user, &pubkey).await?;
+                    // Let the handler distinguish certificate-backed offers
+                    // from plain key offers (pk_or_cert is still available:
+                    // the earlier matches only borrow it).
+                    let auth = match &pk_or_cert {
+                        PublicKeyOrCertificate::Certificate(cert) => {
+                            handler.auth_publickey_offered_cert(user, cert).await?
+                        }
+                        PublicKeyOrCertificate::PublicKey { .. } => {
+                            handler.auth_publickey_offered(user, &pubkey).await?
+                        }
+                    };
                     match auth {
                         Auth::Accept => {
                             let mut public_key = Vec::new();
@@ -1027,13 +1322,22 @@ impl Encrypted {
                             });
                         }
                         auth => {
+                            // Preserve the handler's partial-success
+                            // decision (see reject_auth_request).
                             if let Auth::Reject {
-                                proceed_with_methods: Some(proceed_with_methods),
+                                proceed_with_methods,
                                 partial_success,
                             } = auth
                             {
-                                auth_request.methods = proceed_with_methods;
                                 auth_request.partial_success = partial_success;
+                                match proceed_with_methods {
+                                    Some(proceed_with_methods) => {
+                                        auth_request.methods = proceed_with_methods
+                                    }
+                                    None => {
+                                        auth_request.methods.remove(MethodKind::PublicKey)
+                                    }
+                                }
                             }
                             auth_user.clear();
                             reject_auth_request(until, &mut self.write, auth_request).await?;
@@ -1190,7 +1494,15 @@ impl Session {
                 // consumers waiting on `Channel::wait()` receive an explicit
                 // `ChannelMsg::Close` instead of just seeing `None`.
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Close).await.unwrap_or(())
+                    // Bound the send: a stalled per-channel mpsc must
+                    // never block the run loop past the inactivity
+                    // timer's polling interval. Drop the message on
+                    // timeout (mirrors synch-sock's LANE_SEND_TIMEOUT_MS).
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        chan.send(ChannelMsg::Close),
+                    )
+                    .await;
                 }
                 self.channels.remove(&channel_num);
                 debug!("handler.channel_close {channel_num:?}");
@@ -1203,7 +1515,11 @@ impl Session {
                     return Ok(());
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.send(ChannelMsg::Eof).await.unwrap_or(())
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        chan.send(ChannelMsg::Eof),
+                    )
+                    .await;
                 }
                 debug!("handler.channel_eof {channel_num:?}");
                 handler.channel_eof(channel_num, self).await
@@ -1235,19 +1551,27 @@ impl Session {
                 self.flush()?;
                 if let Some(ext) = ext {
                     if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::ExtendedData {
-                            ext,
-                            data: data.clone(),
-                        })
-                        .await
-                        .unwrap_or(())
+                        // Bound the send: a stalled per-channel mpsc must
+                        // never block the run loop past the inactivity
+                        // timer's polling interval. Drop the message on
+                        // timeout (mirrors synch-sock's LANE_SEND_TIMEOUT_MS).
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            chan.send(ChannelMsg::ExtendedData {
+                                ext,
+                                data: data.clone(),
+                            }),
+                        )
+                        .await;
                     }
                     handler.extended_data(channel_num, ext, &data, self).await
                 } else {
                     if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::Data { data: data.clone() })
-                            .await
-                            .unwrap_or(())
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            chan.send(ChannelMsg::Data { data: data.clone() }),
+                        )
+                        .await;
                     }
                     handler.data(channel_num, &data, self).await
                 }
@@ -1304,14 +1628,15 @@ impl Session {
                 };
 
                 if let Some(channel) = self.channels.get(&local_id) {
-                    channel
-                        .send(ChannelMsg::Open {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        channel.send(ChannelMsg::Open {
                             id: local_id,
                             max_packet_size: msg.maximum_packet_size,
                             window_size: msg.initial_window_size,
-                        })
-                        .await
-                        .unwrap_or(());
+                        }),
+                    )
+                    .await;
                 } else {
                     error!("no channel for id {local_id:?}");
                 }
@@ -1390,8 +1715,9 @@ impl Session {
                         map_err!(ensure_end(r))?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestPty {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::RequestPty {
                                     want_reply: true,
                                     term: term.clone(),
                                     col_width,
@@ -1399,8 +1725,9 @@ impl Session {
                                     pix_width,
                                     pix_height,
                                     terminal_modes: modes.into(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
 
                         debug!("handler.pty_request {channel_num:?}");
@@ -1426,15 +1753,17 @@ impl Session {
                         map_err!(ensure_end(r))?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestX11 {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::RequestX11 {
                                     want_reply: true,
                                     single_connection,
                                     x11_authentication_cookie: x11_auth_cookie.clone(),
                                     x11_authentication_protocol: x11_auth_protocol.clone(),
                                     x11_screen_number,
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                         debug!("handler.x11_request {channel_num:?}");
                         handler
@@ -1454,13 +1783,15 @@ impl Session {
                         map_err!(ensure_end(r))?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::SetEnv {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::SetEnv {
                                     want_reply: true,
                                     variable_name: env_variable.clone(),
                                     variable_value: env_value.clone(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
 
                         debug!("handler.env_request {channel_num:?}");
@@ -1471,9 +1802,11 @@ impl Session {
                     "shell" => {
                         map_err!(ensure_end(r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestShell { want_reply: true })
-                                .await;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::RequestShell { want_reply: true }),
+                            )
+                            .await;
                         }
                         debug!("handler.shell_request {channel_num:?}");
                         handler.shell_request(channel_num, self).await
@@ -1481,9 +1814,11 @@ impl Session {
                     "auth-agent-req@openssh.com" => {
                         map_err!(ensure_end(r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::AgentForward { want_reply: true })
-                                .await;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::AgentForward { want_reply: true }),
+                            )
+                            .await;
                         }
                         debug!("handler.agent_request {channel_num:?}");
 
@@ -1502,12 +1837,14 @@ impl Session {
                         let req = map_err!(Bytes::decode(r))?;
                         map_err!(ensure_end(r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::Exec {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::Exec {
                                     want_reply: true,
                                     command: req.to_vec(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                         debug!("handler.exec_request {channel_num:?}");
                         handler.exec_request(channel_num, &req, self).await
@@ -1517,12 +1854,14 @@ impl Session {
                         map_err!(ensure_end(r))?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::RequestSubsystem {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::RequestSubsystem {
                                     want_reply: true,
                                     name: name.clone(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
                         debug!("handler.subsystem_request {channel_num:?}");
                         handler.subsystem_request(channel_num, &name, self).await
@@ -1535,14 +1874,16 @@ impl Session {
                         map_err!(ensure_end(r))?;
 
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::WindowChange {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::WindowChange {
                                     col_width,
                                     row_height,
                                     pix_width,
                                     pix_height,
-                                })
-                                .await;
+                                }),
+                            )
+                            .await;
                         }
 
                         debug!("handler.window_change {channel_num:?}");
@@ -1561,11 +1902,13 @@ impl Session {
                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
                         map_err!(ensure_end(r))?;
                         if let Some(chan) = self.channels.get(&channel_num) {
-                            chan.send(ChannelMsg::Signal {
-                                signal: signal.clone(),
-                            })
-                            .await
-                            .unwrap_or(())
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                chan.send(ChannelMsg::Signal {
+                                    signal: signal.clone(),
+                                }),
+                            )
+                            .await;
                         }
                         debug!("handler.signal {channel_num:?} {signal:?}");
                         handler.signal(channel_num, signal, self).await
@@ -1681,10 +2024,17 @@ impl Session {
                 }
 
                 if let Some(channel_sender) = self.channels.remove(&channel_num) {
-                    channel_sender
-                        .send(ChannelMsg::OpenFailure(reason))
-                        .await
-                        .map_err(|_| crate::Error::SendError)?;
+                    // Bound the send like every other message queued to the
+                    // per-channel mpsc: a stalled receiver must never block
+                    // the run loop past the inactivity timer's polling
+                    // interval. Drop the message on timeout (bounded-discard
+                    // contract); the connection-level send error below still
+                    // applies when the receiver is gone entirely.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        channel_sender.send(ChannelMsg::OpenFailure(reason)),
+                    )
+                    .await;
                 }
 
                 Ok(())

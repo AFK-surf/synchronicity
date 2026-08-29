@@ -71,11 +71,20 @@ fn clang_targets_bpf() -> bool {
 #[derive(Default)]
 pub struct FakeTree {
     pub files: std::collections::HashMap<String, Vec<u8>>,
+    /// Paths that resolve to a refused row (a socket, symlink, or tombstone
+    /// in the engine's tree): present in the listing (they are keys in
+    /// `files`), but `open` refuses them and `entry_kind` refuses to
+    /// classify them, so the SFTP backend skips them rather than fabricate
+    /// attributes.
+    pub refused: std::collections::HashSet<String>,
 }
 
 #[async_trait::async_trait]
 impl SocketHost for FakeTree {
     fn open(&self, _origin: Option<&str>, path: &str) -> Result<ObjectInfo, HostError> {
+        if self.refused.contains(path) {
+            return Err(HostError::NotReadable("refused".into()));
+        }
         let bytes = self.files.get(path).ok_or(HostError::NotFound)?;
         Ok(ObjectInfo {
             root: Hash::new(bytes),
@@ -123,6 +132,28 @@ impl SocketHost for FakeTree {
             entries: names,
             next,
         })
+    }
+
+    fn entry_kind(&self, _origin: Option<&str>, path: &str) -> Result<u32, HostError> {
+        // The engine contract, over a flat `files` map: a row's kind comes
+        // from the row (every row here is a regular file), a directory that
+        // has no row but has descendants is kind 1, and a refused row
+        // (socket, symlink, tombstone) is refused here too, so the SFTP
+        // backend skips it rather than invent attributes.
+        if self.refused.contains(path) {
+            return Err(HostError::NotReadable("refused".into()));
+        }
+        if self.files.contains_key(path) {
+            return Ok(0);
+        }
+        if self.files.keys().any(|key| {
+            key.len() > path.len()
+                && key.starts_with(path)
+                && key.as_bytes()[path.len()] == b'/'
+        }) {
+            return Ok(1);
+        }
+        Err(HostError::NotFound)
     }
 
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {
@@ -194,6 +225,23 @@ impl Harness {
 
     pub fn with_tree(files: &[(&str, &str)]) -> Harness {
         Harness::with_tree_and_limits(files, Limits::default())
+    }
+
+    /// A tree whose listed rows also include `refused` paths the host will
+    /// not open or classify (sockets, symlinks, tombstones).
+    pub fn with_tree_and_refused(files: &[(&str, &str)], refused: &[&str]) -> Harness {
+        let mut tree = FakeTree::default();
+        for (name, body) in files {
+            tree.files
+                .insert(name.to_string(), body.as_bytes().to_vec());
+        }
+        for path in refused {
+            tree.refused.insert(path.to_string());
+        }
+        Harness {
+            pool: WorkerHandle::start(1, Limits::default()),
+            tree: Arc::new(tree),
+        }
     }
 
     pub fn with_tree_and_limits(files: &[(&str, &str)], limits: Limits) -> Harness {

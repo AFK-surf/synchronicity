@@ -144,6 +144,23 @@ pub trait SocketHost: Send + Sync + 'static {
     /// async and why the helper that calls it returns `SY_EAGAIN` and makes the
     /// handle pollable rather than stalling the whole program.
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError>;
+
+    /// The type of one resolved path, as an SFTP file-type code
+    /// (`ssh2`/`libssh` values: `SSH_FILEXFER_TYPE_REGULAR` etc.), used by the
+    /// SFTP backend to answer `STAT`/`READDIR` honestly without treating every
+    /// path as a regular file.
+    ///
+    /// `origin` is `None` for this node's own view, as in [`SocketHost::open`].
+    ///
+    /// The default fails: a host without kind support cannot classify a path,
+    /// and the SFTP caller skips the entry rather than fabricate attributes
+    /// (fail-closed, never an invented directory).
+    fn entry_kind(&self, origin: Option<&str>, path: &str) -> Result<u32, HostError> {
+        let _ = (origin, path);
+        Err(HostError::Unavailable(
+            "entry kinds are not supported by this host".into(),
+        ))
+    }
 }
 
 /// One bounded storage page returned by [`SocketHost::list_page`].

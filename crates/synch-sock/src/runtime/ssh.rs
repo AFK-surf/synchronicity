@@ -6,11 +6,11 @@ use std::{
         atomic::{AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use russh::{
-    keys::{Algorithm, PrivateKey, PublicKey},
+    keys::{Algorithm, Certificate, PrivateKey, PublicKey},
     server::{Auth, ChannelOpenHandle, Handler, Msg, Session},
     Channel, ChannelId, ChannelOpenFailure, Pty, Sig,
 };
@@ -19,7 +19,14 @@ use tokio::{
     sync::oneshot,
 };
 
-use crate::runtime::endpoint::Readiness;
+use crate::{
+    limits::{
+        AUTH_REJECTION_WINDOW_SECS, LANE_SEND_TIMEOUT_MS, MAX_AUTH_REJECTIONS_PER_IP,
+        MAX_AUTH_REJECTIONS_PER_WINDOW, MAX_AUTH_USERNAME_BYTES,
+        MAX_OUTSTANDING_REQUESTS_PER_CHANNEL,
+    },
+    runtime::endpoint::Readiness,
+};
 
 pub(crate) const AUTH_NONE: u64 = 0x01;
 pub(crate) const AUTH_PUBLICKEY: u64 = 0x02;
@@ -31,6 +38,10 @@ pub(crate) const EVENT_AUTH_PASSWORD: u32 = 2;
 pub(crate) const EVENT_AUTH_PUBLICKEY_OFFER: u32 = 3;
 pub(crate) const EVENT_AUTH_PUBLICKEY_VERIFIED: u32 = 4;
 pub(crate) const EVENT_AUTHENTICATED: u32 = 5;
+// 9, not 5: 5 is EVENT_AUTHENTICATED, and event kinds are a shared ABI.
+// A certificate authentication is a real authentication (russh has already
+// validated the certificate and the possession signature), not an offer.
+pub(crate) const EVENT_AUTH_OPENSSH_CERT: u32 = 9;
 pub(crate) const EVENT_CHANNEL_OPEN: u32 = 6;
 pub(crate) const EVENT_CHANNEL_REQUEST: u32 = 7;
 pub(crate) const EVENT_CHANNEL_EXTENDED_DATA: u32 = 8;
@@ -53,6 +64,11 @@ pub(crate) const FIELD_SIGNAL: u32 = 16;
 pub(crate) const FIELD_TERMINAL: u32 = 17;
 pub(crate) const FIELD_ENV_NAME: u32 = 18;
 pub(crate) const FIELD_ENV_VALUE: u32 = 19;
+/// The 1-based auth-attempt ordinal for the connection, on every auth event.
+pub(crate) const FIELD_AUTH_ATTEMPTS: u32 = 20;
+/// Present on certificate auth events and on publickey offers that were
+/// backed by an OpenSSH certificate.
+pub(crate) const FIELD_AUTH_CERT_FLAG: u32 = 21;
 
 pub(crate) const EVENT_WANT_REPLY: u32 = 0x01;
 
@@ -162,6 +178,15 @@ pub(crate) struct SshState {
     lanes: Mutex<HashMap<LaneKey, LaneBinding>>,
     discarded_lanes: Mutex<HashSet<LaneKey>>,
     request_order: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>,
+    /// CHANNEL_REQUEST tasks currently parked per channel (bounded at
+    /// MAX_OUTSTANDING_REQUESTS_PER_CHANNEL).
+    requests: Mutex<HashMap<ChannelId, usize>>,
+    /// Ownership tokens binding an accepted channel's event to its endpoint
+    /// fd, so a closed-and-reused fd can never capture a stale registration.
+    accepts: Mutex<HashMap<i64, u64>>,
+    /// Exit-status/exit-signal deliveries that could not be sent to the
+    /// client; surfaced to the guest through `sy_ssh_exit_status_lost`.
+    lost_exit_deliveries: AtomicU64,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
@@ -180,6 +205,9 @@ impl SshState {
             lanes: Mutex::new(HashMap::new()),
             discarded_lanes: Mutex::new(HashSet::new()),
             request_order: Mutex::new(HashMap::new()),
+            requests: Mutex::new(HashMap::new()),
+            accepts: Mutex::new(HashMap::new()),
+            lost_exit_deliveries: AtomicU64::new(0),
             tasks: Mutex::new(Vec::new()),
         })
     }
@@ -354,6 +382,17 @@ impl SshState {
         store.outstanding.clear();
         store.payload_bytes = 0;
         drop(store);
+        // The aborting tasks below would otherwise leave their counts and
+        // tokens behind; the state is dead after close, but the maps must not
+        // retain them.
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.accepts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         for task in self
             .tasks
             .lock()
@@ -382,11 +421,94 @@ impl SshState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     }
 
-    fn register_channel(&self, fd: i64, id: ChannelId, channel_type: &str) {
+    /// Registers `fd` as the guest-visible endpoint of channel `id`.
+    ///
+    /// Inbound accepts carry an ownership token: the event id of the channel
+    /// open that produced the fd (recorded by `note_accept`). Registration is
+    /// refused when the token is missing or stale — the fd was closed and
+    /// possibly reused by a different accept — so one channel's data can never
+    /// be routed to another channel's fd. The outbound path (`expected: None`)
+    /// registers without a token, since its registration is synchronous in its
+    /// own task. Returns whether the registration happened.
+    fn register_channel(
+        &self,
+        fd: i64,
+        id: ChannelId,
+        channel_type: &str,
+        expected: Option<u64>,
+    ) -> bool {
+        if let Some(expected) = expected {
+            let mut accepts = self
+                .accepts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if accepts.get(&fd) != Some(&expected) {
+                return false;
+            }
+            // The token is single-use: consumed by the successful
+            // registration, and invalidated by `remove_channel_fd` on close.
+            accepts.remove(&fd);
+        }
         self.channels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(fd, (id, channel_type.to_string()));
+        true
+    }
+
+    /// Binds the accepted channel event `event_id` to its endpoint fd.
+    ///
+    /// Called by the guest-side accept helper immediately after the endpoint
+    /// slot is allocated and before the accept decision is replied.
+    pub(crate) fn note_accept(&self, fd: i64, event_id: u64) {
+        self.accepts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(fd, event_id);
+    }
+
+    /// Drops the ownership token for `fd` (accept-reply error path).
+    pub(crate) fn forget_accept(&self, fd: i64) {
+        self.accepts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&fd);
+    }
+
+    /// Counts one outstanding CHANNEL_REQUEST for `id`; returns the new count.
+    fn bump_request(&self, id: ChannelId) -> usize {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = requests.entry(id).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Uncounts one outstanding CHANNEL_REQUEST for `id`.
+    fn dec_request(&self, id: ChannelId) {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match requests.get_mut(&id) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                requests.remove(&id);
+            }
+            None => {}
+        }
+    }
+
+    /// Counts an exit-status/exit-signal delivery that could not be sent.
+    pub(crate) fn note_lost_exit_delivery(&self) {
+        self.lost_exit_deliveries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many exit-status/exit-signal deliveries were lost so far.
+    pub(crate) fn lost_exit_deliveries(&self) -> u64 {
+        self.lost_exit_deliveries.load(Ordering::Relaxed)
     }
 
     fn remove_channel_id(&self, id: ChannelId) {
@@ -404,6 +526,10 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
     }
 
     pub(crate) fn remove_channel_fd(&self, fd: i64) {
@@ -418,6 +544,10 @@ impl SshState {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
         }
         self.lanes
             .lock()
@@ -427,6 +557,12 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(parent, _)| *parent != fd);
+        // A closed fd loses its accept token: a later accept that reuses the
+        // slot starts from a clean slate.
+        self.accepts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&fd);
     }
 
     pub(crate) fn reserve_channel(&self) -> bool {
@@ -485,7 +621,9 @@ impl SshState {
     }
 
     pub(crate) fn add_outbound_channel(&self, fd: i64, id: ChannelId, channel_type: &str) {
-        self.register_channel(fd, id, channel_type);
+        // The outbound path is synchronous in its own task; no ownership
+        // token is needed (None registers unconditionally).
+        let _ = self.register_channel(fd, id, channel_type, None);
     }
 
     pub(crate) fn register_lane(
@@ -626,6 +764,52 @@ fn method_bit(kind: u32) -> u64 {
     }
 }
 
+/// Host-side, cross-connection throttle on authentication rejections.
+///
+/// Rejections are remembered per IP and in total over a sliding window; when
+/// either cap is reached, further attempts are refused without consulting the
+/// guest — fail-closed against online brute force that would otherwise pace
+/// itself with one fresh connection per batch. The throttle is per daemon
+/// pool (one per `WorkerHandle`), and a guest that accepts everything is
+/// never throttled: that is the guest's own policy.
+#[derive(Debug, Default)]
+pub(crate) struct AuthThrottle {
+    inner: Mutex<VecDeque<(Instant, String)>>,
+}
+
+impl AuthThrottle {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one rejected auth attempt from `ip`.
+    pub(crate) fn note_rejection(&self, ip: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.push_back((Instant::now(), ip.to_string()));
+    }
+
+    /// Whether another auth attempt from `ip` is admitted.
+    ///
+    /// Entries older than the window are evicted; admission requires both the
+    /// window total and the per-IP total to be under their caps.
+    pub(crate) fn admit(&self, ip: &str) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let cutoff = now
+            .checked_sub(Duration::from_secs(AUTH_REJECTION_WINDOW_SECS))
+            .unwrap_or(now);
+        inner.retain(|(at, _)| *at >= cutoff);
+        let per_ip = inner.iter().filter(|(_, seen)| seen == ip).count();
+        inner.len() < MAX_AUTH_REJECTIONS_PER_WINDOW && per_ip < MAX_AUTH_REJECTIONS_PER_IP
+    }
+}
+
 #[derive(Debug)]
 struct SshHandler {
     state: Arc<SshState>,
@@ -635,11 +819,24 @@ struct SshHandler {
     /// named. An attempt outside this set is rejected without waking the
     /// guest — the guest, not the client, chooses what may be attempted.
     methods: u64,
+    throttle: Arc<AuthThrottle>,
+    ip: String,
+    /// 1-based count of auth attempts on this connection, as the guest sees
+    /// them in FIELD_AUTH_ATTEMPTS.
+    attempts: u64,
 }
 
 impl SshHandler {
     async fn auth(&mut self, event: Event) -> Result<Auth, russh::Error> {
         if self.methods & method_bit(event.kind) == 0 {
+            return Ok(Auth::Reject {
+                proceed_with_methods: Some(advertised_methods(self.methods)),
+                partial_success: false,
+            });
+        }
+        if !self.throttle.admit(&self.ip) {
+            // Fail-closed under a rejection flood: the guest is not consulted
+            // when the host-side throttle is exhausted.
             return Ok(Auth::Reject {
                 proceed_with_methods: Some(advertised_methods(self.methods)),
                 partial_success: false,
@@ -652,16 +849,41 @@ impl SshHandler {
         {
             return Err(russh::Error::Disconnect);
         }
+        if self.username.as_ref().is_some_and(|u| u.len() > MAX_AUTH_USERNAME_BYTES)
+            || (self.username.is_none()
+                && event.fields[&FIELD_USERNAME].len() > MAX_AUTH_USERNAME_BYTES)
+        {
+            // An oversized wire-controlled username is an ordinary auth
+            // failure, never a disconnect: a one-packet pre-auth connection
+            // kill must not be possible. russh drops the method, fail-closed.
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
         if self.username.is_none() {
             self.username = Some(String::from_utf8_lossy(&event.fields[&FIELD_USERNAME]).into());
         }
         let (tx, rx) = oneshot::channel();
         let mut event = event;
         event.response = Some(tx);
-        let event_id = self
-            .state
-            .push(event)
-            .map_err(|_| russh::Error::Disconnect)?;
+        self.attempts += 1;
+        event
+            .fields
+            .insert(FIELD_AUTH_ATTEMPTS, self.attempts.to_le_bytes().to_vec());
+        let event_id = match self.state.push(event) {
+            Ok(id) => id,
+            Err(_) => {
+                // The event store is full or the payload is over cap (an
+                // oversized publickey blob): an ordinary auth failure, never
+                // a disconnect. The store must never be a new way to kill the
+                // connection.
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
+            }
+        };
         let decision = match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(decision)) => decision,
             _ => {
@@ -676,7 +898,7 @@ impl SshHandler {
         else {
             return Err(russh::Error::Disconnect);
         };
-        Ok(match result {
+        let auth = match result {
             1 => Auth::Accept,
             3 => {
                 self.methods = next_methods;
@@ -692,7 +914,12 @@ impl SshHandler {
                     partial_success: false,
                 }
             }
-        })
+        };
+        if !matches!(auth, Auth::Accept) {
+            // Partial-success rejections count as failures for the throttle.
+            self.throttle.note_rejection(&self.ip);
+        }
+        Ok(auth)
     }
 
     async fn open_channel(
@@ -737,7 +964,15 @@ impl SshHandler {
         self.state.spawn(async move {
             match tokio::time::timeout(Duration::from_secs(60), rx).await {
                 Ok(Ok(Decision::Channel { fd, mut bridge })) => {
-                    state.register_channel(fd, channel.id(), &channel_type);
+                    if !state.register_channel(fd, channel.id(), &channel_type, Some(event_id)) {
+                        // The accepted fd was closed or reused since the
+                        // accept: its ownership token is gone, so registration
+                        // is dropped and the channel is rejected — fail-closed
+                        // rather than routing one channel's data to another
+                        // channel's fd.
+                        reply.reject(ChannelOpenFailure::ResourceShortage).await;
+                        return;
+                    }
                     reply.accept().await;
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut bridge).await;
@@ -762,7 +997,13 @@ impl SshHandler {
         dims: [u32; 4],
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        let reply = session.take_channel_request_reply(channel)?;
+        let Ok(reply) = session.take_channel_request_reply(channel) else {
+            // A request on a never-opened or already-closed channel: russh
+            // already drops CHANNEL_REQUESTs for unestablished channels, and
+            // there is no reply token to answer with. Dropping the request is
+            // fail-closed behavior, not a disconnect.
+            return Ok(());
+        };
         let Some(fd) = self.state.fd_for_channel(channel) else {
             reply
                 .reply(false)
@@ -770,6 +1011,17 @@ impl SshHandler {
                 .map_err(|_| russh::Error::Disconnect)?;
             return Ok(());
         };
+        // Bound the CHANNEL_REQUEST tasks parked per channel: a client that
+        // pipelines requests faster than the guest answers (each decision can
+        // take up to 60s) must not grow unbounded task memory. The excess is
+        // answered immediately with false, fail-closed; the cap is counted
+        // against the parked tasks themselves, not the event store.
+        let outstanding = self.state.bump_request(channel);
+        if outstanding > MAX_OUTSTANDING_REQUESTS_PER_CHANNEL {
+            self.state.dec_request(channel);
+            let _ = tokio::time::timeout(Duration::from_secs(1), reply.reply(false)).await;
+            return Ok(());
+        }
         let mut event = Event {
             id: 0,
             fd,
@@ -797,16 +1049,19 @@ impl SshHandler {
         self.state.spawn(async move {
             let _ordered = order.lock().await;
             let Ok(event_id) = state.push(event) else {
+                state.dec_request(channel);
                 let _ = reply.reply(false).await;
                 return;
             };
             match tokio::time::timeout(Duration::from_secs(60), rx).await {
                 Ok(Ok(Decision::Request(true))) => {
                     let _ = reply.reply(true).await;
+                    state.dec_request(channel);
                 }
                 _ => {
                     state.cancel_event(event_id);
                     let _ = reply.reply(false).await;
+                    state.dec_request(channel);
                 }
             }
         });
@@ -857,6 +1112,34 @@ impl Handler for SshHandler {
         .await
     }
 
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        cert: &Certificate,
+    ) -> Result<Auth, Self::Error> {
+        // russh has already validated the certificate (expiry, CA signature)
+        // and verified the client's possession signature against the embedded
+        // key before this handler runs, so the guest vouches only for
+        // identity — the crypto boundary stays fail-closed.
+        let key = PublicKey::new(cert.public_key().clone(), "");
+        let mut event = public_key_event(EVENT_AUTH_OPENSSH_CERT, user, &key)?;
+        event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
+        self.auth(event).await
+    }
+
+    async fn auth_publickey_offered_cert(
+        &mut self,
+        user: &str,
+        cert: &Certificate,
+    ) -> Result<Auth, Self::Error> {
+        // Same event shape as a plain key offer, marked as certificate-backed
+        // so the guest can gate offers differently.
+        let key = PublicKey::new(cert.public_key().clone(), "");
+        let mut event = public_key_event(EVENT_AUTH_PUBLICKEY_OFFER, user, &key)?;
+        event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
+        self.auth(event).await
+    }
+
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
         self.state.set_session(_session.handle());
         let event = Event {
@@ -872,6 +1155,11 @@ impl Handler for SshHandler {
             pty: None,
             response: None,
         };
+        // Deliberately still a disconnect on push failure: EVENT_AUTHENTICATED
+        // is the guest's go-signal, and an undeliverable one must fail the
+        // session rather than leave the guest waiting on it forever. Every
+        // other push-failure path turns into an ordinary rejection or a
+        // bounded discard; this one keeps the fail-closed teardown.
         self.state
             .push(event)
             .map(|_| ())
@@ -1059,15 +1347,27 @@ impl Handler for SshHandler {
         let mut data = data.to_vec();
         if let Some(lane) = self.state.lane(fd, data_type) {
             let expected = lane.clone();
-            match lane.send(data).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
+            match tokio::time::timeout(
+                Duration::from_millis(LANE_SEND_TIMEOUT_MS),
+                lane.send(data),
+            )
+            .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
                     // The guest may close a lane independently of its parent.
                     // Treat a racing send exactly like the next packet after
                     // that close: forget the stale mapping and offer the bytes
                     // through a fresh extended-data event.
                     self.state.remove_lane_if(fd, data_type, &expected);
                     data = error.0;
+                }
+                Err(_) => {
+                    // Bounded discard: the lane ring is full and the guest is
+                    // not draining it. Drop the bytes but keep the lane — the
+                    // send must never stall the run loop past the inactivity
+                    // timer's polling interval (docs/SSH-SOCKETS.md §14.3).
+                    return Ok(());
                 }
             }
         }
@@ -1122,7 +1422,11 @@ impl Handler for SshHandler {
         match tokio::time::timeout_at(deadline, &mut rx).await {
             Ok(Ok(_)) => {
                 if let Some(lane) = self.state.lane(fd, data_type) {
-                    let _ = lane.send(data).await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(LANE_SEND_TIMEOUT_MS),
+                        lane.send(data),
+                    )
+                    .await;
                 } else {
                     self.state.discard_lane(fd, data_type);
                 }
@@ -1439,6 +1743,8 @@ pub(crate) async fn serve(
     host_key: Arc<PrivateKey>,
     methods: u64,
     idle: Duration,
+    throttle: Arc<AuthThrottle>,
+    ip: String,
 ) {
     let config = russh::server::Config {
         methods: advertised_methods(methods),
@@ -1459,6 +1765,9 @@ pub(crate) async fn serve(
         state: state.clone(),
         username: None,
         methods,
+        throttle,
+        ip,
+        attempts: 0,
     };
     let outcome =
         match russh::server::run_stream(Arc::new(config), JoinedStream::new(stream), handler).await
@@ -1492,7 +1801,24 @@ pub(crate) fn generate_host_key() -> Result<PrivateKey, russh::keys::ssh_key::Er
 
 #[cfg(test)]
 mod tests {
-    use super::unknown_request_dimensions;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use russh::server::Auth;
+    use tokio::sync::oneshot;
+
+    use super::{
+        unknown_request_dimensions, AuthThrottle, Event, SshHandler, SshState,
+        EVENT_AUTHENTICATED, EVENT_AUTH_NONE, EVENT_AUTH_OPENSSH_CERT,
+        EVENT_AUTH_PUBLICKEY_OFFER, EVENT_AUTH_PUBLICKEY_VERIFIED, FIELD_AUTH_ATTEMPTS,
+        FIELD_AUTH_CERT_FLAG, MAX_AUTH_USERNAME_BYTES, MAX_EVENTS,
+    };
+    use crate::{
+        limits::{AUTH_REJECTION_WINDOW_SECS, MAX_AUTH_REJECTIONS_PER_IP, MAX_AUTH_REJECTIONS_PER_WINDOW},
+        runtime::endpoint::Readiness,
+    };
 
     #[test]
     fn break_requests_expose_their_typed_duration() {
@@ -1505,5 +1831,220 @@ mod tests {
             Ok([0; 4])
         );
         assert_eq!(unknown_request_dimensions("break", &[0, 1]), Err(()));
+    }
+
+    fn handler_for(state: Arc<SshState>) -> SshHandler {
+        SshHandler {
+            state,
+            username: None,
+            throttle: Arc::new(AuthThrottle::new()),
+            ip: "127.0.0.1".to_string(),
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn auth_throttle_admits_within_window_and_rejects_after() {
+        // admit() does not record; only note_rejection() does, so the cap is
+        // reached by the MAX_AUTH_REJECTIONS_PER_IP-th note, not the admit.
+        let throttle = AuthThrottle::new();
+        let ip = "198.51.100.7";
+        for _ in 0..MAX_AUTH_REJECTIONS_PER_IP - 1 {
+            throttle.note_rejection(ip);
+            assert!(throttle.admit(ip), "admitted while under the per-IP cap");
+        }
+        throttle.note_rejection(ip); // the cap-th rejection fills the per-IP cap
+        assert!(!throttle.admit(ip), "the per-IP cap is full");
+
+        // The window total is a separate bound, reached only when the
+        // rejections are spread across more IPs than the per-IP cap.
+        let throttle = AuthThrottle::new();
+        for index in 0..MAX_AUTH_REJECTIONS_PER_WINDOW - 1 {
+            let seen = format!("10.0.0.{index}");
+            throttle.note_rejection(&seen);
+            assert!(throttle.admit(&seen));
+        }
+        throttle.note_rejection("10.0.0.254"); // the cap-th rejection fills the window
+        assert!(!throttle.admit("10.0.0.99"), "the window total is full");
+
+        // Entries older than the window are evicted, so admits resume — on a
+        // fresh throttle (a full window stays full after evicting one entry).
+        let throttle = AuthThrottle::new();
+        let stale = Instant::now() - Duration::from_secs(AUTH_REJECTION_WINDOW_SECS + 1);
+        throttle
+            .inner
+            .lock()
+            .unwrap()
+            .push_back((stale, "10.0.0.99".to_string()));
+        assert!(
+            throttle.admit("10.0.0.99"),
+            "stale entries are evicted and admit resumes"
+        );
+    }
+
+    #[test]
+    fn oversized_username_is_an_auth_failure_not_a_disconnect() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let mut handler = handler_for(state.clone());
+        let huge = "u".repeat(MAX_AUTH_USERNAME_BYTES + 1);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(async {
+            let (tx, _rx) = oneshot::channel();
+            handler
+                .auth(Event::auth(EVENT_AUTH_NONE, &huge, tx))
+                .await
+        });
+        assert!(matches!(
+            outcome,
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        ));
+        assert!(state.next().is_none(), "no event was pushed for the oversized username");
+        assert_eq!(state.event_kind(1), None, "no event id was consumed");
+    }
+
+    #[test]
+    fn auth_push_failure_is_a_rejection_not_a_disconnect() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let mut handler = handler_for(state.clone());
+        for _ in 0..MAX_EVENTS {
+            let (tx, _rx) = oneshot::channel();
+            state
+                .push(Event::auth(EVENT_AUTH_NONE, "filler", tx))
+                .expect("the store accepts MAX_EVENTS events");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(async {
+            let (tx, _rx) = oneshot::channel();
+            handler
+                .auth(Event::auth(EVENT_AUTH_NONE, "user", tx))
+                .await
+        });
+        // A full store is an ordinary auth failure, never a disconnect.
+        assert!(matches!(outcome, Ok(Auth::Reject { .. })));
+        // The 33rd event never entered the store.
+        assert_eq!(state.next().expect("filler is still queued").kind, EVENT_AUTH_NONE);
+    }
+
+    #[test]
+    fn auth_attempts_field_carries_the_1_based_ordinal() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (tx, _rx) = oneshot::channel();
+            let mut handler = handler_for(state.clone());
+            let task = tokio::spawn(async move {
+                handler
+                    .auth(Event::auth(EVENT_AUTH_NONE, "user", tx))
+                    .await
+            });
+            // auth() pushes the event before parking on the guest decision;
+            // the guest never answers here, so read the queued event.
+            let mut header = None;
+            for _ in 0..128 {
+                if let Some(next) = state.next() {
+                    header = Some(next);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let header = header.expect("the attempt event was queued");
+            assert_eq!(state.event_kind(header.id), Some(EVENT_AUTH_NONE));
+            assert_eq!(
+                state.field(header.id, FIELD_AUTH_ATTEMPTS),
+                Some(1u64.to_le_bytes().to_vec()),
+                "the first attempt carries ordinal 1"
+            );
+            task.abort();
+        });
+    }
+
+    #[test]
+    fn auth_reply_gate_accepts_cert_events_and_keeps_offer_accept_on_offers() {
+        use crate::runtime::helpers::{auth_reply_result, peer_ip};
+        // A certificate-signed event (kind 9), built through the same store
+        // the live auth path pushes into: the kind the gate sees is the kind
+        // the wire produced, not one the test invented.
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let (tx, _rx) = oneshot::channel();
+        let id = state
+            .push(Event::auth(EVENT_AUTH_OPENSSH_CERT, "user", tx))
+            .unwrap();
+        let header = state.next().expect("the cert event was queued");
+        assert_eq!(header.id, id);
+        let kind = state.event_kind(id).expect("the cert event is outstanding");
+        assert_eq!(kind, EVENT_AUTH_OPENSSH_CERT);
+        // Accept, reject and partial are all valid on a cert event: russh
+        // has already validated the certificate and the possession signature.
+        assert_eq!(auth_reply_result(kind, 1), Ok(1));
+        assert_eq!(auth_reply_result(kind, 2), Ok(2));
+        assert_eq!(auth_reply_result(kind, 3), Ok(3));
+        // OFFER_ACCEPT (4) is the offer-only pre-signature accept; a cert
+        // event must not accept it.
+        assert_eq!(
+            auth_reply_result(kind, 4),
+            Err(crate::abi::errno::ESTATE),
+            "OFFER_ACCEPT stays invalid on a signed certificate event"
+        );
+        // The offer path is unchanged: 4 maps to the library's pre-signature
+        // accept, and every other auth kind keeps its own results.
+        assert_eq!(
+            auth_reply_result(EVENT_AUTH_PUBLICKEY_OFFER, 4),
+            Ok(1)
+        );
+        assert_eq!(
+            auth_reply_result(EVENT_AUTH_PUBLICKEY_VERIFIED, 4),
+            Err(crate::abi::errno::ESTATE)
+        );
+        // A non-auth kind is still refused outright.
+        assert_eq!(
+            auth_reply_result(EVENT_AUTHENTICATED, 1),
+            Err(crate::abi::errno::ESTATE)
+        );
+
+        // The throttle key is the IP, never the "ip:port" address: a
+        // reconnect is a fresh port, and a key that included the port would
+        // make the per-IP cap unreachable.
+        assert_eq!(peer_ip("198.51.100.7:44321"), "198.51.100.7");
+        assert_eq!(peer_ip("127.0.0.1"), "127.0.0.1");
+        assert_eq!(peer_ip("[2001:db8::1]:44321"), "2001:db8::1");
+        assert_eq!(peer_ip("2001:db8::1"), "2001:db8::1");
+        assert_eq!(peer_ip("2001:db8::1:44321"), "2001:db8::1:44321");
+    }
+
+    #[test]
+    fn cert_auth_events_carry_the_cert_kind_and_flag() {
+        assert_ne!(
+            EVENT_AUTH_OPENSSH_CERT, EVENT_AUTHENTICATED,
+            "9 must not collide with EVENT_AUTHENTICATED (5)"
+        );
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let (tx, _rx) = oneshot::channel();
+        let mut event = Event::auth(EVENT_AUTH_OPENSSH_CERT, "user", tx);
+        event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
+        let id = state.push(event).unwrap();
+        let header = state.next().expect("the cert event was queued");
+        assert_eq!(header.id, id);
+        assert_eq!(
+            state.event_kind(id),
+            Some(EVENT_AUTH_OPENSSH_CERT),
+            "the cert event keeps its kind"
+        );
+        assert_eq!(
+            state.field(id, FIELD_AUTH_CERT_FLAG),
+            Some(vec![1]),
+            "the cert flag survives the store round trip"
+        );
     }
 }

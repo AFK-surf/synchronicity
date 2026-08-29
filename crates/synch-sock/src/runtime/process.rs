@@ -49,8 +49,16 @@ impl ProcessSlot {
         }
         let mut child = self.child.borrow_mut();
         let status = match child.as_mut() {
-            Some(Child::Pipe(child)) => child.try_wait(),
-            Some(Child::Pty(child)) => child.try_wait(),
+            Some(Child::Pipe(child)) => {
+                if let Some(pid) = child.id() {
+                    kill_group_if_exited(pid);
+                }
+                child.try_wait()
+            }
+            Some(Child::Pty(child)) => {
+                kill_group_if_exited(child.id());
+                child.try_wait()
+            }
             None => return Ok(self.status.borrow().clone()),
         }
         .map_err(|_| errno::ECONNRESET)?;
@@ -118,23 +126,85 @@ impl ProcessSlot {
     }
 }
 
+/// Kills the process group of an exited-but-unreaped child, so same-group
+/// descendants die with their leader instead of surviving as orphans.
+///
+/// `waitid` with `WNOWAIT` detects the exit without reaping: the child's pid
+/// stays reserved until the subsequent `try_wait` in `refresh`, so the group
+/// kill can never be aimed at an unrelated pid that reused the number. A child
+/// that is still running (si_pid == 0) or that some other path already reaped
+/// (waitid fails) is left alone.
+fn kill_group_if_exited(pid: u32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WNOHANG | libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 && waitid_si_pid(&info) == pid as i32 {
+        // A fresh process group was created at spawn, so a negative pid
+        // reaches same-group descendants as well as the leader.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+/// The child pid a waitid `siginfo_t` reports for an exited child.
+///
+/// libc exposes `si_pid` as an unsafe accessor on Linux (the field lives
+/// inside a union), and as a plain field elsewhere.
+#[cfg(target_os = "linux")]
+fn waitid_si_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    unsafe { info.si_pid() }
+}
+
+/// See [`waitid_si_pid`].
+#[cfg(not(target_os = "linux"))]
+fn waitid_si_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
 impl Drop for ProcessSlot {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.get_mut().take() else {
+        let Some(child) = self.child.get_mut().take() else {
             return;
         };
-        match &mut child {
-            Child::Pipe(child) => {
+        match child {
+            Child::Pipe(mut child) => {
+                // Group-kill first: the slot still owns the child, so its pid
+                // is reserved and same-group descendants are still reachable
+                // before the child is reaped by tokio's background reaper.
+                if let Some(pid) = child.id() {
+                    if let Ok(pid) = i32::try_from(pid) {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    }
+                }
                 let _ = child.start_kill();
             }
-            Child::Pty(child) => {
+            Child::Pty(mut child) => {
                 if let Ok(pid) = i32::try_from(child.id()) {
                     unsafe {
                         libc::kill(-pid, libc::SIGKILL);
                     }
                 }
-                // std::process::Child does not have Tokio's background reaper.
-                let _ = child.wait();
+                // std::process::Child has no background reaper, and SIGKILL is
+                // no guarantee of prompt death (a child stuck in uninterruptible
+                // kernel I/O stays a zombie). Reap on a detached thread so a
+                // stuck child can never block the worker thread this Drop runs
+                // on; if the thread cannot spawn, dropping the Child unreaped
+                // leaves a transient zombie until the daemon exits — never
+                // block the worker.
+                let _ = std::thread::Builder::new()
+                    .name("synch-reap".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
             }
         }
     }
@@ -205,8 +275,33 @@ pub(crate) fn open_pty(
     if result != 0 {
         return Err(errno::ELIMIT);
     }
+    // The pty descriptors must not survive exec: the declared child runs via
+    // the fork+exec path (a pre_exec closure is always installed), which does
+    // not close stray descriptors, and an inherited master would let the
+    // sandboxed process forge "user input" to the guest. std's spawn clears
+    // CLOEXEC on the stdio targets via dup2; `spawn_pty`'s pre_exec also
+    // clears it on fds 0-2 as the belt-and-braces guard for a dup2 no-op.
+    if set_cloexec(master).is_err() || set_cloexec(slave).is_err() {
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(errno::ELIMIT);
+    }
     // SAFETY: openpty returned two newly owned descriptors.
     Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
+}
+
+/// Marks a descriptor close-on-exec.
+fn set_cloexec(fd: libc::c_int) -> Result<(), i64> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(errno::ELIMIT);
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(errno::ELIMIT);
+    }
+    Ok(())
 }
 
 /// Applies the portable subset of RFC 4254 terminal modes. Unknown modes are
@@ -325,6 +420,13 @@ pub(crate) fn spawn_pipe(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The declared argv[0] is part of the reviewed capability; execve must
+    // present exactly what the guest declared, not the executable path, or
+    // argv-dispatching programs (busybox applets, bash's "sh" detection) run
+    // something other than the reviewed command.
+    if let Some(first) = capability.argv.first() {
+        command.arg0(first);
+    }
     configure_unix_command(command.as_std_mut(), capability, false);
     let mut child = command.spawn().map_err(|_| errno::ENOENT)?;
     let stdout = child.stdout.take().ok_or(errno::ECONNRESET)?;
@@ -354,6 +456,12 @@ pub(crate) fn spawn_pty(
     if !term.is_empty() {
         command.env("TERM", term);
     }
+    // The declared argv[0] is part of the reviewed capability; execve must
+    // present exactly what the guest declared, not the executable path.
+    if let Some(first) = capability.argv.first() {
+        use std::os::unix::process::CommandExt as _;
+        command.arg0(first);
+    }
     configure_unix_command(&mut command, capability, true);
     command.spawn().map_err(|_| errno::ENOENT)
 }
@@ -378,6 +486,13 @@ fn configure_unix_command(
             if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // The pty descriptors are close-on-exec and std's dup2 clears the
+            // flag on the new stdio descriptors, but a stdio target fd that
+            // already collides with a pty fd (a dup2 no-op) would keep it:
+            // make the child's stdio survive exec unconditionally.
+            for fd in 0..3 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, 0);
+            }
             #[cfg(not(target_os = "macos"))]
             let limit = libc::rlimit {
                 rlim_cur: memory as libc::rlim_t,
@@ -388,6 +503,20 @@ fn configure_unix_command(
             // programs. The parent monitors aggregate physical footprint there.
             #[cfg(not(target_os = "macos"))]
             if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Bound the process fan-out a descendant can create: RLIMIT_NPROC
+            // is per-real-UID on Linux, so a setsid-escaped grandchild can at
+            // most hold the uid's total process count to
+            // MAX_PROCESSES_PER_GROUP, and fork() beyond it fails closed with
+            // EAGAIN.
+            #[cfg(target_os = "linux")]
+            let nproc = libc::rlimit {
+                rlim_cur: crate::limits::MAX_PROCESSES_PER_GROUP as libc::rlim_t,
+                rlim_max: crate::limits::MAX_PROCESSES_PER_GROUP as libc::rlim_t,
+            };
+            #[cfg(target_os = "linux")]
+            if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -596,6 +725,239 @@ mod tests {
         assert_eq!(slot.pid(), None);
         slot.kill_if_pid(pid);
         assert_eq!(slot.pid(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refresh_kills_the_process_group_before_reaping() {
+        let capability = synch_core::ProcessCapability {
+            id: 8,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "sleep 60 >/dev/null 2>&1 & echo $!; sleep 1".into(),
+            ],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 10_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (child, mut stdout, stdin, stderr) = spawn_pipe(&capability).unwrap();
+        drop((stdin, stderr));
+        // The child prints the pid of its backgrounded grandchild before it
+        // exits (the grandchild's stdio is redirected so the pipe EOFs with
+        // the direct child).
+        let mut line = String::new();
+        stdout.read_to_string(&mut line).await.unwrap();
+        let Some(grandchild) = line.trim().parse::<i32>().ok() else {
+            // RLIMIT_NPROC (MAX_PROCESSES_PER_GROUP, set in pre_exec) is
+            // per-real-UID: when the uid already holds more threads than the
+            // ceiling — as a shared dev box does — the child's fork of the
+            // grandchild fails closed with EAGAIN and no descendant exists to
+            // assert against. That failure is the bound doing its job; skip.
+            eprintln!(
+                "skipping: uid is over RLIMIT_NPROC, the child could not fork a \
+                 grandchild (stdout {line:?})"
+            );
+            return;
+        };
+        let slot = ProcessSlot {
+            child: RefCell::new(Some(Child::Pipe(child))),
+            status: RefCell::new(ProcessStatus::default()),
+            capability: capability.id,
+            allowed_signals: 0,
+            main: -1,
+            stderr: None,
+        };
+        // The direct child exits after ~1s; refresh() must detect the exit
+        // without reaping first (waitid WNOWAIT), so the group SIGKILL still
+        // reaches the same-group grandchild before the leader is reaped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if slot.refresh().unwrap().exited {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "direct child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(slot.pid(), None, "a reaped child must leave the slot");
+        // The grandchild must be dead. Without the fix the group is never
+        // killed once the leader is reaped (kill() sees no pid) and the
+        // grandchild survives past the invocation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if unsafe { libc::kill(grandchild, 0) } != 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived the pre-reap group kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pty_slot_drop_returns_promptly_with_a_stuck_child() {
+        let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        // A fork-free busy loop: it needs no external fork, so it runs the
+        // same in every environment (a shared uid may already exceed the
+        // per-uid RLIMIT_NPROC, which would make `sleep` fail to fork).
+        let capability = synch_core::ProcessCapability {
+            id: 9,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "while :; do :; done".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 60_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let child = spawn_pty(&capability, slave, "xterm").unwrap();
+        let pid = child.id();
+        let slot = ProcessSlot {
+            child: RefCell::new(Some(Child::Pty(child))),
+            status: RefCell::new(ProcessStatus::default()),
+            capability: capability.id,
+            allowed_signals: 0,
+            main: -1,
+            stderr: None,
+        };
+        // Let the child get going, then drop the slot: the group SIGKILL
+        // fires and the reap happens on a detached thread, so the drop must
+        // not block for the child's busy loop (a child stuck in
+        // uninterruptible kernel I/O would otherwise wedge the worker).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        drop(slot);
+        drop(master);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "ProcessSlot::drop blocked on the pty child's wait()"
+        );
+        // The detached reaper must reap the child (no zombie leak).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pty child {pid} was never reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pty_descriptors_carry_fd_cloexec() {
+        let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "pty master must be close-on-exec"
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "pty slave must be close-on-exec"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_pty_child_cannot_see_the_master_descriptor() {
+        let (mut master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        let capability = synch_core::ProcessCapability {
+            id: 10,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -le 128 ]; do [ -e /proc/self/fd/$i ] && echo $i; i=$((i+1)); done"
+                    .into(),
+            ],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 10_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let mut child = spawn_pty(&capability, slave, "xterm").unwrap();
+        // The child's stdio is the pty slave; read its output from the master
+        // until the slave side closes (read returns EIO on Linux).
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+                Err(_) => break,
+            }
+        }
+        let _ = child.wait();
+        let listing = String::from_utf8_lossy(&output);
+        let mut fds: Vec<i32> = listing
+            .split_whitespace()
+            .map(|fd| fd.parse().expect("fd number"))
+            .collect();
+        fds.sort_unstable();
+        assert_eq!(
+            fds,
+            vec![0, 1, 2],
+            "child inherited descriptors beyond its pty stdio: {listing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_argv0_reaches_the_child() {
+        let capability = synch_core::ProcessCapability {
+            id: 11,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "echo $0".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 5_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, mut stdout, stdin, mut stderr) = spawn_pipe(&capability).unwrap();
+        drop(stdin);
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        let mut error = Vec::new();
+        stderr.read_to_end(&mut error).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(output, b"sh\n", "declared argv[0] must reach the child");
+        assert!(error.is_empty());
+
+        // A declared argv[0] different from the executable path is delivered
+        // verbatim.
+        let capability = synch_core::ProcessCapability {
+            id: 12,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["guest-name".into(), "-c".into(), "echo $0".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 5_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, mut stdout, stdin, mut stderr) = spawn_pipe(&capability).unwrap();
+        drop(stdin);
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        let mut error = Vec::new();
+        stderr.read_to_end(&mut error).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(output, b"guest-name\n");
+        assert!(error.is_empty());
     }
 
     #[cfg(target_os = "macos")]

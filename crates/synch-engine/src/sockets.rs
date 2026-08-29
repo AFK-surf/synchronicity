@@ -755,6 +755,54 @@ impl SocketHost for TreeHost {
             .await
             .map_err(|e| HostError::Unavailable(e.to_string()))
     }
+
+    /// The kind of one resolved path, subtree-aware.
+    ///
+    /// The SFTP backend answers `STAT`/`READDIR` with it, so a directory has
+    /// to be told apart from a path that does not exist — and the local
+    /// scanner publishes no `Dir` rows, so a directory is a prefix with
+    /// entries under it rather than a row of its own. A socket refuses like
+    /// `open` refuses one: the kind says what would serve, not what the
+    /// neighbour's code is.
+    fn entry_kind(&self, origin: Option<&str>, path: &str) -> std::result::Result<u32, HostError> {
+        let (space, rest) = TreeHost::split(path)?;
+        let origin = match origin {
+            None => self.own_origin.clone(),
+            Some(text) => text
+                .parse::<OriginId>()
+                .map_err(|e| HostError::NotReadable(e.to_string()))?,
+        };
+        let entry = self
+            .node
+            .store()
+            .entry(&origin, space, rest)
+            .map_err(|e| HostError::Unavailable(e.to_string()))?;
+        match entry {
+            Some(row) => {
+                if row.kind == EntryKind::Socket {
+                    return Err(HostError::NotReadable(
+                        "that path is a socket; a socket does not read out its neighbours' code"
+                            .into(),
+                    ));
+                }
+                Ok(row.kind as u32)
+            }
+            // No row of its own: the path is a directory only if something is
+            // published under it, and one row's existence check is enough.
+            None => {
+                let children = self
+                    .node
+                    .store()
+                    .list_entries(Some(&origin), space, &format!("{rest}/"), None, Some(1))
+                    .map_err(|e| HostError::Unavailable(e.to_string()))?;
+                if children.is_empty() {
+                    Err(HostError::NotFound)
+                } else {
+                    Ok(1)
+                }
+            }
+        }
+    }
 }
 
 /// The engine's implementation of the network layer's service.
@@ -1490,6 +1538,8 @@ pub enum SocketConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::node;
+    use synch_core::{record::ChunkParams, FileEntry, RECORD_VERSION};
     use synch_store::{ArmRow, SocketRow};
 
     fn resolved(generation: Hash, root: Hash) -> Resolved {
@@ -1628,6 +1678,100 @@ mod tests {
         assert!(!authorization_unchanged(
             &reviewed,
             &resolved(generation, Hash::new(b"new program"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn entry_kind_classifies_rows_dirs_and_missing_paths() {
+        let (_data, node) = node().await;
+        let origin = node.origin().clone();
+        let store = node.store();
+        store
+            .put_entry(
+                &origin,
+                "media",
+                "guide.md",
+                &FileEntry::file(3, 0, Hash::new(b"guide"), 1),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &origin,
+                "media",
+                "docs/inner.md",
+                &FileEntry::file(3, 0, Hash::new(b"inner"), 2),
+            )
+            .unwrap();
+        store
+            .put_entry(&origin, "media", "old.txt", &FileEntry::tombstone(0, 3, None))
+            .unwrap();
+        store
+            .put_entry(
+                &origin,
+                "media",
+                "git.sock",
+                &FileEntry::socket(3, 0, Hash::new(b"sock"), 4),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &origin,
+                "media",
+                "docs",
+                &FileEntry {
+                    v: RECORD_VERSION,
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime_ns: 0,
+                    unix_mode: None,
+                    content: None,
+                    chunking: ChunkParams::DEFAULT,
+                    seq: 5,
+                    prev: None,
+                    symlink_target: None,
+                },
+            )
+            .unwrap();
+        let host = TreeHost {
+            node: node.clone(),
+            own_origin: origin.clone(),
+        };
+
+        // Rows answer with the same kind codes TreeHost::info publishes:
+        // file 0, dir 1, tombstone 3.
+        assert_eq!(host.entry_kind(None, "media/guide.md").unwrap(), 0);
+        assert_eq!(host.entry_kind(None, "media/docs").unwrap(), 1);
+        assert_eq!(host.entry_kind(None, "media/old.txt").unwrap(), 3);
+        // A socket refuses like open() refuses one.
+        assert!(matches!(
+            host.entry_kind(None, "media/git.sock"),
+            Err(HostError::NotReadable(_))
+        ));
+
+        // The local scanner publishes no Dir rows, so once the row is gone
+        // the path is still a directory as long as entries exist under it...
+        store.delete_entry(&origin, "media", "docs").unwrap();
+        assert_eq!(host.entry_kind(None, "media/docs").unwrap(), 1);
+        // ...and a path with neither a row nor anything under it is not found.
+        assert!(matches!(
+            host.entry_kind(None, "media/missing"),
+            Err(HostError::NotFound)
+        ));
+
+        // The origin resolves exactly as open() resolves it.
+        assert!(matches!(
+            host.entry_kind(Some("not an origin"), "media/guide.md"),
+            Err(HostError::NotReadable(_))
+        ));
+        let other = OriginId::named("other", "x.example").unwrap();
+        assert!(matches!(
+            host.entry_kind(Some(&other.canonical()), "media/guide.md"),
+            Err(HostError::NotFound)
+        ));
+        // And a malformed path never reaches the store.
+        assert!(matches!(
+            host.entry_kind(None, "not a space path"),
+            Err(HostError::NotReadable(_))
         ));
     }
 }
