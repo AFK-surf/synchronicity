@@ -345,10 +345,15 @@ pub(crate) fn spawn_pty(
         .args(capability.argv.iter().skip(1))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("TERM", term)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
+    // The validated `pty-req` name, as sshd would export it. A client with no
+    // local terminal sends an empty name; the child then gets no TERM at all
+    // rather than an empty lie.
+    if !term.is_empty() {
+        command.env("TERM", term);
+    }
     configure_unix_command(&mut command, capability, true);
     command.spawn().map_err(|_| errno::ENOENT)
 }

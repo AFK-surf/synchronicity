@@ -1506,10 +1506,12 @@ fn parse_pty_spec(
         return Err(errno::EINVAL);
     }
     let term = String::from_utf8(raw[..term_len].to_vec()).map_err(|_| errno::EINVAL)?;
-    if term.is_empty()
-        || !term
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
+    // Empty is legitimate: a client with no local terminal — `ssh -tt` from a
+    // script or ProxyCommand — sends an empty name, and refusing it would
+    // refuse the PTY. The child then simply gets no TERM variable.
+    if !term
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
     {
         return Err(errno::EINVAL);
     }

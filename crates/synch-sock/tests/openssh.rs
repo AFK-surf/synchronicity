@@ -94,6 +94,10 @@ async fn openssh_logs_into_the_ssh_shell_example() {
 
     let mut ssh = Command::new("ssh")
         .args(ssh_args(port))
+        // A client with no local terminal — CI, a script, ProxyCommand —
+        // sends an empty terminal name in pty-req. Pin that case everywhere
+        // rather than inheriting whatever TERM this machine happens to have.
+        .env_remove("TERM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
