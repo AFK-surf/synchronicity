@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::abi::errno;
 
@@ -345,10 +345,15 @@ pub(crate) fn spawn_pty(
         .args(capability.argv.iter().skip(1))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("TERM", term)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
+    // The validated `pty-req` name, as sshd would export it. A client with no
+    // local terminal sends an empty name; the child then gets no TERM at all
+    // rather than an empty lie.
+    if !term.is_empty() {
+        command.env("TERM", term);
+    }
     configure_unix_command(&mut command, capability, true);
     command.spawn().map_err(|_| errno::ENOENT)
 }
@@ -456,11 +461,13 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
-pub(crate) fn pty_adapters(master: &File) -> Result<(ChannelReader, ChannelWriter), i64> {
+/// Starts the blocking read side of a PTY master and returns its adapter.
+///
+/// The channel between the thread and the adapter is bounded, so a guest
+/// that stops reading parks the thread rather than growing a queue.
+pub(crate) fn pty_reader(master: &File) -> Result<ChannelReader, i64> {
     let mut reader = master.try_clone().map_err(|_| errno::ECONNRESET)?;
-    let mut writer = master.try_clone().map_err(|_| errno::ECONNRESET)?;
     let (read_tx, read_rx) = tokio::sync::mpsc::channel(8);
-    let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::Builder::new()
         .name("synch-pty-read".into())
         .spawn(move || {
@@ -474,17 +481,20 @@ pub(crate) fn pty_adapters(master: &File) -> Result<(ChannelReader, ChannelWrite
             }
         })
         .map_err(|_| errno::ELIMIT)?;
-    std::thread::Builder::new()
-        .name("synch-pty-write".into())
-        .spawn(move || {
-            while let Some(bytes) = write_rx.blocking_recv() {
-                if writer.write_all(&bytes).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|_| errno::ELIMIT)?;
-    Ok((ChannelReader::new(read_rx), ChannelWriter(write_tx)))
+    Ok(ChannelReader::new(read_rx))
+}
+
+/// A clone of the PTY master for the bounded write bridge in the helper.
+pub(crate) fn pty_writer(master: &File) -> Result<std::sync::Arc<File>, i64> {
+    master
+        .try_clone()
+        .map(std::sync::Arc::new)
+        .map_err(|_| errno::ECONNRESET)
+}
+
+/// One blocking write of a chunk to the PTY master, for `spawn_blocking`.
+pub(crate) fn pty_write_all(master: &std::sync::Arc<File>, chunk: &[u8]) -> bool {
+    (&**master).write_all(chunk).is_ok()
 }
 
 pub(crate) struct ChannelReader {
@@ -522,34 +532,6 @@ impl AsyncRead for ChannelReader {
         let n = out.remaining().min(self.current.len() - self.offset);
         out.put_slice(&self.current[self.offset..self.offset + n]);
         self.offset += n;
-        Poll::Ready(Ok(()))
-    }
-}
-
-pub(crate) struct ChannelWriter(pub(crate) tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
-
-impl AsyncWrite for ChannelWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0
-            .send(data.to_vec())
-            .map(|()| Poll::Ready(Ok(data.len())))
-            .unwrap_or_else(|_| {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "PTY closed",
-                )))
-            })
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -621,5 +603,128 @@ mod tests {
     fn darwin_can_measure_its_process_group_footprint() {
         let pgid = u32::try_from(unsafe { libc::getpgrp() }).unwrap();
         assert!(process_group_footprint_bytes(pgid).unwrap().unwrap() > 0);
+    }
+
+    /// The exact query the memory watchdog makes: a freshly spawned child's
+    /// own process group, not this test's. Documentation of what this host
+    /// can account rather than an assertion — where per-child rusage is
+    /// denied, the watchdog stands down instead of enforcing, and this test
+    /// records which world CI runs in.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn darwin_reports_what_a_spawned_childs_group_accounting_says() {
+        let capability = synch_core::ProcessCapability {
+            id: 9,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 10_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, stdout, stdin, stderr) = spawn_pipe(&capability).unwrap();
+        drop((stdout, stdin, stderr));
+        let pgid = child.id().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let measured = process_group_footprint_bytes(pgid);
+        unsafe {
+            libc::kill(-(pgid as i32), libc::SIGKILL);
+        }
+        let _ = child.start_kill();
+        eprintln!("child group accounting on this host: {measured:?}");
+        assert!(
+            !matches!(measured, Ok(Some(u64::MAX))),
+            "a two-process group overflowed the PID buffer: {measured:?}"
+        );
+    }
+
+    /// The PTY path end to end with no SSH in the way: allocate, spawn an
+    /// interactive shell on it, type at the prompt, read the answer, log out.
+    /// Isolates the runtime's PTY layer from the SSH adapter when a shell
+    /// example fails on only one platform.
+    #[test]
+    fn a_pty_shell_answers_what_is_typed_at_it() {
+        let capability = synch_core::ProcessCapability {
+            id: 11,
+            flags: 0x01,
+            executable: "/bin/bash".into(),
+            argv: vec!["bash".into()],
+            allowed_signals: 0x07,
+            max_processes: 1,
+            max_runtime_ms: 30_000,
+            max_memory_bytes: 512 * 1024 * 1024,
+        };
+        let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        apply_pty_modes(&slave, &[]).unwrap();
+        let mut reader = master.try_clone().unwrap();
+        let writer = pty_writer(&master).unwrap();
+        let child = spawn_pty(&capability, slave, "").unwrap();
+        let slot = ProcessSlot {
+            child: RefCell::new(Some(Child::Pty(child))),
+            status: RefCell::new(ProcessStatus::default()),
+            capability: capability.id,
+            allowed_signals: capability.allowed_signals,
+            main: -1,
+            stderr: None,
+        };
+
+        // Read until the shell settles at its prompt, then type, then read
+        // until the answer appears, then log out — the interop tests' shape,
+        // minus SSH. A reader thread keeps this test from blocking forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        let settle = std::time::Duration::from_millis(500);
+        while let Ok(chunk) = rx.recv_timeout(settle) {
+            seen.extend_from_slice(&chunk);
+        }
+        assert!(
+            !seen.is_empty(),
+            "the shell printed nothing before its prompt"
+        );
+        assert!(
+            pty_write_all(&writer, b"echo pty-probe-$((6*7))\nexit 0\n"),
+            "typing at the PTY failed"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !String::from_utf8_lossy(&seen).contains("pty-probe-42") {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(chunk) => seen.extend_from_slice(&chunk),
+                Err(_) => {
+                    let status = slot.refresh();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the shell never answered.\nprocess: {status:?}\nseen: {:?}",
+                        String::from_utf8_lossy(&seen)
+                    );
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = slot.refresh().unwrap();
+            if status.exited {
+                assert_eq!(status.exit_code, 0, "the shell's own exit status");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never exited after `exit`"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

@@ -33,7 +33,7 @@ use crate::{
     limits::{CURSOR_ENTRY_OVERHEAD, MAX_COPY, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
         ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
-        endpoint::{connect_task, Endpoint, State},
+        endpoint::{connect_task, Endpoint, EndpointRole, State},
     },
 };
 
@@ -456,9 +456,14 @@ fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) 
     if n <= 0 {
         return ret(n);
     }
+    // The caller's raw stream, and the cleartext of SSH channel and lane fds
+    // (`docs/SSH-SOCKETS.md` §8): what the invocation received as application
+    // bytes. Backends the guest pumps into are not counted, or a proxy would
+    // report twice the bytes it moved.
+    let counted = ep.role().counts_stream_bytes();
     with(scope, |inner| {
         inner.made_progress();
-        if handle as i64 == SY_SELF {
+        if counted {
             inner
                 .live
                 .bytes_in
@@ -493,12 +498,14 @@ fn h_write(
     };
     let n = ep.write(&data);
     if n > 0 {
+        // Only the caller-facing side is counted — the raw stream, or the SSH
+        // channel and lane cleartext: a proxy moves the same bytes on both
+        // sides, and reporting the sum would say a socket did twice the work
+        // it did.
+        let counted = ep.role().counts_stream_bytes();
         with(scope, |inner| {
             inner.made_progress();
-            // Only the caller's stream is counted: a proxy moves the same bytes
-            // on both sides, and reporting the sum would say a socket did twice
-            // the work it did.
-            if handle as i64 == SY_SELF {
+            if counted {
                 inner
                     .live
                     .bytes_out
@@ -534,17 +541,18 @@ fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -
     let n = src.splice_to(&dst, usize::try_from(max).unwrap_or(usize::MAX));
     if n > 0 {
         inner.made_progress();
-        // Counted as `sy_read` and `sy_write` count: only the caller's own
-        // stream, so a proxy is not reported as having moved twice the bytes it
-        // moved. A splice between two egress endpoints is neither, and shows up
-        // in neither total.
-        if from as i64 == SY_SELF {
+        // Counted as `sy_read` and `sy_write` count: only the caller-facing
+        // side — the raw stream, or an SSH channel or lane fd — so a proxy is
+        // not reported as having moved twice the bytes it moved. A splice
+        // between two egress endpoints is neither, and shows up in neither
+        // total.
+        if src.role().counts_stream_bytes() {
             inner
                 .live
                 .bytes_in
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        if to as i64 == SY_SELF {
+        if dst.role().counts_stream_bytes() {
             inner
                 .live
                 .bytes_out
@@ -661,13 +669,13 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
         inner.ready.clone(),
         State::Connecting,
         format!("{host}:{port}"),
+        EndpointRole::TcpEgress,
     );
     let handle = match inner.insert(Slot::Endpoint(ep.clone())) {
         Ok(h) => h,
         Err(e) => return e,
     };
     inner.egress_open.set(inner.egress_open.get() + 1);
-    ep.charge_egress();
     inner.publish_handles();
     inner.spawn(connect_task(ep, host, port));
     handle
@@ -772,7 +780,13 @@ fn h_ssh_start(
             Ok(stream) => stream,
             Err(error) => return error,
         };
-        inner.spawn(crate::runtime::ssh::serve(stream, state, host_key, methods));
+        inner.spawn(crate::runtime::ssh::serve(
+            stream,
+            state,
+            host_key,
+            methods,
+            inner.limits.idle_deadline,
+        ));
         0
     })
     .and_then(ret)
@@ -832,7 +846,7 @@ fn h_ssh_event_data(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    let Some(value) = state.field(event_id, field as u32) else {
+    let Some(mut value) = state.field(event_id, field as u32) else {
         return ret(errno::ENOENT);
     };
     let n = value.len().min(out_len as usize);
@@ -842,7 +856,13 @@ fn h_ssh_event_data(
         };
         region.copy_from_slice(&value[..n]);
     }
-    ret(value.len() as i64)
+    let total = value.len() as i64;
+    // The credential-zeroization rules (§12.4) cover this host-side copy of
+    // the password too, not only the payload attached to the event.
+    if field as u32 == crate::runtime::ssh::FIELD_PASSWORD {
+        value.fill(0);
+    }
+    ret(total)
 }
 
 fn h_ssh_event_done(
@@ -890,14 +910,20 @@ fn h_ssh_auth_reply(
     ) {
         return ret(errno::ESTATE);
     }
-    // OFFER_ACCEPT maps to the SSH library's pre-signature Accept. It is not
-    // authentication completion because this result is valid only on offers.
-    let result = if result == 4 {
-        if kind != crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER {
+    // An offer proves nothing, so the only decisions it can take are "ask the
+    // client for proof" and "don't": ACCEPT and PARTIAL are for attempts that
+    // could complete a factor, and OFFER_ACCEPT is for offers alone (§4.1).
+    let result = if kind == crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER {
+        match result {
+            2 => 2,
+            // OFFER_ACCEPT maps to the SSH library's pre-signature Accept.
+            4 => 1,
+            _ => return ret(errno::ESTATE),
+        }
+    } else {
+        if result == 4 {
             return ret(errno::ESTATE);
         }
-        1
-    } else {
         result as u32
     };
     match state.reply(
@@ -1051,11 +1077,17 @@ fn h_ssh_channel_accept(
         .field(event_id, crate::runtime::ssh::FIELD_CHANNEL_TYPE)
         .and_then(|value| String::from_utf8(value).ok())
         .unwrap_or_else(|| "unknown".into());
+    // Accepting an inbound open completes locally — sending the confirmation
+    // cannot be refused by the peer — so unlike a server-initiated open the
+    // fd is born open rather than connecting (§6).
     let endpoint = Endpoint::new(
         inner.limits.ring_bytes.min(64 * 1024),
         inner.ready.clone(),
         State::Open,
         format!("ssh:{channel_type}"),
+        EndpointRole::SshChannel {
+            channel_type: channel_type.clone(),
+        },
     );
     let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
         Ok(handle) => handle,
@@ -1108,6 +1140,12 @@ fn h_ssh_channel_reject(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
+    // Only a channel-open token can be answered with a rejection; consuming
+    // an auth or request token here would deliver the wrong decision type and
+    // end the connection instead of failing this one call (§5).
+    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_OPEN) {
+        return ret(errno::ESTATE);
+    }
     match state.reply(
         event_id,
         crate::runtime::ssh::Decision::ChannelReject(reason),
@@ -1155,6 +1193,9 @@ fn h_ssh_channel_open(
         inner.ready.clone(),
         State::Connecting,
         format!("ssh:{channel_type}"),
+        EndpointRole::SshChannel {
+            channel_type: channel_type.clone(),
+        },
     );
     let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
         Ok(handle) => handle,
@@ -1205,11 +1246,11 @@ fn h_ssh_channel_type(
     let Some(endpoint) = with(scope, |inner| inner.endpoint(channel as i64))? else {
         return ret(errno::EBADF);
     };
-    let peer = endpoint.peer();
-    let Some(channel_type) = peer.strip_prefix("ssh:") else {
+    let EndpointRole::SshChannel { channel_type } = endpoint.role() else {
         return ret(errno::ESTATE);
     };
-    out_str(scope, out, out_len, channel_type)
+    let channel_type = channel_type.clone();
+    out_str(scope, out, out_len, &channel_type)
 }
 
 fn h_ssh_channel_lane(
@@ -1234,35 +1275,47 @@ fn h_ssh_channel_lane(
             return ret(handle);
         }
     }
+    let lane_ring = inner.limits.ring_bytes.min(64 * 1024);
     let endpoint = Endpoint::new(
-        inner.limits.ring_bytes.min(64 * 1024),
+        lane_ring,
         inner.ready.clone(),
         State::Open,
         format!("ssh-lane:{}:{data_type}", channel),
+        EndpointRole::SshExtendedData,
     );
     let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
         Ok(handle) => handle,
         Err(error) => return ret(error),
     };
     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(8);
-    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
     state.register_lane(channel as i64, data_type, handle, incoming_tx);
     inner.spawn(crate::runtime::endpoint::reader_task(
         endpoint.clone(),
         Box::new(crate::runtime::process::ChannelReader::new(incoming_rx)),
     ));
+    // Outbound goes through a bounded pipe rather than an unbounded queue:
+    // when the SSH window or the session task stalls, the pipe fills, the
+    // writer pump stops draining the ring, and the guest sees a short write —
+    // backpressure end to end, as invariant §12.7 requires.
+    let (guest_side, mut bridge) = tokio::io::duplex(lane_ring);
     inner.spawn(crate::runtime::endpoint::writer_task(
         endpoint,
-        Box::new(crate::runtime::process::ChannelWriter(outgoing_tx)),
+        Box::new(guest_side),
     ));
     inner.spawn(async move {
-        while let Some(bytes) = outgoing_rx.recv().await {
-            if session
-                .extended_data(channel_id, data_type, bytes)
-                .await
-                .is_err()
-            {
-                break;
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut bridge, &mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if session
+                        .extended_data(channel_id, data_type, chunk[..n].to_vec())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1453,10 +1506,12 @@ fn parse_pty_spec(
         return Err(errno::EINVAL);
     }
     let term = String::from_utf8(raw[..term_len].to_vec()).map_err(|_| errno::EINVAL)?;
-    if term.is_empty()
-        || !term
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
+    // Empty is legitimate: a client with no local terminal — `ssh -tt` from a
+    // script or ProxyCommand — sends an empty name, and refusing it would
+    // refuse the PTY. The child then simply gets no TERM variable.
+    if !term
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
     {
         return Err(errno::EINVAL);
     }
@@ -1507,8 +1562,12 @@ fn h_pty_open(
     if let Err(error) = crate::runtime::process::apply_pty_modes(&slave, &spec.modes) {
         return ret(error);
     }
-    let (reader, writer) = match crate::runtime::process::pty_adapters(&master) {
-        Ok(adapters) => adapters,
+    let reader = match crate::runtime::process::pty_reader(&master) {
+        Ok(reader) => reader,
+        Err(error) => return ret(error),
+    };
+    let writer = match crate::runtime::process::pty_writer(&master) {
+        Ok(writer) => writer,
         Err(error) => return ret(error),
     };
     let endpoint = Endpoint::new(
@@ -1516,6 +1575,7 @@ fn h_pty_open(
         inner.ready.clone(),
         State::Open,
         format!("pty:{}", capability.id),
+        EndpointRole::Pty,
     );
     let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
         Ok(handle) => handle,
@@ -1525,10 +1585,34 @@ fn h_pty_open(
         endpoint.clone(),
         Box::new(reader),
     ));
+    // Writes reach the PTY through a bounded pipe and one blocking write at a
+    // time, so a stalled terminal backpressures the guest ring rather than
+    // growing an unbounded queue (invariant §12.7).
+    let (guest_side, mut bridge) = tokio::io::duplex(inner.limits.ring_bytes.min(64 * 1024));
     inner.spawn(crate::runtime::endpoint::writer_task(
         endpoint,
-        Box::new(writer),
+        Box::new(guest_side),
     ));
+    inner.spawn(async move {
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut bridge, &mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let writer = writer.clone();
+                    let owned = chunk[..n].to_vec();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::runtime::process::pty_write_all(&writer, &owned)
+                    })
+                    .await
+                    {
+                        Ok(true) => {}
+                        _ => break,
+                    }
+                }
+            }
+        }
+    });
     inner.ptys.borrow_mut().insert(
         handle,
         Rc::new(crate::runtime::process::PtySlot {
@@ -1623,6 +1707,7 @@ fn h_process_spawn(
         inner.ready.clone(),
         State::Open,
         format!("process:{}:stdio", capability.id),
+        EndpointRole::ProcessStdio,
     );
     let main = match inner.insert(Slot::Endpoint(main_endpoint.clone())) {
         Ok(handle) => handle,
@@ -1633,6 +1718,7 @@ fn h_process_spawn(
         inner.ready.clone(),
         State::Open,
         format!("process:{}:stderr", capability.id),
+        EndpointRole::ProcessStdio,
     );
     stderr_endpoint.set_read_only();
     let stderr_handle = match inner.insert(Slot::Endpoint(stderr_endpoint.clone())) {
@@ -1726,6 +1812,15 @@ fn schedule_process_memory_limit(
         // process group before proc_pid_rusage can account for any member, so
         // leave one sampling interval for process accounting to become ready.
         interval.tick().await;
+        // Accounting failure means two different things depending on when.
+        // A host that has never measured this group cannot enforce the limit
+        // at all — hardened hosts deny per-child rusage — and killing every
+        // declared process would turn "cannot watch" into "must not run", so
+        // after a bounded attempt the monitor stands down with a warning. A
+        // group that *stops* being measurable while running looks like
+        // hiding, and still fails closed after a short grace for transients.
+        let mut measured = false;
+        let mut failures = 0u32;
         loop {
             interval.tick().await;
             let Some(process) = process.upgrade() else {
@@ -1743,13 +1838,32 @@ fn schedule_process_memory_limit(
                 }
             }
             match crate::runtime::process::process_group_footprint_bytes(pgid) {
-                Ok(Some(bytes)) if bytes <= limit => {}
+                Ok(Some(bytes)) if bytes <= limit => {
+                    measured = true;
+                    failures = 0;
+                }
                 Ok(None) => break,
-                Ok(Some(_)) | Err(()) => {
-                    // Accounting failure is a policy failure: do not leave an
-                    // unbounded declared process running.
+                Ok(Some(_)) => {
+                    // A real measurement over the declared ceiling — the
+                    // fail-closed u64::MAX for an overflowing group included.
                     process.kill_if_pid(pgid);
                     break;
+                }
+                Err(()) => {
+                    failures += 1;
+                    if measured && failures >= 5 {
+                        process.kill_if_pid(pgid);
+                        break;
+                    }
+                    if !measured && failures >= 25 {
+                        tracing::warn!(
+                            pgid,
+                            "process memory accounting is unavailable on this \
+                             host; the declared memory ceiling is not enforced \
+                             for this child"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1893,6 +2007,7 @@ fn h_sftp_open(
         inner.ready.clone(),
         State::Open,
         format!("sftp:{}", capability.scope),
+        EndpointRole::FileTransfer,
     );
     let handle = match inner.insert(Slot::Endpoint(endpoint.clone())) {
         Ok(handle) => handle,
@@ -2949,6 +3064,16 @@ fn h_declare_process(
         max_runtime_ms: le_u64(&raw, 1344),
         max_memory_bytes: le_u64(&raw, 1352),
     };
+    // A limit above the host's hard ceiling is refused at arm time rather
+    // than silently clamped later: the operator approves the numbers the
+    // declaration shows, so those numbers must be the ones enforced (§7.1).
+    // Zero still selects the host default.
+    if capability.max_processes > crate::runtime::process::DEFAULT_MAX_PROCESSES
+        || capability.max_runtime_ms > crate::runtime::process::DEFAULT_MAX_RUNTIME_MS
+        || capability.max_memory_bytes > crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES
+    {
+        return ret(errno::ELIMIT);
+    }
     with(scope, |inner| {
         if let Some(error) = mode_check(inner, true) {
             return error;

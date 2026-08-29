@@ -1,6 +1,6 @@
 # Socket examples
 
-Eight programs, each demonstrating one thing, each a program you could arm as it
+Nine programs, each demonstrating one thing, each a program you could arm as it
 stands. `docs/SOCKETS.md` is the design; this is what it looks like written
 down.
 
@@ -36,6 +36,7 @@ synch connect nas:code/echo.sock
 | [`tcp-proxy.c`](tcp-proxy.c) | forwards to one upstream | declared egress, per-caller rate limits, and a bidirectional loop that ends correctly |
 | [`splice-proxy.c`](splice-proxy.c) | the same, without a buffer | `sy_splice`, and what a proxy stops needing when the bytes never enter it |
 | [`token-gate.c`](token-gate.c) | checks a shared secret | config as a secret store, and a constant-time comparison |
+| [`ssh-shell.c`](ssh-shell.c) | a real `ssh` login onto a declared bash PTY | the SSH adapter (`docs/SSH-SOCKETS.md`): channel events, a process declaration, and why accepting a channel starts nothing |
 | [`compact-frames.c`](compact-frames.c) | uses 512-byte contiguous call frames | declaring a compiler-matched frame size and explicitly disabling guarded frames |
 
 Every one of them is compiled and run by `../tests/examples.rs` on each build,

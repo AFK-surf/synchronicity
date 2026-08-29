@@ -769,7 +769,6 @@ impl Encrypted {
                     } else {
                         auth_request.methods.remove(MethodKind::Password);
                     }
-                    auth_request.partial_success = false;
                     reject_auth_request(until, &mut self.write, auth_request).await?;
                 }
                 Ok(())
@@ -810,7 +809,6 @@ impl Encrypted {
                     } else {
                         auth_request.methods.remove(MethodKind::None);
                     }
-                    auth_request.partial_success = false;
                     reject_auth_request(until, &mut self.write, auth_request).await?;
                 }
                 Ok(())
@@ -990,7 +988,6 @@ impl Encrypted {
                                     auth_request.methods = proceed_with_methods;
                                     auth_request.partial_success = partial_success;
                                 }
-                                auth_request.partial_success = false;
                                 auth_user.clear();
                                 reject_auth_request(until, &mut self.write, auth_request).await?;
                             }
@@ -1038,7 +1035,6 @@ impl Encrypted {
                                 auth_request.methods = proceed_with_methods;
                                 auth_request.partial_success = partial_success;
                             }
-                            auth_request.partial_success = false;
                             auth_user.clear();
                             reject_auth_request(until, &mut self.write, auth_request).await?;
                         }
@@ -1073,6 +1069,11 @@ async fn reject_auth_request(
         write.push(auth_request.partial_success as u8);
     });
     auth_request.current = None;
+    // RFC 4252: partial success describes this one rejected request. The
+    // handler's decision set it just above where there was one; resetting it
+    // here keeps every other rejection path — an unsupported method, a
+    // malformed attempt — from replaying a stale `true`.
+    auth_request.partial_success = false;
     auth_request.rejection_count += 1;
     debug!("packet pushed");
     tokio::time::sleep_until(until).await;

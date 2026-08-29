@@ -663,6 +663,254 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
     );
 }
 
+/// A stock SSH client for the shell example: the transport is already
+/// authenticated by the harness, so the host key is accepted as presented.
+struct ShellClient;
+
+/// Waits for the shell's startup output to settle — the prompt is drawn and
+/// nothing more arrives for half a second — before the test types anything.
+///
+/// A real user types at the prompt, and old interactive shells depend on it:
+/// bash 3.2 (macOS's `/bin/bash`) configures its terminal with flush-style
+/// `tcsetattr` during startup, discarding keystrokes that arrived early,
+/// where modern bash deliberately preserves that typeahead.
+async fn settle_at_prompt(channel: &mut russh::Channel<russh::client::Msg>, output: &mut Vec<u8>) {
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), channel.wait()).await {
+            Ok(Some(russh::ChannelMsg::Data { data })) => output.extend_from_slice(&data),
+            Ok(Some(russh::ChannelMsg::ExtendedData { data, .. })) => {
+                output.extend_from_slice(&data)
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                if !output.is_empty() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shell never drew its prompt"
+                );
+            }
+        }
+    }
+}
+
+impl russh::client::Handler for ShellClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+/// `ssh-shell.c` end to end: SSH `none` completes against the outer identity,
+/// `pty-req` allocates a terminal without starting anything, `shell` starts
+/// exactly the declared `/bin/bash`, the splice loop carries keystrokes and
+/// output both ways, and the shell's own exit status arrives after its last
+/// output rather than racing it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
+    use std::time::Duration;
+
+    let elf = build("ssh-shell.c");
+    let harness = Harness::new();
+
+    // The declaration is the whole approval surface: the exact executable and
+    // argv, PTY permission, and nothing an SSH client could widen.
+    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    assert_eq!(
+        declaration.processes.len(),
+        1,
+        "one exact process capability is what the operator approves"
+    );
+    let bash = &declaration.processes[0];
+    // The declared path is resolved at arm time, so a merged-/usr host shows
+    // the operator `/usr/bin/bash` for a program that named `/bin/bash`.
+    assert!(
+        bash.executable.ends_with("/bash"),
+        "the resolved shell is still bash: {}",
+        bash.executable
+    );
+    assert_eq!(bash.argv, vec!["bash".to_string()]);
+    assert_eq!(bash.flags & 0x01, 0x01, "PTY permission is declared");
+
+    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        policy,
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        ShellClient,
+    )
+    .await
+    .expect("SSH handshake completed");
+    assert!(
+        client
+            .authenticate_none("operator")
+            .await
+            .expect("none authentication got a response")
+            .success(),
+        "the outer identity is the authentication factor here"
+    );
+
+    let mut channel = client
+        .channel_open_session()
+        .await
+        .expect("a session channel");
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("the pty request was sent");
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), channel.wait())
+                .await
+                .expect("a pty-req answer"),
+            Some(russh::ChannelMsg::Success)
+        ),
+        "allocating the terminal succeeds without starting a process"
+    );
+    channel
+        .request_shell(true)
+        .await
+        .expect("the shell request was sent");
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(10), channel.wait())
+                .await
+                .expect("a shell answer"),
+            Some(russh::ChannelMsg::Success)
+        ),
+        "the declared shell started"
+    );
+
+    // Type only once the prompt is drawn, as a person would.
+    let mut output = Vec::new();
+    settle_at_prompt(&mut channel, &mut output).await;
+
+    // Typed at the terminal: bash expands the arithmetic, so seeing the
+    // expansion in the output proves a real shell ran — the echoed input
+    // still spells `$((6*7))`.
+    channel
+        .data(&b"echo interactive-$((6*7)); exit 3\n"[..])
+        .await
+        .expect("keystrokes reached the channel");
+
+    // The server reports the shell's exit and half-closes; closing the
+    // channel back is the client's move, exactly as OpenSSH would. A shell
+    // that dies by signal concludes too, so the failure diagnostics can say
+    // who killed it rather than showing silence.
+    let mut exit_status = None;
+    let mut exit_signal = None;
+    let mut eof = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(eof && (exit_status.is_some() || exit_signal.is_some())) {
+        let message = tokio::time::timeout_at(deadline, channel.wait())
+            .await
+            .expect("the shell session concluded");
+        eprintln!("channel message: {message:?}");
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+            Some(russh::ChannelMsg::ExtendedData { data, .. }) => output.extend_from_slice(&data),
+            Some(russh::ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+            Some(russh::ChannelMsg::ExitSignal { signal_name, .. }) => {
+                exit_signal = Some(format!("{signal_name:?}"))
+            }
+            Some(russh::ChannelMsg::Eof) => eof = true,
+            Some(russh::ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("interactive-42"),
+        "bash did not run the command.\noutput: {text:?}\nexit status: {exit_status:?}\nexit signal: {exit_signal:?}"
+    );
+    assert_eq!(
+        exit_status,
+        Some(3),
+        "the shell's own exit status reached the client.\noutput: {text:?}\nexit signal: {exit_signal:?}"
+    );
+
+    // A second login on the same connection: the finished session freed its
+    // slot, so a fresh shell starts with a fresh lifecycle (§7.3).
+    let mut second = client
+        .channel_open_session()
+        .await
+        .expect("a second session channel");
+    second
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .expect("the second pty request was sent");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), second.wait())
+            .await
+            .expect("a second pty-req answer"),
+        Some(russh::ChannelMsg::Success)
+    ));
+    second
+        .request_shell(true)
+        .await
+        .expect("the second shell request was sent");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(10), second.wait())
+            .await
+            .expect("a second shell answer"),
+        Some(russh::ChannelMsg::Success)
+    ));
+    let mut second_output = Vec::new();
+    settle_at_prompt(&mut second, &mut second_output).await;
+    second
+        .data(&b"exit 0\n"[..])
+        .await
+        .expect("keystrokes reached the second channel");
+    let mut second_status = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while second_status.is_none() {
+        match tokio::time::timeout_at(deadline, second.wait())
+            .await
+            .expect("the second shell concluded")
+        {
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                second_status = Some(exit_status)
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert_eq!(
+        second_status,
+        Some(0),
+        "the second session ran to completion"
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "logout", "en")
+        .await
+        .expect("a clean disconnect");
+    drop(client);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the invocation ended with the connection")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
 /// The runtime loads an object somebody else's compiler wrote.
 ///
 /// Every other test here builds with the compiler in the binary, which would

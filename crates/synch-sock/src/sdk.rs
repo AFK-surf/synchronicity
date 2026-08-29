@@ -71,6 +71,101 @@ mod tests {
         }
     }
 
+    /// `docs/SSH-SOCKETS.md` §14.1: the SDK header and the Rust constants
+    /// agree on every SSH method, event, result, field, lane and capability
+    /// number. Compiled only where the runtime is, because that is where the
+    /// Rust side of each number lives.
+    #[test]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn the_header_and_the_ssh_abi_agree() {
+        use crate::runtime::ssh;
+        for (name, value) in [
+            ("SY_SSH_AUTH_NONE", ssh::AUTH_NONE as i64),
+            ("SY_SSH_AUTH_PUBLICKEY", ssh::AUTH_PUBLICKEY as i64),
+            ("SY_SSH_AUTH_PASSWORD", ssh::AUTH_PASSWORD as i64),
+            ("SY_SSH_EVENT_AUTH_NONE", ssh::EVENT_AUTH_NONE as i64),
+            (
+                "SY_SSH_EVENT_AUTH_PASSWORD",
+                ssh::EVENT_AUTH_PASSWORD as i64,
+            ),
+            (
+                "SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER",
+                ssh::EVENT_AUTH_PUBLICKEY_OFFER as i64,
+            ),
+            (
+                "SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED",
+                ssh::EVENT_AUTH_PUBLICKEY_VERIFIED as i64,
+            ),
+            (
+                "SY_SSH_EVENT_AUTHENTICATED",
+                ssh::EVENT_AUTHENTICATED as i64,
+            ),
+            ("SY_SSH_EVENT_CHANNEL_OPEN", ssh::EVENT_CHANNEL_OPEN as i64),
+            (
+                "SY_SSH_EVENT_CHANNEL_REQUEST",
+                ssh::EVENT_CHANNEL_REQUEST as i64,
+            ),
+            (
+                "SY_SSH_EVENT_CHANNEL_EXTENDED_DATA",
+                ssh::EVENT_CHANNEL_EXTENDED_DATA as i64,
+            ),
+            ("SY_SSH_EVENT_WANT_REPLY", ssh::EVENT_WANT_REPLY as i64),
+            ("SY_SSH_FIELD_USERNAME", ssh::FIELD_USERNAME as i64),
+            ("SY_SSH_FIELD_SERVICE", ssh::FIELD_SERVICE as i64),
+            ("SY_SSH_FIELD_PASSWORD", ssh::FIELD_PASSWORD as i64),
+            (
+                "SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM",
+                ssh::FIELD_PUBLIC_KEY_ALGORITHM as i64,
+            ),
+            (
+                "SY_SSH_FIELD_PUBLIC_KEY_BLOB",
+                ssh::FIELD_PUBLIC_KEY_BLOB as i64,
+            ),
+            (
+                "SY_SSH_FIELD_PUBLIC_KEY_SHA256",
+                ssh::FIELD_PUBLIC_KEY_SHA256 as i64,
+            ),
+            ("SY_SSH_FIELD_COMMAND", ssh::FIELD_COMMAND as i64),
+            ("SY_SSH_FIELD_SUBSYSTEM", ssh::FIELD_SUBSYSTEM as i64),
+            ("SY_SSH_FIELD_CHANNEL_TYPE", ssh::FIELD_CHANNEL_TYPE as i64),
+            (
+                "SY_SSH_FIELD_CHANNEL_OPEN_DATA",
+                ssh::FIELD_CHANNEL_OPEN_DATA as i64,
+            ),
+            ("SY_SSH_FIELD_REQUEST_TYPE", ssh::FIELD_REQUEST_TYPE as i64),
+            ("SY_SSH_FIELD_REQUEST_DATA", ssh::FIELD_REQUEST_DATA as i64),
+            (
+                "SY_SSH_FIELD_DESTINATION_HOST",
+                ssh::FIELD_DESTINATION_HOST as i64,
+            ),
+            (
+                "SY_SSH_FIELD_ORIGINATOR_HOST",
+                ssh::FIELD_ORIGINATOR_HOST as i64,
+            ),
+            ("SY_SSH_FIELD_SIGNAL", ssh::FIELD_SIGNAL as i64),
+            ("SY_SSH_FIELD_TERMINAL", ssh::FIELD_TERMINAL as i64),
+            ("SY_SSH_FIELD_ENV_NAME", ssh::FIELD_ENV_NAME as i64),
+            ("SY_SSH_FIELD_ENV_VALUE", ssh::FIELD_ENV_VALUE as i64),
+            (
+                "SY_PROCESS_MAX_ARGS",
+                synch_core::sock::MAX_PROCESS_ARGS as i64,
+            ),
+            (
+                "SY_PROCESS_ARG_MAX",
+                synch_core::sock::MAX_PROCESS_ARG_BYTES as i64,
+            ),
+        ] {
+            assert_eq!(
+                define(name),
+                Some(value),
+                "the header and the SSH ABI disagree about {name}"
+            );
+        }
+    }
+
     /// The entry macros name the sections the loader actually looks for. A
     /// typo here produces a program that loads and never runs.
     #[test]
