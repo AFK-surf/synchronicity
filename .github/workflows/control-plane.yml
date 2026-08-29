@@ -27,6 +27,7 @@ env:
 jobs:
   gleam:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run: { working-directory: control-plane }
     steps:
@@ -56,6 +57,7 @@ jobs:
   # through real pledged workers.
   openbsd:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: vmactions/openbsd-vm@v1
@@ -99,6 +101,7 @@ jobs:
 
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run: { working-directory: control-plane/web }
     steps:
@@ -123,6 +126,7 @@ jobs:
   # Node has Request/Response/fetch, so this needs no wrangler and no network.
   worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -142,6 +146,7 @@ jobs:
   # the primary made while serving.
   litestream:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -165,6 +170,7 @@ jobs:
 
   e2e-crossval:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
