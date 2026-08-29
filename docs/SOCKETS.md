@@ -609,7 +609,9 @@ here, and a Content-Length has to come from somewhere.
 them by name; a struct initializer or an array assignment is enough to make any
 C compiler emit a call, and without these that call would be an unresolved
 symbol — a program that fails to *link*, at arm time, on somebody else's node,
-a long way from the line that caused it.
+a long way from the line that caused it. Clang emits an intrinsic instead of a
+call, which never meets these definitions; the `--clang` build rewrites those
+to the same helpers (§9).
 
 ## 8. A whole socket, end to end
 
@@ -787,9 +789,13 @@ capability goes unused.
 
 Pass `--clang` when the program benefits from optimized code and compatible
 `clang` and `llc` executables are on `PATH`. The command runs clang at `-O2` to
-produce LLVM bitcode, then llc for BPF v3 with the runtime's 16 KiB stack frame.
+produce LLVM IR, then llc for BPF v3 with the runtime's 16 KiB stack frame.
 It supplies the same `synch.h`, defines, and output handling as the embedded
-path. Either object is armed exactly the same way because the runtime loads ELF
+path. Between the two tools it rewrites the memory intrinsics clang emits for
+a large initializer or struct assignment into `sy_memset`/`sy_memcpy` calls:
+llc would otherwise lower one past its store budget into a call to libc, and
+the BPF backend, having no libc, refuses to emit it ("A call to built-in
+function 'memset' is not supported"). Either object is armed exactly the same way because the runtime loads ELF
 and does not care which compiler wrote it. tinycc is LGPL-2.1 and is linked
 statically, under §6 of that licence.
 

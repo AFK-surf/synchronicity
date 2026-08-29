@@ -511,6 +511,11 @@ extern sy_s64 sy_declare_file_transfer(
  * arm time, on somebody else's node, a long way from the line that caused it.
  * So the SDK supplies them, forwarding to the host helpers.
  *
+ * Clang emits an *intrinsic* rather than a call, which never meets these
+ * definitions; `synch socket build --clang` rewrites the intrinsics its
+ * backend cannot expand into the same helper calls, so both compilers end
+ * up in the same place.
+ *
  * `memmove` is `sy_memcpy`: the host copies through a buffer of its own, so a
  * copy is never torn. Overlap itself is refused, not papered over — the
  * pointer cage registers the source and the destination of one call, and a

@@ -948,3 +948,60 @@ async fn an_example_built_with_clang_runs_the_same_way() {
     assert_eq!(out, b"built elsewhere");
     assert_eq!(status, SockStatus::Ok(15));
 }
+
+/// A clang zero-initializer past llc's store budget zeroes at run time.
+///
+/// Clang compiles a large `= {0}` into an `llvm.memset` intrinsic, llc cannot
+/// expand ~4 KiB into stores, and the BPF backend refuses the libc call that
+/// would otherwise result — `ssh-shell.c`'s process capability hit exactly
+/// this. `synch-cc` rewrites such calls to `sy_memset`, and this is the half
+/// a compile test cannot answer: that the rewritten call resolves at arm
+/// time and the host actually zeroes the guest's stack. The input lands in
+/// the middle of the frame, so the zeros on both sides are the memset's own
+/// work and nothing else's.
+#[tokio::test]
+async fn a_clang_zero_initializer_past_llcs_store_budget_zeroes_at_run_time() {
+    let program = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  char frame[4096] = {0};
+  struct sy_pollfd fds[1] = {{SY_SELF, SY_POLL_IN, 0}};
+  if (sy_poll(fds, 1, 30000) <= 0) return -1;
+  sy_s64 n = sy_read(SY_SELF, frame + 2048, 64);
+  if (n <= 0) return -2;
+  if (sy_write_all(SY_SELF, frame, sizeof frame, 30000) != (sy_s64)sizeof frame)
+    return -3;
+  sy_shutdown(SY_SELF);
+  return n;
+}
+"#;
+    let Some(elf) = compile_with_clang(program, "big-zero.c") else {
+        return;
+    };
+    let input = b"zeroed elsewhere";
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        input,
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    // The status is the read's length: the poll can in principle wake on a
+    // partial arrival, so what was echoed back is judged against what the
+    // program says it read rather than against the whole input.
+    let SockStatus::Ok(n) = status else {
+        panic!("the program failed: {status:?}");
+    };
+    let n = usize::try_from(n).expect("a read length");
+    assert!(n > 0 && n <= input.len(), "read {n} of {}", input.len());
+    assert_eq!(out.len(), 4096, "the whole frame came back");
+    assert_eq!(&out[2048..2048 + n], &input[..n]);
+    assert!(
+        out[..2048].iter().all(|b| *b == 0) && out[2048 + n..].iter().all(|b| *b == 0),
+        "the frame around the input is zero"
+    );
+}
