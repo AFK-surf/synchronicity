@@ -667,6 +667,37 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
 /// authenticated by the harness, so the host key is accepted as presented.
 struct ShellClient;
 
+/// Waits for the shell's startup output to settle — the prompt is drawn and
+/// nothing more arrives for half a second — before the test types anything.
+///
+/// A real user types at the prompt, and old interactive shells depend on it:
+/// bash 3.2 (macOS's `/bin/bash`) configures its terminal with flush-style
+/// `tcsetattr` during startup, discarding keystrokes that arrived early,
+/// where modern bash deliberately preserves that typeahead.
+async fn settle_at_prompt(channel: &mut russh::Channel<russh::client::Msg>, output: &mut Vec<u8>) {
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), channel.wait()).await {
+            Ok(Some(russh::ChannelMsg::Data { data })) => output.extend_from_slice(&data),
+            Ok(Some(russh::ChannelMsg::ExtendedData { data, .. })) => {
+                output.extend_from_slice(&data)
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                if !output.is_empty() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shell never drew its prompt"
+                );
+            }
+        }
+    }
+}
+
 impl russh::client::Handler for ShellClient {
     type Error = russh::Error;
 
@@ -768,6 +799,10 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         "the declared shell started"
     );
 
+    // Type only once the prompt is drawn, as a person would.
+    let mut output = Vec::new();
+    settle_at_prompt(&mut channel, &mut output).await;
+
     // Typed at the terminal: bash expands the arithmetic, so seeing the
     // expansion in the output proves a real shell ran — the echoed input
     // still spells `$((6*7))`.
@@ -778,7 +813,6 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
 
     // The server reports the shell's exit and half-closes; closing the
     // channel back is the client's move, exactly as OpenSSH would.
-    let mut output = Vec::new();
     let mut exit_status = None;
     let mut eof = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -832,6 +866,8 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
             .expect("a second shell answer"),
         Some(russh::ChannelMsg::Success)
     ));
+    let mut second_output = Vec::new();
+    settle_at_prompt(&mut second, &mut second_output).await;
     second
         .data(&b"exit 0\n"[..])
         .await

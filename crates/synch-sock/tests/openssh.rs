@@ -21,7 +21,11 @@ use std::{path::PathBuf, process::Stdio, time::Duration};
 use harness::{peer, sdk, Harness};
 use synch_core::SockStatus;
 use synch_sock::{DuplexStream, EffectivePolicy};
-use tokio::{io::AsyncWriteExt, net::TcpListener, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    process::Command,
+};
 
 fn build_example(name: &str) -> Vec<u8> {
     let path = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples")).join(name);
@@ -103,28 +107,74 @@ async fn openssh_logs_into_the_ssh_shell_example() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("the ssh client started");
+    let mut stdin = ssh.stdin.take().expect("a piped stdin");
+    let mut stdout_pipe = ssh.stdout.take().expect("a piped stdout");
+    let mut stderr_pipe = ssh.stderr.take().expect("a piped stderr");
+    // Drained concurrently so a chatty shell profile cannot fill the pipe.
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+
+    // Type only once the shell's startup output settles at the prompt, as a
+    // person would. Old interactive shells depend on it: bash 3.2 (macOS's
+    // /bin/bash) configures its terminal with flush-style tcsetattr during
+    // startup and discards keystrokes that arrived early, where modern bash
+    // deliberately preserves that typeahead.
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), stdout_pipe.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => output.extend_from_slice(&chunk[..n]),
+            Err(_) => {
+                if !output.is_empty() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the shell never drew its prompt"
+                );
+            }
+        }
+    }
+
     // Typed at the terminal: bash expands the arithmetic, so seeing the
     // expansion proves a real shell behind a real PTY, and `exit 5` proves
-    // the SSH exit-status path end to end.
-    ssh.stdin
-        .take()
-        .expect("a piped stdin")
+    // the SSH exit-status path end to end. Stdin stays open until the remote
+    // side ends the session — a client may treat local EOF as its cue to
+    // leave, and the logout must come from the shell's own exit.
+    stdin
         .write_all(b"echo interop-$((6*7))\nexit 5\n")
         .await
         .expect("keystrokes reached ssh");
-    let out = tokio::time::timeout(Duration::from_secs(30), ssh.wait_with_output())
+    stdin.flush().await.expect("keystrokes flushed");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        stdout_pipe.read_to_end(&mut output),
+    )
+    .await
+    .expect("the ssh session concluded")
+    .expect("stdout drained");
+    // The remote side has closed (stdout reached EOF); only now may stdin
+    // go away, and it must — ssh lingers while its stdin stays readable.
+    drop(stdin);
+    let status = tokio::time::timeout(Duration::from_secs(10), ssh.wait())
         .await
-        .expect("the ssh session concluded")
+        .expect("ssh exited after the remote close")
         .expect("ssh ran");
+    let stderr_bytes = stderr_task.await.expect("stderr drained");
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&output);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     assert!(
         stdout.contains("interop-42"),
         "bash did not run the command.\nstdout: {stdout:?}\nstderr: {stderr:?}"
     );
     assert_eq!(
-        out.status.code(),
+        status.code(),
         Some(5),
         "ssh reports the shell's own exit status.\nstdout: {stdout:?}\nstderr: {stderr:?}"
     );
