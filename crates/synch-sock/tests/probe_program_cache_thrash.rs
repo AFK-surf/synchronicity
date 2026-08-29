@@ -1,6 +1,9 @@
-//! Probe: a caller cycling more than 32 armed content roots forces a
-//! synchronous JIT recompile on every admission, freezing whatever else is
-//! running on that worker while it compiles.
+//! Probe: a caller cycling more than 32 armed content roots forces a JIT
+//! recompile on every admission (fixed `2026-08-29`: the recompile no longer
+//! runs on the worker thread — see `probe_compile_offthread`, which measures
+//! that directly with a program big enough for the difference to be visible;
+//! the small programs here compile in under a millisecond, which is why this
+//! probe never reproduced the stall it describes).
 //!
 //! `program_for` (runtime/mod.rs:575-609) JIT-compiles on a cache miss,
 //! synchronously, on the worker's single current-thread runtime, *before*

@@ -13,6 +13,15 @@
 //! keyed by content root. So a program JIT-compiles at most once per worker, and
 //! a socket under load costs one compilation per worker rather than one per
 //! stream.
+//!
+//! That compile does not happen on the worker thread. `ProgramLoader::load`
+//! returns a `Send` `UnboundProgram` and only `pin_to_current_thread` has to
+//! run where the guest will, so the load goes to the blocking pool and the
+//! worker stays available to everything else placed on it
+//! (`ProgramCompiler::program_for`). What is left on the thread is async-ebpf's
+//! lazy per-function JIT, which is deliberately there — a thread whose PC is in
+//! the compiler cannot be async-preempted — and is charged against the guest's
+//! run budget.
 
 pub(crate) mod ctx;
 pub(crate) mod endpoint;
@@ -159,7 +168,11 @@ struct Job {
 }
 
 type StackConfig = (usize, bool);
-type LoaderCache = RefCell<HashMap<StackConfig, Rc<ProgramLoader>>>;
+type LoaderCache = RefCell<HashMap<StackConfig, Arc<ProgramLoader>>>;
+
+/// What identifies one compiled program: the armed content root, and the stack
+/// shape it was compiled for.
+type ProgramKey = (Hash, StackConfig);
 
 /// How many compiled programs one worker may hold.
 ///
@@ -173,10 +186,46 @@ const MAX_CACHED_PROGRAMS: usize = 32;
 
 /// The compiled-program cache: insertion order alongside the entries, for
 /// oldest-first eviction.
-type ProgramCache = RefCell<(
-    HashMap<(Hash, StackConfig), Rc<Program>>,
-    VecDeque<(Hash, StackConfig)>,
-)>;
+type ProgramCache = RefCell<(HashMap<ProgramKey, Rc<Program>>, VecDeque<ProgramKey>)>;
+
+/// Compilations this worker has in flight, so a cache miss is paid once.
+///
+/// Without it, every invocation that arrives for a root while that root is
+/// still compiling starts its own compilation of the same bytes — the miss
+/// that a burst of callers turns into a stampede, which is exactly the case
+/// the cache exists for.
+type PendingCompiles = RefCell<HashMap<ProgramKey, Rc<tokio::sync::Notify>>>;
+
+/// Marks one compilation in flight and wakes whoever waited on it.
+///
+/// A guard rather than a pair of statements because the wake has to happen on
+/// the failure paths too: a compilation that ends in `SockError::Load`, or one
+/// whose invocation was cancelled mid-compile, must release its waiters to
+/// find out for themselves rather than strand them.
+struct PendingCompile {
+    compiler: Rc<ProgramCompiler>,
+    key: ProgramKey,
+    notify: Rc<tokio::sync::Notify>,
+}
+
+impl Drop for PendingCompile {
+    fn drop(&mut self) {
+        self.compiler.pending.borrow_mut().remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
+/// One worker's compilation state.
+///
+/// Its loaders (whose entropy is what makes a helper index unforgeable, so
+/// they stay per worker), its cache of programs already pinned to this thread,
+/// and the compiles it currently has in flight.
+#[derive(Default)]
+struct ProgramCompiler {
+    loaders: LoaderCache,
+    cache: ProgramCache,
+    pending: PendingCompiles,
+}
 
 fn host_page_size() -> Option<usize> {
     // SAFETY: `sysconf` reads a process-wide platform constant and has no
@@ -522,9 +571,7 @@ impl Worker {
                     }
                 };
                 let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-                let loaders: Rc<LoaderCache> = Rc::new(RefCell::new(HashMap::new()));
-                let cache: Rc<ProgramCache> =
-                    Rc::new(RefCell::new((HashMap::new(), VecDeque::new())));
+                let compiler: Rc<ProgramCompiler> = Rc::new(ProgramCompiler::default());
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     let mut running = tokio::task::JoinSet::new();
@@ -547,16 +594,14 @@ impl Worker {
                                         let _ = job.reply.send(Ok(killed_outcome()));
                                         continue;
                                     }
-                                    let loaders = loaders.clone();
-                                    let cache = cache.clone();
+                                    let compiler = compiler.clone();
                                     let limits = limits.clone();
                                     let maps = maps.clone();
                                     let registry = registry.clone();
                                     let shutdown = worker_shutdown.clone();
                                     running.spawn_local(async move {
                                         let outcome = run_job(
-                                            &loaders,
-                                            &cache,
+                                            &compiler,
                                             thread_env,
                                             &limits,
                                             &maps,
@@ -632,41 +677,117 @@ fn load_pinned(
     Ok(program)
 }
 
-/// Compiles, or returns the compiled program for, one content root.
-fn program_for(
-    loaders: &LoaderCache,
-    cache: &ProgramCache,
-    thread_env: ThreadEnv,
-    root: &Hash,
-    elf: &[u8],
-    stack_frame_size: Option<usize>,
-    guarded_stack_frames: Option<bool>,
-) -> Result<Rc<Program>, SockError> {
-    let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
-    let key = (*root, config);
-    if let Some(program) = cache.borrow().0.get(&key) {
-        return Ok(program.clone());
+impl ProgramCompiler {
+    /// Compiles, or returns the compiled program for, one content root.
+    ///
+    /// The compile does not run on the worker thread. JIT-compiling an ELF is the
+    /// most expensive thing an admission does, and it used to happen synchronously
+    /// in `run_job` *before* the select loop — so a cache miss froze that worker's
+    /// whole reactor: every pump, every poll wait and the idle-deadline branch of
+    /// every other invocation placed on it. With a 32-entry per-worker cache and
+    /// oldest-first eviction, a caller cycling more than 32 armed roots (or
+    /// `--auto` re-arms minting fresh ones) made every admission a miss, and the
+    /// crate's own `blocking_is_allowed` tripwire could not see it: a socket
+    /// worker's current-thread runtime is not a dedicated blocking thread, it
+    /// multiplexes up to 64 invocations.
+    ///
+    /// async-ebpf already splits the work where it needs splitting.
+    /// `ProgramLoader::load` does the parse and the JIT and yields an
+    /// `UnboundProgram`, which is `Send`; `pin_to_current_thread` is a struct wrap
+    /// that must happen on the thread that will run the guest. So the load goes to
+    /// the blocking pool and only the pin stays here, and the worker keeps
+    /// servicing everything else while a program compiles.
+    ///
+    /// The loader stays per worker rather than moving to the compile pool: its
+    /// entropy is what makes a helper index unforgeable, and sharing one loader
+    /// across every worker would make one guest's discovery worth something on all
+    /// of them. `ProgramLoader` is `Sync`, so the worker's own loader is what
+    /// compiles, on whichever thread does it.
+    ///
+    /// This does not make an admission free of on-thread compilation, and cannot:
+    /// async-ebpf JIT-compiles each *function* lazily, when it is first called, on
+    /// the thread running the guest — deliberately, because the SIGUSR1 preemption
+    /// handler only acts on a PC inside the JIT code range and a thread inside the
+    /// compiler cannot be interrupted. It charges that against the run budget like
+    /// any other dispatch, so a guest yields between functions, and there is no
+    /// public API to do it in advance. What moves here is the eager load, which is
+    /// the part that scales with the whole object rather than with the code a
+    /// caller actually reaches.
+    async fn program_for(
+        self: &Rc<Self>,
+        thread_env: ThreadEnv,
+        root: &Hash,
+        elf: &Arc<Vec<u8>>,
+        stack_frame_size: Option<usize>,
+        guarded_stack_frames: Option<bool>,
+    ) -> Result<Rc<Program>, SockError> {
+        let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
+        let key = (*root, config);
+        loop {
+            if let Some(program) = self.cache.borrow().0.get(&key) {
+                return Ok(program.clone());
+            }
+            // Somebody else is already compiling this exact program. Wait for them
+            // rather than compiling the same bytes again.
+            //
+            // No wakeup can be lost between finding the entry and registering on
+            // it, and not because `Notify` retains one — `notify_waiters` wakes
+            // only waiters already registered, and a `Notified` registers on its
+            // first poll. It is that this is a current-thread worker: there is no
+            // await between the lookup and that first poll, so the compiling task
+            // cannot run, and therefore cannot signal, in the window.
+            let waiting = self.pending.borrow().get(&key).cloned();
+            let Some(notify) = waiting else { break };
+            notify.notified().await;
+            // Round again: the compile may have succeeded (the cache now has it),
+            // or failed (nothing pending, nothing cached — and this caller becomes
+            // the one that compiles, and reports the error itself).
+        }
+
+        let notify = Rc::new(tokio::sync::Notify::new());
+        self.pending.borrow_mut().insert(key, notify.clone());
+        let _in_flight = PendingCompile {
+            compiler: Rc::clone(self),
+            key,
+            notify,
+        };
+
+        let existing_loader = self.loaders.borrow().get(&config).cloned();
+        let loader = if let Some(loader) = existing_loader {
+            loader
+        } else {
+            let loader = Arc::new(stack_loader(config)?);
+            self.loaders.borrow_mut().insert(config, loader.clone());
+            loader
+        };
+
+        let elf = Arc::clone(elf);
+        let unbound = tokio::task::spawn_blocking(move || {
+            loader
+                .load(&mut rand::thread_rng(), &elf)
+                .map_err(|e| SockError::Load(e.to_string()))
+        })
+        .await
+        .map_err(|_| SockError::Load("the program compiler panicked".into()))??;
+
+        let program = unbound.pin_to_current_thread(thread_env);
+        if !program.has_section(SECTION_STREAM) {
+            return Err(SockError::NoEntrypoint);
+        }
+        let program = Rc::new(program);
+
+        let mut cache = self.cache.borrow_mut();
+        cache.0.insert(key, program.clone());
+        cache.1.push_back(key);
+        while cache.1.len() > MAX_CACHED_PROGRAMS {
+            let oldest = cache
+                .1
+                .pop_front()
+                .expect("a non-empty eviction queue stays non-empty");
+            cache.0.remove(&oldest);
+        }
+        Ok(program)
     }
-    let existing_loader = loaders.borrow().get(&config).cloned();
-    let loader = if let Some(loader) = existing_loader {
-        loader
-    } else {
-        let loader = Rc::new(stack_loader(config)?);
-        loaders.borrow_mut().insert(config, loader.clone());
-        loader
-    };
-    let program = Rc::new(load_pinned(&loader, elf, thread_env)?);
-    let mut cache = cache.borrow_mut();
-    cache.0.insert(key, program.clone());
-    cache.1.push_back(key);
-    while cache.1.len() > MAX_CACHED_PROGRAMS {
-        let oldest = cache
-            .1
-            .pop_front()
-            .expect("a non-empty eviction queue stays non-empty");
-        cache.0.remove(&oldest);
-    }
-    Ok(program)
 }
 
 /// Builds the invocation state and runs the guest.
@@ -675,8 +796,7 @@ fn program_for(
     reason = "everything a worker needs to run one invocation, and every one of               them is per-worker state a struct would only rename"
 )]
 async fn run_job(
-    loaders: &LoaderCache,
-    cache: &ProgramCache,
+    compiler: &Rc<ProgramCompiler>,
     thread_env: ThreadEnv,
     limits: &Limits,
     maps: &Arc<SocketMaps>,
@@ -688,15 +808,15 @@ async fn run_job(
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
 ) -> Result<Outcome, SockError> {
-    let program = program_for(
-        loaders,
-        cache,
-        thread_env,
-        &invocation.program_root,
-        &invocation.program,
-        invocation.policy.stack_frame_size,
-        invocation.policy.guarded_stack_frames,
-    )?;
+    let program = compiler
+        .program_for(
+            thread_env,
+            &invocation.program_root,
+            &invocation.program,
+            invocation.policy.stack_frame_size,
+            invocation.policy.guarded_stack_frames,
+        )
+        .await?;
 
     let ready = Arc::new(Readiness::default());
     // Start reading before the guest selects raw or SSH mode. Besides applying

@@ -295,6 +295,25 @@ the daemon's threading directly.
   `Program`s keyed by content root. A program therefore JIT-compiles at most
   once per worker, and a socket under load costs N compilations, not one per
   stream.
+- **The compile does not run on the worker thread.** `ProgramLoader::load`
+  does the parse and the JIT and returns an `UnboundProgram`, which is `Send`;
+  only `pin_to_current_thread` has to happen where the guest will run, and it
+  is a struct wrap. So a cache miss goes to the blocking pool and the worker
+  keeps serving everything else placed on it. It used to be inline, before the
+  select loop, which meant one cold admission stopped that worker outright —
+  and with a 32-entry cache and oldest-first eviction, a caller reaching more
+  than 32 armed roots made every admission a miss. Concurrent admissions of the
+  same root wait on the first compile rather than each starting their own.
+  The loader stays per worker: moving it to a shared compile pool would make
+  one guest's discovery of a helper index worth something on every worker.
+- What remains on the worker thread is async-ebpf's *lazy* per-function JIT: a
+  function is compiled when it is first called, on the thread running the
+  guest, because async preemption cannot interrupt a thread whose PC is inside
+  the compiler. async-ebpf charges that against the run budget like any other
+  dispatch, so a program yields between functions — but a single very large
+  function is one uninterruptible compile. There is no public API to do it in
+  advance; a program that wants to be a good co-resident keeps its functions
+  small.
 - A new stream is assigned to the least-loaded worker and stays there. This is a
   placement decision, not a scheduling one: there is no work stealing, by
   construction.
