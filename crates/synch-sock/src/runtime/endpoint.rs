@@ -708,9 +708,45 @@ async fn write_pump(ep: &Rc<Endpoint>, mut writer: Box<dyn AsyncWrite + Unpin + 
 /// forget: an endpoint whose writer never ran at all — a refused name, a
 /// connection nobody answered — owes the far side nothing, and a teardown drain
 /// must be told that rather than waiting out its window on it.
-pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16) {
+/// One outbound connection's place in [`Limits::max_egress`](crate::Limits),
+/// held for as long as the work actually exists.
+///
+/// The budget used to be returned by `sy_close`, and that made it no bound at
+/// all on the expensive part. `tokio::net::lookup_host` resolves through
+/// `getaddrinfo` on the blocking pool, and a blocking-pool task cannot be
+/// cancelled once dispatched: closing the handle fires `abandoned`, which
+/// cancels the *await* around the lookup while the lookup itself runs on. So a
+/// connect/close loop against a slow or hostile resolver returned its permit
+/// every iteration and left the lookups behind, parking the worker's 512
+/// blocking threads and then growing the queue at the guest's iteration rate,
+/// with the 8-connection cap never once reached.
+///
+/// Held by the connect task instead, the cap bounds outstanding resolutions as
+/// well as established connections: the permit comes back when the task ends,
+/// and an abandoned connection's task ends as soon as its lookup returns into
+/// a world that no longer wants it.
+pub(crate) struct EgressPermit(Rc<std::cell::Cell<usize>>);
+
+impl EgressPermit {
+    /// Takes one place in the budget. The caller has already checked the cap.
+    pub(crate) fn take(counter: Rc<std::cell::Cell<usize>>) -> Self {
+        counter.set(counter.get() + 1);
+        EgressPermit(counter)
+    }
+}
+
+impl Drop for EgressPermit {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16, permit: EgressPermit) {
     connect_and_pump(&ep, host, port).await;
     ep.mark_tx_done();
+    // Explicit, so that the reason this argument exists survives a refactor
+    // that would otherwise see an unused binding and delete it.
+    drop(permit);
 }
 
 async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16) {

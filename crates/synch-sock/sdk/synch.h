@@ -380,10 +380,10 @@ extern sy_s64 sy_poll(struct sy_pollfd *fds, sy_u64 n, sy_s64 timeout_ms);
 /* ---- reading the tree --------------------------------------------------- */
 
 /* Opens `space/path` in this node's own view — the same scope this program
- * came from. Refuses a socket entry, so a socket cannot read out its
- * neighbours' code. */
+ * came from. Every path this node holds is readable, socket entries included:
+ * a socket declares no read permissions and none are enforced. */
 extern sy_s64 sy_open(const char *path, sy_u64 path_len);
-/* Another origin's version of a path. Must be declared at arm time. */
+/* Another origin's version of a path. Needs no declaration. */
 extern sy_s64 sy_open_from(const char *origin, sy_u64 origin_len,
                            const char *path, sy_u64 path_len);
 extern sy_s64 sy_open_root(const void *root32);
@@ -425,7 +425,11 @@ SY_MAYBE_UNUSED static sy_u64 sy_strlen(const char *s) {
   while (s[len]) len++;
   return len;
 }
-/* Constant-time equality, for anything a token is checked against. */
+/* Constant-time equality, for anything a token is checked against.
+ * Returns 1 when the n bytes are equal and 0 otherwise — including when the
+ * comparison could not be made at all (an unreadable pointer, or n above
+ * 64 KiB). Never negative, so `if (sy_ct_eq(a, b, n))` fails closed; the
+ * explicit `== 1` is still the clearer spelling. */
 extern sy_s64 sy_ct_eq(const void *a, const void *b, sy_u64 n);
 /* First-class because content roots are BLAKE3: a program can check what it
  * read against what the tree said it would be. */
@@ -445,7 +449,6 @@ extern sy_s64 sy_hex_decode_in_place(void *buf, sy_u64 len);
 extern sy_s64 sy_declare_name(const char *name, sy_u64 name_len);
 /* Port 0 means any port on that host, and is printed in red at the arm prompt. */
 extern sy_s64 sy_declare_egress(const char *host, sy_u64 host_len, sy_u64 port);
-extern sy_s64 sy_declare_tree_read(const char *prefix, sy_u64 prefix_len);
 extern sy_s64 sy_declare_max_streams(sy_u64 n);
 /* Must match the compiler's eBPF stack-frame setting: a multiple of 16 bytes,
  * from 16 through 32768. The default is 16384. */

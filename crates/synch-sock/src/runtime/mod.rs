@@ -21,6 +21,7 @@ pub(crate) mod map;
 pub(crate) mod process;
 pub(crate) mod sftp;
 pub(crate) mod ssh;
+pub(crate) mod tasks;
 
 use std::{
     cell::RefCell,
@@ -888,12 +889,20 @@ async fn run_job(
     // One window for all of them, and the flushes run inside it at once, so
     // teardown costs what it always cost rather than a window per endpoint.
     let deadline = Instant::now() + TEARDOWN_DRAIN;
-    let raw_writer = if let Some(ctx::Slot2::Endpoint(endpoint)) = inner.slot(SY_SELF) {
+    // The caller's stream flushes through its writer task's join handle, and it
+    // does so whether or not the guest still holds the handle. `sy_close`
+    // (`Inner::remove`) drops the slot but not the bytes already queued behind
+    // it — it calls `close_flushing`, which shuts the write side down and lets
+    // the writer drain on its own timing. Taking the handle only while the slot
+    // was still occupied meant a program whose last act was
+    // `sy_write(SY_SELF, …); sy_close(SY_SELF);` had nothing waiting on that
+    // drain, and `abort_tasks()` below killed the writer mid-flush: the caller
+    // got a clean, empty, successful stream. So the take is unconditional, and
+    // the shutdown is what depends on the slot.
+    if let Some(ctx::Slot2::Endpoint(endpoint)) = inner.slot(SY_SELF) {
         endpoint.shutdown();
-        inner.raw_writer.borrow_mut().take()
-    } else {
-        None
-    };
+    }
+    let raw_writer = inner.raw_writer.borrow_mut().take();
     let draining = inner.begin_drain();
     if let Some(mut writer) = raw_writer {
         if tokio::time::timeout_at(deadline.into(), &mut writer)

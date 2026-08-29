@@ -624,15 +624,11 @@ impl TreeHost {
     }
 
     fn info(entry: &synch_store::EntryRow) -> std::result::Result<ObjectInfo, HostError> {
-        // A socket refuses to open a socket. Not because the bytes are secret —
-        // every member reads them out of the tree — but because a program that
-        // can read its neighbours' code can also serve it, and "what executes
-        // here?" should have one answer that lives in the arming table.
-        if entry.kind == EntryKind::Socket {
-            return Err(HostError::NotReadable(
-                "that path is a socket; a socket does not read out its neighbours' code".into(),
-            ));
-        }
+        // Every entry with content is readable, socket entries included. The
+        // bytes are not secret — any member reads them out of the tree — and
+        // refusing them here bought nothing while `sy_open_root` handed the
+        // same bytes over by hash. What executes on this node is decided by the
+        // arming table, not by who can read an ELF.
         let root = entry
             .content
             .ok_or_else(|| HostError::NotReadable("that path has no content".into()))?;
@@ -1453,15 +1449,24 @@ impl Node {
             let invocation = admission.id;
             let (caller, guest) = tokio::io::duplex(self.socket_limits().ring_bytes);
             let node = self.clone();
+            // A real peer-gone signal, not a dropped sender. The runtime reads
+            // a dropped sender as "this caller never leaves" (`run_job` maps it
+            // to `pending`), so the local path used to pin a concurrency slot
+            // for the daemon's lifetime whenever a caller went away while the
+            // program still had an upstream making progress. `LocalStream`
+            // fires it when the caller's half is dropped.
+            let (gone_tx, peer_gone) = tokio::sync::oneshot::channel();
             let completion = tokio::spawn(async move {
-                let (_, peer_gone) = tokio::sync::oneshot::channel();
                 node.run_socket(admission, DuplexStream::from_split(guest), peer_gone)
                     .await
             });
             return Ok(SocketConnection::Local {
                 program,
                 invocation,
-                stream: caller,
+                stream: LocalStream {
+                    inner: caller,
+                    gone: Some(gone_tx),
+                },
                 completion,
             });
         }
@@ -1519,6 +1524,70 @@ impl Node {
     }
 }
 
+/// The caller's half of a local invocation, which reports its own departure.
+///
+/// A remote invocation learns that its caller is gone from
+/// `Connection::closed`, and must: an invocation that keeps running is a slot
+/// held for nobody (`synch_net::sock::SockRunner::run`). In memory there is no
+/// connection to watch, and dropping a `tokio::io::duplex` half is only a clean
+/// EOF — which the runtime treats as an ordinary half-close, because for a
+/// proxy that is exactly what it is. So the drop itself is the signal.
+///
+/// The guard lives inside the stream rather than beside it in
+/// [`SocketConnection::Local`] because callers destructure that variant and
+/// split the stream; a sibling field would fire the moment the variant came
+/// apart, while the stream was still in use. Held here, it fires when both
+/// split halves are gone and not before.
+#[derive(Debug)]
+pub struct LocalStream {
+    inner: tokio::io::DuplexStream,
+    gone: Option<tokio::sync::oneshot::Sender<SockStatus>>,
+}
+
+impl Drop for LocalStream {
+    fn drop(&mut self) {
+        if let Some(gone) = self.gone.take() {
+            // `Deadline`, matching the remote path: a non-fault ending that
+            // says the caller left, not that the program did anything wrong.
+            let _ = gone.send(SockStatus::Deadline);
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for LocalStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for LocalStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// A live socket connection on the caller's side.
 #[derive(Debug)]
 pub enum SocketConnection {
@@ -1538,8 +1607,8 @@ pub enum SocketConnection {
         program: Hash,
         /// The callee's invocation id.
         invocation: u64,
-        /// Opaque bytes in both directions.
-        stream: tokio::io::DuplexStream,
+        /// Opaque bytes in both directions. Dropping it ends the invocation.
+        stream: LocalStream,
         /// The invocation's eventual status.
         completion: tokio::task::JoinHandle<SockStatus>,
     },

@@ -192,6 +192,23 @@ pub const CHANNEL_LANE_CAPACITY: usize = 8;
 /// answers them.
 pub const MAX_OUTSTANDING_REQUESTS_PER_CHANNEL: usize = 16;
 
+/// The most declined extended-data lanes remembered per channel.
+///
+/// When a guest answers an extended-data event with `sy_ssh_event_done` rather
+/// than opening a lane, the connection remembers the refusal so the same
+/// `data_type` does not raise an event again. `data_type` is a wire-controlled
+/// `u32` and the event carries no payload, so neither the per-event nor the
+/// total event-bytes bound applies: without a cap here, a client streaming
+/// `data_type = 0, 1, 2, …` with empty payloads bought one permanent set entry
+/// per ~40-byte packet, and each packet reset the inactivity timer, so the
+/// connection never idled out. Unbounded daemon heap growth from one
+/// connection, which §6.2 promises cannot happen.
+///
+/// A real session uses one extended-data type (stderr). Past the cap the bytes
+/// are still discarded; the only cost is that such a type may raise an event
+/// again later, which the ordinary event-queue bounds already govern.
+pub const MAX_DISCARDED_LANES_PER_CHANNEL: usize = 16;
+
 /// The sliding window, in seconds, over which auth rejections are throttled.
 ///
 /// Host-side and cross-connection: when the window is full, further auth

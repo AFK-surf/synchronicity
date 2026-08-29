@@ -291,7 +291,7 @@ add`. Declaration and arming are separate local gates:
   operator note.
 - The first `socket arm` runs the object's `synchronicity.init` hook and prints
   the program root, resource shape and declared effects, such as outbound TCP
-  destinations or tree reads. It does **not** approve the object. Review that
+  destinations or process capabilities. It does **not** approve the object. Review that
   output, then pass its opaque token to `--review`; the token binds the content
   root, current local authorization revision and exact init result.
 - Approval pins the BLAKE3 content root. Replacing the object and scanning
@@ -331,8 +331,8 @@ running on the connecting side too.
 The destination resolves the path only in the named origin's trie, verifies
 membership and delegation, requires the entry to be a locally declared socket,
 and requires its current root to be armed. Publication alone is never execute
-permission. A program's undeclared tree reads and outbound connections are
-also denied even after it is armed.
+permission. A program's undeclared outbound connections are also denied even
+after it is armed. Reading the tree needs no declaration and is not denied.
 
 Adopting a peer's socket with `synch take`, `fill`, a mirror or S3 copies its
 bytes as an ordinary file. Socket-ness is a local assertion created only by

@@ -643,7 +643,6 @@ const DECLARE: &str = r#"
 SY_INIT_ENTRY sy_s64 declare(void) {
   sy_declare_name(SY_STR("git-http"));
   sy_declare_egress(SY_STR("git.internal"), 9418);
-  sy_declare_tree_read(SY_STR("code"));
   sy_declare_max_streams(32);
   if (sy_declare_stack_frame_size(17) != SY_EINVAL) return -1;
   if (sy_declare_stack_frame_size(32784) != SY_ELIMIT) return -2;
@@ -670,7 +669,6 @@ fn the_init_hook_declares_and_cannot_reach_anything() {
         synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook ran");
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
-    assert_eq!(declared.tree_reads, vec!["code".to_string()]);
     assert_eq!(declared.max_streams, Some(32));
     assert_eq!(declared.stack_frame_size, Some(512));
     assert_eq!(declared.guarded_stack_frames, Some(false));
@@ -745,7 +743,7 @@ const UNSAFE_DECLARATION: &str = r#"
 
 SY_INIT_ENTRY sy_s64 declare(void) {
   if (sy_declare_name(SY_STR("benign\negress evil.example:443")) != SY_EINVAL) return -1;
-  if (sy_declare_tree_read(SY_STR("public\x1b[2J")) != SY_EINVAL) return -2;
+  if (sy_declare_egress(SY_STR("public\x1b[2J"), 80) != SY_EINVAL) return -2;
   return 0;
 }
 
@@ -1388,4 +1386,93 @@ async fn process_status_uses_eagain_then_one_and_is_repeatable() {
     policy.processes.push(process_capability(1));
     let (status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
     assert_eq!(status, SockStatus::Ok(0));
+}
+
+/// What a program wrote before closing `SY_SELF` still reaches its caller.
+///
+/// `sy_close(SY_SELF)` drops the handle, not the bytes queued behind it: the
+/// endpoint half-closes and its writer drains on its own timing (§7.3, §10).
+/// Teardown used to take the writer's join handle only while the slot was
+/// still occupied — which `sy_close` is precisely what empties — so nothing
+/// waited on that drain and `abort_tasks()` then killed the writer mid-flush.
+/// A program whose last act was to close the caller's stream, which is the
+/// last line of most request/response sockets, delivered an empty reply with a
+/// clean `Ok(0)`.
+const CLOSE_AFTER_WRITE: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  const char *msg = "final-response-bytes";
+  sy_u64 len = sy_strlen(msg);
+  sy_u64 off = 0;
+  while (off < len) {
+    sy_s64 n = sy_write(SY_SELF, msg + off, len - off);
+    if (n == SY_EAGAIN) {
+      struct sy_pollfd p = { SY_SELF, SY_POLL_OUT, 0 };
+      sy_poll(&p, 1, 1000);
+      continue;
+    }
+    if (n < 0) return 1;
+    off += (sy_u64)n;
+  }
+  sy_close(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn a_final_write_survives_closing_the_callers_stream() {
+    let elf = compile(CLOSE_AFTER_WRITE, "close-after-write.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(
+        out, b"final-response-bytes",
+        "bytes queued before sy_close(SY_SELF) must still be delivered"
+    );
+}
+
+/// `sy_splice` selects raw mode like every other endpoint operation.
+///
+/// It used to resolve both handles without selecting, so a splice-only proxy
+/// naming `SY_SELF` as its first call got `SY_EBADF` on the handle the SDK
+/// calls "always open when your program starts". Every endpoint helper now
+/// goes through one accessor, so the rule has no exceptions to remember.
+const SPLICE_FIRST: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* The very first helper call of the program. */
+  sy_s64 rc = sy_splice(SY_SELF, SY_SELF, 64);
+  if (rc == SY_EBADF) return 1;
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn splice_may_be_a_programs_first_call_on_self() {
+    let elf = compile(SPLICE_FIRST, "splice-first.c");
+    let harness = Harness::new();
+    let (status, _out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "sy_splice(SY_SELF, ...) as a first call must not be SY_EBADF"
+    );
 }

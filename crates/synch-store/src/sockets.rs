@@ -56,8 +56,8 @@ pub struct SocketRow {
 }
 
 impl SocketRow {
-    /// A declaration with nothing allowed: no egress, no foreign tree reads,
-    /// the daemon's default concurrency, and no auto-arming.
+    /// A declaration with nothing allowed: no egress, the daemon's default
+    /// concurrency, and no auto-arming.
     pub fn new(space: impl Into<String>, path: impl Into<String>, added_at: i64) -> Self {
         SocketRow {
             space: space.into(),

@@ -182,12 +182,12 @@ $ synch socket arm code/git.sock
   declares  name        git-http
             egress      git.internal:9418
             max streams 32
-            tree reads  code/**  (own origin)
   reviewed only — approve with `synch socket arm code/git.sock --review 51a4…d20`
 ```
 
-Arming approves the capabilities the program declared. Egress or foreign-tree
-access with no declaration is denied. Because the declaration is compiled into
+Arming approves the capabilities the program declared. Egress with no
+declaration is denied. Reading the tree is not among the declared capabilities
+and never was denied by one (§7.6). Because the declaration is compiled into
 the object, editing it changes the content root, which disarms the socket. A
 program cannot widen its own reach without a fresh review and approval, and an
 approval cannot silently outlive the code it approved. The opaque `--review`
@@ -328,8 +328,8 @@ KiB-page hosts. A program built for another value must pass that value to
 
 | Table | Scope | Bound |
 | --- | --- | --- |
-| endpoint table | per invocation | 16 handles, `SY_SELF` included |
-| object table | per invocation | shares the 16-handle table with endpoints, 1 MiB footprint |
+| endpoint table | per invocation | 32 handles, `SY_SELF` included |
+| object table | per invocation | shares the 32-handle table with endpoints, 1 MiB footprint |
 | socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each
@@ -460,6 +460,12 @@ Resolution happens host-side, and **both the name and the resolved address are
 checked** against the armed egress list — so a program cannot reach an internal
 address by way of a name that resolves to it.
 
+Closing a connecting handle does not immediately return its place in the
+per-invocation egress budget (§10). Resolution runs on a blocking pool and
+cannot be cancelled once dispatched, so a budget returned at `sy_close` would
+bound established connections while leaving the resolutions behind it
+unbounded; the place comes back when the connection's task actually ends.
+
 ### 7.5 Poll — the only helper that suspends
 
 `sy_poll(fds, n, timeout_ms)` waits for readiness on up to 32 handles. Returns
@@ -482,12 +488,27 @@ than treating either bit as permission to discard the receive buffer. `OUT`
 retains this ABI's narrower meaning of usable tx-ring room, so it is absent
 after `sy_shutdown` when `sy_write` would return `SY_EPIPE`.
 
-### 7.6 Reading the tree — verified, scoped by default to this origin
+### 7.6 Reading the tree — verified, and unrestricted
+
+A socket reads every path in every origin this node holds, and every blob in
+its CAS by content root. There is no read declaration and no per-path check.
+
+That is a deliberate retreat from an earlier design in which a program declared
+`tree-read` prefixes and `sy_open_from` was refused without one. The gate was
+decorative: `sy_open_root` reached the same bytes by hash with no declaration
+at all, so the prefix list bought an extra line at the arm prompt rather than a
+boundary. What a node exposes to a caller is decided by which sockets it arms,
+and by membership and delegation on the way in (§3.2, §3.5) — not by a
+per-program list of paths its own code may read.
+
+Socket entries are readable like any other file. Their bytes are not secret —
+any member fetches them out of the tree — and what executes on this node is
+decided by the arming table, not by who can read an ELF.
 
 | Helper | What it does |
 | --- | --- |
-| `sy_open(path, len)` | Opens `space/path` **in this node's own trie** — the same scope the program came from. Refuses a `Socket` entry, so a socket cannot read out its neighbours' code. |
-| `sy_open_from(origin, olen, path, plen)` | Another origin's version. Requires a matching tree-read declaration in the armed program; §8's mtime-trust caveat is why it is not the default. |
+| `sy_open(path, len)` | Opens `space/path` **in this node's own trie** — the same scope the program came from. |
+| `sy_open_from(origin, olen, path, plen)` | Another origin's version. Needs no declaration; §8's mtime-trust caveat is why it is not the default. |
 | `sy_open_root(root32)` | By content root — how a superseded version is read, mirroring `synch cat --root`. |
 | `sy_stat(obj, out, len)` | Fills a `struct sy_stat`. |
 | `sy_pread(obj, buf, len, off)` | Verified range read. Bytes in the CAS return immediately; bytes that must be fetched return `SY_EAGAIN` and the handle becomes pollable — a cold read is an ordinary poll wait, not a hidden stall. |
@@ -517,9 +538,13 @@ because there is no heap to decode into.
 ### 7.9 Declarations — valid only inside `synchronicity.init`
 
 `sy_declare_name`, `sy_declare_egress(host, len, port)` (port `0` means any port
-on that host and is printed in red at the arm prompt), `sy_declare_tree_read`,
-`sy_declare_max_streams`, `sy_declare_stack_frame_size(bytes)`,
-`sy_declare_guarded_stack_frames(enabled)`.
+on that host and is printed in red at the arm prompt), `sy_declare_max_streams`,
+`sy_declare_stack_frame_size(bytes)`,
+`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(spec, len)` and
+`sy_declare_file_transfer(spec, len)` (`docs/SSH-SOCKETS.md` §7).
+
+There is no `sy_declare_tree_read`: reading the tree is not a declared
+capability (§7.6).
 
 `sy_declare_stack_frame_size` must match the compiler's eBPF stack-frame
 setting. It accepts a multiple of 16 from 16 bytes through 32 KiB; omitting it
@@ -780,8 +805,8 @@ own.
 | Concurrent invocations per socket | 64 | Intersected with `sy_declare_max_streams`. Over it: `Refused{Busy}`. |
 | Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
-| Endpoint handles per invocation | 16 | Including `SY_SELF`. Also the `sy_poll` array cap. |
-| Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. |
+| Endpoint handles per invocation | 32 | Including `SY_SELF`. Also the `sy_poll` array cap (`limits.rs`, and §7.5 and the SDK header agree). |
+| Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. A place is held by the connection's own task and given back when that task ends, not when the guest closes the handle — so the bound covers name resolution in flight, which `sy_close` cannot cancel, and not just established connections. |
 | rx / tx ring per endpoint | 256 KiB each | A full ring stops the host reading, which backpressures the far side. |
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |
 | Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Frames are 16 KiB and guarded by default on hosts with pages up to 16 KiB; larger-page hosts warn and fall back to contiguous frames. Sizes from 16 B through 32 KiB may be declared. |

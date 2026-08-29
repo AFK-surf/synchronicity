@@ -894,8 +894,8 @@ async fn public_key_auth_can_consult_authorized_keys_in_the_virtual_tree() {
     let harness = Harness::with_tree(&[("keys/authorized_keys", &authorized)]);
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
-    let mut policy = EffectivePolicy::default();
-    policy.tree_reads.push("keys".into());
+    // Reading the tree needs no declaration: every invocation reads every path.
+    let policy = EffectivePolicy::default();
     let invocation = harness.invocation(
         &elf,
         DuplexStream::new(server_reader, server_writer),

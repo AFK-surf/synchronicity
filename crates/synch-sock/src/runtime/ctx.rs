@@ -145,7 +145,13 @@ pub(crate) struct Inner {
     pub(crate) metrics: RefCell<Vec<(String, i64)>>,
     pub(crate) labels: RefCell<Vec<(String, String)>>,
     pub(crate) footprint: Cell<u64>,
-    pub(crate) egress_open: Cell<usize>,
+    /// Outbound TCP connections this invocation currently holds against
+    /// [`Limits::max_egress`].
+    ///
+    /// Shared with the connect tasks rather than owned outright: the count is
+    /// given back by [`EgressPermit`] when the task ends, not when the guest
+    /// closes the handle. See that type for why.
+    pub(crate) egress_open: Rc<Cell<usize>>,
     /// Endpoints the guest let go of that still owe bytes to the far side.
     ///
     /// A handle leaves the table the moment `sy_close` is called, but the
@@ -156,7 +162,7 @@ pub(crate) struct Inner {
     /// every proxy ever written, losing whatever had not reached the wire yet.
     pub(crate) draining: RefCell<Vec<Rc<Endpoint>>>,
     /// Detached helper work owned by this invocation.
-    pub(crate) async_tasks: RefCell<Vec<tokio::task::AbortHandle>>,
+    pub(crate) async_tasks: super::tasks::TaskSet,
     /// The pristine stream's writer is retained separately so invocation
     /// teardown can await bytes already removed from the userspace ring.
     pub(crate) raw_writer: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -272,9 +278,9 @@ impl Inner {
             metrics: RefCell::new(Vec::new()),
             labels: RefCell::new(Vec::new()),
             footprint: Cell::new(0),
-            egress_open: Cell::new(0),
+            egress_open: Rc::new(Cell::new(0)),
             draining: RefCell::new(Vec::new()),
-            async_tasks: RefCell::new(Vec::new()),
+            async_tasks: super::tasks::TaskSet::default(),
             raw_writer: RefCell::new(None),
             ptys: RefCell::new(std::collections::HashMap::new()),
             init_mode: false,
@@ -304,14 +310,12 @@ impl Inner {
     /// Starts helper work and makes invocation cleanup its owner.
     pub(crate) fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         let task = tokio::task::spawn_local(future);
-        self.async_tasks.borrow_mut().push(task.abort_handle());
+        self.async_tasks.track(task.abort_handle());
     }
 
     /// Cancels helper work that has not naturally finished.
     pub(crate) fn abort_tasks(&self) {
-        for task in self.async_tasks.borrow_mut().drain(..) {
-            task.abort();
-        }
+        self.async_tasks.abort_all();
     }
 
     /// Namespace shared state by both socket path and armed program root.
@@ -344,10 +348,33 @@ impl Inner {
     }
 
     /// The endpoint at `handle`, or `None` if it is something else.
+    ///
+    /// Does not select a mode: `SY_SELF` is `None` here until something has
+    /// chosen raw or SSH for it. Every helper that performs I/O wants
+    /// [`Inner::endpoint_for_io`] instead.
     pub(crate) fn endpoint(&self, handle: i64) -> Option<Rc<Endpoint>> {
         match self.slot(handle) {
             Some(Slot2::Endpoint(ep)) => Some(ep),
             _ => None,
+        }
+    }
+
+    /// The endpoint at `handle`, selecting raw mode if this is the pristine
+    /// `SY_SELF` and nothing has chosen a mode for it yet.
+    ///
+    /// The single door for every helper that reads, writes, splices, polls,
+    /// shuts down or inspects an endpoint. It exists because the dispatch used
+    /// to be open-coded at each such helper, and `sy_splice` — the one that
+    /// resolved both its handles with the bare [`Inner::endpoint`] — answered
+    /// `SY_EBADF` on a handle the SDK calls "always open when your program
+    /// starts". Which operations select a mode is part of the SSH contract
+    /// (`docs/SSH-SOCKETS.md` §3.1), so it is one function rather than a rule
+    /// each new helper has to remember.
+    pub(crate) fn endpoint_for_io(&self, handle: i64) -> Result<Rc<Endpoint>, i64> {
+        if handle == crate::abi::SY_SELF {
+            self.select_raw()
+        } else {
+            self.endpoint(handle).ok_or(errno::EBADF)
         }
     }
 
@@ -373,7 +400,7 @@ impl Inner {
                 drop(slots);
                 self.spawn(reader_task(endpoint.clone(), stream.reader));
                 let writer = tokio::task::spawn_local(writer_task(endpoint.clone(), stream.writer));
-                self.async_tasks.borrow_mut().push(writer.abort_handle());
+                self.async_tasks.track(writer.abort_handle());
                 *self.raw_writer.borrow_mut() = Some(writer);
                 Ok(endpoint)
             }
@@ -442,18 +469,18 @@ impl Inner {
                 // side drains and half-closes on its own from here.
                 ep.close_flushing();
                 if handle == crate::abi::SY_SELF {
-                    // The caller's stream is not tracked below: `run` holds its
-                    // writer's join handle and waits on that.
+                    // The caller's stream is not tracked below: `close_flushing`
+                    // has shut its write side and left the writer task to drain
+                    // what is queued, and `run_job` unconditionally takes that
+                    // task's join handle at teardown and waits on it inside the
+                    // drain window. It does not matter that this slot is now
+                    // empty — the wait is on the handle, not on the slot.
                     return true;
                 }
-                // Only an outbound endpoint frees a place in the egress
-                // budget. SSH channels, PTYs and service pipes are endpoints
-                // too, but never consumed that quota — the role, not the
-                // handle number, is what decides (`docs/SSH-SOCKETS.md` §8).
-                if *ep.role() == EndpointRole::TcpEgress {
-                    self.egress_open
-                        .set(self.egress_open.get().saturating_sub(1));
-                }
+                // The egress budget is *not* given back here. It belongs to
+                // the connect task's `EgressPermit` and comes back when that
+                // task ends, which is not the same moment as the guest letting
+                // go of the handle.
                 if let Some(Slot::SshControl(ssh)) = slots.first().and_then(Option::as_ref) {
                     ssh.remove_channel_fd(handle);
                 }
@@ -516,8 +543,9 @@ impl Inner {
     /// teardown has a single window to spend, and endpoints draining in
     /// parallel spend it once instead of dividing it.
     ///
-    /// `SY_SELF` is not among them. It has always had a window of its own, and
-    /// `run` waits on its writer's join handle rather than on this.
+    /// `SY_SELF` is not among them, whether or not the guest closed it: it
+    /// drains through its writer task's join handle, which `run_job` takes
+    /// unconditionally and awaits inside the same window.
     pub(crate) fn begin_drain(&self) -> Vec<Rc<Endpoint>> {
         let mut draining = std::mem::take(&mut *self.draining.borrow_mut());
         for slot in self.slots.borrow().iter().skip(1).flatten() {

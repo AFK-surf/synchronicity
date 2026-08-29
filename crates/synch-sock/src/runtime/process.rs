@@ -121,10 +121,18 @@ impl ProcessSlot {
         }
     }
 
+    /// Signals the child's process group, if the child is still ours to signal.
+    ///
+    /// Best-effort by design, and not containment. `pid()` is `None` once
+    /// `refresh` has reaped the direct child — which `watch_exit` does on the
+    /// first `SIGCHLD` after it exits — and after that there is no group leader
+    /// left to name: a descendant that outlived its parent, or that called
+    /// `setsid` for itself, keeps running under the daemon's UID and nothing
+    /// here reaps it. That is the documented shape of a process capability
+    /// (`docs/SSH-SOCKETS.md` §7.1, §12.10); an operator who needs a bound
+    /// declares an executable that bounds itself.
     pub(crate) fn kill(&self) {
         let Some(pid) = self.pid() else { return };
-        // A fresh process group is created at spawn, so negative pid reaches
-        // descendants as well as the direct child.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
@@ -173,6 +181,9 @@ impl Drop for ProcessSlot {
                 // Group-kill first: the slot still owns the child, so its pid
                 // is reserved and same-group descendants are still reachable
                 // before the child is reaped by tokio's background reaper.
+                // Reaching them is not the same as containing them — a
+                // descendant in its own session is already out of range here
+                // (see `ProcessSlot::kill`).
                 if let Some(pid) = child.id() {
                     if let Ok(pid) = i32::try_from(pid) {
                         unsafe {
@@ -569,13 +580,23 @@ impl AsyncRead for ChannelReader {
         out: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         if self.offset == self.current.len() {
-            match self.receiver.poll_recv(cx) {
-                Poll::Ready(Some(bytes)) => {
-                    self.current = bytes;
-                    self.offset = 0;
+            // Skip empty chunks instead of letting one read as end of stream.
+            // A zero-length SSH extended-data payload is a legal packet any
+            // client may send at will, and `AsyncRead` gives a zero-byte fill
+            // exactly one meaning: EOF. Forwarding one would half-close this
+            // lane on the guest for the rest of the connection. Only the
+            // sender going away ends the stream.
+            loop {
+                match self.receiver.poll_recv(cx) {
+                    Poll::Ready(Some(bytes)) if bytes.is_empty() => continue,
+                    Poll::Ready(Some(bytes)) => {
+                        self.current = bytes;
+                        self.offset = 0;
+                        break;
+                    }
+                    Poll::Ready(None) => return Poll::Ready(Ok(())),
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
             }
         }
         let n = out.remaining().min(self.current.len() - self.offset);

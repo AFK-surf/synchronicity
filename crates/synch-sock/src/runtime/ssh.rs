@@ -22,7 +22,7 @@ use tokio::{
 use crate::{
     limits::{
         AUTH_REJECTION_WINDOW_SECS, LANE_SEND_TIMEOUT_MS, MAX_AUTH_REJECTIONS_PER_IP,
-        MAX_AUTH_REJECTIONS_PER_WINDOW, MAX_AUTH_USERNAME_BYTES,
+        MAX_AUTH_REJECTIONS_PER_WINDOW, MAX_AUTH_USERNAME_BYTES, MAX_DISCARDED_LANES_PER_CHANNEL,
         MAX_OUTSTANDING_REQUESTS_PER_CHANNEL,
     },
     runtime::endpoint::Readiness,
@@ -260,7 +260,7 @@ pub(crate) struct SshState {
     /// Exit-status/exit-signal deliveries that could not be sent to the
     /// client; surfaced to the guest through `sy_ssh_exit_status_lost`.
     lost_exit_deliveries: AtomicU64,
-    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    tasks: super::tasks::TaskSet,
 }
 
 /// One live slot in a channel's outstanding-request budget.
@@ -294,7 +294,7 @@ impl SshState {
             request_tasks: Mutex::new(HashMap::new()),
             accepts: Mutex::new(HashMap::new()),
             lost_exit_deliveries: AtomicU64::new(0),
-            tasks: Mutex::new(Vec::new()),
+            tasks: super::tasks::TaskSet::default(),
         })
     }
 
@@ -483,25 +483,13 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        for task in self
-            .tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
-            task.abort();
-        }
+        self.tasks.abort_all();
         self.ready.bump();
     }
 
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         let task = tokio::spawn(future);
-        let mut tasks = self
-            .tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task.abort_handle());
+        self.tasks.track(task.abort_handle());
     }
 
     /// Spawns a channel-request decision task and binds its lifetime to the
@@ -514,13 +502,7 @@ impl SshState {
     ) {
         let task = tokio::spawn(future);
         let abort = task.abort_handle();
-        let mut tasks = self
-            .tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(abort.clone());
-        drop(tasks);
+        self.tasks.track(abort.clone());
         let mut request_tasks = self
             .request_tasks
             .lock()
@@ -854,11 +836,26 @@ impl SshState {
             .contains(&(fd, data_type))
     }
 
+    /// Remembers that the guest declined a lane, so the same `data_type` does
+    /// not raise a second event.
+    ///
+    /// Bounded per channel: `data_type` is wire-controlled and the event
+    /// carries no payload, so this set is the one piece of per-connection
+    /// state a client could otherwise grow for free
+    /// ([`MAX_DISCARDED_LANES_PER_CHANNEL`]). Past the cap nothing is
+    /// remembered — the bytes are discarded either way, and re-offering an
+    /// event is governed by the event queue's own bounds.
     fn discard_lane(&self, fd: i64, data_type: u32) {
-        self.discarded_lanes
+        let mut discarded = self
+            .discarded_lanes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((fd, data_type));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if discarded.iter().filter(|(seen, _)| *seen == fd).count()
+            >= MAX_DISCARDED_LANES_PER_CHANNEL
+        {
+            return;
+        }
+        discarded.insert((fd, data_type));
     }
 }
 
@@ -921,36 +918,75 @@ fn method_bit(kind: u32) -> u64 {
 
 /// Host-side, cross-connection throttle on authentication rejections.
 ///
-/// Rejections are remembered per IP and in total over a sliding window; when
-/// either cap is reached, further attempts are refused without consulting the
-/// guest — fail-closed against online brute force that would otherwise pace
-/// itself with one fresh connection per batch. The throttle is per daemon
-/// pool (one per `WorkerHandle`), and a guest that accepts everything is
-/// never throttled: that is the guest's own policy.
+/// Rejections are remembered over a sliding window, per peer IP and per
+/// socket; when either cap is reached further attempts are refused without
+/// consulting the guest — fail-closed against online brute force that would
+/// otherwise pace itself with one fresh connection per batch. A guest that
+/// accepts everything is never throttled: that is the guest's own policy.
+///
+/// One throttle serves the whole daemon pool, so *which* counters an attempt
+/// is measured against decides who a flood can hurt. Both are scoped to
+/// something the attacker has to own:
+///
+/// * per IP, across every socket, because that is the attacker's own axis and
+///   moving between sockets must not buy a fresh budget;
+/// * per socket, across every IP, as the backstop against a distributed
+///   flood — but *per socket*, not node-wide.
+///
+/// The node-wide total this replaces made one socket's attacker everybody's
+/// problem: four IPs spending 16 rejections each inside the window filled a
+/// 64-entry global bucket, and for the rest of that window every SSH socket on
+/// the node refused every authentication attempt, `none` included. That is a
+/// node-wide outage for about one attempt per second of effort. Scoping the
+/// backstop per socket keeps the protection and confines the damage to the
+/// socket actually under attack.
 #[derive(Debug, Default)]
 pub(crate) struct AuthThrottle {
-    inner: Mutex<VecDeque<(Instant, String)>>,
+    inner: Mutex<VecDeque<Rejection>>,
 }
+
+/// One remembered rejection.
+#[derive(Debug)]
+struct Rejection {
+    at: Instant,
+    ip: String,
+    socket: String,
+}
+
+/// The most rejections retained across all sockets and IPs.
+///
+/// Bookkeeping only, not an admission rule: with per-socket windows the deque
+/// grows with the number of sockets under attack, and something has to bound
+/// it. Generous enough that no legitimate per-socket or per-IP window is ever
+/// evicted early by it.
+const MAX_RETAINED_REJECTIONS: usize = 4096;
 
 impl AuthThrottle {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Records one rejected auth attempt from `ip`.
-    pub(crate) fn note_rejection(&self, ip: &str) {
+    /// Records one rejected auth attempt from `ip` against `socket`.
+    pub(crate) fn note_rejection(&self, socket: &str, ip: &str) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.push_back((Instant::now(), ip.to_string()));
+        inner.push_back(Rejection {
+            at: Instant::now(),
+            ip: ip.to_string(),
+            socket: socket.to_string(),
+        });
+        while inner.len() > MAX_RETAINED_REJECTIONS {
+            inner.pop_front();
+        }
     }
 
-    /// Whether another auth attempt from `ip` is admitted.
+    /// Whether another auth attempt from `ip` against `socket` is admitted.
     ///
     /// Entries older than the window are evicted; admission requires both the
-    /// window total and the per-IP total to be under their caps.
-    pub(crate) fn admit(&self, ip: &str) -> bool {
+    /// per-IP total and this socket's total to be under their caps.
+    pub(crate) fn admit(&self, socket: &str, ip: &str) -> bool {
         let mut inner = self
             .inner
             .lock()
@@ -959,9 +995,10 @@ impl AuthThrottle {
         let cutoff = now
             .checked_sub(Duration::from_secs(AUTH_REJECTION_WINDOW_SECS))
             .unwrap_or(now);
-        inner.retain(|(at, _)| *at >= cutoff);
-        let per_ip = inner.iter().filter(|(_, seen)| seen == ip).count();
-        inner.len() < MAX_AUTH_REJECTIONS_PER_WINDOW && per_ip < MAX_AUTH_REJECTIONS_PER_IP
+        inner.retain(|entry| entry.at >= cutoff);
+        let per_ip = inner.iter().filter(|entry| entry.ip == ip).count();
+        let per_socket = inner.iter().filter(|entry| entry.socket == socket).count();
+        per_ip < MAX_AUTH_REJECTIONS_PER_IP && per_socket < MAX_AUTH_REJECTIONS_PER_WINDOW
     }
 }
 
@@ -976,6 +1013,9 @@ struct SshHandler {
     methods: u64,
     throttle: Arc<AuthThrottle>,
     ip: String,
+    /// Which socket this connection is serving, as the throttle's per-socket
+    /// window is keyed.
+    socket: String,
     /// 1-based count of auth attempts on this connection, as the guest sees
     /// them in FIELD_AUTH_ATTEMPTS.
     attempts: u64,
@@ -989,7 +1029,7 @@ impl SshHandler {
                 partial_success: false,
             });
         }
-        if !self.throttle.admit(&self.ip) {
+        if !self.throttle.admit(&self.socket, &self.ip) {
             // Fail-closed under a rejection flood: the guest is not consulted
             // when the host-side throttle is exhausted.
             return Ok(Auth::Reject {
@@ -1075,7 +1115,7 @@ impl SshHandler {
         };
         if !matches!(auth, Auth::Accept) {
             // Partial-success rejections count as failures for the throttle.
-            self.throttle.note_rejection(&self.ip);
+            self.throttle.note_rejection(&self.socket, &self.ip);
         }
         Ok(auth)
     }
@@ -1921,14 +1961,26 @@ impl AsyncWrite for JoinedStream {
     }
 }
 
+/// What the host-side auth throttle measures one connection against.
+///
+/// The shared counter plus the two axes it is keyed by, together because they
+/// are only ever meaningful together: a throttle with no idea which socket or
+/// which peer it is pacing is the node-wide bucket this replaced.
+pub(crate) struct AuthContext {
+    pub(crate) throttle: Arc<AuthThrottle>,
+    /// The peer's IP, without its port (`peer_ip`).
+    pub(crate) ip: String,
+    /// The socket being served, as `space/path`.
+    pub(crate) socket: String,
+}
+
 pub(crate) async fn serve(
     stream: crate::DuplexStream,
     state: Arc<SshState>,
     host_key: Arc<PrivateKey>,
     methods: u64,
     idle: Duration,
-    throttle: Arc<AuthThrottle>,
-    ip: String,
+    auth: AuthContext,
 ) {
     let config = russh::server::Config {
         methods: advertised_methods(methods),
@@ -1949,8 +2001,9 @@ pub(crate) async fn serve(
         state: state.clone(),
         username: None,
         methods,
-        throttle,
-        ip,
+        throttle: auth.throttle,
+        ip: auth.ip,
+        socket: auth.socket,
         attempts: 0,
     };
     let outcome =
@@ -2027,46 +2080,94 @@ mod tests {
             methods: super::AUTH_ALL,
             throttle: Arc::new(AuthThrottle::new()),
             ip: "127.0.0.1".to_string(),
+            socket: "code/test.sock".to_string(),
             attempts: 0,
         }
     }
 
     #[test]
     fn auth_throttle_admits_within_window_and_rejects_after() {
+        const SOCK: &str = "code/a.sock";
         // admit() does not record; only note_rejection() does, so the cap is
         // reached by the MAX_AUTH_REJECTIONS_PER_IP-th note, not the admit.
         let throttle = AuthThrottle::new();
         let ip = "198.51.100.7";
         for _ in 0..MAX_AUTH_REJECTIONS_PER_IP - 1 {
-            throttle.note_rejection(ip);
-            assert!(throttle.admit(ip), "admitted while under the per-IP cap");
+            throttle.note_rejection(SOCK, ip);
+            assert!(
+                throttle.admit(SOCK, ip),
+                "admitted while under the per-IP cap"
+            );
         }
-        throttle.note_rejection(ip); // the cap-th rejection fills the per-IP cap
-        assert!(!throttle.admit(ip), "the per-IP cap is full");
+        throttle.note_rejection(SOCK, ip); // the cap-th rejection fills the per-IP cap
+        assert!(!throttle.admit(SOCK, ip), "the per-IP cap is full");
 
-        // The window total is a separate bound, reached only when the
+        // The per-socket total is a separate bound, reached only when the
         // rejections are spread across more IPs than the per-IP cap.
         let throttle = AuthThrottle::new();
         for index in 0..MAX_AUTH_REJECTIONS_PER_WINDOW - 1 {
             let seen = format!("10.0.0.{index}");
-            throttle.note_rejection(&seen);
-            assert!(throttle.admit(&seen));
+            throttle.note_rejection(SOCK, &seen);
+            assert!(throttle.admit(SOCK, &seen));
         }
-        throttle.note_rejection("10.0.0.254"); // the cap-th rejection fills the window
-        assert!(!throttle.admit("10.0.0.99"), "the window total is full");
+        throttle.note_rejection(SOCK, "10.0.0.254"); // fills this socket's window
+        assert!(
+            !throttle.admit(SOCK, "10.0.0.99"),
+            "the per-socket total is full"
+        );
 
         // Entries older than the window are evicted, so admits resume — on a
         // fresh throttle (a full window stays full after evicting one entry).
         let throttle = AuthThrottle::new();
         let stale = Instant::now() - Duration::from_secs(AUTH_REJECTION_WINDOW_SECS + 1);
-        throttle
-            .inner
-            .lock()
-            .unwrap()
-            .push_back((stale, "10.0.0.99".to_string()));
+        throttle.inner.lock().unwrap().push_back(super::Rejection {
+            at: stale,
+            ip: "10.0.0.99".to_string(),
+            socket: SOCK.to_string(),
+        });
         assert!(
-            throttle.admit("10.0.0.99"),
+            throttle.admit(SOCK, "10.0.0.99"),
             "stale entries are evicted and admit resumes"
+        );
+    }
+
+    /// One socket's attacker must not lock out any other socket on the node.
+    ///
+    /// The backstop used to be a node-wide total: four IPs spending their
+    /// per-IP budget filled it, and every SSH socket on the daemon then
+    /// refused every authentication attempt for the rest of the window.
+    #[test]
+    fn a_flood_against_one_socket_does_not_throttle_another() {
+        let throttle = AuthThrottle::new();
+        const UNDER_ATTACK: &str = "code/exposed.sock";
+        const BYSTANDER: &str = "ops/admin.sock";
+
+        // Fill the attacked socket's window, spread across enough IPs that no
+        // single per-IP cap is what stops it.
+        for index in 0..MAX_AUTH_REJECTIONS_PER_WINDOW {
+            throttle.note_rejection(UNDER_ATTACK, &format!("203.0.113.{index}"));
+        }
+        assert!(
+            !throttle.admit(UNDER_ATTACK, "203.0.113.1"),
+            "the attacked socket is throttled"
+        );
+
+        // The bystander is untouched, including for an IP that was part of the
+        // flood: its own per-IP budget there is what governs.
+        assert!(
+            throttle.admit(BYSTANDER, "198.51.100.4"),
+            "an unrelated socket must still authenticate"
+        );
+
+        // And an attacker who moves between sockets still spends one per-IP
+        // budget rather than a fresh one per socket.
+        let throttle = AuthThrottle::new();
+        for _ in 0..MAX_AUTH_REJECTIONS_PER_IP {
+            throttle.note_rejection(UNDER_ATTACK, "203.0.113.9");
+        }
+        assert!(
+            !throttle.admit(BYSTANDER, "203.0.113.9"),
+            "the per-IP cap follows the attacker across sockets"
         );
     }
 
