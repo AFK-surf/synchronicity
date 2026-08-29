@@ -349,8 +349,8 @@ KiB-page hosts. A program built for another value must pass that value to
 
 | Table | Scope | Bound |
 | --- | --- | --- |
-| endpoint table | per invocation | 32 handles, `SY_SELF` included |
-| object table | per invocation | shares the 32-handle table with endpoints, 1 MiB footprint; JSON values (§7.11) live here too |
+| endpoint table | per invocation | 256 handles, `SY_SELF` included; per-role caps (§10) bound what the slots can hold |
+| object table | per invocation | shares the 256-handle table with endpoints, 1 MiB footprint; JSON values (§7.11) live here too |
 | socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each
@@ -495,7 +495,7 @@ unbounded; the place comes back when the connection's task actually ends.
 
 ### 7.5 Poll — the only helper that suspends
 
-`sy_poll(fds, n, timeout_ms)` waits for readiness on up to 32 handles. Returns
+`sy_poll(fds, n, timeout_ms)` waits for readiness on up to 256 handles. Returns
 the number ready, `0` on timeout, negative on error; `timeout_ms < 0` means
 "until something happens", clamped by the host to the invocation's idle
 deadline — and the deadline is the end of the invocation itself (§10): a poll
@@ -633,7 +633,7 @@ to the same helpers (§9).
 
 Modeled on zeroserve's JSON API, and the reason the rest of §7 carries no
 struct layouts: values live host-side, the guest holds handles out of the same
-32-slot table endpoints and objects come from, charged against the same 1 MiB
+256-slot table endpoints and objects come from, charged against the same 1 MiB
 footprint and released with `sy_close`.
 
 | Helper | What it does |
@@ -879,7 +879,10 @@ own.
 | Concurrent invocations per socket | 64 | Intersected with `sy_declare_max_streams`. Over it: `Refused{Busy}`. |
 | Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
-| Endpoint handles per invocation | 32 | Including `SY_SELF`. Also the `sy_poll` array cap (`limits.rs`, and §7.5 and the SDK header agree). |
+| Handles per invocation | 256 | Including `SY_SELF`. Also the `sy_poll` array cap (`limits.rs`, and §7.5 and the SDK header agree). Deliberately larger than any one resource's own bound; the per-role caps below are what stop spare slots becoming host memory or OS children. |
+| Live child processes per invocation | 16 | Pipe and PTY spawns together, counted as held process handles; over it, spawn returns `SY_ELIMIT`. Close a finished process to give its place back. |
+| Open PTY masters per invocation | 16 | A master carries a full ring before any child is attached; over it, `sy_pty_open` returns `SY_ELIMIT`. |
+| Open file-transfer endpoints per invocation | 16 | Each carries a ring and a bridge pipe; over it, `sy_file_transfer_open` returns `SY_ELIMIT`. |
 | Outbound TCP per invocation | 8 | Beyond it, `sy_tcp_connect` returns `SY_ELIMIT`. A place is held by the connection's own task and given back when that task ends, not when the guest closes the handle — so the bound covers name resolution in flight, which `sy_close` cannot cancel, and not just established connections. |
 | rx / tx ring per endpoint | 256 KiB each | A full ring stops the host reading, which backpressures the far side. |
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |

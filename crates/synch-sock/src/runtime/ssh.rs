@@ -809,6 +809,16 @@ impl SshState {
         }
     }
 
+    /// How many lanes `fd` holds open, for the per-channel lane cap.
+    pub(crate) fn lane_count(&self, fd: i64) -> usize {
+        self.lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(parent, _)| *parent == fd)
+            .count()
+    }
+
     pub(crate) fn lane_handle(&self, fd: i64, data_type: u32) -> Option<i64> {
         self.lanes
             .lock()

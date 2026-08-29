@@ -22,11 +22,19 @@ use std::time::Duration;
 /// Per-invocation and per-socket bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// The most endpoint handles one invocation may hold, `SY_SELF` included.
+    /// The most handles one invocation may hold, `SY_SELF` included.
     ///
     /// Also the `sy_poll` array cap, and deliberately the same number: a
-    /// program that can hold 32 endpoints must be able to wait on all 32, or
+    /// program that can hold 256 handles must be able to wait on all 256, or
     /// the last one it opened is one it can never learn about.
+    ///
+    /// The table is deliberately larger than any one resource's own bound.
+    /// What stops a guest turning spare slots into host memory or OS
+    /// children is not this number but the per-role caps beside it:
+    /// `max_egress`, the SSH channel cap, [`MAX_LANES_PER_CHANNEL`],
+    /// [`MAX_LIVE_PROCESSES`], [`MAX_OPEN_PTYS`],
+    /// [`MAX_OPEN_FILE_TRANSFERS`], and the footprint meter for objects,
+    /// cursors, and JSON values (`docs/SSH-SOCKETS.md` §9).
     pub max_handles: usize,
     /// The most outbound TCP connections one invocation may open.
     pub max_egress: usize,
@@ -54,7 +62,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_handles: 32,
+            max_handles: 256,
             max_egress: 8,
             ring_bytes: 256 * 1024,
             max_footprint: 1024 * 1024,
@@ -156,6 +164,38 @@ pub const MAX_ACCEPT_CONCURRENT: usize = 16;
 pub const MAX_ACCEPTS_PER_SECOND: usize = 64;
 /// See [`MAX_ACCEPT_CONCURRENT`] — accepts per peer IP per second.
 pub const MAX_ACCEPTS_PER_IP_PER_SECOND: usize = 8;
+
+/// The most concurrently live child processes one invocation may hold.
+///
+/// A process handle stands in front of a real OS child, which no handle-table
+/// arithmetic should be able to multiply: before the table grew to 256 slots
+/// the table itself was the only bound on spawns, and `docs/SSH-SOCKETS.md`
+/// §9 requires that growing the table be paired with a bound like this one.
+/// Counted as `Slot::Process` entries — pipe and PTY spawns alike — so a
+/// guest that is done with a child gives the slot back with `sy_close`.
+pub(crate) const MAX_LIVE_PROCESSES: usize = 16;
+
+/// The most PTY masters one invocation may hold open.
+///
+/// The counterpart of [`MAX_LIVE_PROCESSES`] for `sy_pty_open`: a PTY master
+/// carries a full-sized ring before any child is attached to it, so the
+/// masters are bounded on their own rather than only through the children.
+pub(crate) const MAX_OPEN_PTYS: usize = 16;
+
+/// The most file-transfer service endpoints one invocation may hold open.
+///
+/// Each `sy_file_transfer_open` allocates an endpoint ring and a bridge pipe
+/// host-side; like the process caps, this keeps the 256-slot handle table
+/// from being a multiplier on host memory (`docs/SSH-SOCKETS.md` §9).
+pub(crate) const MAX_OPEN_FILE_TRANSFERS: usize = 16;
+
+/// The most extended-data lanes one SSH channel may hold open.
+///
+/// `data_type` is a guest-chosen `u32` and lanes are keyed per
+/// `(channel, data_type)`, so without a cap a guest could mint one ring per
+/// integer up to the handle table's size. A real session uses one
+/// extended-data type (stderr); eight is generous.
+pub(crate) const MAX_LANES_PER_CHANNEL: usize = 8;
 
 /// The capacity of an ssh lane's outbound channel, in queued messages.
 ///

@@ -1592,6 +1592,48 @@ async fn json_values_parse_navigate_build_and_serialize() {
     assert_eq!(out, br#"{"mixed":[7,true,null]}"#);
 }
 
+/// The handle table holds 256 slots: with `SY_SELF` in slot zero, 255 JSON
+/// handles fit and the 256th is refused, and closing one frees a slot.
+const HANDLE_TABLE_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 handles[255];
+  for (int i = 0; i < 255; i++) {
+    handles[i] = sy_json_parse(SY_STR("null"));
+    if (handles[i] < 0) return 1000 + i;
+  }
+  if (sy_json_parse(SY_STR("null")) != SY_ELIMIT) return 1;
+  sy_close(handles[254]);
+  sy_s64 reused = sy_json_parse(SY_STR("null"));
+  if (reused < 0) return 2;
+  sy_close(reused);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn the_handle_table_holds_256_slots() {
+    let elf = compile(HANDLE_TABLE_CAP, "handle-table-cap.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 /// `sy_stat` answers as JSON, with the kind a name and the root in hex.
 const STAT_JSON: &str = r#"
 #include <synch.h>

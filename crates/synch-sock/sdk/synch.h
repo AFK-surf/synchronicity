@@ -391,7 +391,7 @@ extern sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
 
 /* ---- poll: the only helper that suspends -------------------------------- */
 
-/* Waits for readiness on up to 32 handles. Returns how many are ready, 0 on
+/* Waits for readiness on up to 256 handles. Returns how many are ready, 0 on
  * timeout, negative on error. A negative timeout means "until something
  * happens", clamped by the host to this invocation's idle deadline. */
 extern sy_s64 sy_poll(struct sy_pollfd *fds, sy_u64 n, sy_s64 timeout_ms);

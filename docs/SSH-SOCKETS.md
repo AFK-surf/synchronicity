@@ -989,8 +989,12 @@ The initial bounds:
 
 | Resource | Default / hard bound | Behavior at the bound |
 | --- | --- | --- |
-| Handles and poll entries | 32 | helper fails `SY_ELIMIT`; incoming channel is rejected if it cannot reserve its fd |
+| Handles and poll entries | 256 | helper fails `SY_ELIMIT`; incoming channel is rejected if it cannot reserve its fd |
 | Simultaneous SSH channels | 8 | bounded independently of handles; a full handle table may lower the effective count |
+| Extended-data lanes per channel | 8 | `sy_ssh_channel_lane` fails `SY_ELIMIT`; an existing lane for the same `data_type` is returned, not counted again |
+| Live child processes | 16 | pipe and PTY spawns together; spawn fails `SY_ELIMIT` until a process handle is closed |
+| Open PTY masters | 16 | `sy_pty_open` fails `SY_ELIMIT` |
+| Open file-transfer endpoints | 16 | `sy_file_transfer_open` fails `SY_ELIMIT` |
 | SSH channel ring | 64 KiB per direction | stops reading or writing the SSH channel and applies window backpressure |
 | Outstanding control events | 32 | channel request is deferred where possible; otherwise rejected or connection closed by protocol class |
 | Total event payload | 64 KiB | oversized request rejected; no partial credential or command is delivered |
@@ -1002,10 +1006,14 @@ The initial bounds:
 | SSH packet size | conservative library configuration, at most 64 KiB initially | protocol error |
 | SSH connection idle | existing invocation idle deadline | invocation ends `Deadline` |
 
-Thirty-two `struct sy_pollfd` values occupy 512 bytes, small beside the
-default 16 KiB eBPF local-call frame. Expanding the handle table must still be
-paired with per-role limits and an explicit memory charge; a larger integer
-alone would let thirty-one endpoints each allocate today's 512 KiB of rings.
+Two hundred fifty-six `struct sy_pollfd` values occupy 4 KiB, still small
+beside the default 16 KiB eBPF local-call frame. The table is deliberately
+larger than any one resource's own bound, and that is only sound because the
+expansion is paired with the per-role caps above: egress, channels, lanes,
+processes, PTYs, and file transfers each have their own count, and objects,
+cursors, and JSON values are charged to the 1 MiB footprint — a larger
+integer alone would have let every spare slot allocate today's 512 KiB of
+rings.
 
 The following allocations all have explicit individual bounds, and their
 maximum composition is bounded by the channel, handle, and event-count caps:

@@ -1810,6 +1810,9 @@ fn h_ssh_channel_lane(
             return ret(handle);
         }
     }
+    if state.lane_count(channel as i64) >= crate::limits::MAX_LANES_PER_CHANNEL {
+        return ret(errno::ELIMIT);
+    }
     let lane_ring = inner.limits.ring_bytes.min(64 * 1024);
     let endpoint = Endpoint::new(
         lane_ring,
@@ -2110,6 +2113,19 @@ fn parse_pty_spec(value: &Value) -> Result<crate::runtime::ssh::PtyRequest, i64>
     })
 }
 
+/// How many live child-process handles the invocation holds.
+///
+/// The handle table alone must not bound OS children ([`crate::limits::MAX_LIVE_PROCESSES`]).
+fn live_processes(inner: &Inner) -> usize {
+    inner
+        .slots
+        .borrow()
+        .iter()
+        .flatten()
+        .filter(|slot| matches!(slot, Slot::Process(_)))
+        .count()
+}
+
 fn h_pty_open(
     scope: &HelperScope,
     capability_id: u64,
@@ -2130,6 +2146,9 @@ fn h_pty_open(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if inner.ptys.borrow().len() >= crate::limits::MAX_OPEN_PTYS {
+        return ret(errno::ELIMIT);
+    }
     let (master, slave) = match crate::runtime::process::open_pty(
         spec.columns,
         spec.rows,
@@ -2221,6 +2240,9 @@ fn h_process_spawn_pty(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if live_processes(&inner) >= crate::limits::MAX_LIVE_PROCESSES {
+        return ret(errno::ELIMIT);
+    }
     let Some(pty) = inner.ptys.borrow().get(&(pty_handle as i64)).cloned() else {
         return ret(errno::EBADF);
     };
@@ -2280,6 +2302,9 @@ fn h_process_spawn(
         Ok(capability) if capability.flags & 0x02 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if live_processes(&inner) >= crate::limits::MAX_LIVE_PROCESSES {
+        return ret(errno::ELIMIT);
+    }
     let child_events = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
         Ok(events) => events,
         Err(_) => return ret(errno::ECONNRESET),
@@ -2482,6 +2507,18 @@ fn h_sftp_open(
     };
     if capability.protocol != 1 || capability.access & 0x01 == 0 {
         return ret(errno::EPERM);
+    }
+    let open = inner
+        .slots
+        .borrow()
+        .iter()
+        .flatten()
+        .filter(|slot| {
+            matches!(slot, Slot::Endpoint(ep) if matches!(ep.role(), EndpointRole::FileTransfer))
+        })
+        .count();
+    if open >= crate::limits::MAX_OPEN_FILE_TRANSFERS {
+        return ret(errno::ELIMIT);
     }
     let endpoint = Endpoint::new(
         inner.limits.ring_bytes,
