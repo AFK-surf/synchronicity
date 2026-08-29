@@ -1367,21 +1367,6 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
-const PER_CAPABILITY_PROCESS_LIMIT: &str = r#"
-#include <synch.h>
-
-SY_ENTRY sy_s64 entry(void) {
-  sy_s64 first = sy_process_spawn(1);
-  if (first < 0) return 80;
-  sy_s64 independent = sy_process_spawn(2);
-  if (independent < 0) return 81;
-  if (sy_process_spawn(1) != SY_ELIMIT) return 82;
-  sy_close(first);
-  sy_close(independent);
-  return 0;
-}
-"#;
-
 fn process_capability(id: u32) -> ProcessCapability {
     ProcessCapability {
         id,
@@ -1389,11 +1374,6 @@ fn process_capability(id: u32) -> ProcessCapability {
         executable: "/bin/sh".into(),
         argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
         allowed_signals: 0,
-        max_processes: 1,
-        max_runtime_ms: 5_000,
-        // This fixture exercises process control, not memory enforcement.
-        // Zero selects the runtime's portable default ceiling.
-        max_memory_bytes: 0,
     }
 }
 
@@ -1403,17 +1383,6 @@ async fn process_status_uses_eagain_then_one_and_is_repeatable() {
     let harness = Harness::new();
     let mut policy = EffectivePolicy::default();
     policy.processes.push(process_capability(1));
-    let (status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
-    assert_eq!(status, SockStatus::Ok(0));
-}
-
-#[tokio::test]
-async fn process_limits_are_accounted_per_capability() {
-    let elf = compile(PER_CAPABILITY_PROCESS_LIMIT, "process-limits.c");
-    let harness = Harness::new();
-    let mut policy = EffectivePolicy::default();
-    policy.processes.push(process_capability(1));
-    policy.processes.push(process_capability(2));
     let (status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
     assert_eq!(status, SockStatus::Ok(0));
 }

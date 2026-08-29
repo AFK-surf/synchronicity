@@ -192,19 +192,6 @@ pub const CHANNEL_LANE_CAPACITY: usize = 8;
 /// answers them.
 pub const MAX_OUTSTANDING_REQUESTS_PER_CHANNEL: usize = 16;
 
-/// Additional RLIMIT_NPROC headroom granted to spawned process groups, on Linux.
-///
-/// RLIMIT_NPROC is per-real-UID on Linux, so the cap is shared by every
-/// invocation running under the daemon's service uid. The runtime snapshots
-/// the uid's existing Linux task count once and adds this headroom; later
-/// children inherit that same absolute ceiling instead of granting new
-/// headroom for tasks earlier children created. Descendants are also forbidden
-/// from changing process groups, keeping cleanup able to reach them. A daemon
-/// UID or capability set that bypasses RLIMIT_NPROC refuses process spawning
-/// rather than running without this bound.
-#[cfg(target_os = "linux")]
-pub const MAX_PROCESSES_PER_GROUP: u64 = 64;
-
 /// The sliding window, in seconds, over which auth rejections are throttled.
 ///
 /// Host-side and cross-connection: when the window is full, further auth

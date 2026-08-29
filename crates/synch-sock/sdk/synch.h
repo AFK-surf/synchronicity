@@ -478,9 +478,6 @@ struct sy_process_capability {
   char argv[SY_PROCESS_MAX_ARGS][SY_PROCESS_ARG_MAX];
   sy_u32 argv_len[SY_PROCESS_MAX_ARGS];
   sy_u64 allowed_signals;
-  sy_u64 max_processes;
-  sy_u64 max_runtime_ms;
-  sy_u64 max_memory_bytes;
 };
 
 extern sy_s64 sy_declare_process(

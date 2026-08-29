@@ -282,17 +282,6 @@ pub struct ProcessCapability {
     pub argv: Vec<String>,
     /// `SY_PROCESS_SIGNAL_*` bits.
     pub allowed_signals: u64,
-    /// Self-imposed simultaneous-process limit; zero selects the host default.
-    pub max_processes: u64,
-    /// Self-imposed runtime limit in milliseconds; zero selects the host default.
-    pub max_runtime_ms: u64,
-    /// Self-imposed process-memory limit; zero selects the host default.
-    ///
-    /// Hosts enforce an address-space limit where the kernel supports a useful
-    /// one. macOS instead monitors the spawned process group's aggregate
-    /// resident memory and kills the group when it crosses this limit, because
-    /// its loader reserves a large sparse address space at exec time.
-    pub max_memory_bytes: u64,
 }
 
 /// A scoped built-in file-transfer capability embedded in a socket program.
@@ -1119,9 +1108,6 @@ mod tests {
                     executable: "/usr/bin/printf".into(),
                     argv: vec!["printf".into(), "hello world".into()],
                     allowed_signals: 0,
-                    max_processes: 1,
-                    max_runtime_ms: 1000,
-                    max_memory_bytes: 16 * 1024 * 1024,
                 },
                 ProcessCapability {
                     id: 2,
@@ -1129,9 +1115,6 @@ mod tests {
                     executable: "/bin/sh".into(),
                     argv: vec!["sh".into(), "-l".into()],
                     allowed_signals: 7,
-                    max_processes: 0,
-                    max_runtime_ms: 0,
-                    max_memory_bytes: 0,
                 },
             ],
             file_transfers: vec![FileTransferCapability {
@@ -1158,9 +1141,6 @@ mod tests {
             executable: "/bin/true".into(),
             argv: vec!["true".into()],
             allowed_signals: 0,
-            max_processes: 0,
-            max_runtime_ms: 0,
-            max_memory_bytes: 0,
         };
         let declaration = Declaration {
             processes: vec![process.clone(), process],

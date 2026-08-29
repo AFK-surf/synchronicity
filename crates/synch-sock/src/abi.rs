@@ -64,7 +64,7 @@ pub(crate) const POLLFD_SIZE: u64 = 16;
 pub(crate) const STAT_SIZE: u64 = 56;
 
 /// `sizeof(struct sy_process_capability)` in the C SDK ABI.
-pub(crate) const PROCESS_CAPABILITY_SIZE: u64 = 1360;
+pub(crate) const PROCESS_CAPABILITY_SIZE: u64 = 1336;
 
 /// `sizeof(struct sy_file_transfer_capability)` in the C SDK ABI.
 pub(crate) const FILE_TRANSFER_CAPABILITY_SIZE: u64 = 272;

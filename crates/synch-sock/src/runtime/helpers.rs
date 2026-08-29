@@ -1564,25 +1564,6 @@ fn process_capability(inner: &Inner, id: u32) -> Result<synch_core::ProcessCapab
         .ok_or(errno::EPERM)
 }
 
-fn process_capacity(inner: &Inner, capability: &synch_core::ProcessCapability) -> Result<(), i64> {
-    let open = inner
-        .slots
-        .borrow()
-        .iter()
-        .filter(|slot| {
-            matches!(slot, Some(Slot::Process(process)) if process.capability == capability.id)
-        })
-        .count() as u64;
-    let limit = if capability.max_processes == 0 {
-        crate::runtime::process::DEFAULT_MAX_PROCESSES
-    } else {
-        capability
-            .max_processes
-            .min(crate::runtime::process::DEFAULT_MAX_PROCESSES)
-    };
-    (open < limit).then_some(()).ok_or(errno::ELIMIT)
-}
-
 fn parse_pty_spec(
     scope: &HelperScope,
     ptr: u64,
@@ -1639,9 +1620,6 @@ fn h_pty_open(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
-    if let Err(error) = process_capacity(&inner, &capability) {
-        return ret(error);
-    }
     let (master, slave) = match crate::runtime::process::open_pty(
         spec.columns,
         spec.rows,
@@ -1733,9 +1711,6 @@ fn h_process_spawn_pty(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
-    if let Err(error) = process_capacity(&inner, &capability) {
-        return ret(error);
-    }
     let Some(pty) = inner.ptys.borrow().get(&(pty_handle as i64)).cloned() else {
         return ret(errno::EBADF);
     };
@@ -1755,7 +1730,6 @@ fn h_process_spawn_pty(
     let process = Rc::new(crate::runtime::process::ProcessSlot {
         child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pty(child))),
         status: std::cell::RefCell::new(Default::default()),
-        capability: capability.id,
         allowed_signals: capability.allowed_signals,
         main: pty.endpoint,
         stderr: None,
@@ -1767,9 +1741,6 @@ fn h_process_spawn_pty(
             return ret(error);
         }
     };
-    schedule_process_deadline(&inner, &process, capability.max_runtime_ms);
-    #[cfg(target_os = "macos")]
-    schedule_process_memory_limit(&inner, &process, capability.max_memory_bytes);
     inner.publish_handles();
     ret(handle)
 }
@@ -1787,9 +1758,6 @@ fn h_process_spawn(
         Ok(capability) if capability.flags & 0x02 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
-    if let Err(error) = process_capacity(&inner, &capability) {
-        return ret(error);
-    }
     let (child, stdout, stdin, stderr) = match crate::runtime::process::spawn_pipe(&capability) {
         Ok(parts) => parts,
         Err(error) => return ret(error),
@@ -1839,7 +1807,6 @@ fn h_process_spawn(
     let process = Rc::new(crate::runtime::process::ProcessSlot {
         child: std::cell::RefCell::new(Some(crate::runtime::process::Child::Pipe(child))),
         status: std::cell::RefCell::new(Default::default()),
-        capability: capability.id,
         allowed_signals: capability.allowed_signals,
         main,
         stderr: Some(stderr_handle),
@@ -1853,113 +1820,8 @@ fn h_process_spawn(
             return ret(error);
         }
     };
-    schedule_process_deadline(&inner, &process, capability.max_runtime_ms);
-    #[cfg(target_os = "macos")]
-    schedule_process_memory_limit(&inner, &process, capability.max_memory_bytes);
     inner.publish_handles();
     ret(handle)
-}
-
-fn schedule_process_deadline(
-    inner: &Rc<Inner>,
-    process: &Rc<crate::runtime::process::ProcessSlot>,
-    max_runtime_ms: u64,
-) {
-    let max_runtime_ms = if max_runtime_ms == 0 {
-        crate::runtime::process::DEFAULT_MAX_RUNTIME_MS
-    } else {
-        max_runtime_ms.min(crate::runtime::process::DEFAULT_MAX_RUNTIME_MS)
-    };
-    let Some(pid) = process.pid() else { return };
-    let process = Rc::downgrade(process);
-    inner.spawn(async move {
-        tokio::time::sleep(Duration::from_millis(max_runtime_ms)).await;
-        if let Some(process) = process.upgrade() {
-            process.kill_if_pid(pid);
-        }
-    });
-}
-
-#[cfg(target_os = "macos")]
-fn schedule_process_memory_limit(
-    inner: &Rc<Inner>,
-    process: &Rc<crate::runtime::process::ProcessSlot>,
-    max_memory_bytes: u64,
-) {
-    let limit = if max_memory_bytes == 0 {
-        crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES
-    } else {
-        max_memory_bytes.min(crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES)
-    };
-    let Some(pgid) = process.pid() else { return };
-    if i32::try_from(pgid).is_err() {
-        process.kill();
-        return;
-    }
-    let process = Rc::downgrade(process);
-    inner.spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Tokio intervals tick immediately. Darwin may report a newly-created
-        // process group before proc_pid_rusage can account for any member, so
-        // leave one sampling interval for process accounting to become ready.
-        interval.tick().await;
-        // Accounting failure means two different things depending on when.
-        // A host that has never measured this group cannot enforce the limit
-        // at all — hardened hosts deny per-child rusage — and killing every
-        // declared process would turn "cannot watch" into "must not run", so
-        // after a bounded attempt the monitor stands down with a warning. A
-        // group that *stops* being measurable while running looks like
-        // hiding, and still fails closed after a short grace for transients.
-        let mut measured = false;
-        let mut failures = 0u32;
-        loop {
-            interval.tick().await;
-            let Some(process) = process.upgrade() else {
-                break;
-            };
-            if process.pid() != Some(pgid) {
-                break;
-            }
-            match process.refresh() {
-                Ok(status) if status.exited => break,
-                Ok(_) => {}
-                Err(_) => {
-                    process.kill_if_pid(pgid);
-                    break;
-                }
-            }
-            match crate::runtime::process::process_group_footprint_bytes(pgid) {
-                Ok(Some(bytes)) if bytes <= limit => {
-                    measured = true;
-                    failures = 0;
-                }
-                Ok(None) => break,
-                Ok(Some(_)) => {
-                    // A real measurement over the declared ceiling — the
-                    // fail-closed u64::MAX for an overflowing group included.
-                    process.kill_if_pid(pgid);
-                    break;
-                }
-                Err(()) => {
-                    failures += 1;
-                    if measured && failures >= 5 {
-                        process.kill_if_pid(pgid);
-                        break;
-                    }
-                    if !measured && failures >= 25 {
-                        tracing::warn!(
-                            pgid,
-                            "process memory accounting is unavailable on this \
-                             host; the declared memory ceiling is not enforced \
-                             for this child"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-    });
 }
 
 fn h_process_stdio(
@@ -3152,20 +3014,7 @@ fn h_declare_process(
         executable,
         argv,
         allowed_signals: le_u64(&raw, 1328),
-        max_processes: le_u64(&raw, 1336),
-        max_runtime_ms: le_u64(&raw, 1344),
-        max_memory_bytes: le_u64(&raw, 1352),
     };
-    // A limit above the host's hard ceiling is refused at arm time rather
-    // than silently clamped later: the operator approves the numbers the
-    // declaration shows, so those numbers must be the ones enforced (§7.1).
-    // Zero still selects the host default.
-    if capability.max_processes > crate::runtime::process::DEFAULT_MAX_PROCESSES
-        || capability.max_runtime_ms > crate::runtime::process::DEFAULT_MAX_RUNTIME_MS
-        || capability.max_memory_bytes > crate::runtime::process::DEFAULT_MAX_MEMORY_BYTES
-    {
-        return ret(errno::ELIMIT);
-    }
     with(scope, |inner| {
         if let Some(error) = mode_check(inner, true) {
             return error;

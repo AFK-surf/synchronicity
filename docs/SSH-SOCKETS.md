@@ -103,10 +103,9 @@ used with an SFTP helper or vice versa.
 
 The operator workflow remains one decision: inspect the concrete declarations
 printed by `synch socket arm` and approve or refuse the program. The host may
-refuse an artifact whose executable is absent, whose feature is unsupported on
-that node, or whose request exceeds hard safety limits, but it never asks the
-operator to repair the declaration interactively. Host keys, process isolation
-defaults, resource ceilings, and clean process environments are generated or
+refuse an artifact whose executable is absent or whose feature is unsupported
+on that node, but it never asks the operator to repair the declaration
+interactively. Host keys and clean process environments are generated or
 defined by the runtime. A socket that needs different authority is a different
 program root with a different reviewed declaration.
 
@@ -768,9 +767,6 @@ struct sy_process_capability {
   char argv[SY_PROCESS_MAX_ARGS][SY_PROCESS_ARG_MAX];
   sy_u32 argv_len[SY_PROCESS_MAX_ARGS];
   sy_u64 allowed_signals;            /* host-defined signal-name bits */
-  sy_u64 max_processes;              /* may only lower host hard defaults */
-  sy_u64 max_runtime_ms;
-  sy_u64 max_memory_bytes;
 };
 
 #define SY_PROCESS_ALLOW_PTY  0x01
@@ -787,20 +783,18 @@ sy_s64 sy_declare_process(
 ```
 
 The host rejects duplicate or zero ids, malformed paths and arguments, an
-executable that cannot be resolved safely at arm time, limits above host hard
-ceilings, and unsupported flags. The declaration contains no request-derived
-bytes. A future structured argument facility would be a separate capability;
-the initial API always runs the exact declared argv and never invokes a shell
-implicitly. A zero resource-limit field selects the host default; a nonzero
-field may only reduce it.
+executable that cannot be resolved safely at arm time, and unsupported flags.
+The declaration contains no request-derived bytes. A future structured argument
+facility would be a separate capability; the initial API always runs the exact
+declared argv and never invokes a shell implicitly.
 
-Processes run as the daemon's unprivileged service identity with a clean,
-host-defined environment, closed inherited descriptors, a fresh process group,
-and fixed host safety limits. PTYs synthesize `TERM` from the validated terminal
-request. The declaration may reduce limits and permit specific signals but
-cannot request another uid/gid, inherit daemon environment variables, weaken
-isolation, or raise a limit. These defaults are part of the runtime, not
-operator configuration.
+Processes inherit the daemon's identity and resource limits. The runtime does
+not impose process-specific count, runtime, or memory ceilings, and it does not
+sandbox the child. An operator who wants containment can declare a wrapper such
+as `bwrap` as the executable. The runtime supplies a clean, host-defined
+environment, closes unrelated inherited descriptors, and creates a fresh
+process group for lifecycle and signal handling. PTYs synthesize `TERM` from
+the validated terminal request.
 
 Allocation and process start are separate so a successful `pty-req` does not
 start a shell before a later `shell` request:
@@ -943,8 +937,7 @@ cannot manufacture a new executable or command line.
 
 Authentication remains connection-wide but command selection is per session.
 The same key may therefore open several concurrent sessions, each backed by a
-separate instance of its allowed capability and charged against that
-declaration's process limit.
+separate instance of its allowed capability.
 
 ### 7.2 File-transfer backing
 
@@ -1487,8 +1480,8 @@ boundary. One hardcoded Iroh device key is the user identity, SSH `none`
 completes the inner authentication exchange, and a concrete process capability
 starts a fixed local login shell on a PTY. The SSH username is informational
 and does not select an OS account. The process runs under the runtime's fixed
-service identity and isolation, while its declaration pins the executable,
-argv, resource ceilings, and accepted signals including `HUP` for channel EOF.
+service identity, while its declaration pins the executable, argv, and accepted
+signals including `HUP` for channel EOF. It is not sandboxed by the runtime.
 
 The example reuses the bounded poll/event reactor from §15.1. These are the
 declaration, admission, channel-request, and pump portions that replace its
@@ -1727,7 +1720,7 @@ says so.
 This compact example permits one live shell channel. Replacing `terminal` with
 the same bounded slot array used in §15.1 permits several independent PTYs on a
 control-master connection; each PTY and process is charged separately to the
-declaration and channel limits.
+invocation's ordinary handle and channel limits.
 
 A stock client reaches it through the existing transport bridge:
 
