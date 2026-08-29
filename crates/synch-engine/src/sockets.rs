@@ -764,7 +764,11 @@ impl SocketHost for TreeHost {
     /// entries under it rather than a row of its own. A socket refuses like
     /// `open` refuses one: the kind says what would serve, not what the
     /// neighbour's code is.
-    fn entry_kind(&self, origin: Option<&str>, path: &str) -> std::result::Result<u32, HostError> {
+    fn entry_kind(
+        &self,
+        origin: Option<&str>,
+        path: &str,
+    ) -> std::result::Result<synch_sock::HostEntryKind, HostError> {
         let (space, rest) = TreeHost::split(path)?;
         let origin = match origin {
             None => self.own_origin.clone(),
@@ -785,7 +789,13 @@ impl SocketHost for TreeHost {
                             .into(),
                     ));
                 }
-                Ok(row.kind as u32)
+                Ok(match row.kind {
+                    EntryKind::File => synch_sock::HostEntryKind::File,
+                    EntryKind::Dir => synch_sock::HostEntryKind::Directory,
+                    EntryKind::Symlink => synch_sock::HostEntryKind::Symlink,
+                    EntryKind::Tombstone => synch_sock::HostEntryKind::Tombstone,
+                    EntryKind::Socket => synch_sock::HostEntryKind::Socket,
+                })
             }
             // No row of its own: the path is a directory only if something is
             // published under it, and one row's existence check is enough.
@@ -798,7 +808,7 @@ impl SocketHost for TreeHost {
                 if children.is_empty() {
                     Err(HostError::NotFound)
                 } else {
-                    Ok(1)
+                    Ok(synch_sock::HostEntryKind::Directory)
                 }
             }
         }
@@ -1703,7 +1713,12 @@ mod tests {
             )
             .unwrap();
         store
-            .put_entry(&origin, "media", "old.txt", &FileEntry::tombstone(0, 3, None))
+            .put_entry(
+                &origin,
+                "media",
+                "old.txt",
+                &FileEntry::tombstone(0, 3, None),
+            )
             .unwrap();
         store
             .put_entry(
@@ -1737,11 +1752,18 @@ mod tests {
             own_origin: origin.clone(),
         };
 
-        // Rows answer with the same kind codes TreeHost::info publishes:
-        // file 0, dir 1, tombstone 3.
-        assert_eq!(host.entry_kind(None, "media/guide.md").unwrap(), 0);
-        assert_eq!(host.entry_kind(None, "media/docs").unwrap(), 1);
-        assert_eq!(host.entry_kind(None, "media/old.txt").unwrap(), 3);
+        assert_eq!(
+            host.entry_kind(None, "media/guide.md").unwrap(),
+            synch_sock::HostEntryKind::File
+        );
+        assert_eq!(
+            host.entry_kind(None, "media/docs").unwrap(),
+            synch_sock::HostEntryKind::Directory
+        );
+        assert_eq!(
+            host.entry_kind(None, "media/old.txt").unwrap(),
+            synch_sock::HostEntryKind::Tombstone
+        );
         // A socket refuses like open() refuses one.
         assert!(matches!(
             host.entry_kind(None, "media/git.sock"),
@@ -1751,7 +1773,10 @@ mod tests {
         // The local scanner publishes no Dir rows, so once the row is gone
         // the path is still a directory as long as entries exist under it...
         store.delete_entry(&origin, "media", "docs").unwrap();
-        assert_eq!(host.entry_kind(None, "media/docs").unwrap(), 1);
+        assert_eq!(
+            host.entry_kind(None, "media/docs").unwrap(),
+            synch_sock::HostEntryKind::Directory
+        );
         // ...and a path with neither a row nor anything under it is not found.
         assert!(matches!(
             host.entry_kind(None, "media/missing"),

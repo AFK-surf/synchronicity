@@ -179,6 +179,17 @@ SY_ENTRY sy_s64 entry(void) {
 const SSH_CERT_SERVER: &str = r#"
 #include <synch.h>
 
+static const unsigned char trusted_ca[32] = { __TRUSTED_CA_BYTES__ };
+
+static sy_s64 trusted(sy_u64 event_id) {
+  unsigned char seen[32];
+  if (sy_ssh_event_data(event_id, SY_SSH_FIELD_AUTH_CERT_CA_SHA256,
+                        seen, sizeof seen) != 32) return 0;
+  for (sy_u64 i = 0; i < sizeof seen; i++)
+    if (seen[i] != trusted_ca[i]) return 0;
+  return 1;
+}
+
 SY_ENTRY sy_s64 entry(void) {
   if (sy_ssh_start(SY_SELF, SY_SSH_AUTH_PUBLICKEY) < 0) return 50;
   struct sy_pollfd conn[1] = {{ SY_SELF, SY_POLL_IN, 0 }};
@@ -189,14 +200,17 @@ SY_ENTRY sy_s64 entry(void) {
       while (sy_ssh_next(SY_SELF, &event, sizeof event) == 1) {
         if (event.kind == SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER) {
           /* The certificate probe: accept the offer so the client signs
-             its possession proof. */
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_OFFER_ACCEPT,
+             its possession proof, but only for the declared trusted CA. */
+          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_OFFER_ACCEPT
+                                            : SY_SSH_AUTH_REJECT;
+          if (sy_ssh_auth_reply(event.id, result,
                                 SY_SSH_AUTH_PUBLICKEY) < 0) return 52;
         } else if (event.kind == SY_SSH_EVENT_AUTH_OPENSSH_CERT) {
-          /* The signed certificate request: the library has already
-             validated the certificate and the possession signature, so
-             this is a real authentication -- accept. */
-          if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
+          /* Structure, principal and possession are host-validated; the guest
+             still authorizes the signing CA. */
+          sy_u64 result = trusted(event.id) ? SY_SSH_AUTH_ACCEPT
+                                            : SY_SSH_AUTH_REJECT;
+          if (sy_ssh_auth_reply(event.id, result,
                                 SY_SSH_AUTH_PUBLICKEY) < 0) return 53;
         } else {
           if (sy_ssh_event_done(event.id) < 0) return 54;
@@ -809,7 +823,21 @@ async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
     use russh::keys::ssh_key::certificate::{Builder, CertType};
     use russh::keys::{Algorithm, PrivateKey};
 
-    let elf = compile(SSH_CERT_SERVER, "ssh-cert.c");
+    // A CA-signed user certificate, built in-process exactly as the russh
+    // server-side tests do: no ssh-keygen on the path. Its digest is compiled
+    // into the guest policy, which must make the CA trust decision.
+    let ca = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let user = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let ca_blob = ca.public_key().to_bytes().unwrap();
+    let ca_digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &ca_blob);
+    let ca_bytes = ca_digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = SSH_CERT_SERVER.replace("__TRUSTED_CA_BYTES__", &ca_bytes);
+    let elf = compile(&source, "ssh-cert.c");
     let harness = Harness::new();
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
@@ -829,10 +857,6 @@ async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
     .await
     .unwrap();
 
-    // A CA-signed user certificate, built in-process exactly as the russh
-    // server-side tests do: no ssh-keygen on the path.
-    let ca = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
-    let user = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -849,6 +873,80 @@ async fn openssh_certificate_auth_arrives_as_its_own_event_kind() {
     builder.cert_type(CertType::User).unwrap();
     builder.valid_principal("test").unwrap();
     let cert = builder.sign(&ca).unwrap();
+
+    // Host validation rejects a certificate whose principals do not include
+    // the requested SSH username, even when the signing CA is trusted.
+    let mut wrong_principal_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    wrong_principal_builder.serial(3).unwrap();
+    wrong_principal_builder.key_id("wrong-principal").unwrap();
+    wrong_principal_builder.cert_type(CertType::User).unwrap();
+    wrong_principal_builder
+        .valid_principal("somebody-else")
+        .unwrap();
+    let wrong_principal = wrong_principal_builder.sign(&ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), wrong_principal)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "a certificate for another principal must be rejected"
+    );
+
+    // The adapter implements no OpenSSH critical options; unknown critical
+    // semantics must fail closed rather than being ignored.
+    let mut critical_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    critical_builder.serial(4).unwrap();
+    critical_builder.key_id("critical-option").unwrap();
+    critical_builder.cert_type(CertType::User).unwrap();
+    critical_builder.valid_principal("test").unwrap();
+    critical_builder
+        .critical_option("force-command", "forbidden")
+        .unwrap();
+    let critical = critical_builder.sign(&ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), critical)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "unsupported critical certificate options must be rejected"
+    );
+
+    // An internally valid certificate from an arbitrary CA is not trusted.
+    let rogue_ca = PrivateKey::random(&mut rand_10::rng(), Algorithm::Ed25519).unwrap();
+    let mut rogue_builder = Builder::new_with_random_nonce(
+        &mut rand_10::rng(),
+        user.public_key(),
+        now - 60,
+        now + 3600,
+    )
+    .unwrap();
+    rogue_builder.serial(2).unwrap();
+    rogue_builder.key_id("rogue-user").unwrap();
+    rogue_builder.cert_type(CertType::User).unwrap();
+    rogue_builder.valid_principal("test").unwrap();
+    let rogue = rogue_builder.sign(&rogue_ca).unwrap();
+    let rejected = client
+        .authenticate_openssh_cert("test", Arc::new(user.clone()), rogue)
+        .await
+        .unwrap();
+    assert!(
+        !rejected.success(),
+        "an untrusted signing CA must be rejected"
+    );
 
     let auth = client
         .authenticate_openssh_cert("test", Arc::new(user), cert)
@@ -1233,11 +1331,10 @@ SY_ENTRY sy_s64 entry(void) {
           if (sy_ssh_auth_reply(event.id, SY_SSH_AUTH_ACCEPT,
                                 SY_SSH_AUTH_NONE) < 0) return 92;
         } else if (event.kind == SY_SSH_EVENT_AUTHENTICATED) {
-          /* Every open is refused by the peer (CHANNEL_OPEN_FAILURE). Each
-             refusal must free the handle: 40 refused opens (more than the
-             32-slot table) must all hand out a handle, which fails today
-             because a refused open leaks its slot forever. Each open waits
-             for its ERR before the next, so the cleanup has run. */
+          /* Every open is refused by the peer (CHANNEL_OPEN_FAILURE). The
+             failed fd stays reserved until the guest closes it, so it cannot
+             alias a later endpoint; closing each one must allow more than a
+             handle-table's worth of sequential refusals. */
           for (sy_s64 i = 0; i < 40; i++) {
             sy_s64 h = sy_ssh_channel_open(SY_SELF, type, sizeof(type) - 1,
                                            opening, 0);
@@ -1249,6 +1346,7 @@ SY_ENTRY sy_s64 entry(void) {
               if (wait[0].revents & SY_POLL_ERR) { refused = 1; break; }
             }
             if (!refused) return 95;
+            if (sy_close(h) < 0) return 98;
           }
           if (sy_ssh_event_done(event.id) < 0) return 96;
           return 0;

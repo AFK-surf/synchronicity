@@ -1164,6 +1164,26 @@ impl Encrypted {
                 let pubkey = match pk_or_cert {
                     PublicKeyOrCertificate::PublicKey { ref key, .. } => key.clone(),
                     PublicKeyOrCertificate::Certificate(ref cert) => {
+                        // User authentication accepts only user certificates,
+                        // and a non-empty principal list must name the SSH
+                        // username. CA trust remains the handler's policy
+                        // decision, but certificate identity is enforced here.
+                        if !cert.cert_type().is_user()
+                            || (!cert.valid_principals().is_empty()
+                                && !cert.valid_principals().iter().any(|name| name == user))
+                        {
+                            warn!("Certificate type or principal is invalid for user");
+                            reject_auth_request(until, &mut self.write, auth_request).await?;
+                            return Ok(());
+                        }
+                        // This server layer implements no OpenSSH critical
+                        // options. Per PROTOCOL.certkeys, every unrecognized
+                        // critical option must reject the certificate.
+                        if !cert.critical_options().is_empty() {
+                            warn!("Certificate carries unsupported critical options");
+                            reject_auth_request(until, &mut self.write, auth_request).await?;
+                            return Ok(());
+                        }
                         // Validate certificate expiration. The bounds are None
                         // for OpenSSH's "always valid" sentinels (PROTOCOL.certkeys),
                         // which skips the corresponding check.
@@ -1227,7 +1247,14 @@ impl Encrypted {
                     } else {
                         auth_user.clear();
                         auth_user.push_str(user);
-                        let auth = handler.auth_publickey_offered(user, &pubkey).await?;
+                        let auth = match &pk_or_cert {
+                            PublicKeyOrCertificate::Certificate(cert) => {
+                                handler.auth_publickey_offered_cert(user, cert).await?
+                            }
+                            PublicKeyOrCertificate::PublicKey { .. } => {
+                                handler.auth_publickey_offered(user, &pubkey).await?
+                            }
+                        };
                         auth == Auth::Accept
                     };
 
@@ -1555,7 +1582,7 @@ impl Session {
                         // never block the run loop past the inactivity
                         // timer's polling interval. Drop the message on
                         // timeout (mirrors synch-sock's LANE_SEND_TIMEOUT_MS).
-                        let _ = tokio::time::timeout(
+                        let queued = tokio::time::timeout(
                             std::time::Duration::from_secs(1),
                             chan.send(ChannelMsg::ExtendedData {
                                 ext,
@@ -1563,15 +1590,26 @@ impl Session {
                             }),
                         )
                         .await;
+                        if !matches!(queued, Ok(Ok(()))) {
+                            // Channel data is a reliable byte stream. Once its
+                            // receive window has been consumed/adjusted above,
+                            // silently dropping this packet corrupts the
+                            // stream. Bound the run loop by terminating the
+                            // connection instead.
+                            return Err(H::Error::from(crate::Error::SendError));
+                        }
                     }
                     handler.extended_data(channel_num, ext, &data, self).await
                 } else {
                     if let Some(chan) = self.channels.get(&channel_num) {
-                        let _ = tokio::time::timeout(
+                        let queued = tokio::time::timeout(
                             std::time::Duration::from_secs(1),
                             chan.send(ChannelMsg::Data { data: data.clone() }),
                         )
                         .await;
+                        if !matches!(queued, Ok(Ok(()))) {
+                            return Err(H::Error::from(crate::Error::SendError));
+                        }
                     }
                     handler.data(channel_num, &data, self).await
                 }

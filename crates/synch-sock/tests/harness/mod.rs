@@ -134,24 +134,26 @@ impl SocketHost for FakeTree {
         })
     }
 
-    fn entry_kind(&self, _origin: Option<&str>, path: &str) -> Result<u32, HostError> {
+    fn entry_kind(
+        &self,
+        _origin: Option<&str>,
+        path: &str,
+    ) -> Result<synch_sock::HostEntryKind, HostError> {
         // The engine contract, over a flat `files` map: a row's kind comes
         // from the row (every row here is a regular file), a directory that
-        // has no row but has descendants is kind 1, and a refused row
+        // has no row but has descendants is a directory, and a refused row
         // (socket, symlink, tombstone) is refused here too, so the SFTP
         // backend skips it rather than invent attributes.
         if self.refused.contains(path) {
             return Err(HostError::NotReadable("refused".into()));
         }
         if self.files.contains_key(path) {
-            return Ok(0);
+            return Ok(synch_sock::HostEntryKind::File);
         }
         if self.files.keys().any(|key| {
-            key.len() > path.len()
-                && key.starts_with(path)
-                && key.as_bytes()[path.len()] == b'/'
+            key.len() > path.len() && key.starts_with(path) && key.as_bytes()[path.len()] == b'/'
         }) {
-            return Ok(1);
+            return Ok(synch_sock::HostEntryKind::Directory);
         }
         Err(HostError::NotFound)
     }

@@ -39,8 +39,9 @@ pub(crate) const EVENT_AUTH_PUBLICKEY_OFFER: u32 = 3;
 pub(crate) const EVENT_AUTH_PUBLICKEY_VERIFIED: u32 = 4;
 pub(crate) const EVENT_AUTHENTICATED: u32 = 5;
 // 9, not 5: 5 is EVENT_AUTHENTICATED, and event kinds are a shared ABI.
-// A certificate authentication is a real authentication (russh has already
-// validated the certificate and the possession signature), not an offer.
+// A certificate authentication is a real authentication: russh has validated
+// its structure and signatures, while the guest must authorize its CA. It is
+// not a public-key probe/offer.
 pub(crate) const EVENT_AUTH_OPENSSH_CERT: u32 = 9;
 pub(crate) const EVENT_CHANNEL_OPEN: u32 = 6;
 pub(crate) const EVENT_CHANNEL_REQUEST: u32 = 7;
@@ -69,6 +70,20 @@ pub(crate) const FIELD_AUTH_ATTEMPTS: u32 = 20;
 /// Present on certificate auth events and on publickey offers that were
 /// backed by an OpenSSH certificate.
 pub(crate) const FIELD_AUTH_CERT_FLAG: u32 = 21;
+/// SSH wire blob of the certificate's signing CA public key.
+pub(crate) const FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB: u32 = 22;
+/// SHA-256 digest of [`FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB`].
+pub(crate) const FIELD_AUTH_CERT_CA_SHA256: u32 = 23;
+/// CA-assigned certificate key id.
+pub(crate) const FIELD_AUTH_CERT_KEY_ID: u32 = 24;
+/// Certificate serial as one little-endian `u64`.
+pub(crate) const FIELD_AUTH_CERT_SERIAL: u32 = 25;
+/// OpenSSH certificate type as one little-endian `u32` (user=1, host=2).
+pub(crate) const FIELD_AUTH_CERT_TYPE: u32 = 26;
+/// Principals encoded as repeated little-endian `u32` length plus UTF-8 bytes.
+pub(crate) const FIELD_AUTH_CERT_PRINCIPALS: u32 = 27;
+/// Complete OpenSSH wire-format certificate blob.
+pub(crate) const FIELD_AUTH_CERT_BLOB: u32 = 28;
 
 pub(crate) const EVENT_WANT_REPLY: u32 = 0x01;
 
@@ -181,6 +196,9 @@ pub(crate) struct SshState {
     /// CHANNEL_REQUEST tasks currently parked per channel (bounded at
     /// MAX_OUTSTANDING_REQUESTS_PER_CHANNEL).
     requests: Mutex<HashMap<ChannelId, usize>>,
+    /// Abort handles for those tasks, so closing a channel cancels its parked
+    /// decisions before the numeric channel id can be reused.
+    request_tasks: Mutex<HashMap<ChannelId, Vec<tokio::task::AbortHandle>>>,
     /// Ownership tokens binding an accepted channel's event to its endpoint
     /// fd, so a closed-and-reused fd can never capture a stale registration.
     accepts: Mutex<HashMap<i64, u64>>,
@@ -188,6 +206,18 @@ pub(crate) struct SshState {
     /// client; surfaced to the guest through `sy_ssh_exit_status_lost`.
     lost_exit_deliveries: AtomicU64,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+/// One live slot in a channel's outstanding-request budget.
+struct RequestGuard {
+    state: Arc<SshState>,
+    channel: ChannelId,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.state.dec_request(self.channel);
+    }
 }
 
 impl SshState {
@@ -206,6 +236,7 @@ impl SshState {
             discarded_lanes: Mutex::new(HashSet::new()),
             request_order: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
+            request_tasks: Mutex::new(HashMap::new()),
             accepts: Mutex::new(HashMap::new()),
             lost_exit_deliveries: AtomicU64::new(0),
             tasks: Mutex::new(Vec::new()),
@@ -389,6 +420,10 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.request_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.accepts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -412,6 +447,32 @@ impl SshState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tasks.retain(|task| !task.is_finished());
         tasks.push(task.abort_handle());
+    }
+
+    /// Spawns a channel-request decision task and binds its lifetime to the
+    /// channel. Closing the channel aborts the task, drops its request guard,
+    /// and prevents a late reply from being delivered to a reused channel id.
+    fn spawn_request(
+        &self,
+        channel: ChannelId,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let task = tokio::spawn(future);
+        let abort = task.abort_handle();
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(abort.clone());
+        drop(tasks);
+        let mut request_tasks = self
+            .request_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let channel_tasks = request_tasks.entry(channel).or_default();
+        channel_tasks.retain(|task| !task.is_finished());
+        channel_tasks.push(abort);
     }
 
     fn set_session(&self, handle: russh::server::Handle) {
@@ -475,15 +536,21 @@ impl SshState {
             .remove(&fd);
     }
 
-    /// Counts one outstanding CHANNEL_REQUEST for `id`; returns the new count.
-    fn bump_request(&self, id: ChannelId) -> usize {
+    /// Reserves one outstanding CHANNEL_REQUEST slot for `id`.
+    fn try_request(self: &Arc<Self>, id: ChannelId) -> Option<RequestGuard> {
         let mut requests = self
             .requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = requests.entry(id).or_insert(0);
+        if *count >= MAX_OUTSTANDING_REQUESTS_PER_CHANNEL {
+            return None;
+        }
         *count += 1;
-        *count
+        Some(RequestGuard {
+            state: self.clone(),
+            channel: id,
+        })
     }
 
     /// Uncounts one outstanding CHANNEL_REQUEST for `id`.
@@ -526,10 +593,16 @@ impl SshState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
-        self.requests
+        if let Some(tasks) = self
+            .request_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+            .remove(&id)
+        {
+            for task in tasks {
+                task.abort();
+            }
+        }
     }
 
     pub(crate) fn remove_channel_fd(&self, fd: i64) {
@@ -544,10 +617,16 @@ impl SshState {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&id);
-            self.requests
+            if let Some(tasks) = self
+                .request_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+                .remove(&id)
+            {
+                for task in tasks {
+                    task.abort();
+                }
+            }
         }
         self.lanes
             .lock()
@@ -849,7 +928,10 @@ impl SshHandler {
         {
             return Err(russh::Error::Disconnect);
         }
-        if self.username.as_ref().is_some_and(|u| u.len() > MAX_AUTH_USERNAME_BYTES)
+        if self
+            .username
+            .as_ref()
+            .is_some_and(|u| u.len() > MAX_AUTH_USERNAME_BYTES)
             || (self.username.is_none()
                 && event.fields[&FIELD_USERNAME].len() > MAX_AUTH_USERNAME_BYTES)
         {
@@ -1016,12 +1098,10 @@ impl SshHandler {
         // take up to 60s) must not grow unbounded task memory. The excess is
         // answered immediately with false, fail-closed; the cap is counted
         // against the parked tasks themselves, not the event store.
-        let outstanding = self.state.bump_request(channel);
-        if outstanding > MAX_OUTSTANDING_REQUESTS_PER_CHANNEL {
-            self.state.dec_request(channel);
+        let Some(request_guard) = self.state.try_request(channel) else {
             let _ = tokio::time::timeout(Duration::from_secs(1), reply.reply(false)).await;
             return Ok(());
-        }
+        };
         let mut event = Event {
             id: 0,
             fd,
@@ -1046,22 +1126,20 @@ impl SshHandler {
         event.response = Some(tx);
         let state = self.state.clone();
         let order = state.request_order(channel);
-        self.state.spawn(async move {
+        self.state.spawn_request(channel, async move {
+            let _request_guard = request_guard;
             let _ordered = order.lock().await;
             let Ok(event_id) = state.push(event) else {
-                state.dec_request(channel);
                 let _ = reply.reply(false).await;
                 return;
             };
             match tokio::time::timeout(Duration::from_secs(60), rx).await {
                 Ok(Ok(Decision::Request(true))) => {
                     let _ = reply.reply(true).await;
-                    state.dec_request(channel);
                 }
                 _ => {
                     state.cancel_event(event_id);
                     let _ = reply.reply(false).await;
-                    state.dec_request(channel);
                 }
             }
         });
@@ -1117,14 +1195,12 @@ impl Handler for SshHandler {
         user: &str,
         cert: &Certificate,
     ) -> Result<Auth, Self::Error> {
-        // russh has already validated the certificate (expiry, CA signature)
-        // and verified the client's possession signature against the embedded
-        // key before this handler runs, so the guest vouches only for
-        // identity — the crypto boundary stays fail-closed.
-        let key = PublicKey::new(cert.public_key().clone(), "");
-        let mut event = public_key_event(EVENT_AUTH_OPENSSH_CERT, user, &key)?;
-        event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
-        self.auth(event).await
+        // russh has validated the certificate structure, user principal,
+        // validity, internal signature and the client's possession signature.
+        // The event also carries the signing CA identity so the guest can make
+        // the distinct trust decision before accepting it.
+        self.auth(certificate_event(EVENT_AUTH_OPENSSH_CERT, user, cert)?)
+            .await
     }
 
     async fn auth_publickey_offered_cert(
@@ -1134,10 +1210,8 @@ impl Handler for SshHandler {
     ) -> Result<Auth, Self::Error> {
         // Same event shape as a plain key offer, marked as certificate-backed
         // so the guest can gate offers differently.
-        let key = PublicKey::new(cert.public_key().clone(), "");
-        let mut event = public_key_event(EVENT_AUTH_PUBLICKEY_OFFER, user, &key)?;
-        event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
-        self.auth(event).await
+        self.auth(certificate_event(EVENT_AUTH_PUBLICKEY_OFFER, user, cert)?)
+            .await
     }
 
     async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
@@ -1347,11 +1421,8 @@ impl Handler for SshHandler {
         let mut data = data.to_vec();
         if let Some(lane) = self.state.lane(fd, data_type) {
             let expected = lane.clone();
-            match tokio::time::timeout(
-                Duration::from_millis(LANE_SEND_TIMEOUT_MS),
-                lane.send(data),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_millis(LANE_SEND_TIMEOUT_MS), lane.send(data))
+                .await
             {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(error)) => {
@@ -1688,6 +1759,43 @@ fn public_key_event(kind: u32, user: &str, key: &PublicKey) -> Result<Event, rus
     Ok(event)
 }
 
+/// Builds a certificate auth event with both the subject key and the trust
+/// material the guest needs to authorize the signing CA and identity.
+fn certificate_event(kind: u32, user: &str, cert: &Certificate) -> Result<Event, russh::Error> {
+    let subject = PublicKey::new(cert.public_key().clone(), "");
+    let mut event = public_key_event(kind, user, &subject)?;
+    let ca = PublicKey::new(cert.signature_key().clone(), "");
+    let ca_blob = ca.to_bytes().map_err(|_| russh::Error::Disconnect)?;
+    let ca_digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &ca_blob);
+    let cert_blob = cert.to_bytes().map_err(|_| russh::Error::Disconnect)?;
+    let mut principals = Vec::new();
+    for principal in cert.valid_principals() {
+        let len = u32::try_from(principal.len()).map_err(|_| russh::Error::Disconnect)?;
+        principals.extend_from_slice(&len.to_le_bytes());
+        principals.extend_from_slice(principal.as_bytes());
+    }
+    event.fields.insert(FIELD_AUTH_CERT_FLAG, vec![1]);
+    event
+        .fields
+        .insert(FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB, ca_blob);
+    event
+        .fields
+        .insert(FIELD_AUTH_CERT_CA_SHA256, ca_digest.as_ref().to_vec());
+    event
+        .fields
+        .insert(FIELD_AUTH_CERT_KEY_ID, cert.key_id().as_bytes().to_vec());
+    event
+        .fields
+        .insert(FIELD_AUTH_CERT_SERIAL, cert.serial().to_le_bytes().to_vec());
+    event.fields.insert(
+        FIELD_AUTH_CERT_TYPE,
+        u32::from(cert.cert_type()).to_le_bytes().to_vec(),
+    );
+    event.fields.insert(FIELD_AUTH_CERT_PRINCIPALS, principals);
+    event.fields.insert(FIELD_AUTH_CERT_BLOB, cert_blob);
+    Ok(event)
+}
+
 /// A stream rebuilt from independently boxed read and write halves.
 pub(crate) struct JoinedStream {
     reader: Box<dyn AsyncRead + Unpin + Send>,
@@ -1810,13 +1918,16 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        unknown_request_dimensions, AuthThrottle, Event, SshHandler, SshState,
-        EVENT_AUTHENTICATED, EVENT_AUTH_NONE, EVENT_AUTH_OPENSSH_CERT,
-        EVENT_AUTH_PUBLICKEY_OFFER, EVENT_AUTH_PUBLICKEY_VERIFIED, FIELD_AUTH_ATTEMPTS,
-        FIELD_AUTH_CERT_FLAG, MAX_AUTH_USERNAME_BYTES, MAX_EVENTS,
+        unknown_request_dimensions, AuthThrottle, Event, SshHandler, SshState, EVENT_AUTHENTICATED,
+        EVENT_AUTH_NONE, EVENT_AUTH_OPENSSH_CERT, EVENT_AUTH_PUBLICKEY_OFFER,
+        EVENT_AUTH_PUBLICKEY_VERIFIED, FIELD_AUTH_ATTEMPTS, FIELD_AUTH_CERT_FLAG,
+        MAX_AUTH_USERNAME_BYTES, MAX_EVENTS,
     };
     use crate::{
-        limits::{AUTH_REJECTION_WINDOW_SECS, MAX_AUTH_REJECTIONS_PER_IP, MAX_AUTH_REJECTIONS_PER_WINDOW},
+        limits::{
+            AUTH_REJECTION_WINDOW_SECS, MAX_AUTH_REJECTIONS_PER_IP, MAX_AUTH_REJECTIONS_PER_WINDOW,
+            MAX_OUTSTANDING_REQUESTS_PER_CHANNEL,
+        },
         runtime::endpoint::Readiness,
     };
 
@@ -1837,6 +1948,7 @@ mod tests {
         SshHandler {
             state,
             username: None,
+            methods: super::AUTH_ALL,
             throttle: Arc::new(AuthThrottle::new()),
             ip: "127.0.0.1".to_string(),
             attempts: 0,
@@ -1893,9 +2005,7 @@ mod tests {
             .unwrap();
         let outcome = runtime.block_on(async {
             let (tx, _rx) = oneshot::channel();
-            handler
-                .auth(Event::auth(EVENT_AUTH_NONE, &huge, tx))
-                .await
+            handler.auth(Event::auth(EVENT_AUTH_NONE, &huge, tx)).await
         });
         assert!(matches!(
             outcome,
@@ -1904,7 +2014,10 @@ mod tests {
                 partial_success: false,
             })
         ));
-        assert!(state.next().is_none(), "no event was pushed for the oversized username");
+        assert!(
+            state.next().is_none(),
+            "no event was pushed for the oversized username"
+        );
         assert_eq!(state.event_kind(1), None, "no event id was consumed");
     }
 
@@ -1924,14 +2037,15 @@ mod tests {
             .unwrap();
         let outcome = runtime.block_on(async {
             let (tx, _rx) = oneshot::channel();
-            handler
-                .auth(Event::auth(EVENT_AUTH_NONE, "user", tx))
-                .await
+            handler.auth(Event::auth(EVENT_AUTH_NONE, "user", tx)).await
         });
         // A full store is an ordinary auth failure, never a disconnect.
         assert!(matches!(outcome, Ok(Auth::Reject { .. })));
         // The 33rd event never entered the store.
-        assert_eq!(state.next().expect("filler is still queued").kind, EVENT_AUTH_NONE);
+        assert_eq!(
+            state.next().expect("filler is still queued").kind,
+            EVENT_AUTH_NONE
+        );
     }
 
     #[test]
@@ -1945,9 +2059,7 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             let mut handler = handler_for(state.clone());
             let task = tokio::spawn(async move {
-                handler
-                    .auth(Event::auth(EVENT_AUTH_NONE, "user", tx))
-                    .await
+                handler.auth(Event::auth(EVENT_AUTH_NONE, "user", tx)).await
             });
             // auth() pushes the event before parking on the guest decision;
             // the guest never answers here, so read the queued event.
@@ -1985,8 +2097,9 @@ mod tests {
         assert_eq!(header.id, id);
         let kind = state.event_kind(id).expect("the cert event is outstanding");
         assert_eq!(kind, EVENT_AUTH_OPENSSH_CERT);
-        // Accept, reject and partial are all valid on a cert event: russh
-        // has already validated the certificate and the possession signature.
+        // Accept, reject and partial are all valid on a cert event: russh has
+        // validated its structure and signatures, while the guest owns CA
+        // authorization policy.
         assert_eq!(auth_reply_result(kind, 1), Ok(1));
         assert_eq!(auth_reply_result(kind, 2), Ok(2));
         assert_eq!(auth_reply_result(kind, 3), Ok(3));
@@ -1999,10 +2112,7 @@ mod tests {
         );
         // The offer path is unchanged: 4 maps to the library's pre-signature
         // accept, and every other auth kind keeps its own results.
-        assert_eq!(
-            auth_reply_result(EVENT_AUTH_PUBLICKEY_OFFER, 4),
-            Ok(1)
-        );
+        assert_eq!(auth_reply_result(EVENT_AUTH_PUBLICKEY_OFFER, 4), Ok(1));
         assert_eq!(
             auth_reply_result(EVENT_AUTH_PUBLICKEY_VERIFIED, 4),
             Err(crate::abi::errno::ESTATE)
@@ -2046,5 +2156,41 @@ mod tests {
             Some(vec![1]),
             "the cert flag survives the store round trip"
         );
+    }
+
+    #[tokio::test]
+    async fn closing_a_channel_aborts_and_releases_all_request_tasks() {
+        use russh::keys::ssh_key::encoding::Decode;
+
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let encoded = 7_u32.to_be_bytes();
+        let mut encoded = encoded.as_slice();
+        let channel = russh::ChannelId::decode(&mut encoded).unwrap();
+        for _ in 0..MAX_OUTSTANDING_REQUESTS_PER_CHANNEL {
+            let guard = state.try_request(channel).expect("request slot");
+            state.spawn_request(channel, async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+        }
+        assert!(
+            state.try_request(channel).is_none(),
+            "the live request tasks fill the per-channel bound"
+        );
+        state.remove_channel_id(channel);
+        for _ in 0..32 {
+            if !state.requests.lock().unwrap().contains_key(&channel) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let guards: Vec<_> = (0..MAX_OUTSTANDING_REQUESTS_PER_CHANNEL)
+            .map(|_| {
+                state
+                    .try_request(channel)
+                    .expect("aborted tasks release their request slots")
+            })
+            .collect();
+        drop(guards);
     }
 }

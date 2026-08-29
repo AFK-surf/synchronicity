@@ -478,6 +478,21 @@ fn configure_unix_command(
     } else {
         capability.max_memory_bytes.min(DEFAULT_MAX_MEMORY_BYTES)
     };
+    // RLIMIT_NPROC is charged to the real UID, not to this process group. Base
+    // the child's ceiling on tasks the UID already owns so a daemon account
+    // with normal unrelated activity can still start the declared process.
+    // Descendants then get only the fixed amount of additional headroom.
+    #[cfg(target_os = "linux")]
+    let nproc_limit = linux_uid_task_count().ok().and_then(|current| {
+        let mut existing: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut existing) } != 0 {
+            return None;
+        }
+        let desired = current
+            .saturating_add(crate::limits::MAX_PROCESSES_PER_GROUP)
+            .max(crate::limits::MAX_PROCESSES_PER_GROUP);
+        Some(desired.min(existing.rlim_max as u64))
+    });
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -505,23 +520,64 @@ fn configure_unix_command(
             if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Bound the process fan-out a descendant can create: RLIMIT_NPROC
-            // is per-real-UID on Linux, so a setsid-escaped grandchild can at
-            // most hold the uid's total process count to
-            // MAX_PROCESSES_PER_GROUP, and fork() beyond it fails closed with
-            // EAGAIN.
+            // Bound fan-out above the UID's existing baseline. This is still a
+            // per-real-UID kernel limit (Linux offers no per-process-group
+            // RLIMIT), but it no longer makes every fork fail merely because
+            // the service UID already owns more than the descendant budget.
             #[cfg(target_os = "linux")]
-            let nproc = libc::rlimit {
-                rlim_cur: crate::limits::MAX_PROCESSES_PER_GROUP as libc::rlim_t,
-                rlim_max: crate::limits::MAX_PROCESSES_PER_GROUP as libc::rlim_t,
-            };
-            #[cfg(target_os = "linux")]
-            if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
-                return Err(std::io::Error::last_os_error());
+            if let Some(nproc_limit) = nproc_limit {
+                let nproc = libc::rlimit {
+                    rlim_cur: nproc_limit as libc::rlim_t,
+                    rlim_max: nproc_limit as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
     }
+}
+
+/// Counts Linux tasks currently charged to this process's real UID.
+///
+/// RLIMIT_NPROC counts threads on Linux. `/proc/<pid>/status` gives both the
+/// real UID and the thread count without walking every task directory. Races
+/// with process exit only make the snapshot slightly conservative or lenient;
+/// the kernel still enforces the resulting absolute ceiling.
+#[cfg(target_os = "linux")]
+fn linux_uid_task_count() -> std::io::Result<u64> {
+    let uid = unsafe { libc::getuid() };
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(entry) = entry else { continue };
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let real_uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|text| text.parse::<libc::uid_t>().ok());
+        if real_uid != Some(uid) {
+            continue;
+        }
+        let threads = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(1);
+        total = total.saturating_add(threads);
+    }
+    Ok(total)
 }
 
 /// Returns the aggregate physical footprint in a Darwin process group.
@@ -729,6 +785,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn nproc_headroom_allows_children_when_the_uid_is_already_busy() {
+        let capability = synch_core::ProcessCapability {
+            id: 13,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "/bin/true && echo forked".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 5_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, mut stdout, stdin, mut stderr) = spawn_pipe(&capability).unwrap();
+        drop(stdin);
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        let mut error = Vec::new();
+        stderr.read_to_end(&mut error).await.unwrap();
+        assert!(child.wait().await.unwrap().success(), "stderr: {error:?}");
+        assert_eq!(output, b"forked\n");
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn refresh_kills_the_process_group_before_reaping() {
         let capability = synch_core::ProcessCapability {
             id: 8,
@@ -752,13 +830,11 @@ mod tests {
         let mut line = String::new();
         stdout.read_to_string(&mut line).await.unwrap();
         let Some(grandchild) = line.trim().parse::<i32>().ok() else {
-            // RLIMIT_NPROC (MAX_PROCESSES_PER_GROUP, set in pre_exec) is
-            // per-real-UID: when the uid already holds more threads than the
-            // ceiling — as a shared dev box does — the child's fork of the
-            // grandchild fails closed with EAGAIN and no descendant exists to
-            // assert against. That failure is the bound doing its job; skip.
+            // RLIMIT_NPROC is per-real-UID. A concurrent burst under the same
+            // UID can consume the snapshot-based headroom before this child
+            // forks, leaving no descendant to assert against; skip that race.
             eprintln!(
-                "skipping: uid is over RLIMIT_NPROC, the child could not fork a \
+                "skipping: uid consumed the RLIMIT_NPROC headroom before the child forked a \
                  grandchild (stdout {line:?})"
             );
             return;
@@ -805,9 +881,8 @@ mod tests {
     #[test]
     fn pty_slot_drop_returns_promptly_with_a_stuck_child() {
         let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
-        // A fork-free busy loop: it needs no external fork, so it runs the
-        // same in every environment (a shared uid may already exceed the
-        // per-uid RLIMIT_NPROC, which would make `sleep` fail to fork).
+        // A fork-free busy loop keeps this cleanup test independent of
+        // concurrent consumption of the per-uid RLIMIT_NPROC headroom.
         let capability = synch_core::ProcessCapability {
             id: 9,
             flags: 0x02,

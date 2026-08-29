@@ -6,7 +6,7 @@ use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 
-use crate::{HostError, ListPage, ObjectInfo, SocketHost};
+use crate::{HostEntryKind, HostError, ListPage, ObjectInfo, SocketHost};
 
 const ACCESS_READ: u32 = 0x01;
 const ACCESS_RECURSIVE: u32 = 0x04;
@@ -15,6 +15,7 @@ const MAX_OPEN_HANDLES: usize = 64;
 const LIST_PAGE_ENTRIES: usize = 128;
 const MAX_READDIR_ENTRIES: usize = 64;
 const MAX_READDIR_BYTES: usize = 64 * 1024;
+const MAX_READDIR_PAGES: usize = 32;
 
 #[derive(Debug)]
 struct DirectoryCursor {
@@ -95,7 +96,7 @@ impl TreeSftp {
     /// socket, symlink, or tombstone the host deliberately refuses. A host
     /// without kind support fails here, and the caller then skips the entry —
     /// fail-closed, never a fabricated attribute.
-    async fn entry_kind(&self, path: String) -> Result<u32, StatusCode> {
+    async fn entry_kind(&self, path: String) -> Result<HostEntryKind, StatusCode> {
         let host = self.host.clone();
         tokio::task::spawn_blocking(move || host.entry_kind(None, &path))
             .await
@@ -125,18 +126,12 @@ impl TreeSftp {
         let mut files = Vec::new();
         let mut response_bytes = 0usize;
 
-        // Scan pages until an entry is emitted or the listing ends. There is
-        // no per-call page cap: a deep child subtree (a vendored tree, say)
-        // is skipped transparently inside one call, and an empty mid-scan
-        // batch must never reach the client — OpenSSH's sftp client treats
-        // an empty Name as end-of-listing (`if (count == 0) break`), so it
-        // would truncate every directory whose first emitted entry follows a
-        // large subtree. The batch caps below still bound each returned
-        // Name; per-call work is bounded by the remaining listing size, and
-        // the cursor advances monotonically, so termination is guaranteed
-        // and repeated calls can never rescan. The `full <= *after`
-        // corruption guard stays.
-        loop {
+        // A request scans a bounded number of storage pages. The cursor still
+        // advances monotonically and any entries already found are returned;
+        // if the whole budget contains only refused/filtered rows, fail the
+        // request instead of returning an empty Name (which OpenSSH mistakes
+        // for eof) or monopolizing the storage/blocking pools indefinitely.
+        for _ in 0..MAX_READDIR_PAGES {
             let page = self
                 .list(cursor.prefix.clone(), cursor.after.clone())
                 .await?;
@@ -178,18 +173,23 @@ impl TreeSftp {
                     return Err(StatusCode::Failure);
                 }
                 let child = format!("{start}{name}");
-                let attributes = match self.open_info(child.clone()).await {
-                    Ok(info) => attrs(&info),
+                let (attributes, subtree_end) = match self.open_info(child.clone()).await {
+                    Ok(info) => (attrs(&info), None),
                     Err(_) => match self.entry_kind(child).await {
                         // A directory has no content, so open() refuses it;
                         // the kind is the honest source of its attributes.
-                        Ok(kind) if kind == 1 => {
+                        Ok(HostEntryKind::Directory) => {
                             let mut attrs = FileAttributes {
                                 permissions: Some(0o040555),
                                 ..Default::default()
                             };
                             attrs.set_dir(true);
-                            attrs
+                            // All descendant storage keys start with
+                            // `<start><name>/`. Replacing that trailing slash
+                            // with `0` produces the first ASCII key after the
+                            // whole subtree, so the next page can jump there
+                            // instead of scanning every descendant row.
+                            (attrs, Some(format!("{start}{name}0")))
                         }
                         // Anything else -- a socket, symlink, tombstone, or a
                         // path the host refused to classify -- must not be
@@ -206,6 +206,11 @@ impl TreeSftp {
                 files.push(File::new(name, attributes));
                 cursor.last_child = Some(name.to_string());
                 cursor.after = Some(full);
+                if let Some(subtree_end) = subtree_end {
+                    cursor.after = Some(subtree_end);
+                    consumed_page = false;
+                    break;
+                }
             }
 
             if !consumed_page {
@@ -223,12 +228,12 @@ impl TreeSftp {
             }
         }
 
-        // The scan only falls through with no entries at eof: it loops until
-        // an entry is emitted or the listing ends, so a mid-scan empty batch
-        // (which OpenSSH's sftp client reads as end-of-listing) no longer
-        // exists. Eof is reported only here, at the actual end.
         if files.is_empty() {
-            Err(StatusCode::Eof)
+            if cursor.eof {
+                Err(StatusCode::Eof)
+            } else {
+                Err(StatusCode::Failure)
+            }
         } else {
             Ok(Name { id, files })
         }
@@ -497,20 +502,22 @@ mod tests {
             })
         }
 
-        fn entry_kind(&self, _origin: Option<&str>, path: &str) -> Result<u32, HostError> {
+        fn entry_kind(
+            &self,
+            _origin: Option<&str>,
+            path: &str,
+        ) -> Result<HostEntryKind, HostError> {
             if self.refused.contains(path) {
                 return Err(HostError::NotReadable("refused".into()));
             }
             if self.files.contains_key(path) {
-                return Ok(0);
+                return Ok(HostEntryKind::File);
             }
             // A path with at least one descendant row is a directory.
             if self.keys.iter().any(|k| {
-                k.len() > path.len()
-                    && k.starts_with(path)
-                    && k.as_bytes()[path.len()] == b'/'
+                k.len() > path.len() && k.starts_with(path) && k.as_bytes()[path.len()] == b'/'
             }) {
-                return Ok(1);
+                return Ok(HostEntryKind::Directory);
             }
             Err(HostError::NotFound)
         }
@@ -538,7 +545,10 @@ mod tests {
         // 0x01 = ACCESS_READ, no ACCESS_RECURSIVE: the declared surface is
         // the root listing alone.
         let mut sftp = TreeSftp::new(
-            Arc::new(FakeHost::with_files(&[("files/a.txt", "a"), ("files/sub/x", "x")])),
+            Arc::new(FakeHost::with_files(&[
+                ("files/a.txt", "a"),
+                ("files/sub/x", "x"),
+            ])),
             "files".into(),
             ACCESS_READ,
         );
@@ -574,11 +584,7 @@ mod tests {
         let handle = sftp.opendir(1, ".".into()).await.unwrap();
         let name = sftp.readdir(2, handle.handle.clone()).await.unwrap();
         assert_eq!(names(&name), vec!["a.txt", "sub"]);
-        let a = name
-            .files
-            .iter()
-            .find(|f| f.filename == "a.txt")
-            .unwrap();
+        let a = name.files.iter().find(|f| f.filename == "a.txt").unwrap();
         assert_eq!(a.attrs.permissions, Some(0o100644));
         assert!(!a.attrs.is_dir());
         let sub = name.files.iter().find(|f| f.filename == "sub").unwrap();
@@ -597,11 +603,9 @@ mod tests {
     async fn deep_subtree_readdir_enumerates_completely() {
         // One child "a" whose subtree alone is far larger than one page
         // (128 rows), plus a later sibling "z": the historical bug returned
-        // SSH_FX_FAILURE on the dupe-skipping pass, and the page-cap fix
-        // that followed produced an empty mid-scan Name batch, which
-        // OpenSSH's sftp client reads as end-of-listing and would truncate
-        // the enumeration on. The scan now runs until an entry is emitted
-        // or eof, so one call must return both "a" and "z".
+        // SSH_FX_FAILURE on the dupe-skipping pass. The cursor now jumps over
+        // a recognized child subtree, so work stays bounded without emitting
+        // an empty mid-listing Name batch.
         let owned: Vec<(String, String)> = (0..40000)
             .map(|index| (format!("files/a/x{index:05}"), String::new()))
             .chain(std::iter::once(("files/z".to_string(), String::new())))
@@ -616,14 +620,48 @@ mod tests {
             ACCESS_READ | ACCESS_RECURSIVE,
         );
         let handle = sftp.opendir(1, ".".into()).await.unwrap();
-        // One call: "a" is emitted, the scan dupe-skips the whole subtree,
-        // "z" is found, and the listing ends.
-        let first = sftp.readdir(2, handle.handle.clone()).await.unwrap();
-        assert_eq!(names(&first), vec!["a", "z"]);
-        // The next call reports eof, never an empty mid-scan Name.
+        // The per-request scan budget may split the deep subtree across calls,
+        // but every successful Name is nonempty and the cursor eventually
+        // reaches the later sibling without rescanning.
+        let mut seen = Vec::new();
+        for id in 2..32 {
+            match sftp.readdir(id, handle.handle.clone()).await {
+                Ok(batch) => {
+                    assert!(!batch.files.is_empty(), "no empty mid-listing Name batch");
+                    seen.extend(names(&batch));
+                }
+                Err(StatusCode::Eof) => break,
+                Err(error) => panic!("bounded readdir failed unexpectedly: {error:?}"),
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn refused_rows_stop_at_the_per_request_scan_budget() {
+        let owned: Vec<(String, String)> = (0..(LIST_PAGE_ENTRIES * (MAX_READDIR_PAGES + 1)))
+            .map(|index| (format!("files/refused-{index:05}"), String::new()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .collect();
+        let mut host = FakeHost::with_files(&borrowed);
+        for (name, _) in &owned {
+            host.refuse(name);
+        }
+        let mut sftp = TreeSftp::new(
+            Arc::new(host),
+            "files".into(),
+            ACCESS_READ | ACCESS_RECURSIVE,
+        );
+        let handle = sftp.opendir(1, ".".into()).await.unwrap();
         assert_eq!(
-            sftp.readdir(3, handle.handle).await.unwrap_err(),
-            StatusCode::Eof
+            sftp.readdir(2, handle.handle).await.unwrap_err(),
+            StatusCode::Failure,
+            "a request may not scan past MAX_READDIR_PAGES filtered pages"
         );
     }
 }

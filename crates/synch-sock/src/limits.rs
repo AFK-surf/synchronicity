@@ -192,12 +192,13 @@ pub const CHANNEL_LANE_CAPACITY: usize = 8;
 /// answers them.
 pub const MAX_OUTSTANDING_REQUESTS_PER_CHANNEL: usize = 16;
 
-/// RLIMIT_NPROC ceiling applied to spawned process groups, on Linux.
+/// Additional RLIMIT_NPROC headroom granted to spawned process groups, on Linux.
 ///
 /// RLIMIT_NPROC is per-real-UID on Linux, so the cap is shared by every
-/// invocation running under the daemon's service uid: a descendant that
-/// escapes the group kill (e.g. a setsid() mid-fork race) can hold at most 64
-/// processes for the uid, and fork() beyond it fails closed with EAGAIN.
+/// invocation running under the daemon's service uid. The runtime snapshots
+/// the uid's existing Linux task count and adds this headroom, so unrelated
+/// daemon/user processes do not make every child fork fail while a descendant
+/// still receives only bounded additional capacity from that snapshot.
 #[cfg(target_os = "linux")]
 pub const MAX_PROCESSES_PER_GROUP: u64 = 64;
 

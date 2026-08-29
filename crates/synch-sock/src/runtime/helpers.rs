@@ -915,11 +915,12 @@ fn h_ssh_event_done(
 /// The kind/result gate `h_ssh_auth_reply` applies to one auth event: which
 /// kinds a reply is valid on, and how result 4 (OFFER_ACCEPT) maps.
 ///
-/// A certificate authentication (kind 9) is a real authentication — the ssh
-/// library has already validated the certificate and the possession
-/// signature — so results 1 (accept), 2 (reject) and 3 (partial) are all
-/// valid on it, as they are on the other auth kinds. OFFER_ACCEPT maps to the
-/// SSH library's pre-signature Accept; it is not authentication completion
+/// A certificate authentication (kind 9) is a real authentication — the SSH
+/// library has validated its structure, identity constraints, internal
+/// signature, and the client's possession signature. The guest must still
+/// authorize the signing CA. Results 1 (accept), 2 (reject), and 3 (partial)
+/// are valid on it, as they are on the other auth kinds. OFFER_ACCEPT maps to
+/// the SSH library's pre-signature Accept; it is not authentication completion
 /// and stays valid only on an offer (kind 3). Any other kind — a signed
 /// certificate event (9), a non-offer key event (4), a non-auth kind — is
 /// refused with ESTATE, fail-closed.
@@ -1265,7 +1266,6 @@ fn h_ssh_channel_open(
         endpoint.clone(),
         Box::new(writer),
     ));
-    let task_inner = Rc::clone(&inner);
     inner.spawn(async move {
         let opened = session
             .channel_open_unknown(channel_type.clone(), data)
@@ -1280,12 +1280,10 @@ fn h_ssh_channel_open(
             Err(_) => {
                 state.release_channel();
                 endpoint.fail(errno::ECONNRESET);
-                // Mirror h_ssh_channel_accept's cleanup: a failed outbound open
-                // leaves no slot behind (the client rejected it, or the
-                // connection died mid-open), so the handle budget is not eaten
-                // one refusal at a time. ERR|HUP stays visible to the guest via
-                // revents_for(None); remove() also releases the egress charge.
-                task_inner.remove(handle);
+                // The guest owns `handle` once this helper returns it. Keep the
+                // failed endpoint in its slot until sy_close: asynchronously
+                // freeing and reusing the numeric fd could make the guest's
+                // stale handle alias an unrelated later channel.
             }
         }
     });

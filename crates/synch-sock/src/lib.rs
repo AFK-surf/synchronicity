@@ -145,17 +145,16 @@ pub trait SocketHost: Send + Sync + 'static {
     /// handle pollable rather than stalling the whole program.
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError>;
 
-    /// The type of one resolved path, as an SFTP file-type code
-    /// (`ssh2`/`libssh` values: `SSH_FILEXFER_TYPE_REGULAR` etc.), used by the
-    /// SFTP backend to answer `STAT`/`READDIR` honestly without treating every
-    /// path as a regular file.
+    /// The semantic type of one resolved path, used by the SFTP backend to
+    /// answer `STAT`/`READDIR` honestly without treating every path as a
+    /// regular file.
     ///
     /// `origin` is `None` for this node's own view, as in [`SocketHost::open`].
     ///
     /// The default fails: a host without kind support cannot classify a path,
     /// and the SFTP caller skips the entry rather than fabricate attributes
     /// (fail-closed, never an invented directory).
-    fn entry_kind(&self, origin: Option<&str>, path: &str) -> Result<u32, HostError> {
+    fn entry_kind(&self, origin: Option<&str>, path: &str) -> Result<HostEntryKind, HostError> {
         let _ = (origin, path);
         Err(HostError::Unavailable(
             "entry kinds are not supported by this host".into(),
@@ -188,6 +187,25 @@ pub enum HostError {
     /// The bytes could not be produced.
     #[error("{0}")]
     Unavailable(String),
+}
+
+/// The semantic type of a tree entry exposed through [`SocketHost`].
+///
+/// This deliberately is not a numeric SFTP or storage enum: hosts and the
+/// SFTP adapter share a typed contract, so differing external discriminants
+/// cannot silently turn a directory into a skipped or fabricated entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEntryKind {
+    /// A regular immutable file.
+    File,
+    /// A directory, including an implicit prefix directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+    /// A deleted tree row.
+    Tombstone,
+    /// An executable socket entry.
+    Socket,
 }
 
 /// What a program learns about an object it opened.
