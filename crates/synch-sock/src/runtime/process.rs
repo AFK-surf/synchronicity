@@ -23,6 +23,38 @@ use crate::abi::errno;
 /// lock across `Command::spawn`, closing that inheritance window.
 static PROCESS_SPAWN_FD_LOCK: Mutex<()> = Mutex::new(());
 
+/// Inherited host variables that are useful to ordinary command-line tools
+/// without exposing the daemon's application configuration or credentials.
+const BASIC_PROCESS_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TMPDIR",
+];
+
+fn configure_process_environment(command: &mut std::process::Command) {
+    command.env_clear();
+    for name in BASIC_PROCESS_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env(
+        "PATH",
+        std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+    );
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessStatus {
     pub(crate) exited: bool,
@@ -345,10 +377,9 @@ pub(crate) fn spawn_pipe(
     i64,
 > {
     let mut command = tokio::process::Command::new(&capability.executable);
+    configure_process_environment(command.as_std_mut());
     command
         .args(capability.argv.iter().skip(1))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -379,10 +410,9 @@ pub(crate) fn spawn_pty(
     let stdin = slave.try_clone().map_err(|_| errno::ECONNRESET)?;
     let stdout = slave.try_clone().map_err(|_| errno::ECONNRESET)?;
     let mut command = std::process::Command::new(&capability.executable);
+    configure_process_environment(&mut command);
     command
         .args(capability.argv.iter().skip(1))
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
@@ -524,7 +554,36 @@ impl AsyncRead for ChannelReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt as _;
     use tokio::io::AsyncReadExt as _;
+
+    #[test]
+    fn a_pty_child_inherits_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("skipping: the test process has no HOME");
+            return;
+        };
+        let capability = synch_core::ProcessCapability {
+            id: 15,
+            flags: 0x01,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "printf %s \"$HOME\"".into()],
+            allowed_signals: 0,
+        };
+        let (mut master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        let mut child = spawn_pty(&capability, slave, "").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+            }
+        }
+        assert_eq!(output, home.as_os_str().as_bytes());
+    }
 
     #[tokio::test]
     async fn a_pipe_process_runs_only_its_exact_declared_argv() {

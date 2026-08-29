@@ -793,8 +793,10 @@ not impose process-specific count, runtime, or memory ceilings, and it does not
 sandbox the child. An operator who wants containment can declare a wrapper such
 as `bwrap` as the executable. The runtime supplies a clean, host-defined
 environment, closes unrelated inherited descriptors, and creates a fresh
-process group for lifecycle and signal handling. PTYs synthesize `TERM` from
-the validated terminal request.
+process group for lifecycle and signal handling. The clean environment retains
+the daemon's basic identity, home, shell, path, locale, timezone and temporary
+directory variables, but not application configuration or credentials. PTYs
+synthesize `TERM` from the validated terminal request.
 
 Allocation and process start are separate so a successful `pty-req` does not
 start a shell before a later `shell` request:
