@@ -196,9 +196,12 @@ pub const MAX_OUTSTANDING_REQUESTS_PER_CHANNEL: usize = 16;
 ///
 /// RLIMIT_NPROC is per-real-UID on Linux, so the cap is shared by every
 /// invocation running under the daemon's service uid. The runtime snapshots
-/// the uid's existing Linux task count and adds this headroom, so unrelated
-/// daemon/user processes do not make every child fork fail while a descendant
-/// still receives only bounded additional capacity from that snapshot.
+/// the uid's existing Linux task count once and adds this headroom; later
+/// children inherit that same absolute ceiling instead of granting new
+/// headroom for tasks earlier children created. Descendants are also forbidden
+/// from changing process groups, keeping cleanup able to reach them. A daemon
+/// UID or capability set that bypasses RLIMIT_NPROC refuses process spawning
+/// rather than running without this bound.
 #[cfg(target_os = "linux")]
 pub const MAX_PROCESSES_PER_GROUP: u64 = 64;
 

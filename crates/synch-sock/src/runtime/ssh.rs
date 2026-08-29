@@ -504,6 +504,11 @@ impl SshState {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if accepts.get(&fd) != Some(&expected) {
+                // The guest reserved a channel slot before creating the fd.
+                // If the fd was closed before this asynchronous registration
+                // ran, no entry was ever installed in `channels`, so the close
+                // path had nothing from which to release that reservation.
+                self.release_channel();
                 return false;
             }
             // The token is single-use: consumed by the successful
@@ -2192,5 +2197,30 @@ mod tests {
             })
             .collect();
         drop(guards);
+    }
+
+    #[tokio::test]
+    async fn stale_inbound_accept_releases_its_channel_reservation() {
+        use russh::keys::ssh_key::encoding::Decode;
+
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let encoded = 11_u32.to_be_bytes();
+        let mut encoded = encoded.as_slice();
+        let channel = russh::ChannelId::decode(&mut encoded).unwrap();
+
+        assert!(state.reserve_channel());
+        state.note_accept(7, 99);
+        // This is the race the ownership token protects: the guest closes the
+        // newly accepted fd before the SSH task consumes the accept decision.
+        state.remove_channel_fd(7);
+        assert!(!state.register_channel(7, channel, "session", Some(99)));
+
+        for _ in 0..super::MAX_CHANNELS {
+            assert!(
+                state.reserve_channel(),
+                "the stale accept must not consume one of the live channel slots"
+            );
+        }
+        assert!(!state.reserve_channel());
     }
 }

@@ -7,6 +7,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, RawFd},
     pin::Pin,
     process::Stdio,
+    sync::Mutex,
     task::{Context, Poll},
 };
 
@@ -17,6 +18,20 @@ use crate::abi::errno;
 pub(crate) const DEFAULT_MAX_PROCESSES: u64 = 8;
 pub(crate) const DEFAULT_MAX_RUNTIME_MS: u64 = 24 * 60 * 60 * 1_000;
 pub(crate) const DEFAULT_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Serializes PTY descriptor creation with every declared-process fork.
+///
+/// `openpty` has no close-on-exec flag, so setting `FD_CLOEXEC` afterward is
+/// otherwise racy in this multi-worker daemon: another worker can fork between
+/// the allocation and the `fcntl`. All runtime process spawns take the same
+/// lock across `Command::spawn`, closing that inheritance window.
+static PROCESS_SPAWN_FD_LOCK: Mutex<()> = Mutex::new(());
+
+/// The UID-wide Linux task ceiling is based on one stable daemon baseline.
+/// Recomputing it for every child would grant another block of headroom after
+/// escaped or concurrent descendants had already consumed the previous block.
+#[cfg(target_os = "linux")]
+static LINUX_UID_TASK_CEILING: Mutex<Option<u64>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessStatus {
@@ -255,6 +270,9 @@ pub(crate) fn open_pty(
     pixel_width: u32,
     pixel_height: u32,
 ) -> Result<(File, File), i64> {
+    let _spawn_guard = PROCESS_SPAWN_FD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
     let mut size = libc::winsize {
@@ -427,7 +445,10 @@ pub(crate) fn spawn_pipe(
     if let Some(first) = capability.argv.first() {
         command.arg0(first);
     }
-    configure_unix_command(command.as_std_mut(), capability, false);
+    configure_unix_command(command.as_std_mut(), capability, false)?;
+    let _spawn_guard = PROCESS_SPAWN_FD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child = command.spawn().map_err(|_| errno::ENOENT)?;
     let stdout = child.stdout.take().ok_or(errno::ECONNRESET)?;
     let stdin = child.stdin.take().ok_or(errno::ECONNRESET)?;
@@ -462,7 +483,10 @@ pub(crate) fn spawn_pty(
         use std::os::unix::process::CommandExt as _;
         command.arg0(first);
     }
-    configure_unix_command(&mut command, capability, true);
+    configure_unix_command(&mut command, capability, true)?;
+    let _spawn_guard = PROCESS_SPAWN_FD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     command.spawn().map_err(|_| errno::ENOENT)
 }
 
@@ -470,7 +494,7 @@ fn configure_unix_command(
     command: &mut std::process::Command,
     capability: &synch_core::ProcessCapability,
     controlling_tty: bool,
-) {
+) -> Result<(), i64> {
     use std::os::unix::process::CommandExt as _;
     #[cfg(not(target_os = "macos"))]
     let memory = if capability.max_memory_bytes == 0 {
@@ -478,21 +502,13 @@ fn configure_unix_command(
     } else {
         capability.max_memory_bytes.min(DEFAULT_MAX_MEMORY_BYTES)
     };
-    // RLIMIT_NPROC is charged to the real UID, not to this process group. Base
-    // the child's ceiling on tasks the UID already owns so a daemon account
-    // with normal unrelated activity can still start the declared process.
-    // Descendants then get only the fixed amount of additional headroom.
+    // RLIMIT_NPROC is charged to the real UID, not to this process group. Use
+    // one stable baseline for the daemon lifetime: if every spawn counted the
+    // descendants already created by earlier children, each child would gain a
+    // fresh block of headroom and the supposed ceiling would grow without
+    // bound.
     #[cfg(target_os = "linux")]
-    let nproc_limit = linux_uid_task_count().ok().and_then(|current| {
-        let mut existing: libc::rlimit = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut existing) } != 0 {
-            return None;
-        }
-        let desired = current
-            .saturating_add(crate::limits::MAX_PROCESSES_PER_GROUP)
-            .max(crate::limits::MAX_PROCESSES_PER_GROUP);
-        Some(desired.min(existing.rlim_max as u64))
-    });
+    let nproc_limit = linux_uid_task_ceiling().map_err(|_| errno::ELIMIT)?;
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -520,12 +536,9 @@ fn configure_unix_command(
             if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Bound fan-out above the UID's existing baseline. This is still a
-            // per-real-UID kernel limit (Linux offers no per-process-group
-            // RLIMIT), but it no longer makes every fork fail merely because
-            // the service UID already owns more than the descendant budget.
+            // Bound fan-out above the daemon's original UID task baseline.
             #[cfg(target_os = "linux")]
-            if let Some(nproc_limit) = nproc_limit {
+            {
                 let nproc = libc::rlimit {
                     rlim_cur: nproc_limit as libc::rlim_t,
                     rlim_max: nproc_limit as libc::rlim_t,
@@ -533,10 +546,146 @@ fn configure_unix_command(
                 if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // The direct child has already entered its fresh session.
+                // From here on, deny the two syscalls descendants could use to
+                // leave that process group. The filter is inherited across
+                // fork and exec, so group cleanup reaches the whole tree.
+                install_process_group_seccomp()?;
             }
             Ok(())
         });
     }
+    Ok(())
+}
+
+/// The stable Linux task ceiling inherited by every declared child.
+#[cfg(target_os = "linux")]
+fn linux_uid_task_ceiling() -> std::io::Result<u64> {
+    let mut ceiling = LINUX_UID_TASK_CEILING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Linux does not enforce RLIMIT_NPROC for UID 0 or for a process carrying
+    // either of the capabilities that bypass the check. Refuse process-backed
+    // capabilities in that configuration rather than present an unenforced
+    // safety bound to a privileged daemon.
+    if unsafe { libc::getuid() } == 0 || linux_nproc_limit_is_bypassed()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "declared processes require an unprivileged daemon UID",
+        ));
+    }
+    if let Some(ceiling) = *ceiling {
+        return Ok(ceiling);
+    }
+    let current = linux_uid_task_count()?;
+    let mut existing: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut existing) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let desired = current
+        .saturating_add(crate::limits::MAX_PROCESSES_PER_GROUP)
+        .max(crate::limits::MAX_PROCESSES_PER_GROUP)
+        .min(existing.rlim_max as u64);
+    *ceiling = Some(desired);
+    Ok(desired)
+}
+
+/// Whether this process has a capability that exempts it from RLIMIT_NPROC.
+#[cfg(target_os = "linux")]
+fn linux_nproc_limit_is_bypassed() -> std::io::Result<bool> {
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_SYS_RESOURCE: u32 = 24;
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let effective = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|text| u64::from_str_radix(text.trim(), 16).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "/proc/self/status has no valid CapEff field",
+            )
+        })?;
+    Ok(effective & ((1 << CAP_SYS_ADMIN) | (1 << CAP_SYS_RESOURCE)) != 0)
+}
+
+/// Installs an inherited seccomp filter that keeps descendants in the process
+/// group created by `setsid` above.
+#[cfg(target_os = "linux")]
+fn install_process_group_seccomp() -> std::io::Result<()> {
+    let audit_arch = native_audit_arch().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "declared-process containment is unavailable on this Linux architecture",
+        )
+    })?;
+    let stmt = |code: u16, k: u32| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter { code, jt, jf, k };
+    let load_abs = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    let jump_eq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+    let denied = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    let mut filter = [
+        stmt(load_abs, 4), // seccomp_data.arch
+        jump(jump_eq, audit_arch, 1, 0),
+        stmt(ret, libc::SECCOMP_RET_KILL_PROCESS),
+        stmt(load_abs, 0), // seccomp_data.nr
+        jump(jump_eq, libc::SYS_setsid as u32, 0, 1),
+        stmt(ret, denied),
+        jump(jump_eq, libc::SYS_setpgid as u32, 0, 1),
+        stmt(ret, denied),
+        stmt(ret, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn native_audit_arch() -> Option<u32> {
+    Some(0xc000_003e)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn native_audit_arch() -> Option<u32> {
+    Some(0xc000_00b7)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+fn native_audit_arch() -> Option<u32> {
+    Some(0xc000_00f3)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))
+))]
+fn native_audit_arch() -> Option<u32> {
+    None
 }
 
 /// Counts Linux tasks currently charged to this process's real UID.
@@ -804,6 +953,73 @@ mod tests {
         stderr.read_to_end(&mut error).await.unwrap();
         assert!(child.wait().await.unwrap().success(), "stderr: {error:?}");
         assert_eq!(output, b"forked\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nproc_ceiling_does_not_grow_with_later_uid_tasks() {
+        let first = linux_uid_task_ceiling().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    barrier.wait();
+                })
+            })
+            .collect();
+        barrier.wait();
+        let while_busier = linux_uid_task_ceiling().unwrap();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            while_busier, first,
+            "later UID tasks must not grant fresh descendant headroom"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descendants_cannot_create_a_new_session() {
+        let Some(setsid) = ["/usr/bin/setsid", "/bin/setsid"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+        else {
+            eprintln!("skipping: util-linux setsid is unavailable");
+            return;
+        };
+        // --fork makes the process that invokes setsid a descendant which is
+        // not already the process-group leader; without the inherited filter
+        // this succeeds. --wait propagates its failure to the direct child.
+        let capability = synch_core::ProcessCapability {
+            id: 14,
+            flags: 0x02,
+            executable: setsid.into(),
+            argv: vec![
+                "setsid".into(),
+                "--fork".into(),
+                "--wait".into(),
+                "/bin/true".into(),
+            ],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 5_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, mut stdout, stdin, mut stderr) = spawn_pipe(&capability).unwrap();
+        drop(stdin);
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        let mut error = Vec::new();
+        stderr.read_to_end(&mut error).await.unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(
+            !status.success(),
+            "a descendant escaped the owned process group: stdout={output:?}, stderr={error:?}"
+        );
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]

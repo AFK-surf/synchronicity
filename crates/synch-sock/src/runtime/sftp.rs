@@ -21,6 +21,12 @@ const MAX_READDIR_PAGES: usize = 32;
 struct DirectoryCursor {
     prefix: String,
     after: Option<String>,
+    /// Include `after` itself on the next storage page. Subtree skipping uses
+    /// the prefix's exclusive upper bound (for example `a/` -> `a0`); that
+    /// bound can also be a real sibling, so the first page after a jump must
+    /// probe and include the exact boundary before continuing strictly after
+    /// it.
+    include_after: bool,
     last_child: Option<String>,
     eof: bool,
 }
@@ -104,14 +110,39 @@ impl TreeSftp {
             .map_err(host_error)
     }
 
-    async fn list(&self, prefix: String, after: Option<String>) -> Result<ListPage, StatusCode> {
+    async fn list(
+        &self,
+        prefix: String,
+        after: Option<String>,
+        include_after: bool,
+    ) -> Result<ListPage, StatusCode> {
+        let exact = if include_after {
+            let Some(path) = after.as_ref() else {
+                return Err(StatusCode::Failure);
+            };
+            // `entry_kind` also recognizes implicit directories, which is the
+            // desired SFTP view: if the boundary is the name of such a sibling,
+            // emit it before jumping over its own descendants.
+            match self.entry_kind(path.clone()).await {
+                Ok(_) => Some(path.clone()),
+                Err(StatusCode::NoSuchFile | StatusCode::PermissionDenied) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let tail_limit = LIST_PAGE_ENTRIES.saturating_sub(usize::from(exact.is_some()));
         let host = self.host.clone();
-        tokio::task::spawn_blocking(move || {
-            host.list_page(&prefix, after.as_deref(), LIST_PAGE_ENTRIES)
+        let mut page = tokio::task::spawn_blocking(move || {
+            host.list_page(&prefix, after.as_deref(), tail_limit)
         })
         .await
         .map_err(|_| StatusCode::Failure)?
-        .map_err(host_error)
+        .map_err(host_error)?;
+        if let Some(exact) = exact {
+            page.entries.insert(0, exact);
+        }
+        Ok(page)
     }
 
     async fn read_directory(
@@ -133,8 +164,14 @@ impl TreeSftp {
         // for eof) or monopolizing the storage/blocking pools indefinitely.
         for _ in 0..MAX_READDIR_PAGES {
             let page = self
-                .list(cursor.prefix.clone(), cursor.after.clone())
+                .list(
+                    cursor.prefix.clone(),
+                    cursor.after.clone(),
+                    cursor.include_after,
+                )
                 .await?;
+            let included_after = cursor.include_after;
+            cursor.include_after = false;
             if page.entries.len() > LIST_PAGE_ENTRIES
                 || page
                     .next
@@ -145,8 +182,13 @@ impl TreeSftp {
             }
 
             let mut consumed_page = true;
-            for full in page.entries {
-                if cursor.after.as_ref().is_some_and(|after| full <= *after) {
+            for (index, full) in page.entries.into_iter().enumerate() {
+                let is_included_boundary = included_after
+                    && index == 0
+                    && cursor.after.as_ref().is_some_and(|after| full == *after);
+                if !is_included_boundary
+                    && cursor.after.as_ref().is_some_and(|after| full <= *after)
+                {
                     return Err(StatusCode::Failure);
                 }
                 let Some(rest) = full.strip_prefix(&start) else {
@@ -208,6 +250,7 @@ impl TreeSftp {
                 cursor.after = Some(full);
                 if let Some(subtree_end) = subtree_end {
                     cursor.after = Some(subtree_end);
+                    cursor.include_after = true;
                     consumed_page = false;
                     break;
                 }
@@ -375,6 +418,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         let handle = self.allocate(OpenHandle::Directory(DirectoryCursor {
             prefix,
             after: None,
+            include_after: false,
             last_child: None,
             eof: false,
         }))?;
@@ -637,6 +681,31 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn subtree_jump_keeps_a_sibling_equal_to_the_upper_bound() {
+        let mut sftp = TreeSftp::new(
+            Arc::new(FakeHost::with_files(&[
+                ("files/a/child", "nested"),
+                ("files/a0", "sibling"),
+                ("files/z", "last"),
+            ])),
+            "files".into(),
+            ACCESS_READ | ACCESS_RECURSIVE,
+        );
+        let handle = sftp.opendir(1, ".".into()).await.unwrap();
+        let mut seen = Vec::new();
+        for id in 2..16 {
+            match sftp.readdir(id, handle.handle.clone()).await {
+                Ok(batch) => seen.extend(names(&batch)),
+                Err(StatusCode::Eof) => break,
+                Err(error) => panic!("bounded readdir failed unexpectedly: {error:?}"),
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, vec!["a", "a0", "z"]);
     }
 
     #[tokio::test]
