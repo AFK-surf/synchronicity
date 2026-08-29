@@ -174,8 +174,13 @@ async fn a_cold_compile_does_not_stall_a_co_resident_invocation() {
     cold_task.abort();
 
     // The compile has to be long enough for the question to mean anything.
+    // 120 functions take ~170ms to load on the machine this was written on, and
+    // are about as many as fit: the object is already 800 KB and async-ebpf
+    // caps JIT code at 1 MiB per program (`docs/SOCKETS.md` §10). The
+    // bound is set an order of magnitude below that so a much faster runner
+    // still measures something real rather than failing on its own speed.
     assert!(
-        compile_elapsed > Duration::from_millis(40),
+        compile_elapsed > Duration::from_millis(15),
         "this machine loaded the big program in {compile_elapsed:?}, too fast for this probe \
          to tell a stalled worker from a busy one; raise the function count"
     );
@@ -191,8 +196,10 @@ async fn a_cold_compile_does_not_stall_a_co_resident_invocation() {
     // round-trips sees that; a maximum does not.
     //
     // If the worker were blocked for the compile, the resident could complete
-    // about one round-trip in the window. Unblocked it manages thousands. The
-    // threshold sits an order of magnitude clear of both.
+    // about one round-trip in the window. Unblocked it manages hundreds. The
+    // threshold is deliberately far below what a healthy run achieves (~33% on
+    // an idle 4-core box) and far above what a blocked one can (~0.1%), so a
+    // loaded or small CI runner has room to be slow without being wrong.
     let ideal = compile_elapsed.as_nanos() / base_median.as_nanos().max(1);
     let achieved = during.len() as u128;
     let fraction = achieved as f64 / ideal.max(1) as f64;
@@ -202,7 +209,7 @@ async fn a_cold_compile_does_not_stall_a_co_resident_invocation() {
         fraction * 100.0
     );
     assert!(
-        fraction > 0.15,
+        fraction > 0.05,
         "BREAK: the resident completed only {achieved} round-trips ({:.1}%) of the {ideal} it \
          could have during a {compile_elapsed:?} compile: the worker is compiling on its own \
          thread and is unavailable to everything else placed on it",
