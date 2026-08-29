@@ -92,8 +92,78 @@ SY_ENTRY sy_s64 entry(void) {
 #[test]
 fn a_struct_assignment_past_llcs_store_budget_still_compiles() {
     if !clang_targets_bpf() {
+        eprintln!("skipping: no compatible clang/llc BPF toolchain");
         return;
     }
     synch_cc::compile_with_clang(BIG_STRUCT_ASSIGNMENT, "big-copy.c", &sdk(), &[])
         .expect("a large struct assignment compiles through the clang pipeline");
+}
+
+/// A program whose own names begin with a helper's still gets the helper
+/// declared. The lowering appends `declare … @sy_memset` only where the
+/// module lacks one, and that check must match the exact symbol: with a
+/// substring test, this program's `sy_memset_secure` swallowed the
+/// declaration and llc reported an undefined `@sy_memset` on a line the
+/// user never wrote — a regression, since it compiles fine without the
+/// lowering (a 100-byte fill is within llc's store budget).
+const HELPER_PREFIXED_NAME: &str = r#"
+#include <synch.h>
+
+__attribute__((noinline)) static void sy_memset_secure(volatile char *p,
+                                                       sy_u64 n) {
+  for (sy_u64 i = 0; i < n; i++) p[i] = 0;
+}
+
+struct capability {
+  unsigned id;
+  char argv[10][128];
+};
+
+SY_ENTRY sy_s64 entry(void) {
+  struct capability cap = {0};
+  char note[100] = {0};
+  sy_s64 r = sy_write(0, &cap, sizeof cap) + sy_write(0, note, sizeof note);
+  sy_memset_secure(note, sizeof note);
+  return r;
+}
+"#;
+
+#[test]
+fn a_name_that_merely_starts_with_a_helpers_does_not_cost_its_declaration() {
+    if !clang_targets_bpf() {
+        eprintln!("skipping: no compatible clang/llc BPF toolchain");
+        return;
+    }
+    synch_cc::compile_with_clang(HELPER_PREFIXED_NAME, "prefixed.c", &sdk(), &[])
+        .expect("a helper-prefixed name of the program's own compiles");
+}
+
+/// The host refuses a fill or copy past 64 KiB with `SY_EINVAL`, and the
+/// lowered call has nowhere to surface that. Before the lowering this was a
+/// (baffling) llc error; an object that quietly leaves the memory untouched
+/// at run time would be strictly worse, so the constant case is refused
+/// here, naming the source.
+const PAST_THE_HOST_LIMIT: &str = r#"
+#include <synch.h>
+
+static char scrap[100000];
+
+SY_ENTRY sy_s64 entry(void) {
+  __builtin_memset(scrap, 1, sizeof scrap);
+  return sy_write(0, scrap, sizeof scrap);
+}
+"#;
+
+#[test]
+fn a_fill_the_host_would_refuse_is_a_compile_error_not_a_no_op() {
+    if !clang_targets_bpf() {
+        eprintln!("skipping: no compatible clang/llc BPF toolchain");
+        return;
+    }
+    let err = synch_cc::compile_with_clang(PAST_THE_HOST_LIMIT, "huge.c", &sdk(), &[])
+        .expect_err("a 100 KB fill cannot run: the host moves at most 64 KiB per call");
+    let synch_cc::CcError::Diagnostics(text) = &err else {
+        panic!("expected diagnostics, got {err:?}");
+    };
+    assert!(text.contains("huge.c") && text.contains("64 KiB"), "{text}");
 }

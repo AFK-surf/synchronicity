@@ -78,6 +78,30 @@ fn every_example_compiles_loads_and_declares_itself() {
     }
 }
 
+/// The same floor under the clang pipeline, where a toolchain exists.
+///
+/// This is what caught nothing for too long: `ssh-shell.c`'s 1.3 KiB
+/// process-capability zero-initializer compiled fine with tinycc and failed
+/// with `--clang` ("A call to built-in function 'memset' is not supported"),
+/// and no test built an example that way. Now every example goes through
+/// clang too, and *declaring* each one runs the init entrypoint — which for
+/// ssh-shell means the lowered `sy_memset` call executes in declaring mode,
+/// not just the stream mode the test below covers.
+#[test]
+fn every_example_compiles_with_clang_and_declares_itself() {
+    for name in &every_example() {
+        let Some(elf) = compile_with_clang(&source(name), name) else {
+            return; // no toolchain; compile_with_clang said so
+        };
+        let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+            .unwrap_or_else(|e| panic!("examples/{name} (clang) does not load: {e}"));
+        assert!(
+            !declared.name.is_empty(),
+            "examples/{name} (clang) declares no name"
+        );
+    }
+}
+
 #[tokio::test]
 async fn compact_frames_runs_with_the_layout_it_declares() {
     let elf = build("compact-frames.c");
@@ -949,28 +973,39 @@ async fn an_example_built_with_clang_runs_the_same_way() {
     assert_eq!(status, SockStatus::Ok(15));
 }
 
-/// A clang zero-initializer past llc's store budget zeroes at run time.
+/// A clang zero-initializer past llc's store budget zeroes at run time —
+/// and a struct assignment past it copies.
 ///
-/// Clang compiles a large `= {0}` into an `llvm.memset` intrinsic, llc cannot
-/// expand ~4 KiB into stores, and the BPF backend refuses the libc call that
-/// would otherwise result — `ssh-shell.c`'s process capability hit exactly
-/// this. `synch-cc` rewrites such calls to `sy_memset`, and this is the half
-/// a compile test cannot answer: that the rewritten call resolves at arm
-/// time and the host actually zeroes the guest's stack. The input lands in
-/// the middle of the frame, so the zeros on both sides are the memset's own
-/// work and nothing else's.
+/// Clang compiles a large `= {0}` into an `llvm.memset` intrinsic and a
+/// whole-struct assignment into `llvm.memcpy`; llc cannot expand ~4 KiB into
+/// stores, and the BPF backend refuses the libc call that would otherwise
+/// result — `ssh-shell.c`'s process capability hit exactly this. `synch-cc`
+/// rewrites such calls to `sy_memset`/`sy_memcpy`, and this is the half a
+/// compile test cannot answer: that the rewritten calls resolve at arm time
+/// and the host actually touches the guest's stack. The input lands in the
+/// middle of the frame, so the zeros on both sides are the memset's own
+/// work; what comes back is the copy, so those bytes crossed `sy_memcpy`
+/// too.
 #[tokio::test]
 async fn a_clang_zero_initializer_past_llcs_store_budget_zeroes_at_run_time() {
     let program = r#"
 #include <synch.h>
 
+struct frame { char bytes[4096]; };
+
 SY_ENTRY sy_s64 entry(void) {
-  char frame[4096] = {0};
+  struct frame frame = {0};
   struct sy_pollfd fds[1] = {{SY_SELF, SY_POLL_IN, 0}};
   if (sy_poll(fds, 1, 30000) <= 0) return -1;
-  sy_s64 n = sy_read(SY_SELF, frame + 2048, 64);
+  sy_s64 n = sy_read(SY_SELF, frame.bytes + 2048, 64);
   if (n <= 0) return -2;
-  if (sy_write_all(SY_SELF, frame, sizeof frame, 30000) != (sy_s64)sizeof frame)
+  struct frame copy;
+  copy = frame;
+  /* Diverge from the copy before it is written, so the compiler cannot
+     hand the original to the write and skip the 4 KiB assignment. */
+  frame.bytes[0] = 1;
+  if (sy_write_all(SY_SELF, copy.bytes, sizeof copy.bytes, 30000) !=
+      (sy_s64)sizeof copy.bytes)
     return -3;
   sy_shutdown(SY_SELF);
   return n;

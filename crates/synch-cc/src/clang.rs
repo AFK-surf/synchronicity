@@ -35,6 +35,16 @@ pub(crate) fn compile(
         "-target",
         "bpf",
         "-fno-builtin",
+        // The runtime loads each entrypoint section as a self-contained
+        // program: a local call must land in the caller's own section, which
+        // is why tinycc copies a static function into every section that
+        // calls it. Clang instead leaves an uninlined static in `.text`, and
+        // the object then fails to *load* ("local call target out of range")
+        // — `whoami.c`'s `field` did. Raising the inline cost threshold far
+        // past any socket-sized function makes clang fold statics into their
+        // callers, which is the same duplication tinycc does, minus the call.
+        "-mllvm",
+        "-inline-threshold=2000000",
         "-emit-llvm",
         "-S",
     ]);
@@ -55,9 +65,14 @@ pub(crate) fn compile(
     // memory intrinsic, llc would turn one past its store budget into a call
     // to libc, and the BPF backend refuses to emit that call. `lower.rs`
     // rewrites those to the host helpers the SDK's own memset forwards to.
+    // (Text does not carry bitcode's use-list order, so llc's instruction
+    // scheduling — and the object's bytes — can differ from the old pipeline
+    // even for a program the pass leaves alone; object bytes were never
+    // stable across LLVM versions either, and nothing hashes them but the
+    // tree, which versions content like any other file's.)
     let ir = std::fs::read_to_string(&ir_path)
         .map_err(|e| CcError::Io(format!("cannot read {}: {e}", ir_path.display())))?;
-    std::fs::write(&ir_path, lower_mem_intrinsics(&ir))
+    std::fs::write(&ir_path, lower_mem_intrinsics(&ir, name)?)
         .map_err(|e| CcError::Io(format!("cannot write {}: {e}", ir_path.display())))?;
 
     let mut llc = Command::new("llc");
