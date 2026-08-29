@@ -604,4 +604,125 @@ mod tests {
         let pgid = u32::try_from(unsafe { libc::getpgrp() }).unwrap();
         assert!(process_group_footprint_bytes(pgid).unwrap().unwrap() > 0);
     }
+
+    /// The exact query the memory watchdog makes: a freshly spawned child's
+    /// own process group, not this test's. The watchdog kills the group when
+    /// accounting fails, so accounting that fails on a hardened host would
+    /// silently kill every declared PTY shell moments after it starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_can_measure_a_spawned_childs_process_group() {
+        let capability = synch_core::ProcessCapability {
+            id: 9,
+            flags: 0x02,
+            executable: "/bin/sh".into(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            allowed_signals: 0,
+            max_processes: 1,
+            max_runtime_ms: 10_000,
+            max_memory_bytes: 128 * 1024 * 1024,
+        };
+        let (mut child, stdout, stdin, stderr) = spawn_pipe(&capability).unwrap();
+        drop((stdout, stdin, stderr));
+        let pgid = child.id().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let measured = process_group_footprint_bytes(pgid);
+        unsafe {
+            libc::kill(-(pgid as i32), libc::SIGKILL);
+        }
+        let _ = child.start_kill();
+        assert!(
+            matches!(measured, Ok(Some(bytes)) if bytes > 0),
+            "the watchdog's accounting failed for a child group: {measured:?}"
+        );
+    }
+
+    /// The PTY path end to end with no SSH in the way: allocate, spawn an
+    /// interactive shell on it, type at the prompt, read the answer, log out.
+    /// Isolates the runtime's PTY layer from the SSH adapter when a shell
+    /// example fails on only one platform.
+    #[test]
+    fn a_pty_shell_answers_what_is_typed_at_it() {
+        let capability = synch_core::ProcessCapability {
+            id: 11,
+            flags: 0x01,
+            executable: "/bin/bash".into(),
+            argv: vec!["bash".into()],
+            allowed_signals: 0x07,
+            max_processes: 1,
+            max_runtime_ms: 30_000,
+            max_memory_bytes: 512 * 1024 * 1024,
+        };
+        let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        apply_pty_modes(&slave, &[]).unwrap();
+        let mut reader = master.try_clone().unwrap();
+        let writer = pty_writer(&master).unwrap();
+        let child = spawn_pty(&capability, slave, "").unwrap();
+        let slot = ProcessSlot {
+            child: RefCell::new(Some(Child::Pty(child))),
+            status: RefCell::new(ProcessStatus::default()),
+            capability: capability.id,
+            allowed_signals: capability.allowed_signals,
+            main: -1,
+            stderr: None,
+        };
+
+        // Read until the shell settles at its prompt, then type, then read
+        // until the answer appears, then log out — the interop tests' shape,
+        // minus SSH. A reader thread keeps this test from blocking forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        let settle = std::time::Duration::from_millis(500);
+        while let Ok(chunk) = rx.recv_timeout(settle) {
+            seen.extend_from_slice(&chunk);
+        }
+        assert!(
+            !seen.is_empty(),
+            "the shell printed nothing before its prompt"
+        );
+        assert!(
+            pty_write_all(&writer, b"echo pty-probe-$((6*7))\nexit 0\n"),
+            "typing at the PTY failed"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !String::from_utf8_lossy(&seen).contains("pty-probe-42") {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(chunk) => seen.extend_from_slice(&chunk),
+                Err(_) => {
+                    let status = slot.refresh();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the shell never answered.\nprocess: {status:?}\nseen: {:?}",
+                        String::from_utf8_lossy(&seen)
+                    );
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = slot.refresh().unwrap();
+            if status.exited {
+                assert_eq!(status.exit_code, 0, "the shell's own exit status");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never exited after `exit`"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }

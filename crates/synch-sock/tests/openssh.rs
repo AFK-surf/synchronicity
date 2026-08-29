@@ -127,7 +127,17 @@ async fn openssh_logs_into_the_ssh_shell_example() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         match tokio::time::timeout(Duration::from_millis(500), stdout_pipe.read(&mut chunk)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(0)) => {
+                eprintln!(
+                    "the session ended before anything was typed.\nstdout so far: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+                break;
+            }
+            Ok(Err(error)) => {
+                eprintln!("reading ssh stdout failed before the prompt: {error}");
+                break;
+            }
             Ok(Ok(n)) => output.extend_from_slice(&chunk[..n]),
             Err(_) => {
                 if !output.is_empty() {
@@ -140,6 +150,10 @@ async fn openssh_logs_into_the_ssh_shell_example() {
             }
         }
     }
+    eprintln!(
+        "typing at the prompt; startup output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
 
     // Typed at the terminal: bash expands the arithmetic, so seeing the
     // expansion proves a real shell behind a real PTY, and `exit 5` proves

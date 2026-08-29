@@ -812,18 +812,25 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
         .expect("keystrokes reached the channel");
 
     // The server reports the shell's exit and half-closes; closing the
-    // channel back is the client's move, exactly as OpenSSH would.
+    // channel back is the client's move, exactly as OpenSSH would. A shell
+    // that dies by signal concludes too, so the failure diagnostics can say
+    // who killed it rather than showing silence.
     let mut exit_status = None;
+    let mut exit_signal = None;
     let mut eof = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(eof && exit_status.is_some()) {
+    while !(eof && (exit_status.is_some() || exit_signal.is_some())) {
         let message = tokio::time::timeout_at(deadline, channel.wait())
             .await
             .expect("the shell session concluded");
+        eprintln!("channel message: {message:?}");
         match message {
             Some(russh::ChannelMsg::Data { data }) => output.extend_from_slice(&data),
             Some(russh::ChannelMsg::ExtendedData { data, .. }) => output.extend_from_slice(&data),
             Some(russh::ChannelMsg::ExitStatus { exit_status: code }) => exit_status = Some(code),
+            Some(russh::ChannelMsg::ExitSignal { signal_name, .. }) => {
+                exit_signal = Some(format!("{signal_name:?}"))
+            }
             Some(russh::ChannelMsg::Eof) => eof = true,
             Some(russh::ChannelMsg::Close) | None => break,
             Some(_) => {}
@@ -832,12 +839,12 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains("interactive-42"),
-        "bash did not run the command: {text:?}"
+        "bash did not run the command.\noutput: {text:?}\nexit status: {exit_status:?}\nexit signal: {exit_signal:?}"
     );
     assert_eq!(
         exit_status,
         Some(3),
-        "the shell's own exit status reached the client: {text:?}"
+        "the shell's own exit status reached the client.\noutput: {text:?}\nexit signal: {exit_signal:?}"
     );
 
     // A second login on the same connection: the finished session freed its
