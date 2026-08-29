@@ -1,39 +1,25 @@
-//! Probe: `sy_open_root` is a CAS-wide read oracle with no tree-read
-//! declaration check (hypothesis `open-root-cas-oracle`).
+//! Reading the tree needs no declaration, and refuses nothing.
 //!
-//! Code reading that motivates this probe:
+//! This node's sockets read every path in every origin it holds, and every
+//! blob in its CAS by content root, with no `tree-read` declaration and no
+//! per-path check (`docs/SOCKETS.md` §7.6). Socket entries are readable too:
+//! the bytes are not secret — any member fetches them out of the tree — and
+//! what executes on this node is decided by the arming table, not by who can
+//! read an ELF.
 //!
-//! * `h_open_root` (crates/synch-sock/src/runtime/helpers.rs:913-926) checks
-//!   only `init_mode`. It never consults `policy.tree_read_allowed`, unlike
-//!   `open_common` (helpers.rs:861-881), which refuses an undeclared
-//!   `sy_open_from` with `SY_EPERM`. `policy.rs:146` is the only call site of
-//!   `tree_read_allowed`, so no policy check stands between a guest and
-//!   `host.open_root`.
-//! * The engine's `TreeHost::open_root`
-//!   (crates/synch-engine/src/sockets.rs:665-680) answers
-//!   `store().blob(root)` — the node-wide content-addressed store, with no
-//!   origin, space, or entry-kind scoping, and reports `kind: 0`. `TreeHost::pread`
-//!   (sockets.rs:748-778) reads the same CAS by root, fetching missing groups
-//!   from remote providers. Meanwhile `TreeHost::info` (sockets.rs:617-643)
-//!   refuses `EntryKind::Socket` for path opens, so a socket cannot read its
-//!   neighbours' code — a refusal `open_root` knows nothing about.
+//! This file was a probe asserting the opposite. It recorded that
+//! `sy_open_root` reached the whole CAS while `sy_open_from` was gated on a
+//! declaration and `sy_open` refused socket entries — a split that made the
+//! gate decorative, since the same bytes came back by hash. The gate was
+//! removed rather than extended, so the tests now pin the model that replaced
+//! it: three ways to reach the same bytes, all of them allowed, none of them
+//! declared.
 //!
-//! Two probes, run as two tests:
-//!
-//! (a) Policy bypass: an invocation armed with *zero* tree-read declarations
-//!     (and a caller who is a delegate restricted to space `code`) reads the
-//!     bytes of `secrets/key.pem` by content hash. The same program's
-//!     `sy_open_from` of the same path is refused with `SY_EPERM`, proving the
-//!     declaration check exists and was bypassed, not absent.
-//! (b) Socket-kind bypass: against a custom `SocketHost` that mirrors the
-//!     engine's split — `open` refuses a `.sock` path with
-//!     `HostError::NotReadable` exactly as `TreeHost::info` does, while
-//!     `open_root` resolves any content by hash with `kind: 0` — the guest
-//!     reads the ELF bytes of a neighbouring socket by hash. `sy_open` of the
-//!     same path is refused, proving the kind check was bypassed.
-//!
-//! A break is the secret (or ELF) bytes crossing the stream back to the
-//! caller.
+//! (a) An invocation with an empty policy, called by a delegate restricted to
+//!     space `code`, reads `secrets/key.pem` both by foreign-origin path and
+//!     by content hash.
+//! (b) A neighbouring socket's ELF object is readable both by its `.sock` path
+//!     and by content hash.
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
@@ -109,14 +95,14 @@ const POLICY_PROBE_C: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   sy_u8 root[32] = { @ROOT@ };
 
-  /* Contrast: the same content by path from a foreign origin must be
-   * refused, because this program declared no tree reads at arm time. */
+  /* The same content by path from a foreign origin: allowed, and declared
+   * nowhere. */
   sy_s64 of = sy_open_from(SY_STR("nas@cluster.example"), SY_STR("secrets/key.pem"));
   wr_all(SY_STR("OPEN_FROM="));
   wr_num(of);
   wr_all(SY_STR("\n"));
 
-  /* The attack: the same content by hash. */
+  /* And the same content by hash. */
   sy_s64 h = sy_open_root(root);
   wr_all(SY_STR("OPEN_ROOT="));
   wr_num(h);
@@ -135,13 +121,13 @@ const KIND_PROBE_C: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   sy_u8 root[32] = { @ROOT@ };
 
-  /* Contrast: opening the neighbour socket by path must be refused. */
+  /* Opening the neighbour socket by path: allowed. */
   sy_s64 so = sy_open(SY_STR("code/neighbour.sock"));
   wr_all(SY_STR("OPEN_SOCK="));
   wr_num(so);
   wr_all(SY_STR("\n"));
 
-  /* The attack: the same socket's bytes by content hash. */
+  /* And the same socket's bytes by content hash. */
   sy_s64 h = sy_open_root(root);
   wr_all(SY_STR("OPEN_ROOT="));
   wr_num(h);
@@ -169,10 +155,10 @@ fn build_guest(template: &str, root: &Hash, name: &str) -> Vec<u8> {
     compile(&source, name)
 }
 
-/// A host that mirrors the engine's `TreeHost` split: path opens refuse
-/// socket-kind entries (`TreeHost::info`, sockets.rs:622-626), while
-/// `open_root` resolves any content in the store by hash alone and reports
-/// `kind: 0` (`TreeHost::open_root`, sockets.rs:665-680).
+/// A host that mirrors the engine's `TreeHost`: a path open reports the
+/// entry's real kind and refuses nothing that has content (`TreeHost::info`),
+/// and `open_root` resolves any content in the store by hash alone, reporting
+/// `kind: 0` (`TreeHost::open_root`).
 struct KindAwareTree {
     /// path -> (entry kind as SY_KIND_*, content)
     files: std::collections::HashMap<String, (u32, Vec<u8>)>,
@@ -182,11 +168,6 @@ struct KindAwareTree {
 impl SocketHost for KindAwareTree {
     fn open(&self, _origin: Option<&str>, path: &str) -> Result<ObjectInfo, HostError> {
         let (kind, bytes) = self.files.get(path).ok_or(HostError::NotFound)?;
-        if *kind == 4 {
-            return Err(HostError::NotReadable(
-                "that path is a socket; a socket does not read out its neighbours' code".into(),
-            ));
-        }
         Ok(ObjectInfo {
             root: Hash::new(bytes),
             size: bytes.len() as u64,
@@ -281,10 +262,10 @@ async fn exchange_with_host(
     (outcome.status, out)
 }
 
-/// (a) Zero tree-read declarations, a delegate restricted to space `code`,
-/// and the bytes of `secrets/key.pem` still come back over the stream.
+/// (a) An empty policy and a delegate restricted to space `code` still read
+/// `secrets/key.pem`, by foreign-origin path and by content hash alike.
 #[tokio::test]
-async fn open_root_reads_a_blob_with_zero_tree_read_declarations() {
+async fn a_foreign_path_and_a_content_root_are_both_readable_undeclared() {
     const SECRET: &str = "PRIVATE-KEY-MATERIAL: 0123456789abcdef do not exfiltrate";
     let root = Hash::new(SECRET.as_bytes());
     let elf = build_guest(POLICY_PROBE_C, &root, "policy-probe.c");
@@ -294,10 +275,10 @@ async fn open_root_reads_a_blob_with_zero_tree_read_declarations() {
         &harness,
         &elf,
         b"",
-        // The armed declaration showed no tree reads at all.
+        // Nothing declared: an empty policy grants every read there is.
         EffectivePolicy::default(),
-        // And the caller is a delegate who may read only space `code` —
-        // never `secrets`.
+        // And the caller is a delegate scoped to space `code`, which bounds
+        // which sockets it may invoke, not what an invocation may read.
         peer(Some(vec!["code".into()])),
         vec![],
     )
@@ -306,32 +287,26 @@ async fn open_root_reads_a_blob_with_zero_tree_read_declarations() {
     let text = String::from_utf8_lossy(&out);
     eprintln!("status: {status:?}\nreply:\n{text}");
 
-    // The contrast must hold: the declaration check exists and fired.
+    // A foreign-origin path open needs no declaration.
     assert!(
-        text.contains("OPEN_FROM=-4"),
-        "sy_open_from without a declaration must be SY_EPERM, got: {text}"
+        !text.contains("OPEN_FROM=-"),
+        "sy_open_from must succeed without a declaration, got: {text}"
     );
-
-    // The break: the same bytes came back anyway, by hash.
+    // So does the same content by hash.
     assert!(
         !text.contains("OPEN_ROOT=-"),
-        "sy_open_root must fail for containment; it returned a handle: {text}"
+        "sy_open_root must return a handle, got: {text}"
     );
     assert!(
         out.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
-        "BREAK: the secret crossed the stream with zero tree-read declarations; reply: {text}"
+        "the bytes must come back over the stream; reply: {text}"
     );
-    assert_eq!(
-        status,
-        SockStatus::Ok(0),
-        "the exfiltrating program ran to a clean completion"
-    );
+    assert_eq!(status, SockStatus::Ok(0));
 }
 
-/// (b) `sy_open` refuses a socket entry; `sy_open_root` hands over the same
-/// socket's ELF bytes by hash.
+/// (b) A neighbouring socket's ELF object is readable by path and by hash.
 #[tokio::test]
-async fn open_root_reads_socket_code_that_sy_open_refuses() {
+async fn a_neighbouring_sockets_object_is_readable_by_path_and_by_hash() {
     // The neighbour socket: a real compiled eBPF object, as the tree would
     // hold for an armed socket.
     let neighbour = compile(
@@ -351,14 +326,14 @@ async fn open_root_reads_socket_code_that_sy_open_refuses() {
     let text = String::from_utf8_lossy(&out);
     eprintln!("status: {status:?}\nreply: {} bytes\n{text}", out.len());
 
-    // The contrast must hold: the path open of the socket was refused.
+    // A socket entry is an ordinary readable path.
     assert!(
-        text.contains("OPEN_SOCK=-4"),
-        "sy_open of a socket path must be SY_EPERM, got: {text}"
+        !text.contains("OPEN_SOCK=-"),
+        "sy_open of a socket path must succeed, got: {text}"
     );
 
-    // The break: the neighbour socket's ELF bytes came back by hash. The
-    // whole object is dumped; check the ELF header and the exact length.
+    // And the same object comes back by hash. The whole object is dumped;
+    // check the ELF header and the exact length.
     let start = out
         .windows(5)
         .position(|w| w == b"DATA:")
@@ -367,13 +342,13 @@ async fn open_root_reads_socket_code_that_sy_open_refuses() {
     let data = &out[start..out.len().min(start + neighbour.len())];
     assert!(
         data.starts_with(b"\x7fELF"),
-        "BREAK: socket ELF bytes crossed the stream; first bytes: {:?}",
+        "the socket's ELF bytes must cross the stream; first bytes: {:?}",
         data.get(..16)
     );
     assert_eq!(
         data.len(),
         neighbour.len(),
-        "BREAK: the entire neighbour socket object was exfiltrated by hash"
+        "the whole object must be readable by hash"
     );
     assert_eq!(status, SockStatus::Ok(0));
 }

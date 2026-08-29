@@ -1,8 +1,13 @@
 //! Who is calling, and what this invocation may do.
 //!
 //! Arming a program approves the capabilities it declared in its
-//! `synchronicity.init` hook. Egress or foreign-tree access the program did not
-//! declare remains denied.
+//! `synchronicity.init` hook. Egress the program did not declare remains
+//! denied.
+//!
+//! Reading the tree is not among the things a program declares. Every
+//! invocation may read every path in every origin this node holds
+//! (`docs/SOCKETS.md` §7.6): the bytes are already readable by any member, and
+//! a per-program prefix list bought an approval prompt rather than a boundary.
 //!
 //! The effective policy is computed once when the invocation is built, so a
 //! helper answers a policy question by looking at a list rather than by
@@ -95,8 +100,6 @@ impl PeerIdentity {
 pub struct EffectivePolicy {
     /// Egress rules the armed program declared, as `host` or `host:port`.
     pub egress: Vec<String>,
-    /// Foreign-tree prefixes the armed program declared.
-    pub tree_reads: Vec<String>,
     /// Exact process capabilities approved for this program root.
     pub processes: Vec<synch_core::ProcessCapability>,
     /// Exact file-transfer capabilities approved for this program root.
@@ -131,7 +134,6 @@ impl EffectivePolicy {
 
         EffectivePolicy {
             egress: declared.egress.clone(),
-            tree_reads: declared.tree_reads.clone(),
             processes: declared.processes.clone(),
             file_transfers: declared.file_transfers.clone(),
             config,
@@ -146,13 +148,6 @@ impl EffectivePolicy {
         self.egress
             .iter()
             .any(|rule| egress_rule_matches(rule, host, port))
-    }
-
-    /// Whether this invocation may read `path` from another origin's view.
-    pub(crate) fn tree_read_allowed(&self, path: &str) -> bool {
-        self.tree_reads
-            .iter()
-            .any(|prefix| synch_core::sock::path_prefix_matches(prefix, path))
     }
 
     /// The value of a config key.
@@ -317,21 +312,6 @@ mod tests {
         assert!(!resolved_address_allowed("git.internal", ula));
         let global: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
         assert!(resolved_address_allowed("git.internal", global));
-    }
-
-    #[test]
-    fn arming_approves_the_declared_tree_reads() {
-        let p = EffectivePolicy::armed(
-            &Declaration {
-                tree_reads: vec!["code/pub".into(), "secrets".into()],
-                ..Declaration::default()
-            },
-            vec![],
-            None,
-            64,
-        );
-        assert!(p.tree_read_allowed("code/pub/readme"));
-        assert!(p.tree_read_allowed("secrets/keys"));
     }
 
     #[test]

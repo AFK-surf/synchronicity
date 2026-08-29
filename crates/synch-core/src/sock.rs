@@ -251,9 +251,6 @@ impl SockOpen {
 /// The most destinations one program may declare.
 pub const MAX_DECLARED_EGRESS: usize = 32;
 
-/// The most tree-read prefixes one program may declare.
-pub const MAX_DECLARED_TREE_READS: usize = 32;
-
 /// The most exact process capabilities one program may declare.
 pub const MAX_DECLARED_PROCESSES: usize = 16;
 
@@ -351,10 +348,6 @@ pub enum DeclarationError {
          {MIN_EBPF_STACK_FRAME_SIZE} through {MAX_EBPF_STACK_FRAME_SIZE} bytes"
     )]
     InvalidStackFrameSize,
-    /// A tree-read prefix names nothing: `""` or `"/"` would grant every path
-    /// in every origin.
-    #[error("a tree-read prefix must name a directory: an empty prefix or `/` is the everything-spelling")]
-    InvalidTreeReadPrefix,
     /// A structured backing capability was malformed or duplicated.
     #[error("invalid {kind} capability: {reason}")]
     InvalidCapability {
@@ -420,16 +413,15 @@ fn escaped_declaration_value(value: &str) -> String {
 /// root, which disarms the socket: a program cannot widen its own reach
 /// without a fresh approval.
 ///
-/// Arming approves these capabilities for this exact program root. Egress or a
-/// foreign-tree read the program did not declare remains denied.
+/// Arming approves these capabilities for this exact program root. Egress the
+/// program did not declare remains denied. Reading the tree is not declared and
+/// not restricted (`docs/SOCKETS.md` §7.6).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declaration {
     /// A human name, for `synch socket ls` and `synch socket ps`.
     pub name: String,
     /// Destinations, as `host` or `host:port`. A bare host is any port on it.
     pub egress: Vec<String>,
-    /// Path prefixes the program intends to read from other origins' views.
-    pub tree_reads: Vec<String>,
     /// Exact process capabilities local to this program root.
     pub processes: Vec<ProcessCapability>,
     /// Exact file-transfer capabilities local to this program root.
@@ -449,9 +441,6 @@ impl Declaration {
         if self.egress.len() > MAX_DECLARED_EGRESS {
             return Err(DeclarationError::TooMany { field: "egress" });
         }
-        if self.tree_reads.len() > MAX_DECLARED_TREE_READS {
-            return Err(DeclarationError::TooMany { field: "tree-read" });
-        }
         if self.processes.len() > MAX_DECLARED_PROCESSES {
             return Err(DeclarationError::TooMany { field: "process" });
         }
@@ -463,12 +452,6 @@ impl Declaration {
         validate_declaration_value("name", &self.name)?;
         for host in &self.egress {
             validate_declaration_value("egress", host)?;
-        }
-        for prefix in &self.tree_reads {
-            validate_declaration_value("tree-read", prefix)?;
-            if !tree_read_prefix_grants_something(prefix) {
-                return Err(DeclarationError::InvalidTreeReadPrefix);
-            }
         }
         let mut process_ids = std::collections::BTreeSet::new();
         for process in &self.processes {
@@ -569,12 +552,6 @@ impl Declaration {
         for host in egress {
             out.push(format!("egress {}", escaped_declaration_value(&host)));
         }
-        let mut reads = self.tree_reads.clone();
-        reads.sort();
-        reads.dedup();
-        for prefix in reads {
-            out.push(format!("tree-read {}", escaped_declaration_value(&prefix)));
-        }
         let mut processes = self.processes.clone();
         processes.sort_by_key(|capability| capability.id);
         for capability in processes {
@@ -617,16 +594,6 @@ impl Declaration {
                     if out.egress.len() < MAX_DECLARED_EGRESS && display_text_is_safe(v) =>
                 {
                     out.egress.push(v.to_string())
-                }
-                Some(("tree-read", v))
-                    if out.tree_reads.len() < MAX_DECLARED_TREE_READS
-                        && display_text_is_safe(v)
-                        // The everything-spelling is not a permission: an
-                        // approval that carries it is read as no grant, the
-                        // way an unknown directive is.
-                        && tree_read_prefix_grants_something(v) =>
-                {
-                    out.tree_reads.push(v.to_string())
                 }
                 Some(("process", v)) if out.processes.len() < MAX_DECLARED_PROCESSES => {
                     if let Ok(capability) = serde_json::from_str(v) {
@@ -678,38 +645,6 @@ pub fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
     let strip = |s: &str| s.trim_matches(['[', ']']).to_string();
     strip(rule_host).eq_ignore_ascii_case(&strip(host))
         && rule_port.is_none_or(|declared| declared == port)
-}
-
-/// True if a tree-read prefix admits `path`.
-///
-/// Boundary-aware: `code` admits `code` and `code/x`, and does not admit
-/// `codex/secret`. A plain `starts_with` would, which is the difference between
-/// naming a directory and naming a string.
-///
-/// The everything-spellings — `""` and `"/"` — match every path, which is why
-/// [`tree_read_prefix_grants_something`] refuses them as declarations: the
-/// matcher itself treats them as the root of the whole tree.
-pub fn path_prefix_matches(prefix: &str, path: &str) -> bool {
-    let prefix = prefix.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    match path.strip_prefix(prefix) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/'),
-        None => false,
-    }
-}
-
-/// Whether a tree-read prefix names something at all.
-///
-/// A prefix that trims to nothing — `""` or `"/"` — is the everything-spelling
-/// to [`path_prefix_matches`]: it admits every path in every origin, which is
-/// not a prefix an operator approving a bounded list can be expected to have
-/// meant. Declarations must not carry it, and a persisted approval that does
-/// is read as no permission rather than as everything.
-pub fn tree_read_prefix_grants_something(prefix: &str) -> bool {
-    !prefix.trim_end_matches('/').is_empty()
 }
 
 /// Decodes [`SockOpen::meta`] under [`MAX_OPEN_META_PAIRS`].
@@ -941,22 +876,10 @@ mod tests {
     }
 
     #[test]
-    fn tree_read_prefixes_stop_at_a_path_boundary() {
-        assert!(path_prefix_matches("code/pub", "code/pub"));
-        assert!(path_prefix_matches("code/pub", "code/pub/readme"));
-        assert!(
-            !path_prefix_matches("code/pub", "code/public-secrets"),
-            "a prefix matched across a path boundary"
-        );
-        assert!(!path_prefix_matches("code/pub", "code"));
-    }
-
-    #[test]
     fn a_declaration_round_trips_through_its_stored_text() {
         let d = Declaration {
             name: "git-http".into(),
             egress: vec!["git.internal:9418".into(), "cache.internal".into()],
-            tree_reads: vec!["code".into()],
             processes: vec![],
             file_transfers: vec![],
             max_streams: Some(32),
@@ -978,9 +901,9 @@ mod tests {
 
     #[test]
     fn declaration_values_cannot_inject_or_conceal_capabilities() {
+        // A newline in one value must not become a second directive.
         let injected = Declaration {
             name: "benign\negress evil.example:443".into(),
-            tree_reads: vec!["public\u{1b}[2J".into()],
             ..Declaration::default()
         };
         assert!(matches!(
@@ -989,10 +912,18 @@ mod tests {
         ));
 
         let rendered = injected.render();
-        assert!(!rendered.contains('\u{1b}'));
-        assert_eq!(rendered.lines().count(), 2);
+        assert_eq!(rendered.lines().count(), 1, "the name spanned two lines");
         let reparsed = Declaration::parse(&rendered);
         assert!(reparsed.egress.is_empty(), "a name became an egress rule");
+
+        // And a control character is refused, and never reaches the rendered
+        // text an operator reads at the arm prompt.
+        let control = Declaration {
+            egress: vec!["public\u{1b}[2J".into()],
+            ..Declaration::default()
+        };
+        assert!(control.validate().is_err());
+        assert!(!control.render().contains('\u{1b}'));
 
         let directional = Declaration {
             name: "safe-looking\u{202e}txt".into(),
@@ -1020,46 +951,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(Declaration::parse(&text).egress.len(), MAX_DECLARED_EGRESS);
-    }
-
-    #[test]
-    fn tree_reads_must_name_something() {
-        // The everything-spellings are not declarations: an operator
-        // approving `tree-read /` would be approving every path in every
-        // origin.
-        let root = Declaration {
-            tree_reads: vec!["/".into()],
-            ..Declaration::default()
-        };
-        assert!(matches!(
-            root.validate(),
-            Err(DeclarationError::InvalidTreeReadPrefix)
-        ));
-        let empty = Declaration {
-            tree_reads: vec!["".into()],
-            ..Declaration::default()
-        };
-        assert!(matches!(
-            empty.validate(),
-            Err(DeclarationError::InvalidTreeReadPrefix)
-        ));
-
-        // And they are not read back as permissions from stored text.
-        assert_eq!(
-            Declaration::parse("tree-read /").tree_reads,
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            Declaration::parse("tree-read ").tree_reads,
-            Vec::<String>::new()
-        );
-
-        // An honest prefix still round-trips.
-        let honest = Declaration {
-            tree_reads: vec!["code/pub".into()],
-            ..Declaration::default()
-        };
-        assert_eq!(Declaration::parse(&honest.render()), honest);
     }
 
     #[test]

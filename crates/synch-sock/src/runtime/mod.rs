@@ -13,6 +13,16 @@
 //! keyed by content root. So a program JIT-compiles at most once per worker, and
 //! a socket under load costs one compilation per worker rather than one per
 //! stream.
+//!
+//! That compile does not happen on the worker thread. `ProgramLoader::load`
+//! returns a `Send` `UnboundProgram` and only `pin_to_current_thread` has to
+//! run where the guest will, so the load goes to the blocking pool and the
+//! worker stays available to everything else placed on it
+//! (`ProgramCompiler::program_for`). async-ebpf's *lazy* per-function JIT — a
+//! function is compiled when the guest first calls it — leaves the thread the
+//! same way, through `Timeslicer::run_blocking`. Neither kind of compilation
+//! runs where the guests do; both are still charged to the compiling guest's
+//! run budget, so offloading buys it no extra CPU.
 
 pub(crate) mod ctx;
 pub(crate) mod endpoint;
@@ -21,6 +31,7 @@ pub(crate) mod map;
 pub(crate) mod process;
 pub(crate) mod sftp;
 pub(crate) mod ssh;
+pub(crate) mod tasks;
 
 use std::{
     cell::RefCell,
@@ -110,8 +121,48 @@ impl Timeslicer for TokioTimeslicer {
     fn yield_now(&self) -> impl std::future::Future<Output = ()> {
         tokio::task::yield_now()
     }
+
+    /// Runs guest-triggered CPU-bound work — a lazy JIT compilation — off the
+    /// worker thread.
+    ///
+    /// This is the other half of the compile story, and the half the runtime
+    /// could not fix on its own. `ProgramCompiler::program_for` moves the
+    /// *eager* load to the blocking pool, but async-ebpf compiles each function
+    /// lazily, when the guest first calls it, and used to do that on whichever
+    /// thread was running the guest — necessarily, since the preemption handler
+    /// only acts on a PC inside the JIT code range and a thread inside the
+    /// compiler cannot be interrupted. On a worker multiplexing up to 64
+    /// invocations, one guest's large function stopped all of them.
+    ///
+    /// async-ebpf 0.4.0-alpha.13 hands that work here instead. Sending it to
+    /// `spawn_blocking` keeps the worker's reactor live; the elapsed wall time
+    /// is still charged to the guest's run budget by the caller, so offloading
+    /// buys the guest no extra CPU, only the rest of the worker its turn.
+    ///
+    /// A `JoinError` from a blocking task is a panic in the compiler — such a
+    /// task is never cancelled once it has started — so the unwind is resumed
+    /// rather than swallowed. That reproduces what an inline compile would have
+    /// done, and async-ebpf contains a faulting run at the coroutine root.
+    async fn run_blocking<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(value) => value,
+            Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+        }
+    }
 }
 
+/// The guest's yield and throttle budget.
+///
+/// Worth knowing when reading a latency measurement here: async-ebpf's budget
+/// is **wall-clock between checkpoints**, not CPU consumed. A run that is
+/// descheduled long enough — waiting on a compile, or simply not scheduled on a
+/// busy host — arrives at its next checkpoint over `THROTTLE_AFTER` and sleeps
+/// `THROTTLE_FOR`, having burned no CPU of its own. So a co-resident's worst
+/// round-trip during a large compile is `THROTTLE_FOR`, whichever thread the
+/// compile ran on; that number is the throttle, not the compile, and moving
+/// compilation off the worker does not change it. Measure a compile's effect on
+/// co-residents by completed round-trips rather than by the worst one
+/// (`probe_compile_offthread`).
 fn timeslice() -> TimesliceConfig {
     TimesliceConfig {
         max_run_time_before_yield: YIELD_AFTER,
@@ -158,7 +209,11 @@ struct Job {
 }
 
 type StackConfig = (usize, bool);
-type LoaderCache = RefCell<HashMap<StackConfig, Rc<ProgramLoader>>>;
+type LoaderCache = RefCell<HashMap<StackConfig, Arc<ProgramLoader>>>;
+
+/// What identifies one compiled program: the armed content root, and the stack
+/// shape it was compiled for.
+type ProgramKey = (Hash, StackConfig);
 
 /// How many compiled programs one worker may hold.
 ///
@@ -172,10 +227,46 @@ const MAX_CACHED_PROGRAMS: usize = 32;
 
 /// The compiled-program cache: insertion order alongside the entries, for
 /// oldest-first eviction.
-type ProgramCache = RefCell<(
-    HashMap<(Hash, StackConfig), Rc<Program>>,
-    VecDeque<(Hash, StackConfig)>,
-)>;
+type ProgramCache = RefCell<(HashMap<ProgramKey, Rc<Program>>, VecDeque<ProgramKey>)>;
+
+/// Compilations this worker has in flight, so a cache miss is paid once.
+///
+/// Without it, every invocation that arrives for a root while that root is
+/// still compiling starts its own compilation of the same bytes — the miss
+/// that a burst of callers turns into a stampede, which is exactly the case
+/// the cache exists for.
+type PendingCompiles = RefCell<HashMap<ProgramKey, Rc<tokio::sync::Notify>>>;
+
+/// Marks one compilation in flight and wakes whoever waited on it.
+///
+/// A guard rather than a pair of statements because the wake has to happen on
+/// the failure paths too: a compilation that ends in `SockError::Load`, or one
+/// whose invocation was cancelled mid-compile, must release its waiters to
+/// find out for themselves rather than strand them.
+struct PendingCompile {
+    compiler: Rc<ProgramCompiler>,
+    key: ProgramKey,
+    notify: Rc<tokio::sync::Notify>,
+}
+
+impl Drop for PendingCompile {
+    fn drop(&mut self) {
+        self.compiler.pending.borrow_mut().remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
+/// One worker's compilation state.
+///
+/// Its loaders (whose entropy is what makes a helper index unforgeable, so
+/// they stay per worker), its cache of programs already pinned to this thread,
+/// and the compiles it currently has in flight.
+#[derive(Default)]
+struct ProgramCompiler {
+    loaders: LoaderCache,
+    cache: ProgramCache,
+    pending: PendingCompiles,
+}
 
 fn host_page_size() -> Option<usize> {
     // SAFETY: `sysconf` reads a process-wide platform constant and has no
@@ -521,9 +612,7 @@ impl Worker {
                     }
                 };
                 let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-                let loaders: Rc<LoaderCache> = Rc::new(RefCell::new(HashMap::new()));
-                let cache: Rc<ProgramCache> =
-                    Rc::new(RefCell::new((HashMap::new(), VecDeque::new())));
+                let compiler: Rc<ProgramCompiler> = Rc::new(ProgramCompiler::default());
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     let mut running = tokio::task::JoinSet::new();
@@ -546,16 +635,14 @@ impl Worker {
                                         let _ = job.reply.send(Ok(killed_outcome()));
                                         continue;
                                     }
-                                    let loaders = loaders.clone();
-                                    let cache = cache.clone();
+                                    let compiler = compiler.clone();
                                     let limits = limits.clone();
                                     let maps = maps.clone();
                                     let registry = registry.clone();
                                     let shutdown = worker_shutdown.clone();
                                     running.spawn_local(async move {
                                         let outcome = run_job(
-                                            &loaders,
-                                            &cache,
+                                            &compiler,
                                             thread_env,
                                             &limits,
                                             &maps,
@@ -631,41 +718,115 @@ fn load_pinned(
     Ok(program)
 }
 
-/// Compiles, or returns the compiled program for, one content root.
-fn program_for(
-    loaders: &LoaderCache,
-    cache: &ProgramCache,
-    thread_env: ThreadEnv,
-    root: &Hash,
-    elf: &[u8],
-    stack_frame_size: Option<usize>,
-    guarded_stack_frames: Option<bool>,
-) -> Result<Rc<Program>, SockError> {
-    let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
-    let key = (*root, config);
-    if let Some(program) = cache.borrow().0.get(&key) {
-        return Ok(program.clone());
+impl ProgramCompiler {
+    /// Compiles, or returns the compiled program for, one content root.
+    ///
+    /// The compile does not run on the worker thread. JIT-compiling an ELF is the
+    /// most expensive thing an admission does, and it used to happen synchronously
+    /// in `run_job` *before* the select loop — so a cache miss froze that worker's
+    /// whole reactor: every pump, every poll wait and the idle-deadline branch of
+    /// every other invocation placed on it. With a 32-entry per-worker cache and
+    /// oldest-first eviction, a caller cycling more than 32 armed roots (or
+    /// `--auto` re-arms minting fresh ones) made every admission a miss, and the
+    /// crate's own `blocking_is_allowed` tripwire could not see it: a socket
+    /// worker's current-thread runtime is not a dedicated blocking thread, it
+    /// multiplexes up to 64 invocations.
+    ///
+    /// async-ebpf already splits the work where it needs splitting.
+    /// `ProgramLoader::load` does the parse and the JIT and yields an
+    /// `UnboundProgram`, which is `Send`; `pin_to_current_thread` is a struct wrap
+    /// that must happen on the thread that will run the guest. So the load goes to
+    /// the blocking pool and only the pin stays here, and the worker keeps
+    /// servicing everything else while a program compiles.
+    ///
+    /// The loader stays per worker rather than moving to the compile pool: its
+    /// entropy is what makes a helper index unforgeable, and sharing one loader
+    /// across every worker would make one guest's discovery worth something on all
+    /// of them. `ProgramLoader` is `Sync`, so the worker's own loader is what
+    /// compiles, on whichever thread does it.
+    ///
+    /// This is the eager half — the part that scales with the whole object rather
+    /// than with the code a caller actually reaches. async-ebpf compiles each
+    /// *function* lazily on top of it, when the guest first calls it, and that
+    /// used to be pinned to the thread running the guest. Since
+    /// 0.4.0-alpha.13 it is handed to `Timeslicer::run_blocking`, which
+    /// `TokioTimeslicer` sends to the same blocking pool. So no compilation of
+    /// either kind runs on a worker thread.
+    async fn program_for(
+        self: &Rc<Self>,
+        thread_env: ThreadEnv,
+        root: &Hash,
+        elf: &Arc<Vec<u8>>,
+        stack_frame_size: Option<usize>,
+        guarded_stack_frames: Option<bool>,
+    ) -> Result<Rc<Program>, SockError> {
+        let config = resolve_stack_config(stack_frame_size, guarded_stack_frames)?;
+        let key = (*root, config);
+        loop {
+            if let Some(program) = self.cache.borrow().0.get(&key) {
+                return Ok(program.clone());
+            }
+            // Somebody else is already compiling this exact program. Wait for them
+            // rather than compiling the same bytes again.
+            //
+            // No wakeup can be lost between finding the entry and registering on
+            // it, and not because `Notify` retains one — `notify_waiters` wakes
+            // only waiters already registered, and a `Notified` registers on its
+            // first poll. It is that this is a current-thread worker: there is no
+            // await between the lookup and that first poll, so the compiling task
+            // cannot run, and therefore cannot signal, in the window.
+            let waiting = self.pending.borrow().get(&key).cloned();
+            let Some(notify) = waiting else { break };
+            notify.notified().await;
+            // Round again: the compile may have succeeded (the cache now has it),
+            // or failed (nothing pending, nothing cached — and this caller becomes
+            // the one that compiles, and reports the error itself).
+        }
+
+        let notify = Rc::new(tokio::sync::Notify::new());
+        self.pending.borrow_mut().insert(key, notify.clone());
+        let _in_flight = PendingCompile {
+            compiler: Rc::clone(self),
+            key,
+            notify,
+        };
+
+        let existing_loader = self.loaders.borrow().get(&config).cloned();
+        let loader = if let Some(loader) = existing_loader {
+            loader
+        } else {
+            let loader = Arc::new(stack_loader(config)?);
+            self.loaders.borrow_mut().insert(config, loader.clone());
+            loader
+        };
+
+        let elf = Arc::clone(elf);
+        let unbound = tokio::task::spawn_blocking(move || {
+            loader
+                .load(&mut rand::thread_rng(), &elf)
+                .map_err(|e| SockError::Load(e.to_string()))
+        })
+        .await
+        .map_err(|_| SockError::Load("the program compiler panicked".into()))??;
+
+        let program = unbound.pin_to_current_thread(thread_env);
+        if !program.has_section(SECTION_STREAM) {
+            return Err(SockError::NoEntrypoint);
+        }
+        let program = Rc::new(program);
+
+        let mut cache = self.cache.borrow_mut();
+        cache.0.insert(key, program.clone());
+        cache.1.push_back(key);
+        while cache.1.len() > MAX_CACHED_PROGRAMS {
+            let oldest = cache
+                .1
+                .pop_front()
+                .expect("a non-empty eviction queue stays non-empty");
+            cache.0.remove(&oldest);
+        }
+        Ok(program)
     }
-    let existing_loader = loaders.borrow().get(&config).cloned();
-    let loader = if let Some(loader) = existing_loader {
-        loader
-    } else {
-        let loader = Rc::new(stack_loader(config)?);
-        loaders.borrow_mut().insert(config, loader.clone());
-        loader
-    };
-    let program = Rc::new(load_pinned(&loader, elf, thread_env)?);
-    let mut cache = cache.borrow_mut();
-    cache.0.insert(key, program.clone());
-    cache.1.push_back(key);
-    while cache.1.len() > MAX_CACHED_PROGRAMS {
-        let oldest = cache
-            .1
-            .pop_front()
-            .expect("a non-empty eviction queue stays non-empty");
-        cache.0.remove(&oldest);
-    }
-    Ok(program)
 }
 
 /// Builds the invocation state and runs the guest.
@@ -674,8 +835,7 @@ fn program_for(
     reason = "everything a worker needs to run one invocation, and every one of               them is per-worker state a struct would only rename"
 )]
 async fn run_job(
-    loaders: &LoaderCache,
-    cache: &ProgramCache,
+    compiler: &Rc<ProgramCompiler>,
     thread_env: ThreadEnv,
     limits: &Limits,
     maps: &Arc<SocketMaps>,
@@ -687,15 +847,15 @@ async fn run_job(
     cancel: oneshot::Receiver<SockStatus>,
     peer_gone: oneshot::Receiver<SockStatus>,
 ) -> Result<Outcome, SockError> {
-    let program = program_for(
-        loaders,
-        cache,
-        thread_env,
-        &invocation.program_root,
-        &invocation.program,
-        invocation.policy.stack_frame_size,
-        invocation.policy.guarded_stack_frames,
-    )?;
+    let program = compiler
+        .program_for(
+            thread_env,
+            &invocation.program_root,
+            &invocation.program,
+            invocation.policy.stack_frame_size,
+            invocation.policy.guarded_stack_frames,
+        )
+        .await?;
 
     let ready = Arc::new(Readiness::default());
     // Start reading before the guest selects raw or SSH mode. Besides applying
@@ -888,12 +1048,20 @@ async fn run_job(
     // One window for all of them, and the flushes run inside it at once, so
     // teardown costs what it always cost rather than a window per endpoint.
     let deadline = Instant::now() + TEARDOWN_DRAIN;
-    let raw_writer = if let Some(ctx::Slot2::Endpoint(endpoint)) = inner.slot(SY_SELF) {
+    // The caller's stream flushes through its writer task's join handle, and it
+    // does so whether or not the guest still holds the handle. `sy_close`
+    // (`Inner::remove`) drops the slot but not the bytes already queued behind
+    // it — it calls `close_flushing`, which shuts the write side down and lets
+    // the writer drain on its own timing. Taking the handle only while the slot
+    // was still occupied meant a program whose last act was
+    // `sy_write(SY_SELF, …); sy_close(SY_SELF);` had nothing waiting on that
+    // drain, and `abort_tasks()` below killed the writer mid-flush: the caller
+    // got a clean, empty, successful stream. So the take is unconditional, and
+    // the shutdown is what depends on the slot.
+    if let Some(ctx::Slot2::Endpoint(endpoint)) = inner.slot(SY_SELF) {
         endpoint.shutdown();
-        inner.raw_writer.borrow_mut().take()
-    } else {
-        None
-    };
+    }
+    let raw_writer = inner.raw_writer.borrow_mut().take();
     let draining = inner.begin_drain();
     if let Some(mut writer) = raw_writer {
         if tokio::time::timeout_at(deadline.into(), &mut writer)

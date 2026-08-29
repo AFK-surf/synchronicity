@@ -133,7 +133,6 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     // declarations
     ("sy_declare_name", h_declare_name),
     ("sy_declare_egress", h_declare_egress),
-    ("sy_declare_tree_read", h_declare_tree_read),
     ("sy_declare_max_streams", h_declare_max_streams),
     ("sy_declare_stack_frame_size", h_declare_stack_frame_size),
     (
@@ -234,6 +233,33 @@ fn out_exact(scope: &HelperScope, ptr: u64, len: u64, value: &[u8]) -> Result<u6
 /// Refuses a helper that has no business running in the given mode.
 fn mode_check(inner: &Inner, declaring: bool) -> Option<i64> {
     (inner.init_mode != declaring).then_some(errno::EPERM)
+}
+
+/// The gate every `sy_declare_*` helper opens with, **before** it looks at its
+/// arguments.
+///
+/// Declaration helpers are valid only inside `synchronicity.init`, and the
+/// check has to come first rather than at the mutation, because reading the
+/// arguments is not always free of consequence. `sy_declare_process` resolves
+/// its executable against the host filesystem — `canonicalize`, `metadata`, a
+/// mode test — and it used to do all three before reaching `mode_check`. A
+/// served invocation could therefore call it purely for the return code and
+/// tell `SY_ENOENT` (no such path) from `SY_EINVAL` (not a regular file) from
+/// `SY_EPERM` (not executable), walking the daemon host's filesystem from an
+/// ordinary stream with nothing declared. Gating at the top makes that
+/// impossible for every declaration helper, including ones not yet written.
+fn declaring_only(scope: &HelperScope) -> Result<Option<u64>, ()> {
+    let refused = with(scope, |inner| mode_check(inner, true))?;
+    Ok(refused.map(|e| e as u64))
+}
+
+/// Runs `body` only inside the init hook, answering `SY_EPERM` outside it.
+macro_rules! declaring {
+    ($scope:expr) => {
+        if let Some(refused) = declaring_only($scope)? {
+            return Ok(refused);
+        }
+    };
 }
 
 // ---- diagnostics and configuration ---------------------------------------
@@ -441,13 +467,7 @@ fn h_stream_index(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -
 
 fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) -> Result<u64, ()> {
     let len = len.min(MAX_COPY);
-    let ep = match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    let ep = match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
     };
@@ -489,13 +509,7 @@ fn h_write(
     _: u64,
 ) -> Result<u64, ()> {
     let data = guest!(bytes(scope, ptr, len.min(MAX_COPY)));
-    let ep = match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    let ep = match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
     };
@@ -535,11 +549,18 @@ fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -
         return ret(errno::EINVAL);
     }
     let inner = with(scope, Rc::clone)?;
-    let (Some(src), Some(dst)) = (inner.endpoint(from as i64), inner.endpoint(to as i64)) else {
-        // Including an object or a cursor handle: the tree is read with
-        // `sy_pread`, whose answer may not be here yet, and a splice that could
-        // block is not the helper this is.
-        return ret(errno::EBADF);
+    // Both sides go through the same door every other I/O helper uses, so a
+    // splice-only proxy can name `SY_SELF` as its first act. An object or a
+    // cursor handle is still `SY_EBADF`: the tree is read with `sy_pread`,
+    // whose answer may not be here yet, and a splice that could block is not
+    // the helper this is.
+    let src = match inner.endpoint_for_io(from as i64) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
+    };
+    let dst = match inner.endpoint_for_io(to as i64) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
     };
     let n = src.splice_to(&dst, usize::try_from(max).unwrap_or(usize::MAX));
     if n > 0 {
@@ -566,39 +587,21 @@ fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -
 }
 
 fn h_readable(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(ep) => ret(ep.readable() as i64),
         Err(error) => ret(error),
     }
 }
 
 fn h_writable(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(ep) => ret(ep.writable() as i64),
         Err(error) => ret(error),
     }
 }
 
 fn h_shutdown(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(ep) => {
             ep.shutdown();
             ret(0)
@@ -678,9 +681,10 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
         Ok(h) => h,
         Err(e) => return e,
     };
-    inner.egress_open.set(inner.egress_open.get() + 1);
+    let permit =
+        crate::runtime::endpoint::EgressPermit::take(std::rc::Rc::clone(&inner.egress_open));
     inner.publish_handles();
-    inner.spawn(connect_task(ep, host, port));
+    inner.spawn(connect_task(ep, host, port, permit));
     handle
 }
 
@@ -731,13 +735,7 @@ fn h_endpoint_info(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let ep = match with(scope, |inner| {
-        if handle as i64 == SY_SELF {
-            inner.select_raw()
-        } else {
-            inner.endpoint(handle as i64).ok_or(errno::EBADF)
-        }
-    })? {
+    let ep = match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
     };
@@ -799,8 +797,11 @@ fn h_ssh_start(
             host_key,
             methods,
             inner.limits.idle_deadline,
-            throttle,
-            ip,
+            crate::runtime::ssh::AuthContext {
+                throttle,
+                ip,
+                socket: inner.socket.qualified(),
+            },
         ));
         0
     })
@@ -2230,17 +2231,6 @@ fn open_common(scope: &HelperScope, origin: Option<String>, path: String) -> Res
     if inner.init_mode {
         return ret(errno::EPERM);
     }
-    if let Some(origin) = &origin {
-        if !inner.policy.tree_read_allowed(&path) {
-            tracing::warn!(
-                socket = %inner.socket.qualified(),
-                origin,
-                path,
-                "socket tree read refused: the armed program did not declare it"
-            );
-            return ret(errno::EPERM);
-        }
-    }
     match inner.host.open(origin.as_deref(), &path) {
         Ok(info) => ret(insert_object(&inner, info)),
         Err(e) => ret(host_errno(&e)),
@@ -2662,9 +2652,23 @@ fn h_memset(scope: &HelperScope, dst: u64, byte: u64, n: u64, _: u64, _: u64) ->
     Ok(dst)
 }
 
+/// Constant-time equality, and the one helper whose failure must not be
+/// truthy.
+///
+/// Every other helper reports a bad argument as a negative errno. This one is
+/// written as `if (sy_ct_eq(secret, offered, n))` in C — the natural spelling
+/// for a token check — and `-3` is as true as `1` there, so an unreadable
+/// buffer or an over-long `n` would *grant* what it was asked to guard. It
+/// therefore answers only `1` (equal) or `0` (not equal, or the comparison
+/// could not be made), which makes the failure mode the closed one under both
+/// the correct spelling and the natural one.
 fn h_ct_eq(scope: &HelperScope, a: u64, b: u64, n: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let left = guest!(bytes(scope, a, n));
-    let right = guest!(bytes(scope, b, n));
+    let (Ok(left), Ok(right)) = (bytes(scope, a, n), bytes(scope, b, n)) else {
+        return ret(0);
+    };
+    if left.len() != right.len() {
+        return ret(0);
+    }
     let mut diff = 0u8;
     for (l, r) in left.iter().zip(right.iter()) {
         diff |= l ^ r;
@@ -2810,14 +2814,12 @@ fn h_declare_name(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     let name = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&name) {
         return ret(errno::EINVAL);
     }
     with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
         inner.declaration.borrow_mut().name = name;
         0
     })
@@ -2832,6 +2834,7 @@ fn h_declare_egress(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     let host = guest!(string(scope, ptr, len));
     if !synch_core::display_text_is_safe(&host) {
         return ret(errno::EINVAL);
@@ -2840,9 +2843,6 @@ fn h_declare_egress(
         return ret(errno::EINVAL);
     }
     with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
         let mut decl = inner.declaration.borrow_mut();
         if decl.egress.len() >= synch_core::MAX_DECLARED_EGRESS {
             return errno::ELIMIT;
@@ -2859,37 +2859,6 @@ fn h_declare_egress(
     .and_then(ret)
 }
 
-fn h_declare_tree_read(
-    scope: &HelperScope,
-    ptr: u64,
-    len: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    let prefix = guest!(string(scope, ptr, len));
-    if !synch_core::display_text_is_safe(&prefix) {
-        return ret(errno::EINVAL);
-    }
-    // The everything-spelling is not a declaration: an operator approving
-    // `tree-read /` would be approving every path in every origin.
-    if !synch_core::sock::tree_read_prefix_grants_something(&prefix) {
-        return ret(errno::EINVAL);
-    }
-    with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
-        let mut decl = inner.declaration.borrow_mut();
-        if decl.tree_reads.len() >= synch_core::MAX_DECLARED_TREE_READS {
-            return errno::ELIMIT;
-        }
-        decl.tree_reads.push(prefix);
-        0
-    })
-    .and_then(ret)
-}
-
 fn h_declare_max_streams(
     scope: &HelperScope,
     n: u64,
@@ -2898,10 +2867,8 @@ fn h_declare_max_streams(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
         inner.declaration.borrow_mut().max_streams = Some(n.min(u32::MAX as u64) as u32);
         0
     })
@@ -2916,10 +2883,8 @@ fn h_declare_stack_frame_size(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
         let Ok(size) = u32::try_from(size) else {
             return errno::ELIMIT;
         };
@@ -2943,10 +2908,8 @@ fn h_declare_guarded_stack_frames(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     with(scope, |inner| {
-        if let Some(e) = mode_check(inner, true) {
-            return e;
-        }
         let enabled = match enabled {
             0 => false,
             1 => true,
@@ -2990,6 +2953,7 @@ fn h_declare_process(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     if len != PROCESS_CAPABILITY_SIZE {
         return ret(errno::EINVAL);
     }
@@ -3036,9 +3000,6 @@ fn h_declare_process(
         allowed_signals: le_u64(&raw, 1328),
     };
     with(scope, |inner| {
-        if let Some(error) = mode_check(inner, true) {
-            return error;
-        }
         let mut declaration = inner.declaration.borrow_mut();
         if declaration.processes.len() >= synch_core::MAX_DECLARED_PROCESSES {
             return errno::ELIMIT;
@@ -3070,6 +3031,7 @@ fn h_declare_file_transfer(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    declaring!(scope);
     if len != FILE_TRANSFER_CAPABILITY_SIZE {
         return ret(errno::EINVAL);
     }
@@ -3081,9 +3043,6 @@ fn h_declare_file_transfer(
         scope: guest!(fixed_string(&raw, 12, 256, le_u32(&raw, 268))),
     };
     with(scope, |inner| {
-        if let Some(error) = mode_check(inner, true) {
-            return error;
-        }
         let mut declaration = inner.declaration.borrow_mut();
         if declaration.file_transfers.len() >= synch_core::MAX_DECLARED_FILE_TRANSFERS {
             return errno::ELIMIT;

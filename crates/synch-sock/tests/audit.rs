@@ -17,9 +17,6 @@
 //! * `the_in_place_decode_helpers_decode_in_place` — `sy_base64_decode_in_place`
 //!   and `sy_hex_decode_in_place` work, reading and writing the one registered
 //!   region (helpers.rs).
-//! * `tree_read_root_and_empty_prefixes_are_refused_as_declarations` — the
-//!   everything-spellings `""` and `"/"` cannot be declared, and a persisted
-//!   approval carrying one is read as no permission (sock.rs).
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
@@ -299,52 +296,4 @@ async fn the_in_place_decode_helpers_decode_in_place() {
         SockStatus::Ok(0),
         "the in-place decode helpers must decode in place"
     );
-}
-
-#[test]
-fn tree_read_root_and_empty_prefixes_are_refused_as_declarations() {
-    use synch_core::sock::{Declaration, DeclarationError};
-
-    // The matcher treats "/" and "" as everything — which is why they are not
-    // declarations an operator can approve.
-    let root = Declaration {
-        tree_reads: vec!["/".into()],
-        ..Declaration::default()
-    };
-    assert!(matches!(
-        root.validate(),
-        Err(DeclarationError::InvalidTreeReadPrefix)
-    ));
-    let empty = Declaration {
-        tree_reads: vec!["".into()],
-        ..Declaration::default()
-    };
-    assert!(matches!(
-        empty.validate(),
-        Err(DeclarationError::InvalidTreeReadPrefix)
-    ));
-
-    // And a persisted approval that carries the everything-spelling is read
-    // as no permission rather than as everything.
-    assert_eq!(
-        Declaration::parse("tree-read /").tree_reads,
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        Declaration::parse("tree-read ").tree_reads,
-        Vec::<String>::new()
-    );
-
-    // An honest prefix still round-trips.
-    let honest = Declaration {
-        tree_reads: vec!["code/pub".into()],
-        ..Declaration::default()
-    };
-    assert_eq!(Declaration::parse(&honest.render()), honest);
-
-    // The boundary check the docs promise still holds for honest prefixes.
-    assert!(!synch_core::sock::path_prefix_matches(
-        "code",
-        "codex/secret"
-    ));
 }

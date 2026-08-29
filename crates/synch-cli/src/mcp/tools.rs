@@ -787,7 +787,7 @@ fn build_catalog() -> Vec<Tool> {
             name: "synch_socket_review",
             title: "Review a socket program",
             description: "Prints what a declared socket's current program declares — its \
-                          name, egress destinations, stream cap and tree reads — and the \
+                          name, egress destinations and stream cap — and the \
                           review token that approves exactly it. Approving is a separate \
                           call, synch_socket_arm, and the token binds the content root, \
                           the authorization revision, and this init result together."

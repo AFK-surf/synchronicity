@@ -31,8 +31,8 @@ pub use sock::{
     display_text_is_safe, valid_ebpf_stack_frame_size, Declaration, FaultKind,
     FileTransferCapability, ProcessCapability, RefuseCode, SockClosed, SockOpen, SockOpened,
     SockStatus, ALPN_SOCK, DEFAULT_EBPF_STACK_FRAME_SIZE, MAX_DECLARED_EGRESS,
-    MAX_DECLARED_FILE_TRANSFERS, MAX_DECLARED_PROCESSES, MAX_DECLARED_TREE_READS,
-    MAX_EBPF_STACK_FRAME_SIZE, MAX_OPEN_FRAME_LEN,
+    MAX_DECLARED_FILE_TRANSFERS, MAX_DECLARED_PROCESSES, MAX_EBPF_STACK_FRAME_SIZE,
+    MAX_OPEN_FRAME_LEN,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,

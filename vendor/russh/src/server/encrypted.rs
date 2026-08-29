@@ -521,6 +521,197 @@ mod tests {
         );
     }
 
+    /// F20: an unknown channel request that set `want-reply` must always be
+    /// answered, exactly once. Upstream replied `CHANNEL_FAILURE` from the
+    /// fallback arm; the `channel_request_unknown` hook that replaced it has
+    /// an empty default body, so nothing reached the wire and a client that
+    /// matches channel replies in strict request order would misattribute the
+    /// reply to a later request.
+    #[tokio::test]
+    async fn unknown_channel_request_with_want_reply_is_answered_once() {
+        let mut session = test_authenticated_session();
+        let (channel, _receiver) = insert_confirmed_channel(&mut session, 8);
+        let mut handler = ChannelCallbackProbe::default();
+
+        let mut packet = channel_request_payload(channel.0, b"x@example.com");
+        packet.extend_from_slice(b"opaque");
+        session.process_packet(&mut handler, &packet).await.unwrap();
+
+        assert_eq!(
+            queued_channel_replies(&session),
+            vec![msg::CHANNEL_FAILURE],
+            "unknown channel request with want_reply was not answered exactly once",
+        );
+    }
+
+    /// A `want-reply` bit that was not set must not produce a reply either.
+    #[tokio::test]
+    async fn unknown_channel_request_without_want_reply_is_not_answered() {
+        let mut session = test_authenticated_session();
+        let (channel, _receiver) = insert_confirmed_channel(&mut session, 8);
+        let mut handler = ChannelCallbackProbe::default();
+
+        let mut packet = channel_request_payload(channel.0, b"x@example.com");
+        // `channel_request_payload` sets want-reply; clear it in place.
+        let want_reply = packet.len() - 1;
+        #[allow(clippy::indexing_slicing)] // the payload was just built
+        {
+            packet[want_reply] = 0;
+        }
+        packet.extend_from_slice(b"opaque");
+        session.process_packet(&mut handler, &packet).await.unwrap();
+
+        assert!(
+            queued_channel_replies(&session).is_empty(),
+            "unknown channel request without want_reply was answered anyway",
+        );
+    }
+
+    /// A handler that answers the unknown request itself keeps its answer and
+    /// must not also get the automatic rejection appended to it.
+    #[tokio::test]
+    async fn unknown_channel_request_answered_by_handler_is_not_answered_twice() {
+        struct InlineReply;
+
+        impl Handler for InlineReply {
+            type Error = Error;
+
+            async fn channel_request_unknown(
+                &mut self,
+                channel: ChannelId,
+                _request_type: &str,
+                _payload: &[u8],
+                session: &mut Session,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+        }
+
+        let mut session = test_authenticated_session();
+        let (channel, _receiver) = insert_confirmed_channel(&mut session, 8);
+
+        let mut packet = channel_request_payload(channel.0, b"x@example.com");
+        packet.extend_from_slice(b"opaque");
+        session
+            .process_packet(&mut InlineReply, &packet)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            queued_channel_replies(&session),
+            vec![msg::CHANNEL_SUCCESS],
+            "handler's own reply was duplicated or overridden",
+        );
+    }
+
+    /// A handler that detaches the reply right answers after returning, so no
+    /// automatic rejection may be emitted in the meantime.
+    #[tokio::test]
+    async fn unknown_channel_request_deferred_by_handler_is_not_auto_rejected() {
+        #[derive(Default)]
+        struct DeferredReply {
+            token: Option<ChannelRequestReply>,
+        }
+
+        impl Handler for DeferredReply {
+            type Error = Error;
+
+            async fn channel_request_unknown(
+                &mut self,
+                channel: ChannelId,
+                _request_type: &str,
+                _payload: &[u8],
+                session: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.token = Some(session.take_channel_request_reply(channel)?);
+                Ok(())
+            }
+        }
+
+        let mut session = test_authenticated_session();
+        let (channel, _receiver) = insert_confirmed_channel(&mut session, 8);
+        let mut handler = DeferredReply::default();
+
+        let mut packet = channel_request_payload(channel.0, b"x@example.com");
+        packet.extend_from_slice(b"opaque");
+        session.process_packet(&mut handler, &packet).await.unwrap();
+
+        assert!(
+            queued_channel_replies(&session).is_empty(),
+            "a detached reply token was pre-empted by an automatic rejection",
+        );
+        assert!(
+            handler
+                .token
+                .as_ref()
+                .expect("handler took the reply token")
+                .wants_reply(),
+            "the detached token lost the packet's want-reply bit",
+        );
+    }
+
+    /// F21: a *dropped* per-channel receiver — the application dropped its
+    /// `Channel` while the SSH channel entry is still live — must only retire
+    /// that channel. Tearing down the connection here would kill every other
+    /// channel multiplexed on it.
+    #[tokio::test]
+    async fn channel_data_for_dropped_receiver_does_not_kill_the_connection() {
+        let mut session = test_authenticated_session();
+        let (dropped, receiver) = insert_confirmed_channel(&mut session, 8);
+        let (live, _live_receiver) = insert_confirmed_channel(&mut session, 8);
+        drop(receiver);
+        let mut handler = ChannelCallbackProbe::default();
+
+        let mut packet = Vec::new();
+        packet.push(msg::CHANNEL_DATA);
+        dropped.encode(&mut packet).unwrap();
+        encode_string(&mut packet, b"hello");
+        session
+            .process_packet(&mut handler, &packet)
+            .await
+            .expect("a dropped channel receiver terminated the whole connection");
+
+        assert!(
+            !session.channels.contains_key(&dropped),
+            "the sender for a dropped receiver was kept as live",
+        );
+        assert!(
+            session.channels.contains_key(&live),
+            "an unrelated channel was retired along with the dropped one",
+        );
+    }
+
+    /// A receiver that is merely *stalled* still terminates the connection:
+    /// the packet's receive window has already been adjusted, so dropping it
+    /// would silently corrupt the reliable byte stream.
+    #[tokio::test]
+    async fn channel_data_send_timeout_terminates_the_connection() {
+        let mut session = test_authenticated_session();
+        // One slot, filled while the receiver stays alive but never reads:
+        // the next send blocks until the 1s bound elapses.
+        let (channel, _receiver) = insert_confirmed_channel(&mut session, 1);
+        session
+            .channels
+            .get(&channel)
+            .expect("test channel")
+            .send(ChannelMsg::Eof)
+            .await
+            .unwrap();
+        let mut handler = ChannelCallbackProbe::default();
+
+        let mut packet = Vec::new();
+        packet.push(msg::CHANNEL_DATA);
+        channel.encode(&mut packet).unwrap();
+        encode_string(&mut packet, b"hello");
+        let result = session.process_packet(&mut handler, &packet).await;
+
+        assert!(
+            matches!(result, Err(Error::SendError)),
+            "a stalled channel receiver did not terminate the connection: {result:?}",
+        );
+    }
+
     #[derive(Default)]
     struct ChannelCallbackProbe {
         exec_called: bool,
@@ -574,6 +765,73 @@ mod tests {
             .channels
             .insert(channel, crate::channels::ChannelRef::new(sender));
         channel
+    }
+
+    fn insert_confirmed_channel(
+        session: &mut Session,
+        buffer: usize,
+    ) -> (ChannelId, tokio::sync::mpsc::Receiver<ChannelMsg>) {
+        let enc = session
+            .common
+            .encrypted
+            .as_mut()
+            .expect("test session has encrypted state");
+        let channel = enc.new_channel(
+            session.common.config.window_size,
+            session.common.config.maximum_packet_size,
+        );
+        if let Some(params) = enc.channels.get_mut(&channel) {
+            params.confirmed = true;
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(buffer);
+        session
+            .channels
+            .insert(channel, crate::channels::ChannelRef::new(sender));
+        (channel, receiver)
+    }
+
+    /// The message payloads queued in the encrypted write buffer, in order.
+    fn queued_packets(session: &Session) -> Vec<&[u8]> {
+        let write = &session
+            .common
+            .encrypted
+            .as_ref()
+            .expect("test session has encrypted state")
+            .write;
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        while let Some(header) = write.get(offset..offset + 4) {
+            let len = u32::from_be_bytes(header.try_into().expect("4 bytes")) as usize;
+            offset += 4;
+            let Some(packet) = write.get(offset..offset + len) else {
+                break;
+            };
+            offset += len;
+            packets.push(packet);
+        }
+        packets
+    }
+
+    /// The `CHANNEL_SUCCESS`/`CHANNEL_FAILURE` message types queued so far, in
+    /// order, so a test can assert on how many replies reached the wire.
+    fn queued_channel_replies(session: &Session) -> Vec<u8> {
+        queued_packets(session)
+            .iter()
+            .filter_map(|packet| packet.first().copied())
+            .filter(|m| matches!(*m, msg::CHANNEL_SUCCESS | msg::CHANNEL_FAILURE))
+            .collect()
+    }
+
+    /// The final octet of each queued `USERAUTH_FAILURE` — RFC 4252's
+    /// partial-success flag. `AuthRequest::partial_success` is reset after
+    /// every rejection so no later path replays a stale `true`, so the wire
+    /// bytes are the only place the handler's decision can be observed.
+    fn queued_partial_success_flags(session: &Session) -> Vec<bool> {
+        queued_packets(session)
+            .iter()
+            .filter(|packet| packet.first() == Some(&msg::USERAUTH_FAILURE))
+            .filter_map(|packet| packet.last().map(|flag| *flag != 0))
+            .collect()
     }
 
     fn publickey_probe_packet(user: &str, public_key: &PublicKey) -> Vec<u8> {
@@ -741,11 +999,12 @@ mod tests {
         };
         let packet = password_auth_packet();
         session.process_packet(&mut handler, &packet).await.unwrap();
-        let auth_request = auth_request_of(&session);
-        assert!(
-            auth_request.partial_success,
+        assert_eq!(
+            queued_partial_success_flags(&session),
+            vec![true],
             "password site dropped the handler's partial_success",
         );
+        let auth_request = auth_request_of(&session);
         assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
 
         // (2) password site: Reject{None, false} removes the failed method
@@ -757,8 +1016,8 @@ mod tests {
         };
         let packet = password_auth_packet();
         session.process_packet(&mut handler, &packet).await.unwrap();
+        assert_eq!(queued_partial_success_flags(&session), vec![false]);
         let auth_request = auth_request_of(&session);
-        assert!(!auth_request.partial_success);
         assert!(
             !auth_request.methods.contains(&MethodKind::Password),
             "password must be removed from the advertised methods on Reject{{None}}",
@@ -776,11 +1035,12 @@ mod tests {
         "ssh-connection".encode(&mut packet).unwrap();
         "none".encode(&mut packet).unwrap();
         session.process_packet(&mut handler, &packet).await.unwrap();
-        let auth_request = auth_request_of(&session);
-        assert!(
-            auth_request.partial_success,
+        assert_eq!(
+            queued_partial_success_flags(&session),
+            vec![true],
             "none site dropped the handler's partial_success",
         );
+        let auth_request = auth_request_of(&session);
         assert_eq!(auth_request.methods, method_set(&[MethodKind::Password]));
 
         // (4) publickey probe site (is_real == 0): Reject{Some(next), true}.
@@ -793,11 +1053,12 @@ mod tests {
         };
         let packet = publickey_probe_packet("alice", &public);
         session.process_packet(&mut handler, &packet).await.unwrap();
-        let auth_request = auth_request_of(&session);
-        assert!(
-            auth_request.partial_success,
+        assert_eq!(
+            queued_partial_success_flags(&session),
+            vec![true],
             "publickey probe site dropped the handler's partial_success",
         );
+        let auth_request = auth_request_of(&session);
         assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
 
         // (5) publickey signed site (is_real == 1): the offer is accepted,
@@ -811,11 +1072,12 @@ mod tests {
         };
         let packet = publickey_signed_packet("alice", Arc::new(private), &public);
         session.process_packet(&mut handler, &packet).await.unwrap();
-        let auth_request = auth_request_of(&session);
-        assert!(
-            auth_request.partial_success,
+        assert_eq!(
+            queued_partial_success_flags(&session),
+            vec![true],
             "publickey signed site dropped the handler's partial_success",
         );
+        let auth_request = auth_request_of(&session);
         assert_eq!(auth_request.methods, method_set(&[MethodKind::PublicKey]));
     }
 
@@ -1499,6 +1761,38 @@ async fn reply_userauth_info_response(
 }
 
 impl Session {
+    /// Queues one reliable-stream message on a channel's mpsc under a bound.
+    ///
+    /// A receiver that is merely *stalled* must never block the run loop past
+    /// the inactivity timer's polling interval, and channel data is a reliable
+    /// byte stream whose receive window has already been adjusted by the
+    /// caller, so dropping the packet would silently corrupt the stream: a
+    /// timeout terminates the connection instead.
+    ///
+    /// A *closed* receiver is a different condition: the application dropped
+    /// its [`crate::Channel`] while the SSH channel entry is still live. There
+    /// is no consumer left for this stream, so the message is discarded and
+    /// the channel's sender is retired — every other channel multiplexed on
+    /// this connection keeps running.
+    async fn send_channel_data(
+        &mut self,
+        channel_num: ChannelId,
+        msg: ChannelMsg,
+    ) -> Result<(), crate::Error> {
+        let Some(chan) = self.channels.get(&channel_num) else {
+            return Ok(());
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(1), chan.send(msg)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                debug!("channel {channel_num:?} receiver dropped, retiring its sender");
+                self.channels.remove(&channel_num);
+                Ok(())
+            }
+            Err(_) => Err(crate::Error::SendError),
+        }
+    }
+
     async fn server_read_authenticated<H: Handler + Send, R: Reader>(
         &mut self,
         handler: &mut H,
@@ -1577,40 +1871,22 @@ impl Session {
                 }
                 self.flush()?;
                 if let Some(ext) = ext {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        // Bound the send: a stalled per-channel mpsc must
-                        // never block the run loop past the inactivity
-                        // timer's polling interval. Drop the message on
-                        // timeout (mirrors synch-sock's LANE_SEND_TIMEOUT_MS).
-                        let queued = tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            chan.send(ChannelMsg::ExtendedData {
-                                ext,
-                                data: data.clone(),
-                            }),
-                        )
-                        .await;
-                        if !matches!(queued, Ok(Ok(()))) {
-                            // Channel data is a reliable byte stream. Once its
-                            // receive window has been consumed/adjusted above,
-                            // silently dropping this packet corrupts the
-                            // stream. Bound the run loop by terminating the
-                            // connection instead.
-                            return Err(H::Error::from(crate::Error::SendError));
-                        }
-                    }
+                    // Bound the send: a stalled per-channel mpsc must never
+                    // block the run loop past the inactivity timer's polling
+                    // interval (mirrors synch-sock's LANE_SEND_TIMEOUT_MS).
+                    // See `send_channel_data` for the timeout/closed split.
+                    self.send_channel_data(
+                        channel_num,
+                        ChannelMsg::ExtendedData {
+                            ext,
+                            data: data.clone(),
+                        },
+                    )
+                    .await?;
                     handler.extended_data(channel_num, ext, &data, self).await
                 } else {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        let queued = tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            chan.send(ChannelMsg::Data { data: data.clone() }),
-                        )
-                        .await;
-                        if !matches!(queued, Ok(Ok(()))) {
-                            return Err(H::Error::from(crate::Error::SendError));
-                        }
-                    }
+                    self.send_channel_data(channel_num, ChannelMsg::Data { data: data.clone() })
+                        .await?;
                     handler.data(channel_num, &data, self).await
                 }
             }
@@ -1957,7 +2233,17 @@ impl Session {
                         map_err!(r.read(&mut payload))?;
                         handler
                             .channel_request_unknown(channel_num, x, &payload, self)
-                            .await
+                            .await?;
+                        // A handler may answer inline, or detach the reply
+                        // right with `take_channel_request_reply` and answer
+                        // after returning; both clear the channel's
+                        // `wants_reply`. If neither happened the request is
+                        // still unanswered, so fall back to upstream's
+                        // rejection. `channel_failure` is a no-op once the bit
+                        // is clear, so a `want-reply` request always produces
+                        // exactly one reply and never two.
+                        self.channel_failure(channel_num)?;
+                        Ok(())
                     }
                 }
             }

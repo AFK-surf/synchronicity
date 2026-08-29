@@ -11,6 +11,15 @@
 //! 512 blocking threads per worker and then grows the queue at the guest's
 //! iteration rate: multi-hundred-MB RSS per invocation, x64 streams, OOM.
 //!
+//! Fixed `2026-08-29`. The egress budget is no longer returned by `sy_close`:
+//! `connect_task` owns an `EgressPermit` (runtime/endpoint.rs) and gives its
+//! place back when the task ends, so `max_egress` now bounds outstanding
+//! resolutions as well as established connections. A churn loop can have at
+//! most `max_egress` lookups in flight regardless of how slowly they answer,
+//! which is the bound that was missing — the lookup itself is still
+//! uncancellable, because a dispatched blocking-pool task cannot be cancelled,
+//! and that is now contained rather than unbounded.
+//!
 //! This host cannot express slow DNS (no root; the stub resolver answers
 //! fast), so the probe demonstrates what the fast path does: no thread
 //! accumulation and no egress-slot leak — and records the thread-count and

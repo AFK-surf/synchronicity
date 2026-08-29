@@ -84,12 +84,14 @@ Consequently, two layers are checked:
 
 - opening the built-in service always requires a file-transfer declaration
   naming its protocol, path scope and read/write mode;
-- the service may exercise only underlying tree authority the invocation also
-  holds: foreign-origin reads retain the existing tree-read declaration, and
-  writes or live-filesystem access require their corresponding authority;
-- if the project later wants *all* exports to require review, `sy_open` itself
-  must move behind a declaration. Adding a declaration only to an SFTP helper
-  would give a false assurance.
+- the declared scope bounds what the service exposes, which is narrower than
+  what the invocation can read: reading the tree is unrestricted
+  (`docs/SOCKETS.md` §7.6), so the scope is about what an SSH client is served,
+  not about what the program may open;
+- adding the declaration to the SFTP helper alone would give a false assurance
+  if it were read as a read boundary. It is not one: an armed program can
+  always export bytes manually through `sy_open`. What the declaration buys is
+  that the *built-in service* is reviewed before it serves a subtree wholesale.
 
 ### 1.3 Zero-configuration capability declarations
 
@@ -177,13 +179,23 @@ Instead, `SY_SELF` is a small unselected slot holding the original
 `DuplexStream`. Its first operation selects exactly one mode:
 
 - `sy_ssh_start` consumes it directly into the SSH engine;
-- the first `sy_read`, `sy_write`, `sy_readable`, `sy_writable`, `sy_shutdown`,
-  `sy_close`, or endpoint `sy_poll` materializes the existing raw `Endpoint`
-  and its pumps.
+- **every** helper that takes an endpoint handle materializes the raw
+  `Endpoint` and its pumps. That is the whole list — `sy_read`, `sy_write`,
+  `sy_splice` (either side), `sy_readable`, `sy_writable`, `sy_shutdown`,
+  `sy_close`, `sy_endpoint_info`, and endpoint `sy_poll`.
+
+The rule is "any endpoint operation selects raw mode", with no exceptions to
+memorize, because all of them resolve the handle through one accessor
+(`Inner::endpoint_for_io`). It was not always: `sy_splice` used to resolve its
+handles without selecting, so a splice-only proxy got `SY_EBADF` on `SY_SELF`
+until some other call had selected for it, and `sy_endpoint_info` selected raw
+mode without being listed here, which silently made a later `sy_ssh_start`
+impossible. Both are fixed, and a new endpoint helper inherits the rule by
+using the accessor.
 
 Existing programs are unchanged: their first ordinary operation selects raw
-mode. An SSH program must call `sy_ssh_start` before including `SY_SELF` in a
-poll set.
+mode. An SSH program must call `sy_ssh_start` before *any* other operation on
+`SY_SELF`, including `sy_endpoint_info` and including a poll set that names it.
 
 The direct handoff keeps one set of flow-control buffers rather than copying
 the encrypted SSH stream through an endpoint ring before parsing it.
@@ -798,6 +810,16 @@ the daemon's basic identity, home, shell, path, locale, timezone and temporary
 directory variables, but not application configuration or credentials. PTYs
 synthesize `TERM` from the validated terminal request.
 
+The fresh process group is for lifecycle and signal handling, not containment,
+and it is best-effort: `sy_process_signal` and teardown signal the group while
+the runtime still holds the child, but once the direct child has exited and
+been reaped there is no group left to signal, and a descendant that outlived it
+— a daemonized child, or one that called `setsid` for itself — keeps running
+under the daemon's UID until something else stops it. Nothing reaps it and
+nothing bounds it. A process capability is therefore authority to leave work
+running on the host after the invocation ends; an operator who does not want
+that declares an executable that bounds itself.
+
 Allocation and process start are separate so a successful `pty-req` does not
 start a shell before a later `shell` request:
 
@@ -994,10 +1016,9 @@ Version 1 is deliberately read-only because the published virtual tree is
 immutable. Uploading needs a separate design for staging, atomic publication,
 conflicts, and attribution; pretending an SFTP close is a tree commit would be
 an implicit and unsafe mutation API. The service declaration is shown during
-arming and intersects its scope with the invocation's underlying tree-read
-authority. As §1.2 explains, it does not claim that an armed program lacking
-the service is unable to export bytes manually through the existing `sy_open`
-API.
+arming and bounds the subtree the service itself exposes. As §1.2 explains, it
+does not claim that an armed program lacking the service is unable to export
+bytes manually through the existing `sy_open` API.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,
@@ -1194,8 +1215,18 @@ The host enforces these regardless of guest correctness:
    deadlines, attempt limits, packet bounds, memory charges or channel caps.
 9. **Backing authority is checked where the fd is created.** Naming a PTY,
    SFTP subsystem or destination in SSH data never grants it.
-10. **Kill and shutdown are complete.** No SSH task, process, deferred channel
-    or credential buffer outlives its invocation.
+10. **Kill and shutdown release everything the runtime owns.** No SSH task,
+    deferred channel or credential buffer outlives its invocation.
+    **Spawned processes are the deliberate exception.** A declared process is
+    started in its own session (`setsid`) and the runtime signals it on
+    teardown, but a descendant that outlives its parent — a daemonized child, a
+    process that left the group — keeps running under the daemon's UID, and
+    nothing reaps it. This follows from §7.1: the runtime imposes no process
+    count, runtime or memory ceiling and no descendant containment, so an
+    operator who needs a process bounded declares one that bounds itself
+    (`bwrap`, `systemd-run`, a wrapper that traps and kills its own group).
+    Treat "declare a process capability" as "grant the ability to leave
+    something running on this host".
 11. **Authorization data is explicit and immutable.** The guest chooses an
     object fd, matching is tied to that object's content root and the exact
     authentication event, and unsupported `authorized_keys` options never
