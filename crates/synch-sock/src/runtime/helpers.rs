@@ -1812,6 +1812,15 @@ fn schedule_process_memory_limit(
         // process group before proc_pid_rusage can account for any member, so
         // leave one sampling interval for process accounting to become ready.
         interval.tick().await;
+        // Accounting failure means two different things depending on when.
+        // A host that has never measured this group cannot enforce the limit
+        // at all — hardened hosts deny per-child rusage — and killing every
+        // declared process would turn "cannot watch" into "must not run", so
+        // after a bounded attempt the monitor stands down with a warning. A
+        // group that *stops* being measurable while running looks like
+        // hiding, and still fails closed after a short grace for transients.
+        let mut measured = false;
+        let mut failures = 0u32;
         loop {
             interval.tick().await;
             let Some(process) = process.upgrade() else {
@@ -1829,13 +1838,32 @@ fn schedule_process_memory_limit(
                 }
             }
             match crate::runtime::process::process_group_footprint_bytes(pgid) {
-                Ok(Some(bytes)) if bytes <= limit => {}
+                Ok(Some(bytes)) if bytes <= limit => {
+                    measured = true;
+                    failures = 0;
+                }
                 Ok(None) => break,
-                Ok(Some(_)) | Err(()) => {
-                    // Accounting failure is a policy failure: do not leave an
-                    // unbounded declared process running.
+                Ok(Some(_)) => {
+                    // A real measurement over the declared ceiling — the
+                    // fail-closed u64::MAX for an overflowing group included.
                     process.kill_if_pid(pgid);
                     break;
+                }
+                Err(()) => {
+                    failures += 1;
+                    if measured && failures >= 5 {
+                        process.kill_if_pid(pgid);
+                        break;
+                    }
+                    if !measured && failures >= 25 {
+                        tracing::warn!(
+                            pgid,
+                            "process memory accounting is unavailable on this \
+                             host; the declared memory ceiling is not enforced \
+                             for this child"
+                        );
+                        break;
+                    }
                 }
             }
         }
