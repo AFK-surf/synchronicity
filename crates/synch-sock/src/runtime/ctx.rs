@@ -72,6 +72,25 @@ pub(crate) enum PutCommand {
     Delete,
 }
 
+/// Which dispatch family a [`PutCommand`] belongs to, kept on the slot from
+/// dispatch to collection: the helper collecting a parked answer must be the
+/// one that asked, or a commit could collect a delete's bare success and hand
+/// the guest an unwritten root buffer as a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutKind {
+    Commit,
+    Delete,
+}
+
+impl PutCommand {
+    pub(crate) fn kind(&self) -> PutKind {
+        match self {
+            PutCommand::Commit(_) => PutKind::Commit,
+            PutCommand::Delete => PutKind::Delete,
+        }
+    }
+}
+
 /// A tree writer the guest opened with `sy_put_open`
 /// (`docs/TREE-WRITES.md` §5).
 ///
@@ -97,6 +116,9 @@ pub(crate) struct WriterSlot {
     pub(crate) work: Rc<tokio::sync::Notify>,
     /// The one commit or delete this writer will perform.
     pub(crate) command: Cell<Option<PutCommand>>,
+    /// The dispatched operation's kind, from dispatch until its result is
+    /// collected, so only the matching `sy_put_*` call can collect it.
+    pub(crate) dispatched: Cell<Option<PutKind>>,
     /// True from dispatch until the result is parked.
     pub(crate) op_pending: Cell<bool>,
     /// What the operation produced: the published root (`None` for a delete),

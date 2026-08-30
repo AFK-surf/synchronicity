@@ -445,7 +445,11 @@ extern sy_s64 sy_put_splice(sy_s64 writer, sy_s64 from, sy_u64 max);
 /* Commits the staged bytes as this node's own new version of the path.
  * First call dispatches and returns SY_EAGAIN; poll the writer for
  * SY_POLL_IN, then repeat the call — it returns 0 and fills `root32` with
- * the published content root. After success the writer is spent. */
+ * the published content root. After success the writer is spent. A parked
+ * answer is collected only by the family that dispatched it: collecting a
+ * dispatched delete here (or a commit with sy_put_delete) is SY_ESTATE.
+ * A refusal (SY_EPERM, SY_ESTALE) leaves the writer retryable; a host-side
+ * failure (SY_EIO) is sticky — open a new writer. */
 extern sy_s64 sy_put_commit(sy_s64 writer, void *root32);
 /* The same, but only if this node's own live version of the path currently
  * has content root `expected32`; all-zero expected means "no live version of

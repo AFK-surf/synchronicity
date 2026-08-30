@@ -857,6 +857,7 @@ impl SocketHost for TreeHost {
             path: rest,
             modes,
             staged: None,
+            staging_lost: false,
             socket: self.socket.clone(),
             invocation: self.invocation,
             peer: self.peer.clone(),
@@ -980,6 +981,11 @@ struct TreeWriter {
     /// The armed grant's `TREE_WRITE_*` bits, for the commit-time condition.
     modes: u32,
     staged: Option<crate::Adoption>,
+    /// A commit consumed the staging and then failed. The bytes are gone —
+    /// the [`Adoption`](crate::Adoption)'s failure path unlinks them — and
+    /// silently re-staging would let the retry publish an *empty* file under
+    /// a valid receipt, so every later operation refuses instead.
+    staging_lost: bool,
     socket: String,
     invocation: u64,
     peer: String,
@@ -988,6 +994,11 @@ struct TreeWriter {
 impl TreeWriter {
     /// Opens the adoption lazily, so a delete-only writer stages nothing.
     async fn ensure_staged(&mut self) -> std::result::Result<(), HostError> {
+        if self.staging_lost {
+            return Err(HostError::Io(
+                "a failed commit consumed the staged bytes; open a new writer".into(),
+            ));
+        }
         if self.staged.is_some() {
             return Ok(());
         }
@@ -1049,6 +1060,9 @@ impl SocketWriter for TreeWriter {
         condition?;
 
         let adoption = self.staged.take().expect("just staged");
+        // From here down the staging is consumed: should any step below
+        // fail, a retry must not quietly re-stage zero bytes.
+        self.staging_lost = true;
         let (root, size) = if detached {
             let scratch = crate::blocking::offload(move || adoption.commit())
                 .await

@@ -3110,19 +3110,31 @@ async fn writer_pump(
                     .map(|receipt| Some(receipt.root)),
                 PutCommand::Delete => host_writer.delete().await.map(|_| None),
             };
-            let succeeded = outcome.is_ok();
             slot.op_pending.set(false);
-            *slot.result.borrow_mut() = Some(outcome.map_err(|e| host_errno(&e)));
+            let parked = outcome.map_err(|e| host_errno(&e));
+            let succeeded = parked.is_ok();
+            // A refusal (`SY_ESTALE`, `SY_EPERM`) leaves the host's staging
+            // intact by contract — evaluated before anything is consumed —
+            // so the guest may repair and re-dispatch. Anything else (disk,
+            // CAS, a vanished space) may have consumed the staging on its
+            // way down, and a retry over unknown staging is how an empty
+            // file gets published under a valid receipt: sticky instead.
+            let retryable = matches!(parked, Err(code)
+                if code == errno::ESTALE || code == errno::EPERM);
+            if succeeded || retryable {
+                *slot.result.borrow_mut() = Some(parked);
+            } else if let Err(code) = parked {
+                slot.failed.set(code);
+            }
             // A commit landing is progress in exactly the idle deadline's
             // sense, and a refused one is the answer the guest was parked on.
             inner.made_progress();
             slot.ready.bump();
-            if succeeded {
-                // The writer is spent; nothing further will be asked of it.
+            if succeeded || !retryable {
+                // Spent on success, broken on a sticky failure; either way
+                // nothing further will be asked of this writer.
                 return;
             }
-            // A lost condition is retryable: the guest may read the tree
-            // again and re-dispatch, so the pump stays for the next command.
             continue;
         }
         slot.work.notified().await;
@@ -3219,6 +3231,7 @@ fn h_put_open(
         buf: std::cell::RefCell::new(std::collections::VecDeque::new()),
         work: Rc::new(tokio::sync::Notify::new()),
         command: std::cell::Cell::new(None),
+        dispatched: std::cell::Cell::new(None),
         op_pending: std::cell::Cell::new(false),
         result: std::cell::RefCell::new(None),
         delivered: std::cell::Cell::new(false),
@@ -3302,6 +3315,14 @@ fn h_put_splice(
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
     };
+    let avail = src.readable();
+    if avail == 0 {
+        // The same answer `sy_read` gives an empty ring: `0` at a clean EOF,
+        // the endpoint's errno, `SY_EAGAIN` while it may still fill. Checked
+        // before the grant bound, so a payload of exactly `max_bytes` ends at
+        // its clean EOF instead of tripping `SY_ELIMIT` with nothing left.
+        return ret(src.read(&mut []));
+    }
     let mut room = writer
         .room()
         .min(usize::try_from(max).unwrap_or(usize::MAX));
@@ -3312,12 +3333,6 @@ fn h_put_splice(
             return ret(errno::ELIMIT);
         }
         room = room.min(usize::try_from(remaining).unwrap_or(usize::MAX));
-    }
-    let avail = src.readable();
-    if avail == 0 {
-        // The same answer `sy_read` gives an empty ring: `0` at a clean EOF,
-        // the endpoint's errno, `SY_EAGAIN` while it may still fill.
-        return ret(src.read(&mut []));
     }
     let n = avail.min(room);
     if n == 0 {
@@ -3357,6 +3372,19 @@ fn put_op(
     if writer.failed.get() != 0 {
         return ret(writer.failed.get());
     }
+    // An in-flight or parked answer belongs to the call that dispatched it:
+    // a commit collecting a delete's bare success would return 0 with the
+    // root buffer unwritten, and a delete collecting a commit would discard
+    // the receipt. The wrong collector is the lifecycle bug `SY_ESTATE`
+    // names, and the parked answer stays for the right one.
+    let kind = command.kind();
+    if writer
+        .dispatched
+        .get()
+        .is_some_and(|dispatched| dispatched != kind)
+    {
+        return ret(errno::ESTATE);
+    }
     // A parked answer is what the repeated call collects, before anything new
     // is dispatched.
     let parked = writer.result.borrow_mut().take();
@@ -3371,12 +3399,16 @@ fn put_op(
                     };
                     region.copy_from_slice(root.as_bytes());
                 }
+                writer.dispatched.set(None);
                 writer.delivered.set(true);
                 return ret(0);
             }
             // A failed operation is not the writer's end: a lost condition is
             // retryable once the guest has read the tree again.
-            Err(code) => return ret(code),
+            Err(code) => {
+                writer.dispatched.set(None);
+                return ret(code);
+            }
         }
     }
     if writer.op_pending.get() || writer.command.get().is_some() {
@@ -3418,6 +3450,7 @@ fn put_op(
     }
     inner.put_commits.set(inner.put_commits.get() + 1);
     writer.command.set(Some(command));
+    writer.dispatched.set(Some(kind));
     writer.op_pending.set(true);
     writer.work.notify_one();
     ret(errno::EAGAIN)

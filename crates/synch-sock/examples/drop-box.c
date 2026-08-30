@@ -54,12 +54,17 @@ SY_ENTRY sy_s64 entry(void) {
   if (nlen <= 0 || nlen >= (sy_s64)sizeof name || !name_ok(name, nlen))
     return -1;
 
-  /* 4. The rest of the path is the handshake's, not the caller's. */
+  /* 4. The rest of the path is the handshake's, not the caller's. The
+     origin helper returns the origin's full length even when the copy was
+     cut to fit the buffer, so the return is checked against the window
+     before it becomes an offset — and the final length against the frame. */
   char path[256];
-  sy_u64 plen = 0;
+  sy_u64 plen = 11;
   sy_memcpy(path, "code/inbox/", 11);
-  plen = 11;
-  plen += sy_peer_origin(path + plen, sizeof path - plen - 1);
+  sy_s64 olen = sy_peer_origin(path + plen, sizeof path - plen);
+  if (olen <= 0 || (sy_u64)olen >= sizeof path - plen) return -1;
+  plen += (sy_u64)olen;
+  if (plen + 1 + (sy_u64)nlen > sizeof path) return -1;
   path[plen++] = '/';
   sy_memcpy(path + plen, name, (sy_u64)nlen);
   plen += (sy_u64)nlen;
