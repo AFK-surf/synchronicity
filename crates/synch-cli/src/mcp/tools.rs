@@ -690,10 +690,11 @@ fn build_catalog() -> Vec<Tool> {
         Tool {
             name: "synch_socket_list",
             title: "List sockets",
-            description: "Every socket this node has declared: whether it is armed, what \
-                          the armed program declared, and its stream cap. A socket is a \
-                          path whose content is an eBPF program this node runs for peers \
-                          that connect to it."
+            description: "Every path this node has activated as a socket: whether its \
+                          current content is published and serves, what that content's \
+                          manifest declares, and its stream cap. A socket is a path whose \
+                          content is an eBPF program this node runs for peers that \
+                          connect to it."
                 .into(),
             tier: Tier::Read,
             input: json!({
@@ -755,8 +756,9 @@ fn build_catalog() -> Vec<Tool> {
             title: "Compile a socket program",
             description: "Compiles C source to the eBPF object a socket is made of, and \
                           returns it base64-encoded. Nothing is written or published: \
-                          write the bytes into a space with synch_write, then declare \
-                          and arm the path. synch.h is included automatically."
+                          inspect it with synch_socket_inspect, then write the bytes to \
+                          an activated path with synch_write to deploy them. synch.h is \
+                          included automatically."
                 .into(),
             tier: Tier::Read,
             input: json!({
@@ -767,8 +769,8 @@ fn build_catalog() -> Vec<Tool> {
                     "defines": {
                         "type": "object",
                         "description": "Preprocessor defines, as a name-to-value map. A \
-                                        socket's declarations are compiled in, so a value \
-                                        here is part of what gets approved at arm time.",
+                                        socket's manifest is compiled in, so a value here \
+                                        is part of what the deployed object declares.",
                         "additionalProperties": { "type": "string" },
                     },
                 },
@@ -785,25 +787,32 @@ fn build_catalog() -> Vec<Tool> {
             })),
         },
         Tool {
-            name: "synch_socket_review",
-            title: "Review a socket program",
-            description: "Prints what a declared socket's current program declares — its \
-                          name, egress destinations and stream cap — and the \
-                          review token that approves exactly it. Approving is a separate \
-                          call, synch_socket_arm, and the token binds the content root, \
-                          the authorization revision, and this init result together."
+            name: "synch_socket_inspect",
+            title: "Inspect a socket object",
+            description: "Statelessly describes an eBPF object: the BLAKE3 root the tree \
+                          would name for it, its parsed manifest — name, egress, \
+                          capabilities, stream cap — and whether the program loads. \
+                          Touches no daemon state and publishes nothing."
                 .into(),
             tier: Tier::Read,
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "object_base64": { "type": "string", "description": "The eBPF ELF object, as synch_socket_build returns it." },
                 },
-                "required": ["space", "path"],
+                "required": ["object_base64"],
                 "additionalProperties": false,
             }),
-            output: None,
+            output: Some(json!({
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string" },
+                    "size": { "type": "integer" },
+                    "declares": { "type": "string", "description": "The canonical rendering of the manifest's declaration; empty when it declares nothing." },
+                    "loads": { "type": "boolean", "description": "Whether the program load-validated on this build; absent where this build has no eBPF runtime." },
+                },
+                "required": ["root", "size", "declares"],
+            })),
         },
         Tool {
             name: "synch_socket_connect",
@@ -983,12 +992,15 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_socket_declare",
-            title: "Declare a socket",
-            description: "Declares that a path in one of this node's spaces is a socket, \
-                          so the scanner publishes it as one. Declaring is not arming: \
-                          the program does not run until synch_socket_arm approves a \
-                          reviewed declaration."
+            name: "synch_socket_activate",
+            title: "Activate a socket path",
+            description: "Makes a path in one of this node's spaces a socket until \
+                          synch_socket_deactivate. From the next scan the path publishes \
+                          as a socket, and every later write to it — synch_write, \
+                          adoption, an S3 PUT — is an intentional deployment: the new \
+                          content serves immediately under its own manifest. Activate a \
+                          path only when every channel that can write it is meant as a \
+                          deployment channel."
                 .into(),
             tier: Tier::Write,
             input: json!({
@@ -1002,12 +1014,6 @@ fn build_catalog() -> Vec<Tool> {
                         "additionalProperties": { "type": "string" },
                     },
                     "max_streams": { "type": "integer", "minimum": 1, "description": "A concurrency cap for this socket." },
-                    "auto": {
-                        "type": "boolean",
-                        "description": "Re-arm on every content change, skipping review forever. \
-                                        Correct only for a path you are the only writer of — \
-                                        wrong for any path adoption or an S3 key can reach.",
-                    },
                     "note": { "type": "string" },
                 },
                 "required": ["space", "path"],
@@ -1016,50 +1022,11 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_socket_arm",
-            title: "Arm a socket",
-            description: "Approves the reviewed declaration a review token names, so this \
-                          node will run the program for peers that connect. Call \
-                          synch_socket_review first: the token binds the content root, \
-                          the authorization revision, and the init result, and approval \
-                          fails if any of them has changed since."
-                .into(),
-            tier: Tier::Write,
-            input: json!({
-                "type": "object",
-                "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
-                    "review_token": { "type": "string", "description": "The token synch_socket_review printed." },
-                },
-                "required": ["space", "path", "review_token"],
-                "additionalProperties": false,
-            }),
-            output: None,
-        },
-        Tool {
-            name: "synch_socket_disarm",
-            title: "Disarm a socket",
-            description: "Withdraws an approval, leaving the socket declared and \
-                          published but not runnable."
-                .into(),
-            tier: Tier::Write,
-            input: json!({
-                "type": "object",
-                "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
-                },
-                "required": ["space", "path"],
-                "additionalProperties": false,
-            }),
-            output: None,
-        },
-        Tool {
-            name: "synch_socket_undeclare",
-            title: "Undeclare a socket",
-            description: "Undeclares a path; the next scan republishes it as an ordinary \
-                          file."
+            name: "synch_socket_deactivate",
+            title: "Deactivate a socket path",
+            description: "Stops a path being a socket: connections refuse immediately, \
+                          running invocations finish on their snapshot, and the next \
+                          scan republishes the path as an ordinary file."
                 .into(),
             tier: Tier::Write,
             input: json!({
@@ -1133,7 +1100,7 @@ pub(crate) async fn call(
         "synch_socket_log" => socket_log(ctx, args, reporter).await,
         "synch_socket_sdk" => rendered(ctx, Cmd::SocketSdk(pb::SocketSdk {}), reporter).await,
         "synch_socket_build" => socket_build(args).await,
-        "synch_socket_review" => socket_arm(ctx, args, reporter, None).await,
+        "synch_socket_inspect" => socket_inspect(args).await,
         "synch_socket_connect" => connect(ctx, args).await,
 
         "synch_write" => write(ctx, args).await,
@@ -1156,20 +1123,10 @@ pub(crate) async fn call(
             ctx.whole_node("synch_peer_sync")?;
             rendered(ctx, Cmd::PeerSync(pb::PeerSync {}), reporter).await
         }
-        "synch_socket_declare" => socket_declare(ctx, args, reporter).await,
-        "synch_socket_arm" => {
-            let token = need_str(args, "review_token")?.to_string();
-            socket_arm(ctx, args, reporter, Some(token)).await
-        }
-        "synch_socket_disarm" => {
+        "synch_socket_activate" => socket_activate(ctx, args, reporter).await,
+        "synch_socket_deactivate" => {
             socket_target(ctx, args, reporter, |target| {
-                Cmd::SocketDisarm(pb::SocketDisarm { target })
-            })
-            .await
-        }
-        "synch_socket_undeclare" => {
-            socket_target(ctx, args, reporter, |target| {
-                Cmd::SocketUndeclare(pb::SocketUndeclare { target })
+                Cmd::SocketDeactivate(pb::SocketDeactivate { target })
             })
             .await
         }
@@ -1685,30 +1642,75 @@ fn string_map(args: &Value, name: &str) -> Result<Vec<(String, String)>, ToolErr
     Ok(out)
 }
 
-/// `synch_socket_review` and `synch_socket_arm`, which are one call with and
-/// without the token that turns inspection into approval.
-async fn socket_arm(
-    ctx: &Context,
-    args: &Value,
-    reporter: &Reporter,
-    review: Option<String>,
-) -> Result<Outcome, ToolError> {
-    let space = need_str(args, "space")?;
-    ctx.scope(space)?;
-    let target = reference(space, need_str(args, "path")?, None)?;
-    rendered(
-        ctx,
-        Cmd::SocketArm(pb::SocketArm {
-            target,
-            review: review.unwrap_or_default(),
-        }),
-        reporter,
-    )
+/// `synch_socket_inspect` — stateless, no daemon involved.
+async fn socket_inspect(args: &Value) -> Result<Outcome, ToolError> {
+    let encoded = need_str(args, "object_base64")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| ToolError::execution(format!("object_base64 does not decode: {e}")))?;
+    let limit = synch_sock::Limits::default().max_program_bytes;
+    if bytes.len() as u64 > limit {
+        return Err(ToolError::execution(format!(
+            "the object is {} bytes, past the {limit} a socket program may be",
+            bytes.len()
+        )));
+    }
+    // Hashing and validating can be real CPU for a 4 MiB object; keep it off
+    // the reader loop, like the compiler.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let root = synch_core::hash_reader(bytes.as_slice())
+            .map_err(|e| format!("hashing the object: {e}"))?;
+        let declared =
+            synch_sock::manifest::manifest_declaration(&bytes).map_err(|e| e.to_string())?;
+        let loads = inspect_loads(&bytes, &declared)?;
+        Ok::<_, String>((root, bytes.len(), declared.render(), loads))
+    })
     .await
+    .map_err(|e| ToolError::execution(format!("the inspection did not finish: {e}")))?;
+    let (root, size, declares, loads) = outcome.map_err(ToolError::execution)?;
+    let mut structured = json!({
+        "root": root.to_hex().to_string(),
+        "size": size,
+        "declares": declares,
+    });
+    if let Some(loads) = loads {
+        structured["loads"] = json!(loads);
+    }
+    let text = if declares.is_empty() {
+        format!("{} ({size} bytes); declares nothing", root.to_hex())
+    } else {
+        format!("{} ({size} bytes)\n{declares}", root.to_hex())
+    };
+    Ok(Outcome::both(text, structured))
 }
 
-/// `synch_socket_declare`.
-async fn socket_declare(
+/// The load half of inspection, where this build has a runtime.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn inspect_loads(bytes: &[u8], declared: &synch_core::Declaration) -> Result<Option<bool>, String> {
+    synch_sock::validate_program(bytes, declared).map_err(|e| e.to_string())?;
+    Ok(Some(true))
+}
+
+/// The portable half where it cannot: the stream section is still checkable.
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn inspect_loads(
+    bytes: &[u8],
+    _declared: &synch_core::Declaration,
+) -> Result<Option<bool>, String> {
+    if !synch_sock::manifest::has_stream_section(bytes) {
+        return Err("the program has no `synchronicity.stream` entrypoint".into());
+    }
+    Ok(None)
+}
+
+/// `synch_socket_activate`.
+async fn socket_activate(
     ctx: &Context,
     args: &Value,
     reporter: &Reporter,
@@ -1727,11 +1729,10 @@ async fn socket_declare(
     };
     rendered(
         ctx,
-        Cmd::SocketDeclare(pb::SocketDeclare {
+        Cmd::SocketActivate(pb::SocketActivate {
             target,
             config,
             max_streams,
-            auto: opt_bool(args, "auto")?,
             note: opt_str(args, "note")?.unwrap_or_default().to_string(),
         }),
         reporter,
@@ -2100,17 +2101,17 @@ mod tests {
         let read_only = context(false, &[]);
         let names: Vec<&str> = read_only.catalog().iter().map(|t| t.name).collect();
         assert!(names.contains(&"synch_read"));
-        assert!(names.contains(&"synch_socket_review"));
+        assert!(names.contains(&"synch_socket_inspect"));
         assert!(names.contains(&"synch_socket_connect"));
         assert!(!names.contains(&"synch_write"));
-        assert!(!names.contains(&"synch_socket_arm"));
+        assert!(!names.contains(&"synch_socket_activate"));
 
         let full = context(true, &[]);
         assert!(full.catalog().len() > read_only.catalog().len());
         assert!(full
             .catalog()
             .iter()
-            .any(|tool| tool.name == "synch_socket_arm"));
+            .any(|tool| tool.name == "synch_socket_activate"));
     }
 
     #[tokio::test]

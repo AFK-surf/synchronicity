@@ -1,8 +1,7 @@
 //! Who is calling, and what this invocation may do.
 //!
-//! Arming a program approves the capabilities it declared in its
-//! `synchronicity.init` hook. Egress the program did not declare remains
-//! denied.
+//! What an invocation may do is what its program's `synchronicity.manifest`
+//! section declares. Egress the manifest does not declare remains denied.
 //!
 //! Reading the tree is not among the things a program declares. Every
 //! invocation may read every path in every origin this node holds
@@ -22,7 +21,7 @@ use synch_core::{sock::egress_rule_matches, Declaration, NodeId, OriginId};
 /// The encoding of the ed25519 base point: a real point on the curve, so
 /// `NodeId` accepts it, and one no keypair anybody holds will ever produce. It
 /// stands in where the protocol needs a key and there is no caller — the
-/// declaration run, which happens at arm time with nobody connected.
+/// test harness's bare runs, which have nobody connected.
 ///
 /// Arbitrary bytes will not do: most 32-byte strings are not valid public keys,
 /// and `NodeId::from_bytes` rejects them.
@@ -95,16 +94,16 @@ impl PeerIdentity {
     }
 }
 
-/// What one invocation may do, already computed from the armed declaration.
+/// What one invocation may do, already computed from the program's manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectivePolicy {
-    /// Egress rules the armed program declared, as `host` or `host:port`.
+    /// Egress rules the program's manifest declares, as `host` or `host:port`.
     pub egress: Vec<String>,
-    /// Exact process capabilities approved for this program root.
+    /// Exact process capabilities the manifest declares.
     pub processes: Vec<synch_core::ProcessCapability>,
-    /// Exact file-transfer capabilities approved for this program root.
+    /// Exact file-transfer capabilities the manifest declares.
     pub file_transfers: Vec<synch_core::FileTransferCapability>,
-    /// Prefix-scoped tree-write capabilities approved for this program root.
+    /// Prefix-scoped tree-write capabilities the manifest declares.
     pub tree_writes: Vec<synch_core::TreeWriteCapability>,
     /// Config the operator set, readable through `sy_config_get`.
     pub config: Vec<(String, String)>,
@@ -117,8 +116,9 @@ pub struct EffectivePolicy {
 }
 
 impl EffectivePolicy {
-    /// Builds the runtime policy approved by arming this declaration.
-    pub fn armed(
+    /// Builds the runtime policy this declaration grants, capped by the
+    /// activation's and the daemon's own stream limits.
+    pub fn granted(
         declared: &Declaration,
         config: Vec<(String, String)>,
         operator_max_streams: Option<u32>,
@@ -224,7 +224,7 @@ mod tests {
     }
 
     fn armed(program: &[&str]) -> EffectivePolicy {
-        EffectivePolicy::armed(&declared(program), vec![], None, 64)
+        EffectivePolicy::granted(&declared(program), vec![], None, 64)
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn the_stream_cap_is_the_lowest_of_the_three() {
         let cap = |program, operator| {
-            EffectivePolicy::armed(
+            EffectivePolicy::granted(
                 &Declaration {
                     max_streams: program,
                     ..Declaration::default()
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn the_declared_stack_frame_size_reaches_the_runtime_policy() {
         assert_eq!(armed(&[]).stack_frame_size, None);
-        let policy = EffectivePolicy::armed(
+        let policy = EffectivePolicy::granted(
             &Declaration {
                 stack_frame_size: Some(512),
                 guarded_stack_frames: Some(false),

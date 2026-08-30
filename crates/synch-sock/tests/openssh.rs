@@ -77,8 +77,8 @@ async fn openssh_logs_into_the_ssh_shell_example() {
 
     let elf = build_example("ssh-shell.c");
     let harness = Harness::new();
-    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
-    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let declaration = synch_sock::manifest::manifest_declaration(&elf).expect("the hook ran");
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("a loopback listener");
@@ -228,8 +228,8 @@ async fn openssh_logs_into_the_ssh_shell_example() {
 async fn serve_the_ssh_shell_example_for_a_manual_login() {
     let elf = build_example("ssh-shell.c");
     let harness = Harness::new();
-    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
-    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let declaration = synch_sock::manifest::manifest_declaration(&elf).expect("the hook ran");
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
     let listener = TcpListener::bind("127.0.0.1:2222")
         .await
         .expect("port 2222 is free");

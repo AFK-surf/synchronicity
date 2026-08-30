@@ -405,11 +405,10 @@ runs it *here*, one invocation per incoming stream, under
 ```sh
 synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
 synch socket build git.c --clang -o git.o       # optimized; needs clang + llc on PATH
-synch socket declare code/git.sock
+synch socket inspect code/git.sock             # stateless: root, manifest, load check
+synch socket activate code/git.sock            # the path is a socket until deactivated
 synch source scan                              # publish it as kind=Socket
-synch socket arm code/git.sock                 # inspect declarations and copy the token
-synch socket arm code/git.sock --review <token> # approve exactly what was inspected
-synch socket ls -l                             # armed root, drift, declarations
+synch socket ls -l                             # published root, manifest, validity
 synch socket sdk > synch.h                     # the header a program is built against
 ```
 
@@ -432,13 +431,15 @@ synch socket connect nas@cluster.example.com:code/git.sock
 synch socket connect nas@cluster.example.com:code/git.sock --listen 127.0.0.1:9418
 ```
 
-**A node executes only eBPF that is present in its own published tree.** So the
-connecting side ships no code, needs no runtime, and works anywhere — while
-adopting somebody's socket with `synch adopt path` adopts its bytes and not its
-socket-ness, because the entry kind comes from a local declaration and is never
-taken from a peer. Publishing is not permission either: an arming record pins
-the BLAKE3 content root that was approved, and bytes that change leave the
-socket published and not runnable until somebody approves the new program.
+**A node executes only eBPF that is present in its own published tree, at a
+path it activated.** So the connecting side ships no code, needs no runtime,
+and works anywhere — while adopting somebody's socket with `synch adopt path`
+adopts its bytes and not its socket-ness, because the entry kind comes from a
+local activation and is never taken from a peer. What a program may reach is
+declared as data in the object itself — a JSON manifest in a non-executable
+ELF section — so `synch socket inspect` answers "what would this deployment
+do?" without running anything, and every write to an activated path is an
+intentional deployment that serves immediately under its own manifest.
 Serving needs Linux, macOS or OpenBSD on x86-64 or arm64, which is where
 async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 

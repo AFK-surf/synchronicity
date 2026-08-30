@@ -28,12 +28,13 @@ pub use record::{
     SpaceInfo, AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use sock::{
-    display_text_is_safe, valid_ebpf_stack_frame_size, Declaration, FaultKind,
-    FileTransferCapability, ProcessCapability, RefuseCode, SockClosed, SockOpen, SockOpened,
-    SockStatus, TreeWriteCapability, ALPN_SOCK, DEFAULT_EBPF_STACK_FRAME_SIZE,
-    DEFAULT_TREE_WRITE_MAX_BYTES, MAX_DECLARED_EGRESS, MAX_DECLARED_FILE_TRANSFERS,
-    MAX_DECLARED_PROCESSES, MAX_DECLARED_TREE_WRITES, MAX_EBPF_STACK_FRAME_SIZE,
-    MAX_OPEN_FRAME_LEN, TREE_WRITE_CREATE, TREE_WRITE_DELETE, TREE_WRITE_REPLACE,
+    display_text_is_safe, parse_socket_manifest, valid_ebpf_stack_frame_size, Declaration,
+    FaultKind, FileTransferCapability, ManifestError, ProcessCapability, RefuseCode, SockClosed,
+    SockOpen, SockOpened, SockStatus, TreeWriteCapability, ALPN_SOCK,
+    DEFAULT_EBPF_STACK_FRAME_SIZE, DEFAULT_TREE_WRITE_MAX_BYTES, MAX_DECLARED_EGRESS,
+    MAX_DECLARED_FILE_TRANSFERS, MAX_DECLARED_PROCESSES, MAX_DECLARED_TREE_WRITES,
+    MAX_EBPF_STACK_FRAME_SIZE, MAX_OPEN_FRAME_LEN, MAX_SOCKET_MANIFEST_BYTES,
+    SOCKET_MANIFEST_VERSION, TREE_WRITE_CREATE, TREE_WRITE_DELETE, TREE_WRITE_REPLACE,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,

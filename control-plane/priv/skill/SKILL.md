@@ -272,21 +272,21 @@ verified peer identity, never code. This is the rule to keep in mind:
 > A node executes only eBPF that is present in its own published tree.
 
 That makes the two sides deliberately asymmetric. `synch socket ...` builds,
-declares, approves and operates programs belonging to this node. `synch socket
+inspects, activates and operates programs belonging to this node. `synch socket
 connect ...` is only a byte pump to a socket belonging to a named origin and
 needs no eBPF runtime on the caller.
 
-### Build, publish and arm one
+### Build, inspect and activate one
 
 The normal path from C source to a runnable socket is:
 
 ```sh
-synch socket build git.c -o code/git.sock       # C to eBPF; no daemon needed
-synch socket declare code/git.sock              # declare the local path
+synch socket build git.c -o git.o               # C to eBPF; no daemon needed
+synch socket inspect git.o                      # stateless: root, manifest, load check
+cp git.o <source-dir>/git.sock                  # place it at the path
+synch socket activate code/git.sock             # the path is a socket until deactivated
 synch source scan code                          # publish it as kind=Socket
-synch socket arm code/git.sock                  # inspect root and declarations
-synch socket arm code/git.sock --review <token> # approve exactly that inspection
-synch socket ls -l                              # verify armed root and policy
+synch socket ls -l                              # verify published root and manifest
 ```
 
 On supported builds, `socket build` uses the compiler embedded in `synch` and
@@ -296,26 +296,26 @@ compatible `clang` and `llc` executables from `PATH` at `-O2`, and `-D
 NAME[=VALUE]` supplies compile-time definitions. Windows builds need this
 `--clang` route to build, but can connect normally.
 
-The object must already be below a filesystem source registered with `synch
-source add`. Declaration and arming are separate local gates:
+The object must live below a filesystem source registered with `synch
+source add`. Activation is the one local gate:
 
-- `synch socket declare <space>/<path>` makes the next source scan publish the
-  entry as a socket. Add `--config k=v` for values read through `sy_config_get`,
-  `--max-streams N` for a local concurrency ceiling, or `--note TEXT` for an
-  operator note.
-- The first `socket arm` runs the object's `synchronicity.init` hook and prints
-  the program root, resource shape and declared effects, such as outbound TCP
-  destinations or process capabilities. It does **not** approve the object. Review that
-  output, then pass its opaque token to `--review`; the token binds the content
-  root, current local authorization revision and exact init result.
-- Approval pins the BLAKE3 content root. Replacing the object and scanning
-  leaves the new root published but not runnable until it is reviewed and
-  armed. In-flight invocations keep the root they started with.
-
-`synch socket declare --auto` deliberately skips that fresh review by re-arming
-on every content change. Use it only when the path has a single trusted
-writer. It is unsafe for a path a read-write S3 key or adoption can write,
-because either can replace bytes that this node then publishes as its own.
+- `synch socket inspect <file>` statelessly describes any eBPF object: the
+  BLAKE3 root the tree would name for it, its `synchronicity.manifest`
+  declaration — name, egress, process/file-transfer/tree-write capabilities,
+  stream cap — and whether the program loads. Nothing executes: the manifest
+  is data, and inspection touches no daemon state.
+- `synch socket activate <space>/<path>` makes the path a socket. The next
+  source scan publishes the entry as `kind=Socket`, and from then on **every
+  write to the path is an intentional deployment**: the new content serves
+  immediately under whatever its own manifest declares, until
+  `synch socket deactivate`. Add `--config k=v` for values read through
+  `sy_config_get`, `--max-streams N` for a local concurrency ceiling, or
+  `--note TEXT` for an operator note.
+- Activation is about the path, never a content root. That breadth is the
+  grant: adoption and a read-write S3 key are deployment channels for an
+  activated path, so activate only paths whose every writer you mean as a
+  deployer. In-flight invocations keep the root snapshot they started with; a
+  deployment changes what the next connection runs.
 
 Serving sockets requires Linux, macOS or OpenBSD on x86-64 or arm64, where the
 async-ebpf runtime is available. Connecting works on every platform supported
@@ -343,37 +343,38 @@ Synchronicity endpoint and bridges the control-socket stream, so it must be
 running on the connecting side too.
 
 The destination resolves the path only in the named origin's trie, verifies
-membership and delegation, requires the entry to be a locally declared socket,
-and requires its current root to be armed. Publication alone is never execute
-permission. A program's undeclared outbound connections are also denied even
-after it is armed. Reading the tree needs no declaration and is not denied.
+membership and delegation, requires the path to be locally activated, and
+parses the current content's manifest before anything runs. Publication alone
+is never execute permission. A program's undeclared outbound connections are
+denied. Reading the tree needs no declaration and is not denied.
 
-Adopting a peer's socket, materializing it in a replica checkout, or writing it
-through S3 copies its bytes as an ordinary file. Socket-ness is a local
-assertion created only by `synch socket declare`, and executability is a
-separate local approval. If one origin publishes a socket and another
+Adopting a peer's socket, materializing it in a replica checkout, or writing
+it through S3 copies its bytes as an ordinary file — unless the *local*
+destination path is activated, in which case the write is a deployment, which
+is exactly what activation means. Socket-ness is a local assertion created
+only by `synch socket activate`. If one origin publishes a socket and another
 publishes a regular file with identical bytes, they are divergent versions
 rather than one unanimous version.
 
 ### Operate and troubleshoot sockets
 
 ```sh
-synch socket ls [<space>] -l        # declarations, current/armed roots, drift
-synch socket ps [<space>/<path>]    # live invocations, ids, peers and counters
-synch socket log <space>/<path>     # recent sy_log output
-synch socket kill <invocation>      # end one invocation
-synch socket disarm <space>/<path>  # keep publishing it; refuse new runs
-synch socket undeclare <space>/<path> # next source scan publishes a file
+synch socket ls [<space>] -l          # activations, published roots, manifests
+synch socket ps [<space>/<path>]      # live invocations, ids, peers and counters
+synch socket log <space>/<path>       # recent sy_log output
+synch socket kill <invocation>        # end one invocation
+synch socket deactivate <space>/<path> # refuse now; next scan publishes a file
 ```
 
 The common refusals say which gate failed: `NoSuchPath` means that origin does
-not publish the path, `NotASocket` that it is not a socket entry, `NotArmed`
-that the current root lacks approval, `Unauthorized` that the caller is not a
-member or delegate, `SpaceNotDelegated` that the socket falls outside the
-caller's grant, `Busy` that its concurrency cap is full, and `ProgramInvalid`
-that the object could not load or link. Repeated program faults automatically
-disarm that socket; inspect `socket log` and `socket ls -l`, fix or rebuild the
-object, source-scan it, and review and arm the new root.
+not publish the path, `NotASocket` that it is not a socket entry,
+`NotActivated` that the path was deactivated or its content replaced during
+admission, `Unauthorized` that the caller is not a member or delegate,
+`SpaceNotDelegated` that the socket falls outside the caller's grant, `Busy`
+that its concurrency cap is full, and `ProgramInvalid` that the manifest does
+not parse or the object could not load or link. An invalid update stays
+activated and unavailable: inspect `socket log` and `socket ls -l`, fix or
+rebuild the object, and deploy it — the next scan serves it.
 
 ## Membership
 

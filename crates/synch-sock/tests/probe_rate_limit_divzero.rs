@@ -26,8 +26,6 @@
 
 mod harness;
 
-use std::sync::Arc;
-
 use harness::{compile, peer, Harness};
 use synch_sock::{DuplexStream, EffectivePolicy};
 use tokio::io::AsyncWriteExt;
@@ -40,21 +38,6 @@ const DIVZERO_WINDOW: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   const char k[1] = {'x'};
   return sy_rate_limit(k, 1, 10, 288230376151711744ULL);
-}
-"#;
-
-/// The same window from the declaration hook: `synch socket arm` runs this
-/// path, so it must not crash either.
-const DIVZERO_INIT: &str = r#"
-#include <synch.h>
-
-SY_INIT_ENTRY sy_s64 declare(void) {
-  const char k[1] = {'x'};
-  return sy_rate_limit(k, 1, 10, 288230376151711744ULL);
-}
-
-SY_ENTRY sy_s64 entry(void) {
-  return 0;
 }
 "#;
 
@@ -181,33 +164,6 @@ async fn the_pool_survives_and_a_sane_window_still_works() {
         .status;
     caller.await.unwrap();
     assert_eq!(outcome, synch_core::SockStatus::Ok(0));
-}
-
-#[tokio::test]
-async fn a_poison_init_hook_is_contained_by_declare() {
-    let elf = compile(DIVZERO_INIT, "divzero-init.c");
-    let tree = Arc::new(harness::FakeTree::default());
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = synch_sock::declare(&elf, tree).map(|d| d.render());
-        let _ = done_tx.send(result);
-    });
-
-    match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(Err(e)) => {
-            let text = e.to_string();
-            assert!(
-                text.contains("idle deadline"),
-                "the clamped window must not panic the hook; got: {text}"
-            );
-            eprintln!("init-hook poison contained as: {text}");
-        }
-        Ok(Ok(decl)) => {
-            eprintln!("init hook accepted the clamped window: {decl:?}");
-        }
-        Err(_) => panic!("the declaration hook hung or the process died"),
-    }
 }
 
 /// The quarantine accounting must see a normal outcome: a panic that skips

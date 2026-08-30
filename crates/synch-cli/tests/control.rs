@@ -1843,12 +1843,11 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
 
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
-fn socket_declare(target: &str) -> Command {
-    Command::SocketDeclare(pb::SocketDeclare {
+fn socket_activate(target: &str) -> Command {
+    Command::SocketActivate(pb::SocketActivate {
         target: target.into(),
         config: vec![],
         max_streams: 32,
-        auto: false,
         note: String::new(),
     })
 }
@@ -1884,23 +1883,13 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
     std::fs::write(space.path().join("echo.sock"), elf).unwrap();
     daemon
         .node
-        .socket_declare(&synch_store::SocketRow::new(
+        .socket_activate(&synch_store::SocketActivation::new(
             "code",
             "echo.sock",
             synch_core::now_ns(),
         ))
         .unwrap();
     daemon.node.scan_and_publish().unwrap();
-    let inspected = daemon
-        .node
-        .socket_inspect("code", "echo.sock")
-        .await
-        .unwrap();
-    daemon
-        .node
-        .socket_approve("code", "echo.sock", &inspected.review)
-        .await
-        .unwrap();
 
     let (requests, rx) = tokio::sync::mpsc::channel(4);
     for kind in [
@@ -1939,7 +1928,7 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
 }
 
 #[tokio::test]
-async fn a_socket_is_declared_listed_and_undeclared() {
+async fn a_socket_is_activated_listed_and_deactivated() {
     let dir = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1950,42 +1939,42 @@ async fn a_socket_is_declared_listed_and_undeclared() {
     )
     .await;
 
-    let out = lines(dir.path(), socket_declare("code/git.sock")).await;
-    assert!(out.contains("declared code/git.sock"), "{out}");
+    let out = lines(dir.path(), socket_activate("code/git.sock")).await;
+    assert!(out.contains("activated code/git.sock"), "{out}");
     assert!(
-        out.contains("socket arm"),
-        "the next step has to be named: {out}"
+        out.contains("deployment"),
+        "the breadth of the grant has to be named where it is made: {out}"
     );
 
-    // Declared but not published: the scanner has not run, so there is nothing
-    // for an arming record to pin.
+    // Activated but not published: the scanner has not run, so there is
+    // nothing to serve yet, and the listing says so.
     let out = lines(dir.path(), socket_ls("", true)).await;
     assert!(out.contains("code/git.sock"), "{out}");
     assert!(out.contains("unpublished"), "{out}");
 
-    // Arming something with no published entry says what to do about it rather
-    // than failing obscurely.
-    let code = failure(
-        dir.path(),
-        Command::SocketArm(pb::SocketArm {
-            target: "code/git.sock".into(),
-            review: String::new(),
-        }),
-    )
-    .await;
-    assert_eq!(code, ErrorCode::Invalid);
-
     let out = lines(
         dir.path(),
-        Command::SocketUndeclare(pb::SocketUndeclare {
+        Command::SocketDeactivate(pb::SocketDeactivate {
             target: "code/git.sock".into(),
         }),
     )
     .await;
-    assert!(out.contains("undeclared"), "{out}");
+    assert!(out.contains("deactivated"), "{out}");
     assert!(lines(dir.path(), socket_ls("", false))
         .await
-        .contains("no sockets declared"),);
+        .contains("no sockets activated"),);
+
+    // Deactivating what is not activated is a not-found, not a silent success.
+    assert_eq!(
+        failure(
+            dir.path(),
+            Command::SocketDeactivate(pb::SocketDeactivate {
+                target: "code/git.sock".into(),
+            })
+        )
+        .await,
+        ErrorCode::NotFound
+    );
 
     daemon.shutdown().await;
 }
@@ -1995,24 +1984,24 @@ async fn a_socket_target_must_name_this_nodes_own_space_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
 
-    // An origin-qualified target is refused: a socket is declared on the node
+    // An origin-qualified target is refused: a socket is activated on the node
     // that publishes it, so naming somebody else's tree here is a mistake
     // worth saying out loud rather than quietly dropping.
     assert_eq!(
         failure(
             dir.path(),
-            socket_declare("nas@cluster.example:code/git.sock")
+            socket_activate("nas@cluster.example:code/git.sock")
         )
         .await,
         ErrorCode::Invalid
     );
     assert_eq!(
-        failure(dir.path(), socket_declare("nopathhere")).await,
+        failure(dir.path(), socket_activate("nopathhere")).await,
         ErrorCode::Invalid
     );
-    // A space this node does not index has nothing to declare in.
+    // A space this node does not index has nothing to activate in.
     assert_eq!(
-        failure(dir.path(), socket_declare("absent/git.sock")).await,
+        failure(dir.path(), socket_activate("absent/git.sock")).await,
         ErrorCode::Invalid
     );
 
@@ -2044,7 +2033,7 @@ async fn the_live_surface_answers_when_nothing_is_running() {
         source_add("code", space.path().to_str().unwrap()),
     )
     .await;
-    lines(dir.path(), socket_declare("code/git.sock")).await;
+    lines(dir.path(), socket_activate("code/git.sock")).await;
 
     // An empty answer is an answer, and saying so beats printing nothing and
     // leaving an operator wondering whether the command worked.

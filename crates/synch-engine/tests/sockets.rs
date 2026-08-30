@@ -1,7 +1,7 @@
 //! Sockets, from the engine's side (`docs/SOCKETS.md`).
 //!
-//! The properties here are the ones the design turns on, and none of them needs
-//! an eBPF runtime to check: what the scanner publishes, what an arming record
+//! The properties here are the ones the design turns on, and most of them need
+//! no eBPF runtime to check: what the scanner publishes, what an activation
 //! means, and what happens to a socket that arrives from somebody else. The
 //! runtime's own end-to-end tests live in `synch-sock`.
 
@@ -11,7 +11,7 @@ use std::path::Path;
 
 use synch_core::{EntryKind, Hash};
 use synch_engine::{Node, NodeConfig};
-use synch_store::{ArmCandidate, SocketRow};
+use synch_store::SocketActivation;
 
 /// A node with one filesystem source and its directory.
 async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
@@ -30,17 +30,17 @@ fn write(space: &Path, name: &str, body: &[u8]) {
     std::fs::write(space.join(name), body).unwrap();
 }
 
-fn declaration(space: &str, path: &str) -> SocketRow {
-    SocketRow::new(space, path, synch_core::now_ns())
+fn activation(space: &str, path: &str) -> SocketActivation {
+    SocketActivation::new(space, path, synch_core::now_ns())
 }
 
 #[tokio::test]
-async fn a_declared_path_is_published_as_a_socket_and_an_undeclared_one_is_not() {
+async fn an_activated_path_is_published_as_a_socket_and_an_ordinary_one_is_not() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF not really");
     write(space.path(), "readme.md", b"hello");
 
-    node.socket_declare(&declaration("code", "git.sock"))
+    node.socket_activate(&activation("code", "git.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
 
@@ -61,7 +61,7 @@ async fn a_declared_path_is_published_as_a_socket_and_an_undeclared_one_is_not()
 }
 
 #[tokio::test]
-async fn declaring_an_unchanged_published_file_changes_its_kind() {
+async fn activating_an_unchanged_published_file_changes_its_kind() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF unchanged");
     node.scan_and_publish().unwrap();
@@ -74,7 +74,7 @@ async fn declaring_an_unchanged_published_file_changes_its_kind() {
         EntryKind::File
     );
 
-    node.socket_declare(&declaration("code", "git.sock"))
+    node.socket_activate(&activation("code", "git.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
     assert_eq!(
@@ -84,17 +84,18 @@ async fn declaring_an_unchanged_published_file_changes_its_kind() {
             .unwrap()
             .kind,
         EntryKind::Socket,
-        "the scanner's unchanged-file cache hid the new declaration"
+        "the scanner's unchanged-file cache hid the new activation"
     );
 }
 
 #[tokio::test]
-async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
+async fn deactivating_republishes_it_as_an_ordinary_file_and_blocks_resolution() {
     // The kind is an assertion this origin makes about its own copy, so
-    // withdrawing the assertion has to change what it publishes.
+    // withdrawing the assertion has to change what it publishes — and
+    // admission must refuse before the scan runs, not after.
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF");
-    node.socket_declare(&declaration("code", "git.sock"))
+    node.socket_activate(&activation("code", "git.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
     assert_eq!(
@@ -106,9 +107,16 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
         EntryKind::Socket
     );
 
-    assert!(node.socket_undeclare("code", "git.sock").unwrap());
-    node.scan_and_publish().unwrap();
+    assert!(node.socket_deactivate("code", "git.sock").unwrap());
 
+    // Resolution — the front of admission — refuses immediately, while the
+    // stale Socket entry is still published.
+    assert!(
+        node.resolve_socket("code", "git.sock").unwrap().is_none(),
+        "a deactivated path resolved to a runnable socket before the rescan"
+    );
+
+    node.scan_and_publish().unwrap();
     assert_eq!(
         node.store()
             .entry(node.origin(), "code", "git.sock")
@@ -116,39 +124,28 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
             .unwrap()
             .kind,
         EntryKind::File,
-        "a path with no declaration must publish as a file"
+        "a path with no activation must publish as a file"
     );
 }
 
 #[tokio::test]
-async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
+async fn a_content_change_is_a_deployment_not_a_disarmament() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF v1");
-    node.socket_declare(&declaration("code", "git.sock"))
+    node.socket_activate(&activation("code", "git.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
-
     let first = node.resolve_socket("code", "git.sock").unwrap().unwrap();
-    // Armed by hand rather than through `socket_arm`, which runs the program's
-    // declaration hook and so needs a real eBPF object.
-    node.store()
-        .arm_socket("code", "git.sock", &first.root, "", synch_core::now_ns())
-        .unwrap();
-    assert!(node
-        .resolve_socket("code", "git.sock")
-        .unwrap()
-        .unwrap()
-        .state
-        .is_armed_for(&first.root));
 
-    write(space.path(), "git.sock", b"\x7fELF v2, unapproved");
+    write(space.path(), "git.sock", b"\x7fELF v2, deployed");
     node.scan_and_publish().unwrap();
 
     let second = node.resolve_socket("code", "git.sock").unwrap().unwrap();
     assert_ne!(second.root, first.root, "the bytes changed");
-    assert!(
-        !second.state.is_armed_for(&second.root),
-        "changed bytes must not stay armed"
+    assert_eq!(
+        second.activation.qualified(),
+        "code/git.sock",
+        "the activation stands untouched across a deployment"
     );
     assert_eq!(
         node.store()
@@ -157,72 +154,16 @@ async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
             .unwrap()
             .kind,
         EntryKind::Socket,
-        "a disarmed socket is still published; it just will not run"
+        "a deployed socket is still published as one"
     );
-}
-
-#[tokio::test]
-async fn approval_is_compare_and_set_against_the_reviewed_state() {
-    let (_data, space, node) = node_with_space().await;
-    write(space.path(), "git.sock", b"\x7fELF reviewed");
-    node.socket_declare(&declaration("code", "git.sock"))
-        .unwrap();
-    node.scan_and_publish().unwrap();
-
-    let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
-    let reviewed = resolved.root;
-    let wrong = Hash::new(b"different bytes");
-    assert!(
-        !node
-            .store()
-            .arm_socket_reviewed(
-                node.origin(),
-                "code",
-                "git.sock",
-                ArmCandidate {
-                    generation: &resolved.state.generation,
-                    root: &wrong,
-                    declared: "",
-                    armed_at: synch_core::now_ns(),
-                },
-            )
-            .unwrap(),
-        "approval accepted bytes other than the reviewed root"
-    );
-    assert!(node
-        .resolve_socket("code", "git.sock")
-        .unwrap()
-        .unwrap()
-        .state
-        .arm
-        .is_none());
-
-    assert!(node
-        .store()
-        .arm_socket_reviewed(
-            node.origin(),
-            "code",
-            "git.sock",
-            ArmCandidate {
-                generation: &resolved.state.generation,
-                root: &reviewed,
-                declared: "",
-                armed_at: synch_core::now_ns(),
-            },
-        )
-        .unwrap());
-    assert!(node
-        .resolve_socket("code", "git.sock")
-        .unwrap()
-        .unwrap()
-        .state
-        .is_armed_for(&reviewed));
 }
 
 #[tokio::test]
 async fn adopting_someone_elses_socket_adopts_its_bytes_and_not_its_socket_ness() {
     // The property the whole design rests on: a node executes only what is in
-    // its own tree, and taking a peer's socket does not put a socket in it.
+    // its own tree at a path it activated, and taking a peer's socket does not
+    // put a socket in it. Remote content that arrives at an ordinary path is a
+    // file, whatever it was to its publisher.
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "theirs.sock", b"\x7fELF from a peer");
     node.scan_and_publish().unwrap();
@@ -241,37 +182,37 @@ async fn adopting_someone_elses_socket_adopts_its_bytes_and_not_its_socket_ness(
         node.resolve_socket("code", "theirs.sock")
             .unwrap()
             .is_none(),
-        "an undeclared path resolves to no socket at all"
+        "a path that is not activated resolves to no socket at all"
     );
 }
 
 #[tokio::test]
-async fn a_socket_cannot_be_declared_outside_a_filesystem_source() {
+async fn a_socket_cannot_be_activated_outside_a_filesystem_source() {
     let (_data, _space, node) = node_with_space().await;
     assert!(node
-        .socket_declare(&declaration("nowhere", "x.sock"))
+        .socket_activate(&activation("nowhere", "x.sock"))
         .is_err());
     assert!(
-        node.socket_declare(&declaration("code", "../escape.sock"))
+        node.socket_activate(&activation("code", "../escape.sock"))
             .is_err(),
-        "a path that leaves the space must be refused at declaration"
+        "a path that leaves the space must be refused at activation"
     );
 }
 
 #[tokio::test]
-async fn a_socket_cannot_be_declared_in_an_api_source() {
+async fn a_socket_cannot_be_activated_in_an_api_source() {
     let data = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
     node.add_api_source("code").unwrap();
-    let err = node.socket_declare(&declaration("code", "git.sock"));
+    let err = node.socket_activate(&activation("code", "git.sock"));
     assert!(err.is_err(), "a space with no scanner accepted a socket");
 }
 
 #[tokio::test]
-async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
+async fn an_activated_path_with_nothing_published_resolves_to_nothing() {
     let (_data, _space, node) = node_with_space().await;
-    node.socket_declare(&declaration("code", "missing.sock"))
+    node.socket_activate(&activation("code", "missing.sock"))
         .unwrap();
     assert!(node
         .resolve_socket("code", "missing.sock")
@@ -284,21 +225,27 @@ async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
-async fn a_node_can_connect_to_its_own_socket() {
+async fn an_invalid_update_stays_activated_but_unavailable() {
+    // The bytes at the activated path are not a loadable program. The path
+    // stays activated and published — deploying a fixed object is the remedy —
+    // and every connection is refused with a message naming the defect.
     let (_data, space, node) = node_with_space().await;
-    write(space.path(), "local.sock", b"\x7fELF not armed");
-    node.socket_declare(&declaration("code", "local.sock"))
+    write(space.path(), "local.sock", b"\x7fELF but not really");
+    node.socket_activate(&activation("code", "local.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
 
     let err = node
         .connect_socket(node.origin(), "code", "local.sock", Vec::new())
         .await
-        .expect_err("an unarmed socket should be refused after the self-connection lands");
+        .expect_err("an unloadable update should refuse after the self-connection lands");
     assert!(
-        err.to_string().contains("declared but never armed"),
-        "self-connection did not reach socket admission: {err}"
+        err.to_string().contains("program-invalid"),
+        "self-connection did not reach the manifest gate: {err}"
     );
+    // Still activated, still published as a socket: the defect is the
+    // content's, not the path's.
+    assert!(node.resolve_socket("code", "local.sock").unwrap().is_some());
 }
 
 #[cfg(all(
@@ -306,7 +253,7 @@ async fn a_node_can_connect_to_its_own_socket() {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
-async fn a_self_connection_runs_the_armed_program() {
+async fn a_self_connection_runs_the_activated_program() {
     use synch_core::SockStatus;
     use synch_engine::sockets::SocketConnection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -320,13 +267,9 @@ async fn a_self_connection_runs_the_armed_program() {
     )
     .unwrap();
     write(space.path(), "echo.sock", &elf);
-    node.socket_declare(&declaration("code", "echo.sock"))
+    node.socket_activate(&activation("code", "echo.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
-    let inspected = node.socket_inspect("code", "echo.sock").await.unwrap();
-    node.socket_approve("code", "echo.sock", &inspected.review)
-        .await
-        .unwrap();
 
     let connection = node
         .connect_socket(node.origin(), "code", "echo.sock", Vec::new())
@@ -353,16 +296,97 @@ async fn a_self_connection_runs_the_armed_program() {
     node.shutdown().await.unwrap();
 }
 
+/// Deployment end to end: content written over an activated path serves on
+/// the next connection, no further ceremony, and the program that answers is
+/// exactly the one the tree names.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn a_deployment_serves_on_the_next_connection() {
+    use synch_engine::sockets::SocketConnection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const SPEAK: &str = r#"
+#include <synch.h>
+SY_MANIFEST("{\"manifest\":1,\"name\":\"speak\",\"max_streams\":4}");
+SY_ENTRY sy_s64 entry(void) {
+  sy_write_all(SY_SELF, SY_STR(ANSWER), 5000);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+    let compile = |answer: &str| {
+        synch_cc::compile(
+            SPEAK,
+            "speak.c",
+            &[("synch.h", synch_sock::sdk::HEADER)],
+            &[("ANSWER", &format!("{answer:?}"))],
+        )
+        .unwrap()
+    };
+    let drive = |node: Node| async move {
+        let connection = node
+            .connect_socket(node.origin(), "code", "speak.sock", Vec::new())
+            .await
+            .unwrap();
+        let SocketConnection::Local {
+            mut stream,
+            completion,
+            program,
+            ..
+        } = connection
+        else {
+            panic!("a self-connection used the remote transport");
+        };
+        stream.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        completion.await.unwrap();
+        (String::from_utf8(out).unwrap(), program)
+    };
+
+    let (_data, space, node) = node_with_space().await;
+    write(space.path(), "speak.sock", &compile("one"));
+    node.socket_activate(&activation("code", "speak.sock"))
+        .unwrap();
+    node.scan_and_publish().unwrap();
+    let first_root = node
+        .resolve_socket("code", "speak.sock")
+        .unwrap()
+        .unwrap()
+        .root;
+    let (answer, program) = drive(node.clone()).await;
+    assert_eq!(answer, "one");
+    assert_eq!(program, first_root, "the reply names the snapshot that ran");
+
+    // The deployment: new bytes over the same activated path. No activation
+    // change, no approval — a scan and the next connection serves them.
+    write(space.path(), "speak.sock", &compile("two"));
+    node.scan_and_publish().unwrap();
+    let second_root = node
+        .resolve_socket("code", "speak.sock")
+        .unwrap()
+        .unwrap()
+        .root;
+    assert_ne!(second_root, first_root);
+    let (answer, program) = drive(node.clone()).await;
+    assert_eq!(answer, "two", "the new invocation runs the latest root");
+    assert_eq!(program, second_root);
+    node.shutdown().await.unwrap();
+}
+
 /// The daemon uses a multi-thread Tokio runtime, whose workers must never open
 /// the synchronous SQLite store. Keep the fixture setup outside that runtime,
-/// then exercise the complete async arm/admit/run path inside it. A regression
+/// then exercise the complete async admit/run path inside it. A regression
 /// here aborts in debug builds at `Store::conn`, exactly as a real daemon does.
 #[cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[test]
-fn a_daemon_style_runtime_can_arm_and_run_a_self_socket() {
+fn a_daemon_style_runtime_can_activate_and_run_a_self_socket() {
     use synch_core::SockStatus;
     use synch_engine::sockets::SocketConnection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -390,15 +414,11 @@ fn a_daemon_style_runtime_can_arm_and_run_a_self_socket() {
     )
     .unwrap();
     write(space.path(), "echo.sock", &elf);
-    node.socket_declare(&declaration("code", "echo.sock"))
+    node.socket_activate(&activation("code", "echo.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
 
     runtime.block_on(async {
-        let inspected = node.socket_inspect("code", "echo.sock").await.unwrap();
-        node.socket_approve("code", "echo.sock", &inspected.review)
-            .await
-            .unwrap();
         let connection = node
             .connect_socket(node.origin(), "code", "echo.sock", Vec::new())
             .await
@@ -446,14 +466,9 @@ async fn a_discovery_only_peer_can_connect_to_a_socket() {
     .unwrap();
     write(server_space.path(), "echo.sock", &elf);
     server
-        .socket_declare(&declaration("code", "echo.sock"))
+        .socket_activate(&activation("code", "echo.sock"))
         .unwrap();
     server.scan_and_publish().unwrap();
-    let inspected = server.socket_inspect("code", "echo.sock").await.unwrap();
-    server
-        .socket_approve("code", "echo.sock", &inspected.review)
-        .await
-        .unwrap();
 
     // Trust is present in both directions, but neither node records the
     // other's address in `peers_seen`. The client's iroh resolver is the only
@@ -502,43 +517,6 @@ async fn a_discovery_only_peer_can_connect_to_a_socket() {
 }
 
 #[tokio::test]
-async fn auto_follows_the_file_and_the_default_does_not() {
-    let (_data, space, node) = node_with_space().await;
-    write(space.path(), "manual.sock", b"\x7fELF a");
-    write(space.path(), "auto.sock", b"\x7fELF a");
-    node.socket_declare(&declaration("code", "manual.sock"))
-        .unwrap();
-    node.socket_declare(&SocketRow {
-        auto: true,
-        ..declaration("code", "auto.sock")
-    })
-    .unwrap();
-    node.scan_and_publish().unwrap();
-
-    // Neither is armed yet: a declaration is not an approval.
-    for path in ["manual.sock", "auto.sock"] {
-        let state = node.resolve_socket("code", path).unwrap().unwrap();
-        assert!(state.state.arm.is_none(), "{path} armed itself");
-    }
-
-    // Auto-arming needs a program that loads, and these bytes are not one, so
-    // what this checks is the half that does not depend on a runtime: the
-    // manual socket is left alone and neither is armed to bytes nobody
-    // approved.
-    write(space.path(), "manual.sock", b"\x7fELF b");
-    write(space.path(), "auto.sock", b"\x7fELF b");
-    node.scan_and_publish().unwrap();
-
-    for path in ["manual.sock", "auto.sock"] {
-        let resolved = node.resolve_socket("code", path).unwrap().unwrap();
-        assert!(
-            !resolved.state.is_armed_for(&resolved.root),
-            "{path} armed itself to a program that does not load"
-        );
-    }
-}
-
-#[tokio::test]
 async fn a_dropped_node_is_actually_dropped() {
     // A regression test for a reference cycle, not a hypothetical. The node
     // owns its endpoint, the endpoint's router owns the socket protocol
@@ -559,16 +537,16 @@ async fn a_dropped_node_is_actually_dropped() {
 }
 
 #[tokio::test]
-async fn a_socket_that_is_not_declared_here_never_resolves_however_it_is_named() {
+async fn a_socket_that_is_not_activated_here_never_resolves_however_it_is_named() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "a/b/c.sock", b"\x7fELF");
-    node.socket_declare(&declaration("code", "a/b/c.sock"))
+    node.socket_activate(&activation("code", "a/b/c.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
 
     assert!(node.resolve_socket("code", "a/b/c.sock").unwrap().is_some());
     // A different space with the same path is a different socket, and this
-    // node declares nothing there.
+    // node activates nothing there.
     assert!(node
         .resolve_socket("other", "a/b/c.sock")
         .unwrap()
@@ -577,7 +555,7 @@ async fn a_socket_that_is_not_declared_here_never_resolves_however_it_is_named()
 }
 
 #[tokio::test]
-async fn the_arming_record_survives_a_restart_and_the_map_does_not() {
+async fn the_activation_survives_a_restart() {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
@@ -585,19 +563,13 @@ async fn the_arming_record_survives_a_restart_and_the_map_does_not() {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         node.add_filesystem_source("code", space.path()).unwrap();
         write(space.path(), "git.sock", b"\x7fELF");
-        node.socket_declare(&declaration("code", "git.sock"))
-            .unwrap();
+        node.socket_activate(&SocketActivation {
+            note: "kept across restarts".into(),
+            ..activation("code", "git.sock")
+        })
+        .unwrap();
         node.scan_and_publish().unwrap();
         let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
-        node.store()
-            .arm_socket(
-                "code",
-                "git.sock",
-                &resolved.root,
-                "name test",
-                synch_core::now_ns(),
-            )
-            .unwrap();
         node.shutdown().await.unwrap();
         resolved.root
     };
@@ -605,14 +577,9 @@ async fn the_arming_record_survives_a_restart_and_the_map_does_not() {
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
     let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
     assert_eq!(resolved.root, root);
-    assert!(
-        resolved.state.is_armed_for(&root),
-        "an approval must survive a restart; it is operator state, not a cache"
-    );
     assert_eq!(
-        resolved.state.arm.unwrap().declared,
-        "name test",
-        "what was approved is kept, so `socket ls` can show it"
+        resolved.activation.note, "kept across restarts",
+        "an activation must survive a restart; it is operator state, not a cache"
     );
 }
 
@@ -623,7 +590,7 @@ async fn resolving_ignores_what_other_origins_publish() {
     // decide whose program a connection lands on.
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF mine");
-    node.socket_declare(&declaration("code", "git.sock"))
+    node.socket_activate(&activation("code", "git.sock"))
         .unwrap();
     node.scan_and_publish().unwrap();
     let mine = node.resolve_socket("code", "git.sock").unwrap().unwrap();

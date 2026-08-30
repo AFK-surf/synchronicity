@@ -17,8 +17,6 @@
 
 mod harness;
 
-use std::sync::Arc;
-
 use harness::{compile, exchange, peer, Harness};
 use synch_core::{FaultKind, FileTransferCapability, ProcessCapability, SockStatus};
 use synch_sock::{DuplexStream, EffectivePolicy, Limits, SocketId};
@@ -396,11 +394,8 @@ async fn undeclared_egress_is_refused() {
 const QUEUE_AND_GO: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("queue-and-go"));
-  sy_declare_egress(SY_STR("127.0.0.1"), UPSTREAM_PORT);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"queue-and-go\","
+            "\"egress\":[\"127.0.0.1:" SY_STRINGIZE(UPSTREAM_PORT) "\"]}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 up = sy_tcp_connect_ip(SY_STR("127.0.0.1"), UPSTREAM_PORT);
@@ -484,8 +479,7 @@ async fn what_a_program_queued_upstream_survives_the_end_of_the_invocation() {
         "queue-and-go.c",
         &[("UPSTREAM_PORT", &port.to_string())],
     );
-    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
-        .expect("the program loads");
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the program loads");
     let harness = Harness::with_limits(Limits {
         ring_bytes: 4096,
         ..Limits::default()
@@ -494,7 +488,7 @@ async fn what_a_program_queued_upstream_survives_the_end_of_the_invocation() {
         &harness,
         &elf,
         b"",
-        EffectivePolicy::armed(&declared, vec![], None, 64),
+        EffectivePolicy::granted(&declared, vec![], None, 64),
         peer(None),
         vec![],
     )
@@ -652,33 +646,20 @@ async fn a_fault_is_contained_and_the_worker_survives_it() {
 const DECLARE: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("git-http"));
-  sy_declare_egress(SY_STR("git.internal"), 9418);
-  sy_declare_max_streams(32);
-  if (sy_declare_stack_frame_size(17) != SY_EINVAL) return -1;
-  if (sy_declare_stack_frame_size(32784) != SY_ELIMIT) return -2;
-  sy_declare_stack_frame_size(512);
-  if (sy_declare_guarded_stack_frames(2) != SY_EINVAL) return -3;
-  sy_declare_guarded_stack_frames(0);
-  /* An I/O helper here has nothing to reach, and is refused before it tries. */
-  if (sy_tcp_connect(SY_STR("git.internal"), 9418) != SY_EPERM) return -4;
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"git-http\","
+            "\"egress\":[\"git.internal:9418\"],\"max_streams\":32,"
+            "\"stack_frame_size\":512,\"guarded_stack_frames\":false}");
 
 SY_ENTRY sy_s64 entry(void) {
-  /* A declaration helper outside the hook is refused the same way. */
-  if (sy_declare_egress(SY_STR("anywhere.example"), 80) != SY_EPERM) return -1;
   sy_shutdown(SY_SELF);
   return 0;
 }
 "#;
 
 #[test]
-fn the_init_hook_declares_and_cannot_reach_anything() {
+fn the_manifest_declares_without_anything_executing() {
     let elf = compile(DECLARE, "declare.c");
-    let declared =
-        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook ran");
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the manifest parses");
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);
     assert_eq!(declared.max_streams, Some(32));
@@ -689,10 +670,8 @@ fn the_init_hook_declares_and_cannot_reach_anything() {
 const SMALL_FRAMES: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  if (sy_declare_stack_frame_size(512) < 0) return -1;
-  return sy_declare_guarded_stack_frames(0);
-}
+SY_MANIFEST("{\"manifest\":1,\"stack_frame_size\":512,"
+            "\"guarded_stack_frames\":false}");
 
 static sy_s64 descend(sy_s64 n) {
   volatile sy_s64 local = n;
@@ -725,8 +704,8 @@ async fn a_declared_stack_frame_size_configures_stream_local_calls() {
         "the 16 KiB default unexpectedly admitted 17 recursive frames: {default_status:?}"
     );
 
-    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
-    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let declaration = synch_sock::manifest::manifest_declaration(&elf).expect("the hook ran");
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
     let (declared_status, _) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
     assert_eq!(declared_status, SockStatus::Ok(16));
 }
@@ -734,10 +713,8 @@ async fn a_declared_stack_frame_size_configures_stream_local_calls() {
 const MISALIGNED_GUARDED_FRAMES: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  if (sy_declare_stack_frame_size(512) < 0) return -1;
-  return sy_declare_guarded_stack_frames(1);
-}
+SY_MANIFEST("{\"manifest\":1,\"stack_frame_size\":512,"
+            "\"guarded_stack_frames\":true}");
 
 SY_ENTRY sy_s64 entry(void) { return 0; }
 "#;
@@ -745,7 +722,10 @@ SY_ENTRY sy_s64 entry(void) { return 0; }
 #[test]
 fn custom_frames_require_page_alignment_unless_guarding_is_disabled() {
     let elf = compile(MISALIGNED_GUARDED_FRAMES, "misaligned-guarded-frames.c");
-    let error = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+    // The manifest itself parses — the shape it declares is legal somewhere —
+    // and load validation is where this host refuses to serve it.
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the manifest parses");
+    let error = synch_sock::validate_program(&elf, &declared)
         .expect_err("512-byte guarded frames cannot be host-page aligned");
     assert!(error.to_string().contains("not aligned"), "{error}");
 }
@@ -753,57 +733,61 @@ fn custom_frames_require_page_alignment_unless_guarding_is_disabled() {
 const UNSAFE_DECLARATION: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  if (sy_declare_name(SY_STR("benign\negress evil.example:443")) != SY_EINVAL) return -1;
-  if (sy_declare_egress(SY_STR("public\x1b[2J"), 80) != SY_EINVAL) return -2;
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"benign\\negress evil.example:443\"}");
 
 SY_ENTRY sy_s64 entry(void) { return 0; }
 "#;
 
 #[test]
-fn declaration_helpers_reject_line_and_terminal_control_text() {
+fn a_manifest_cannot_smuggle_control_text_into_a_declaration() {
+    // The JSON parses — \n is a legal string escape — and the declaration it
+    // produces is refused whole: a newline in a name must never become a
+    // second directive in a rendered status line.
     let elf = compile(UNSAFE_DECLARATION, "unsafe-declaration.c");
-    let declared =
-        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook ran");
-    assert_eq!(declared, synch_core::Declaration::default());
-}
-
-#[tokio::test]
-async fn a_declaration_helper_is_refused_outside_the_init_hook() {
-    let elf = compile(DECLARE, "declare.c");
-    let harness = Harness::new();
-    let (status, _) = exchange(
-        &harness,
-        &elf,
-        b"",
-        EffectivePolicy::default(),
-        peer(None),
-        vec![],
-    )
-    .await;
-    assert_eq!(
-        status,
-        SockStatus::Ok(0),
-        "a declaration helper was allowed outside the init hook"
+    let error = synch_sock::manifest::manifest_declaration(&elf)
+        .expect_err("a control character survived into a declaration");
+    assert!(
+        error.to_string().contains("control or directional"),
+        "{error}"
     );
 }
 
 #[test]
-fn a_program_with_no_stream_entrypoint_is_refused_at_arm_time() {
+fn a_program_with_no_stream_entrypoint_is_refused_at_validation() {
     let elf = compile(
         r#"
         #include <synch.h>
-        SY_INIT_ENTRY sy_s64 declare(void) { return 0; }
+        SY_MANIFEST("{\"manifest\":1}");
         "#,
-        "init-only.c",
+        "manifest-only.c",
     );
-    let out = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()));
+    assert!(!synch_sock::manifest::has_stream_section(&elf));
+    let declared = synch_sock::manifest::manifest_declaration(&elf).unwrap();
+    let out = synch_sock::validate_program(&elf, &declared);
     assert!(
         matches!(out, Err(synch_sock::SockError::NoEntrypoint)),
         "expected NoEntrypoint, got {out:?}"
     );
+}
+
+#[test]
+fn an_executable_declaration_section_is_refused_by_name() {
+    // A stale object built against the removed SDK still carries the
+    // executable `synchronicity.init` hook. It must be refused loudly — its
+    // author expected that code to run — never silently read as an object
+    // that declares nothing.
+    let elf = compile(
+        r#"
+        #include <synch.h>
+        __attribute__((section("synchronicity.init"))) sy_s64 declare(void) { return 0; }
+        SY_ENTRY sy_s64 entry(void) { return 0; }
+        "#,
+        "stale-init.c",
+    );
+    assert!(matches!(
+        synch_sock::manifest::manifest_declaration(&elf),
+        Err(synch_sock::manifest::ProgramManifestError::ExecutableDeclaration)
+    ));
 }
 
 const WAIT_FOREVER: &str = r#"
@@ -974,7 +958,7 @@ fn the_documented_example_compiles_against_the_shipped_header() {
 
     // And it is a program the runtime will actually accept: both sections
     // present, and the declaration hook says what the document says it says.
-    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+    let declared = synch_sock::manifest::manifest_declaration(&elf)
         .expect("the documented example loads and declares");
     assert_eq!(declared.name, "git-http");
     assert_eq!(declared.egress, vec!["git.internal:9418".to_string()]);

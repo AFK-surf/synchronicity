@@ -14,7 +14,7 @@ The short version is:
 
 This extends the socket runtime in [`docs/SOCKETS.md`](SOCKETS.md); it does not
 add another network protocol. The caller still opens one `sync/sock/1`
-bidirectional stream, and the callee still runs one invocation of its own armed
+bidirectional stream, and the callee still runs one invocation of its own activated
 eBPF program for that stream. The SSH adapter exists entirely inside that
 invocation.
 
@@ -55,7 +55,7 @@ only replaces code that cannot realistically fit in an eBPF guest with a safe
 host implementation.
 
 Accepting `none` authentication is likewise application policy, not host
-authority. It grants access only to behavior the already-armed program can
+authority. It grants access only to behavior the already-deployed program can
 perform. Any effect behind the accepted connection remains governed by its own
 declaration.
 
@@ -89,7 +89,7 @@ Consequently, two layers are checked:
   (`docs/SOCKETS.md` §7.6), so the scope is about what an SSH client is served,
   not about what the program may open;
 - adding the declaration to the SFTP helper alone would give a false assurance
-  if it were read as a read boundary. It is not one: an armed program can
+  if it were read as a read boundary. It is not one: a deployed program can
   always export bytes manually through `sy_open`. What the declaration buys is
   that the *built-in service* is reviewed before it serves a subtree wholesale.
 
@@ -99,12 +99,12 @@ Every backing declaration is complete data embedded in the program artifact.
 It contains the exact process executable and argv, or the exact file-transfer
 scope and access. Runtime calls select one with a small integer id meaningful
 only inside that program root. There is no daemon-wide registry, separate
-creation command, mutable lookup record, or arm-time value for an operator to
+creation command, mutable lookup record, or operator-side value for anyone to
 supply. Id namespaces are also capability-specific: a process id cannot be
 used with an SFTP helper or vice versa.
 
 The operator workflow remains one decision: inspect the concrete declarations
-printed by `synch socket arm` and approve or refuse the program. The host may
+printed by `synch socket inspect` and choose what to deploy. The host may
 refuse an artifact whose executable is absent or whose feature is unsupported
 on that node, but it never asks the operator to repair the declaration
 interactively. Host keys and clean process environments are generated or
@@ -720,27 +720,28 @@ client finishes sending its request.
 
 This is deliberately guest work. It lets the program inspect, rate-limit,
 transform, tee, or refuse the stream, and it keeps the connection between an
-SSH channel and a host effect visible in the code the operator armed.
+SSH channel and a host effect visible in the code the operator deployed.
 
 ### 7.1 Process and PTY backing
 
 A PTY is useful only in conjunction with process authority. The declaration
 therefore contains the complete process capability rather than referring to an
 external configuration record. A small capability id is local to one program
-root and has no daemon-wide namespace or configuration. Arming displays and
-approves the concrete declaration; there is no separate setup command.
+root and has no daemon-wide namespace or configuration. `synch socket
+inspect` displays the concrete declaration; there is no separate setup
+command.
 
 ```c
-/* {"id"              -- program-local, nonzero
+/* One entry of the manifest's "processes" array:
+   {"id"              -- program-local, nonzero
    ,"allow"           -- ["pty" | "pipe", ...]
    ,"executable"      -- exact absolute path, at most 256 bytes
    ,"argv"            -- exact argv incl. argv[0]; 1..8 args of <= 128 bytes
    ,"allowed_signals" -- ["HUP" | "INT" | "TERM", ...]?}                    */
-sy_s64 sy_declare_process(sy_s64 capability_json);
 ```
 
-The host rejects duplicate or zero ids, malformed paths and arguments, an
-executable that cannot be resolved safely at arm time, and unsupported flags.
+The manifest parse rejects duplicate or zero ids, malformed paths and
+arguments, and unsupported flags.
 The declaration contains no request-derived bytes. A future structured argument
 facility would be a separate capability; the initial API always runs the exact
 declared argv and never invokes a shell implicitly.
@@ -771,16 +772,10 @@ start a shell before a later `shell` request:
 ```c
 #define PROCESS_MAINTENANCE_SHELL 1
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 shell = sy_json_parse(SY_STR(
-      "{\"id\":1,\"allow\":[\"pty\"],"
-      "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
-      "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
-  if (shell < 0) return shell;
-  sy_s64 declared = sy_declare_process(shell);
-  sy_close(shell);
-  return declared;
-}
+SY_MANIFEST("{\"manifest\":1,"
+            "\"processes\":[{\"id\":1,\"allow\":[\"pty\"],"
+            "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
+            "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}]}");
 
 /* {"term", "columns", "rows", "pixel_width", "pixel_height",
     "modes": [{"opcode", "value"}, ...]} — mode opcodes are RFC 4254 §8
@@ -856,7 +851,7 @@ SSH adapter, and the adapter is tested without it.
 
 #### Selecting a forced command by authenticated key
 
-An armed program may declare several exact process capabilities, for example a
+A program's manifest may declare several exact process capabilities, for example a
 status shell, release writer, and read-only Git command. On
 `AUTH_PUBLICKEY_VERIFIED` it compares the raw fingerprint, records a small
 principal enum, and accepts the key. On each later `SHELL_REQUEST` or
@@ -880,24 +875,18 @@ program-local id selects that declaration at runtime; there is no named service
 or operator configuration:
 
 ```c
-/* {"id", "protocol": "sftp", "access": ["read", "recursive"?],
+/* One entry of the manifest's "file_transfers" array:
+   {"id", "protocol": "sftp", "access": ["read", "recursive"?],
     "scope" -- exact normalized tree path of at most 256 bytes} */
-sy_s64 sy_declare_file_transfer(sy_s64 capability_json);
 
 sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
 
 #define FILE_TRANSFER_RELEASES 1
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 releases = sy_json_parse(SY_STR(
-      "{\"id\":1,\"protocol\":\"sftp\","
-      "\"access\":[\"read\",\"recursive\"],"
-      "\"scope\":\"code/releases\"}"));
-  if (releases < 0) return releases;
-  sy_s64 declared = sy_declare_file_transfer(releases);
-  sy_close(releases);
-  return declared;
-}
+SY_MANIFEST("{\"manifest\":1,"
+            "\"file_transfers\":[{\"id\":1,\"protocol\":\"sftp\","
+            "\"access\":[\"read\",\"recursive\"],"
+            "\"scope\":\"code/releases\"}]}");
 
 sy_s64 sftp = sy_sftp_open(FILE_TRANSFER_RELEASES);
 ```
@@ -915,9 +904,9 @@ an implicit and unsafe mutation API. That design now exists —
 staging, and commit-time conditions — so upload support here is a follow-up
 that commits through the same engine seam under a tree-write declaration,
 rather than a reason to invent close-as-commit. The service declaration is
-shown during arming and bounds the subtree the service itself exposes. As §1.2
-explains, it does not claim that an armed program lacking the service is
-unable to export bytes manually through the existing `sy_open` API.
+shown at inspection and bounds the subtree the service itself exposes. As §1.2
+explains, it does not claim that a program lacking the service is unable to
+export bytes manually through the existing `sy_open` API.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,
@@ -1109,7 +1098,7 @@ The host enforces these regardless of guest correctness:
 1. **Outer admission is unchanged.** The socket invocation begins only after
    the `sync/sock/1` peer passed membership and delegation checks.
 2. **SSH grants no host capability.** An authenticated SSH user has only the
-   channel fds the guest accepts and the behavior the armed guest implements.
+   channel fds the guest accepts and the behavior the deployed guest implements.
 3. **The guest never handles SSH private host keys or raw signature
    verification.** Public-key events distinguish an unverified offer from
    verified possession.
@@ -1145,11 +1134,12 @@ The host enforces these regardless of guest correctness:
     authentication event, and unsupported `authorized_keys` options never
     degrade into a less restrictive match.
 12. **Capability ids are program-local selectors.** An id resolves only inside
-    the declarations of the currently armed program root; it cannot name
+    the declarations of the program root currently being served; it cannot name
     mutable daemon state or a capability belonging to another socket.
 
 The eBPF sandbox remains defence in depth. The primary execution gate is still
-that the callee published and armed the exact program root being run.
+that the callee published, at a path it activated, the exact program root
+being run.
 
 ## 13. Failure semantics
 
@@ -1466,16 +1456,10 @@ static const sy_u8 shell_peer[32] = {
 
 #define PROCESS_LOCAL_LOGIN_SHELL 1
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 shell = sy_json_parse(SY_STR(
-      "{\"id\":1,\"allow\":[\"pty\"],"
-      "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
-      "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
-  if (shell < 0) return shell;
-  sy_s64 declared = sy_declare_process(shell);
-  sy_close(shell);
-  return declared;
-}
+SY_MANIFEST("{\"manifest\":1,"
+            "\"processes\":[{\"id\":1,\"allow\":[\"pty\"],"
+            "\"executable\":\"/bin/sh\",\"argv\":[\"sh\",\"-l\"],"
+            "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}]}");
 
 struct terminal {
   struct attached io;                 /* channel <-> PTY */
@@ -1679,7 +1663,7 @@ The result behaves like an ordinary interactive SSH login: terminal modes and
 initial dimensions come from `pty-req`, resize follows `window-change`, client
 input and terminal output are explicitly pumped, and the final process status
 is preserved. What it does not do is implicit OS login policy—the one Iroh key
-maps to the one concretely declared shell capability because the armed eBPF program
+maps to the one concretely declared shell capability because the deployed eBPF program
 says so.
 
 This compact example permits one live shell channel. Replacing `terminal` with
@@ -1714,26 +1698,13 @@ struct auth_files {
 #define PROCESS_ADMIN_STATUS    1
 #define PROCESS_PUBLISH_RELEASE 2
 
-static sy_s64 declare_one(const char *capability_json) {
-  sy_s64 capability = sy_json_parse(capability_json,
-                                    sy_strlen(capability_json));
-  if (capability < 0) return capability;
-  sy_s64 declared = sy_declare_process(capability);
-  sy_close(capability);
-  return declared;
-}
-
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 rc = declare_one(
-      "{\"id\":1,\"allow\":[\"pipe\"],"
-      "\"executable\":\"/usr/local/bin/admin-status\","
-      "\"argv\":[\"admin-status\"]}");
-  if (rc < 0) return rc;
-  return declare_one(
-      "{\"id\":2,\"allow\":[\"pipe\"],"
-      "\"executable\":\"/usr/local/bin/publish-release\","
-      "\"argv\":[\"publish-release\"]}");
-}
+SY_MANIFEST("{\"manifest\":1,\"processes\":["
+            "{\"id\":1,\"allow\":[\"pipe\"],"
+            "\"executable\":\"/usr/local/bin/admin-status\","
+            "\"argv\":[\"admin-status\"]},"
+            "{\"id\":2,\"allow\":[\"pipe\"],"
+            "\"executable\":\"/usr/local/bin/publish-release\","
+            "\"argv\":[\"publish-release\"]}]}");
 
 /* Called at invocation start, before any endpoint operation on SY_SELF. */
 static sy_s64 begin_ssh(struct auth_files *files) {
@@ -1861,15 +1832,9 @@ and explicitly copies bytes in both directions.
 
 #define FILE_TRANSFER_RELEASES 1
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 releases = sy_json_parse(SY_STR(
-      "{\"id\":1,\"protocol\":\"sftp\",\"access\":[\"read\"],"
-      "\"scope\":\"code/releases\"}"));
-  if (releases < 0) return releases;
-  sy_s64 declared = sy_declare_file_transfer(releases);
-  sy_close(releases);
-  return declared;
-}
+SY_MANIFEST("{\"manifest\":1,"
+            "\"file_transfers\":[{\"id\":1,\"protocol\":\"sftp\","
+            "\"access\":[\"read\"],\"scope\":\"code/releases\"}]}");
 
 static int event_text_is(sy_s64 event, const char *key, const char *want) {
   char value[32] = {0};
@@ -1939,10 +1904,7 @@ ordinary declared TCP fd. It accepts the SSH channel only after the backend is
 available, then uses the same two-pump `struct attached`:
 
 ```c
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_egress(SY_STR("git.internal"), 9418);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"egress\":[\"git.internal:9418\"]}");
 
 static sy_s64 begin_git_forward(
     sy_s64 event,
@@ -1986,7 +1948,7 @@ static sy_s64 finish_git_forward(
 ```
 
 The destination named in SSH data grants nothing. Both the guest comparison
-and the existing armed egress declaration must permit the connection.
+and the manifest's egress declaration must permit the connection.
 
 ## 16. Implementation order
 

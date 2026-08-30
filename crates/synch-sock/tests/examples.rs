@@ -65,7 +65,7 @@ fn every_example_compiles_loads_and_declares_itself() {
     );
     for name in &names {
         let elf = build(name);
-        let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+        let declared = synch_sock::manifest::manifest_declaration(&elf)
             .unwrap_or_else(|e| panic!("examples/{name} does not load: {e}"));
         assert!(
             !declared.name.is_empty(),
@@ -93,7 +93,7 @@ fn every_example_compiles_with_clang_and_declares_itself() {
         let Some(elf) = compile_with_clang(&source(name), name) else {
             return; // no toolchain; compile_with_clang said so
         };
-        let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
+        let declared = synch_sock::manifest::manifest_declaration(&elf)
             .unwrap_or_else(|e| panic!("examples/{name} (clang) does not load: {e}"));
         assert!(
             !declared.name.is_empty(),
@@ -106,11 +106,11 @@ fn every_example_compiles_with_clang_and_declares_itself() {
 async fn compact_frames_runs_with_the_layout_it_declares() {
     let elf = build("compact-frames.c");
     let harness = Harness::new();
-    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    let declaration = synch_sock::manifest::manifest_declaration(&elf).expect("the hook ran");
     assert_eq!(declaration.stack_frame_size, Some(512));
     assert_eq!(declaration.guarded_stack_frames, Some(false));
 
-    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
     let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
     assert_eq!(status, SockStatus::Ok(0));
     assert_eq!(out, b"compact frames\n");
@@ -485,8 +485,7 @@ async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
         ],
     );
 
-    let declared =
-        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the proxy loads");
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the proxy loads");
     assert_eq!(
         declared.egress,
         vec![format!("127.0.0.1:{port}")],
@@ -496,7 +495,7 @@ async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
     let harness = Harness::new();
     // Arming approves the program's declaration. A literal address is the one
     // way it may name something in a range a DNS name must never reach.
-    let armed = EffectivePolicy::armed(&declared, vec![], None, 64);
+    let armed = EffectivePolicy::granted(&declared, vec![], None, 64);
 
     let (status, out) = exchange(
         &harness,
@@ -571,9 +570,8 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
             ("UPSTREAM_PORT", &port.to_string()),
         ],
     );
-    let declared =
-        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the proxy loads");
-    let policy = EffectivePolicy::armed(&declared, vec![], None, 64);
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the proxy loads");
+    let policy = EffectivePolicy::granted(&declared, vec![], None, 64);
     let harness = Harness::with_limits(Limits {
         ring_bytes: 4096,
         ..Limits::default()
@@ -708,8 +706,8 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
             ("UPSTREAM_PORT", &port.to_string()),
         ],
     );
-    let declared = synch_sock::declare(&elf, Arc::new(harness::FakeTree::default()))
-        .expect("the spliced proxy loads");
+    let declared =
+        synch_sock::manifest::manifest_declaration(&elf).expect("the spliced proxy loads");
     assert_eq!(declared.egress, vec![format!("127.0.0.1:{port}")]);
 
     let harness = Harness::with_limits(Limits {
@@ -721,7 +719,7 @@ async fn splice_proxy_forwards_both_directions_without_a_buffer() {
     let invocation = harness.invocation(
         &elf,
         DuplexStream::new(their_r, their_w),
-        EffectivePolicy::armed(&declared, vec![], None, 64),
+        EffectivePolicy::granted(&declared, vec![], None, 64),
         peer(Some(vec!["code".into()])),
         vec![],
     );
@@ -814,7 +812,7 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
 
     // The declaration is the whole approval surface: the exact executable and
     // argv, PTY permission, and nothing an SSH client could widen.
-    let declaration = synch_sock::declare(&elf, harness.tree.clone()).expect("the hook ran");
+    let declaration = synch_sock::manifest::manifest_declaration(&elf).expect("the hook ran");
     assert_eq!(
         declaration.processes.len(),
         1,
@@ -831,7 +829,7 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
     assert_eq!(bash.argv, vec!["bash".to_string()]);
     assert_eq!(bash.flags & 0x01, 0x01, "PTY permission is declared");
 
-    let policy = EffectivePolicy::armed(&declaration, vec![], None, 64);
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
     let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
     let (server_reader, server_writer) = tokio::io::split(server_stream);
     let invocation = harness.invocation(

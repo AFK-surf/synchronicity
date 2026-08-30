@@ -106,5 +106,12 @@ pub mod json_type {
 /// The entrypoint section run once per incoming stream.
 pub(crate) const SECTION_STREAM: &str = "synchronicity.stream";
 
-/// The entrypoint section run once at arm time, to collect declarations.
+/// The non-executable section carrying the program's JSON manifest.
+pub(crate) const SECTION_MANIFEST: &str = "synchronicity.manifest";
+
+/// The executable declaration section an earlier format ran at arm time.
+///
+/// Kept only so its presence can be *refused*: declarations are data now, and
+/// an object still carrying the executable form was built against an SDK this
+/// build no longer honors.
 pub(crate) const SECTION_INIT: &str = "synchronicity.init";

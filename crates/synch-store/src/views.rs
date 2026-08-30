@@ -662,10 +662,10 @@ impl Store {
             if !exists {
                 return Ok(false);
             }
-            txn.conn()
-                .execute("DELETE FROM socket_arms WHERE space = ?1", params![space])?;
-            txn.conn()
-                .execute("DELETE FROM sockets WHERE space = ?1", params![space])?;
+            txn.conn().execute(
+                "DELETE FROM socket_activations WHERE space = ?1",
+                params![space],
+            )?;
             txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             let holder = crate::PinHolder::Source(space.to_string()).render();

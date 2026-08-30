@@ -13,7 +13,7 @@
 //! async-ebpf runs on Linux, macOS and OpenBSD, on x86-64 and arm64. This crate
 //! builds everywhere: the ABI, the limits, the policy and the SDK header are
 //! portable, and [`SUPPORTED`] says whether the runtime behind them exists.
-//! What a node without it loses is *serving*: it can still declare, publish,
+//! What a node without it loses is *serving*: it can still activate, publish,
 //! replicate and materialize socket entries, and `synch socket connect` works from
 //! anywhere, because the connecting side executes nothing
 //! (`docs/SOCKETS.md` §1).
@@ -32,6 +32,7 @@
 
 pub mod abi;
 pub mod limits;
+pub mod manifest;
 pub mod policy;
 pub mod registry;
 pub mod sdk;
@@ -47,7 +48,7 @@ mod runtime;
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use runtime::{declare, SshHostKey, Worker, WorkerHandle};
+pub use runtime::{validate_program, SshHostKey, Worker, WorkerHandle};
 
 use std::sync::Arc;
 
@@ -62,7 +63,7 @@ pub use stream::DuplexStream;
 ///
 /// A node without one answers an inbound `Open` with
 /// [`RefuseCode::Unsupported`](synch_core::RefuseCode::Unsupported), and
-/// `synch socket declare` says so at declaration time rather than at 3am.
+/// `synch socket activate` says so at activation time rather than at 3am.
 pub const SUPPORTED: bool = cfg!(all(
     any(
         target_os = "linux",
@@ -164,7 +165,7 @@ pub trait SocketHost: Send + Sync + 'static {
     /// Opens a writer that will publish `space/path` as this node's own new
     /// version (`docs/TREE-WRITES.md` §6).
     ///
-    /// The runtime has already checked the armed tree-write grant — the
+    /// The runtime has already checked the manifest's tree-write grant — the
     /// prefix, the modes, the size bound — before this is reached; what the
     /// engine's implementation re-takes are its own durable gates: the
     /// declared-socket refusal, `.syncignore`, path normalization, recovery.
@@ -252,7 +253,7 @@ pub enum HostError {
     /// The bytes could not be produced.
     #[error("{0}")]
     Unavailable(String),
-    /// A write refused by the engine's own gates: a declared socket path, a
+    /// A write refused by the engine's own gates: an activated socket path, a
     /// mode the grant does not carry, an ignored path, a node in recovery.
     #[error("{0}")]
     Denied(String),
@@ -310,7 +311,8 @@ pub struct ObjectInfo {
 pub struct Admission {
     /// The ELF object to run — read from *this node's own* CAS.
     pub program: Arc<Vec<u8>>,
-    /// Its content root, which is what was armed.
+    /// Its content root: the snapshot this invocation runs, however the
+    /// path's content moves underneath it.
     pub program_root: Hash,
     /// Which socket this is.
     pub socket: SocketId,
@@ -369,7 +371,8 @@ impl std::fmt::Debug for Admission {
 pub struct Invocation {
     /// The ELF object to run — read from *this node's own* CAS.
     pub program: Arc<Vec<u8>>,
-    /// Its content root, which is what was armed.
+    /// Its content root: the snapshot this invocation runs, however the
+    /// path's content moves underneath it.
     pub program_root: Hash,
     /// Which socket this is.
     pub socket: SocketId,

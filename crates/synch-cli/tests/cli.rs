@@ -186,6 +186,47 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
     }
 }
 
+/// `socket build` and `socket inspect` are local work: C in, eBPF out, then a
+/// stateless description of the object — no daemon, no database, no
+/// publication. The description names the same root the tree would.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn socket_build_and_inspect_run_without_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Cli::new(dir.path());
+    let source = dir.path().join("echo.c");
+    std::fs::write(&source, include_str!("../../synch-sock/examples/echo.c")).unwrap();
+    let object = dir.path().join("echo.o");
+
+    cli.run(&[
+        "socket",
+        "build",
+        source.to_str().unwrap(),
+        "-o",
+        object.to_str().unwrap(),
+    ]);
+    let out = cli.run(&["socket", "inspect", object.to_str().unwrap()]);
+    assert!(out.contains("declares name echo"), "{out}");
+    assert!(out.contains("max-streams 16"), "{out}");
+    assert!(out.contains("loads and links"), "{out}");
+    let bytes = std::fs::read(&object).unwrap();
+    let root = synch_core::hash_reader(bytes.as_slice()).unwrap();
+    assert!(
+        out.contains(&root.to_hex().to_string()),
+        "inspection names the content root the tree would: {out}"
+    );
+
+    // A garbled object is a named refusal, never a description of nothing.
+    let broken = dir.path().join("broken.o");
+    std::fs::write(&broken, b"\x7fELF but not really").unwrap();
+    let (ok, _, stderr) = cli.try_run(&["socket", "inspect", broken.to_str().unwrap()]);
+    assert!(!ok, "a non-object inspected successfully");
+    assert!(stderr.contains("ELF"), "{stderr}");
+}
+
 #[test]
 fn daemon_start_returns_once_the_background_socket_is_ready() {
     let dir = tempfile::tempdir().unwrap();

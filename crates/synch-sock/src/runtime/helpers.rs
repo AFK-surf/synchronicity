@@ -156,17 +156,6 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_hex_encode", h_hex_encode),
     ("sy_hex_decode_in_place", h_hex_decode_in_place),
     // declarations
-    ("sy_declare_name", h_declare_name),
-    ("sy_declare_egress", h_declare_egress),
-    ("sy_declare_max_streams", h_declare_max_streams),
-    ("sy_declare_stack_frame_size", h_declare_stack_frame_size),
-    (
-        "sy_declare_guarded_stack_frames",
-        h_declare_guarded_stack_frames,
-    ),
-    ("sy_declare_process", h_declare_process),
-    ("sy_declare_file_transfer", h_declare_file_transfer),
-    ("sy_declare_tree_write", h_declare_tree_write),
     ("sy_ssh_exit_status_lost", h_ssh_exit_status_lost),
 ];
 
@@ -249,38 +238,6 @@ fn out_exact(scope: &HelperScope, ptr: u64, len: u64, value: &[u8]) -> Result<u6
     };
     region.copy_from_slice(value);
     ret(value.len() as i64)
-}
-
-/// Refuses a helper that has no business running in the given mode.
-fn mode_check(inner: &Inner, declaring: bool) -> Option<i64> {
-    (inner.init_mode != declaring).then_some(errno::EPERM)
-}
-
-/// The gate every `sy_declare_*` helper opens with, **before** it looks at its
-/// arguments.
-///
-/// Declaration helpers are valid only inside `synchronicity.init`, and the
-/// check has to come first rather than at the mutation, because reading the
-/// arguments is not always free of consequence. `sy_declare_process` resolves
-/// its executable against the host filesystem — `canonicalize`, `metadata`, a
-/// mode test — and it used to do all three before reaching `mode_check`. A
-/// served invocation could therefore call it purely for the return code and
-/// tell `SY_ENOENT` (no such path) from `SY_EINVAL` (not a regular file) from
-/// `SY_EPERM` (not executable), walking the daemon host's filesystem from an
-/// ordinary stream with nothing declared. Gating at the top makes that
-/// impossible for every declaration helper, including ones not yet written.
-fn declaring_only(scope: &HelperScope) -> Result<Option<u64>, ()> {
-    let refused = with(scope, |inner| mode_check(inner, true))?;
-    Ok(refused.map(|e| e as u64))
-}
-
-/// Runs `body` only inside the init hook, answering `SY_EPERM` outside it.
-macro_rules! declaring {
-    ($scope:expr) => {
-        if let Some(refused) = declaring_only($scope)? {
-            return Ok(refused);
-        }
-    };
 }
 
 // ---- diagnostics and configuration ---------------------------------------
@@ -1114,9 +1071,6 @@ fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
 
 /// Opens an outbound endpoint after the policy says yes.
 fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64 {
-    if inner.init_mode {
-        return errno::EPERM;
-    }
     if !inner.policy.egress_allowed(&host, port) {
         tracing::warn!(
             socket = %inner.socket.qualified(),
@@ -1263,9 +1217,6 @@ fn h_ssh_start(
         Err(error) => return ret(error),
     };
     with(scope, |inner| {
-        if let Some(error) = mode_check(inner, false) {
-            return error;
-        }
         let Some(host_key) = inner.ssh_host_key.clone() else {
             return errno::EPERM;
         };
@@ -2178,9 +2129,6 @@ fn h_pty_open(
         Ok(spec) => spec,
         Err(error) => return ret(error),
     };
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     let capability = match process_capability(&inner, capability_id as u32) {
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
@@ -2532,9 +2480,6 @@ fn h_sftp_open(
     _: u64,
 ) -> Result<u64, ()> {
     let inner = with(scope, Rc::clone)?;
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     let Some(capability) = inner
         .policy
         .file_transfers
@@ -2815,9 +2760,6 @@ fn insert_object(inner: &Rc<Inner>, info: crate::ObjectInfo) -> i64 {
 /// would cost every program a state machine for a call that never waits.
 fn open_common(scope: &HelperScope, origin: Option<String>, path: String) -> Result<u64, ()> {
     let inner = with(scope, Rc::clone)?;
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     match inner.host.open(origin.as_deref(), &path) {
         Ok(info) => ret(insert_object(&inner, info)),
         Err(e) => ret(host_errno(&e)),
@@ -2863,9 +2805,6 @@ fn h_open_root(scope: &HelperScope, ptr: u64, _: u64, _: u64, _: u64, _: u64) ->
         return ret(errno::EINVAL);
     };
     let inner = with(scope, Rc::clone)?;
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     match inner.host.open_root(&root) {
         Ok(info) => ret(insert_object(&inner, info)),
         Err(e) => ret(host_errno(&e)),
@@ -2995,9 +2934,6 @@ fn h_list_open(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) 
         return ret(errno::EINVAL);
     }
     let inner = with(scope, Rc::clone)?;
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     let mut names = Vec::new();
     let mut cursor: Option<String> = None;
     let mut bytes = 0u64;
@@ -3186,9 +3122,6 @@ fn h_put_open(
 ) -> Result<u64, ()> {
     let raw = guest!(string(scope, path_ptr, path_len));
     let inner = with(scope, Rc::clone)?;
-    if inner.init_mode {
-        return ret(errno::EPERM);
-    }
     let Ok(path) = synch_core::normalize_path(&raw) else {
         return ret(errno::EINVAL);
     };
@@ -3848,398 +3781,6 @@ fn h_hex_decode_in_place(
     // form was.
     region[..decoded.len()].copy_from_slice(&decoded);
     ret(decoded.len() as i64)
-}
-
-// ---- declarations --------------------------------------------------------
-
-fn h_declare_name(
-    scope: &HelperScope,
-    ptr: u64,
-    len: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    let name = guest!(string(scope, ptr, len));
-    if !synch_core::display_text_is_safe(&name) {
-        return ret(errno::EINVAL);
-    }
-    with(scope, |inner| {
-        inner.declaration.borrow_mut().name = name;
-        0
-    })
-    .and_then(ret)
-}
-
-fn h_declare_egress(
-    scope: &HelperScope,
-    ptr: u64,
-    len: u64,
-    port: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    let host = guest!(string(scope, ptr, len));
-    if !synch_core::display_text_is_safe(&host) {
-        return ret(errno::EINVAL);
-    }
-    if port > u16::MAX as u64 {
-        return ret(errno::EINVAL);
-    }
-    with(scope, |inner| {
-        let mut decl = inner.declaration.borrow_mut();
-        if decl.egress.len() >= synch_core::MAX_DECLARED_EGRESS {
-            return errno::ELIMIT;
-        }
-        // Port 0 means "any port on this host" and is rendered as a bare host,
-        // which is exactly how the operator's own list spells the same thing.
-        decl.egress.push(if port == 0 {
-            host
-        } else {
-            format!("{host}:{port}")
-        });
-        0
-    })
-    .and_then(ret)
-}
-
-fn h_declare_max_streams(
-    scope: &HelperScope,
-    n: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    with(scope, |inner| {
-        inner.declaration.borrow_mut().max_streams = Some(n.min(u32::MAX as u64) as u32);
-        0
-    })
-    .and_then(ret)
-}
-
-fn h_declare_stack_frame_size(
-    scope: &HelperScope,
-    size: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    with(scope, |inner| {
-        let Ok(size) = u32::try_from(size) else {
-            return errno::ELIMIT;
-        };
-        if size > synch_core::MAX_EBPF_STACK_FRAME_SIZE {
-            return errno::ELIMIT;
-        }
-        if !synch_core::valid_ebpf_stack_frame_size(size) {
-            return errno::EINVAL;
-        }
-        inner.declaration.borrow_mut().stack_frame_size = Some(size);
-        0
-    })
-    .and_then(ret)
-}
-
-fn h_declare_guarded_stack_frames(
-    scope: &HelperScope,
-    enabled: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    with(scope, |inner| {
-        let enabled = match enabled {
-            0 => false,
-            1 => true,
-            _ => return errno::EINVAL,
-        };
-        inner.declaration.borrow_mut().guarded_stack_frames = Some(enabled);
-        0
-    })
-    .and_then(ret)
-}
-
-/// A nonzero program-local capability id out of a JSON object.
-fn capability_id_field(map: &serde_json::Map<String, Value>) -> Result<u32, i64> {
-    map.get("id")
-        .and_then(Value::as_u64)
-        .and_then(|id| u32::try_from(id).ok())
-        .filter(|id| *id != 0)
-        .ok_or(errno::EINVAL)
-}
-
-/// Named-flag bits out of a JSON string array: every name must be known.
-fn flag_bits(value: Option<&Value>, name_bit: impl Fn(&str) -> Option<u64>) -> Result<u64, i64> {
-    let items = match value {
-        None | Some(Value::Null) => return Ok(0),
-        Some(Value::Array(items)) => items,
-        Some(_) => return Err(errno::EINVAL),
-    };
-    let mut bits = 0;
-    for item in items {
-        bits |= item.as_str().and_then(&name_bit).ok_or(errno::EINVAL)?;
-    }
-    Ok(bits)
-}
-
-/// Declares one exact process capability from its JSON form:
-/// `{"id", "allow": ["pty" | "pipe", …], "executable", "argv": [...],
-///   "allowed_signals": ["HUP" | "INT" | "TERM", …]?}`.
-fn h_declare_process(
-    scope: &HelperScope,
-    handle: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    let inner = with(scope, Rc::clone)?;
-    let value = match json_value(&inner, handle as i64) {
-        Ok(value) => value,
-        Err(error) => return ret(error),
-    };
-    let Value::Object(map) = value else {
-        return ret(errno::EINVAL);
-    };
-    let id = match capability_id_field(&map) {
-        Ok(id) => id,
-        Err(error) => return ret(error),
-    };
-    let flags = match flag_bits(map.get("allow"), |name| match name {
-        "pty" => Some(0x01),
-        "pipe" => Some(0x02),
-        _ => None,
-    }) {
-        Ok(bits) => bits as u32,
-        Err(error) => return ret(error),
-    };
-    let allowed_signals = match flag_bits(map.get("allowed_signals"), |name| {
-        crate::runtime::process::signal_number(name).map(|(bit, _)| bit)
-    }) {
-        Ok(bits) => bits,
-        Err(error) => return ret(error),
-    };
-    let Some(executable) = map.get("executable").and_then(Value::as_str) else {
-        return ret(errno::EINVAL);
-    };
-    let argv: Vec<String> = match map.get("argv") {
-        Some(Value::Array(items)) => {
-            let mut argv = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(arg) => argv.push(arg.to_owned()),
-                    None => return ret(errno::EINVAL),
-                }
-            }
-            argv
-        }
-        _ => return ret(errno::EINVAL),
-    };
-    if argv.is_empty() || argv.len() > synch_core::sock::MAX_PROCESS_ARGS {
-        return ret(errno::EINVAL);
-    }
-    let canonical = match std::fs::canonicalize(executable) {
-        Ok(path) => path,
-        Err(_) => return ret(errno::ENOENT),
-    };
-    let Ok(metadata) = std::fs::metadata(&canonical) else {
-        return ret(errno::ENOENT);
-    };
-    if !metadata.is_file() {
-        return ret(errno::EINVAL);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return ret(errno::EPERM);
-        }
-    }
-    let Some(executable) = canonical.to_str().map(str::to_owned) else {
-        return ret(errno::EINVAL);
-    };
-    let capability = synch_core::ProcessCapability {
-        id,
-        flags,
-        executable,
-        argv,
-        allowed_signals,
-    };
-    with(scope, |inner| {
-        let mut declaration = inner.declaration.borrow_mut();
-        if declaration.processes.len() >= synch_core::MAX_DECLARED_PROCESSES {
-            return errno::ELIMIT;
-        }
-        if declaration
-            .processes
-            .iter()
-            .any(|item| item.id == capability.id)
-        {
-            return errno::EINVAL;
-        }
-        declaration.processes.push(capability);
-        match declaration.validate() {
-            Ok(()) => 0,
-            Err(_) => {
-                declaration.processes.pop();
-                errno::EINVAL
-            }
-        }
-    })
-    .and_then(ret)
-}
-
-/// Declares one scoped file-transfer capability from its JSON form:
-/// `{"id", "protocol": "sftp", "access": ["read", "recursive"?],
-///   "scope": "space/prefix"}`.
-fn h_declare_file_transfer(
-    scope: &HelperScope,
-    handle: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    let inner = with(scope, Rc::clone)?;
-    let value = match json_value(&inner, handle as i64) {
-        Ok(value) => value,
-        Err(error) => return ret(error),
-    };
-    let Value::Object(map) = value else {
-        return ret(errno::EINVAL);
-    };
-    let id = match capability_id_field(&map) {
-        Ok(id) => id,
-        Err(error) => return ret(error),
-    };
-    let protocol = match map.get("protocol").and_then(Value::as_str) {
-        Some("sftp") => 0x01,
-        _ => return ret(errno::EINVAL),
-    };
-    let access = match flag_bits(map.get("access"), |name| match name {
-        "read" => Some(0x01),
-        "recursive" => Some(0x04),
-        _ => None,
-    }) {
-        Ok(bits) => bits as u32,
-        Err(error) => return ret(error),
-    };
-    let Some(transfer_scope) = map.get("scope").and_then(Value::as_str) else {
-        return ret(errno::EINVAL);
-    };
-    let capability = synch_core::FileTransferCapability {
-        id,
-        protocol,
-        access,
-        scope: transfer_scope.to_owned(),
-    };
-    with(scope, |inner| {
-        let mut declaration = inner.declaration.borrow_mut();
-        if declaration.file_transfers.len() >= synch_core::MAX_DECLARED_FILE_TRANSFERS {
-            return errno::ELIMIT;
-        }
-        if declaration
-            .file_transfers
-            .iter()
-            .any(|item| item.id == capability.id)
-        {
-            return errno::EINVAL;
-        }
-        declaration.file_transfers.push(capability);
-        match declaration.validate() {
-            Ok(()) => 0,
-            Err(_) => {
-                declaration.file_transfers.pop();
-                errno::EINVAL
-            }
-        }
-    })
-    .and_then(ret)
-}
-
-/// Declares one prefix-scoped tree-write capability from its JSON form:
-/// `{"id", "prefix": "space/dir", "allow": ["create" | "replace" | "delete"],
-///   "max_bytes"?}` (`docs/TREE-WRITES.md` §3).
-fn h_declare_tree_write(
-    scope: &HelperScope,
-    handle: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    declaring!(scope);
-    let inner = with(scope, Rc::clone)?;
-    let value = match json_value(&inner, handle as i64) {
-        Ok(value) => value,
-        Err(error) => return ret(error),
-    };
-    let Value::Object(map) = value else {
-        return ret(errno::EINVAL);
-    };
-    let id = match capability_id_field(&map) {
-        Ok(id) => id,
-        Err(error) => return ret(error),
-    };
-    let modes = match flag_bits(map.get("allow"), |name| match name {
-        "create" => Some(synch_core::TREE_WRITE_CREATE as u64),
-        "replace" => Some(synch_core::TREE_WRITE_REPLACE as u64),
-        "delete" => Some(synch_core::TREE_WRITE_DELETE as u64),
-        _ => None,
-    }) {
-        Ok(bits) => bits as u32,
-        Err(error) => return ret(error),
-    };
-    let Some(prefix) = map.get("prefix").and_then(Value::as_str) else {
-        return ret(errno::EINVAL);
-    };
-    // Absent means the modest default; `0` is the explicit "unbounded", which
-    // the arm prompt prints loudly.
-    let max_bytes = match map.get("max_bytes") {
-        None | Some(Value::Null) => synch_core::DEFAULT_TREE_WRITE_MAX_BYTES,
-        Some(value) => match value.as_u64() {
-            Some(bytes) => bytes,
-            None => return ret(errno::EINVAL),
-        },
-    };
-    let capability = synch_core::TreeWriteCapability {
-        id,
-        modes,
-        prefix: prefix.to_owned(),
-        max_bytes,
-    };
-    with(scope, |inner| {
-        let mut declaration = inner.declaration.borrow_mut();
-        if declaration.tree_writes.len() >= synch_core::MAX_DECLARED_TREE_WRITES {
-            return errno::ELIMIT;
-        }
-        if declaration
-            .tree_writes
-            .iter()
-            .any(|item| item.id == capability.id)
-        {
-            return errno::EINVAL;
-        }
-        declaration.tree_writes.push(capability);
-        match declaration.validate() {
-            Ok(()) => 0,
-            Err(_) => {
-                declaration.tree_writes.pop();
-                errno::EINVAL
-            }
-        }
-    })
-    .and_then(ret)
 }
 
 // The `SY_SELF` constant is part of the ABI rather than an implementation

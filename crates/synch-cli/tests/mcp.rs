@@ -607,7 +607,7 @@ async fn the_write_tier_is_absent_from_a_read_only_server() {
         .collect();
     assert!(names.contains(&"synch_list"));
     assert!(!names.contains(&"synch_write"));
-    assert!(!names.contains(&"synch_socket_arm"));
+    assert!(!names.contains(&"synch_socket_activate"));
 
     // Calling one anyway is refused with the remedy, and changes nothing.
     let refused = client
@@ -827,8 +827,8 @@ async fn the_socket_lifecycle_runs_end_to_end_over_the_protocol() {
     let header = sdk["content"][0]["text"].as_str().unwrap();
     assert!(header.contains("SY_ENTRY"), "the SDK header");
 
-    // Build → write → declare → review, with nothing touching the filesystem
-    // outside the space.
+    // Build → inspect → write → activate, with nothing touching the
+    // filesystem outside the space.
     let source = "\
 #include <synch.h>\n\
 SY_ENTRY sy_s64 entry(void) { return 0; }\n";
@@ -854,6 +854,17 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
         .to_string();
     assert!(built["structuredContent"]["size"].as_u64().unwrap() > 0);
 
+    // Inspection is stateless: the root, the manifest, and the load check
+    // describe the object before anything is deployed.
+    let inspected = client
+        .tool("synch_socket_inspect", json!({ "object_base64": object }))
+        .await;
+    let root = inspected["structuredContent"]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(root.len(), 64, "a hex BLAKE3 root");
+
     client
         .tool(
             "synch_write",
@@ -862,45 +873,35 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
         .await;
     client
         .tool(
-            "synch_socket_declare",
+            "synch_socket_activate",
             json!({ "space": "code", "path": "echo.o", "note": "from mcp" }),
         )
         .await;
-    // Declaring makes the *scanner* publish the path as a socket, so the
+    // Activation makes the *scanner* publish the path as a socket, so the
     // republish is a step of the lifecycle rather than an implementation
     // detail — and the whole of it is reachable over the protocol.
     client.tool("synch_source_scan", json!({})).await;
 
-    // Declaring is not arming: the listing says so before any approval.
     let listed = client
         .tool("synch_socket_list", json!({ "long": true }))
         .await;
-    assert!(listed["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("echo.o"));
-
-    // Reviewing prints the declaration and the token that approves exactly it.
-    let review = client
-        .tool(
-            "synch_socket_review",
-            json!({ "space": "code", "path": "echo.o" }),
-        )
-        .await;
-    let printed = review["content"][0]["text"].as_str().unwrap().to_string();
-    assert!(printed.contains("--review"), "{printed}");
-
-    // Arming without that token is refused, which is the whole point of it.
-    let refused = client
-        .tool_error(
-            "synch_socket_arm",
-            json!({ "space": "code", "path": "echo.o", "review_token": "0000" }),
-        )
-        .await;
-    assert!(!refused.is_empty());
+    let text = listed["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(text.contains("echo.o"), "{text}");
+    assert!(
+        text.contains(&root),
+        "the listing names the root inspection described: {text}"
+    );
 
     // Nothing is running, and asking is answered rather than refused.
     client.tool("synch_socket_ps", json!({})).await;
+
+    // Deactivation over the protocol completes the lifecycle.
+    client
+        .tool(
+            "synch_socket_deactivate",
+            json!({ "space": "code", "path": "echo.o" }),
+        )
+        .await;
 
     client.close().await;
     daemon.shutdown().await;

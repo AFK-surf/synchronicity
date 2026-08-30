@@ -19,11 +19,7 @@
 /* Guesses one caller may make in a minute. An offered token is a guess. */
 #define ATTEMPTS_PER_MINUTE 10
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("token-gate"));
-  sy_declare_max_streams(8);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"token-gate\",\"max_streams\":8}");
 
 static sy_s64 read_line(char *out, sy_u64 cap) {
   sy_u64 len = 0;

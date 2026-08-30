@@ -2972,15 +2972,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         // ---- sockets (`docs/SOCKETS.md`) ----------------------------------
-        Command::SocketDeclare(pb::SocketDeclare {
+        Command::SocketActivate(pb::SocketActivate {
             target,
             config,
             max_streams,
-            auto,
             note,
         }) => {
             let (space, path) = split_socket_target(&target)?;
-            let row = synch_store::SocketRow {
+            let row = synch_store::SocketActivation {
                 space: space.clone(),
                 path: path.clone(),
                 config: config
@@ -2991,14 +2990,13 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     })
                     .collect(),
                 max_streams: (max_streams > 0).then_some(max_streams),
-                auto,
                 note,
-                added_at: synch_core::now_ns(),
+                activated_at: synch_core::now_ns(),
             };
             let node = node.clone();
-            let declared = row.clone();
-            read(&node, move |n| Ok(n.socket_declare(&declared)?)).await?;
-            out.line(format!("declared {space}/{path}")).await?;
+            let activated = row.clone();
+            read(&node, move |n| Ok(n.socket_activate(&activated)?)).await?;
+            out.line(format!("activated {space}/{path}")).await?;
             if !synch_sock::SUPPORTED {
                 out.line(
                     "note: this build serves no sockets — async-ebpf supports Linux, macOS, \
@@ -3009,106 +3007,30 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             out.line(
-                "next: `synch source scan`, then `synch socket arm` to approve it".to_string(),
+                "every write to this path is now a deployment: what it holds serves \
+                 immediately, under its own manifest, until `synch socket deactivate`. \
+                 That includes adoption and S3 writes — activate only paths whose every \
+                 writer you mean as a deployer."
+                    .to_string(),
             )
             .await?;
-            if row.auto {
-                out.line(
-                    "warning: --auto re-arms on every content change — tree-write grants \
-                     included, so whatever the bytes become may publish under the prefixes \
-                     they declare. Correct for a path you are the only writer of; wrong for \
-                     any path an S3 key or adoption can reach."
-                        .to_string(),
-                )
+            out.line("next: `synch source scan` publishes the current bytes".to_string())
                 .await?;
-            }
         }
 
-        Command::SocketArm(pb::SocketArm { target, review }) => {
-            let (space, path) = split_socket_target(&target)?;
-            if review.is_empty() {
-                let inspected = node
-                    .socket_inspect(&space, &path)
-                    .await
-                    .map_err(ControlError::from)?;
-                out.line(format!("  program  {}", inspected.root.to_hex()))
-                    .await?;
-                let rendered = inspected.declaration.render();
-                if rendered.is_empty() {
-                    out.line(
-                        "  declares nothing — it reaches nothing and reads nothing".to_string(),
-                    )
-                    .await?;
-                } else {
-                    for line in rendered.lines() {
-                        out.line(format!("  declares {line}")).await?;
-                    }
-                }
-                for write in &inspected.declaration.tree_writes {
-                    out.line(format!(
-                        "  tree-write {}  {}  {}",
-                        write.prefix,
-                        write.mode_names(),
-                        if write.max_bytes == 0 {
-                            "UNBOUNDED bytes per commit".to_string()
-                        } else {
-                            format!("<= {} bytes per commit", write.max_bytes)
-                        }
-                    ))
-                    .await?;
-                }
-                if !inspected.declaration.tree_writes.is_empty() {
-                    out.line(
-                        "writes win `newest`: paths this program publishes are what every \
-                         policy-default read of them serves, cluster-wide, until adopted over"
-                            .to_string(),
-                    )
-                    .await?;
-                }
-                out.line(format!(
-                    "reviewed only — approve with `synch socket arm {space}/{path} --review {}`",
-                    inspected.review.to_hex()
-                ))
-                .await?;
-            } else {
-                let expected = review
-                    .parse::<synch_core::Hash>()
-                    .map_err(|e| ControlError::invalid(format!("--review: {e}")))?;
-                node.socket_approve(&space, &path, &expected)
-                    .await
-                    .map_err(ControlError::from)?;
-                out.line(format!("armed {space}/{path}")).await?;
-            }
-        }
-
-        Command::SocketDisarm(pb::SocketDisarm { target }) => {
+        Command::SocketDeactivate(pb::SocketDeactivate { target }) => {
             let (space, path) = split_socket_target(&target)?;
             let node = node.clone();
             let (s, p) = (space.clone(), path.clone());
-            if !read(&node, move |n| Ok(n.socket_disarm(&s, &p)?)).await? {
+            if !read(&node, move |n| Ok(n.socket_deactivate(&s, &p)?)).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
-                    format!("{space}/{path} was not armed"),
+                    format!("{space}/{path} is not an activated socket"),
                 ));
             }
             out.line(format!(
-                "disarmed {space}/{path} — still published, will not run"
-            ))
-            .await?;
-        }
-
-        Command::SocketUndeclare(pb::SocketUndeclare { target }) => {
-            let (space, path) = split_socket_target(&target)?;
-            let node = node.clone();
-            let (s, p) = (space.clone(), path.clone());
-            if !read(&node, move |n| Ok(n.socket_undeclare(&s, &p)?)).await? {
-                return Err(ControlError::new(
-                    ErrorCode::NotFound,
-                    format!("{space}/{path} is not a declared socket"),
-                ));
-            }
-            out.line(format!(
-                "undeclared {space}/{path} — the next scan republishes it as a file"
+                "deactivated {space}/{path} — connections refuse now; the next scan \
+                 republishes it as a file"
             ))
             .await?;
         }
@@ -3119,42 +3041,49 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let sockets =
                 read(&node_for_read, move |n| Ok(n.socket_ls(filter.as_deref())?)).await?;
             if sockets.is_empty() {
-                out.line("no sockets declared".to_string()).await?;
+                out.line("no sockets activated".to_string()).await?;
             }
-            for state in sockets {
-                let qualified = state.declaration.qualified();
-                // What the tree names right now, which is what an arming record
-                // has to match for anything to run.
+            for activation in sockets {
+                let qualified = activation.qualified();
+                // What the tree currently names, which is what a connection
+                // would run right now — and its manifest, from the same parse
+                // admission uses, so "invalid update" is visible here rather
+                // than only as connection errors.
                 let resolved = {
                     let node = node.clone();
-                    let (s, p) = (
-                        state.declaration.space.clone(),
-                        state.declaration.path.clone(),
-                    );
+                    let (s, p) = (activation.space.clone(), activation.path.clone());
                     read(&node, move |n| Ok(n.resolve_socket(&s, &p)?)).await?
                 };
-                let status = match (&resolved, &state.arm) {
-                    (None, _) => "unpublished".to_string(),
-                    (Some(r), Some(arm)) if arm.root == r.root => "armed".to_string(),
-                    (Some(_), Some(_)) => "disarmed (content changed)".to_string(),
-                    (Some(_), None) => "never armed".to_string(),
+                let declared = match &resolved {
+                    Some(r) => {
+                        let node = node.clone();
+                        let root = r.root;
+                        Some(read(&node, move |n| Ok(n.socket_program_declaration(&root))).await?)
+                    }
+                    None => None,
                 };
-                let auto = if state.declaration.auto { "  auto" } else { "" };
-                out.line(format!("{qualified:<40}  {status}{auto}")).await?;
+                let status = match (&resolved, &declared) {
+                    (None, _) => "unpublished — run `synch source scan`".to_string(),
+                    (Some(_), Some(Err(e))) => format!("activated, unavailable: {e}"),
+                    (Some(_), _) => "activated".to_string(),
+                };
+                out.line(format!("{qualified:<40}  {status}")).await?;
                 if long {
                     if let Some(r) = &resolved {
                         out.line(format!("    tree     {}", r.root.to_hex()))
                             .await?;
                     }
-                    if let Some(arm) = &state.arm {
-                        out.line(format!("    armed    {}", arm.root.to_hex()))
-                            .await?;
-                        for line in arm.declared.lines() {
+                    if let Some(Ok(declared)) = &declared {
+                        for line in declared.render().lines() {
                             out.line(format!("    declares {line}")).await?;
                         }
                     }
-                    if let Some(n) = state.declaration.max_streams {
+                    if let Some(n) = activation.max_streams {
                         out.line(format!("    allowed  max-streams {n}")).await?;
+                    }
+                    if !activation.note.is_empty() {
+                        out.line(format!("    note     {}", activation.note))
+                            .await?;
                     }
                 }
             }

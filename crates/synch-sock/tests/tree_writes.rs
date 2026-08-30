@@ -15,8 +15,6 @@
 
 mod harness;
 
-use std::sync::Arc;
-
 use harness::{compile, exchange, peer, Harness};
 use synch_core::{
     Hash, SockStatus, TreeWriteCapability, TREE_WRITE_CREATE, TREE_WRITE_DELETE, TREE_WRITE_REPLACE,
@@ -524,43 +522,20 @@ SY_ENTRY sy_s64 entry(void) {
     assert_eq!(status, SockStatus::Ok(0));
 }
 
-/// The declaration hook's half: `sy_declare_tree_write` is init-side, and the
-/// grant it captures round-trips through the rendered approval.
+/// The manifest's half: a tree-write grant is data in the object, and the
+/// grant it captures round-trips through the rendered declaration.
 #[test]
-fn the_declaration_hook_captures_a_tree_write_grant() {
+fn the_manifest_captures_a_tree_write_grant() {
     const DECLARES: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  /* Stream-side helpers have nothing to reach here. */
-  if (sy_put_open(1, SY_STR("code/inbox/a")) != SY_EPERM) return 1;
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\",\"delete\"]}"));
-  if (cap < 0) return 2;
-  if (sy_declare_tree_write(cap) != 0) return 3;
-  /* A duplicate id is refused. */
-  if (sy_declare_tree_write(cap) != SY_EINVAL) return 4;
-  sy_close(cap);
-  /* An unknown mode name is refused whole. */
-  sy_s64 bad = sy_json_parse(SY_STR(
-      "{\"id\":2,\"prefix\":\"code\",\"allow\":[\"append\"]}"));
-  if (bad < 0) return 5;
-  if (sy_declare_tree_write(bad) != SY_EINVAL) return 6;
-  sy_close(bad);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,"
+            "\"prefix\":\"code/inbox\",\"allow\":[\"create\",\"delete\"]}]}");
 
-SY_ENTRY sy_s64 entry(void) {
-  /* And declaring from a served stream is refused. */
-  sy_s64 cap = sy_json_new_object();
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc == SY_EPERM ? 0 : 1;
-}
+SY_ENTRY sy_s64 entry(void) { return 0; }
 "#;
     let elf = compile(DECLARES, "declares.c");
-    let declared =
-        synch_sock::declare(&elf, Arc::new(harness::FakeTree::default())).expect("the hook runs");
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the manifest parses");
     assert_eq!(declared.tree_writes.len(), 1);
     let grant = &declared.tree_writes[0];
     assert_eq!(grant.id, 1);
@@ -573,30 +548,4 @@ SY_ENTRY sy_s64 entry(void) {
     );
     let parsed = synch_core::Declaration::parse(&declared.render());
     assert_eq!(parsed.tree_writes, declared.tree_writes);
-}
-
-#[tokio::test]
-async fn declaring_from_a_served_stream_is_refused() {
-    const STREAM_DECLARE: &str = r#"
-#include <synch.h>
-
-SY_ENTRY sy_s64 entry(void) {
-  sy_s64 cap = sy_json_new_object();
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc == SY_EPERM ? 0 : 1;
-}
-"#;
-    let elf = compile(STREAM_DECLARE, "stream_declare.c");
-    let harness = Harness::new();
-    let (status, _) = exchange(
-        &harness,
-        &elf,
-        b"",
-        EffectivePolicy::default(),
-        peer(None),
-        vec![],
-    )
-    .await;
-    assert_eq!(status, SockStatus::Ok(0));
 }

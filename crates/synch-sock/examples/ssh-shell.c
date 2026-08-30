@@ -47,23 +47,14 @@
    away from the control fd or the other direction. */
 #define CHUNK 32768
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("ssh-shell"));
-  sy_declare_max_streams(4);
-
-  /* The complete capability, embedded in the object as JSON: the exact
-     executable, argv, PTY permission, and the signals the guest may relay.
-     Literal concatenation splices the macros in at compile time. */
-  sy_s64 shell = sy_json_parse(
-      SY_STR("{\"id\":1,\"allow\":[\"pty\"],"
-             "\"executable\":\"" SHELL_EXECUTABLE "\","
-             "\"argv\":[\"" SHELL_ARGV0 "\"],"
-             "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
-  if (shell < 0) return shell;
-  sy_s64 declared = sy_declare_process(shell);
-  sy_close(shell);
-  return declared;
-}
+/* The complete capability, embedded in the object as data: the exact
+   executable, argv, PTY permission, and the signals the guest may relay.
+   Literal concatenation splices the macros in at compile time. */
+SY_MANIFEST("{\"manifest\":1,\"name\":\"ssh-shell\",\"max_streams\":4,"
+            "\"processes\":[{\"id\":1,\"allow\":[\"pty\"],"
+            "\"executable\":\"" SHELL_EXECUTABLE "\","
+            "\"argv\":[\"" SHELL_ARGV0 "\"],"
+            "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}]}");
 
 static int str_is(const char *value, const char *want) {
   sy_u64 len = sy_strlen(want);
