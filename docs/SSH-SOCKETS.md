@@ -918,11 +918,15 @@ append writes, truncation, removal, and rename. Rename conditionally publishes
 the copy and conditionally deletes the exact source version that was copied,
 because the tree has one-path atomic commits. If the source changes between
 those steps, the copy may already exist but the newer source is retained and
-the rename reports failure. Directories in
+the rename reports failure. Baseline SFTP v3 rename refuses an occupied
+destination; no overwrite extension is advertised. Directories in
 the published tree are implicit prefixes, so empty-directory creation/removal,
 symlinks, and client-supplied modes or mtimes are not mutation inputs; metadata
 changes through `SETSTAT` or `FSETSTAT` return `SSH_FX_OP_UNSUPPORTED` instead
-of claiming that ignored metadata was preserved.
+of claiming that ignored metadata was preserved. `OPEN` likewise rejects
+unsupported initial metadata, but honors an initial size for a newly created
+file. A staged mutation failure poisons its handle: `CLOSE` aborts rather than
+publishing bytes the failed request may have written only partially.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,

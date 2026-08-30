@@ -51,6 +51,7 @@ struct WriteFile {
     readable: bool,
     append: bool,
     dirty: bool,
+    failed: bool,
     max_bytes: u64,
 }
 
@@ -449,10 +450,9 @@ fn attrs(info: &ObjectInfo) -> FileAttributes {
     }
 }
 
-fn file_attrs(size: u64) -> FileAttributes {
+fn staged_file_attrs(size: u64) -> FileAttributes {
     FileAttributes {
         size: Some(size),
-        permissions: Some(0o100644),
         ..Default::default()
     }
 }
@@ -505,7 +505,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         id: u32,
         filename: String,
         pflags: OpenFlags,
-        _attrs: FileAttributes,
+        attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
         let wants_read = pflags.contains(OpenFlags::READ);
         let wants_write = pflags.intersects(OpenFlags::WRITE | OpenFlags::APPEND);
@@ -514,9 +514,15 @@ impl russh_sftp::server::Handler for TreeSftp {
         if (!wants_read && !wants_write)
             || (wants_read && self.access & ACCESS_READ == 0)
             || (write_options && !wants_write)
-            || (pflags.contains(OpenFlags::EXCLUDE) && !pflags.contains(OpenFlags::CREATE))
+            || (pflags.intersects(OpenFlags::EXCLUDE | OpenFlags::TRUNCATE)
+                && !pflags.contains(OpenFlags::CREATE))
         {
             return Err(StatusCode::PermissionDenied);
+        }
+        if has_unsupported_metadata(&attrs)
+            || (attrs.size.is_some() && !pflags.contains(OpenFlags::CREATE))
+        {
+            return Err(StatusCode::OpUnsupported);
         }
 
         let path = self.path(&filename)?;
@@ -543,7 +549,9 @@ impl russh_sftp::server::Handler for TreeSftp {
 
         let capability = self.write_capability(&path)?;
         let truncated = pflags.contains(OpenFlags::TRUNCATE);
-        let initial_size = if truncated {
+        let initial_size = if existing.is_none() {
+            attrs.size.unwrap_or(0)
+        } else if truncated {
             0
         } else {
             existing.as_ref().map_or(0, |info| info.size)
@@ -559,7 +567,7 @@ impl russh_sftp::server::Handler for TreeSftp {
             self.copy_into_writer(info, writer.as_mut(), info.size)
                 .await?;
         } else {
-            writer.set_len(0).await.map_err(host_error)?;
+            writer.set_len(initial_size).await.map_err(host_error)?;
         }
         let handle = self.allocate(OpenHandle::WriteFile(WriteFile {
             writer: tokio::sync::Mutex::new(writer),
@@ -569,6 +577,7 @@ impl russh_sftp::server::Handler for TreeSftp {
             readable: wants_read,
             append: pflags.contains(OpenFlags::APPEND),
             dirty: truncated || existing.is_none(),
+            failed: false,
             max_bytes: capability.max_bytes,
         }))?;
         Ok(Handle { id, handle })
@@ -577,6 +586,9 @@ impl russh_sftp::server::Handler for TreeSftp {
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         let open = self.handles.remove(&handle).ok_or(StatusCode::Failure)?;
         if let OpenHandle::WriteFile(mut file) = open {
+            if file.failed {
+                return Err(StatusCode::Failure);
+            }
             if file.dirty {
                 self.count_commit()?;
                 file.writer
@@ -608,6 +620,9 @@ impl russh_sftp::server::Handler for TreeSftp {
                         .map_err(host_error)
                 };
                 (result, OpenHandle::ReadFile(info))
+            }
+            OpenHandle::WriteFile(file) if file.failed => {
+                (Err(StatusCode::Failure), OpenHandle::WriteFile(file))
             }
             OpenHandle::WriteFile(mut file) if file.readable => {
                 let result = if offset >= file.size {
@@ -643,6 +658,10 @@ impl russh_sftp::server::Handler for TreeSftp {
             self.handles.insert(handle, open);
             return Err(StatusCode::PermissionDenied);
         };
+        if file.failed {
+            self.handles.insert(handle, OpenHandle::WriteFile(file));
+            return Err(StatusCode::Failure);
+        }
         let offset = if file.append { file.size } else { offset };
         let Some(end) = offset.checked_add(data.len() as u64) else {
             self.handles.insert(handle, OpenHandle::WriteFile(file));
@@ -661,6 +680,8 @@ impl russh_sftp::server::Handler for TreeSftp {
         if result.is_ok() {
             file.size = file.size.max(end);
             file.dirty = true;
+        } else {
+            file.failed = true;
         }
         self.handles.insert(handle, OpenHandle::WriteFile(file));
         result.map(|_| ok(id))
@@ -673,10 +694,11 @@ impl russh_sftp::server::Handler for TreeSftp {
                 id,
                 attrs: attrs(info),
             }),
-            Some(OpenHandle::WriteFile(file)) => Ok(Attrs {
+            Some(OpenHandle::WriteFile(file)) if !file.failed => Ok(Attrs {
                 id,
-                attrs: file_attrs(file.size),
+                attrs: staged_file_attrs(file.size),
             }),
+            Some(OpenHandle::WriteFile(_)) => Err(StatusCode::Failure),
             Some(OpenHandle::Directory(_)) => Ok(Attrs {
                 id,
                 attrs: directory_attrs(),
@@ -707,6 +729,10 @@ impl russh_sftp::server::Handler for TreeSftp {
             self.handles.insert(handle, open);
             return Err(StatusCode::PermissionDenied);
         };
+        if file.failed {
+            self.handles.insert(handle, OpenHandle::WriteFile(file));
+            return Err(StatusCode::Failure);
+        }
         if file.max_bytes > 0 && size > file.max_bytes {
             self.handles.insert(handle, OpenHandle::WriteFile(file));
             return Err(StatusCode::Failure);
@@ -720,6 +746,8 @@ impl russh_sftp::server::Handler for TreeSftp {
         if result.is_ok() {
             file.size = size;
             file.dirty = true;
+        } else {
+            file.failed = true;
         }
         self.handles.insert(handle, OpenHandle::WriteFile(file));
         result.map(|_| ok(id))
@@ -861,11 +889,14 @@ impl russh_sftp::server::Handler for TreeSftp {
         if new_capability.max_bytes > 0 && source.size > new_capability.max_bytes {
             return Err(StatusCode::Failure);
         }
-        let destination = match self.open_info(newpath.clone()).await {
-            Ok(info) => Some(info),
-            Err(StatusCode::NoSuchFile) => None,
+        match self.open_info(newpath.clone()).await {
+            // Baseline SFTP v3 rename never overwrites. Overwrite semantics
+            // belong to an explicitly negotiated extension, which this
+            // server does not advertise.
+            Ok(_) => return Err(StatusCode::Failure),
+            Err(StatusCode::NoSuchFile) => {}
             Err(error) => return Err(error),
-        };
+        }
         self.reserve_commits(2)?;
 
         // The tree API has one-path atomic commits. Rename is therefore the
@@ -875,11 +906,8 @@ impl russh_sftp::server::Handler for TreeSftp {
         let (mut target, _target_permit) = self.open_writer(newpath, &new_capability).await?;
         self.copy_into_writer(&source, target.as_mut(), source.size)
             .await?;
-        let destination_condition = destination
-            .as_ref()
-            .map_or(PutCondition::Absent, |info| PutCondition::Root(info.root));
         target
-            .commit(destination_condition)
+            .commit(PutCondition::Absent)
             .await
             .map_err(host_error)?;
 
@@ -918,6 +946,7 @@ mod tests {
     use synch_core::Hash;
 
     type CommitReplacement = Arc<std::sync::Mutex<Option<(String, String, Vec<u8>)>>>;
+    type PartialWriteFailure = Arc<std::sync::Mutex<Option<usize>>>;
 
     /// An in-memory tree mirroring the integration harness's `FakeTree`
     /// semantics, with a `refused` set for entries the host deliberately
@@ -928,6 +957,7 @@ mod tests {
         kinds: std::collections::HashMap<String, HostEntryKind>,
         refused: std::collections::HashSet<String>,
         replace_on_commit: CommitReplacement,
+        fail_write_after: PartialWriteFailure,
     }
 
     impl FakeHost {
@@ -942,6 +972,7 @@ mod tests {
                 kinds: std::collections::HashMap::new(),
                 refused: std::collections::HashSet::new(),
                 replace_on_commit: Arc::new(std::sync::Mutex::new(None)),
+                fail_write_after: Arc::new(std::sync::Mutex::new(None)),
             }
         }
 
@@ -960,6 +991,10 @@ mod tests {
         fn replace_after_commit(&self, trigger: &str, target: &str, bytes: &[u8]) {
             *self.replace_on_commit.lock().unwrap() =
                 Some((trigger.to_string(), target.to_string(), bytes.to_vec()));
+        }
+
+        fn fail_next_write_after(&self, bytes: usize) {
+            *self.fail_write_after.lock().unwrap() = Some(bytes);
         }
     }
 
@@ -1072,6 +1107,7 @@ mod tests {
                 staged: Vec::new(),
                 files: self.files.clone(),
                 replace_on_commit: self.replace_on_commit.clone(),
+                fail_write_after: self.fail_write_after.clone(),
             }))
         }
     }
@@ -1082,6 +1118,7 @@ mod tests {
         staged: Vec<u8>,
         files: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
         replace_on_commit: CommitReplacement,
+        fail_write_after: PartialWriteFailure,
     }
 
     #[async_trait::async_trait]
@@ -1104,6 +1141,15 @@ mod tests {
         async fn write_at(&mut self, offset: u64, data: Vec<u8>) -> Result<(), HostError> {
             let start = usize::try_from(offset)
                 .map_err(|_| HostError::Denied("offset too large".into()))?;
+            if let Some(prefix) = self.fail_write_after.lock().unwrap().take() {
+                let prefix = prefix.min(data.len());
+                let partial_end = start
+                    .checked_add(prefix)
+                    .ok_or_else(|| HostError::Denied("write too large".into()))?;
+                self.staged.resize(self.staged.len().max(partial_end), 0);
+                self.staged[start..partial_end].copy_from_slice(&data[..prefix]);
+                return Err(HostError::Io("injected partial write failure".into()));
+            }
             let end = start
                 .checked_add(data.len())
                 .ok_or_else(|| HostError::Denied("write too large".into()))?;
@@ -1597,6 +1643,173 @@ mod tests {
                 .unwrap_err(),
             StatusCode::PermissionDenied
         );
+    }
+
+    #[tokio::test]
+    async fn baseline_rename_refuses_an_occupied_destination() {
+        let host = Arc::new(FakeHost::with_files(&[
+            ("files/source", "source-body"),
+            ("files/destination", "destination-body"),
+        ]));
+        let capability = synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE
+                | synch_core::TREE_WRITE_REPLACE
+                | synch_core::TREE_WRITE_DELETE,
+            prefix: "files".into(),
+            max_bytes: 1024,
+        };
+        let commits = commit_budget();
+        let mut sftp = TreeSftp::new(
+            host.clone(),
+            "files".into(),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_RECURSIVE,
+            Some(capability),
+            commits.clone(),
+            writer_budget(),
+        );
+
+        assert_eq!(
+            sftp.rename(1, "source".into(), "destination".into())
+                .await
+                .unwrap_err(),
+            StatusCode::Failure
+        );
+        let files = host.files.lock().unwrap();
+        assert_eq!(files.get("files/source").unwrap(), b"source-body");
+        assert_eq!(files.get("files/destination").unwrap(), b"destination-body");
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn open_enforces_v3_flags_and_initial_attributes() {
+        let host = Arc::new(FakeHost::with_files(&[("files/existing", "body")]));
+        let capability = synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE | synch_core::TREE_WRITE_REPLACE,
+            prefix: "files".into(),
+            max_bytes: 1024,
+        };
+        let mut sftp = TreeSftp::new(
+            host.clone(),
+            "files".into(),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_RECURSIVE,
+            Some(capability),
+            commit_budget(),
+            writer_budget(),
+        );
+
+        assert_eq!(
+            sftp.open(
+                1,
+                "existing".into(),
+                OpenFlags::WRITE | OpenFlags::TRUNCATE,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::PermissionDenied
+        );
+        assert_eq!(
+            sftp.open(
+                2,
+                "new-with-mode".into(),
+                OpenFlags::WRITE | OpenFlags::CREATE,
+                FileAttributes {
+                    permissions: Some(0o600),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::OpUnsupported
+        );
+        assert_eq!(
+            sftp.open(
+                3,
+                "existing".into(),
+                OpenFlags::WRITE,
+                FileAttributes {
+                    size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::OpUnsupported
+        );
+
+        let opened = sftp
+            .open(
+                4,
+                "sized".into(),
+                OpenFlags::WRITE | OpenFlags::CREATE,
+                FileAttributes {
+                    size: Some(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let staged = sftp.fstat(5, opened.handle.clone()).await.unwrap();
+        assert_eq!(staged.attrs.size, Some(4));
+        assert_eq!(staged.attrs.permissions, None);
+        sftp.close(6, opened.handle).await.unwrap();
+        assert_eq!(
+            host.files.lock().unwrap().get("files/sized").unwrap(),
+            &[0, 0, 0, 0]
+        );
+        assert_eq!(
+            host.files.lock().unwrap().get("files/existing").unwrap(),
+            b"body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_write_failure_poisoned_handle_never_commits() {
+        let host = Arc::new(FakeHost::with_files(&[]));
+        host.fail_next_write_after(3);
+        let capability = synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE,
+            prefix: "files".into(),
+            max_bytes: 1024,
+        };
+        let commits = commit_budget();
+        let mut sftp = TreeSftp::new(
+            host.clone(),
+            "files".into(),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_RECURSIVE,
+            Some(capability),
+            commits.clone(),
+            writer_budget(),
+        );
+        let opened = sftp
+            .open(
+                1,
+                "partial".into(),
+                OpenFlags::WRITE | OpenFlags::CREATE,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sftp.write(2, opened.handle.clone(), 0, b"abcdef".to_vec())
+                .await
+                .unwrap_err(),
+            StatusCode::Failure
+        );
+        assert_eq!(
+            sftp.fstat(3, opened.handle.clone()).await.unwrap_err(),
+            StatusCode::Failure
+        );
+        assert_eq!(
+            sftp.close(4, opened.handle).await.unwrap_err(),
+            StatusCode::Failure
+        );
+        assert!(!host.files.lock().unwrap().contains_key("files/partial"));
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

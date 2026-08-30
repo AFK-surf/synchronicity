@@ -897,10 +897,10 @@ struct TreeWriter {
     /// The armed grant's `TREE_WRITE_*` bits, for the commit-time condition.
     modes: u32,
     staged: Option<crate::Adoption>,
-    /// A commit consumed the staging and then failed. The bytes are gone —
-    /// the [`Adoption`](crate::Adoption)'s failure path unlinks them — and
-    /// silently re-staging would let the retry publish an *empty* file under
-    /// a valid receipt, so every later operation refuses instead.
+    /// A mutation may have partially changed the staging before failing, or a
+    /// commit may have consumed it before failing. In either case the bytes
+    /// are no longer safe to publish or silently replace with empty staging,
+    /// so every later operation refuses instead.
     staging_lost: bool,
     socket: String,
     invocation: u64,
@@ -908,13 +908,19 @@ struct TreeWriter {
 }
 
 impl TreeWriter {
-    /// Opens the adoption lazily, so a delete-only writer stages nothing.
-    async fn ensure_staged(&mut self) -> std::result::Result<(), HostError> {
+    fn ensure_usable(&self) -> std::result::Result<(), HostError> {
         if self.staging_lost {
             return Err(HostError::Io(
-                "a failed commit consumed the staged bytes; open a new writer".into(),
+                "the staged bytes are unusable after a failed mutation or commit; open a new writer"
+                    .into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Opens the adoption lazily, so a delete-only writer stages nothing.
+    async fn ensure_staged(&mut self) -> std::result::Result<(), HostError> {
+        self.ensure_usable()?;
         if self.staged.is_some() {
             return Ok(());
         }
@@ -939,11 +945,19 @@ impl SocketWriter for TreeWriter {
         })
         .await;
         match outcome {
-            Ok((adoption, result)) => {
+            Ok((adoption, Ok(()))) => {
                 self.staged = Some(adoption);
-                result.map_err(write_refusal)
+                Ok(())
             }
-            Err(e) => Err(write_refusal(e)),
+            Ok((adoption, Err(error))) => {
+                drop(adoption);
+                self.staging_lost = true;
+                Err(write_refusal(error))
+            }
+            Err(e) => {
+                self.staging_lost = true;
+                Err(write_refusal(e))
+            }
         }
     }
 
@@ -973,11 +987,19 @@ impl SocketWriter for TreeWriter {
         })
         .await;
         match outcome {
-            Ok((adoption, result)) => {
+            Ok((adoption, Ok(()))) => {
                 self.staged = Some(adoption);
-                result.map_err(write_refusal)
+                Ok(())
             }
-            Err(e) => Err(write_refusal(e)),
+            Ok((adoption, Err(error))) => {
+                drop(adoption);
+                self.staging_lost = true;
+                Err(write_refusal(error))
+            }
+            Err(e) => {
+                self.staging_lost = true;
+                Err(write_refusal(e))
+            }
         }
     }
 
@@ -990,11 +1012,19 @@ impl SocketWriter for TreeWriter {
         })
         .await;
         match outcome {
-            Ok((adoption, result)) => {
+            Ok((adoption, Ok(()))) => {
                 self.staged = Some(adoption);
-                result.map_err(write_refusal)
+                Ok(())
             }
-            Err(e) => Err(write_refusal(e)),
+            Ok((adoption, Err(error))) => {
+                drop(adoption);
+                self.staging_lost = true;
+                Err(write_refusal(error))
+            }
+            Err(e) => {
+                self.staging_lost = true;
+                Err(write_refusal(e))
+            }
         }
     }
 
@@ -1077,6 +1107,7 @@ impl SocketWriter for TreeWriter {
     }
 
     async fn delete_if(&mut self, expected: PutCondition) -> std::result::Result<(), HostError> {
+        self.ensure_usable()?;
         // Checked by the runtime against the grant already; re-taken here so
         // an embedder's host cannot be talked past it.
         if self.modes & synch_core::TREE_WRITE_DELETE == 0 {
