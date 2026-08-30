@@ -40,6 +40,7 @@ use std::path::Path;
 mod clang;
 #[cfg(tinycc)]
 mod fold;
+mod lower;
 mod scratch;
 #[cfg(tinycc)]
 mod tinycc;
@@ -156,10 +157,12 @@ fn read_source(path: &Path) -> Result<(String, String), CcError> {
 
 /// Compiles one translation unit with the host's `clang` and `llc`.
 ///
-/// Clang optimizes the program at `-O2` into LLVM bitcode. `llc` then emits a
-/// BPF v3 relocatable object with the `STACK_FRAME_SIZE` stack frames the
-/// socket runtime expects. Both executables must be on `PATH` and come from
-/// compatible LLVM installations.
+/// Clang optimizes the program at `-O2` into LLVM IR; the memory intrinsics
+/// clang emits for large initializers and copies — which llc would turn into
+/// libc calls the BPF backend cannot emit — are rewritten into host-helper
+/// calls (see `lower.rs`); `llc` then emits a BPF v3 relocatable object with
+/// the `STACK_FRAME_SIZE` stack frames the socket runtime expects. Both
+/// executables must be on `PATH` and come from compatible LLVM installations.
 pub fn compile_with_clang(
     source: &str,
     name: &str,

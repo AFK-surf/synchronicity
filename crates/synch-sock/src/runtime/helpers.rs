@@ -30,7 +30,7 @@ use crate::{
         PROCESS_CAPABILITY_SIZE, PROCESS_STATUS_SIZE, PTY_SPEC_SIZE, SSH_EVENT_SIZE, STAT_SIZE,
         SY_SELF,
     },
-    limits::{CURSOR_ENTRY_OVERHEAD, MAX_COPY, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
+    limits::{CURSOR_ENTRY_OVERHEAD, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
         ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
         endpoint::{connect_task, Endpoint, EndpointRole, State},
@@ -188,9 +188,6 @@ fn with<R>(scope: &HelperScope, f: impl FnOnce(&Rc<Inner>) -> R) -> Result<R, ()
 
 /// Copies a guest buffer out, rather than holding a borrow across other calls.
 fn bytes(scope: &HelperScope, ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
-    if len > MAX_COPY {
-        return Err(errno::EINVAL);
-    }
     match scope.user_memory(ptr, len) {
         Ok(slice) => Ok(slice.to_vec()),
         Err(()) => Err(errno::EINVAL),
@@ -301,14 +298,19 @@ fn h_monotonic_ns(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -
 }
 
 fn h_getrandom(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    if len > MAX_COPY {
+    if len == 0 {
+        return ret(0);
+    }
+    // The destination is the bound: the cage grants at most the guest's own
+    // memory, so a length no buffer could hold is refused as an argument
+    // rather than allocated for.
+    let Ok(mut region) = scope.user_memory_mut(ptr, len) else {
+        return ret(errno::EINVAL);
+    };
+    if aws_lc_rs::rand::fill(&mut region).is_err() {
         return ret(errno::EINVAL);
     }
-    let mut buf = vec![0u8; len as usize];
-    if aws_lc_rs::rand::fill(&mut buf).is_err() {
-        return ret(errno::EINVAL);
-    }
-    out_exact(scope, ptr, len, &buf)
+    ret(len as i64)
 }
 
 fn h_version(scope: &HelperScope, ptr: u64, len: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
@@ -466,7 +468,6 @@ fn h_stream_index(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -
 // ---- endpoint I/O --------------------------------------------------------
 
 fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) -> Result<u64, ()> {
-    let len = len.min(MAX_COPY);
     let ep = match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
@@ -474,8 +475,16 @@ fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) 
     if len == 0 {
         return ret(0);
     }
-    let mut buf = vec![0u8; len as usize];
-    let n = ep.read(&mut buf);
+    // The destination is the bound: the cage grants at most the guest's own
+    // memory, so a length no buffer could hold is refused as an argument
+    // rather than allocated for, and the ring is read straight into the
+    // region. The borrow ends before `with` runs, as everywhere here.
+    let n = {
+        let Ok(mut region) = scope.user_memory_mut(ptr, len) else {
+            return ret(errno::EINVAL);
+        };
+        ep.read(&mut region)
+    };
     if n <= 0 {
         return ret(n);
     }
@@ -493,10 +502,6 @@ fn h_read(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) 
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
     })?;
-    let Ok(mut region) = scope.user_memory_mut(ptr, n as u64) else {
-        return ret(errno::EINVAL);
-    };
-    region.copy_from_slice(&buf[..n as usize]);
     ret(n)
 }
 
@@ -508,7 +513,7 @@ fn h_write(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let data = guest!(bytes(scope, ptr, len.min(MAX_COPY)));
+    let data = guest!(bytes(scope, ptr, len));
     let ep = match with(scope, |inner| inner.endpoint_for_io(handle as i64))? {
         Ok(endpoint) => endpoint,
         Err(error) => return ret(error),
@@ -539,8 +544,8 @@ fn h_write(
 /// for: a proxy that does not need to look at what it forwards pays neither the
 /// two copies through the pointer cage nor the stack buffer they would need,
 /// and — because the bytes are never picked up out of the rx ring — has no
-/// remainder to carry between calls. [`MAX_COPY`] therefore does not apply; the
-/// move is bounded by the two rings and by what the guest asked for.
+/// remainder to carry between calls. The move is bounded by the two rings and
+/// by what the guest asked for.
 fn h_splice(scope: &HelperScope, from: u64, to: u64, max: u64, _: u64, _: u64) -> Result<u64, ()> {
     // Zero would have to mean either "nothing moved" or "the source is at its
     // end", and telling those two apart is the whole of a caller's control
@@ -2306,7 +2311,6 @@ fn h_pread(
     offset: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let len = len.min(MAX_COPY);
     let inner = with(scope, Rc::clone)?;
     let Some(Slot2::Object(obj)) = inner.slot(handle as i64) else {
         return ret(errno::EBADF);
@@ -2642,9 +2646,6 @@ fn h_memset(scope: &HelperScope, dst: u64, byte: u64, n: u64, _: u64, _: u64) ->
     if n == 0 {
         return Ok(dst);
     }
-    if n > MAX_COPY {
-        return ret(errno::EINVAL);
-    }
     let Ok(mut region) = scope.user_memory_mut(dst, n) else {
         return ret(errno::EINVAL);
     };
@@ -2736,9 +2737,6 @@ fn h_base64_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if len > MAX_COPY {
-        return ret(errno::EINVAL);
-    }
     let Some(engine) = engine(kind) else {
         return ret(errno::EINVAL);
     };
@@ -2785,9 +2783,6 @@ fn h_hex_decode_in_place(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if len > MAX_COPY {
-        return ret(errno::EINVAL);
-    }
     // One registration, read and write through it, as in
     // [`h_base64_decode_in_place`].
     let mut region = match scope.user_memory_mut(ptr, len) {
