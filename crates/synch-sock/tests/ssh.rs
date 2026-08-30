@@ -527,6 +527,57 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
 
+const LANE_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  if (ssh_start_with("[\"none\"]") < 0) return 60;
+  sy_s64 channel = -1;
+  struct sy_pollfd fds[2] = {{ SY_SELF, SY_POLL_IN, 0 }};
+  sy_u64 count = 1;
+  for (;;) {
+    if (sy_poll(fds, count, 5000) < 0) return 61;
+    if (fds[0].revents & SY_POLL_IN) {
+      sy_s64 event;
+      while ((event = sy_ssh_next(SY_SELF)) > 0) {
+        char kind[40] = {0};
+        sy_json_get_string(event, SY_STR("kind"), kind, sizeof kind);
+        sy_u64 id = event_id(event);
+        sy_close(event);
+        if (text_is(kind, "auth_none")) {
+          if (auth_reply(id, "{\"result\":\"accept\",\"next_methods\":[\"none\"]}") < 0) return 62;
+        } else if (text_is(kind, "channel_open")) {
+          channel = sy_ssh_channel_accept(id);
+          if (channel < 0) return 63;
+          fds[1] = (struct sy_pollfd){ channel, SY_POLL_IN, 0 };
+          count = 2;
+        } else if (text_is(kind, "channel_request")) {
+          /* Eight lanes fit; the ninth data_type is refused; closing a
+             lane gives the place back. */
+          sy_s64 lanes[8];
+          for (int t = 0; t < 8; t++) {
+            lanes[t] = sy_ssh_channel_lane(channel, (sy_u32)t);
+            if (lanes[t] < 0) return 70 + t;
+          }
+          if (sy_ssh_channel_lane(channel, 8) != SY_ELIMIT) return 64;
+          if (sy_close(lanes[7]) != 0) return 65;
+          if (sy_ssh_channel_lane(channel, 8) < 0) return 66;
+          if (sy_ssh_request_reply(id, 1) < 0) return 67;
+        } else if (sy_ssh_event_done(id) < 0) {
+          return 68;
+        }
+      }
+    }
+    if (count == 2 && (fds[1].revents & SY_POLL_IN)) {
+      char buffer[64];
+      sy_s64 n = sy_read(channel, buffer, sizeof buffer);
+      if (n > 0 && sy_write(channel, buffer, (sy_u64)n) != n) return 69;
+    }
+    if (fds[0].revents & (SY_POLL_HUP | SY_POLL_ERR)) return 0;
+  }
+}
+"#;
+
 const METHOD_POLICY: &str = r#"
 #include <synch.h>
 
@@ -956,6 +1007,53 @@ async fn pipelined_request_replies_retain_their_own_want_reply_bit() {
             .unwrap(),
         Some(russh::ChannelMsg::Success)
     ));
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
+#[tokio::test]
+async fn extended_data_lanes_are_capped_per_channel() {
+    let elf = compile(&ssh_prog(LANE_CAP), "ssh-lane-cap.c");
+    let harness = Harness::new();
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        Client,
+    )
+    .await
+    .unwrap();
+    assert!(client.authenticate_none("test").await.unwrap().success());
+    let channel = client.channel_open_session().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.request_shell(true),
+    )
+    .await
+    .expect("the shell request got a reply")
+    .unwrap();
+    assert_eq!(
+        round_trip(channel.into_stream(), b"lanes bounded").await,
+        b"lanes bounded"
+    );
 
     client
         .disconnect(russh::Disconnect::ByApplication, "done", "en")

@@ -441,6 +441,23 @@ impl Inner {
     /// lives.
     pub(crate) fn insert(&self, slot: Slot) -> Result<i64, i64> {
         let mut slots = self.slots.borrow_mut();
+        // Ring-bearing endpoints keep the pre-256 bound
+        // ([`crate::limits::MAX_OPEN_ENDPOINTS`]): the per-role budgets can
+        // be given back while their endpoints still hold rings, so the
+        // endpoints themselves are counted at the one place they all enter
+        // the table. The pristine slot-0 stream counts too — `select_raw`
+        // turns it into the caller's endpoint in place, never through here,
+        // and "`SY_SELF` included" must stay true either way.
+        if matches!(slot, Slot::Endpoint(_)) {
+            let open = slots
+                .iter()
+                .flatten()
+                .filter(|held| matches!(held, Slot::Endpoint(_) | Slot::Unselected(_)))
+                .count();
+            if open >= crate::limits::MAX_OPEN_ENDPOINTS {
+                return Err(errno::ELIMIT);
+            }
+        }
         if slots.is_empty() {
             // Only reachable off the served path — the arming run has no
             // endpoint table at all. Zero stays reserved there too, rather

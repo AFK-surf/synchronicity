@@ -990,11 +990,12 @@ The initial bounds:
 | Resource | Default / hard bound | Behavior at the bound |
 | --- | --- | --- |
 | Handles and poll entries | 256 | helper fails `SY_ELIMIT`; incoming channel is rejected if it cannot reserve its fd |
+| Open endpoints | 32 | every ring-bearing fd, `SY_SELF` included; the opening helper fails `SY_ELIMIT` |
 | Simultaneous SSH channels | 8 | bounded independently of handles; a full handle table may lower the effective count |
 | Extended-data lanes per channel | 8 | `sy_ssh_channel_lane` fails `SY_ELIMIT`; an existing lane for the same `data_type` is returned, not counted again |
 | Live child processes | 16 | pipe and PTY spawns together; spawn fails `SY_ELIMIT` until a process handle is closed |
 | Open PTY masters | 16 | `sy_pty_open` fails `SY_ELIMIT` |
-| Open file-transfer endpoints | 16 | `sy_file_transfer_open` fails `SY_ELIMIT` |
+| Open file-transfer endpoints | 16 | `sy_sftp_open` fails `SY_ELIMIT` |
 | SSH channel ring | 64 KiB per direction | stops reading or writing the SSH channel and applies window backpressure |
 | Outstanding control events | 32 | channel request is deferred where possible; otherwise rejected or connection closed by protocol class |
 | Total event payload | 64 KiB | oversized request rejected; no partial credential or command is delivered |
@@ -1009,11 +1010,16 @@ The initial bounds:
 Two hundred fifty-six `struct sy_pollfd` values occupy 4 KiB, still small
 beside the default 16 KiB eBPF local-call frame. The table is deliberately
 larger than any one resource's own bound, and that is only sound because the
-expansion is paired with the per-role caps above: egress, channels, lanes,
-processes, PTYs, and file transfers each have their own count, and objects,
-cursors, and JSON values are charged to the 1 MiB footprint — a larger
-integer alone would have let every spare slot allocate today's 512 KiB of
-rings.
+expansion is paired with the bounds above. Ring-bearing endpoints keep the
+old table size as their own count — 32, checked where every endpoint enters
+the table — because a per-role budget can be released while its endpoint
+still holds rings: a closed process handle leaves its stdio endpoints open,
+a channel closed from the wire leaves the guest's fd, an ended egress task
+gives back its permit. The per-role caps bound what is behind the endpoints
+— OS children, PTY masters, transfer services, lanes per channel — and
+objects, cursors, and JSON values are charged to the 1 MiB footprint. A
+larger integer alone would have let every spare slot allocate today's
+512 KiB of rings.
 
 The following allocations all have explicit individual bounds, and their
 maximum composition is bounded by the channel, handle, and event-count caps:

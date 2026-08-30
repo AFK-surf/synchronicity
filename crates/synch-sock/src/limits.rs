@@ -30,11 +30,11 @@ pub struct Limits {
     ///
     /// The table is deliberately larger than any one resource's own bound.
     /// What stops a guest turning spare slots into host memory or OS
-    /// children is not this number but the per-role caps beside it:
-    /// `max_egress`, the SSH channel cap, `MAX_LANES_PER_CHANNEL`,
-    /// `MAX_LIVE_PROCESSES`, `MAX_OPEN_PTYS`,
-    /// `MAX_OPEN_FILE_TRANSFERS`, and the footprint meter for objects,
-    /// cursors, and JSON values (`docs/SSH-SOCKETS.md` §9).
+    /// children is not this number but the bounds beside it:
+    /// `MAX_OPEN_ENDPOINTS` for everything ring-bearing, `max_egress`,
+    /// the SSH channel cap, `MAX_LANES_PER_CHANNEL`, `MAX_LIVE_PROCESSES`,
+    /// `MAX_OPEN_PTYS`, `MAX_OPEN_FILE_TRANSFERS`, and the footprint meter
+    /// for objects, cursors, and JSON values (`docs/SSH-SOCKETS.md` §9).
     pub max_handles: usize,
     /// The most outbound TCP connections one invocation may open.
     pub max_egress: usize,
@@ -165,6 +165,19 @@ pub const MAX_ACCEPTS_PER_SECOND: usize = 64;
 /// See [`MAX_ACCEPT_CONCURRENT`] — accepts per peer IP per second.
 pub const MAX_ACCEPTS_PER_IP_PER_SECOND: usize = 8;
 
+/// The most open endpoints one invocation may hold, `SY_SELF` included.
+///
+/// The 256-slot handle table's guard against ring amplification, and the
+/// pre-256 table size on purpose: every endpoint carries up to two
+/// `ring_bytes` rings, and the per-role caps alone do not bound them,
+/// because a counted budget can be released while its endpoint lives on —
+/// a closed process handle leaves its stdio endpoints open, a channel
+/// closed from the wire leaves the guest's fd in the table, an ended
+/// egress task gives its permit back while the guest keeps the handle.
+/// Counting open endpoints at insertion bounds the sum of all such
+/// residue at exactly what the 32-handle table used to allow.
+pub(crate) const MAX_OPEN_ENDPOINTS: usize = 32;
+
 /// The most concurrently live child processes one invocation may hold.
 ///
 /// A process handle stands in front of a real OS child, which no handle-table
@@ -184,7 +197,7 @@ pub(crate) const MAX_OPEN_PTYS: usize = 16;
 
 /// The most file-transfer service endpoints one invocation may hold open.
 ///
-/// Each `sy_file_transfer_open` allocates an endpoint ring and a bridge pipe
+/// Each `sy_sftp_open` allocates an endpoint ring and a bridge pipe
 /// host-side; like the process caps, this keeps the 256-slot handle table
 /// from being a multiplier on host memory (`docs/SSH-SOCKETS.md` §9).
 pub(crate) const MAX_OPEN_FILE_TRANSFERS: usize = 16;

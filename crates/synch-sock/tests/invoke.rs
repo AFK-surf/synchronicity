@@ -20,7 +20,7 @@ mod harness;
 use std::sync::Arc;
 
 use harness::{compile, exchange, peer, Harness};
-use synch_core::{FaultKind, ProcessCapability, SockStatus};
+use synch_core::{FaultKind, FileTransferCapability, ProcessCapability, SockStatus};
 use synch_sock::{DuplexStream, EffectivePolicy, Limits, SocketId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1626,6 +1626,140 @@ async fn the_handle_table_holds_256_slots() {
         vec![],
     )
     .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// Ring-bearing endpoints keep the pre-256 bound of 32, and a closed process
+/// handle gives no ring capacity back while its stdio endpoints stay open —
+/// only closing the endpoints does.
+const ENDPOINT_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 procs[16], mains[16], errs[16];
+  int n = 0;
+  for (; n < 16; n++) {
+    sy_s64 p = sy_process_spawn(1);
+    if (p == SY_ELIMIT) break;
+    if (p < 0) return 100 + n;
+    procs[n] = p;
+    mains[n] = sy_process_stdio(p, SY_STR("main"));
+    errs[n] = sy_process_stdio(p, SY_STR("stderr"));
+    if (mains[n] < 0 || errs[n] < 0) return 200 + n;
+  }
+  /* SY_SELF plus fifteen stdio pairs is 31 open endpoints; the sixteenth
+     spawn needs two more and fails whole. */
+  if (n != 15) return 1;
+  /* Closing only the process handle gives no ring capacity back. */
+  if (sy_close(procs[14]) != 0) return 2;
+  if (sy_process_spawn(1) != SY_ELIMIT) return 3;
+  /* Closing the stdio pair does. */
+  if (sy_close(mains[14]) != 0 || sy_close(errs[14]) != 0) return 4;
+  if (sy_process_spawn(1) < 0) return 5;
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn open_endpoints_are_capped_and_orphaned_stdio_still_counts() {
+    let elf = compile(ENDPOINT_CAP, "endpoint-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(ProcessCapability {
+        id: 1,
+        flags: 0x02,
+        executable: "/bin/sh".into(),
+        argv: vec!["sh".into(), "-c".into(), "true".into()],
+        allowed_signals: 0,
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// The sixteen-PTY-master bound, and a close giving the place back.
+const PTY_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  const char *spec_json = "{\"term\":\"xterm\",\"columns\":80,\"rows\":24}";
+  sy_s64 spec = sy_json_parse(spec_json, sy_strlen(spec_json));
+  if (spec < 0) return 1;
+  sy_s64 ptys[16];
+  for (int i = 0; i < 16; i++) {
+    ptys[i] = sy_pty_open(1, spec);
+    if (ptys[i] < 0) return 100 + i;
+  }
+  if (sy_pty_open(1, spec) != SY_ELIMIT) return 2;
+  if (sy_close(ptys[15]) != 0) return 3;
+  if (sy_pty_open(1, spec) < 0) return 4;
+  sy_close(spec);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn pty_masters_are_capped_per_invocation() {
+    let elf = compile(PTY_CAP, "pty-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(ProcessCapability {
+        id: 1,
+        flags: 0x01,
+        executable: "/bin/sh".into(),
+        argv: vec!["sh".into()],
+        allowed_signals: 0,
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// The sixteen-file-transfer bound, and a close giving the place back.
+const SFTP_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 fds[16];
+  for (int i = 0; i < 16; i++) {
+    fds[i] = sy_sftp_open(1);
+    if (fds[i] < 0) return 100 + i;
+  }
+  if (sy_sftp_open(1) != SY_ELIMIT) return 1;
+  if (sy_close(fds[15]) != 0) return 2;
+  if (sy_sftp_open(1) < 0) return 3;
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn file_transfer_endpoints_are_capped_per_invocation() {
+    let elf = compile(SFTP_CAP, "sftp-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.file_transfers.push(FileTransferCapability {
+        id: 1,
+        protocol: 1,
+        access: 0x01 | 0x04,
+        scope: "files".into(),
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
     assert_eq!(
         status,
         SockStatus::Ok(0),

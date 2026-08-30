@@ -554,24 +554,31 @@ fn json_mutate(
         Ok(slot) => slot,
         Err(error) => return error,
     };
+    // Every copy is scrubbed on the way out, not only the slot's own drop:
+    // the candidate clone on a refused mutation, and the value a successful
+    // one replaces — `sy_json_remove(event, "password")` is exactly the call
+    // a hygienic guest makes, and it must not leave the un-scrubbed original
+    // on the freed heap (`docs/SSH-SOCKETS.md` §12.4).
     let mut candidate = slot.value.borrow().clone();
-    if let Err(error) = mutate(&mut candidate) {
-        return error;
-    }
-    let size = match json_size(&candidate) {
+    let size = match mutate(&mut candidate).and_then(|()| json_size(&candidate)) {
         Ok(size) => size,
-        Err(error) => return error,
+        Err(error) => {
+            crate::runtime::json::zeroize_strings(&mut candidate);
+            return error;
+        }
     };
     let charged = slot.charged.get();
     if size > charged {
         if inner.charge(size - charged).is_err() {
+            crate::runtime::json::zeroize_strings(&mut candidate);
             return errno::ELIMIT;
         }
     } else {
         inner.release(charged - size);
     }
     slot.charged.set(size);
-    *slot.value.borrow_mut() = candidate;
+    let mut replaced = std::mem::replace(&mut *slot.value.borrow_mut(), candidate);
+    crate::runtime::json::zeroize_strings(&mut replaced);
     0
 }
 
@@ -599,14 +606,21 @@ fn h_json_stringify(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let value = match with(scope, |inner| json_value(inner, handle as i64))? {
+    let mut value = match with(scope, |inner| json_value(inner, handle as i64))? {
         Ok(value) => value,
         Err(error) => return ret(error),
     };
-    let Ok(text) = serde_json::to_string(&value) else {
+    let text = serde_json::to_string(&value);
+    // The clone and the serialized buffer are host-side copies of a value
+    // that may hold a credential; scrub them like the slot's drop does.
+    crate::runtime::json::zeroize_strings(&mut value);
+    let Ok(mut text) = text else {
         return ret(errno::EINVAL);
     };
-    out_str(scope, out, out_len, &text)
+    let result = out_str(scope, out, out_len, &text);
+    // SAFETY: all-zero bytes are valid UTF-8.
+    unsafe { text.as_mut_vec() }.fill(0);
+    result
 }
 
 fn h_json_new_object(

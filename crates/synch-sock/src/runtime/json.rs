@@ -69,7 +69,7 @@ impl Drop for JsonSlot {
     }
 }
 
-fn zeroize_strings(value: &mut Value) {
+pub(crate) fn zeroize_strings(value: &mut Value) {
     match value {
         Value::String(s) => {
             // All-zero bytes are valid UTF-8, so the invariant `as_mut_vec`
