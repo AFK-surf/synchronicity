@@ -1,10 +1,15 @@
 # Tree writes — an in-tree file write API for sockets
 
-Status: **proposed**. Nothing here is built. This document revisits the first
-non-goal of `docs/SOCKETS.md` §12 — *writing to the tree from a program* — and
-proposes the design that makes it safe to stop being one. Where it names
-functions and tables, it names the ones that exist today, so the seams claimed
-here are checkable against the tree before a line lands.
+Status: **implemented**. Everything here describes the built thing: the
+declaration and its arming, the `sy_put_*` writer family, the engine seam a
+commit lands through, and the bounds. This document began as the proposal that
+revisited the first non-goal of `docs/SOCKETS.md` §12 — *writing to the tree
+from a program* — and, where the built thing settled a detail differently from
+the draft, the text has been corrected to describe the built thing and says so
+at that point. The worked example ships as
+`crates/synch-sock/examples/drop-box.c`, compiled and run by the test suite on
+every build; the end-to-end engine tests are
+`crates/synch-engine/tests/tree_writes.rs`.
 
 A **tree write** is a socket program publishing a file version into the node's
 own origin trie: the same act as saving a file into a space directory, an S3
@@ -60,7 +65,7 @@ that surface:
 What membership grants a caller therefore grows by exactly one clause: a member
 may *invoke programs the callee armed*, and such a program may, within the
 prefixes its operator approved, cause the callee to publish new versions of its
-own view. DESIGN.md §12 should say that plainly (§9 below).
+own view. DESIGN.md §12 says that plainly (§9 below).
 
 ## 2. What a write is — and is not
 
@@ -220,8 +225,9 @@ extern sy_s64 sy_put_commit(sy_s64 writer, void *root32);
 
 /* Commit only if this node's own live version of the path currently has
  * content root `expected32`; all-zero expected means "no live version of
- * ours" (create). Evaluated inside the publish transaction, so there is
- * no window. SY_ESTALE if the tree moved: re-read and decide again. */
+ * ours" (create). Evaluated under the engine's tree-write commit lock,
+ * immediately before the staging lands (§5.3). SY_ESTALE if the tree
+ * moved: re-read and decide again. */
 extern sy_s64 sy_put_commit_if(sy_s64 writer, const void *expected32,
                                void *root32);
 
@@ -283,18 +289,29 @@ today, and the same future batching work would fix both (§10).
 `sy_put_commit_if`'s comparison is against *this node's own* live entry only —
 the thing this write replaces — never against other origins' versions, which a
 write cannot touch anyway. It is the read-modify-write primitive: read a path
-and its root with `sy_stat`, compute, commit-if. On a path-backed space the
-comparison still checks the published entry, not the disk: an unscanned local
-edit under the target path can be overwritten, exactly as a `PUT` overwrites it
-today. That is inherited deliberately — the fill-style shelf-life guards
-protect a directory the *operator* edits, and a directory the operator edits by
-hand is a poor candidate for a `replace` grant, which the arm prompt is where
-to notice.
+and its root with `sy_stat`, compute, commit-if. The condition is evaluated
+under the node's **tree-write commit lock**, immediately before the staging
+lands, so two socket commits of one path cannot interleave the check and the
+write. (An earlier draft claimed "inside the publish transaction, so there is
+no window"; the built thing is the lock, and the honest statement is narrower:
+the window that is closed is against *other socket writers*.) The scanner does
+not take that lock — on a path-backed space the comparison checks the
+published entry, not the disk, so an unscanned local edit under the target
+path can be overwritten and a simultaneous local save races the commit,
+exactly as either races an S3 `PUT` today. That is inherited deliberately —
+the fill-style shelf-life guards protect a directory the *operator* edits, and
+a directory the operator edits by hand is a poor candidate for a `replace`
+grant, which the arm prompt is where to notice.
 
 ## 6. Where a commit lands — the engine seam
 
 No new publish machinery. `SocketHost` (the socket runtime's only view of the
-node) grows a writer sub-API whose engine implementation is a re-composition of
+node) grows one method, `put_open`, returning a `SocketWriter` — the trait a
+writer's pump task drives: chunks in order, then one commit or delete. The
+runtime's half is the writer handle (`Slot::Writer`): a bounded staging
+buffer the guest fills, drained by a per-writer pump task that owns the
+`SocketWriter`, so closing the handle uncommitted drops it and the staging
+behind it. The engine's implementation (`TreeWriter`) is a re-composition of
 what the control-service `Put` handler already does, gate for gate:
 
 - open: `ensure_adoptable` (publishable + `.syncignore`),
@@ -303,10 +320,14 @@ what the control-service `Put` handler already does, gate for gate:
   parent dirfd pinned, detached spaces staging in the daemon's scratch, both
   behind `Adoption`'s single choke point.
 - write: `Adoption::write` on the blocking pool.
-- commit: `Adoption::commit` (fsync + rename); then detached →
-  `commit_detached_file` (CAS ingest, `stage_detached_reference` with `prev`
-  and the `b:` ad), path-backed → `scan_publish_push`; the conditional check of
-  `commit_if` rides inside the same transaction that folds the entry.
+- commit: under the node's tree-write lock, the condition (§5.3) and the
+  socket refusal are re-checked; then `Adoption::commit` (fsync + rename);
+  then detached → `commit_detached_file` (CAS ingest,
+  `stage_detached_reference` with `prev` and the `b:` ad) plus a
+  `flush_staged`, path-backed → `scan_publish_push`. The reported root is
+  taken from the staged bytes (`hash_staged`), describing what this call
+  assembled rather than whatever the tree holds by the time a scan reaches
+  it — the multipart completion's answer semantics.
 - delete: `adopt_deletion` + `scan_publish_push`, with the same
   tombstone-record fallback `delete_object` carries.
 - `ensure_publishable` is re-taken inside the commit like everywhere else on
@@ -330,65 +351,78 @@ SY_INIT_ENTRY sy_s64 declare(void) {
   sy_s64 cap = sy_json_parse(SY_STR(
       "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\"],"
       "\"max_bytes\":16777216}"));
-  sy_declare_tree_write(cap);
+  if (cap < 0) return cap;
+  sy_s64 rc = sy_declare_tree_write(cap);
   sy_close(cap);
+  if (rc < 0) return rc;
   sy_declare_name(SY_STR("drop-box"));
   sy_declare_max_streams(8);
   return 0;
 }
 
-/* `name` comes from caller-chosen Open.meta: untrusted. One flat component. */
-static int name_ok(const char *s, sy_u64 n) {
-  if (n == 0 || n > 128 || s[0] == '.') return 0;
-  for (sy_u64 i = 0; i < n; i++)
+/* `name` comes from caller-chosen Open.meta: untrusted. One flat component,
+ * no dotfiles, no controls — everything else about the path is ours. */
+static int name_ok(const char *s, sy_s64 n) {
+  if (n <= 0 || n > 128 || s[0] == '.') return 0;
+  for (sy_s64 i = 0; i < n; i++)
     if (s[i] == '/' || s[i] < 0x20) return 0;
   return 1;
 }
 
 SY_ENTRY sy_s64 entry(void) {
+  /* 1. Authorization is the handshake. Nothing here parses caller input
+     to decide who may deposit. */
   if (!sy_peer_has_space(SY_STR("code"))) return -1;
 
+  /* 2. Per-caller rate limit, keyed by device key — survives a rename. */
   sy_u8 key[32];
   sy_peer_device_key(key);
   if (sy_rate_limit(key, sizeof key, 1, 60000) < 0) return -1;
 
+  /* 3. One validated filename out of the caller's metadata. */
   char name[129];
   sy_s64 nlen = sy_conn_meta(SY_STR("name"), name, sizeof name);
   if (nlen <= 0 || nlen >= (sy_s64)sizeof name || !name_ok(name, nlen))
     return -1;
 
+  /* 4. The rest of the path is the handshake's, not the caller's. */
   char path[256];
   sy_u64 plen = 0;
-  sy_memcpy(path, "code/inbox/", 11); plen = 11;
+  sy_memcpy(path, "code/inbox/", 11);
+  plen = 11;
   plen += sy_peer_origin(path + plen, sizeof path - plen - 1);
   path[plen++] = '/';
-  sy_memcpy(path + plen, name, nlen); plen += nlen;
+  sy_memcpy(path + plen, name, (sy_u64)nlen);
+  plen += (sy_u64)nlen;
 
   sy_s64 w = sy_put_open(1, path, plen);
   if (w < 0) return w;
 
-  /* Drain the caller into staging; never lift the payload into the frame. */
+  /* 5. Drain the caller into staging; the payload never enters the frame. */
   for (;;) {
     sy_s64 n = sy_put_splice(w, SY_SELF, 65536);
-    if (n == 0) break;                       /* caller's clean EOF */
+    if (n == 0) break; /* caller's clean EOF */
     if (n == SY_EAGAIN) {
       struct sy_pollfd fds[2] = { { SY_SELF, SY_POLL_IN, 0 },
                                   { w, SY_POLL_OUT, 0 } };
       if (sy_poll(fds, 2, -1) <= 0) return -1;
       if ((fds[0].revents | fds[1].revents) & SY_POLL_ERR) return -1;
-    } else if (n < 0) return n;
+    } else if (n < 0) {
+      return n;
+    }
   }
 
+  /* 6. Commit: dispatch, poll, repeat the call for the receipt. */
   sy_u8 root[32];
   sy_s64 rc;
   while ((rc = sy_put_commit(w, root)) == SY_EAGAIN) {
     struct sy_pollfd fd = { w, SY_POLL_IN, 0 };
     if (sy_poll(&fd, 1, -1) <= 0) return -1;
   }
-  if (rc < 0) return rc;                     /* SY_EPERM: exists (create-only) */
+  if (rc < 0) return rc; /* SY_EPERM: already deposited (create-only) */
 
   char hex[65];
-  sy_hex_encode(root, sizeof root, hex, sizeof hex);
+  sy_hex_encode(root, sizeof root, hex, sizeof hex, 0);
   sy_write_all(SY_SELF, hex, 64, 5000);
   return 0;
 }
@@ -425,11 +459,14 @@ Additions to the §10 tables of `docs/SOCKETS.md`:
 | Invocation ends with uncommitted writers | Staging removed, nothing published; a crash leaves orphans to the §5.4 sweep. |
 | Invocation killed with a commit dispatched | The commit completes or fails atomically on its own; its result is discarded. |
 
-## 9. What this changes in the existing design
+## 9. What this changed in the existing design
 
-- **`docs/SOCKETS.md`** — §12 drops the first non-goal, pointing here; §7 gains
-  the `sy_put_*` family and §7.9 gains `sy_declare_tree_write`; the §10 tables
-  gain the rows above; §3's `--auto` warning names writes.
+All applied in the change that built this:
+
+- **`docs/SOCKETS.md`** — §12 drops the first non-goal, pointing here; §7.12
+  names the `sy_put_*` family and §7.9 gains `sy_declare_tree_write`; the §10
+  tables gain the rows above; the `--auto` warning at `synch socket add` names
+  writes.
 - **`docs/SSH-SOCKETS.md` §7.2** — the "read-only in v1" rationale gains its
   second half: upload support becomes a follow-up that commits through this
   API's engine seam under a tree-write declaration, instead of inventing

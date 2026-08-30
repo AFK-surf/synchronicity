@@ -75,8 +75,71 @@ pub struct FakeTree {
     /// in the engine's tree): present in the listing (they are keys in
     /// `files`), but `open` refuses them and `entry_kind` refuses to
     /// classify them, so the SFTP backend skips them rather than fabricate
-    /// attributes.
+    /// attributes — and `put_open` refuses them the way the engine refuses
+    /// a declared socket path.
     pub refused: std::collections::HashSet<String>,
+    /// What tree writers committed, observable by tests — and the "live tree"
+    /// a conditional commit is evaluated against, mirroring the engine's
+    /// condition semantics over a flat map.
+    pub written: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    /// Paths tree writers deleted, in order.
+    pub deleted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// The [`FakeTree`] half of a `sy_put_*` writer: bytes accumulate in memory,
+/// and a commit lands them in the shared `written` map under the engine's
+/// condition semantics.
+pub struct FakeWriter {
+    path: String,
+    staged: Vec<u8>,
+    written: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    deleted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl synch_sock::SocketWriter for FakeWriter {
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), HostError> {
+        self.staged.extend_from_slice(&data);
+        Ok(())
+    }
+
+    async fn commit(
+        &mut self,
+        expected: synch_sock::PutCondition,
+    ) -> Result<synch_sock::PutReceipt, HostError> {
+        let mut written = self.written.lock().unwrap();
+        match expected {
+            synch_sock::PutCondition::Any => {}
+            synch_sock::PutCondition::Absent => {
+                if written.contains_key(&self.path) {
+                    return Err(HostError::Conflict(
+                        "the path now has a live version".into(),
+                    ));
+                }
+            }
+            synch_sock::PutCondition::Root(root) => {
+                let current = written.get(&self.path).map(|bytes| Hash::new(bytes));
+                if current != Some(root) {
+                    return Err(HostError::Conflict(
+                        "the path no longer has the expected version".into(),
+                    ));
+                }
+            }
+        }
+        let bytes = std::mem::take(&mut self.staged);
+        let receipt = synch_sock::PutReceipt {
+            root: Hash::new(&bytes),
+            size: bytes.len() as u64,
+        };
+        written.insert(self.path.clone(), bytes);
+        Ok(receipt)
+    }
+
+    async fn delete(&mut self) -> Result<(), HostError> {
+        self.written.lock().unwrap().remove(&self.path);
+        self.deleted.lock().unwrap().push(self.path.clone());
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -167,6 +230,24 @@ impl SocketHost for FakeTree {
         let start = (offset as usize).min(bytes.len());
         let end = (start + len as usize).min(bytes.len());
         Ok(bytes[start..end].to_vec())
+    }
+
+    fn put_open(
+        &self,
+        path: &str,
+        _modes: u32,
+    ) -> Result<Box<dyn synch_sock::SocketWriter>, HostError> {
+        // The engine's declared-socket refusal, over the same `refused` set
+        // the read side uses.
+        if self.refused.contains(path) {
+            return Err(HostError::Denied(format!("{path} is a declared socket")));
+        }
+        Ok(Box::new(FakeWriter {
+            path: path.to_string(),
+            staged: Vec::new(),
+            written: self.written.clone(),
+            deleted: self.deleted.clone(),
+        }))
     }
 }
 

@@ -104,6 +104,8 @@ pub struct EffectivePolicy {
     pub processes: Vec<synch_core::ProcessCapability>,
     /// Exact file-transfer capabilities approved for this program root.
     pub file_transfers: Vec<synch_core::FileTransferCapability>,
+    /// Prefix-scoped tree-write capabilities approved for this program root.
+    pub tree_writes: Vec<synch_core::TreeWriteCapability>,
     /// Config the operator set, readable through `sy_config_get`.
     pub config: Vec<(String, String)>,
     /// The concurrency cap, already the lower of the two.
@@ -136,6 +138,7 @@ impl EffectivePolicy {
             egress: declared.egress.clone(),
             processes: declared.processes.clone(),
             file_transfers: declared.file_transfers.clone(),
+            tree_writes: declared.tree_writes.clone(),
             config,
             max_streams,
             stack_frame_size: declared.stack_frame_size.map(|size| size as usize),

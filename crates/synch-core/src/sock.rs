@@ -257,6 +257,9 @@ pub const MAX_DECLARED_PROCESSES: usize = 16;
 /// The most file-transfer capabilities one program may declare.
 pub const MAX_DECLARED_FILE_TRANSFERS: usize = 16;
 
+/// The most tree-write capabilities one program may declare.
+pub const MAX_DECLARED_TREE_WRITES: usize = 16;
+
 /// The most arguments in an exact process declaration.
 pub const MAX_PROCESS_ARGS: usize = 8;
 
@@ -292,6 +295,64 @@ pub struct FileTransferCapability {
     pub access: u32,
     /// Exact normalized tree scope.
     pub scope: String,
+}
+
+/// The program may publish a path where this node holds no live version of
+/// its own.
+pub const TREE_WRITE_CREATE: u32 = 0x01;
+/// The program may publish over this node's own live version of a path.
+pub const TREE_WRITE_REPLACE: u32 = 0x02;
+/// The program may publish this node's tombstone for a path.
+pub const TREE_WRITE_DELETE: u32 = 0x04;
+
+/// Bytes one tree-write commit may stage when the declaration names no bound.
+///
+/// Modest on purpose: staged bytes cost the callee disk before any
+/// operator-visible record exists, so a larger appetite has to be declared —
+/// and an unbounded one (`max_bytes: 0`) is printed loudly at the arm prompt.
+pub const DEFAULT_TREE_WRITE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A prefix-scoped tree-write capability embedded in a socket program
+/// (`docs/TREE-WRITES.md` §3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TreeWriteCapability {
+    /// Program-local, nonzero identifier.
+    pub id: u32,
+    /// `TREE_WRITE_*` mode bits.
+    pub modes: u32,
+    /// Normalized tree prefix the grant covers: `space`, or `space/dir`.
+    ///
+    /// Matched by path component, never by string prefix — `code/inbox` does
+    /// not admit `code/inbox-evil` — and there is no way to spell "every
+    /// space": a prefix begins with a space id or the declaration is invalid.
+    pub prefix: String,
+    /// The most bytes one commit may stage. `0` means unbounded.
+    pub max_bytes: u64,
+}
+
+impl TreeWriteCapability {
+    /// Whether this grant covers `path`, by whole path components.
+    pub fn covers(&self, path: &str) -> bool {
+        path == self.prefix
+            || (path.len() > self.prefix.len()
+                && path.starts_with(&self.prefix)
+                && path.as_bytes()[self.prefix.len()] == b'/')
+    }
+
+    /// The declared modes as the arm prompt and `synch socket ls` name them.
+    pub fn mode_names(&self) -> String {
+        let mut names = Vec::new();
+        if self.modes & TREE_WRITE_CREATE != 0 {
+            names.push("create");
+        }
+        if self.modes & TREE_WRITE_REPLACE != 0 {
+            names.push("replace");
+        }
+        if self.modes & TREE_WRITE_DELETE != 0 {
+            names.push("delete");
+        }
+        names.join(", ")
+    }
 }
 
 /// The most UTF-8 bytes one human-readable declaration value may carry.
@@ -426,6 +487,8 @@ pub struct Declaration {
     pub processes: Vec<ProcessCapability>,
     /// Exact file-transfer capabilities local to this program root.
     pub file_transfers: Vec<FileTransferCapability>,
+    /// Prefix-scoped tree-write capabilities local to this program root.
+    pub tree_writes: Vec<TreeWriteCapability>,
     /// A self-imposed concurrency cap, bounded by operator and daemon caps.
     pub max_streams: Option<u32>,
     /// Bytes in each eBPF local-call frame; absent means the 16 KiB default.
@@ -526,6 +589,35 @@ impl Declaration {
                 });
             }
         }
+        if self.tree_writes.len() > MAX_DECLARED_TREE_WRITES {
+            return Err(DeclarationError::TooMany {
+                field: "tree-write",
+            });
+        }
+        let mut write_ids = std::collections::BTreeSet::new();
+        for write in &self.tree_writes {
+            if write.id == 0 || !write_ids.insert(write.id) {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "tree-write",
+                    reason: "id must be nonzero and unique",
+                });
+            }
+            if write.modes == 0 || write.modes & !0x07 != 0 {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "tree-write",
+                    reason: "unsupported modes",
+                });
+            }
+            if write.prefix.len() > MAX_CAPABILITY_PATH_BYTES
+                || !display_text_is_safe(&write.prefix)
+                || crate::normalize_path(&write.prefix).as_deref() != Ok(write.prefix.as_str())
+            {
+                return Err(DeclarationError::InvalidCapability {
+                    kind: "tree-write",
+                    reason: "prefix must be a safe normalized tree path of at most 256 bytes",
+                });
+            }
+        }
         if self
             .stack_frame_size
             .is_some_and(|size| !valid_ebpf_stack_frame_size(size))
@@ -566,6 +658,13 @@ impl Declaration {
                 .expect("a file-transfer declaration contains only serializable values");
             out.push(format!("file-transfer {encoded}"));
         }
+        let mut writes = self.tree_writes.clone();
+        writes.sort_by_key(|capability| capability.id);
+        for capability in writes {
+            let encoded = serde_json::to_string(&capability)
+                .expect("a tree-write declaration contains only serializable values");
+            out.push(format!("tree-write {encoded}"));
+        }
         if let Some(n) = self.max_streams {
             out.push(format!("max-streams {n}"));
         }
@@ -605,6 +704,11 @@ impl Declaration {
                 {
                     if let Ok(capability) = serde_json::from_str(v) {
                         out.file_transfers.push(capability);
+                    }
+                }
+                Some(("tree-write", v)) if out.tree_writes.len() < MAX_DECLARED_TREE_WRITES => {
+                    if let Ok(capability) = serde_json::from_str(v) {
+                        out.tree_writes.push(capability);
                     }
                 }
                 Some(("max-streams", v)) => out.max_streams = v.parse().ok(),
@@ -882,6 +986,7 @@ mod tests {
             egress: vec!["git.internal:9418".into(), "cache.internal".into()],
             processes: vec![],
             file_transfers: vec![],
+            tree_writes: vec![],
             max_streams: Some(32),
             stack_frame_size: Some(512),
             guarded_stack_frames: Some(false),
@@ -1022,6 +1127,74 @@ mod tests {
         let parsed = Declaration::parse(&rendered);
         assert_eq!(parsed.render(), rendered);
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn a_tree_write_capability_round_trips_and_validates_its_shape() {
+        let declaration = Declaration {
+            tree_writes: vec![TreeWriteCapability {
+                id: 1,
+                modes: TREE_WRITE_CREATE | TREE_WRITE_DELETE,
+                prefix: "code/inbox".into(),
+                max_bytes: DEFAULT_TREE_WRITE_MAX_BYTES,
+            }],
+            ..Declaration::default()
+        };
+        declaration.validate().unwrap();
+        let parsed = Declaration::parse(&declaration.render());
+        assert_eq!(parsed, declaration);
+        assert_eq!(parsed.tree_writes[0].mode_names(), "create, delete");
+
+        for (modes, prefix) in [
+            (0, "code/inbox"),     // no mode at all
+            (0x08, "code/inbox"),  // an unknown mode bit
+            (0x01, "../etc"),      // not a normalized tree path
+            (0x01, "code/inbox/"), // not normalized either
+            (0x01, ""),            // no space to begin the prefix
+        ] {
+            let bad = Declaration {
+                tree_writes: vec![TreeWriteCapability {
+                    id: 1,
+                    modes,
+                    prefix: prefix.into(),
+                    max_bytes: 0,
+                }],
+                ..Declaration::default()
+            };
+            assert!(
+                matches!(
+                    bad.validate(),
+                    Err(DeclarationError::InvalidCapability {
+                        kind: "tree-write",
+                        ..
+                    })
+                ),
+                "accepted modes {modes:#x} prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_write_prefix_matches_by_component_not_by_string() {
+        let grant = TreeWriteCapability {
+            id: 1,
+            modes: TREE_WRITE_CREATE,
+            prefix: "code/inbox".into(),
+            max_bytes: 0,
+        };
+        assert!(grant.covers("code/inbox"));
+        assert!(grant.covers("code/inbox/report.txt"));
+        assert!(grant.covers("code/inbox/deep/er"));
+        assert!(!grant.covers("code/inbox-evil"), "a string prefix matched");
+        assert!(!grant.covers("code"));
+        assert!(!grant.covers("media/inbox/x"));
+
+        let space_wide = TreeWriteCapability {
+            prefix: "code".into(),
+            ..grant
+        };
+        assert!(space_wide.covers("code/anything/at/all"));
+        assert!(!space_wide.covers("codex/anything"));
     }
 
     #[test]

@@ -62,6 +62,89 @@ impl ObjectSlot {
     }
 }
 
+/// What a tree writer's one commit or delete will do, once dispatched.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PutCommand {
+    /// Publish the staged bytes, under a condition on the path's current
+    /// state.
+    Commit(crate::PutCondition),
+    /// Publish this node's tombstone instead.
+    Delete,
+}
+
+/// A tree writer the guest opened with `sy_put_open`
+/// (`docs/TREE-WRITES.md` §5).
+///
+/// The guest's half of the writer: a bounded staging buffer, the one command,
+/// and the parked result. The host's half — the engine's staging file and the
+/// commit — lives inside the writer's pump task, which drains the buffer in
+/// order and performs the command once the buffer is empty. The pump owns the
+/// [`SocketWriter`](crate::SocketWriter), so closing the handle drops it and
+/// the staging behind it.
+#[derive(Debug)]
+pub(crate) struct WriterSlot {
+    /// `space/path` being written, for `sy_errno` displays and logs.
+    pub(crate) path: String,
+    /// The armed grant this writer was opened under.
+    pub(crate) capability: synch_core::TreeWriteCapability,
+    /// Bytes accepted from the guest and not yet flushed to the host.
+    pub(crate) buf: RefCell<std::collections::VecDeque<u8>>,
+    /// Wakes the pump when bytes or the command arrive, or the handle closes.
+    ///
+    /// `notify_one` on every transition: the permit persists, so a wakeup
+    /// posted while the pump is mid-write is consumed on its next wait rather
+    /// than lost.
+    pub(crate) work: Rc<tokio::sync::Notify>,
+    /// The one commit or delete this writer will perform.
+    pub(crate) command: Cell<Option<PutCommand>>,
+    /// True from dispatch until the result is parked.
+    pub(crate) op_pending: Cell<bool>,
+    /// What the operation produced: the published root (`None` for a delete),
+    /// or the errno to report.
+    pub(crate) result: RefCell<Option<Result<Option<synch_core::Hash>, i64>>>,
+    /// A success was handed to the guest; the writer is spent.
+    pub(crate) delivered: Cell<bool>,
+    /// A sticky staging failure, or `0`.
+    pub(crate) failed: Cell<i64>,
+    /// Bytes accepted in total, checked against the grant's `max_bytes`.
+    pub(crate) accepted: Cell<u64>,
+    /// The guest let go of the handle; the pump exits and drops the staging.
+    pub(crate) closed: Cell<bool>,
+    pub(crate) ready: Arc<Readiness>,
+}
+
+impl WriterSlot {
+    /// Buffer room left, which is what `SY_POLL_OUT` reports.
+    pub(crate) fn room(&self) -> usize {
+        crate::limits::WRITER_BUFFER_BYTES.saturating_sub(self.buf.borrow().len())
+    }
+
+    fn revents(&self) -> u32 {
+        if self.failed.get() != 0 {
+            return poll::ERR;
+        }
+        match &*self.result.borrow() {
+            Some(Ok(_)) => return poll::IN,
+            Some(Err(_)) => return poll::ERR,
+            None => {}
+        }
+        if self.op_pending.get() || self.delivered.get() {
+            return 0;
+        }
+        if self.room() > 0 {
+            poll::OUT
+        } else {
+            0
+        }
+    }
+
+    /// Filters readiness for one guest poll entry: `ERR` is unconditional,
+    /// like every other handle's.
+    pub(crate) fn poll_revents(&self, events: u32) -> u32 {
+        self.revents() & (events | poll::ERR)
+    }
+}
+
 /// A directory cursor.
 #[derive(Debug)]
 pub(crate) struct CursorSlot {
@@ -95,6 +178,7 @@ pub(crate) enum Slot {
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
     Json(Rc<JsonSlot>),
+    Writer(Rc<WriterSlot>),
 }
 
 impl Slot {
@@ -114,6 +198,7 @@ impl Slot {
             // A JSON value is inert data: nothing about it will ever become
             // ready, so it reports nothing and never keeps a poll waiting.
             Slot::Json(_) => 0,
+            Slot::Writer(writer) => writer.revents(),
         }
     }
 }
@@ -157,6 +242,10 @@ pub(crate) struct Inner {
     /// given back by [`EgressPermit`] when the task ends, not when the guest
     /// closes the handle. See that type for why.
     pub(crate) egress_open: Rc<Cell<usize>>,
+    /// Commits and deletes dispatched through tree writers, against
+    /// [`MAX_PUT_COMMITS`](crate::limits::MAX_PUT_COMMITS): every one is a
+    /// published head, so the count is per invocation rather than per writer.
+    pub(crate) put_commits: Cell<u32>,
     /// Endpoints the guest let go of that still owe bytes to the far side.
     ///
     /// A handle leaves the table the moment `sy_close` is called, but the
@@ -284,6 +373,7 @@ impl Inner {
             labels: RefCell::new(Vec::new()),
             footprint: Cell::new(0),
             egress_open: Rc::new(Cell::new(0)),
+            put_commits: Cell::new(0),
             draining: RefCell::new(Vec::new()),
             async_tasks: super::tasks::TaskSet::default(),
             raw_writer: RefCell::new(None),
@@ -349,6 +439,7 @@ impl Inner {
             Some(Slot::Object(obj)) => Some(Slot2::Object(obj.clone())),
             Some(Slot::Cursor(cur)) => Some(Slot2::Cursor(cur.clone())),
             Some(Slot::Json(json)) => Some(Slot2::Json(json.clone())),
+            Some(Slot::Writer(writer)) => Some(Slot2::Writer(writer.clone())),
             None => None,
         }
     }
@@ -559,6 +650,15 @@ impl Inner {
                 self.release(json.charged.get());
                 true
             }
+            Some(Slot::Writer(writer)) => {
+                // The pump owns the host writer; telling it to stop is what
+                // drops the staging file behind an uncommitted write. An
+                // operation already dispatched still runs to completion —
+                // commits are atomic engine-side — with its result discarded.
+                writer.closed.set(true);
+                writer.work.notify_one();
+                true
+            }
             None => false,
         }
     }
@@ -717,6 +817,10 @@ impl Inner {
             // gives up on a file it was about to get. This matters especially
             // after the stream endpoint has been fully shut or removed.
             Slot::Object(obj) => !obj.pending.get() && obj.revents() == 0,
+            // A writer is quiet only once its result was handed over: an open
+            // one can always accept more, a full buffer will drain, and a
+            // dispatched commit has an answer on its way.
+            Slot::Writer(writer) => writer.delivered.get(),
             // A cursor with an answer waiting is not quiet either.
             other => other.revents() == 0,
         })
@@ -733,6 +837,7 @@ pub(crate) enum Slot2 {
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
     Json(Rc<JsonSlot>),
+    Writer(Rc<WriterSlot>),
 }
 
 /// Replaces anything a terminal should not be asked to render.

@@ -910,10 +910,14 @@ know that the session bytes are SFTP.
 Version 1 is deliberately read-only because the published virtual tree is
 immutable. Uploading needs a separate design for staging, atomic publication,
 conflicts, and attribution; pretending an SFTP close is a tree commit would be
-an implicit and unsafe mutation API. The service declaration is shown during
-arming and bounds the subtree the service itself exposes. As §1.2 explains, it
-does not claim that an armed program lacking the service is unable to export
-bytes manually through the existing `sy_open` API.
+an implicit and unsafe mutation API. That design now exists —
+`docs/TREE-WRITES.md` is the explicit mutation API, with declared prefixes,
+staging, and commit-time conditions — so upload support here is a follow-up
+that commits through the same engine seam under a tree-write declaration,
+rather than a reason to invent close-as-commit. The service declaration is
+shown during arming and bounds the subtree the service itself exposes. As §1.2
+explains, it does not claim that an armed program lacking the service is
+unable to export bytes manually through the existing `sy_open` API.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,

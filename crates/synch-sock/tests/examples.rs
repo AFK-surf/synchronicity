@@ -389,6 +389,73 @@ async fn token_gate_lets_the_right_secret_through_and_nothing_else() {
     assert_eq!(out, b"misconfigured\n");
 }
 
+#[tokio::test]
+async fn drop_box_deposits_the_stream_under_the_callers_own_name() {
+    let elf = build("drop-box.c");
+    let harness = Harness::new();
+    let granted = EffectivePolicy {
+        tree_writes: vec![synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE,
+            prefix: "code/inbox".into(),
+            max_bytes: 16 * 1024 * 1024,
+        }],
+        ..EffectivePolicy::default()
+    };
+    let payload = b"quarterly numbers".to_vec();
+
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        &payload,
+        granted.clone(),
+        peer(None),
+        vec![("name".into(), "report.pdf".into())],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        synch_core::Hash::new(&payload).to_hex(),
+        "the receipt is the root of what was deposited"
+    );
+    // The path is the handshake's identity plus the one validated name.
+    assert_eq!(
+        harness
+            .tree
+            .written
+            .lock()
+            .unwrap()
+            .get("code/inbox/laptop@cluster.example/report.pdf")
+            .map(Vec::as_slice),
+        Some(payload.as_slice())
+    );
+
+    // A name that reaches for a path of its own is refused before any write.
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"nope",
+        granted.clone(),
+        peer(None),
+        vec![("name".into(), "../escape".into())],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(-1));
+
+    // A delegate without `code` is refused by the handshake, not the payload.
+    let (status, _) = exchange(
+        &harness,
+        &elf,
+        b"nope",
+        granted,
+        peer(Some(vec!["media".into()])),
+        vec![("name".into(), "report.pdf".into())],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(-1));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_proxy_reaches_the_upstream_it_declared_and_only_that_caller() {
     // A real listener, and the port it landed on becomes the constant the

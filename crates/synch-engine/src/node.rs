@@ -144,6 +144,13 @@ struct NodeInner {
     /// sync` asked: two passes over one root would plan against each other's
     /// half-written state.
     mirror_lock: tokio::sync::Mutex<()>,
+    /// Serializes socket tree-write commits (`docs/TREE-WRITES.md` §5.3): a
+    /// conditional commit's check and the staging that follows it must not
+    /// interleave with another socket writer's commit of the same path. The
+    /// scanner does not take it — a concurrent local edit races a socket
+    /// commit exactly as it races an S3 `PUT`, and that race is documented
+    /// rather than closed.
+    tree_write_lock: tokio::sync::Mutex<()>,
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
@@ -779,6 +786,7 @@ impl Node {
                 replica_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
+                tree_write_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
                 cloud: std::sync::Mutex::new(Default::default()),
             }),
@@ -993,6 +1001,11 @@ impl Node {
     /// The configuration this node was opened with.
     pub fn config(&self) -> &NodeConfig {
         &self.inner.config
+    }
+
+    /// Serializes socket tree-write commits (`docs/TREE-WRITES.md` §5.3).
+    pub(crate) fn tree_write_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.tree_write_lock
     }
 
     /// Holds socket authorization stable while an admission becomes live.

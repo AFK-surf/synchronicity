@@ -2144,6 +2144,12 @@ CI (GitHub Actions):
   space. That power is not created by delegation — a member already reads every space
   and can hand over its device secret — but delegation is what makes an exercise of it
   bounded, dated and published where `synch delegate ls` on any node can read it.
+  Sockets extend what membership grants, and both extensions are operator-gated: a
+  member may *invoke* programs the callee has armed (docs/SOCKETS.md), and such a
+  program may, within prefixes its operator approved at arm time, cause the callee
+  to *publish* new versions of its own view (docs/TREE-WRITES.md). Every such write
+  is the callee's own assertion, so the version model bounds it — divergence stays
+  first-class and visible, and no other origin's assertion can be touched.
 - **Protocol integrity**: trie nodes are verified against requested hashes, heads
   against origin signatures, and content received from peers against object roots per
   16 KiB group. A compromised peer can withhold, but never inject bytes. LocalFs and

@@ -23,7 +23,7 @@ use synch_core::{
 };
 use synch_sock::{
     Admission, DuplexStream, EffectivePolicy, HostError, Limits, ObjectInfo, PeerIdentity,
-    SocketHost, SocketId,
+    PutCondition, PutReceipt, SocketHost, SocketId, SocketWriter,
 };
 use synch_store::{ArmCandidate, SocketRow, SocketState};
 
@@ -475,6 +475,7 @@ impl Node {
             }
         };
 
+        let peer_label = origin.canonical();
         Ok(Admission {
             program,
             program_root: resolved.root,
@@ -492,6 +493,9 @@ impl Node {
             host: Arc::new(TreeHost {
                 node: self.clone(),
                 own_origin: self.origin().clone(),
+                socket: qualified,
+                invocation: id,
+                peer: peer_label,
             }),
             id,
             slot: Some(slot),
@@ -603,16 +607,26 @@ fn socket_review(root: &Hash, generation: &Hash, declaration: &Declaration) -> H
     Hash::new(&bytes)
 }
 
-/// The tree, as a running program reads it.
+/// The tree, as a running program reaches it.
 ///
-/// Read-only, and scoped by default to this node's own view — the same scope
-/// the program itself came from. Writing is deliberately absent: publishing is
-/// the scanner's job, and a remotely-triggered publish path is a much larger
-/// surface than a remotely-triggered read one.
+/// Reads are scoped by default to this node's own view — the same scope the
+/// program itself came from — and unrestricted (`docs/SOCKETS.md` §7.6).
+/// Writes go through [`SocketHost::put_open`] and exist only behind an armed
+/// tree-write declaration (`docs/TREE-WRITES.md`): the runtime checks the
+/// grant before this host is asked, and this host re-takes the engine's own
+/// durable gates — the declared-socket refusal, `.syncignore`, recovery —
+/// at open and again at commit.
 #[derive(Debug)]
 struct TreeHost {
     node: Node,
     own_origin: OriginId,
+    /// `<space>/<path>` of the socket being served, for the tree-write audit
+    /// log.
+    socket: String,
+    /// The invocation id, likewise.
+    invocation: u64,
+    /// The caller's canonical origin, likewise.
+    peer: String,
 }
 
 impl TreeHost {
@@ -808,6 +822,305 @@ impl SocketHost for TreeHost {
                 }
             }
         }
+    }
+
+    /// Opens a writer that will publish `space/path` as this node's own new
+    /// version (`docs/TREE-WRITES.md` §6).
+    ///
+    /// The runtime has already matched the armed grant's prefix, modes and
+    /// size bound; what is taken here — and re-taken inside the commit — are
+    /// the engine's own gates, the same ones an S3 `PUT` goes through.
+    fn put_open(
+        &self,
+        path: &str,
+        modes: u32,
+    ) -> std::result::Result<Box<dyn SocketWriter>, HostError> {
+        let (space, rest) = TreeHost::split(path)?;
+        let rest = crate::scanner::normalized_adoption_path(rest)
+            .map_err(|e| HostError::Denied(e.to_string()))?;
+        if self
+            .node
+            .store()
+            .space(space)
+            .map_err(|e| HostError::Io(e.to_string()))?
+            .is_none()
+        {
+            return Err(HostError::NotFound);
+        }
+        refuse_socket_path(&self.node, space, &rest)?;
+        self.node
+            .ensure_adoptable(space, &rest)
+            .map_err(write_refusal)?;
+        Ok(Box::new(TreeWriter {
+            node: self.node.clone(),
+            space: space.to_string(),
+            path: rest,
+            modes,
+            staged: None,
+            socket: self.socket.clone(),
+            invocation: self.invocation,
+            peer: self.peer.clone(),
+        }))
+    }
+}
+
+/// A path with a `sockets` row is never writable through a program
+/// (`docs/TREE-WRITES.md` §2) — declared, armed or not, `--auto` or not.
+///
+/// This is the rule that keeps tree-write and `--auto` composable: without
+/// it, a socket armed to write a prefix containing an `--auto` socket's path
+/// is remote code persistence in two moves (write the ELF, invoke it). With
+/// it, code reaches executability only over the operator's own
+/// declare-and-arm acts.
+fn refuse_socket_path(node: &Node, space: &str, path: &str) -> std::result::Result<(), HostError> {
+    match node.store().socket(space, path) {
+        Ok(Some(_)) => Err(HostError::Denied(format!(
+            "{space}/{path} is a declared socket, and sockets are never writable through a program"
+        ))),
+        Ok(None) => Ok(()),
+        Err(e) => Err(HostError::Io(e.to_string())),
+    }
+}
+
+/// Maps an engine failure on the write path onto the guest's errno classes.
+fn write_refusal(e: EngineError) -> HostError {
+    match e {
+        EngineError::NotFound(_) => HostError::NotFound,
+        // A gate saying no — recovery, an ignore rule, an invalid path — is
+        // policy, not breakage: the guest gets `SY_EPERM` and should stop
+        // asking rather than retry.
+        EngineError::InRecovery { .. } => HostError::Denied(e.to_string()),
+        EngineError::Invalid(_) => HostError::Denied(e.to_string()),
+        other => HostError::Io(other.to_string()),
+    }
+}
+
+/// The create/replace condition, evaluated against this node's own live entry
+/// under the tree-write lock, immediately before the staging lands
+/// (`docs/TREE-WRITES.md` §5.3).
+fn evaluate_put_condition(
+    node: &Node,
+    space: &str,
+    path: &str,
+    modes: u32,
+    expected: PutCondition,
+) -> std::result::Result<(), HostError> {
+    // Re-taken inside the lock: a socket declaration may have arrived at this
+    // path since the writer opened.
+    refuse_socket_path(node, space, path)?;
+    let entry = node
+        .store()
+        .entry(node.origin(), space, path)
+        .map_err(|e| HostError::Io(e.to_string()))?;
+    let live = entry.filter(|entry| entry.kind != EntryKind::Tombstone);
+    let live_root = live.as_ref().and_then(|entry| entry.content);
+    let create = modes & synch_core::TREE_WRITE_CREATE != 0;
+    let replace = modes & synch_core::TREE_WRITE_REPLACE != 0;
+    match expected {
+        // The mode's own condition: `SY_EPERM`, because the answer will not
+        // change until the tree does — unlike a lost expectation below, which
+        // a re-read can repair.
+        PutCondition::Any => {
+            if live.is_some() && !replace {
+                return Err(HostError::Denied(format!(
+                    "{space}/{path} already has a live version here and the grant cannot replace"
+                )));
+            }
+            if live.is_none() && !create {
+                return Err(HostError::Denied(format!(
+                    "{space}/{path} has no live version here and the grant cannot create"
+                )));
+            }
+        }
+        PutCondition::Absent => {
+            if !create {
+                return Err(HostError::Denied(format!(
+                    "the grant for {space}/{path} carries no create mode"
+                )));
+            }
+            if live.is_some() {
+                return Err(HostError::Conflict(format!(
+                    "{space}/{path} now has a live version here"
+                )));
+            }
+        }
+        PutCondition::Root(expected) => {
+            if !replace {
+                return Err(HostError::Denied(format!(
+                    "the grant for {space}/{path} carries no replace mode"
+                )));
+            }
+            match live_root {
+                Some(root) if root == expected => {}
+                _ => {
+                    return Err(HostError::Conflict(format!(
+                        "{space}/{path} no longer has the expected version here"
+                    )))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A single socket write into this node's own tree, behind a `sy_put_*`
+/// writer handle (`docs/TREE-WRITES.md` §6).
+///
+/// A re-composition of what the control-service `Put` handler does, gate for
+/// gate: bytes stream into an [`Adoption`](crate::Adoption) beside the target
+/// — or the daemon's scratch, for a detached space — and a commit is the
+/// adoption's rename plus the ordinary publish path (`scan_publish_push` for
+/// a path-backed space, `commit_detached_file` plus a flush for a detached
+/// one). Dropping it uncommitted drops the adoption, whose own `Drop` removes
+/// the staging file.
+struct TreeWriter {
+    node: Node,
+    space: String,
+    path: String,
+    /// The armed grant's `TREE_WRITE_*` bits, for the commit-time condition.
+    modes: u32,
+    staged: Option<crate::Adoption>,
+    socket: String,
+    invocation: u64,
+    peer: String,
+}
+
+impl TreeWriter {
+    /// Opens the adoption lazily, so a delete-only writer stages nothing.
+    async fn ensure_staged(&mut self) -> std::result::Result<(), HostError> {
+        if self.staged.is_some() {
+            return Ok(());
+        }
+        let node = self.node.clone();
+        let (space, path) = (self.space.clone(), self.path.clone());
+        let adoption = crate::blocking::offload(move || node.open_adoption(&space, &path))
+            .await
+            .map_err(write_refusal)?;
+        self.staged = Some(adoption);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SocketWriter for TreeWriter {
+    async fn write(&mut self, data: Vec<u8>) -> std::result::Result<(), HostError> {
+        self.ensure_staged().await?;
+        let mut adoption = self.staged.take().expect("just staged");
+        let outcome = crate::blocking::offload(move || {
+            adoption.write(&data)?;
+            Ok(adoption)
+        })
+        .await;
+        match outcome {
+            Ok(adoption) => {
+                self.staged = Some(adoption);
+                Ok(())
+            }
+            Err(e) => Err(write_refusal(e)),
+        }
+    }
+
+    async fn commit(
+        &mut self,
+        expected: PutCondition,
+    ) -> std::result::Result<PutReceipt, HostError> {
+        self.ensure_staged().await?;
+        // One socket commit at a time (`docs/TREE-WRITES.md` §5.3): the
+        // condition and the staging that follows it must not interleave with
+        // another writer's commit of the same path. The scanner does not take
+        // this lock — a concurrent local edit races a socket commit exactly
+        // as it races an S3 `PUT`.
+        let node = self.node.clone();
+        let _guard = node.tree_write_lock().lock().await;
+        let check = self.node.clone();
+        let (space, path, modes) = (self.space.clone(), self.path.clone(), self.modes);
+        let (condition, detached) = crate::blocking::offload(move || {
+            check.ensure_publishable()?;
+            let detached = check.is_detached_space(&space)?;
+            Ok((
+                evaluate_put_condition(&check, &space, &path, modes, expected),
+                detached,
+            ))
+        })
+        .await
+        .map_err(write_refusal)?;
+        // A refused condition leaves the staging in place: a lost expectation
+        // is retryable once the guest has read the tree again.
+        condition?;
+
+        let adoption = self.staged.take().expect("just staged");
+        let (root, size) = if detached {
+            let scratch = crate::blocking::offload(move || adoption.commit())
+                .await
+                .map_err(write_refusal)?;
+            let committed = self
+                .node
+                .commit_detached_file(&self.space, &self.path, &scratch, synch_core::now_ns())
+                .await;
+            let cleanup = scratch.clone();
+            let _ = crate::blocking::offload(move || {
+                let _ = std::fs::remove_file(&cleanup);
+                Ok(())
+            })
+            .await;
+            let (root, size) = committed.map_err(write_refusal)?;
+            self.node.flush_staged().await.map_err(write_refusal)?;
+            (root, size)
+        } else {
+            let (root, size) = crate::blocking::offload(move || {
+                let mut adoption = adoption;
+                let size = adoption.written();
+                let root = adoption.hash_staged()?;
+                adoption.commit()?;
+                Ok((root, size))
+            })
+            .await
+            .map_err(write_refusal)?;
+            self.node.scan_publish_push().await.map_err(write_refusal)?;
+            (root, size)
+        };
+        tracing::info!(
+            socket = %self.socket,
+            invocation = self.invocation,
+            peer = %self.peer,
+            path = format!("{}/{}", self.space, self.path),
+            root = %root,
+            size,
+            "socket published a tree write"
+        );
+        Ok(PutReceipt { root, size })
+    }
+
+    async fn delete(&mut self) -> std::result::Result<(), HostError> {
+        // Checked by the runtime against the grant already; re-taken here so
+        // an embedder's host cannot be talked past it.
+        if self.modes & synch_core::TREE_WRITE_DELETE == 0 {
+            return Err(HostError::Denied(format!(
+                "the grant for {}/{} carries no delete mode",
+                self.space, self.path
+            )));
+        }
+        let node = self.node.clone();
+        let _guard = node.tree_write_lock().lock().await;
+        let check = self.node.clone();
+        let (space, path) = (self.space.clone(), self.path.clone());
+        crate::blocking::offload(move || Ok(refuse_socket_path(&check, &space, &path)))
+            .await
+            .map_err(write_refusal)??;
+        let deleted = self
+            .node
+            .delete_object(&self.space, &self.path)
+            .await
+            .map_err(write_refusal)?;
+        tracing::info!(
+            socket = %self.socket,
+            invocation = self.invocation,
+            peer = %self.peer,
+            path = format!("{}/{}", self.space, self.path),
+            still_published = deleted.still_published,
+            "socket published a tree delete"
+        );
+        Ok(())
     }
 }
 
@@ -1819,6 +2132,9 @@ mod tests {
         let host = TreeHost {
             node: node.clone(),
             own_origin: origin.clone(),
+            socket: "media/test.sock".into(),
+            invocation: 0,
+            peer: "test".into(),
         };
 
         assert_eq!(

@@ -2956,9 +2956,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             if row.auto {
                 out.line(
-                    "warning: --auto re-arms on every content change. Correct for a path \
-                     you are the only writer of; wrong for any path an S3 key, a fill or \
-                     a take can reach."
+                    "warning: --auto re-arms on every content change — tree-write grants \
+                     included, so whatever the bytes become may publish under the prefixes \
+                     they declare. Correct for a path you are the only writer of; wrong for \
+                     any path an S3 key, a fill or a take can reach."
                         .to_string(),
                 )
                 .await?;
@@ -2984,6 +2985,27 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     for line in rendered.lines() {
                         out.line(format!("  declares {line}")).await?;
                     }
+                }
+                for write in &inspected.declaration.tree_writes {
+                    out.line(format!(
+                        "  tree-write {}  {}  {}",
+                        write.prefix,
+                        write.mode_names(),
+                        if write.max_bytes == 0 {
+                            "UNBOUNDED bytes per commit".to_string()
+                        } else {
+                            format!("<= {} bytes per commit", write.max_bytes)
+                        }
+                    ))
+                    .await?;
+                }
+                if !inspected.declaration.tree_writes.is_empty() {
+                    out.line(
+                        "writes win `newest`: paths this program publishes are what every \
+                         policy-default read of them serves, cluster-wide, until adopted over"
+                            .to_string(),
+                    )
+                    .await?;
                 }
                 out.line(format!(
                     "reviewed only — approve with `synch socket arm {space}/{path} --review {}`",

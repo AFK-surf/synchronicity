@@ -286,8 +286,10 @@ impl TreeSftp {
 fn host_error(error: HostError) -> StatusCode {
     match error {
         HostError::NotFound => StatusCode::NoSuchFile,
-        HostError::NotReadable(_) => StatusCode::PermissionDenied,
-        HostError::Unavailable(_) => StatusCode::Failure,
+        HostError::NotReadable(_) | HostError::Denied(_) => StatusCode::PermissionDenied,
+        HostError::Unavailable(_) | HostError::Conflict(_) | HostError::Io(_) => {
+            StatusCode::Failure
+        }
     }
 }
 
