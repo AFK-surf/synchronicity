@@ -124,12 +124,13 @@ enum Operations {
     .init("control-plane.status", "Remote access", "synch control-plane status", surface: .node, provides: [.cloud]),
     .init("control-plane.enable", "Allow remote browsing", "synch control-plane enable", gate: .confirm, surface: .node, dirties: [.cloud]),
     .init("control-plane.disable", "Stop remote browsing", "synch control-plane disable", gate: .confirm, surface: .node, dirties: [.cloud]),
-    // Sockets (oneof 47…55), none of them surfaced.
+    // Sockets (oneof 51…55, 68…69), none of them surfaced.
     //
-    // v3 publishes a socket as an entry of its own kind, arms it against a
-    // reviewed content root, and runs it for a peer that connects. That is a
-    // whole surface — an object to review, an armed/disarmed state, a list of
-    // running invocations, a log — and this app has not one piece of it. They
+    // v3 publishes a socket as an entry of its own kind at a path the operator
+    // activated, and runs its current content for a peer that connects. That
+    // is a whole surface — a manifest to show, an activated/unavailable state,
+    // a list of running invocations, a log — and this app has not one piece
+    // of it. They
     // are listed anyway, because the registry is the count the daemon is
     // checked against: leaving an operation out is not neutrality. A new
     // operation once stayed invisible for three releases.
@@ -141,14 +142,10 @@ enum Operations {
     // `CoverageTests.everyMutationInvalidatesSomething` exempts `.notSurfaced`
     // for exactly that reason, and the exemption ends the moment one gets a
     // button.
-    .init("socket.declare", "—", "synch socket declare <space>/<path>", surface: .notSurfaced,
-          omission: "Publishes an eBPF object as a runnable entry; nothing in this app builds, inspects or reviews one."),
-    .init("socket.arm", "—", "synch socket arm <space>/<path>", surface: .notSurfaced,
-          omission: "Approves one review token to execute, which is a review decision — a button without the review it approves is the wrong half of the feature."),
-    .init("socket.disarm", "—", "synch socket disarm <space>/<path>", surface: .notSurfaced,
-          omission: "Stops a socket serving, and there is no armed state shown anywhere for a person to want stopped."),
-    .init("socket.undeclare", "—", "synch socket undeclare <space>/<path>", surface: .notSurfaced,
-          omission: "Withdraws the socket entry; the browser can name a socket row now but offers it only `rpc.delete`, which is a different question from retiring a published program."),
+    .init("socket.activate", "—", "synch socket activate <space>/<path>", surface: .notSurfaced,
+          omission: "Makes a path an executable socket — every later write to it deploys immediately, which is an authoring decision the CLI walks an operator through and a Files pane should not offer as a click."),
+    .init("socket.deactivate", "—", "synch socket deactivate <space>/<path>", surface: .notSurfaced,
+          omission: "Stops a path serving; the browser can name a socket row now but offers it only `rpc.delete`, which is a different question from retiring a published program."),
     .init("socket.ls", "—", "synch socket ls [<space>]", surface: .notSurfaced,
           omission: "The sockets of a space, with no pane to list them in and no Topic for them to fill."),
     .init("socket.sdk", "—", "synch socket sdk", surface: .notSurfaced,

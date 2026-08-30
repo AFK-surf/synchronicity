@@ -13,11 +13,7 @@
 
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("echo"));
-  sy_declare_max_streams(16);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"echo\",\"max_streams\":16}");
 
 SY_ENTRY sy_s64 entry(void) {
   char buf[2048];

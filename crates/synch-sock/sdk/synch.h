@@ -16,7 +16,7 @@
  *   1. You have no heap and no mutable globals. The stack holds at least eight
  *      local-call frames; frames are 16 KiB and guarded where the host page is
  *      no larger than that. Larger-page hosts warn and use contiguous frames
- *      unless `synchronicity.init` declares otherwise. A large buffer is a
+ *      unless the manifest declares otherwise. A large buffer is a
  *      stack buffer; state that must outlive the invocation goes in the socket
  *      map (`sy_map_*`). A `static` you write to will not link.
  *
@@ -65,18 +65,40 @@ typedef unsigned char sy_u8;
  */
 #define SY_ENTRY SY_SECTION("synchronicity.stream")
 
-/* The declaration hook. Runs once, at `synch socket arm`, with no endpoint
- * table at all — an I/O helper called from here returns SY_EPERM. What it
- * declares is what the operator is shown and approves. Undeclared capabilities
- * remain unavailable.
+/* The manifest: what the program declares about itself, as data, never code.
+ * One versioned JSON document in a non-executable `synchronicity.manifest`
+ * section. Undeclared capabilities remain unavailable, and because the
+ * manifest is part of the object's bytes, changing it changes the content
+ * root the tree publishes.
  *
- *   SY_INIT_ENTRY sy_s64 declare(void) {
- *     sy_declare_name(SY_STR("git-http"));
- *     sy_declare_egress(SY_STR("git.internal"), 9418);
- *     return 0;
- *   }
+ *   SY_MANIFEST("{"
+ *     "\"manifest\": 1,"
+ *     "\"name\": \"git-http\","
+ *     "\"egress\": [\"git.internal:9418\"],"
+ *     "\"max_streams\": 32"
+ *   "}");
+ *
+ * Members (all optional except "manifest"): "name"; "egress" (an array of
+ * "host" or "host:port" strings — a bare host is any port on it);
+ * "max_streams"; "stack_frame_size" (a multiple of 16 bytes, 16 through
+ * 32768; must match the compiler's eBPF stack-frame setting, default 16384);
+ * "guarded_stack_frames" (a bool; guards are on by default when the host page
+ * is at most 16 KiB); "processes", "file_transfers" and "tree_writes"
+ * (capability objects, documented where their helper families are). Unknown
+ * members, duplicate keys and out-of-range values are refused when the file
+ * is inspected or served — never silently dropped.
+ *
+ * SY_STRINGIZE turns a numeric -D define into the string a manifest member
+ * needs, so one source builds for several upstreams:
+ *
+ *   SY_MANIFEST("{\"manifest\":1,\"egress\":[\""
+ *               UPSTREAM_HOST ":" SY_STRINGIZE(UPSTREAM_PORT) "\"]}");
  */
-#define SY_INIT_ENTRY SY_SECTION("synchronicity.init")
+#define SY_MANIFEST(json)                                                      \
+  __attribute__((section("synchronicity.manifest"), used))                     \
+  static const char sy_manifest_json[] = json
+#define SY_STRINGIZE_(x) #x
+#define SY_STRINGIZE(x) SY_STRINGIZE_(x)
 
 /* ---- error codes ------------------------------------------------------- */
 
@@ -118,7 +140,7 @@ struct sy_pollfd {
  * own value: `sy_json_get`/`sy_json_array_get` return a *copy* as a fresh
  * handle, and `sy_json_set`/`sy_json_array_push` copy the inserted value in,
  * so no two handles ever alias and nested documents are built bottom-up.
- * Valid in `synchronicity.init` too — the declaration helpers take JSON. */
+ */
 
 #define SY_JSON_NULL   0
 #define SY_JSON_BOOL   1
@@ -210,7 +232,7 @@ extern sy_u64 sy_now_ms(void);
 extern sy_u64 sy_monotonic_ns(void);
 extern sy_s64 sy_getrandom(void *out, sy_u64 out_len);
 extern sy_s64 sy_version(char *out, sy_u64 out_len);
-/* Reads a key set by `synch socket declare --config k=v`. Deliberately not an
+/* Reads a key set by `synch socket activate --config k=v`. Deliberately not an
  * environment read: this program is reachable by every member of the cluster,
  * and on a serverless node the daemon's environment holds cloud credentials. */
 extern sy_s64 sy_config_get(const char *key, sy_u64 key_len, char *out,
@@ -288,7 +310,7 @@ extern sy_s64 sy_errno(sy_s64 handle);
 /* ---- outbound connections ---------------------------------------------- */
 
 /* Returns a handle immediately, still connecting; poll for SY_POLL_OUT. Both
- * the name and the address it resolves to are checked against the armed egress
+ * the name and the address it resolves to are checked against the manifest's egress
  * list, so a name that resolves inward is refused where the address would be. */
 extern sy_s64 sy_tcp_connect(const char *host, sy_u64 host_len, sy_u64 port);
 extern sy_s64 sy_tcp_connect_ip(const void *addr, sy_u64 addr_len, sy_u64 port);
@@ -421,9 +443,9 @@ extern sy_s64 sy_list_next(sy_s64 cursor, char *out, sy_u64 out_len);
 
 /* ---- writing the tree ---------------------------------------------------
  *
- * Requires an armed tree-write declaration (`sy_declare_tree_write`): the
- * grant's prefix, modes and size bound are the operator's approval, and the
- * helpers below are the only door to mutation. A committed write publishes
+ * Requires a tree-write capability in the manifest ("tree_writes"): the
+ * grant's prefix, modes and size bound are declared in the object itself, and
+ * the helpers below are the only door to mutation. A committed write publishes
  * this node's own new version of the path — an ordinary local publish, which
  * wins `newest` selection like any local save — and a delete publishes this
  * node's tombstone. A writer is opened, filled, committed (or deleted), and
@@ -512,56 +534,29 @@ extern sy_s64 sy_hex_encode(const void *data, sy_u64 len, void *out,
                             sy_u64 out_len, sy_u64 uppercase);
 extern sy_s64 sy_hex_decode_in_place(void *buf, sy_u64 len);
 
-/* ---- declarations: `synchronicity.init` only ---------------------------- */
-
-extern sy_s64 sy_declare_name(const char *name, sy_u64 name_len);
-/* Port 0 means any port on that host, and is printed in red at the arm prompt. */
-extern sy_s64 sy_declare_egress(const char *host, sy_u64 host_len, sy_u64 port);
-extern sy_s64 sy_declare_max_streams(sy_u64 n);
-/* Must match the compiler's eBPF stack-frame setting: a multiple of 16 bytes,
- * from 16 through 32768. The default is 16384. */
-extern sy_s64 sy_declare_stack_frame_size(sy_u64 bytes);
-/* `enabled` is 0 or 1. Guarded frames are enabled by default when the host
- * page is at most 16 KiB; larger-page hosts warn and default to contiguous
- * frames. Disabling guards permits sizes not aligned to the host page. */
-extern sy_s64 sy_declare_guarded_stack_frames(sy_u64 enabled);
-
-/* Backing-service declarations are complete JSON values embedded in the
- * object. Their ids are nonzero and local to this exact program root; no
- * operator-side registry or mutable named configuration is consulted at
- * runtime.
+/* ---- capability objects, as the manifest declares them ------------------
  *
- * A process capability is an object: {"id", "allow": ["pty" | "pipe", ...],
- * "executable" (exact absolute path), "argv" (exact argv, argv[0] included,
- * one through eight arguments of at most 128 bytes),
- * "allowed_signals": ["HUP" | "INT" | "TERM", ...]?}.
+ * A process capability ("processes") is an object: {"id" (nonzero, local to
+ * this program), "allow": ["pty" | "pipe", ...], "executable" (exact absolute
+ * path), "argv" (exact argv, argv[0] included, one through eight arguments of
+ * at most 128 bytes), "allowed_signals": ["HUP" | "INT" | "TERM", ...]?}.
  *
- *   sy_s64 shell = sy_json_parse(SY_STR(
- *       "{\"id\":1,\"allow\":[\"pty\"],\"executable\":\"/bin/bash\","
- *       "\"argv\":[\"bash\"],\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}"));
- *   sy_declare_process(shell);
- *   sy_close(shell);
- */
-extern sy_s64 sy_declare_process(sy_s64 capability_json);
-
-/* A file-transfer capability is an object: {"id", "protocol": "sftp",
- * "access": ["read", "recursive"?], "scope" (exact normalized tree path of
- * at most 256 bytes)}. */
-extern sy_s64 sy_declare_file_transfer(sy_s64 capability_json);
-
-/* A tree-write capability is an object: {"id", "prefix" (a normalized tree
- * path: a space, or space/dir), "allow": ["create" | "replace" | "delete"],
- * "max_bytes"?}. `max_bytes` bounds one commit's staged bytes; absent means
- * 16 MiB, and 0 means unbounded — printed loudly at the arm prompt, like
- * egress port 0. */
-extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
+ * A file-transfer capability ("file_transfers") is an object: {"id",
+ * "protocol": "sftp", "access": ["read", "recursive"?], "scope" (exact
+ * normalized tree path of at most 256 bytes)}.
+ *
+ * A tree-write capability ("tree_writes") is an object: {"id", "prefix" (a
+ * normalized tree path: a space, or space/dir), "allow": ["create" |
+ * "replace" | "delete"], "max_bytes"?}. `max_bytes` bounds one commit's
+ * staged bytes; absent means 16 MiB, and 0 means unbounded — which
+ * `synch socket inspect` prints loudly, like egress on any port. */
 
 /* ---- what the compiler calls whether you write it or not ---------------- */
 
 /* A struct initializer, an array assignment or a large local is enough to make
  * a C compiler emit a call to `memset` or `memcpy`. There is no libc here to
  * resolve one, and an unresolved symbol is a program that fails to *link* — at
- * arm time, on somebody else's node, a long way from the line that caused it.
+ * admission, on somebody else's node, a long way from the line that caused it.
  * So the SDK supplies them, forwarding to the host helpers.
  *
  * Clang emits an *intrinsic* rather than a call, which never meets these

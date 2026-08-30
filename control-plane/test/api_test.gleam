@@ -1792,7 +1792,7 @@ pub fn skill_md_is_served_by_every_role_test() {
   // Enough of the document to know it is the guide and not, say, index.html.
   assert string.contains(body(served), "synch daemon run")
   // The served guide includes the socket lifecycle, not only file operations.
-  assert string.contains(body(served), "synch socket arm")
+  assert string.contains(body(served), "synch socket activate")
   // And that it still carries this service's own API, which is the half an
   // agent holding nothing but this URL cannot get anywhere else: the node
   // that answers /SKILL.md is the node that answers /api.

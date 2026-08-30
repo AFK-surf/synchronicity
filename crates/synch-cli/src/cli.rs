@@ -422,7 +422,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Declare, arm and inspect this node's sockets (`docs/SOCKETS.md`).
+    /// Inspect, activate and serve this node's sockets (`docs/SOCKETS.md`).
     Socket {
         /// The socket subcommand.
         #[command(subcommand)]
@@ -799,12 +799,25 @@ pub enum ReplicaCommand {
 /// `synch socket ...`
 #[derive(Debug, Subcommand)]
 pub enum SocketCommand {
-    /// Declare a path in one of this node's spaces to be a socket.
+    /// Describe an eBPF object file: its content root, its manifest, and
+    /// whether it loads.
     ///
-    /// Declaring is not arming. It makes the scanner publish the path as a
-    /// socket; `synch socket arm` is where the program's own declaration is
-    /// printed and approved.
-    Declare {
+    /// Stateless: reads the file, computes the BLAKE3 root the tree would
+    /// name, parses and validates the `synchronicity.manifest` section, and
+    /// load-validates the stream program. Touches no database, no daemon, and
+    /// publishes nothing.
+    Inspect {
+        /// The eBPF ELF object to describe.
+        file: PathBuf,
+    },
+    /// Make a path in one of this node's spaces a socket, until `deactivate`.
+    ///
+    /// From the next scan the path publishes as a socket, and every later
+    /// write to it — an editor save, an adoption, an S3 PUT — is an
+    /// intentional deployment: the new content serves immediately, under
+    /// whatever its own manifest declares. Activate a path only when every
+    /// channel that can write it is one you mean as a deployment channel.
+    Activate {
         /// `<space>/<path>`.
         target: String,
         /// `k=v`, readable by the program through `sy_config_get`.
@@ -813,35 +826,15 @@ pub enum SocketCommand {
         /// A concurrency cap for this socket.
         #[arg(long, value_name = "N")]
         max_streams: Option<u32>,
-        /// Re-arm on every content change, without asking.
-        ///
-        /// Correct for a path you are the only writer of, and wrong for any
-        /// path an S3 key or adoption can reach — those are all ways
-        /// bytes you did not write become bytes this node publishes.
-        #[arg(long)]
-        auto: bool,
         /// A note, for `synch socket ls`.
         #[arg(long)]
         note: Option<String>,
     },
-    /// Approve the bytes a declared socket currently has.
-    Arm {
-        /// `<space>/<path>`.
-        target: String,
-        /// Approve exactly this token after reviewing the declaration.
-        ///
-        /// Without this option the command only inspects the current program
-        /// and prints the token to pass on the approving invocation.
-        #[arg(long, value_name = "HEX")]
-        review: Option<String>,
-    },
-    /// Withdraw an approval, leaving the socket published.
-    Disarm {
-        /// `<space>/<path>`.
-        target: String,
-    },
-    /// Undeclare a path; the next scan republishes it as an ordinary file.
-    Undeclare {
+    /// Stop a path being a socket; the next scan republishes it as a file.
+    ///
+    /// Admission refuses immediately; invocations already running keep their
+    /// snapshot and finish.
+    Deactivate {
         /// `<space>/<path>`.
         target: String,
     },
@@ -859,11 +852,11 @@ pub enum SocketCommand {
         #[arg(long, requires = "listen")]
         once: bool,
     },
-    /// List this node's declared sockets.
+    /// List this node's activated sockets.
     Ls {
         /// Only this space.
         space: Option<String>,
-        /// Show the armed root, what the program declared, and the policy.
+        /// Show the published root, what its manifest declares, and the policy.
         #[arg(short, long)]
         long: bool,
     },
@@ -897,8 +890,8 @@ pub enum SocketCommand {
     /// is no libc.
     ///
     /// This does not publish anything. The object it writes becomes a socket
-    /// when it is in a source and `synch socket declare` and `synch socket arm`
-    /// have been run over it.
+    /// when it is written into a source at a path `synch socket activate` has
+    /// made a socket.
     Build {
         /// The C source to compile.
         source: PathBuf,
@@ -911,10 +904,10 @@ pub enum SocketCommand {
         /// `NAME[=VALUE]`, as a compiler's `-D`.
         ///
         /// What an example guards with `#ifndef` — an upstream host, a port, a
-        /// limit — so one source builds two ways. A socket's declarations are
-        /// compiled in, so changing one of these is a rebuild and a re-arm,
-        /// which is the point: a destination that could change without another
-        /// approval is not a destination anybody approved.
+        /// limit — so one source builds two ways. A socket's manifest is
+        /// compiled in, so changing one of these is a rebuild and a new
+        /// deployment, and `synch socket inspect` shows exactly what any
+        /// object declares before it is deployed.
         #[arg(short = 'D', long = "define", value_name = "NAME[=VALUE]")]
         define: Vec<String>,
     },

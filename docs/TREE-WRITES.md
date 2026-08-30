@@ -1,7 +1,7 @@
 # Tree writes — an in-tree file write API for sockets
 
 Status: **implemented**. Everything here describes the built thing: the
-declaration and its arming, the `sy_put_*` writer family, the engine seam a
+manifest's tree-write declaration, the `sy_put_*` writer family, the engine seam a
 commit lands through, and the bounds. This document began as the proposal that
 revisited the first non-goal of `docs/SOCKETS.md` §12 — *writing to the tree
 from a program* — and, where the built thing settled a detail differently from
@@ -16,8 +16,9 @@ own origin trie: the same act as saving a file into a filesystem-source director
 `PutObject`, or a `synch adopt path` — a new assertion of *this node's* view, entering
 through the same ingest-and-publish path they all share. The caller supplies
 bytes and a verified identity. It still never supplies code, and it still never
-publishes anything: the program decides what is written, and the program is the
-operator's, armed and reviewed.
+publishes anything: the program decides what is written, and the program is
+whatever content the operator's activated path currently holds — inspectable,
+and deployed on purpose.
 
 ## 1. The non-goal, and why it is revisited
 
@@ -52,20 +53,21 @@ that surface:
    superseded roots stay readable under ordinary retention. The blast radius of
    the worst write is "this node published something ugly", which is a state
    the cluster already knows how to display and recover from.
-2. **The capability is declared in the object and approved at arm time**, like
-   egress: prefix, modes, size bound, printed at the arm prompt, pinned by the
-   content root (§3). And unlike the read declaration §7.6 dropped, this one is
-   *enforceable*: the `sy_put_*` helpers are the only way a guest can reach the
-   publish path — there is no `sy_open_root`-shaped side door to mutation — so
-   the gate is a boundary, not decoration.
+2. **The capability is declared in the object**, like egress: prefix, modes,
+   size bound, all data in the manifest, all printed by `synch socket
+   inspect` before anything is deployed (§3). And unlike the read declaration
+   §7.6 dropped, this one is *enforceable*: the `sy_put_*` helpers are the
+   only way a guest can reach the publish path — there is no
+   `sy_open_root`-shaped side door to mutation — so the gate is a boundary,
+   not decoration.
 3. **The caller still ships bytes, not decisions.** Which paths can be written,
-   under what conditions, with whose input, is the program's logic — reviewed,
-   armed, and disarmed by a byte of drift like everything else in §3.
+   under what conditions, with whose input, is the program's logic — and every
+   change to it is a deployment the operator made to an activated path.
 
 What membership grants a caller therefore grows by exactly one clause: a member
-may *invoke programs the callee armed*, and such a program may, within the
-prefixes its operator approved, cause the callee to publish new versions of its
-own view. DESIGN.md §12 says that plainly (§9 below).
+may *invoke programs at paths the callee activated*, and such a program may,
+within the prefixes its manifest declares, cause the callee to publish new
+versions of its own view. DESIGN.md §12 says that plainly (§9 below).
 
 ## 2. What a write is — and is not
 
@@ -81,41 +83,39 @@ own view. DESIGN.md §12 says that plainly (§9 below).
   version; other origins' versions survive it, per §8 of the design.
 - **`mtime_ns` is now-stamped and wins `newest`.** That is not a leak, it is
   what publishing an edit means — an honest local save claims the present
-  instant too — but it belongs in the operator's face: a socket armed to
-  replace paths is a socket whose writes will be selected by every `newest`
-  surface in the cluster until outranked or adopted over. The arm prompt says
-  so (§4).
+  instant too — but it belongs in the operator's face: a socket that replaces
+  paths is a socket whose writes will be selected by every `newest` surface in
+  the cluster until outranked or adopted over. `synch socket inspect` and
+  `synch socket ls -l` say so (§4).
 - **Files only.** No symlinks (a peer-influenced link target materializing
   into an operator's directory is an attack surface with no matching need), no
   explicit directories (parents come into being as they do for a `PUT`: created
   on disk for filesystem sources, implicit in the trie), no mode bits in v1.
-- **Never a socket.** A path that has a row in the `sockets` table — declared,
-  armed or not, `--auto` or not — is not writable and not deletable through
-  this API, `SY_EPERM`, checked at open and re-checked inside the commit. This
-  is the rule that keeps tree-write and `--auto` composable: without it, a
-  socket armed to write a prefix containing an `--auto` socket's path is remote
-  code persistence in two moves (write the ELF, invoke it). With it, code
-  reaches executability only over the operator's own declare-and-arm acts. A
-  program also cannot *declare* sockets, delegations, or anything else: the
+- **Never a socket.** An activated path is not writable and not deletable
+  through this API, `SY_EPERM`, checked at open and re-checked inside the
+  commit. This is the rule that keeps tree-write grants and activation
+  composable: without it, a socket whose manifest writes a prefix containing
+  an activated path is remote code persistence in two moves (write the ELF,
+  invoke it) — every write to an activated path is a deployment, and a
+  deployment must come over channels outside the socket runtime. A program
+  also cannot *activate* sockets, declare delegations, or anything else: the
   API stages file entries and tombstones, nothing more.
-- **Not a quota system.** What a member can cause an armed write-socket to
-  publish is bounded per invocation (§8) as sanity, and unbounded across
-  invocations as policy — the same trust stance as §12 of the design: abuse of
-  an armed socket by a member is a membership problem, and the remedy is
-  `synch trust rm` or disarming the socket.
+- **Not a quota system.** What a member can cause a write-socket to publish
+  is bounded per invocation (§8) as sanity, and unbounded across invocations
+  as policy — the same trust stance as §12 of the design: abuse of a socket by
+  a member is a membership problem, and the remedy is `synch trust rm` or
+  deactivating the socket.
 
-## 3. The declaration — `sy_declare_tree_write`
+## 3. The declaration — the manifest's `"tree_writes"` member
 
-Follows §7.9's JSON-declaration shape (`sy_declare_process`,
-`sy_declare_file_transfer`): the capability is complete data compiled into the
-object, selected at runtime by a small program-local id, and approved as a
-whole at arm time.
+Follows §7.9's capability shape (`"processes"`, `"file_transfers"`): the
+capability is complete data compiled into the object's manifest, selected at
+runtime by a small program-local id.
 
 ```c
-/* synchronicity.init only. A tree-write capability is an object:
- * {"id", "prefix", "allow": ["create" | "replace" | "delete"],
- *  "max_bytes"?}. */
-extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
+SY_MANIFEST("{\"manifest\":1,"
+            "\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\","
+            "\"allow\":[\"create\"],\"max_bytes\":16777216}]}");
 ```
 
 - `id` — nonzero u32, unique among this program's tree-write declarations,
@@ -125,8 +125,8 @@ extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
   component, never by string prefix — `code/inbox` does not admit
   `code/inbox-evil`. There is no way to spell "every space": a prefix begins
   with a space id or the declaration is invalid. The space does not have to
-  exist at arm time (an operator may arm before `source add`); a write into a
-  space this node does not publish fails at open with `SY_ENOENT`.
+  exist when the object is inspected or deployed; a write into a space this
+  node does not publish fails at open with `SY_ENOENT`.
 - `allow` — every mode named must be known, as with process flags:
   - `create` — commit to a path where this node currently publishes no live
     version of its own (absent, or tombstoned by us).
@@ -139,15 +139,14 @@ extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
   "rewrite what I published". The check is a condition on the commit, taken
   inside the publish transaction (§5.3), not on the open.
 - `max_bytes` — per-commit size bound. Default **16 MiB** when omitted; `0`
-  means unbounded and is printed in red at the arm prompt, exactly as
-  `sy_declare_egress` port `0` is. The bound exists because staged bytes cost
-  the callee disk before any operator-visible record exists; modest by default,
-  loud when waived.
+  means unbounded and is printed loudly by `synch socket inspect` and
+  `synch socket ls -l`, exactly as any-port egress is. The bound exists
+  because staged bytes cost the callee disk before any operator-visible record
+  exists; modest by default, loud when waived.
 
 At most **16** tree-write declarations per program, alongside the existing
-per-family caps. `Declaration::validate` re-checks all of the above, and the
-rendered `tree-write {json}` lines travel in `socket_arms.declared` like every
-other family — **no schema change**.
+per-family caps. `Declaration::validate` re-checks all of the above at every
+manifest parse — inspection and admission read the same object.
 
 The honesty note that §7.2 of the SSH document carries applies inverted here,
 and is worth stating in the header: the *read* side of the tree is open (§7.6
@@ -155,30 +154,28 @@ of SOCKETS.md) and a tree-write declaration does not narrow it. What the
 declaration bounds is mutation, and it bounds all of it, because the helpers
 are mutation's only door.
 
-## 4. Arming
+## 4. Inspection
 
-Nothing new mechanically — the init hook already runs at `synch socket arm`,
-`--review` already pins root, revision and rendered declaration — but the
-prompt grows teeth for this family:
+Nothing new mechanically — `synch socket inspect` already parses and renders
+the whole manifest — but the output grows teeth for this family:
 
 ```
-$ synch socket arm code/drop.sock
+$ synch socket inspect drop-box.o
 
-  program   3e0c…b551
-  size      38 KB  ·  jit 197 KB  ·  sections: init, stream
-  declares  name        drop-box
-            tree-write  code/inbox        create           ≤ 16 MiB
-            tree-write  code/inbox/tmp    create, replace, delete   UNBOUNDED
-  writes win `newest`: paths this program publishes are what every
-  policy-default read of them serves, cluster-wide, until adopted over.
-  reviewed only — approve with `synch socket arm code/drop.sock --review 77b1…9a3`
+  file     drop-box.o
+  root     3e0cd5cc41f0a2b56de5f1fca2a5f7e6d3b2c65671f2d3438bfc0d70cbb1b551
+  size     38 KB
+  declares name drop-box
+  declares tree-write {"id":1,"prefix":"code/inbox","allow":["create"],...}
+  tree-write code/inbox        create           <= 16777216 bytes per commit
+  tree-write code/inbox/tmp    create, replace, delete   UNBOUNDED bytes per commit
+  program  loads and links against this build's host API
 ```
 
-Bytes drifting disarms as always; a widened prefix is a changed root is a fresh
-review. `--auto` re-arms tree-write declarations like any others — the §3
-warning at `synch socket declare --auto` time should name writes explicitly, since
-`--auto` plus tree-write means "whatever these bytes become may publish under
-this prefix without me looking". `synch socket ls -l` lists armed tree-write
+A widened prefix is a changed root is a new deployment, visible in `synch
+socket ls -l` the moment the scanner publishes it — and activating a path
+whose future contents may declare writes is exactly the breadth the
+`synch socket activate` warning names. `synch socket ls -l` lists tree-write
 lines beside egress, and every commit is logged: socket, invocation, peer
 origin, target path, root, size. `synch socket ps` shows live writers per
 invocation (target path, bytes staged).
@@ -196,7 +193,7 @@ interrupted `PUT` today, backed by the same orphan sweep if the daemon dies
 mid-write.
 
 ```c
-/* ---- writing the tree (requires an armed tree-write declaration) -------- */
+/* ---- writing the tree (requires a tree-write grant in the manifest) ------ */
 
 /* Opens a writer on `space/path` under declared capability `id`.
  * Path must be component-wise inside the declared prefix, a normal
@@ -301,7 +298,7 @@ path can be overwritten and a simultaneous local save races the commit,
 exactly as either races an S3 `PUT` today. That is inherited deliberately —
 the tree-adoption shelf-life guards protect a directory the *operator* edits, and
 a directory the operator edits by hand is a poor candidate for a `replace`
-grant, which the arm prompt is where to notice.
+grant, which `synch socket inspect` is where to notice.
 
 ## 6. Where a commit lands — the engine seam
 
@@ -347,18 +344,9 @@ files into `code/inbox/<their-origin>/`, append-only, at most one per minute.
 ```c
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\"],"
-      "\"max_bytes\":16777216}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  if (rc < 0) return rc;
-  sy_declare_name(SY_STR("drop-box"));
-  sy_declare_max_streams(8);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"drop-box\",\"max_streams\":8,"
+            "\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\","
+            "\"allow\":[\"create\"],\"max_bytes\":16777216}]}");
 
 /* `name` comes from caller-chosen Open.meta: untrusted. One flat component,
  * no dotfiles, no controls — everything else about the path is ours. */
@@ -448,7 +436,7 @@ Additions to the §10 tables of `docs/SOCKETS.md`:
 | Tree-write declarations per program | 16 | Like the other per-family declaration caps. |
 | Open writers per invocation | 4 | Each holds a 256 KiB buffer and a staging file; counted as their own role, like endpoints, not charged to the footprint. Over: `sy_put_open` returns `SY_ELIMIT`. |
 | Writer staging buffer | 256 KiB | Full buffer is backpressure: `SY_EAGAIN`, poll `SY_POLL_OUT`. |
-| Bytes per commit | declared `max_bytes`, default 16 MiB | Enforced as bytes enter staging (`SY_ELIMIT`), not at commit. `0` = unbounded, printed red at arm. A splice source already at EOF reports the EOF before the bound, so a payload of exactly `max_bytes` lands. |
+| Bytes per commit | declared `max_bytes`, default 16 MiB | Enforced as bytes enter staging (`SY_ELIMIT`), not at commit. `0` = unbounded, printed loudly at inspection. A splice source already at EOF reports the EOF before the bound, so a payload of exactly `max_bytes` lands. |
 | Commits per invocation | 64 | Deletes included. A sanity bound on heads-per-stream, not a quota; a program that batches into fewer, larger files is the intended pressure. |
 
 | What happens | Result |
@@ -469,23 +457,24 @@ Additions to the §10 tables of `docs/SOCKETS.md`:
 All applied in the change that built this:
 
 - **`docs/SOCKETS.md`** — §12 drops the first non-goal, pointing here; §7.12
-  names the `sy_put_*` family and §7.9 gains `sy_declare_tree_write`; the §10
-  tables gain the rows above; the `--auto` warning at `synch socket declare` names
-  writes.
+  names the `sy_put_*` family and §7.9 gains the `"tree_writes"` manifest
+  member; the §10 tables gain the rows above; the breadth warning at
+  `synch socket activate` names writes.
 - **`docs/SSH-SOCKETS.md` §7.2** — the "read-only in v1" rationale gains its
   second half: upload support becomes a follow-up that commits through this
   API's engine seam under a tree-write declaration, instead of inventing
   close-as-commit.
-- **`DESIGN.md` §12** — the membership-capability sentence extends: invoking an
-  armed socket may, where its operator approved a tree-write prefix, cause the
+- **`DESIGN.md` §12** — the membership-capability sentence extends: invoking a
+  socket may, where its manifest declares a tree-write prefix, cause the
   callee to publish new versions of its own view. Mitigations in place: the
-  operator declared the prefix and modes, the version model scopes every write
-  to the callee's own origin, and divergence remains first-class.
-- **Schema** — none. Declarations render into `socket_arms.declared`; writers
-  are invocation state in the registry, gone on restart like everything there.
+  prefix and modes are data in the object the operator deployed, the version
+  model scopes every write to the callee's own origin, and divergence remains
+  first-class.
+- **Schema** — none. Declarations live in the object itself; writers are
+  invocation state in the registry, gone on restart like everything there.
 - **ABI** — two errnos (`SY_ESTALE`, `SY_EIO`), one handle kind, six helpers,
-  one declaration helper; the header/ABI/helper-table agreement tests bind them
-  as usual.
+  one manifest capability family; the header/ABI/helper-table agreement tests
+  bind them as usual.
 
 ## 10. Non-goals, and what comes after
 
@@ -500,9 +489,7 @@ Not in this design:
   commit point — the tree's own idiom.
 - **Rename/copy helpers.** A rename is read + write + delete composed in the
   program, under the modes it declared.
-- **Writes from `synchronicity.init`.** Declaration context has no endpoint
-  table and no tree access, unchanged.
-- **Writing other origins, other record kinds, or socket declarations.**
+- **Writing other origins, other record kinds, or socket activations.**
   Structural, not policy (§2).
 
 Worth building next:

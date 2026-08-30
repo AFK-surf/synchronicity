@@ -51,7 +51,13 @@ pub use pb::{
 /// addition, so it takes a bump for the reason above. It also changes what
 /// `List` means by `limit` — entries rather than paths scanned — which is a
 /// change to an existing request and takes one on its own.
-pub const CONTROL_VERSION: u32 = 4;
+///
+/// v5 replaces the declaration-and-approval socket lifecycle
+/// (`SocketDeclare`/`SocketArm`/`SocketDisarm`/`SocketUndeclare`) with
+/// path-based activation (`SocketActivate`/`SocketDeactivate`): a removal and
+/// an addition of calls, so a daemon on either side of the change must not be
+/// spoken to by a client on the other.
+pub const CONTROL_VERSION: u32 = 5;
 
 /// How many payload bytes one chunk carries.
 ///

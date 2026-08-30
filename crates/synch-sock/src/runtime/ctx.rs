@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 
-use synch_core::{Declaration, Hash};
+use synch_core::Hash;
 
 use crate::{
     abi::{errno, poll},
@@ -290,14 +290,6 @@ pub(crate) struct Inner {
     pub(crate) raw_writer: RefCell<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) ptys: RefCell<std::collections::HashMap<i64, Rc<PtySlot>>>,
 
-    /// Set while the `synchronicity.init` hook is running.
-    ///
-    /// The one flag that changes what a helper is allowed to be: a declaration
-    /// helper called outside the hook, or an I/O helper called inside it, is
-    /// `SY_EPERM`. The init hook runs with no endpoint table at all, so there
-    /// is nothing for it to reach even if the check were missed.
-    pub(crate) init_mode: bool,
-    pub(crate) declaration: RefCell<Declaration>,
     pub(crate) ssh_host_key: Option<Arc<russh::keys::PrivateKey>>,
     /// Host-side auth-rejection throttle for SSH connections served by this
     /// invocation; `None` when the invocation cannot serve SSH.
@@ -318,7 +310,6 @@ impl std::fmt::Debug for Inner {
             .field("id", &self.id)
             .field("socket", &self.socket)
             .field("program_root", &self.program_root)
-            .field("init_mode", &self.init_mode)
             .finish_non_exhaustive()
     }
 }
@@ -342,34 +333,19 @@ pub(crate) struct Ctx {
     pub(crate) inner: Rc<Inner>,
 }
 
-/// How long a declaration run may run before it is abandoned.
-///
-/// The whole hook, not just its poll waits: the serving-side idle deadline is
-/// consulted only by `sy_poll`, so a hook that never polls gets its bound
-/// here, where `declare_here` enforces it with a timeout around the run.
-pub(crate) const DECLARE_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// A key-shaped placeholder for the declaration run, which has no caller.
-///
-/// The init hook has no peer — nobody has connected, and nothing about a
-/// caller is knowable at arm time — so the identity helpers are given a
-/// delegate with an empty space list rather than a member. A hook that asked
-/// about its caller gets "not you", which is the true answer.
+/// A key-shaped placeholder for a run that has no caller: the
+/// [`Inner::bare`] base a test drives a program over, before a real
+/// invocation's authenticated identity is filled in.
 fn zero_key() -> synch_core::NodeId {
     synch_core::NodeId::from_bytes(&crate::policy::NOBODY).expect("the base point is a valid key")
 }
 
 impl Inner {
     /// A run over nothing: no handles, no caller, no output, an idle deadline
-    /// `idle` from `started` — and the *serving*-mode flags, so the arming
-    /// path is the one that must flip what it differs in ([`Inner::declaring`])
-    /// and a forgotten override breaks the declaration run loudly rather than
-    /// widening what a served guest may do.
+    /// `idle` from `started`.
     ///
-    /// Both constructions build on this one base, so a new field gets one
-    /// default here rather than one hand-written spelling per path — the
-    /// divergence that would let arming show an operator one thing while
-    /// serving runs another.
+    /// The one base every construction builds on, so a new field gets one
+    /// default here rather than one hand-written spelling per path.
     pub(crate) fn bare(
         host: Arc<dyn SocketHost>,
         started: Instant,
@@ -406,8 +382,6 @@ impl Inner {
             async_tasks: super::tasks::TaskSet::default(),
             raw_writer: RefCell::new(None),
             ptys: RefCell::new(std::collections::HashMap::new()),
-            init_mode: false,
-            declaration: RefCell::new(Declaration::default()),
             ssh_host_key: None,
             ssh_auth_throttle: None,
             live: Default::default(),
@@ -415,19 +389,6 @@ impl Inner {
             // keeps a log tail; the base is a run nobody is watching.
             registry: None,
         }
-    }
-
-    /// The declaration run's state: [`Inner::bare`] with the init hook's one
-    /// flag set. What its hook logs belongs to the operator who asked for the
-    /// arming rather than to a socket's tail, so the registry stays `None`.
-    ///
-    /// Built by mutation rather than struct update: `Inner` has a `Drop` that
-    /// aborts its tasks, so moving fields out of another `Inner` is not
-    /// allowed.
-    pub(crate) fn declaring(host: Arc<dyn SocketHost>, started: Instant) -> Inner {
-        let mut inner = Inner::bare(host, started, DECLARE_IDLE);
-        inner.init_mode = true;
-        inner
     }
 
     /// Starts helper work and makes invocation cleanup its owner.

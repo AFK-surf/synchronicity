@@ -7,13 +7,10 @@
 //!   invocation deadline now, not only a poll-wait clamp: a guest looping on
 //!   timed-out polls is ended with `Deadline` instead of spinning a worker
 //!   forever (helpers.rs:712, runtime/mod.rs).
-//! * `a_spinning_init_hook_is_ended_by_its_deadline` — the declaration hook
-//!   has a hard deadline, so `synch socket arm` (and `--auto` in the scanner)
-//!   fail instead of hanging on a hook that never polls (runtime/mod.rs).
 //! * `one_callers_faults_do_not_quarantine_a_shared_socket` — fault history is
 //!   attributed to the caller, and the quarantine latch needs two distinct
-//!   callers, so one member force-faulting a shared program cannot disarm it
-//!   for everyone (registry.rs).
+//!   callers, so one member force-faulting a shared program cannot trip its
+//!   fault window for everyone (registry.rs).
 //! * `the_in_place_decode_helpers_decode_in_place` — `sy_base64_decode_in_place`
 //!   and `sy_hex_decode_in_place` work, reading and writing the one registered
 //!   region (helpers.rs).
@@ -24,8 +21,6 @@
 ))]
 
 mod harness;
-
-use std::sync::Arc;
 
 use harness::{compile, peer, Harness};
 use synch_core::{FaultKind, NodeId, OriginId, SockStatus};
@@ -93,51 +88,6 @@ async fn an_idle_stream_is_ended_by_its_deadline() {
         SockStatus::Deadline,
         "a guest spinning in poll after its idle deadline must be ended by the runtime"
     );
-}
-
-/// A declaration hook that never finishes: no poll, no helper, just a spin.
-/// The stream entrypoint is required at load time even for the init run, and
-/// never executes here.
-const SPINNING_INIT: &str = r#"
-#include <synch.h>
-
-SY_INIT_ENTRY sy_s64 declare(void) {
-  volatile unsigned long long x = 0;
-  for (;;) { x = x + 1; }
-}
-
-SY_ENTRY sy_s64 entry(void) {
-  return 0;
-}
-"#;
-
-#[test]
-fn a_spinning_init_hook_is_ended_by_its_deadline() {
-    let elf = compile(SPINNING_INIT, "spinning-init.c");
-    let tree = Arc::new(harness::FakeTree::default());
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = synch_sock::declare(&elf, tree).map(|d| d.render());
-        let _ = done_tx.send(result);
-    });
-
-    // The hook has a hard 5 s deadline (DECLARE_IDLE): `synch socket arm`
-    // (and `--auto` in the scanner) fail rather than hang forever.
-    match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("the declaration hook outlived its deadline; arm would hang")
-        }
-        Ok(Ok(decl)) => panic!("the hook returned a declaration: {decl:?}"),
-        Ok(Err(e)) => {
-            let text = e.to_string();
-            assert!(
-                text.contains("idle deadline"),
-                "expected a deadline error, got: {text}"
-            );
-        }
-        Err(e) => panic!("channel error: {e}"),
-    }
 }
 
 /// Faults when the caller's first byte is 'X'; fine on anything else.

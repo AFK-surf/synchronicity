@@ -19,11 +19,7 @@
    under it. */
 #define ROOT "code/pub/"
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("tree-cat"));
-  sy_declare_max_streams(16);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"tree-cat\",\"max_streams\":16}");
 
 /* Reads one `\n`-terminated line. A byte at a time, which is the wrong way to
    read a stream and the right way to read one short line: it cannot read past

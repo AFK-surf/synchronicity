@@ -15,11 +15,7 @@
 
 #define TIMEOUT 10000
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("whoami"));
-  sy_declare_max_streams(8);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"whoami\",\"max_streams\":8}");
 
 /* Every out-parameter here has snprintf semantics: the return is what a
    complete write would have needed, so a value larger than the buffer is

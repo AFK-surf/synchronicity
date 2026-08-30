@@ -137,7 +137,7 @@ service Control {
 message Command {
   // 9 was `trust rebind`: a hand-made name is the only thing it could
   // re-point, and there are none (DESIGN.md 3.2).
-  reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 46;
+  reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 50;
   oneof kind {
     // `synch id`
     Id id = 1;
@@ -205,14 +205,10 @@ message Command {
     DelegateRm delegate_rm = 42;
     // `synch delegate ls`
     DelegateLs delegate_ls = 43;
-    // `synch socket declare <space>/<path> ...`
-    SocketDeclare socket_declare = 47;
-    // `synch socket arm <space>/<path>`
-    SocketArm socket_arm = 48;
-    // `synch socket disarm <space>/<path>`
-    SocketDisarm socket_disarm = 49;
-    // `synch socket undeclare <space>/<path>`
-    SocketUndeclare socket_undeclare = 50;
+    // `synch socket activate <space>/<path> ...`
+    SocketActivate socket_activate = 68;
+    // `synch socket deactivate <space>/<path>`
+    SocketDeactivate socket_deactivate = 69;
     // `synch socket ls [<space>]`
     SocketLs socket_ls = 51;
     // `synch socket sdk`
@@ -841,39 +837,26 @@ message PartInfo {
 
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
-message SocketDeclare {
+message SocketActivate {
   // `<space>/<path>`.
   string target = 1;
   // `k=v` pairs the program reads through `sy_config_get`.
   repeated string config = 2;
-  reserved 3, 4;
-  // A concurrency cap; zero means the daemon's default.
-  uint32 max_streams = 5;
-  // Re-arm on every content change. Correct for a path you are the only
-  // writer of, wrong for any path an S3 key or adoption can reach.
-  bool auto = 6;
+  // A concurrency cap for this socket; 0 means the daemon's default.
+  uint32 max_streams = 3;
   // A free-form operator note.
-  string note = 7;
+  string note = 4;
 }
 
-message SocketArm {
-  string target = 1;
-  // Empty inspects only; otherwise approve exactly this opaque review token.
-  string review = 2;
-}
-
-message SocketDisarm {
-  string target = 1;
-}
-
-message SocketUndeclare {
+message SocketDeactivate {
   string target = 1;
 }
 
 message SocketLs {
   // Empty lists every space.
   string space = 1;
-  // Show the armed root, declaration, configuration, and stream cap.
+  // Show the published root, the manifest's declaration, configuration, and
+  // the stream cap.
   bool long = 2;
 }
 

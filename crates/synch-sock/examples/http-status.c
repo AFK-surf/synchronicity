@@ -16,11 +16,7 @@
 
 #define TIMEOUT 15000
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("http-status"));
-  sy_declare_max_streams(32);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"http-status\",\"max_streams\":32}");
 
 /* Appends to a fixed buffer, refusing to overrun it. Returns the new length,
    or `cap + 1` once anything has been dropped — a marker the caller checks

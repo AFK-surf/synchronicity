@@ -365,8 +365,8 @@ impl Node {
         // someone's socket adopt its bytes and not its socket-ness: this node
         // publishes what it has declared, and it has declared nothing about a
         // path it merely received.
-        let declared_socket = self.store().is_declared_socket(space_id, rel)?;
-        let mut entry = if declared_socket {
+        let activated_socket = self.store().is_activated_socket(space_id, rel)?;
+        let mut entry = if activated_socket {
             FileEntry::socket(size, mtime_ns, content, seq)
         } else {
             FileEntry::file(size, mtime_ns, content, seq)
@@ -374,8 +374,11 @@ impl Node {
         entry.prev = previous.filter(|p| *p != content);
         entry.unix_mode = unix_mode(&metadata);
 
-        if declared_socket {
-            self.follow_socket_content(space_id, rel, &content)?;
+        // A content change under an activated path is a deployment: it
+        // publishes like any other change, and the only thing that resets is
+        // the per-socket map the old program minted.
+        if activated_socket && previous.is_some_and(|p| p != content) {
+            self.socket_content_deployed(space_id, rel, &content);
         }
 
         report.staged.push((

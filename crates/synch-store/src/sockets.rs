@@ -1,40 +1,45 @@
-//! Socket declarations and their arming records (`docs/SOCKETS.md` §3).
+//! Socket activations (`docs/SOCKETS.md` §3).
 //!
-//! Two gates stand between a published socket entry and an invocation, and both
-//! live here. Neither is ever published, replicated, or derived from a peer's
-//! trie.
+//! One gate stands between a published socket entry and an invocation, and it
+//! lives here: the **activation** ([`SocketActivation`]). It is a statement
+//! about a *path* — "what this path holds is a socket, run it" — never about a
+//! content root. It is what makes the scanner publish
+//! [`EntryKind::Socket`](synch_core::EntryKind::Socket) for the path, and it
+//! carries the operator's half of the policy: configuration, the stream cap,
+//! and a note. Every later write to an activated path is an intentional
+//! deployment: the new content serves as soon as it publishes, under whatever
+//! its own manifest declares.
 //!
-//! The **declaration** ([`SocketRow`]) is what makes the scanner publish
-//! [`EntryKind::Socket`](synch_core::EntryKind::Socket) for a path, and carries
-//! local configuration and the operator's stream cap. The **arming record**
-//! ([`ArmRow`]) is the approval, keyed by the BLAKE3 content root it approved.
+//! An activation is **local operator state**. It is never published,
+//! replicated, or derived from a peer's trie, and that is the whole point: a
+//! node's own tree is not a closed system — `synch adopt path`, `synch adopt
+//! tree --replace` and an S3 `PUT` all write bytes into a filesystem-source
+//! directory that the scanner then publishes as this node's own view — so
+//! publication cannot be the gate on execution. Activating a path is the
+//! operator saying those write paths are, for this path, deployment channels.
 //!
-//! Keeping them in two tables rather than two columns of one is what makes
-//! disarming a deletion rather than a nulling, and what makes "declared but
-//! never armed" the natural state of a socket somebody has just added a file
-//! for. It also means the arming record can be dropped by a content change
-//! without touching that local configuration, which is exactly the transition that
-//! has to be cheap and exactly the one that must not lose anything.
+//! Content roots still exist everywhere content does — CAS integrity,
+//! replication, caching, and the snapshot a running invocation keeps — but no
+//! root is ever an authorization pin.
 
 use rusqlite::{params, OptionalExtension};
-use synch_core::{Hash, OriginId};
 
 use crate::{
     db::{Store, Txn},
     error::{Result, StoreError},
 };
 
-/// The most sockets one space may declare (`docs/SOCKETS.md` §10).
+/// The most sockets one space may activate (`docs/SOCKETS.md` §10).
 ///
-/// A sanity bound rather than a quota: a declaration is operator state, and an
+/// A sanity bound rather than a quota: an activation is operator state, and an
 /// operator with sixty-five sockets in one space has a naming problem this
 /// number is not going to fix. It exists so that "how much work can one space
 /// make the scanner do per file?" has an answer.
 pub(crate) const MAX_SOCKETS_PER_SPACE: usize = 64;
 
-/// One declared socket: local configuration attached to its tree path.
+/// One activated socket path: local configuration attached to its tree path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketRow {
+pub struct SocketActivation {
     /// The space the socket lives in.
     pub space: String,
     /// Its path within that space.
@@ -43,30 +48,23 @@ pub struct SocketRow {
     pub config: Vec<(String, String)>,
     /// The concurrency cap, or `None` for the daemon's default.
     pub max_streams: Option<u32>,
-    /// Whether the declaration re-arms itself on every content change.
-    ///
-    /// Correct for a path you are the only writer of, wrong for any path an S3
-    /// key, an API write or a checkout can reach. `synch doctor` lists these,
-    /// because that list is the honest answer to "what can execute here?".
-    pub auto: bool,
     /// A free-form operator note.
     pub note: String,
-    /// When the declaration was made, unix nanoseconds.
-    pub added_at: i64,
+    /// When the path was activated, unix nanoseconds.
+    pub activated_at: i64,
 }
 
-impl SocketRow {
-    /// A declaration with nothing allowed: no egress, the daemon's default
-    /// concurrency, and no auto-arming.
-    pub fn new(space: impl Into<String>, path: impl Into<String>, added_at: i64) -> Self {
-        SocketRow {
+impl SocketActivation {
+    /// An activation with the defaults: no config, the daemon's default
+    /// concurrency, no note.
+    pub fn new(space: impl Into<String>, path: impl Into<String>, activated_at: i64) -> Self {
+        SocketActivation {
             space: space.into(),
             path: path.into(),
             config: Vec::new(),
             max_streams: None,
-            auto: false,
             note: String::new(),
-            added_at,
+            activated_at,
         }
     }
 
@@ -84,111 +82,51 @@ impl SocketRow {
     }
 }
 
-/// One arming record: the approval, and what was approved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArmRow {
-    /// The space the socket lives in.
-    pub space: String,
-    /// Its path within that space.
-    pub path: String,
-    /// The content root approved.
-    pub root: Hash,
-    /// The program's own declaration at the moment of approval.
-    ///
-    /// Stored as text so `synch socket ls` can show what was agreed to rather
-    /// than re-running the init hook and showing what is claimed now. The two
-    /// differing is the interesting case and it is only visible if the old one
-    /// was kept.
-    pub declared: String,
-    /// When it was armed, unix nanoseconds.
-    pub armed_at: i64,
-}
-
-/// The result of declaration work proposed for an atomic arming write.
-#[derive(Debug, Clone, Copy)]
-pub struct ArmCandidate<'a> {
-    /// Declaration revision that requested the work.
-    pub generation: &'a Hash,
-    /// Content root whose program was inspected.
-    pub root: &'a Hash,
-    /// Rendered result of its init hook.
-    pub declared: &'a str,
-    /// When the inspection completed, unix nanoseconds.
-    pub armed_at: i64,
-}
-
-/// What the store knows about one declared socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketState {
-    /// The declaration.
-    pub declaration: SocketRow,
-    /// Opaque identity of this exact authorization revision.
-    ///
-    /// It changes on every `put_socket` and disarm, and is the compare-and-set
-    /// token used by arming and final admission.
-    pub generation: Hash,
-    /// The arming record, if there is one.
-    pub arm: Option<ArmRow>,
-}
-
-impl SocketState {
-    /// Whether this socket may run `root` right now.
-    ///
-    /// The whole of the second gate: an armed root that is not the root the
-    /// tree currently names is not an approval of the bytes a caller would
-    /// reach, so it is not an approval at all.
-    pub fn is_armed_for(&self, root: &Hash) -> bool {
-        self.arm.as_ref().is_some_and(|arm| &arm.root == root)
-    }
-}
-
 impl Store {
-    /// Declares a path in one of this node's spaces to be a socket.
+    /// Makes a path in one of this node's spaces a socket.
     ///
-    /// Replaces any existing declaration for that path, and **does not** carry
-    /// its arming forward: a declaration that changed the allowed egress and
-    /// kept the old approval would be an approval of something nobody
-    /// approved.
-    pub fn put_socket(&self, row: &SocketRow) -> Result<()> {
-        self.transaction(|txn| txn.put_socket(row))
+    /// Replaces any existing activation for that path: re-activating with new
+    /// config or a new cap is a new bargain, applied to the next admission.
+    pub fn activate_socket(&self, row: &SocketActivation) -> Result<()> {
+        self.transaction(|txn| txn.activate_socket(row))
     }
 
-    /// Every declared socket, ordered by space then path.
-    pub fn sockets(&self) -> Result<Vec<SocketState>> {
+    /// Every activated socket, ordered by space then path.
+    pub fn socket_activations(&self) -> Result<Vec<SocketActivation>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(SELECT_SOCKETS)?;
-        let rows = stmt.query_map([], socket_state)?;
+        let mut stmt = conn.prepare(&format!("{SELECT_ACTIVATIONS} ORDER BY space, path"))?;
+        let rows = stmt.query_map([], activation_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// The declared sockets of one space.
-    pub fn sockets_in(&self, space: &str) -> Result<Vec<SocketState>> {
+    /// The activated sockets of one space.
+    pub fn socket_activations_in(&self, space: &str) -> Result<Vec<SocketActivation>> {
         Ok(self
-            .sockets()?
+            .socket_activations()?
             .into_iter()
-            .filter(|s| s.declaration.space == space)
+            .filter(|s| s.space == space)
             .collect())
     }
 
-    /// One declared socket, by space and path.
-    pub fn socket(&self, space: &str, path: &str) -> Result<Option<SocketState>> {
+    /// One activation, by space and path.
+    pub fn socket_activation(&self, space: &str, path: &str) -> Result<Option<SocketActivation>> {
         let conn = self.conn();
         Ok(conn
             .query_row(
-                &format!("{SELECT_SOCKETS_BASE} WHERE s.space = ?1 AND s.path = ?2"),
+                &format!("{SELECT_ACTIVATIONS} WHERE space = ?1 AND path = ?2"),
                 params![space, path],
-                socket_state,
+                activation_row,
             )
             .optional()?)
     }
 
-    /// True if this path is declared a socket — what the scanner asks before
-    /// deciding what kind to publish.
-    pub fn is_declared_socket(&self, space: &str, path: &str) -> Result<bool> {
+    /// True if this path is activated — what the scanner asks before deciding
+    /// what kind to publish, and what admission asks before running anything.
+    pub fn is_activated_socket(&self, space: &str, path: &str) -> Result<bool> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT 1 FROM sockets WHERE space = ?1 AND path = ?2",
+                "SELECT 1 FROM socket_activations WHERE space = ?1 AND path = ?2",
                 params![space, path],
                 |_| Ok(()),
             )
@@ -196,100 +134,12 @@ impl Store {
             .is_some())
     }
 
-    /// Removes a declaration and its arming record.
-    pub fn remove_socket(&self, space: &str, path: &str) -> Result<bool> {
-        self.transaction(|txn| {
-            txn.conn().execute(
-                "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2",
-                params![space, path],
-            )?;
-            let n = txn.conn().execute(
-                "DELETE FROM sockets WHERE space = ?1 AND path = ?2",
-                params![space, path],
-            )?;
-            Ok(n > 0)
-        })
-    }
-
-    /// Records an approval of `root`, with what the program declared.
-    pub fn arm_socket(
-        &self,
-        space: &str,
-        path: &str,
-        root: &Hash,
-        declared: &str,
-        armed_at: i64,
-    ) -> Result<()> {
-        self.transaction(|txn| txn.arm_socket(space, path, root, declared, armed_at))
-    }
-
-    /// Arms a manually reviewed program only if both facts reviewed by the
-    /// caller are still current: the local authorization revision and this
-    /// origin's published socket root.
-    pub fn arm_socket_reviewed(
-        &self,
-        origin: &OriginId,
-        space: &str,
-        path: &str,
-        candidate: ArmCandidate<'_>,
-    ) -> Result<bool> {
+    /// Removes an activation. The next scan republishes the path as an
+    /// ordinary file, and admission refuses it immediately.
+    pub fn deactivate_socket(&self, space: &str, path: &str) -> Result<bool> {
         let n = self.conn().execute(
-            "INSERT INTO socket_arms (space, path, root, declared, armed_at)
-             SELECT ?2, ?3, ?5, ?6, ?7
-              WHERE EXISTS (
-                    SELECT 1 FROM sockets
-                     WHERE space = ?2 AND path = ?3 AND generation = ?4
-              )
-                AND EXISTS (
-                    SELECT 1 FROM entries
-                     WHERE origin_id = ?1 AND space = ?2 AND path = ?3
-                       AND kind = 4 AND content = ?5
-              )
-             ON CONFLICT(space, path) DO UPDATE SET
-               root = excluded.root,
-               declared = excluded.declared,
-               armed_at = excluded.armed_at",
-            params![
-                origin.canonical(),
-                space,
-                path,
-                candidate.generation.as_bytes().to_vec(),
-                candidate.root.as_bytes().to_vec(),
-                candidate.declared,
-                candidate.armed_at,
-            ],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Auto-arms only if the declaration that requested the work still exists
-    /// unchanged and still has auto-arming enabled.
-    pub fn auto_arm_socket(
-        &self,
-        space: &str,
-        path: &str,
-        candidate: ArmCandidate<'_>,
-    ) -> Result<bool> {
-        let n = self.conn().execute(
-            "INSERT INTO socket_arms (space, path, root, declared, armed_at)
-             SELECT ?1, ?2, ?4, ?5, ?6
-              WHERE EXISTS (
-                    SELECT 1 FROM sockets
-                     WHERE space = ?1 AND path = ?2
-                       AND generation = ?3 AND auto = 1
-              )
-             ON CONFLICT(space, path) DO UPDATE SET
-               root = excluded.root,
-               declared = excluded.declared,
-               armed_at = excluded.armed_at",
-            params![
-                space,
-                path,
-                candidate.generation.as_bytes().to_vec(),
-                candidate.root.as_bytes().to_vec(),
-                candidate.declared,
-                candidate.armed_at,
-            ],
+            "DELETE FROM socket_activations WHERE space = ?1 AND path = ?2",
+            params![space, path],
         )?;
         Ok(n > 0)
     }
@@ -343,183 +193,56 @@ impl Store {
         spaces.dedup();
         Ok(Some((origin, Some(spaces))))
     }
-
-    /// Withdraws an approval, leaving the declaration standing.
-    pub fn disarm_socket(&self, space: &str, path: &str) -> Result<bool> {
-        self.transaction(|txn| {
-            // Rotation is unconditional for an existing declaration. Besides
-            // invalidating a copied manual-review token, this cancels auto-arm
-            // work that may still be running even when there is no arm row yet.
-            txn.conn().execute(
-                "UPDATE sockets SET generation = randomblob(32)
-                  WHERE space = ?1 AND path = ?2",
-                params![space, path],
-            )?;
-            let n = txn.conn().execute(
-                "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2",
-                params![space, path],
-            )?;
-            Ok(n > 0)
-        })
-    }
-
-    /// Withdraws an approval only if it still names `root`.
-    ///
-    /// Fault quarantine uses this so an old invocation cannot disarm a newer
-    /// program that was armed while the old one was still finishing.
-    pub fn disarm_socket_root(&self, space: &str, path: &str, root: &Hash) -> Result<bool> {
-        self.transaction(|txn| {
-            let n = txn.conn().execute(
-                "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2 AND root = ?3",
-                params![space, path, root.as_bytes().to_vec()],
-            )?;
-            if n > 0 {
-                txn.conn().execute(
-                    "UPDATE sockets SET generation = randomblob(32)
-                      WHERE space = ?1 AND path = ?2",
-                    params![space, path],
-                )?;
-            }
-            Ok(n > 0)
-        })
-    }
 }
 
 impl Txn<'_> {
-    /// Declares a socket, dropping any approval the old declaration carried.
-    pub fn put_socket(&self, row: &SocketRow) -> Result<()> {
-        let declared: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM sockets WHERE space = ?1 AND path != ?2",
+    /// Activates a socket path, replacing any existing activation.
+    pub fn activate_socket(&self, row: &SocketActivation) -> Result<()> {
+        let activated: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM socket_activations WHERE space = ?1 AND path != ?2",
             params![row.space, row.path],
             |r| r.get(0),
         )?;
-        if declared >= MAX_SOCKETS_PER_SPACE as i64 {
+        if activated >= MAX_SOCKETS_PER_SPACE as i64 {
             return Err(StoreError::Invalid(format!(
-                "space `{}` already declares {declared} sockets, the most one space may \
+                "space `{}` already activates {activated} sockets, the most one space may \
                  (docs/SOCKETS.md §10)",
                 row.space
             )));
         }
         self.conn().execute(
-            "INSERT INTO sockets
-               (space, path, config, max_streams, auto, note, added_at, generation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, randomblob(32))
+            "INSERT INTO socket_activations
+               (space, path, config, max_streams, note, activated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(space, path) DO UPDATE SET
                config = excluded.config,
                max_streams = excluded.max_streams,
-               auto = excluded.auto,
                note = excluded.note,
-               generation = randomblob(32)",
+               activated_at = excluded.activated_at",
             params![
                 row.space,
                 row.path,
                 join_pairs(&row.config),
                 row.max_streams,
-                i64::from(row.auto),
                 row.note,
-                row.added_at,
+                row.activated_at,
             ],
         )?;
-        // A re-declaration is a new bargain, so the old approval goes with the
-        // old terms. Doing this in the same transaction is what keeps a crash
-        // from leaving an approval standing over a policy nobody approved.
-        self.conn().execute(
-            "DELETE FROM socket_arms WHERE space = ?1 AND path = ?2",
-            params![row.space, row.path],
-        )?;
-        Ok(())
-    }
-
-    /// Records an approval of `root`.
-    pub fn arm_socket(
-        &self,
-        space: &str,
-        path: &str,
-        root: &Hash,
-        declared: &str,
-        armed_at: i64,
-    ) -> Result<()> {
-        let known: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM sockets WHERE space = ?1 AND path = ?2",
-            params![space, path],
-            |r| r.get(0),
-        )?;
-        if known == 0 {
-            return Err(StoreError::Invalid(format!(
-                "`{space}/{path}` is not declared a socket, so there is nothing to arm"
-            )));
-        }
-        self.conn().execute(
-            "INSERT INTO socket_arms (space, path, root, declared, armed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(space, path) DO UPDATE SET
-               root = excluded.root,
-               declared = excluded.declared,
-               armed_at = excluded.armed_at",
-            params![space, path, root.as_bytes().to_vec(), declared, armed_at],
-        )?;
         Ok(())
     }
 }
 
-const SELECT_SOCKETS_BASE: &str = "SELECT s.space, s.path, s.config,
-            s.max_streams, s.auto, s.note, s.added_at, s.generation,
-            a.root, a.declared, a.armed_at
-       FROM sockets s
-       LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path";
+const SELECT_ACTIVATIONS: &str =
+    "SELECT space, path, config, max_streams, note, activated_at FROM socket_activations";
 
-const SELECT_SOCKETS: &str = "SELECT s.space, s.path, s.config,
-            s.max_streams, s.auto, s.note, s.added_at, s.generation,
-            a.root, a.declared, a.armed_at
-       FROM sockets s
-       LEFT JOIN socket_arms a ON a.space = s.space AND a.path = s.path
-      ORDER BY s.space, s.path";
-
-fn socket_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketState> {
-    let space: String = row.get(0)?;
-    let path: String = row.get(1)?;
-    let declaration = SocketRow {
-        space: space.clone(),
-        path: path.clone(),
+fn activation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SocketActivation> {
+    Ok(SocketActivation {
+        space: row.get(0)?,
+        path: row.get(1)?,
         config: split_pairs(&row.get::<_, String>(2)?),
         max_streams: row.get(3)?,
-        auto: row.get::<_, i64>(4)? != 0,
-        note: row.get(5)?,
-        added_at: row.get(6)?,
-    };
-    let generation = hash_column(row, 7, "sockets.generation")?;
-    let arm = match row.get::<_, Option<Vec<u8>>>(8)? {
-        Some(bytes) => {
-            let root = hash_bytes(&bytes, 8, "socket_arms.root")?;
-            Some(ArmRow {
-                space,
-                path,
-                root,
-                declared: row.get(9)?,
-                armed_at: row.get(10)?,
-            })
-        }
-        None => None,
-    };
-    Ok(SocketState {
-        declaration,
-        generation,
-        arm,
-    })
-}
-
-fn hash_column(row: &rusqlite::Row<'_>, column: usize, name: &str) -> rusqlite::Result<Hash> {
-    let bytes: Vec<u8> = row.get(column)?;
-    hash_bytes(&bytes, column, name)
-}
-
-fn hash_bytes(bytes: &[u8], column: usize, name: &str) -> rusqlite::Result<Hash> {
-    Hash::from_slice(bytes).map_err(|_| {
-        rusqlite::Error::FromSqlConversionFailure(
-            column,
-            rusqlite::types::Type::Blob,
-            format!("{name} is not a 32-byte hash").into(),
-        )
+        note: row.get(4)?,
+        activated_at: row.get(5)?,
     })
 }
 
@@ -556,179 +279,90 @@ mod tests {
     use super::*;
     use crate::testutil::store;
 
-    fn row() -> SocketRow {
-        SocketRow {
+    fn row() -> SocketActivation {
+        SocketActivation {
             config: vec![("upstream".into(), "git.internal".into())],
             max_streams: Some(32),
-            ..SocketRow::new("code", "git.sock", 1)
+            ..SocketActivation::new("code", "git.sock", 1)
         }
     }
 
     #[test]
-    fn a_declaration_round_trips() {
+    fn an_activation_round_trips() {
         let (_d, store) = store();
-        store.put_socket(&row()).unwrap();
-        let got = store.socket("code", "git.sock").unwrap().unwrap();
-        assert_eq!(got.declaration, row());
-        assert_eq!(got.arm, None, "a fresh declaration is not armed");
-        assert!(store.is_declared_socket("code", "git.sock").unwrap());
-        assert!(!store.is_declared_socket("code", "other.sock").unwrap());
-    }
-
-    #[test]
-    fn arming_pins_a_root_and_only_that_root() {
-        let (_d, store) = store();
-        store.put_socket(&row()).unwrap();
-        let armed = Hash::new(b"elf-v1");
-        store
-            .arm_socket("code", "git.sock", &armed, "egress git.internal:9418", 2)
+        store.activate_socket(&row()).unwrap();
+        let got = store
+            .socket_activation("code", "git.sock")
+            .unwrap()
             .unwrap();
-
-        let got = store.socket("code", "git.sock").unwrap().unwrap();
-        assert!(got.is_armed_for(&armed));
-        assert!(
-            !got.is_armed_for(&Hash::new(b"elf-v2")),
-            "an approval of one root approved a different one"
-        );
-        assert_eq!(got.arm.unwrap().declared, "egress git.internal:9418");
+        assert_eq!(got, row());
+        assert!(store.is_activated_socket("code", "git.sock").unwrap());
+        assert!(!store.is_activated_socket("code", "other.sock").unwrap());
     }
 
     #[test]
-    fn arming_something_undeclared_is_refused() {
+    fn reactivating_replaces_the_terms() {
         let (_d, store) = store();
-        let out = store.arm_socket("code", "nope.sock", &Hash::new(b"x"), "", 2);
-        assert!(matches!(out, Err(StoreError::Invalid(_))), "{out:?}");
-    }
-
-    #[test]
-    fn redeclaring_drops_the_approval_it_was_not_given_for() {
-        // The transition that has to be safe: an operator changes config and
-        // the old approval must not carry over onto the new terms.
-        let (_d, store) = store();
-        store.put_socket(&row()).unwrap();
-        store
-            .arm_socket("code", "git.sock", &Hash::new(b"elf"), "", 2)
-            .unwrap();
-
+        store.activate_socket(&row()).unwrap();
         let mut changed = row();
         changed.config.push(("mode".into(), "strict".into()));
-        store.put_socket(&changed).unwrap();
-
-        let got = store.socket("code", "git.sock").unwrap().unwrap();
-        assert_eq!(got.declaration.config, changed.config);
-        assert!(
-            got.arm.is_none(),
-            "a re-declaration carried its old approval onto new terms"
-        );
-    }
-
-    #[test]
-    fn redeclaring_changes_the_compare_and_set_generation() {
-        let (_d, store) = store();
-        store.put_socket(&row()).unwrap();
-        let before = store.socket("code", "git.sock").unwrap().unwrap();
-
-        store.put_socket(&row()).unwrap();
-        let after = store.socket("code", "git.sock").unwrap().unwrap();
-
-        assert_ne!(before.generation, after.generation);
-        assert!(
-            !store
-                .auto_arm_socket(
-                    "code",
-                    "git.sock",
-                    ArmCandidate {
-                        generation: &before.generation,
-                        root: &Hash::new(b"elf"),
-                        declared: "",
-                        armed_at: 3,
-                    },
-                )
-                .unwrap(),
-            "stale work armed a later declaration"
-        );
-        assert!(store
-            .socket("code", "git.sock")
+        changed.max_streams = Some(8);
+        store.activate_socket(&changed).unwrap();
+        let got = store
+            .socket_activation("code", "git.sock")
             .unwrap()
-            .unwrap()
-            .arm
-            .is_none());
-    }
-
-    #[test]
-    fn disarming_keeps_the_declaration_and_removal_takes_both() {
-        let (_d, store) = store();
-        store.put_socket(&row()).unwrap();
-        store
-            .arm_socket("code", "git.sock", &Hash::new(b"elf"), "", 2)
             .unwrap();
-
-        assert!(store.disarm_socket("code", "git.sock").unwrap());
-        let got = store.socket("code", "git.sock").unwrap().unwrap();
-        assert!(got.arm.is_none());
-        assert!(
-            store.is_declared_socket("code", "git.sock").unwrap(),
-            "disarming removed the declaration too"
-        );
-
-        assert!(store.remove_socket("code", "git.sock").unwrap());
-        assert!(store.socket("code", "git.sock").unwrap().is_none());
+        assert_eq!(got.config, changed.config);
+        assert_eq!(got.max_streams, Some(8));
     }
 
     #[test]
-    fn disarm_invalidates_auto_arm_work_already_in_flight() {
+    fn deactivating_removes_the_gate() {
         let (_d, store) = store();
-        let mut automatic = row();
-        automatic.auto = true;
-        store.put_socket(&automatic).unwrap();
-        let before = store.socket("code", "git.sock").unwrap().unwrap();
-        let root = Hash::new(b"elf");
-        store.arm_socket("code", "git.sock", &root, "", 2).unwrap();
-
-        assert!(store.disarm_socket("code", "git.sock").unwrap());
-        let after = store.socket("code", "git.sock").unwrap().unwrap();
-        assert_ne!(before.generation, after.generation);
-        assert!(
-            !store
-                .auto_arm_socket(
-                    "code",
-                    "git.sock",
-                    ArmCandidate {
-                        generation: &before.generation,
-                        root: &Hash::new(b"new elf"),
-                        declared: "",
-                        armed_at: 3,
-                    },
-                )
-                .unwrap(),
-            "auto-arm work that began before disarm restored the approval"
-        );
+        store.activate_socket(&row()).unwrap();
+        assert!(store.deactivate_socket("code", "git.sock").unwrap());
+        assert!(!store.is_activated_socket("code", "git.sock").unwrap());
         assert!(store
-            .socket("code", "git.sock")
+            .socket_activation("code", "git.sock")
             .unwrap()
-            .unwrap()
-            .arm
             .is_none());
+        assert!(
+            !store.deactivate_socket("code", "git.sock").unwrap(),
+            "deactivating twice reports there was nothing to remove"
+        );
     }
 
     #[test]
-    fn a_space_may_not_declare_more_sockets_than_the_bound() {
+    fn listing_filters_by_space() {
+        let (_d, store) = store();
+        store.activate_socket(&row()).unwrap();
+        store
+            .activate_socket(&SocketActivation::new("docs", "d.sock", 2))
+            .unwrap();
+        assert_eq!(store.socket_activations().unwrap().len(), 2);
+        let one = store.socket_activations_in("docs").unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].qualified(), "docs/d.sock");
+    }
+
+    #[test]
+    fn a_space_may_not_activate_more_sockets_than_the_bound() {
         let (_d, store) = store();
         for i in 0..MAX_SOCKETS_PER_SPACE {
             store
-                .put_socket(&SocketRow::new("code", format!("s{i}.sock"), 0))
+                .activate_socket(&SocketActivation::new("code", format!("s{i}.sock"), 0))
                 .unwrap();
         }
-        // Re-declaring one already counted stays legal: the bound is on how
+        // Re-activating one already counted stays legal: the bound is on how
         // many exist, not on how often they are written.
         store
-            .put_socket(&SocketRow::new("code", "s0.sock", 0))
+            .activate_socket(&SocketActivation::new("code", "s0.sock", 0))
             .unwrap();
-        let out = store.put_socket(&SocketRow::new("code", "one-too-many.sock", 0));
+        let out = store.activate_socket(&SocketActivation::new("code", "one-too-many.sock", 0));
         assert!(matches!(out, Err(StoreError::Invalid(_))), "{out:?}");
         // Another space has its own budget.
         store
-            .put_socket(&SocketRow::new("docs", "s.sock", 0))
+            .activate_socket(&SocketActivation::new("docs", "s.sock", 0))
             .unwrap();
     }
 }

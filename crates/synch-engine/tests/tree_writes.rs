@@ -3,7 +3,7 @@
 //!
 //! Everything here runs a compiled program against the engine's own gates: a
 //! commit is an ordinary local publish through the `Adoption` seam, a delete
-//! is this node's tombstone, and a declared socket path is never writable.
+//! is this node's tombstone, and an activated socket path is never writable.
 //! The runtime's own lifecycle tests live in `synch-sock/tests/tree_writes.rs`.
 
 #![cfg(all(
@@ -15,7 +15,7 @@ use std::path::Path;
 
 use synch_core::{EntryKind, Hash, SockStatus};
 use synch_engine::{sockets::SocketConnection, Node, NodeConfig};
-use synch_store::SocketRow;
+use synch_store::SocketActivation;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A node with one filesystem source and its directory.
@@ -39,17 +39,13 @@ fn compile(source: &str, name: &str) -> Vec<u8> {
     synch_cc::compile(source, name, &[("synch.h", synch_sock::sdk::HEADER)], &[]).unwrap()
 }
 
-/// Declares, scans, inspects and approves one socket program.
+/// Activates a path, writes one compiled program to it, and publishes it.
 async fn install(node: &Node, space_dir: &Path, path: &str, source: &str) {
     let elf = compile(source, "prog.c");
     write(space_dir, path, &elf);
-    node.socket_declare(&SocketRow::new("code", path, synch_core::now_ns()))
+    node.socket_activate(&SocketActivation::new("code", path, synch_core::now_ns()))
         .unwrap();
     node.scan_and_publish().unwrap();
-    let inspected = node.socket_inspect("code", path).await.unwrap();
-    node.socket_approve("code", path, &inspected.review)
-        .await
-        .unwrap();
 }
 
 /// One local invocation: sends `payload`, half-closes, reads the reply.
@@ -79,14 +75,7 @@ async fn drive(node: &Node, path: &str, payload: &[u8]) -> (SockStatus, Vec<u8>)
 const DROP: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\",\"replace\"]}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\",\"replace\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 w = sy_put_open(1, SY_STR("code/inbox/drop.bin"));
@@ -150,23 +139,16 @@ async fn a_socket_write_publishes_this_nodes_own_version() {
 }
 
 #[tokio::test]
-async fn a_declared_socket_path_is_never_writable() {
+async fn an_activated_socket_path_is_never_writable() {
     const SELF_WRITE: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code\",\"allow\":[\"create\",\"replace\",\"delete\"]}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code\",\"allow\":[\"create\",\"replace\",\"delete\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
   /* The whole space is granted, and the socket's own path is still refused:
-     with --auto in the picture, writing an ELF over a declared socket path
-     would be remote code persistence in two moves. */
+     writing an ELF over an activated socket path would be remote code
+     persistence in two moves. */
   return sy_put_open(1, SY_STR("code/self.sock")) == SY_EPERM ? 0 : 1;
 }
 "#;
@@ -182,14 +164,7 @@ async fn a_socket_delete_publishes_this_nodes_tombstone() {
     const DELETER: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"delete\"]}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"delete\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 w = sy_put_open(1, SY_STR("code/inbox/gone.txt"));
@@ -237,14 +212,7 @@ async fn a_create_only_grant_cannot_replace() {
     const CREATOR: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\"]}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 w = sy_put_open(1, SY_STR("code/inbox/once.txt"));
@@ -279,14 +247,7 @@ async fn a_socket_writes_into_an_api_source() {
     const DETACHED: &str = r#"
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"archive\",\"allow\":[\"create\"]}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  return rc;
-}
+SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"archive\",\"allow\":[\"create\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 w = sy_put_open(1, SY_STR("archive/kept.bin"));

@@ -27,14 +27,12 @@
    follows the caller through an origin rename. */
 #define PER_PEER_PER_MINUTE 60
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("tcp-proxy"));
-  /* The whole of what this program may reach. Arming the program approves this
-     declaration; changing it changes the root and requires another approval. */
-  sy_declare_egress(SY_STR(UPSTREAM_HOST), UPSTREAM_PORT);
-  sy_declare_max_streams(32);
-  return 0;
-}
+/* The whole of what this program may reach, as data in the object itself.
+   Changing it changes the content root, so what an activated path serves is
+   always exactly what its current bytes declare. */
+SY_MANIFEST("{\"manifest\":1,\"name\":\"tcp-proxy\",\"max_streams\":32,"
+            "\"egress\":[\"" UPSTREAM_HOST ":" SY_STRINGIZE(UPSTREAM_PORT)
+            "\"]}");
 
 SY_ENTRY sy_s64 entry(void) {
   /* Authorization is the handshake. Nothing below parses caller input to

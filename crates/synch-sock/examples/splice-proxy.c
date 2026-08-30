@@ -32,12 +32,9 @@
    a saturated direction cannot keep the loop away from the other one. */
 #define CHUNK 32768
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("splice-proxy"));
-  sy_declare_egress(SY_STR(UPSTREAM_HOST), UPSTREAM_PORT);
-  sy_declare_max_streams(32);
-  return 0;
-}
+SY_MANIFEST("{\"manifest\":1,\"name\":\"splice-proxy\",\"max_streams\":32,"
+            "\"egress\":[\"" UPSTREAM_HOST ":" SY_STRINGIZE(UPSTREAM_PORT)
+            "\"]}");
 
 SY_ENTRY sy_s64 entry(void) {
   /* Authorization is the handshake, here as everywhere. */

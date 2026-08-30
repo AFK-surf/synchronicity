@@ -1,11 +1,11 @@
 # Sockets
 
 Status: **implemented**. Everything here describes the built thing: the record
-kind, the arming tables, the `sync/sock/1` protocol, the host API and its
-runtime, the scanner's publishing rule, the live-invocation registry, the
-embedded compiler, and the command surface. The one thing named here and not
-built is `synch doctor` reporting on sockets — the same facts are in
-`synch socket ls -l` and `synch socket ps`, and each place below says so.
+kind, the activation table, the manifest, the `sync/sock/1` protocol, the host
+API and its runtime, the scanner's publishing rule, the live-invocation
+registry, the embedded compiler, and the command surface. The one thing named
+here and not built is `synch doctor` reporting on sockets — the same facts are
+in `synch socket ls -l` and `synch socket ps`, and each place below says so.
 
 Checked against the tree it landed in. Where the built thing differs from an
 earlier draft of this design, this document has been corrected to describe the
@@ -54,7 +54,8 @@ it — was rejected, and it is worth naming what rejecting it buys. Under that
 design every member, and every delegate, becomes a code-execution grant on
 every node it can reach, and the sandbox is the only thing standing between a
 stranger and the machine. Under this one the sandbox is defence in depth and
-the *gate* is that the callee already chose to publish and arm the program.
+the *gate* is that the callee already chose to publish the program at a path
+it activated.
 
 It also buys portability where it matters. async-ebpf runs on Linux, macOS and
 OpenBSD, on x86-64 and arm64. Serving sockets is gated to those targets.
@@ -93,7 +94,8 @@ Discovery still works — `synch ls` marks sockets from the kind alone — and t
 encoding of every non-socket record is byte-for-byte what it was.
 
 A `Socket` entry is otherwise an ordinary file entry: `content` is the ELF's
-BLAKE3 root (this is what gets armed), `size` is its length, and `chunking` is
+BLAKE3 root — a content identifier, never an authorization pin — `size` is its
+length, and `chunking` is
 the default.
 
 ### 2.1 Why it lives under `f:`
@@ -109,13 +111,15 @@ keeping `m:space/<id>` an exact key rather than a prefix, and it is decisive.
 ### 2.2 Kind is an assertion, and it is not adoptable
 
 The kind of an entry is what *this* origin says about *its own* copy — like
-`unix_mode`, and unlike content. It comes from a local declaration (`synch
-socket declare`, §3), never from a peer. So:
+`unix_mode`, and unlike content. It comes from a local activation (`synch
+socket activate`, §3), never from a peer. So:
 
 - `synch adopt path nas:code/git.sock` fetches the ELF bytes and writes them into the
   local space. The next scan publishes them as `EntryKind::File`, because this
-  node never declared that path a socket. **Adopting a socket adopts its bytes,
-  not its socket-ness** — and certainly not its executability.
+  node never activated that path. **Adopting a socket adopts its bytes, not
+  its socket-ness** — and certainly not its executability. (Adopting onto a
+  path this node *has* activated is the other case, and it is deliberate: an
+  activated path's writers are deployment channels, §3.)
 - `synch adopt tree`, `synch replica sync` and the S3 gateway behave identically: a
   `Socket` entry materializes as a regular file containing the ELF, which is
   exactly what it is on the publisher's disk too.
@@ -136,7 +140,7 @@ connection lands on, and §12 already names member-supplied `mtime_ns` as the
 sharpest edge of the version model. The unified tree stays a discovery surface
 here and never a dispatch one.
 
-## 3. Arming: how code gets into a node's own tree
+## 3. Activation: how code gets into a node's own tree
 
 "Only its own tree" is a strong rule, but a node's own tree is not a closed
 system. Several existing commands write bytes into a filesystem-source directory that the
@@ -149,53 +153,66 @@ threat model:
 - an S3 gateway `PUT`, which writes into a filesystem-source directory over the network.
 
 Every one of these is an existing, sanctioned way to change what this node
-publishes. So publication is not, and must not be, the gate. Two locally-held
-gates stand between a published socket entry and an invocation:
+publishes. So publication is not, and must not be, the gate. **Activation**
+is: `synch socket activate code/git.sock` records that this path, in this
+space, is a socket. That is what makes the scanner publish `kind: Socket`,
+and it is what admission checks before anything runs. It is local state,
+never adopted from a peer, and never replicated.
 
-1. **Declaration.** `synch socket declare code/git.sock` records that this path, in
-   this space, is a socket. That is what makes the scanner publish
-   `kind: Socket`. It is local state, never adopted from a peer, and never
-   replicated.
-2. **Arming.** The approval pins the BLAKE3 content root it approved. The
-   bytes changing changes the root, which disarms the socket: `Refused
-   { NotArmed }`, naming both roots. In-flight invocations keep running the root
-   they started on.
+Activation is a statement about the *path*, never about a content root.
+While the path is activated, **every write to it is an intentional
+deployment**: the new content serves as soon as the scanner publishes it,
+under whatever its own manifest declares (§3.1), until `synch socket
+deactivate`. That breadth is the grant, and the command says so at the moment
+it is asked for: activating a path pre-approves every future write through
+every channel above — adoption and a read-write S3 key included. Activate a
+path only when everything that can write it is something you mean as a
+deployment channel; content roots remain content identifiers everywhere
+content is handled — CAS integrity, replication, caching, and the snapshot a
+running invocation keeps — but no root is ever an authorization pin.
 
-`synch socket declare --auto` follows the file: it re-arms on every content change
-and skips the second gate forever. It is correct for a path you are the only
-writer of and wrong for any path a read-write S3 key or adoption can reach. `synch
-socket ls` marks every `--auto` socket, because that list is the honest answer
-to "what can execute here?", and `synch socket declare` says what `--auto` costs at
-the moment it is asked for.
+A deployment landing changes what the *next* admission runs. Invocations
+already running keep the snapshot they were admitted with, and the per-socket
+map (§6) is cleared: a session table the old program minted is not state the
+new one agreed to inherit.
 
-### 3.1 The init hook is what makes arming meaningful
+### 3.1 The manifest is what makes a deployment reviewable
 
-An approval that says only "these bytes are fine" asks the operator to read
-eBPF. Instead the program declares its own external effects in a
-`synchronicity.init` section, run once at arm time in a context with no
-endpoint table at all, and `synch socket arm` prints the declaration for
-approval:
+An object that could reach anything would make "what can execute here?"
+unanswerable. Instead the program declares its own external effects in a
+`synchronicity.manifest` ELF section — **data, never code**: one versioned
+JSON document, parsed with bounded, typed parsing that refuses duplicate
+keys, unknown members, invalid values, oversized sections, and any executable
+declaration section. There is no init hook and nothing executes at
+inspection: what a file declares is a property of its bytes, the same answer
+on every platform and every day.
 
 ```
-$ synch socket arm code/git.sock
+$ synch socket inspect git-gateway.o
 
-  program   9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
-  size      41 KB  ·  jit 214 KB  ·  sections: init, stream
-  declares  name        git-http
-            egress      git.internal:9418
-            max streams 32
-  reviewed only — approve with `synch socket arm code/git.sock --review 51a4…d20`
+  file     git-gateway.o
+  root     9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  size     41 KB
+  declares name git-http
+  declares egress git.internal:9418
+  declares max-streams 32
+  program  loads and links against this build's host API
 ```
 
-Arming approves the capabilities the program declared. Egress with no
-declaration is denied. Reading the tree is not among the declared capabilities
-and never was denied by one (§7.6). Because the declaration is compiled into
-the object, editing it changes the content root, which disarms the socket. A
-program cannot widen its own reach without a fresh review and approval, and an
-approval cannot silently outlive the code it approved. The opaque `--review`
-token binds the content root, the local authorization revision, and the exact
-init result shown above. If any of them changes between the two commands,
-approval fails; this remains true even if init consults time or randomness.
+`synch socket inspect` is stateless: one file snapshot, its BLAKE3 root — the
+same root the tree names once the bytes are deployed — its parsed manifest
+rendered canonically, and a load/link validation of the stream program. It
+touches no database, no scanner, no daemon state, and publishes nothing.
+
+Egress with no declaration is denied. Reading the tree is not among the
+declared capabilities and never was denied by one (§7.6). Because the
+manifest is compiled into the object, editing it changes the content root:
+what an activated path serves is always exactly what its current bytes
+declare, and `synch socket ls -l` shows that declaration from the same parse
+admission uses. An update whose manifest does not parse — or whose program
+does not load — keeps the path activated and published and refuses every
+connection with a message naming the defect; deploying a fixed object is the
+whole remedy.
 
 ## 4. The wire — `sync/sock/1`
 
@@ -221,7 +238,7 @@ enum Opened {
 }
 
 enum RefuseCode {
-    NoSuchPath, NotASocket, NotArmed, Unauthorized, SpaceNotDelegated,
+    NoSuchPath, NotASocket, NotActivated, Unauthorized, SpaceNotDelegated,
     Busy, ProgramInvalid, Unsupported,       // Unsupported = callee has no runtime
 }
 
@@ -304,7 +321,7 @@ the daemon's threading directly.
   keeps serving everything else placed on it. It used to be inline, before the
   select loop, which meant one cold admission stopped that worker outright —
   and with a 32-entry cache and oldest-first eviction, a caller reaching more
-  than 32 armed roots made every admission a miss. Concurrent admissions of the
+  than 32 distinct roots made every admission a miss. Concurrent admissions of the
   same root wait on the first compile rather than each starting their own.
   The loader stays per worker: moving it to a shared compile pool would make
   one guest's discovery of a helper index worth something on every worker.
@@ -338,14 +355,14 @@ least eight local-call frames plus 512 bytes of calldata: 128 KiB of frame
 space at the 16 KiB default, with a 32 KiB floor for smaller custom frames.
 Default frames are guarded on hosts whose pages are no larger than 16 KiB and
 contiguous on larger-page hosts. A program compiled with another frame size
-declares that size in `synchronicity.init`. Everything that outlives a helper
+declares that size in its manifest. Everything that outlives a helper
 call lives host-side:
 
 The number that binds in practice is the **local-call frame**, not the total
 stack. The SDK examples' functions keep their locals below 4 KiB, while the
 runtime's guarded 16 KiB frame stride is portable to both 4 KiB- and 16
-KiB-page hosts. A program built for another value must pass that value to
-`sy_declare_stack_frame_size`.
+KiB-page hosts. A program built for another value must declare it as the manifest's
+`"stack_frame_size"`.
 
 | Table | Scope | Bound |
 | --- | --- | --- |
@@ -354,7 +371,7 @@ KiB-page hosts. A program built for another value must pass that value to
 | socket map | per socket, outlives invocations | 4096 keys, 1 MiB; expired entries are reclaimed, otherwise a full map refuses writes |
 
 The socket map is the only way two invocations of one socket can see each
-other. It is memory-only: cleared on daemon restart and on re-arm, and
+other. It is memory-only: cleared on daemon restart and on every deployment, and
 deliberately absent from SQLite.
 
 Two conventions fall out of the absence of a heap:
@@ -380,12 +397,12 @@ automatically by `synch socket build` (§9).
 #define SY_SELF     0                    /* the inbound stream is always handle 0 */
 
 #define SY_ENTRY        __attribute__((section("synchronicity.stream")))
-#define SY_INIT_ENTRY   __attribute__((section("synchronicity.init")))
+#define SY_MANIFEST(json) /* one JSON document in `synchronicity.manifest` */
 
 #define SY_EAGAIN     -1   /* would block — poll and come back                    */
 #define SY_EBADF      -2   /* no such handle in this invocation                   */
 #define SY_EINVAL     -3
-#define SY_EPERM      -4   /* policy: egress not declared/armed, path out of scope */
+#define SY_EPERM      -4   /* policy: egress not in the manifest, path out of scope */
 #define SY_ECONNRESET -5
 #define SY_ETIMEDOUT  -6
 #define SY_ELIMIT     -7   /* a documented bound in §9 was hit                    */
@@ -421,7 +438,7 @@ one meaning per errno — is specified in `docs/HANDLES.md`.
 | `sy_monotonic_ns()` | Monotonic since invocation start. What a timeout should be written against. |
 | `sy_getrandom(out, len)` | CSPRNG bytes. |
 | `sy_version(out, len)` | The daemon's version string. |
-| `sy_config_get(k, klen, out, olen)` | Reads a key from `synch socket declare --config k=v`. |
+| `sy_config_get(k, klen, out, olen)` | Reads a key from `synch socket activate --config k=v`. |
 | `sy_metric_add(name, len, delta)` | Bumps a named counter shown by `synch socket ps`. |
 | `sy_label_set(k, klen, v, vlen)` | Labels this invocation's row in `synch socket ps`. |
 
@@ -488,7 +505,7 @@ the whole argument.
 | `sy_endpoint_info(h, out, len)` | Peer address and connection state of an endpoint the program opened. |
 
 Resolution happens host-side, and **both the name and the resolved address are
-checked** against the armed egress list — so a program cannot reach an internal
+checked** against the manifest's egress list — so a program cannot reach an internal
 address by way of a name that resolves to it.
 
 Closing a connecting handle does not immediately return its place in the
@@ -527,14 +544,15 @@ its CAS by content root. There is no read declaration and no per-path check.
 That is a deliberate retreat from an earlier design in which a program declared
 `tree-read` prefixes and `sy_open_from` was refused without one. The gate was
 decorative: `sy_open_root` reached the same bytes by hash with no declaration
-at all, so the prefix list bought an extra line at the arm prompt rather than a
-boundary. What a node exposes to a caller is decided by which sockets it arms,
+at all, so the prefix list bought an extra status line rather than a
+boundary. What a node exposes to a caller is decided by which paths it
+activates,
 and by membership and delegation on the way in (§3.2, §3.5) — not by a
 per-program list of paths its own code may read.
 
 Socket entries are readable like any other file. Their bytes are not secret —
 any member fetches them out of the tree — and what executes on this node is
-decided by the arming table, not by who can read an ELF.
+decided by the activation table, not by who can read an ELF.
 
 | Helper | What it does |
 | --- | --- |
@@ -568,43 +586,35 @@ because there is no heap to decode into. The base64 pair takes two orthogonal
 flags — `SY_BASE64_URL` and `SY_BASE64_NO_PAD` — rather than a numbered
 four-alphabet enum.
 
-### 7.9 Declarations — valid only inside `synchronicity.init`
+### 7.9 The manifest's capability members
 
-`sy_declare_name`, `sy_declare_egress(host, len, port)` (port `0` means any port
-on that host and is printed in red at the arm prompt), `sy_declare_max_streams`,
-`sy_declare_stack_frame_size(bytes)`,
-`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(json)`,
-`sy_declare_file_transfer(json)` (`docs/SSH-SOCKETS.md` §7) and
-`sy_declare_tree_write(json)` (`docs/TREE-WRITES.md` §3). The two
-backing-service declarations take JSON handles —
+There are no declaration helpers: a declaration is data in the object's
+`synchronicity.manifest` section (§3.1), never an API call. The scalar
+members are `"name"`, `"egress"` (an array of `host` or `host:port` strings —
+a bare host is any port on it, which inspection prints loudly),
+`"max_streams"`, `"stack_frame_size"` (a multiple of 16 from 16 bytes through
+32 KiB; omitting it keeps the 16 KiB default), and `"guarded_stack_frames"`.
+
+The capability members are arrays of JSON objects — `"processes"`:
 `{"id", "allow": ["pty" | "pipe"], "executable", "argv",
-"allowed_signals": ["HUP" | "INT" | "TERM"]}` and
-`{"id", "protocol": "sftp", "access": ["read", "recursive"], "scope"}` — built
-with the same `sy_json_*` helpers a served stream uses, which is why the JSON
-family is valid inside `synchronicity.init`.
+"allowed_signals": ["HUP" | "INT" | "TERM"]}`; `"file_transfers"`:
+`{"id", "protocol": "sftp", "access": ["read", "recursive"], "scope"}`
+(`docs/SSH-SOCKETS.md` §7); and `"tree_writes"`:
+`{"id", "prefix", "allow": ["create" | "replace" | "delete"], "max_bytes"?}`
+(`docs/TREE-WRITES.md` §3). Tree writes are the one capability family whose
+gate is a boundary rather than a status line: the `sy_put_*` helpers are the
+only door to mutation.
 
-There is no `sy_declare_tree_read`: reading the tree is not a declared
-capability (§7.6).
+There is no read capability: reading the tree is not declared (§7.6).
 
-`sy_declare_tree_write(json)` declares a prefix-scoped write grant —
-`{"id", "prefix", "allow": ["create" | "replace" | "delete"], "max_bytes"?}` —
-which is the one declaration family whose gate is a boundary rather than a
-prompt line: the `sy_put_*` helpers are the only door to mutation
-(`docs/TREE-WRITES.md` §3).
-
-`sy_declare_stack_frame_size` must match the compiler's eBPF stack-frame
-setting. It accepts a multiple of 16 from 16 bytes through 32 KiB; omitting it
-keeps Synchronicity's 16 KiB default. Frames are guarded by default when the
-host page is no larger than 16 KiB. On hosts with larger pages the daemon warns
-at startup and explicitly selects async-ebpf's contiguous layout; it does not
-use automatic guard selection. A guarded custom size must be aligned to the
-executing host's page size. `sy_declare_guarded_stack_frames(0)` explicitly
-selects the contiguous layout, while passing `1` requires guards and refuses an
-incompatible host. Both choices are included in the operator's approval text.
-
-Calling a declaration helper from `synchronicity.stream` returns `SY_EPERM`;
-calling an I/O helper from `synchronicity.init` does too. The init hook runs
-with no endpoint table at all, so there is nothing for it to reach.
+`"stack_frame_size"` must match the compiler's eBPF stack-frame setting.
+Frames are guarded by default when the host page is no larger than 16 KiB. On
+hosts with larger pages the daemon warns at startup and explicitly selects
+async-ebpf's contiguous layout; it does not use automatic guard selection. A
+guarded custom size must be aligned to the executing host's page size —
+checked when the program is load-validated, at inspection and admission.
+`"guarded_stack_frames": false` explicitly selects the contiguous layout,
+while `true` requires guards and refuses an incompatible host.
 
 ### 7.10 In the header, not in the host
 
@@ -635,7 +645,7 @@ here, and a Content-Length has to come from somewhere.
 `memset`, `memcpy` and `memmove` forward to the host helpers. Nothing calls
 them by name; a struct initializer or an array assignment is enough to make any
 C compiler emit a call, and without these that call would be an unresolved
-symbol — a program that fails to *link*, at arm time, on somebody else's node,
+symbol — a program that fails to *link*, at admission, on somebody else's node,
 a long way from the line that caused it. Clang emits an intrinsic instead of a
 call, which never meets these definitions; the `--clang` build rewrites those
 to the same helpers (§9).
@@ -669,17 +679,17 @@ host-side walks each mutation performs cheap. `sy_json_get_string`,
 `sy_json_get_i64` and `sy_json_get_bool` in the header are the
 get-read-close spelling of the common case.
 
-The JSON family is pure data manipulation, so it is the one part of the API
-valid in `synchronicity.init` as well as in the stream entrypoint: the
-declaration helpers take JSON.
+The JSON family is pure data manipulation — the natural shape for a program
+whose configuration, identity answers, and capability descriptions are all
+JSON values.
 
 ### 7.12 Writing the tree — declared, and a boundary
 
 `sy_put_open`, `sy_put_write`, `sy_put_splice`, `sy_put_commit`,
 `sy_put_commit_if` and `sy_put_delete` publish file versions and tombstones
-into this node's own trie, behind an armed `sy_declare_tree_write` grant
+into this node's own trie, behind a `"tree_writes"` grant in the manifest
 (§7.9). A committed write is an ordinary local publish through the same
-ingest path an S3 `PUT` takes; a declared socket path is never writable. The
+ingest path an S3 `PUT` takes; an activated socket path is never writable. The
 whole design — why the write declaration is enforceable where the read one
 (§7.6) was decorative, the writer lifecycle, the commit conditions, and the
 bounds — is **[docs/TREE-WRITES.md](TREE-WRITES.md)**.
@@ -692,13 +702,10 @@ than by a password, rate-limited per caller, and reaching exactly one upstream.
 ```c
 #include <synch.h>
 
-/* Runs once, at `synch socket arm`. The operator reads this list, not the code. */
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("git-http"));
-  sy_declare_egress(SY_STR("git.internal"), 9418);
-  sy_declare_max_streams(32);
-  return 0;
-}
+/* Data, never code: the whole of what this program may reach, compiled into
+   the object. `synch socket inspect` shows this list; nobody reads eBPF. */
+SY_MANIFEST("{\"manifest\":1,\"name\":\"git-http\","
+            "\"egress\":[\"git.internal:9418\"],\"max_streams\":32}");
 
 SY_ENTRY sy_s64 entry(void) {
   /* 1. Authorization is the handshake. Nothing here parses caller input. */
@@ -719,7 +726,7 @@ SY_ENTRY sy_s64 entry(void) {
   sy_peer_origin(who, sizeof who);
   sy_label_set(SY_STR("peer"), who, sy_strlen(who));
 
-  /* 3. The one destination this program declared and the operator armed. */
+  /* 3. The one destination this program's manifest declares. */
   sy_s64 up = sy_tcp_connect(SY_STR("git.internal"), 9418);
   if (up < 0) return up;
 
@@ -810,15 +817,16 @@ place the program sleeps.
 ## 9. Command surface
 
 ```
-synch socket declare <space>/<path> [--config k=v]…       declare a path in one of my spaces
-                 [--max-streams <n>] [--auto]         to be a socket: the next scan
-                                                      publishes it as kind=Socket
-synch socket arm <space>/<path>                       inspect the current root and what
-                                                      the program declares
-synch socket arm <space>/<path> --review <hex>        approve exactly the inspection
-synch socket disarm <space>/<path>                    keep publishing it, stop running it
-synch socket undeclare <space>/<path>                        republish as an ordinary file
-synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
+synch socket inspect <file>                           statelessly describe an eBPF
+                                                      object: root, manifest, load check
+synch socket activate <space>/<path>                  make the path a socket until
+                 [--config k=v]… [--max-streams <n>]  deactivated: the next scan
+                 [--note <text>]                      publishes it as kind=Socket, and
+                                                      every later write is a deployment
+synch socket deactivate <space>/<path>                republish as an ordinary file;
+                                                      admission refuses immediately
+synch socket ls [<space>] [-l]                        mine: published root, manifest
+                                                      declaration, validity, policy
 synch socket ps [<space>/<path>]                      live invocations: peer, age, bytes,
                                                       handles, labels, counters
 synch socket kill <invocation>                        end one; the stream closes Killed
@@ -834,10 +842,10 @@ synch socket connect <origin>:<space>/<path>                 stdio by default: s
               [--listen <addr:port>] [--once]         Closed{status}
 ```
 
-`synch socket ls -l` prints, per socket, what the tree currently names, what
-was armed, and what the program declared when it was armed — so "the bytes
-changed and nobody re-approved them" is visible as a difference between two
-lines rather than inferred.
+`synch socket ls -l` prints, per socket, what the tree currently names and
+what that content's manifest declares — the same parse admission uses — so an
+update whose manifest does not parse is visible as `activated, unavailable`
+with the parse error, rather than only as connection failures.
 
 `synch socket ps` reads the registry, which is what `kill` pulls, what the
 concurrency cap counts, and what `log` keeps a tail in. It holds nothing
@@ -866,7 +874,7 @@ path. Between the two tools it rewrites the memory intrinsics clang emits for
 a large initializer or struct assignment into `sy_memset`/`sy_memcpy` calls:
 llc would otherwise lower one past its store budget into a call to libc, and
 the BPF backend, having no libc, refuses to emit it ("A call to built-in
-function 'memset' is not supported"). Either object is armed exactly the same way because the runtime loads ELF
+function 'memset' is not supported"). Either object deploys exactly the same way because the runtime loads ELF
 and does not care which compiler wrote it. tinycc is LGPL-2.1 and is linked
 statically, under §6 of that licence.
 
@@ -898,8 +906,8 @@ own.
 
 | Bound | Default | Note |
 | --- | --- | --- |
-| Concurrent invocations per socket | 64 | Intersected with `sy_declare_max_streams`. Over it: `Refused{Busy}`. |
-| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every armed socket in the cluster must not be able to fill every worker's queue. |
+| Concurrent invocations per socket | 64 | Intersected with the manifest's and the activation's `max_streams`. Over it: `Refused{Busy}`. |
+| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every activated socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
 | Handles per invocation | 256 | Including `SY_SELF`. Also the `sy_poll` array cap (`limits.rs`, and §7.5 and the SDK header agree). Deliberately larger than any one resource's own bound; the bounds below are what stop spare slots becoming host memory or OS children. |
 | Open endpoints per invocation | 32 | Including `SY_SELF` — the pre-256 table size, kept for everything ring-bearing. A per-role budget can be given back while its endpoint still holds rings (a closed process handle leaves its stdio endpoints, a wire-closed channel leaves the guest's fd, an ended egress task returns its permit), so endpoints are counted where they enter the table; over it, the opening helper returns `SY_ELIMIT`. |
@@ -911,7 +919,7 @@ own.
 | Host-side footprint per invocation | 1 MiB | Object table, decoded buffers, cursors. |
 | Guest stack | `max(32 KiB, 8 × frame size)` | Plus 512 B of calldata. Frames are 16 KiB and guarded by default on hosts with pages up to 16 KiB; larger-page hosts warn and fall back to contiguous frames. Sizes from 16 B through 32 KiB may be declared. |
 | JIT code per program | 1 MiB | async-ebpf's default; on arm64 a single ELF section is additionally capped near 1 MiB. |
-| Program ELF size | 4 MiB | Checked at arm time and again at admission, so a synced or re-armed tree cannot serve an object past the bound. |
+| Program ELF size | 4 MiB | Checked at inspection and again at admission, so a synced or freshly deployed tree cannot serve an object past the bound. |
 | Timeslice | 1 ms / 20 ms / 100 ms | Yield / throttle threshold / throttle sleep. zeroserve's numbers. |
 | Idle deadline | 300 s | Measured from the last *progress* — bytes read, written or spliced — not from the start of the invocation. Progress pushes it out, so there is still **no total wall-clock cap**: a proxy with steady traffic is long-lived. Readiness alone is not progress: a poll that comes back with a terminal or bogus handle ready is ready forever, and counting that would let a guest re-poll a dead handle with the deadline never arriving. But the deadline is a deadline: an invocation that stops making progress is ended with `Closed{Deadline}`, because an idle invocation is a stream and a slot a caller can hold open forever while its guest spins a throttled loop into a worker. A program whose every handle has hung up is told so at once rather than waited out: nothing that can become ready means waiting for nothing. |
 | Teardown drain | 5 s | One budget for the whole end of an invocation, spent by every endpoint that still owes bytes at once. A program returning is not its last write landing: what `sy_write` accepted is in a ring the host owns, and every endpoint — the caller's stream and everything the program connected to — half-closes and drains before it is dropped. A bound rather than a promise: an upstream that has stopped reading would otherwise hold a concurrency slot open with nothing to show for it. |
@@ -919,8 +927,8 @@ own.
 | Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
 | Guest duration inputs | `u32::MAX` ms (~49.7 days) | Rate-limit windows and map TTLs are clamped, not refused: the memory-only map cannot honestly promise longer, and the clamp keeps every host-side duration computation in range — `Duration::as_nanos` must not truncate into a zero window width, and `Instant + Duration` must not overflow. |
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
-| `Open` handshake | 120 s, 8 per connection | The shared accept path's per-stream timeout and per-connection in-flight cap, applied to the one phase of a socket stream that has no runtime of its own: a stream that never finishes its `Open` is not an invocation, and without a bound it would own a task and a buffer for as long as the peer keeps the connection. The bound ends the moment the `Open` is admitted — a socket that proxies is supposed to be long-lived, and its concurrency bound is the armed `max_streams`, not this. |
-| Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |
+| `Open` handshake | 120 s, 8 per connection | The shared accept path's per-stream timeout and per-connection in-flight cap, applied to the one phase of a socket stream that has no runtime of its own: a stream that never finishes its `Open` is not an invocation, and without a bound it would own a task and a buffer for as long as the peer keeps the connection. The bound ends the moment the `Open` is admitted — a socket that proxies is supposed to be long-lived, and its concurrency bound is the effective `max_streams`, not this. |
+| Activated sockets per space | 64 | An activation is operator state; this is a sanity bound, not a quota. |
 | Tree-write declarations per program | 16 | Like the other per-family declaration caps (`docs/TREE-WRITES.md` §8). |
 | Open tree writers per invocation | 4 | Each holds a 256 KiB staging buffer and, engine-side, a staging file; counted as their own role, like endpoints, not charged to the footprint. Over: `sy_put_open` returns `SY_ELIMIT`. |
 | Tree-writer staging buffer | 256 KiB | Full is backpressure: `SY_EAGAIN`, poll `SY_POLL_OUT`. |
@@ -933,10 +941,10 @@ own.
 | Idle deadline reached | clean FIN | `Closed{Deadline}`, exit 73. The deadline is measured from the last progress, so a proxy with traffic never sees it; a caller holding a stream open with nothing happening is ended and told to come back. |
 | Caller's connection dies, or its stream resets | — | `Closed{Deadline}` to whoever still holds the control stream. Nothing the guest produces can be delivered to a caller whose transport has failed, so the runtime ends the invocation rather than holding a slot, a worker placement and its rings for it — one caller must not be able to pin every stream on a socket and then disconnect. The same ending covers a caller that FINs cleanly and *then* closes the connection: the stream itself never fails (the runtime's reader has already exited on the FIN), so `sync/sock/1` watches `Connection::closed` and signals the invocation separately. A caller's clean FIN alone is not this: a half-close is normal, and a proxy works past it. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
-| Faults on ≥ 8 of the last 16 invocations, from ≥ 2 different callers | — | The socket is disarmed and says why in the daemon's log. Disarmed, not undeclared: the declaration and its policy are the operator's and survive; what is withdrawn is the approval of *these* bytes, which have proved they do not work. Faults are attributed to the caller whose invocation faulted, and the breadth is the point: any input-triggered bug in a program is a contained fault, and a caller who finds one can repeat it, so a window that counted faults alone would hand whoever reached the socket first the power to disarm it for everyone. A program that is genuinely broken faults for whoever asks. The counter clears when it fires, so a repaired program gets a full window rather than tripping on its first fault forever. |
-| JIT or link failure | refused | `Refused{ProgramInvalid}`. async-ebpf compiles functions lazily, per function and per pointer signature, so this can surface on the first stream that reaches a given path; `synch socket arm` therefore loads and runs the program's init hook, which forces the compilation early — a program that will not load cannot be armed. |
-| Bytes changed under an armed socket | refused | `Refused{NotArmed}` naming both roots. In-flight invocations keep their root. |
-| Egress to an unarmed destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
+| Faults on ≥ 8 of the last 16 invocations, from ≥ 2 different callers | — | One loud error in the daemon's log naming the program root. Nothing is deactivated for it — activation is the operator's statement about the path, not a judgement about these bytes, and the remedy is deploying a fixed program, which also clears the window. Faults are attributed to the caller whose invocation faulted, and the breadth is the point: any input-triggered bug in a program is a contained fault, and a caller who finds one can repeat it, so a window that counted faults alone would let whoever reached the socket first fill the log for everyone. A program that is genuinely broken faults for whoever asks. |
+| Manifest invalid, no stream entrypoint, or JIT/link failure | refused | `Refused{ProgramInvalid}` naming the defect. The manifest parse and a stream-entrypoint check run at every admission; `synch socket inspect` runs the same checks plus an eager load before anything is deployed, because async-ebpf compiles functions lazily and a bad function would otherwise surface mid-stream. The path stays activated and published: deploying a fixed object is the remedy. |
+| Bytes changed under an activated socket | served | A deployment: the next admission runs the new root, in-flight invocations keep their snapshot, and the per-socket map clears. A replacement landing *during* one admission refuses it `Refused{NotActivated}`; the retry lands on the new program. |
+| Egress to an undeclared destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
 | Preemption watcher failed | refused | That worker refuses new runs — async-ebpf checks this itself rather than risk a guest that cannot be interrupted. Surfacing the degraded worker count in `synch doctor` is not built. |
 | A socket is at its concurrency cap | refused | `Refused{Busy}` naming the cap. The slot is taken at *admission* and released when the invocation ends or the admission is dropped, so a caller that opens streams and never uses them cannot walk through the cap. |
@@ -956,36 +964,35 @@ own.
   scopes correctly ("a record this node cannot apply fails its own origin and no
   other"), but it does mean one socket entry stalls the publisher's whole head
   on old peers. That is unavoidable for any new kind and is the reason the
-  rollout order is: upgrade, then declare.
+  rollout order is: upgrade, then activate.
 - **§4.1, redaction boundary.** The new record type is checked against the prefix
   rule, as §4.1 requires. It passes without a new rule because it is not a new
   record type: it is a field on `f:`, entirely inside the space prefix a
   delegation already projects.
 - **§12, a new capability to name.** Membership currently grants read access and
-  publish rights. It now also grants the ability to *invoke* programs the callee
-  has armed. The security section should say that plainly, alongside the
-  mitigations: the callee chose and armed every program, the caller supplies no
-  code, and egress is declared and approved in advance. `synch socket ls -l`
-  lists every armed socket and what it was armed for; surfacing the same in
-  `synch doctor` is not built.
+  publish rights. It now also grants the ability to *invoke* programs at paths
+  the callee has activated. The security section should say that plainly,
+  alongside the mitigations: the callee chose every activated path, the caller
+  supplies no code, and every capability is declared in the object itself.
+  `synch socket ls -l` lists every activated socket and what its current
+  content declares; surfacing the same in `synch doctor` is not built.
 - **§11, crate layout.** A new `synch-sock` crate holds the helper table, the
-  endpoint and reactor machinery, the program cache and the arming logic; it
+  endpoint and reactor machinery, the program cache and the manifest reader; it
   depends on `async-ebpf` and is gated to the platforms that crate supports.
   `synch-engine` owns the worker pool and the trie/CAS resolution; `synch-net`
   gains the `sync/sock/1` protocol handler beside the two it already mounts. The
   engine crate stays embeddable — a library user gets sockets by enabling a
   feature, not by taking a dependency it cannot build.
-- **§10, schema.** Two tables: `sockets` (space, path, config, max streams,
-  auto flag, declaration generation) and `socket_arms` (space, path,
-  approved root, declarations as approved, armed_at). Both are local operator
-  state and neither is ever published or replicated. The map store is
-  memory-only and deliberately absent from SQLite.
+- **§10, schema.** One table: `socket_activations` (space, path, config,
+  max streams, note, activated_at). Local operator state, never published or
+  replicated. The map store is memory-only and deliberately absent from
+  SQLite.
 
 ## 12. Non-goals, and what comes after
 
 An earlier revision's first non-goal — *writing to the tree from a program* —
 has since been designed and built: **[docs/TREE-WRITES.md](TREE-WRITES.md)**,
-the `sy_put_*` family behind an operator-armed tree-write declaration (§7.12).
+the `sy_put_*` family behind the manifest's tree-write declaration (§7.12).
 
 Not in this design:
 
@@ -1010,10 +1017,10 @@ Worth building next:
 - **`sy_synch_connect(origin, path)`** — a socket calling another node's socket
   over iroh rather than TCP, so a composition of sockets stays inside the
   authenticated fabric instead of falling back to the network underneath it.
-- **Signed arming records.** Arming is local state today. An operator with many
-  nodes would rather approve a content root once and have every node honour it,
-  which is a delegation-shaped problem and should reuse §3.5 rather than invent
-  a second grant format.
+- **Signed activation records.** Activation is local state today. An operator
+  with many nodes would rather activate a path once and have every node honour
+  it, which is a delegation-shaped problem and should reuse §3.5 rather than
+  invent a second grant format.
 - **A Rust SDK** beside the C header, following zeroserve's lead — the helper
   surface is small enough that safe wrappers around the handle table are a
   weekend, and a `#![no_std]` guest with real types is a better place to write

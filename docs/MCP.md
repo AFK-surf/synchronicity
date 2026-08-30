@@ -85,7 +85,7 @@ here and no output drifts from what `synch` prints.
 | `synch_socket_log` | `Run(SocketLog)` |
 | `synch_socket_sdk` | `Run(SocketSdk)` |
 | `synch_socket_build` | none — the compiler is in this process |
-| `synch_socket_review` | `Run(SocketArm)` with no token: inspects only |
+| `synch_socket_inspect` | local: describes a built object, no daemon call |
 | `synch_socket_connect` | `OpenSocket` |
 
 ### Write tier — `--allow-write`
@@ -99,10 +99,8 @@ here and no output drifts from what `synch` prints.
 | `synch_pin` | `Run(PinAdd)` / `Run(PinRm)` |
 | `synch_source_scan` | `Run(SourceScan)` |
 | `synch_peer_sync` | `Run(PeerSync)` |
-| `synch_socket_declare` | `Run(SocketDeclare)` |
-| `synch_socket_arm` | `Run(SocketArm)` with a review token |
-| `synch_socket_disarm` | `Run(SocketDisarm)` |
-| `synch_socket_undeclare` | `Run(SocketUndeclare)` |
+| `synch_socket_activate` | `Run(SocketActivate)` |
+| `synch_socket_deactivate` | `Run(SocketDeactivate)` |
 | `synch_socket_kill` | `Run(SocketKill)` |
 
 The split is by whether a tool changes state, not by how alarming it sounds. The
@@ -112,22 +110,24 @@ given rather than discovering the boundary by being refused at it.
 Two placements are worth stating because they are not obvious:
 
 - **The socket lifecycle is on the surface**, with the mutating half in the
-  write tier. Arming is not a blind approval of bytes: the program declares its
-  external effects in a `synchronicity.init` section, `synch_socket_review`
-  prints that declaration, and the token binds the content root, the
-  authorization revision and the init result together (`docs/SOCKETS.md` §3.1).
-  Undeclared capabilities are denied, and editing the program changes its root,
-  which disarms it.
+  write tier. Activation is not a blind approval of bytes: the program
+  declares its external effects as data, in a `synchronicity.manifest` JSON
+  section, and `synch_socket_inspect` statelessly describes any object — its
+  root, its parsed manifest, whether it loads — before it is deployed
+  (`docs/SOCKETS.md` §3.1). Undeclared capabilities are denied, and while a
+  path is activated every write to it is an intentional deployment that serves
+  immediately under its own manifest.
 
 - **Connecting is a read.** The connecting side executes nothing
   (`docs/SOCKETS.md` §1): it names a path and pipes bytes. What runs is bounded
-  by the declaration the *serving* node armed, which is that node's decision.
+  by the manifest of the content the *serving* node activated a path for,
+  which is that node's decision.
 
 The whole socket lifecycle is reachable over the protocol without a single
 filesystem write outside a space: `synch_socket_build` takes C source and
-returns the object base64-encoded, `synch_write` puts it in a space,
-`synch_socket_declare` declares it, `synch_source_scan` republishes it as a socket, and
-`synch_socket_review` then `synch_socket_arm` approve it.
+returns the object base64-encoded, `synch_socket_inspect` describes it,
+`synch_write` puts it in a space, `synch_socket_activate` makes the path a
+socket, and `synch_source_scan` republishes it as one.
 
 ### `--space`
 

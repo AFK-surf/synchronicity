@@ -10,7 +10,7 @@
 //! `run_job` enters the select loop that services preemption, the idle
 //! deadline, and cancel. The cache holds `MAX_CACHED_PROGRAMS = 32` entries
 //! per worker with oldest-first eviction. So a member who can reach >= 33
-//! armed sockets (or whose `--auto` re-arms keep minting fresh roots)
+//! activated sockets (or whose deployments keep minting fresh roots)
 //! alternates admissions and forces a full ELF load + JIT per admission.
 //!
 //! Break signature: (a) re-admitting a root that was evicted measurably costs

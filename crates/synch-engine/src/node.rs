@@ -897,15 +897,6 @@ impl Node {
         }
     }
 
-    /// Runs a program's declaration hook, off the runtime.
-    ///
-    /// Offloaded because it JIT-compiles: the hook itself does nothing, but
-    /// forcing compilation early is half the point of running it, and that is
-    /// real CPU on a thread the reactor is not waiting for.
-    pub(crate) fn declare_program(&self, elf: &[u8]) -> Result<synch_core::Declaration> {
-        crate::sockets::declare_blocking(elf)
-    }
-
     /// The batch between staging and one signed root (§7.1).
     pub fn publisher(&self) -> &Publisher {
         &self.inner.publisher

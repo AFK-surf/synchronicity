@@ -88,7 +88,57 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V21_REPLICATION),
     Migration::Sql(V22_SOCKETS),
     Migration::Sql(V23_SOURCE_REPLICA_ROLES),
+    Migration::Rust {
+        name: "path-based socket activation",
+        run: v24_socket_activations,
+    },
 ];
+
+/// v24 — path-based socket activation replaces declaration-and-approval.
+///
+/// The old model kept two tables: `sockets` (the declaration that made the
+/// scanner publish `EntryKind::Socket`) and `socket_arms` (an approval pinned
+/// to one content root). The new model keeps one statement, about a *path*:
+/// while `<space>/<path>` is activated, whatever it holds is a socket and its
+/// current content serves — a content change is a deployment, not a
+/// disarmament. Roots remain content identifiers everywhere content is
+/// handled, and are never authorization pins.
+///
+/// Existing declarations are **not converted**. Activating a path is a
+/// strictly broader grant than approving one root — it pre-approves every
+/// future write to the path, adoption and S3 writes included — and a
+/// migration must not widen anybody's trust silently. Each dropped
+/// declaration is reported here, and the operator re-activates explicitly
+/// with `synch socket activate`.
+fn v24_socket_activations(tx: &Transaction<'_>) -> Result<()> {
+    let declared: Vec<(String, String)> = {
+        let mut stmt = tx.prepare("SELECT space, path FROM sockets ORDER BY space, path")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (space, path) in &declared {
+        tracing::warn!(
+            socket = format!("{space}/{path}"),
+            "socket declaration dropped by the activation migration: path activation is a \
+             broader grant than a root approval, so it is not granted silently — run \
+             `synch socket activate {space}/{path}` to serve this path again"
+        );
+    }
+    tx.execute_batch(
+        "DROP TABLE socket_arms;
+         DROP TABLE sockets;
+         CREATE TABLE socket_activations (
+           space         TEXT NOT NULL,
+           path          TEXT NOT NULL,
+           config        TEXT NOT NULL DEFAULT '',  -- newline-separated k=v
+           max_streams   INTEGER,                   -- NULL: the daemon's default
+           note          TEXT NOT NULL DEFAULT '',
+           activated_at  INTEGER NOT NULL,
+           PRIMARY KEY (space, path)
+         );",
+    )?;
+    Ok(())
+}
 
 /// v23 — local participation is two independent roles.
 ///
@@ -953,24 +1003,13 @@ CREATE TABLE s3_upload_parts (
   PRIMARY KEY (upload, number)
 );
 
-CREATE TABLE sockets (
-  space            TEXT NOT NULL,
-  path             TEXT NOT NULL,
-  config           TEXT NOT NULL DEFAULT '',
-  max_streams      INTEGER,
-  auto             INTEGER NOT NULL DEFAULT 0,
-  note             TEXT NOT NULL DEFAULT '',
-  added_at         INTEGER NOT NULL,
-  generation       BLOB NOT NULL,
-  PRIMARY KEY (space, path)
-);
-
-CREATE TABLE socket_arms (
-  space      TEXT NOT NULL,
-  path       TEXT NOT NULL,
-  root       BLOB NOT NULL,
-  declared   TEXT NOT NULL DEFAULT '',
-  armed_at   INTEGER NOT NULL,
+CREATE TABLE socket_activations (
+  space         TEXT NOT NULL,
+  path          TEXT NOT NULL,
+  config        TEXT NOT NULL DEFAULT '',
+  max_streams   INTEGER,
+  note          TEXT NOT NULL DEFAULT '',
+  activated_at  INTEGER NOT NULL,
   PRIMARY KEY (space, path)
 );
 "#;

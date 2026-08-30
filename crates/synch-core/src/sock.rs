@@ -83,8 +83,9 @@ pub enum RefuseCode {
     NoSuchPath,
     /// There is an entry, but its kind is not [`Socket`](crate::EntryKind::Socket).
     NotASocket,
-    /// Declared but not armed, or armed at a root the bytes no longer have.
-    NotArmed,
+    /// The path is not activated on the callee, or its activation was removed
+    /// or its content replaced while this admission was in flight.
+    NotActivated,
     /// The caller is not a member, or the space is not one it may read.
     Unauthorized,
     /// The caller is a delegate and this space is outside its list (§3.5).
@@ -103,7 +104,7 @@ impl RefuseCode {
         match self {
             RefuseCode::NoSuchPath => "no-such-path",
             RefuseCode::NotASocket => "not-a-socket",
-            RefuseCode::NotArmed => "not-armed",
+            RefuseCode::NotActivated => "not-activated",
             RefuseCode::Unauthorized => "unauthorized",
             RefuseCode::SpaceNotDelegated => "space-not-delegated",
             RefuseCode::Busy => "busy",
@@ -465,18 +466,15 @@ fn escaped_declaration_value(value: &str) -> String {
     escaped
 }
 
-/// What a program's `synchronicity.init` hook said about itself
+/// What a program's `synchronicity.manifest` section declares about itself
 /// (`docs/SOCKETS.md` §3.1).
 ///
-/// The point of the hook is that an approval which says only "these bytes are
-/// fine" asks the operator to read eBPF. This is the list they are shown
-/// instead. It is compiled into the object, so editing it changes the content
-/// root, which disarms the socket: a program cannot widen its own reach
-/// without a fresh approval.
-///
-/// Arming approves these capabilities for this exact program root. Egress the
-/// program did not declare remains denied. Reading the tree is not declared and
-/// not restricted (`docs/SOCKETS.md` §7.6).
+/// The manifest is data, never code: a versioned JSON document compiled into
+/// the object, parsed by [`parse_socket_manifest`]. A capability the manifest
+/// does not declare remains denied. Reading the tree is not declared and not
+/// restricted (`docs/SOCKETS.md` §7.6). Because the manifest is part of the
+/// object's bytes, editing it changes the content root — so what a path
+/// serves is always exactly what its current content declares.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declaration {
     /// A human name, for `synch socket ls` and `synch socket ps`.
@@ -727,6 +725,305 @@ impl Declaration {
     }
 }
 
+/// The socket-manifest format version this build reads.
+///
+/// Carried as the required `"manifest"` member of the JSON document, first so
+/// a later format can change everything else about the shape and still be
+/// recognized — and refused with its version named — by this build.
+pub const SOCKET_MANIFEST_VERSION: u64 = 1;
+
+/// The most bytes a `synchronicity.manifest` section may carry.
+///
+/// Generous next to anything a legal declaration produces — the largest is a
+/// full complement of capabilities at a few kilobytes — and small enough that
+/// parsing it is never the expensive part of an admission.
+pub const MAX_SOCKET_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// Why a socket manifest cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManifestError {
+    /// The manifest section is larger than the documented bound.
+    #[error("the manifest is {size} bytes, past the {MAX_SOCKET_MANIFEST_BYTES} it may be")]
+    TooLarge {
+        /// The oversized section's length in bytes.
+        size: usize,
+    },
+    /// The manifest is not UTF-8 text.
+    #[error("the manifest is not UTF-8 text")]
+    NotText,
+    /// The manifest does not parse as the JSON shape this build reads: a
+    /// syntax error, a duplicate key, an unknown field, or a mistyped value.
+    #[error("the manifest is not valid: {0}")]
+    Json(String),
+    /// The manifest names a version this build does not read.
+    #[error(
+        "manifest version {found}, not the {SOCKET_MANIFEST_VERSION} this build reads \
+         (a `\"manifest\": {SOCKET_MANIFEST_VERSION}` member is required)"
+    )]
+    Version {
+        /// The version the manifest carried, or 0 when it carried none.
+        found: u64,
+    },
+    /// One member carries a value the format does not admit.
+    #[error("invalid manifest value for {field}: {reason}")]
+    Value {
+        /// The offending member.
+        field: &'static str,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The declared capabilities fail [`Declaration::validate`].
+    #[error("invalid manifest: {0}")]
+    Declaration(#[from] DeclarationError),
+}
+
+/// The strict JSON shape of a v1 manifest.
+///
+/// `deny_unknown_fields` is what makes an unknown member an error rather than
+/// a silently dropped grant, and serde's derived decoder is what refuses a
+/// duplicated one — both halves of "typed, bounded parsing".
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManifest {
+    /// The format version; checked before this struct is trusted.
+    manifest: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    egress: Vec<String>,
+    #[serde(default)]
+    max_streams: Option<u32>,
+    #[serde(default)]
+    stack_frame_size: Option<u32>,
+    #[serde(default)]
+    guarded_stack_frames: Option<bool>,
+    #[serde(default)]
+    processes: Vec<RawProcess>,
+    #[serde(default)]
+    file_transfers: Vec<RawFileTransfer>,
+    #[serde(default)]
+    tree_writes: Vec<RawTreeWrite>,
+}
+
+/// One process capability, in the manifest's named form.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProcess {
+    id: u32,
+    allow: Vec<String>,
+    executable: String,
+    argv: Vec<String>,
+    #[serde(default)]
+    allowed_signals: Vec<String>,
+}
+
+/// One file-transfer capability, in the manifest's named form.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileTransfer {
+    id: u32,
+    protocol: String,
+    access: Vec<String>,
+    scope: String,
+}
+
+/// One tree-write capability, in the manifest's named form.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTreeWrite {
+    id: u32,
+    prefix: String,
+    allow: Vec<String>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+/// Collects named flags into bits, refusing a name the format does not know.
+fn named_bits(
+    field: &'static str,
+    names: &[String],
+    bit: impl Fn(&str) -> Option<u64>,
+) -> Result<u64, ManifestError> {
+    let mut bits = 0;
+    for name in names {
+        bits |= bit(name).ok_or_else(|| ManifestError::Value {
+            field,
+            reason: format!("unknown name {name:?}"),
+        })?;
+    }
+    Ok(bits)
+}
+
+/// Whether an egress rule is well-formed: nonempty, display-safe, and — when
+/// it carries a numeric `:port` suffix — a port that actually fits `u16`.
+///
+/// [`egress_rule_matches`] would treat `host:99999` as a rule that never
+/// matches; typed parsing refuses it instead, at the one moment the author is
+/// looking.
+fn valid_egress_rule(rule: &str) -> Result<(), ManifestError> {
+    let invalid = |reason: &str| ManifestError::Value {
+        field: "egress",
+        reason: format!("{reason}: {rule:?}"),
+    };
+    if rule.is_empty() {
+        return Err(invalid("an empty rule names nothing"));
+    }
+    if let Some((host, port)) = rule.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) {
+            port.parse::<u16>()
+                .map_err(|_| invalid("the port does not fit a u16"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Parses the bytes of a `synchronicity.manifest` section into the
+/// [`Declaration`] they carry.
+///
+/// The parse is bounded and typed: an oversized section, non-UTF-8 bytes, a
+/// duplicate key, an unknown member, an unknown version, a mistyped or
+/// out-of-range value, and a declaration past its documented bounds are all
+/// distinct, named errors — never permissions. Trailing NUL bytes and
+/// whitespace are trimmed first, because a C `char[]` literal carries its
+/// terminator into the section.
+///
+/// The empty section (or one that is all padding) is refused rather than read
+/// as "declares nothing": a program that declares nothing writes `{"manifest":
+/// 1}`, and a truncated or garbled section must not decay into a silent grant
+/// of nothing when its author meant something.
+pub fn parse_socket_manifest(bytes: &[u8]) -> Result<Declaration, ManifestError> {
+    if bytes.len() > MAX_SOCKET_MANIFEST_BYTES {
+        return Err(ManifestError::TooLarge { size: bytes.len() });
+    }
+    let text = std::str::from_utf8(trim_manifest(bytes)).map_err(|_| ManifestError::NotText)?;
+
+    // The version first, leniently: a v2 document may carry members v1 has
+    // never heard of, and the answer it deserves is "version 2, not 1" rather
+    // than "unknown field". Duplicate `manifest` members still fail here.
+    #[derive(serde::Deserialize)]
+    struct VersionOnly {
+        #[serde(default)]
+        manifest: Option<u64>,
+    }
+    let version: VersionOnly =
+        serde_json::from_str(text).map_err(|e| ManifestError::Json(e.to_string()))?;
+    match version.manifest {
+        Some(SOCKET_MANIFEST_VERSION) => {}
+        found => {
+            return Err(ManifestError::Version {
+                found: found.unwrap_or(0),
+            })
+        }
+    }
+
+    let raw: RawManifest =
+        serde_json::from_str(text).map_err(|e| ManifestError::Json(e.to_string()))?;
+    debug_assert_eq!(raw.manifest, SOCKET_MANIFEST_VERSION, "checked above");
+    if raw.max_streams == Some(0) {
+        return Err(ManifestError::Value {
+            field: "max_streams",
+            reason: "a cap of 0 admits nothing; omit the member instead".into(),
+        });
+    }
+    for rule in &raw.egress {
+        valid_egress_rule(rule)?;
+    }
+
+    let mut processes = Vec::with_capacity(raw.processes.len());
+    for process in raw.processes {
+        let flags = named_bits("processes.allow", &process.allow, |name| match name {
+            "pty" => Some(0x01),
+            "pipe" => Some(0x02),
+            _ => None,
+        })? as u32;
+        let allowed_signals = named_bits(
+            "processes.allowed_signals",
+            &process.allowed_signals,
+            |name| match name {
+                "HUP" => Some(1 << 0),
+                "INT" => Some(1 << 1),
+                "TERM" => Some(1 << 2),
+                _ => None,
+            },
+        )?;
+        processes.push(ProcessCapability {
+            id: process.id,
+            flags,
+            executable: process.executable,
+            argv: process.argv,
+            allowed_signals,
+        });
+    }
+
+    let mut file_transfers = Vec::with_capacity(raw.file_transfers.len());
+    for transfer in raw.file_transfers {
+        let protocol = match transfer.protocol.as_str() {
+            "sftp" => 0x01,
+            other => {
+                return Err(ManifestError::Value {
+                    field: "file_transfers.protocol",
+                    reason: format!("unknown protocol {other:?}"),
+                })
+            }
+        };
+        let access = named_bits(
+            "file_transfers.access",
+            &transfer.access,
+            |name| match name {
+                "read" => Some(0x01),
+                "recursive" => Some(0x04),
+                _ => None,
+            },
+        )? as u32;
+        file_transfers.push(FileTransferCapability {
+            id: transfer.id,
+            protocol,
+            access,
+            scope: transfer.scope,
+        });
+    }
+
+    let mut tree_writes = Vec::with_capacity(raw.tree_writes.len());
+    for write in raw.tree_writes {
+        let modes = named_bits("tree_writes.allow", &write.allow, |name| match name {
+            "create" => Some(TREE_WRITE_CREATE as u64),
+            "replace" => Some(TREE_WRITE_REPLACE as u64),
+            "delete" => Some(TREE_WRITE_DELETE as u64),
+            _ => None,
+        })? as u32;
+        tree_writes.push(TreeWriteCapability {
+            id: write.id,
+            modes,
+            prefix: write.prefix,
+            // Absent means the modest default; an explicit 0 is "unbounded",
+            // which inspection and status print loudly.
+            max_bytes: write.max_bytes.unwrap_or(DEFAULT_TREE_WRITE_MAX_BYTES),
+        });
+    }
+
+    let declaration = Declaration {
+        name: raw.name.unwrap_or_default(),
+        egress: raw.egress,
+        processes,
+        file_transfers,
+        tree_writes,
+        max_streams: raw.max_streams,
+        stack_frame_size: raw.stack_frame_size,
+        guarded_stack_frames: raw.guarded_stack_frames,
+    };
+    declaration.validate()?;
+    Ok(declaration)
+}
+
+/// Strips the trailing padding a C string literal or a section aligner adds.
+fn trim_manifest(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == 0 || bytes[end - 1].is_ascii_whitespace()) {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
 /// True if a declared egress rule admits `host:port`.
 ///
 /// A rule is `host` or `host:port`. Host comparison is ASCII-case-insensitive
@@ -840,8 +1137,8 @@ mod tests {
                 invocation: 7,
             },
             SockOpened::Refused {
-                code: RefuseCode::NotArmed,
-                message: "armed at 9f86, tree has aa11".into(),
+                code: RefuseCode::NotActivated,
+                message: "deactivated during admission".into(),
             },
         ] {
             let bytes = postcard::to_stdvec(&msg).unwrap();
@@ -1217,6 +1514,125 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_manifest_parses_deterministically_into_a_declaration() {
+        let text = br#"{
+            "manifest": 1,
+            "name": "git-http",
+            "egress": ["git.internal:9418", "cache.internal"],
+            "max_streams": 32,
+            "stack_frame_size": 512,
+            "guarded_stack_frames": false,
+            "processes": [{"id": 1, "allow": ["pty"], "executable": "/bin/bash",
+                           "argv": ["bash"], "allowed_signals": ["HUP", "INT", "TERM"]}],
+            "file_transfers": [{"id": 2, "protocol": "sftp",
+                                "access": ["read", "recursive"], "scope": "code/releases"}],
+            "tree_writes": [{"id": 3, "prefix": "code/inbox", "allow": ["create"]}]
+        }"#;
+        let first = parse_socket_manifest(text).unwrap();
+        let second = parse_socket_manifest(text).unwrap();
+        assert_eq!(first, second, "two parses of one manifest disagree");
+        assert_eq!(first.name, "git-http");
+        assert_eq!(first.max_streams, Some(32));
+        assert_eq!(first.stack_frame_size, Some(512));
+        assert_eq!(first.guarded_stack_frames, Some(false));
+        assert_eq!(first.processes[0].flags, 0x01);
+        assert_eq!(first.processes[0].allowed_signals, 0x07);
+        assert_eq!(first.file_transfers[0].protocol, 0x01);
+        assert_eq!(first.file_transfers[0].access, 0x05);
+        assert_eq!(first.tree_writes[0].modes, TREE_WRITE_CREATE);
+        assert_eq!(
+            first.tree_writes[0].max_bytes, DEFAULT_TREE_WRITE_MAX_BYTES,
+            "an absent max_bytes is the modest default, not unbounded"
+        );
+        assert_eq!(
+            first.render(),
+            second.render(),
+            "canonical rendering is not stable"
+        );
+    }
+
+    #[test]
+    fn a_manifest_trims_the_padding_a_c_literal_carries() {
+        let mut bytes = br#"{"manifest": 1, "name": "padded"}"#.to_vec();
+        bytes.push(0); // the char[] terminator
+        bytes.extend_from_slice(&[0, 0, 0]); // section alignment
+        assert_eq!(parse_socket_manifest(&bytes).unwrap().name, "padded");
+    }
+
+    #[test]
+    fn a_manifest_rejects_what_typed_parsing_exists_to_reject() {
+        // A duplicate key is two claims about one grant, and neither wins.
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 1, "name": "a", "name": "b"}"#),
+            Err(ManifestError::Json(_))
+        ));
+        // An unknown member is not silently dropped: it may be a typo'd grant.
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 1, "egres": ["evil:80"]}"#),
+            Err(ManifestError::Json(_))
+        ));
+        // A version this build does not read is named, not guessed at.
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 2, "quantum_egress": true}"#),
+            Err(ManifestError::Version { found: 2 })
+        ));
+        assert!(matches!(
+            parse_socket_manifest(br#"{"name": "unversioned"}"#),
+            Err(ManifestError::Version { found: 0 })
+        ));
+        // Invalid values are refused at parse, not discovered at admission.
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 1, "egress": ["host:99999"]}"#),
+            Err(ManifestError::Value {
+                field: "egress",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 1, "max_streams": 0}"#),
+            Err(ManifestError::Value { .. })
+        ));
+        assert!(matches!(
+            parse_socket_manifest(br#"{"manifest": 1, "stack_frame_size": 17}"#),
+            Err(ManifestError::Declaration(
+                DeclarationError::InvalidStackFrameSize
+            ))
+        ));
+        assert!(matches!(
+            parse_socket_manifest(
+                br#"{"manifest": 1, "processes": [{"id": 1, "allow": ["fork"],
+                     "executable": "/bin/sh", "argv": ["sh"]}]}"#
+            ),
+            Err(ManifestError::Value { .. })
+        ));
+        // Not text, not JSON, or empty: distinct errors, never permissions.
+        assert!(matches!(
+            parse_socket_manifest(&[0xff, 0xfe]),
+            Err(ManifestError::NotText)
+        ));
+        assert!(matches!(
+            parse_socket_manifest(b""),
+            Err(ManifestError::Json(_))
+        ));
+        // Oversized is refused before anything is parsed.
+        let huge = vec![b' '; MAX_SOCKET_MANIFEST_BYTES + 1];
+        assert!(matches!(
+            parse_socket_manifest(&huge),
+            Err(ManifestError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_minimal_manifest_declares_nothing() {
+        let declaration = parse_socket_manifest(br#"{"manifest": 1}"#).unwrap();
+        assert_eq!(declaration, Declaration::default());
+        assert!(
+            declaration.egress.is_empty(),
+            "nothing declared grants nothing"
+        );
     }
 
     #[test]

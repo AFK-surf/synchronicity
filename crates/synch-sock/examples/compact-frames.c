@@ -14,16 +14,11 @@
 
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_declare_name(SY_STR("compact-frames"));
-  sy_declare_max_streams(16);
-
-  /* Declaration order is not significant: the runtime validates the complete
-     pair after `synchronicity.init` returns. Both lines appear at arm review. */
-  if (sy_declare_stack_frame_size(512) < 0) return -1;
-  if (sy_declare_guarded_stack_frames(0) < 0) return -2;
-  return 0;
-}
+/* The stack shape is declared beside everything else the program claims: one
+   JSON document, validated whole when the file is inspected or served. */
+SY_MANIFEST("{\"manifest\":1,\"name\":\"compact-frames\","
+            "\"max_streams\":16,"
+            "\"stack_frame_size\":512,\"guarded_stack_frames\":false}");
 
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 n = sy_write_all(SY_SELF, SY_STR("compact frames\n"), 5000);

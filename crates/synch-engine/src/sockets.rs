@@ -2,16 +2,17 @@
 //!
 //! Three things live here, and they are deliberately separate.
 //!
-//! **Resolution** answers "what would run, if anything?" — a lookup in *this
-//! node's own* trie, a kind check, and an arming check against the content root
-//! the tree currently names. It is the whole of the rule the design is built
-//! on, and it never consults the unified tree: connecting to a socket names an
-//! origin, and `newest` would otherwise let any member's `mtime_ns` decide
-//! whose program a connection lands on.
+//! **Resolution** answers "what would run, if anything?" — an activation check
+//! and a lookup in *this node's own* trie. It is the whole of the rule the
+//! design is built on, and it never consults the unified tree: connecting to a
+//! socket names an origin, and `newest` would otherwise let any member's
+//! `mtime_ns` decide whose program a connection lands on.
 //!
 //! **Admission** turns that into an invocation: it adds the caller's identity
-//! as the handshake established it and the capabilities approved by arming the
-//! program's declaration.
+//! as the handshake established it and the capabilities the program's own
+//! manifest declares. The root it resolves is the invocation's snapshot — a
+//! deployment landing mid-stream changes what the *next* invocation runs,
+//! never what a running one is executing.
 //!
 //! **The tree host** is what the running program reads through. It is the one
 //! place a socket touches the rest of the node, and it is read-only.
@@ -25,7 +26,7 @@ use synch_sock::{
     Admission, DuplexStream, EffectivePolicy, HostError, Limits, ObjectInfo, PeerIdentity,
     PutCondition, PutReceipt, SocketHost, SocketId, SocketWriter,
 };
-use synch_store::{ArmCandidate, SocketRow, SocketState};
+use synch_store::SocketActivation;
 
 use crate::{
     error::{EngineError, Result},
@@ -35,39 +36,25 @@ use crate::{
 /// What a socket path resolves to right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// The content root the tree currently names.
+    /// The content root the tree currently names — the snapshot an invocation
+    /// admitted against it will run, however the path moves afterwards.
     pub root: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// The declaration and its arming record.
-    pub state: SocketState,
-}
-
-/// The immutable result an operator reviews before arming a socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketInspection {
-    /// The content root that was inspected.
-    pub root: Hash,
-    /// What that exact execution of the program's init hook declared.
-    pub declaration: Declaration,
-    /// Opaque approval token binding the root, authorization revision, and
-    /// rendered program declaration. Disarm also advances the revision, so a
-    /// copied token cannot restore an approval the operator withdrew.
-    pub review: Hash,
-}
-
-struct CurrentInspection {
-    public: SocketInspection,
-    generation: Hash,
+    /// The activation that makes the path a socket.
+    pub activation: SocketActivation,
 }
 
 impl Node {
-    /// Declares a path in one of this node's spaces to be a socket.
+    /// Makes a path in one of this node's spaces a socket, until
+    /// [`Node::socket_deactivate`].
     ///
-    /// Does not arm it: what the file contains at declaration time may not be
-    /// what the operator meant to approve, and `synch socket arm` is where the
-    /// approval happens after the declaration is printed.
-    pub fn socket_declare(&self, row: &SocketRow) -> Result<()> {
+    /// From the next scan the path publishes as `EntryKind::Socket`, and every
+    /// later write to it — an editor save, an adoption, an S3 `PUT` — is an
+    /// intentional deployment: the new content serves as soon as it publishes,
+    /// under whatever its own manifest declares. That breadth is the grant, and
+    /// `synch socket activate` says so where it is asked for.
+    pub fn socket_activate(&self, row: &SocketActivation) -> Result<()> {
         let _authorization = self.socket_authorization_write();
         let Some(space) = self.store().source(&row.space)? else {
             return Err(EngineError::invalid(format!(
@@ -84,119 +71,35 @@ impl Node {
         let mut row = row.clone();
         row.path = synch_core::normalize_path(&row.path)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
-        self.store().put_socket(&row)?;
+        self.store().activate_socket(&row)?;
         // Kind is part of the published entry even when the file's bytes and
         // stat are unchanged. Invalidate the scanner cache so its next pass
-        // reaches the declaration check instead of returning early.
+        // reaches the activation check instead of returning early.
         self.store().remove_local_file(&row.space, &row.path)?;
+        // A re-activation is a new bargain; a session table minted under the
+        // old terms is not state the new terms agreed to inherit.
+        self.clear_socket_map(&row.qualified());
         Ok(())
     }
 
-    /// Every socket this node declares.
-    pub fn socket_ls(&self, space: Option<&str>) -> Result<Vec<SocketState>> {
+    /// Every path this node has activated.
+    pub fn socket_ls(&self, space: Option<&str>) -> Result<Vec<SocketActivation>> {
         Ok(match space {
-            Some(space) => self.store().sockets_in(space)?,
-            None => self.store().sockets()?,
+            Some(space) => self.store().socket_activations_in(space)?,
+            None => self.store().socket_activations()?,
         })
     }
 
-    /// Runs the program's declaration hook without approving anything.
+    /// Removes an activation.
     ///
-    /// The dry run is not a formality. async-ebpf compiles lazily, per function
-    /// and per pointer signature, so a program that fails to compile would
-    /// otherwise surface that on the first stream that reaches the bad path —
-    /// a long way from the operator who armed it.
-    pub async fn socket_inspect(&self, space: &str, path: &str) -> Result<SocketInspection> {
-        Ok(self.inspect_socket_current(space, path).await?.public)
-    }
-
-    async fn inspect_socket_current(&self, space: &str, path: &str) -> Result<CurrentInspection> {
-        // Resolution opens the SQLite store. This method is reached directly
-        // from the daemon's async control handler, so it belongs on the
-        // blocking pool rather than on a Tokio worker.
-        let node = self.clone();
-        let (space_owned, path_owned) = (space.to_string(), path.to_string());
-        let resolved =
-            crate::blocking::offload(move || node.resolve_socket(&space_owned, &path_owned))
-                .await?
-                .ok_or_else(|| {
-                    EngineError::invalid(format!(
-                "`{space}/{path}` is declared a socket but this node publishes no entry for it \
-                 — run `synch source scan` first"
-            ))
-                })?;
-        let elf = self.socket_program(&resolved).await?;
-        // The declaration hook JIT-compiles the program and joins its isolated
-        // worker thread. It is deliberately synchronous, so hand that wait to
-        // the blocking pool too.
-        let node = self.clone();
-        let declared = crate::blocking::offload(move || node.declare_program(&elf)).await?;
-        let review = socket_review(&resolved.root, &resolved.state.generation, &declared);
-        Ok(CurrentInspection {
-            public: SocketInspection {
-                root: resolved.root,
-                declaration: declared,
-                review,
-            },
-            generation: resolved.state.generation,
-        })
-    }
-
-    /// Approves only the exact init result returned by a prior inspection.
-    ///
-    /// Init is deliberately rerun here. A root alone is insufficient because
-    /// init may consult time or randomness; the opaque token proves that this
-    /// second execution produced the declaration the operator actually saw.
-    pub async fn socket_approve(&self, space: &str, path: &str, review: &Hash) -> Result<()> {
-        let inspected = self.inspect_socket_current(space, path).await?;
-        if &inspected.public.review != review {
-            return Err(EngineError::invalid(
-                "the socket's content, declaration, or init result changed after review; inspect it again",
-            ));
-        }
-        let node = self.clone();
-        let (space, path) = (space.to_string(), path.to_string());
-        crate::blocking::offload(move || {
-            let _authorization = node.socket_authorization_write();
-            let armed = node.store().arm_socket_reviewed(
-                node.origin(),
-                &space,
-                &path,
-                ArmCandidate {
-                    generation: &inspected.generation,
-                    root: &inspected.public.root,
-                    declared: &inspected.public.declaration.render(),
-                    armed_at: synch_core::now_ns(),
-                },
-            )?;
-            if !armed {
-                return Err(EngineError::invalid(
-                    "the socket's declaration or published content changed while it was being armed; inspect it again",
-                ));
-            }
-            // A re-arm is a different program; a session table minted by the
-            // old one is not state the new one agreed to inherit.
-            node.clear_socket_map(&format!("{space}/{path}"));
-            Ok(())
-        })
-        .await
-    }
-
-    /// Withdraws an approval, leaving the declaration standing.
-    pub fn socket_disarm(&self, space: &str, path: &str) -> Result<bool> {
+    /// Admission refuses immediately — the write side of the authorization
+    /// gate excludes in-flight admissions — and the next scan republishes the
+    /// path as an ordinary file, because the kind comes from the activation
+    /// and there is no longer one. Invocations already running keep their
+    /// snapshot and finish.
+    pub fn socket_deactivate(&self, space: &str, path: &str) -> Result<bool> {
         let _authorization = self.socket_authorization_write();
-        let out = self.store().disarm_socket(space, path)?;
-        self.clear_socket_map(&format!("{space}/{path}"));
-        Ok(out)
-    }
-
-    /// Removes a declaration and its approval.
-    ///
-    /// The next scan republishes the path as an ordinary file, because the kind
-    /// comes from the declaration and there is no longer one.
-    pub fn socket_undeclare(&self, space: &str, path: &str) -> Result<bool> {
-        let _authorization = self.socket_authorization_write();
-        let out = self.store().remove_socket(space, path)?;
+        let out = self.store().deactivate_socket(space, path)?;
         if out {
             self.store().remove_local_file(space, path)?;
         }
@@ -204,13 +107,23 @@ impl Node {
         Ok(out)
     }
 
+    /// The declaration the program at `root` carries in its manifest.
+    ///
+    /// A read of this node's own CAS plus a bounded parse — nothing executes.
+    /// What `synch socket ls -l` shows, from the same parse admission uses.
+    pub fn socket_program_declaration(&self, root: &Hash) -> Result<Declaration> {
+        let elf = self.read_socket_bytes(root)?;
+        synch_sock::manifest::manifest_declaration(&elf)
+            .map_err(|e| EngineError::invalid(e.to_string()))
+    }
+
     /// Resolves a socket path in **this node's own** trie.
     ///
-    /// `Ok(None)` means this node publishes no entry there, or publishes one
-    /// that is not a socket. The distinction between those two is drawn by the
-    /// caller, which has a refusal code for each.
+    /// `Ok(None)` means the path is not activated, this node publishes no
+    /// entry there, or publishes one that is not a socket. The distinctions
+    /// are drawn by the caller, which has a refusal code for each.
     pub fn resolve_socket(&self, space: &str, path: &str) -> Result<Option<Resolved>> {
-        let Some(state) = self.store().socket(space, path)? else {
+        let Some(activation) = self.store().socket_activation(space, path)? else {
             return Ok(None);
         };
         let Some(entry) = self.store().entry(self.origin(), space, path)? else {
@@ -225,7 +138,7 @@ impl Node {
         Ok(Some(Resolved {
             root,
             size: entry.size,
-            state,
+            activation,
         }))
     }
 
@@ -281,17 +194,17 @@ impl Node {
         }
     }
 
-    /// Builds the policy one invocation runs under.
-    fn socket_policy(&self, state: &SocketState) -> EffectivePolicy {
-        let declared = state
-            .arm
-            .as_ref()
-            .map(|arm| Declaration::parse(&arm.declared))
-            .unwrap_or_default();
-        EffectivePolicy::armed(
-            &declared,
-            state.declaration.config.clone(),
-            state.declaration.max_streams,
+    /// Builds the policy one invocation runs under: what the program's own
+    /// manifest declares, capped by the activation's and the daemon's limits.
+    fn socket_policy(
+        &self,
+        declared: &Declaration,
+        activation: &SocketActivation,
+    ) -> EffectivePolicy {
+        EffectivePolicy::granted(
+            declared,
+            activation.config.clone(),
+            activation.max_streams,
             self.socket_limits().max_streams,
         )
     }
@@ -299,8 +212,8 @@ impl Node {
     /// Resolves and authorizes an `Open`.
     ///
     /// Every refusal here is a distinct code, because the caller can act on the
-    /// difference: `NotArmed` is the operator's to fix, `SpaceNotDelegated` is
-    /// the caller's, and `NoSuchPath` means look again.
+    /// difference: `ProgramInvalid` is the operator's to fix by deploying,
+    /// `SpaceNotDelegated` is the caller's, and `NoSuchPath` means look again.
     pub(crate) async fn admit_socket(
         &self,
         peer: NodeId,
@@ -380,52 +293,78 @@ impl Node {
             }
         };
 
-        if !resolved.state.is_armed_for(&resolved.root) {
-            let message = match &resolved.state.arm {
-                Some(arm) => format!(
-                    "armed at {}, the tree now names {}",
-                    arm.root.to_hex(),
-                    resolved.root.to_hex()
-                ),
-                None => "declared but never armed".into(),
-            };
-            return Err((RefuseCode::NotArmed, message));
+        // The program's bytes and manifest come before the registry slot: the
+        // policy an invocation runs under — its stream cap included — is
+        // declared in the object itself, so nothing can be reserved until the
+        // object has been read and its manifest parsed. Concurrent cold
+        // admissions of one root still coalesce onto one CAS read
+        // (`ProgramBytesCache`), and the authorization re-check below closes
+        // the window this opens.
+        let program = match self.socket_program(&resolved).await {
+            Ok(bytes) => bytes,
+            Err(e) => return Err((RefuseCode::ProgramInvalid, e.to_string())),
+        };
+        // The manifest gate: an update whose manifest does not parse — or
+        // that has no stream entrypoint at all — keeps the path activated and
+        // published, and refuses every connection with a message that names
+        // the defect. Deploying a fixed object is the whole remedy.
+        let declared = match synch_sock::manifest::manifest_declaration(&program) {
+            Ok(declared) => declared,
+            Err(e) => return Err((RefuseCode::ProgramInvalid, e.to_string())),
+        };
+        if !synch_sock::manifest::has_stream_section(&program) {
+            return Err((
+                RefuseCode::ProgramInvalid,
+                "the program has no `synchronicity.stream` entrypoint".into(),
+            ));
         }
 
-        // Program loading may fetch from a remote CAS. Authorization is
-        // deliberately not held across that wait, but it must be checked again
-        // while the registry slot is made live. Arm/disarm/redeclare take the
-        // write side of this gate, so either this admission becomes in-flight
-        // first or the revocation wins and this request is refused.
+        // Authorization is deliberately not held across the CAS wait above,
+        // so it is checked again while the registry slot is made live.
+        // Activation and deactivation take the write side of this gate, so
+        // either this admission becomes in-flight first or the deactivation
+        // wins and this request is refused.
         let qualified = format!("{}/{}", open.space, open.path);
         let node = self.clone();
         let (space, path) = (open.space.clone(), open.path.clone());
-        let checked = resolved.clone();
+        let checked_root = resolved.root;
         let qualified_for_slot = qualified.clone();
         let peer_name = origin.canonical();
         // The store read and the registry reservation are one blocking-pool
-        // closure so the authorization read guard spans both. A concurrent
-        // disarm therefore wins before admission or waits until the live slot
-        // exists; there is no unchecked gap between them.
+        // closure so the authorization read guard spans both; there is no
+        // unchecked gap between them. A concurrent *deployment* — the content
+        // replaced mid-admission — refuses this admission too: the caller
+        // retries and lands on the new root, so a new invocation never runs
+        // bytes the tree no longer names. The effective policy is computed from
+        // the activation this re-read observes, not the one taken before the
+        // CAS wait: a re-activation that rotated the config or tightened the
+        // stream cap in that window is a new bargain, and the slot is reserved
+        // against its cap.
         let prepared = crate::blocking::offload(move || {
             let _authorization = node.socket_authorization_read();
             let current = match node.resolve_socket(&space, &path)? {
                 Some(current) => current,
                 None => {
                     return Ok(Err((
-                        RefuseCode::NotArmed,
-                        "the socket was removed or republished during admission".into(),
+                        RefuseCode::NotActivated,
+                        "the socket was deactivated or republished during admission".into(),
                     )))
                 }
             };
-            if !authorization_unchanged(&checked, &current) {
+            if current.root != checked_root {
                 return Ok(Err((
-                    RefuseCode::NotArmed,
-                    "the socket was disarmed, redeclared, or changed during admission".into(),
+                    RefuseCode::NotActivated,
+                    "the socket's content was replaced during admission; connect again to \
+                     reach the new program"
+                        .into(),
                 )));
             }
+            // The parsed manifest still matches the content, since the root is
+            // unchanged; the operator half of the policy comes from the row
+            // this closure just read under the lock.
+            let policy = node.socket_policy(&declared, &current.activation);
+            let max_streams = policy.max_streams;
 
-            let policy = node.socket_policy(&current.state);
             // The pool-wide bound, before the socket's own cap: one caller
             // who can reach many sockets must not be able to fill every
             // worker's queue past the documented daemon limit.
@@ -443,37 +382,22 @@ impl Node {
                 &qualified_for_slot,
                 &peer_name,
                 peer,
-                checked.root,
-                policy.max_streams,
+                checked_root,
+                max_streams,
             ) else {
                 return Ok(Err((
                     RefuseCode::Busy,
                     format!(
-                        "{qualified_for_slot} is at its limit of {} concurrent invocations",
-                        policy.max_streams
+                        "{qualified_for_slot} is at its limit of {max_streams} concurrent \
+                         invocations"
                     ),
                 )));
             };
             Ok(Ok((policy, id, slot)))
         })
         .await
-        .map_err(|e| (RefuseCode::NotArmed, e.to_string()))?;
+        .map_err(|e| (RefuseCode::NotActivated, e.to_string()))?;
         let (policy, id, slot) = prepared?;
-
-        // The pool token is taken *before* the program's bytes are read: the
-        // CAS fetch can be the expensive part of an admission (up to 4 MiB,
-        // possibly from a remote CAS), and concurrent opens for distinct
-        // roots must not bypass the daemon-wide bound during it. A load that
-        // fails — the size check, the fetch, the read — gives the token back
-        // by dropping the slot, and the admission is refused as it would have
-        // been before.
-        let program = match self.socket_program(&resolved).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                drop(slot);
-                return Err((RefuseCode::ProgramInvalid, e.to_string()));
-            }
-        };
 
         let peer_label = origin.canonical();
         Ok(Admission {
@@ -529,44 +453,21 @@ impl Node {
                 SockStatus::Fault(synch_core::FaultKind::Load)
             }
         };
-        // The pool has already recorded this outcome against the socket's
-        // fault history; what it cannot do is disarm, which is a store write.
+        // The pool records every outcome against the socket's fault history.
+        // Nothing is deactivated for it — activation is the operator's
+        // statement about the path, not a judgement about these bytes — but a
+        // program faulting for most of its callers is worth one loud line an
+        // operator will find. Deploying a fixed object is the remedy, and it
+        // clears the window.
         if pool.should_quarantine(&socket.qualified(), program_root) {
-            self.quarantine_socket(&socket.space, &socket.path, program_root)
-                .await;
+            tracing::error!(
+                socket = socket.qualified(),
+                program = %program_root,
+                "socket program faulted on most of its recent invocations, from more than \
+                 one caller; it stays activated — deploy a fixed program to this path"
+            );
         }
         status
-    }
-
-    /// Disarms a socket that has been faulting on most of what it is asked.
-    ///
-    /// A program that cannot run is not left accepting connections: every
-    /// caller gets a reset instead of an answer, and the operator finds out
-    /// from their users. Disarmed rather than undeclared — the declaration and
-    /// its policy are the operator's and survive; what is withdrawn is the
-    /// approval of *these bytes*, which have proved they do not work.
-    async fn quarantine_socket(&self, space: &str, path: &str, root: Hash) {
-        let node = self.clone();
-        let (space, path) = (space.to_string(), path.to_string());
-        if let Err(e) = crate::blocking::offload(move || {
-            let _authorization = node.socket_authorization_write();
-            match node.store().disarm_socket_root(&space, &path, &root) {
-                Ok(true) => tracing::error!(
-                    socket = format!("{space}/{path}"),
-                    "socket disarmed: it faulted on most of its recent invocations.                  Fix the program and `synch socket arm` it again."
-                ),
-                Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    socket = format!("{space}/{path}"),
-                    "could not disarm a faulting socket: {e}"
-                ),
-            }
-            Ok(())
-        })
-        .await
-        {
-            tracing::warn!("could not schedule fault quarantine: {e}");
-        }
     }
 
     /// Every invocation running right now, optionally for one socket.
@@ -589,22 +490,6 @@ impl Node {
             None => Vec::new(),
         }
     }
-}
-
-fn authorization_unchanged(reviewed: &Resolved, current: &Resolved) -> bool {
-    current.root == reviewed.root
-        && current.state.generation == reviewed.state.generation
-        && current.state.is_armed_for(&current.root)
-}
-
-fn socket_review(root: &Hash, generation: &Hash, declaration: &Declaration) -> Hash {
-    let rendered = declaration.render();
-    let mut bytes = Vec::with_capacity(32 + 32 + rendered.len() + 31);
-    bytes.extend_from_slice(b"synch/socket-review/v1\0");
-    bytes.extend_from_slice(root.as_bytes());
-    bytes.extend_from_slice(generation.as_bytes());
-    bytes.extend_from_slice(rendered.as_bytes());
-    Hash::new(&bytes)
 }
 
 /// The tree, as a running program reaches it.
@@ -865,20 +750,22 @@ impl SocketHost for TreeHost {
     }
 }
 
-/// A path with a `sockets` row is never writable through a program
-/// (`docs/TREE-WRITES.md` §2) — declared, armed or not, `--auto` or not.
+/// An activated path is never writable through a program
+/// (`docs/TREE-WRITES.md` §2).
 ///
-/// This is the rule that keeps tree-write and `--auto` composable: without
-/// it, a socket armed to write a prefix containing an `--auto` socket's path
-/// is remote code persistence in two moves (write the ELF, invoke it). With
-/// it, code reaches executability only over the operator's own
-/// declare-and-arm acts.
+/// This is the rule that keeps tree-write grants and activation composable:
+/// without it, a socket whose manifest writes a prefix containing an
+/// activated path is remote code persistence in two moves (write the ELF,
+/// invoke it). With it, code reaches executability only over write channels
+/// outside the socket runtime — channels the operator accepted as deployment
+/// channels when activating the path.
 fn refuse_socket_path(node: &Node, space: &str, path: &str) -> std::result::Result<(), HostError> {
-    match node.store().socket(space, path) {
-        Ok(Some(_)) => Err(HostError::Denied(format!(
-            "{space}/{path} is a declared socket, and sockets are never writable through a program"
+    match node.store().is_activated_socket(space, path) {
+        Ok(true) => Err(HostError::Denied(format!(
+            "{space}/{path} is an activated socket, and sockets are never writable through a \
+             program"
         ))),
-        Ok(None) => Ok(()),
+        Ok(false) => Ok(()),
         Err(e) => Err(HostError::Io(e.to_string())),
     }
 }
@@ -1328,14 +1215,6 @@ mod pool {
             self.0.registry().logs(socket)
         }
     }
-
-    /// Runs a program's declaration hook.
-    pub(super) fn declare(
-        elf: &[u8],
-        host: Arc<dyn SocketHost>,
-    ) -> std::result::Result<Declaration, synch_sock::SockError> {
-        synch_sock::declare(elf, host)
-    }
 }
 
 #[cfg(not(all(
@@ -1424,76 +1303,9 @@ mod pool {
             Vec::new()
         }
     }
-
-    /// Refuses: a declaration is what a program says, and nothing here can ask.
-    pub(super) fn declare(
-        _elf: &[u8],
-        _host: Arc<dyn SocketHost>,
-    ) -> std::result::Result<Declaration, synch_sock::SockError> {
-        Err(synch_sock::SockError::Unsupported)
-    }
 }
 
 pub(crate) use pool::SocketPool;
-
-/// A tree the declaration hook cannot read.
-///
-/// The init hook runs with no endpoint table and, deliberately, no tree: it is
-/// asked what the program *intends*, and a hook that could read files could
-/// make its answer depend on them — so what an operator approved would stop
-/// being a property of the bytes they approved.
-#[derive(Debug)]
-pub(crate) struct NoTree;
-
-#[async_trait::async_trait]
-impl SocketHost for NoTree {
-    fn open(
-        &self,
-        _origin: Option<&str>,
-        _path: &str,
-    ) -> std::result::Result<ObjectInfo, HostError> {
-        Err(HostError::NotReadable(
-            "the declaration hook reads no tree".into(),
-        ))
-    }
-
-    fn open_root(&self, _root: &Hash) -> std::result::Result<ObjectInfo, HostError> {
-        Err(HostError::NotReadable(
-            "the declaration hook reads no tree".into(),
-        ))
-    }
-
-    fn list_page(
-        &self,
-        _prefix: &str,
-        _start_after: Option<&str>,
-        _limit: usize,
-    ) -> std::result::Result<synch_sock::ListPage, HostError> {
-        Err(HostError::NotReadable(
-            "the declaration hook reads no tree".into(),
-        ))
-    }
-
-    async fn pread(
-        &self,
-        _root: Hash,
-        _offset: u64,
-        _len: u64,
-    ) -> std::result::Result<Vec<u8>, HostError> {
-        Err(HostError::NotReadable(
-            "the declaration hook reads no tree".into(),
-        ))
-    }
-}
-
-/// Runs a declaration hook on a thread that is allowed to block.
-///
-/// The hook always runs against [`NoTree`]: a declaration names intent, and
-/// granting it a tree to read would let the arming step observe state.
-pub(crate) fn declare_blocking(elf: &[u8]) -> Result<Declaration> {
-    let _scope = synch_core::BlockingScope::enter();
-    pool::declare(elf, Arc::new(NoTree)).map_err(|e| EngineError::invalid(e.to_string()))
-}
 
 /// How many socket programs the node keeps in memory after their
 /// invocations end.
@@ -1632,89 +1444,21 @@ impl ProgramBytesCache {
 }
 
 impl Node {
-    /// Keeps a socket's arming record in step with the bytes the scanner just
-    /// published (`docs/SOCKETS.md` §3).
+    /// Notes a deployment: the scanner republished an activated socket path
+    /// with new content (`docs/SOCKETS.md` §3).
     ///
-    /// Two cases, and the difference between them is the whole of `--auto`.
-    ///
-    /// Without it, nothing happens here: the declaration stands, the old
-    /// arming record stands, and the mismatch between the armed root and the
-    /// published one is what makes the next connection `Refused{NotArmed}`.
-    /// The socket keeps being published and stops being runnable, which is the
-    /// intended shape — the operator approved bytes, and these are not those
-    /// bytes.
-    ///
-    /// With it, the declaration follows the file: the new root is armed with
-    /// whatever the new program declares. That is correct for a path you are
-    /// the only writer of and wrong for any path a read-write S3 key or adoption
-    /// can reach, which is why `synch doctor` lists every `--auto` socket.
-    pub(crate) fn follow_socket_content(&self, space: &str, path: &str, root: &Hash) -> Result<()> {
-        let Some(state) = self.store().socket(space, path)? else {
-            return Ok(());
-        };
-        let generation = state.generation;
-        if state.is_armed_for(root) {
-            return Ok(());
-        }
-        if !state.declaration.auto {
-            if state.arm.is_some() {
-                tracing::warn!(
-                    socket = format!("{space}/{path}"),
-                    "socket content changed; it is published but disarmed until \
-                     `synch socket arm` approves the new program"
-                );
-            }
-            return Ok(());
-        }
-        // `--auto` re-arms without asking, but it still re-reads what the new
-        // program declares: following the file means following what the file
-        // says about itself, not carrying the old program's declaration onto
-        // new bytes.
-        let elf = match self.read_socket_bytes(root) {
-            Ok(elf) => elf,
-            Err(e) => {
-                tracing::warn!(socket = format!("{space}/{path}"), "auto-arm skipped: {e}");
-                return Ok(());
-            }
-        };
-        match self.declare_program(&elf) {
-            Ok(declared) => {
-                let _authorization = self.socket_authorization_write();
-                let armed = self.store().auto_arm_socket(
-                    space,
-                    path,
-                    ArmCandidate {
-                        generation: &generation,
-                        root,
-                        declared: &declared.render(),
-                        armed_at: synch_core::now_ns(),
-                    },
-                )?;
-                if armed {
-                    self.clear_socket_map(&format!("{space}/{path}"));
-                    tracing::info!(
-                        socket = format!("{space}/{path}"),
-                        root = %root,
-                        "auto-armed"
-                    );
-                } else {
-                    tracing::info!(
-                        socket = format!("{space}/{path}"),
-                        "auto-arm skipped because the declaration changed or auto-arming was disabled"
-                    );
-                }
-            }
-            Err(e) => {
-                // A program that does not load is left disarmed rather than
-                // armed-and-broken: the next connection gets `NotArmed`, which
-                // is true, instead of `ProgramInvalid` on every stream.
-                tracing::warn!(
-                    socket = format!("{space}/{path}"),
-                    "auto-arm refused: the program does not load: {e}"
-                );
-            }
-        }
-        Ok(())
+    /// Nothing about the activation changes — that is the model — but the
+    /// per-socket map does not survive the program it was minted by: a session
+    /// table the old bytes built is not state the new bytes agreed to inherit.
+    /// Invocations already running keep the snapshot they were admitted with;
+    /// the next admission serves the new root.
+    pub(crate) fn socket_content_deployed(&self, space: &str, path: &str, root: &Hash) {
+        self.clear_socket_map(&format!("{space}/{path}"));
+        tracing::info!(
+            socket = format!("{space}/{path}"),
+            root = %root,
+            "socket content deployed; new connections serve the new program"
+        );
     }
 
     /// Reads an object out of the local CAS synchronously.
@@ -1946,25 +1690,6 @@ mod tests {
     use super::*;
     use crate::testkit::node;
     use synch_core::{record::ChunkParams, FileEntry, RECORD_VERSION};
-    use synch_store::{ArmRow, SocketRow};
-
-    fn resolved(generation: Hash, root: Hash) -> Resolved {
-        Resolved {
-            root,
-            size: 3,
-            state: SocketState {
-                declaration: SocketRow::new("code", "git.sock", 0),
-                generation,
-                arm: Some(ArmRow {
-                    space: "code".into(),
-                    path: "git.sock".into(),
-                    root,
-                    declared: String::new(),
-                    armed_at: 0,
-                }),
-            },
-        }
-    }
 
     #[tokio::test]
     async fn concurrent_cold_loads_coalesce_onto_one_allocation() {
@@ -2060,31 +1785,6 @@ mod tests {
         );
         let newest = Hash::new(format!("program {}", MAX_CACHED_PROGRAMS + 3).as_bytes());
         assert!(matches!(cache.begin_load(&newest), ProgramLoad::Ready(_)));
-    }
-
-    #[test]
-    fn final_admission_rejects_every_authorization_change() {
-        let root = Hash::new(b"program");
-        let generation = Hash::new(b"authorization");
-        let reviewed = resolved(generation, root);
-        assert!(authorization_unchanged(
-            &reviewed,
-            &resolved(generation, root)
-        ));
-
-        let after_disarm = Resolved {
-            state: SocketState {
-                generation: Hash::new(b"after disarm"),
-                arm: None,
-                ..reviewed.state.clone()
-            },
-            ..reviewed.clone()
-        };
-        assert!(!authorization_unchanged(&reviewed, &after_disarm));
-        assert!(!authorization_unchanged(
-            &reviewed,
-            &resolved(generation, Hash::new(b"new program"))
-        ));
     }
 
     #[tokio::test]

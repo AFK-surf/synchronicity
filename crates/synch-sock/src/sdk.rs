@@ -151,9 +151,21 @@ mod tests {
             abi::SECTION_STREAM
         );
         assert!(
-            HEADER.contains(&format!("SY_SECTION(\"{}\")", abi::SECTION_INIT)),
-            "SY_INIT_ENTRY does not name {}",
+            HEADER.contains(&format!("section(\"{}\")", abi::SECTION_MANIFEST)),
+            "SY_MANIFEST does not name {}",
+            abi::SECTION_MANIFEST
+        );
+        // The executable declaration hook is gone from the SDK entirely: a
+        // header that still names its section is a header that invites
+        // programs this build refuses to serve.
+        assert!(
+            !HEADER.contains(abi::SECTION_INIT),
+            "the header still names the executable {} section",
             abi::SECTION_INIT
+        );
+        assert!(
+            !HEADER.contains("sy_declare_"),
+            "the header still declares the removed sy_declare_* helpers"
         );
     }
 

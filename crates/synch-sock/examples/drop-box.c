@@ -16,18 +16,12 @@
 
 #include <synch.h>
 
-SY_INIT_ENTRY sy_s64 declare(void) {
-  sy_s64 cap = sy_json_parse(SY_STR(
-      "{\"id\":1,\"prefix\":\"code/inbox\",\"allow\":[\"create\"],"
-      "\"max_bytes\":16777216}"));
-  if (cap < 0) return cap;
-  sy_s64 rc = sy_declare_tree_write(cap);
-  sy_close(cap);
-  if (rc < 0) return rc;
-  sy_declare_name(SY_STR("drop-box"));
-  sy_declare_max_streams(8);
-  return 0;
-}
+/* The complete write grant, embedded in the object: the prefix, the one mode,
+   and the per-commit byte bound are all part of the content root the tree
+   publishes, so changing any of them is a new deployment. */
+SY_MANIFEST("{\"manifest\":1,\"name\":\"drop-box\",\"max_streams\":8,"
+            "\"tree_writes\":[{\"id\":1,\"prefix\":\"code/inbox\","
+            "\"allow\":[\"create\"],\"max_bytes\":16777216}]}");
 
 /* `name` comes from caller-chosen Open.meta: untrusted. One flat component,
  * no dotfiles, no controls — everything else about the path is ours. */

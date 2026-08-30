@@ -1963,30 +1963,16 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
 -- Local operator state, never published and never replicated. Publication
 -- cannot gate execution: `synch adopt path`, `synch adopt tree --replace` and an S3 PUT all
 -- write bytes into a filesystem-source directory that the scanner publishes as this
--- node's own view. These two rows are the gate instead.
-
--- The declaration. What makes the scanner publish kind=Socket for a path.
--- Arming approves the capabilities in the program's `synchronicity.init`
--- hook; there is no separate operator capability list.
-CREATE TABLE sockets (space TEXT NOT NULL, path TEXT NOT NULL,
+-- node's own view. Activating a path makes those write paths deployment
+-- channels for it: while the row exists, whatever the path holds is a socket
+-- and its current content serves under its own embedded manifest. No content
+-- root is ever an authorization pin.
+CREATE TABLE socket_activations (space TEXT NOT NULL, path TEXT NOT NULL,
                       config TEXT NOT NULL DEFAULT '',   -- newline-separated k=v
                       max_streams INTEGER,       -- NULL: the daemon's default
-                      auto INTEGER NOT NULL DEFAULT 0,   -- re-arm on every change
                       note TEXT NOT NULL DEFAULT '',
-                      added_at INTEGER NOT NULL,
-                      generation BLOB NOT NULL,  -- fresh on declaration update or disarm
+                      activated_at INTEGER NOT NULL,
                       PRIMARY KEY (space, path));
-
--- The approval, keyed by the content root approved. The bytes changing changes
--- the root, which leaves the declaration standing and this row behind it: the
--- socket keeps being published and stops being runnable. `declared` is what the
--- init hook said when it was approved, kept so `synch socket ls` can show what
--- was agreed to rather than what is claimed now.
-CREATE TABLE socket_arms (space TEXT NOT NULL, path TEXT NOT NULL,
-                          root BLOB NOT NULL,
-                          declared TEXT NOT NULL DEFAULT '',
-                          armed_at INTEGER NOT NULL,
-                          PRIMARY KEY (space, path));
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
@@ -2063,8 +2049,8 @@ CI (GitHub Actions):
   and can hand over its device secret — but delegation is what makes an exercise of it
   bounded, dated and published where `synch delegate ls` on any node can read it.
   Sockets extend what membership grants, and both extensions are operator-gated: a
-  member may *invoke* programs the callee has armed (docs/SOCKETS.md), and such a
-  program may, within prefixes its operator approved at arm time, cause the callee
+  member may *invoke* programs at paths the callee has activated (docs/SOCKETS.md),
+  and such a program may, within prefixes its own manifest declares, cause the callee
   to *publish* new versions of its own view (docs/TREE-WRITES.md). Every such write
   is the callee's own assertion, so the version model bounds it — divergence stays
   first-class and visible, and no other origin's assertion can be touched.

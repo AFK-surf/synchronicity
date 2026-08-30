@@ -1,7 +1,7 @@
 # Socket examples
 
-Ten programs, each demonstrating one thing, each a program you could arm as it
-stands. `docs/SOCKETS.md` is the design; this is what it looks like written
+Ten programs, each demonstrating one thing, each a program you could deploy as
+it stands. `docs/SOCKETS.md` is the design; this is what it looks like written
 down.
 
 Build one with the compiler inside the binary — nothing to install, no clang,
@@ -11,14 +11,16 @@ no BPF backend:
 synch socket build echo.c -o echo.o
 ```
 
-Then publish and arm it. A socket is a file in one of this node's spaces whose
-content is that object; `add` declares the path to be a socket, and `arm`
-prints what the program says it needs and asks you to approve it:
+Then inspect it, and activate the path it will live at. A socket is a file in
+one of this node's spaces whose content is that object; `inspect` statelessly
+prints what the object's manifest says it needs, and `activate` makes the path
+a socket — from then on, every write to it is a deployment that serves
+immediately:
 
 ```sh
+synch socket inspect echo.o
 cp echo.o ~/synchronicity/code/echo.sock
-synch socket declare code/echo.sock
-synch socket arm code/echo.sock
+synch socket activate code/echo.sock
 ```
 
 And call it from another node in the cluster:
@@ -29,7 +31,7 @@ synch socket connect nas:code/echo.sock
 
 | | what it is for | what to read it for |
 | --- | --- | --- |
-| [`echo.c`](echo.c) | echoes the stream back | the smallest complete socket: a declaration hook, one poll loop, a clean end |
+| [`echo.c`](echo.c) | echoes the stream back | the smallest complete socket: a manifest, one poll loop, a clean end |
 | [`whoami.c`](whoami.c) | reports the caller's identity | which facts come from the handshake and which are the caller's own text |
 | [`tree-cat.c`](tree-cat.c) | serves one directory of the tree | validating caller input before it reaches a path, and cold reads as poll waits |
 | [`http-status.c`](http-status.c) | a status page over HTTP | speaking a real protocol, and state that outlives the invocation |
@@ -69,7 +71,7 @@ stopped working would fail the build rather than fail a reader.
 ## Building with clang instead
 
 The embedded compiler is tinycc: small, fast, and not an optimizing compiler. A
-program that outgrows it is armed exactly the same way — the runtime loads an
+program that outgrows it deploys exactly the same way — the runtime loads an
 ELF object and does not care which compiler wrote it:
 
 ```sh

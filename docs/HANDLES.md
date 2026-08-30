@@ -47,7 +47,7 @@ document, not a ninth special case.
 | SSH control | conduit | handle `0` after `sy_ssh_start` | the `sy_ssh_*` connection family, addressed as `SY_SELF` |
 | Object | operation | `sy_open`, `sy_open_from`, `sy_open_root` | `sy_stat`, `sy_pread` |
 | Cursor | value | `sy_list_open` | `sy_list_next` |
-| JSON value | value | `sy_json_*` constructors, and every helper that answers structured — `sy_peer_info`, `sy_stat`, `sy_process_status`, `sy_ssh_next` | the `sy_json_*` family; consumed by `sy_ssh_start`, `sy_pty_open`, the `sy_declare_*` family |
+| JSON value | value | `sy_json_*` constructors, and every helper that answers structured — `sy_peer_info`, `sy_stat`, `sy_process_status`, `sy_ssh_next` | the `sy_json_*` family; consumed by `sy_ssh_start` and `sy_pty_open` |
 | Process | operation | `sy_process_spawn`, `sy_process_spawn_pty` | `sy_process_status`, `sy_process_signal`, `sy_process_stdio` |
 | Tree writer | operation | `sy_put_open` | `sy_put_write`, `sy_put_commit`, `sy_put_commit_if`, `sy_put_delete`, and as `sy_put_splice`'s destination |
 
@@ -136,10 +136,10 @@ Three helper argument families look like handles and are not, and each has
 its own refusal:
 
 - **Capability ids** (`sy_put_open`, `sy_sftp_open`, `sy_process_spawn`,
-  `sy_pty_open`) name rows of the operator-approved declaration, a namespace
-  fixed at arm time. Unknown ids are `SY_EPERM`, deliberately
-  indistinguishable from "declared but not granted": what a program was not
-  armed for does not exist for it.
+  `sy_pty_open`) name rows of the program's own manifest, a namespace fixed
+  when the object was built. Unknown ids are `SY_EPERM`, deliberately
+  indistinguishable from "declared but not granted": what a program's
+  manifest does not declare does not exist for it.
 - **SSH event ids** (`sy_ssh_event_data`, `sy_ssh_channel_accept`, …) name
   entries in the connection's event queue, valid until `sy_ssh_event_done`.
   An unknown field is `SY_ENOENT`; an event of the wrong kind for the verb is
@@ -158,7 +158,7 @@ One meaning per code, everywhere:
 | `SY_EBADF` | No such handle: an empty or out-of-range index, or a kind the verb does not take. | A handle in the wrong *state* — that is `SY_ESTATE`. |
 | `SY_ESTATE` | Right handle, wrong lifecycle moment: writing a committed writer, endpoint verbs on the SSH control object, collecting a commit with `sy_put_delete`, an attribute helper on the wrong endpoint role. | A malformed argument. |
 | `SY_EINVAL` | The argument itself is malformed: a bad pointer range, `max == 0`, an unparseable path, a non-`SY_SELF` selector. | Policy. |
-| `SY_EPERM` | Policy said no: an undeclared capability, an unarmed grant, a helper outside its mode (init vs. stream). | A transient condition — retrying cannot change the answer until the tree or the declaration does. |
+| `SY_EPERM` | Policy said no: a capability the manifest does not declare, or a path outside a grant's scope. | A transient condition — retrying cannot change the answer until the tree or the deployed manifest does. |
 | `SY_EAGAIN` | Come back after a poll: the answer is on its way. | An error. It is the *only* "not yet". |
 | `SY_ELIMIT` | A documented bound was hit (`docs/SOCKETS.md` §10). | — |
 

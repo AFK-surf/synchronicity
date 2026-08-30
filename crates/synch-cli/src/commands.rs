@@ -226,6 +226,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     define,
                 },
         } => build_socket(source, output.as_deref(), *clang, define),
+        // Stateless by design: inspection describes a file, and describing a
+        // file must not depend on — or touch — a database, a daemon, or any
+        // publication state (`docs/SOCKETS.md` §3.1).
+        Command::Socket {
+            command: SocketCommand::Inspect { file },
+        } => inspect_socket(file),
         // Not a `Run` command either: it owns this process's stdin and stdout
         // for its lifetime and answers a protocol of its own, translating each
         // request into the control calls below (`crate::mcp`).
@@ -289,6 +295,88 @@ fn build_socket(
     };
     std::fs::write(&output, &object).with_context(|| format!("writing {}", output.display()))?;
     println!("{} ({} bytes)", output.display(), object.len());
+    Ok(())
+}
+
+/// `synch socket inspect` — one file, described statelessly.
+///
+/// One read gives the whole answer a stable snapshot: the root, the manifest,
+/// and the load check all describe the same bytes even if the file is being
+/// rewritten underneath. Nothing here consults or mutates a database, a
+/// scanner, a daemon, or any publication state.
+fn inspect_socket(file: &Path) -> Result<()> {
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let limit = synch_sock::Limits::default().max_program_bytes;
+    if bytes.len() as u64 > limit {
+        anyhow::bail!(
+            "{} is {} bytes, past the {limit} a socket program may be",
+            file.display(),
+            bytes.len()
+        );
+    }
+    // The same BLAKE3 root the tree names when these bytes are published, so
+    // what inspection describes is recognizable in `socket ls`, `Opened::Ok`
+    // and every log line once the file is deployed.
+    let root = synch_core::hash_reader(bytes.as_slice())?;
+    println!("  file     {}", file.display());
+    println!("  root     {}", root.to_hex());
+    println!("  size     {} bytes", bytes.len());
+
+    let declared =
+        synch_sock::manifest::manifest_declaration(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rendered = declared.render();
+    if rendered.is_empty() {
+        println!("  declares nothing — it reaches nothing and spawns nothing");
+    } else {
+        for line in rendered.lines() {
+            println!("  declares {line}");
+        }
+    }
+    for write in &declared.tree_writes {
+        println!(
+            "  tree-write {}  {}  {}",
+            write.prefix,
+            write.mode_names(),
+            if write.max_bytes == 0 {
+                "UNBOUNDED bytes per commit".to_string()
+            } else {
+                format!("<= {} bytes per commit", write.max_bytes)
+            }
+        );
+    }
+
+    validate_inspected(&bytes, &declared)?;
+    println!(
+        "activate a path holding these bytes with `synch socket activate <space>/<path>`; \
+         every later write to that path deploys immediately"
+    );
+    Ok(())
+}
+
+/// The load half of inspection, where this build has a runtime.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn validate_inspected(bytes: &[u8], declared: &synch_core::Declaration) -> Result<()> {
+    synch_sock::validate_program(bytes, declared).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("  program  loads and links against this build's host API");
+    Ok(())
+}
+
+/// The same check where it cannot run: the portable facts still hold.
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn validate_inspected(bytes: &[u8], _declared: &synch_core::Declaration) -> Result<()> {
+    if !synch_sock::manifest::has_stream_section(bytes) {
+        anyhow::bail!("the program has no `synchronicity.stream` entrypoint");
+    }
+    println!(
+        "  program  has a stream entrypoint; this build has no eBPF runtime, so it \
+         cannot load-validate further"
+    );
     Ok(())
 }
 
@@ -856,27 +944,18 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Socket { command } => match command {
-            SocketCommand::Declare {
+            SocketCommand::Activate {
                 target,
                 config,
                 max_streams,
-                auto,
                 note,
-            } => Cmd::SocketDeclare(pb::SocketDeclare {
+            } => Cmd::SocketActivate(pb::SocketActivate {
                 target: target.clone(),
                 config: config.clone(),
                 max_streams: max_streams.unwrap_or(0),
-                auto: *auto,
                 note: note.clone().unwrap_or_default(),
             }),
-            SocketCommand::Arm { target, review } => Cmd::SocketArm(pb::SocketArm {
-                target: target.clone(),
-                review: review.clone().unwrap_or_default(),
-            }),
-            SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
-                target: target.clone(),
-            }),
-            SocketCommand::Undeclare { target } => Cmd::SocketUndeclare(pb::SocketUndeclare {
+            SocketCommand::Deactivate { target } => Cmd::SocketDeactivate(pb::SocketDeactivate {
                 target: target.clone(),
             }),
             SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
@@ -893,13 +972,15 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 target: target.clone(),
             }),
             SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
-            // Compiling is local work with no node in it, so `run` handles it
-            // before anything reaches here and there is no control command to
-            // build. Spelled out rather than left to `_`, so adding a socket
-            // command that *does* need the daemon is a compile error here
-            // rather than a silent no-op.
-            SocketCommand::Build { .. } | SocketCommand::Connect { .. } => {
-                anyhow::bail!("`synch socket build` runs in this process, not the daemon")
+            // Compiling and inspecting are local work with no node in them,
+            // so `run` handles them before anything reaches here and there is
+            // no control command to build. Spelled out rather than left to
+            // `_`, so adding a socket command that *does* need the daemon is
+            // a compile error here rather than a silent no-op.
+            SocketCommand::Build { .. }
+            | SocketCommand::Inspect { .. }
+            | SocketCommand::Connect { .. } => {
+                anyhow::bail!("this socket command runs in this process, not the daemon")
             }
         },
 

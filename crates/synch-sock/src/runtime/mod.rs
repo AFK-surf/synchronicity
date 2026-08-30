@@ -58,7 +58,7 @@ use crate::{
         Limits, PREEMPTION_INTERVAL, TEARDOWN_DRAIN, THROTTLE_AFTER, THROTTLE_FOR, YIELD_AFTER,
     },
     runtime::{
-        ctx::{Ctx, Inner, Slot, DECLARE_IDLE},
+        ctx::{Ctx, Inner, Slot},
         endpoint::Readiness,
         map::SocketMaps,
     },
@@ -220,7 +220,7 @@ type ProgramKey = (Hash, StackConfig);
 ///
 /// A bound on what content churn can make a worker accumulate: every distinct
 /// content root ever served would otherwise stay JIT-compiled here forever,
-/// one worker at a time (`--auto` re-arms make that a real stream). The
+/// one worker at a time (steady deployments make that a real stream). The
 /// oldest is evicted first; an invocation that is still running holds its
 /// program through its own `Rc`, so eviction only releases programs nothing
 /// is executing.
@@ -728,7 +728,7 @@ impl ProgramCompiler {
     /// whole reactor: every pump, every poll wait and the idle-deadline branch of
     /// every other invocation placed on it. With a 32-entry per-worker cache and
     /// oldest-first eviction, a caller cycling more than 32 armed roots (or
-    /// `--auto` re-arms minting fresh ones) made every admission a miss, and the
+    /// deployments minting fresh ones) made every admission a miss, and the
     /// crate's own `blocking_is_allowed` tripwire could not see it: a socket
     /// worker's current-thread runtime is not a dedicated blocking thread, it
     /// multiplexes up to 64 invocations.
@@ -1154,93 +1154,59 @@ fn classify(message: &str) -> FaultKind {
     }
 }
 
-/// Runs a program's `synchronicity.init` hook and returns what it declared.
+/// Loads and link-validates a program without running it.
 ///
-/// This is what `synch socket arm` shows an operator, and it runs in a context
-/// with no endpoint table at all: an I/O helper called from here has nothing to
-/// reach, and is refused before it tries.
+/// This is the runtime half of inspection and admission: the manifest is data
+/// ([`crate::manifest`]) and this is the check that the program itself loads —
+/// the ELF parses, the linker resolves every helper, the stream entrypoint
+/// exists, and the manifest's stack shape is one this host can serve. A
+/// program that fails any of it would otherwise surface that on the first
+/// stream to reach it — a long way from the operator who deployed it.
 ///
-/// It doubles as the dry run that forces compilation early. async-ebpf compiles
-/// lazily, per function and per pointer signature, so a program that fails to
-/// compile would otherwise surface that on the first stream that reaches the
-/// bad path — a long way from the operator who armed it.
-pub fn declare(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declaration, SockError> {
+/// async-ebpf still compiles function bodies lazily, so this bounds what a
+/// load can promise; it is the same guarantee an admission gets.
+pub fn validate_program(elf: &[u8], declaration: &Declaration) -> Result<(), SockError> {
     // Its own thread, for two reasons that point the same way. A `Program` is
-    // pinned to the thread that loaded it, so a declaration run needs a thread
-    // it can have to itself; and the runtime it needs cannot be *dropped*
-    // inside an async context, which is where an arm or a scan calls this from.
-    // A thread costs nothing here: this runs when an operator arms a socket,
-    // not when a peer connects.
+    // pinned to the thread that loaded it, and the runtime it needs cannot be
+    // *dropped* inside an async context, which is where an inspection calls
+    // this from. A thread costs nothing here: this runs when an operator
+    // inspects a file, not when a peer connects.
     let elf = elf.to_vec();
-    std::thread::Builder::new()
-        .name("synch-sock-declare".into())
-        .spawn(move || declare_here(&elf, host))
-        .map_err(|e| SockError::Load(e.to_string()))?
-        .join()
-        .map_err(|_| SockError::Fault("the declaration hook panicked".into()))?
-}
-
-fn declare_here(elf: &[u8], host: Arc<dyn crate::SocketHost>) -> Result<Declaration, SockError> {
-    let global = global_env();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| SockError::Load(e.to_string()))?;
-    let thread_env = global.init_thread(PREEMPTION_INTERVAL);
-    let loader = stack_loader(resolve_stack_config(None, None)?)?;
-    let program = load_pinned(&loader, elf, thread_env)?;
-    if !program.has_section(SECTION_INIT) {
-        // No hook is a legitimate shape: a socket that reaches nothing and
-        // reads nothing needs to declare nothing. It gets the empty
-        // declaration, which grants exactly nothing.
-        return Ok(Declaration::default());
-    }
-
-    let inner = Rc::new(Inner::declaring(host, Instant::now()));
-    let mut ctx = Ctx {
-        inner: inner.clone(),
-    };
-    let timeslice = timeslice();
-    let preemption = PreemptionEnabled::new(thread_env);
-    let mut resources: [&mut dyn std::any::Any; 1] = [&mut ctx];
-    let local = tokio::task::LocalSet::new();
-    // A hard deadline on the whole hook, not just on its poll waits: the idle
-    // deadline a declaration run carries is only consulted by `sy_poll`, and a
-    // hook that never polls would otherwise spin past it and hang the arming
-    // thread (and, with `--auto`, the scanner) forever.
-    let outcome = local.block_on(&runtime, async {
-        tokio::time::timeout(
-            DECLARE_IDLE,
-            program.run(
-                &timeslice,
-                &TokioTimeslicer,
-                SECTION_INIT,
-                &mut resources,
-                &[],
-                &preemption,
-            ),
-        )
-        .await
-    });
-    match outcome {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(SockError::Fault(e.to_string())),
-        Err(_) => {
-            return Err(SockError::Load(
-                "the declaration hook exceeded its idle deadline".into(),
-            ))
-        }
-    }
-    inner.flush_log();
-    let declaration = inner.declaration.borrow().clone();
-    declaration
-        .validate()
-        .map_err(|e| SockError::Load(format!("invalid declaration: {e}")))?;
-    resolve_stack_config(
+    let stack = (
         declaration.stack_frame_size.map(|size| size as usize),
         declaration.guarded_stack_frames,
-    )?;
-    Ok(declaration)
+    );
+    std::thread::Builder::new()
+        .name("synch-sock-validate".into())
+        .spawn(move || validate_here(&elf, stack.0, stack.1))
+        .map_err(|e| SockError::Load(e.to_string()))?
+        .join()
+        .map_err(|_| SockError::Fault("the program validation panicked".into()))?
+}
+
+fn validate_here(
+    elf: &[u8],
+    stack_frame_size: Option<usize>,
+    guarded_stack_frames: Option<bool>,
+) -> Result<(), SockError> {
+    let global = global_env();
+    let thread_env = global.init_thread(PREEMPTION_INTERVAL);
+    let loader = stack_loader(resolve_stack_config(
+        stack_frame_size,
+        guarded_stack_frames,
+    )?)?;
+    let program = load_pinned(&loader, elf, thread_env)?;
+    if !program.has_section(SECTION_STREAM) {
+        return Err(SockError::NoEntrypoint);
+    }
+    if program.has_section(SECTION_INIT) {
+        return Err(SockError::Load(
+            "the object carries an executable `synchronicity.init` declaration section; \
+             rebuild against the current SDK"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Every helper name, for the SDK-header agreement test.
