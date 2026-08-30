@@ -628,13 +628,17 @@ mod tests {
         let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
         let mut reader = master.try_clone().unwrap();
         let mut child = spawn_pty(&capability, slave, "").unwrap();
-        assert!(child.wait().unwrap().success());
 
-        // Read through a thread with a timeout rather than to EOF on this
-        // thread: once the last slave descriptor closes, Linux fails the
-        // master read with EIO but macOS may never report EOF at all, and
-        // a blocking read then hangs the suite until the CI job limit.
-        // The shell test below reads the same way, for the same reason.
+        // Drain the master from a thread, with timeouts, and only then reap
+        // the child — never a bare `wait()` first. On macOS the child's exit
+        // blocks in the kernel until the pty's pending output drains to a
+        // master reader (a BSD tty's last close waits for its output queue),
+        // so waiting before reading deadlocks: the exit needs the reader and
+        // the wait needs the exit. The timeouts matter too: once the last
+        // slave descriptor closes, Linux fails the master read with EIO but
+        // macOS may never report EOF at all, and a blocking read to EOF then
+        // hangs the suite until the CI job limit. The shell test below reads
+        // the same way, for the same reasons.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 256];
@@ -656,6 +660,24 @@ mod tests {
                 Ok(chunk) => output.extend_from_slice(&chunk),
                 Err(_) => break,
             }
+        }
+        // The reader thread keeps draining while the child finishes exiting;
+        // reap against a deadline so a regression fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the pty child never exited; read so far: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(output, expected);
     }
