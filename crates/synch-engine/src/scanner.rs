@@ -1394,18 +1394,50 @@ impl Adoption {
             .as_mut()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.set_len(len)?;
+        self.written = len;
+        Ok(())
+    }
+
+    /// Reads one range from the staged payload without changing its logical
+    /// length.
+    pub(crate) fn read_at(&mut self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let len = usize::try_from(len)
+            .map_err(|_| EngineError::invalid("the staged read length is too large"))?;
+        let mut bytes = vec![0; len];
+        let count = file.read(&mut bytes)?;
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
+    /// Writes one range into the staged payload, growing it as necessary.
+    pub(crate) fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::io::{Seek, Write};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        self.written = self.written.max(offset.saturating_add(bytes.len() as u64));
         Ok(())
     }
 
     /// Appends one piece of the payload.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+        use std::io::{Seek, Write};
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.seek(std::io::SeekFrom::End(0))?;
         file.write_all(bytes)?;
-        self.written += bytes.len() as u64;
+        self.written = self.written.saturating_add(bytes.len() as u64);
         Ok(())
     }
 

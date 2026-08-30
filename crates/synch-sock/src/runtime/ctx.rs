@@ -139,6 +139,25 @@ pub(crate) struct WriterSlot {
     /// The guest let go of the handle; the pump exits and drops the staging.
     pub(crate) closed: Cell<bool>,
     pub(crate) ready: Arc<Readiness>,
+    /// Shared with protocol-backed writers so the invocation-wide staging
+    /// limit cannot be multiplied by opening several SFTP services.
+    pub(crate) writer_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) counted: Cell<bool>,
+}
+
+impl Drop for WriterSlot {
+    fn drop(&mut self) {
+        self.release_count();
+    }
+}
+
+impl WriterSlot {
+    pub(crate) fn release_count(&self) {
+        if self.counted.replace(false) {
+            self.writer_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl WriterSlot {
@@ -273,7 +292,8 @@ pub(crate) struct Inner {
     /// Commits and deletes dispatched through tree writers, against
     /// [`MAX_PUT_COMMITS`](crate::limits::MAX_PUT_COMMITS): every one is a
     /// published head, so the count is per invocation rather than per writer.
-    pub(crate) put_commits: Cell<u32>,
+    pub(crate) put_commits: Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) put_writers: Arc<std::sync::atomic::AtomicUsize>,
     /// Endpoints the guest let go of that still owe bytes to the far side.
     ///
     /// A handle leaves the table the moment `sy_close` is called, but the
@@ -377,7 +397,8 @@ impl Inner {
             labels: RefCell::new(Vec::new()),
             footprint: Cell::new(0),
             egress_open: Rc::new(Cell::new(0)),
-            put_commits: Cell::new(0),
+            put_commits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            put_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             draining: RefCell::new(Vec::new()),
             async_tasks: super::tasks::TaskSet::default(),
             raw_writer: RefCell::new(None),
@@ -650,6 +671,9 @@ impl Inner {
                 // operation already dispatched still runs to completion —
                 // commits are atomic engine-side — with its result discarded.
                 writer.closed.set(true);
+                // Handle capacity is guest-visible and returns at sy_close;
+                // the stopping pump may retain the staging object briefly.
+                writer.release_count();
                 writer.work.notify_one();
                 true
             }

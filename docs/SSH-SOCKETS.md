@@ -84,6 +84,9 @@ Consequently, two layers are checked:
 
 - opening the built-in service always requires a file-transfer declaration
   naming its protocol, path scope and read/write mode;
+- write mode additionally requires a same-id tree-write declaration, whose
+  prefix, create/replace/delete modes, and byte bound are rechecked for every
+  staged file;
 - the declared scope bounds what the service exposes, which is narrower than
   what the invocation can read: reading the tree is unrestricted
   (`docs/SOCKETS.md` §7.6), so the scope is about what an SSH client is served,
@@ -876,7 +879,8 @@ or operator configuration:
 
 ```c
 /* One entry of the manifest's "file_transfers" array:
-   {"id", "protocol": "sftp", "access": ["read", "recursive"?],
+   {"id", "protocol": "sftp",
+    "access": ["read" | "write", "recursive"?],
     "scope" -- exact normalized tree path of at most 256 bytes} */
 
 sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
@@ -885,8 +889,10 @@ sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
 
 SY_MANIFEST("{\"manifest\":1,"
             "\"file_transfers\":[{\"id\":1,\"protocol\":\"sftp\","
-            "\"access\":[\"read\",\"recursive\"],"
-            "\"scope\":\"code/releases\"}]}");
+            "\"access\":[\"read\",\"write\",\"recursive\"],"
+            "\"scope\":\"code/releases\"}],"
+            "\"tree_writes\":[{\"id\":1,\"prefix\":\"code/releases\","
+            "\"allow\":[\"create\",\"replace\",\"delete\"]}]}");
 
 sy_s64 sftp = sy_sftp_open(FILE_TRANSFER_RELEASES);
 ```
@@ -896,17 +902,27 @@ tree policy, replies success, and pumps `session <-> sftp`. The SFTP engine
 does not know which SSH connection carries it, and the SSH engine does not
 know that the session bytes are SFTP.
 
-Version 1 is deliberately read-only because the published virtual tree is
-immutable. Uploading needs a separate design for staging, atomic publication,
-conflicts, and attribution; pretending an SFTP close is a tree commit would be
-an implicit and unsafe mutation API. That design now exists —
-`docs/TREE-WRITES.md` is the explicit mutation API, with declared prefixes,
-staging, and commit-time conditions — so upload support here is a follow-up
-that commits through the same engine seam under a tree-write declaration,
-rather than a reason to invent close-as-commit. The service declaration is
-shown at inspection and bounds the subtree the service itself exposes. As §1.2
-explains, it does not claim that a program lacking the service is unable to
-export bytes manually through the existing `sy_open` API.
+`write` access requires a tree-write declaration with the same program-local
+id. The file-transfer declaration selects the protocol and visible scope; the
+tree-write declaration independently bounds create, replace, delete, and the
+bytes staged per file. A writable handle stages random-access writes and its
+`CLOSE` conditionally commits against the version opened, so a concurrent tree
+change fails instead of being silently overwritten. Disconnecting or closing
+the service with live handles aborts their staging. The declarations are shown
+during inspection and activation. As §1.2 explains, they do not claim that a
+deployed program
+lacking the service is unable to export bytes manually through `sy_open`.
+
+The SFTP v3 adapter covers regular-file reads, create/replace, random and
+append writes, truncation, removal, and rename. Rename conditionally publishes
+the copy and conditionally deletes the exact source version that was copied,
+because the tree has one-path atomic commits. If the source changes between
+those steps, the copy may already exist but the newer source is retained and
+the rename reports failure. Directories in
+the published tree are implicit prefixes, so empty-directory creation/removal,
+symlinks, and client-supplied modes or mtimes are not mutation inputs; metadata
+changes through `SETSTAT` or `FSETSTAT` return `SSH_FX_OP_UNSUPPORTED` instead
+of claiming that ignored metadata was preserved.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,
@@ -1892,8 +1908,10 @@ static sy_s64 move_sftp(struct attached *a) {
 ```
 
 The declaration gates creation of the `sftp` fd; accepting the SSH channel and
-subsystem request does not. A read/write declaration changes only the backing
-declaration and SFTP policy, not the SSH program's channel logic.
+subsystem request does not. Adding `write` also requires a same-id tree-write
+declaration, but does not change the SSH channel logic. The shipped
+`crates/synch-sock/examples/ssh-shell.c` combines the shell path above with
+this read/write SFTP path and declares both sides of that authority.
 
 ### 15.5 A generic `direct-tcpip` channel with declared egress
 

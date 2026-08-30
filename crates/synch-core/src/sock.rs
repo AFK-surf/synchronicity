@@ -569,8 +569,8 @@ impl Declaration {
                 });
             }
             if transfer.protocol != 0x01
-                || transfer.access & 0x01 == 0
-                || transfer.access & !0x05 != 0
+                || transfer.access & 0x03 == 0
+                || transfer.access & !0x07 != 0
             {
                 return Err(DeclarationError::InvalidCapability {
                     kind: "file-transfer",
@@ -971,6 +971,7 @@ pub fn parse_socket_manifest(bytes: &[u8]) -> Result<Declaration, ManifestError>
             &transfer.access,
             |name| match name {
                 "read" => Some(0x01),
+                "write" => Some(0x02),
                 "recursive" => Some(0x04),
                 _ => None,
             },

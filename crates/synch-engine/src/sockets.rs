@@ -851,6 +851,35 @@ fn evaluate_put_condition(
     Ok(())
 }
 
+/// The delete counterpart to `evaluate_put_condition`. This is evaluated
+/// while holding the same tree-write lock as the tombstone publication, so a
+/// protocol adapter cannot delete a version that replaced the one it read.
+fn evaluate_delete_condition(
+    node: &Node,
+    space: &str,
+    path: &str,
+    expected: PutCondition,
+) -> std::result::Result<(), HostError> {
+    refuse_socket_path(node, space, path)?;
+    let entry = node
+        .store()
+        .entry(node.origin(), space, path)
+        .map_err(|e| HostError::Io(e.to_string()))?;
+    let live = entry.filter(|entry| entry.kind != EntryKind::Tombstone);
+    let live_root = live.as_ref().and_then(|entry| entry.content);
+    match expected {
+        PutCondition::Any => Ok(()),
+        PutCondition::Absent if live.is_none() => Ok(()),
+        PutCondition::Absent => Err(HostError::Conflict(format!(
+            "{space}/{path} now has a live version here"
+        ))),
+        PutCondition::Root(expected) if live_root == Some(expected) => Ok(()),
+        PutCondition::Root(_) => Err(HostError::Conflict(format!(
+            "{space}/{path} no longer has the expected version here"
+        ))),
+    }
+}
+
 /// A single socket write into this node's own tree, behind a `sy_put_*`
 /// writer handle (`docs/TREE-WRITES.md` §6).
 ///
@@ -905,14 +934,65 @@ impl SocketWriter for TreeWriter {
         self.ensure_staged().await?;
         let mut adoption = self.staged.take().expect("just staged");
         let outcome = crate::blocking::offload(move || {
-            adoption.write(&data)?;
-            Ok(adoption)
+            let result = adoption.write(&data);
+            Ok((adoption, result))
         })
         .await;
         match outcome {
-            Ok(adoption) => {
+            Ok((adoption, result)) => {
                 self.staged = Some(adoption);
-                Ok(())
+                result.map_err(write_refusal)
+            }
+            Err(e) => Err(write_refusal(e)),
+        }
+    }
+
+    async fn read_at(&mut self, offset: u64, len: u64) -> std::result::Result<Vec<u8>, HostError> {
+        self.ensure_staged().await?;
+        let mut adoption = self.staged.take().expect("just staged");
+        let outcome = crate::blocking::offload(move || {
+            let result = adoption.read_at(offset, len);
+            Ok((adoption, result))
+        })
+        .await;
+        match outcome {
+            Ok((adoption, result)) => {
+                self.staged = Some(adoption);
+                result.map_err(write_refusal)
+            }
+            Err(e) => Err(write_refusal(e)),
+        }
+    }
+
+    async fn write_at(&mut self, offset: u64, data: Vec<u8>) -> std::result::Result<(), HostError> {
+        self.ensure_staged().await?;
+        let mut adoption = self.staged.take().expect("just staged");
+        let outcome = crate::blocking::offload(move || {
+            let result = adoption.write_at(offset, &data);
+            Ok((adoption, result))
+        })
+        .await;
+        match outcome {
+            Ok((adoption, result)) => {
+                self.staged = Some(adoption);
+                result.map_err(write_refusal)
+            }
+            Err(e) => Err(write_refusal(e)),
+        }
+    }
+
+    async fn set_len(&mut self, len: u64) -> std::result::Result<(), HostError> {
+        self.ensure_staged().await?;
+        let mut adoption = self.staged.take().expect("just staged");
+        let outcome = crate::blocking::offload(move || {
+            let result = adoption.set_len(len);
+            Ok((adoption, result))
+        })
+        .await;
+        match outcome {
+            Ok((adoption, result)) => {
+                self.staged = Some(adoption);
+                result.map_err(write_refusal)
             }
             Err(e) => Err(write_refusal(e)),
         }
@@ -993,6 +1073,10 @@ impl SocketWriter for TreeWriter {
     }
 
     async fn delete(&mut self) -> std::result::Result<(), HostError> {
+        self.delete_if(PutCondition::Any).await
+    }
+
+    async fn delete_if(&mut self, expected: PutCondition) -> std::result::Result<(), HostError> {
         // Checked by the runtime against the grant already; re-taken here so
         // an embedder's host cannot be talked past it.
         if self.modes & synch_core::TREE_WRITE_DELETE == 0 {
@@ -1005,9 +1089,12 @@ impl SocketWriter for TreeWriter {
         let _guard = node.tree_write_lock().lock().await;
         let check = self.node.clone();
         let (space, path) = (self.space.clone(), self.path.clone());
-        crate::blocking::offload(move || Ok(refuse_socket_path(&check, &space, &path)))
-            .await
-            .map_err(write_refusal)??;
+        crate::blocking::offload(move || {
+            check.ensure_publishable()?;
+            Ok(evaluate_delete_condition(&check, &space, &path, expected))
+        })
+        .await
+        .map_err(write_refusal)??;
         let deleted = self
             .node
             .delete_object(&self.space, &self.path)

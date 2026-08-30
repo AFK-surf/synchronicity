@@ -39,7 +39,7 @@ synch socket connect nas:code/echo.sock
 | [`splice-proxy.c`](splice-proxy.c) | the same, without a buffer | `sy_splice`, and what a proxy stops needing when the bytes never enter it |
 | [`token-gate.c`](token-gate.c) | checks a shared secret | config as a secret store, and a constant-time comparison |
 | [`drop-box.c`](drop-box.c) | accepts files into the tree | tree writes (`docs/TREE-WRITES.md`): a declared prefix and size bound, `sy_put_splice`, and a commit whose root is the caller's receipt |
-| [`ssh-shell.c`](ssh-shell.c) | a real `ssh` login onto a declared bash PTY | the SSH adapter (`docs/SSH-SOCKETS.md`): channel events, a process declaration, and why accepting a channel starts nothing |
+| [`ssh-shell.c`](ssh-shell.c) | a real `ssh` login plus read/write SFTP over a declared tree scope | the SSH adapter (`docs/SSH-SOCKETS.md`): channel events, process and file-transfer declarations, and explicit close-to-commit writes |
 | [`compact-frames.c`](compact-frames.c) | uses 512-byte contiguous call frames | declaring a compiler-matched frame size and explicitly disabling guarded frames |
 
 Every one of them is compiled and run by `../tests/examples.rs` on each build,
