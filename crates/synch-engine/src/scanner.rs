@@ -505,8 +505,8 @@ impl Node {
         Ok(changes)
     }
 
-    /// Stages the removal of `b:` records for objects this node no longer
-    /// holds (§6.3).
+    /// Reconciles published `b:` records with what this node actually holds
+    /// (§6.3).
     ///
     /// An availability ad has to be retired explicitly. The scanner stages
     /// `blob_key(content) -> Some(ad)` on every hash and stages only `f:` keys
@@ -520,35 +520,37 @@ impl Node {
     /// goes on telling every peer this node holds the object, so peers keep
     /// selecting it as a provider and keep failing.
     ///
-    /// Retiring is the same shape as tombstone expiry — staged, so it costs one
-    /// head like any other batch.
-    pub(crate) fn retired_ad_changes(&self) -> Result<Vec<StagedChange>> {
+    /// Loss detection can also demote a complete local row to a partial one
+    /// while the last published head still says complete. Replacing that record
+    /// is as important as deleting an ad after GC: until this pass lands, peers
+    /// can select a provider which has already proved it cannot serve the bytes.
+    /// Reconciliation is staged, so any number of corrections costs one head.
+    pub(crate) fn ad_reconciliation_changes(&self) -> Result<Vec<StagedChange>> {
         let mut changes = Vec::new();
         for root in self.store().provider_roots_for_origin(self.origin())? {
-            // Still held, whole or in part: the ad stands, and a partial
-            // holder's ad is exactly what §6.3 wants advertised.
-            if self.store().local_ad(&root)?.is_some() {
-                continue;
+            let published = self.store().provider_for_origin(&root, self.origin())?;
+            match self.store().local_ad(&root)? {
+                Some(local) if published.as_ref() != Some(&local) => {
+                    changes.push((blob_key(&root), Some(synch_core::record::encode(&local)?)))
+                }
+                Some(_) => {}
+                None => changes.push((blob_key(&root), None)),
             }
-            changes.push((blob_key(&root), None));
         }
         Ok(changes)
     }
 
-    /// Stages the removal of ads for objects this node has dropped.
+    /// Stages corrected ads for objects whose local availability changed.
     ///
     /// Returns how many were staged.
-    pub(crate) fn retire_ads(&self) -> Result<usize> {
-        let changes = self.retired_ad_changes()?;
-        let retired = changes.len();
-        if retired > 0 {
+    pub(crate) fn reconcile_ads(&self) -> Result<usize> {
+        let changes = self.ad_reconciliation_changes()?;
+        let corrected = changes.len();
+        if corrected > 0 {
             self.stage(changes);
-            tracing::info!(
-                retired,
-                "staging availability ads for objects no longer held"
-            );
+            tracing::info!(corrected, "staging corrected availability advertisements");
         }
-        Ok(retired)
+        Ok(corrected)
     }
 
     /// Stages the removal of this node's aged-out tombstones (§4.2).
@@ -2391,6 +2393,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detected_local_loss_corrects_the_published_complete_ad() {
+        let (data, node) = crate::testkit::node().await;
+        node.add_api_source("media").unwrap();
+        let incoming = data.path().join("incoming");
+        std::fs::write(&incoming, vec![19u8; 100_000]).unwrap();
+        let (root, _) = node
+            .commit_api_file("media", "lost.bin", &incoming, 42)
+            .await
+            .unwrap();
+        node.flush_staged().await.unwrap().unwrap();
+        assert!(node
+            .store()
+            .provider_for_origin(&root, node.origin())
+            .unwrap()
+            .unwrap()
+            .is_complete());
+
+        let hex = root.to_string();
+        std::fs::remove_file(data.path().join("store").join(&hex[..2]).join(&hex)).unwrap();
+        assert!(node.store().read_all(&root).is_err());
+        assert!(!node.store().local_ad(&root).unwrap().unwrap().is_complete());
+
+        let changes = node.ad_reconciliation_changes().unwrap();
+        assert_eq!(changes.len(), 1);
+        let corrected: synch_core::BlobAd =
+            synch_core::record::decode(changes[0].1.as_ref().expect("the partial replacement ad"))
+                .unwrap();
+        assert!(!corrected.is_complete());
+        node.publish(&changes).unwrap();
+        assert!(!node
+            .store()
+            .provider_for_origin(&root, node.origin())
+            .unwrap()
+            .unwrap()
+            .is_complete());
+
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn api_source_cloud_ingest_is_remote_before_its_row_and_publish() {
         let data = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
@@ -2441,7 +2483,7 @@ mod tests {
         node.store().delete_blob(&root).unwrap();
         assert!(node.store().blob(&root).unwrap().is_none());
         node.reconstruct_recovered_cloud_rows().await.unwrap();
-        assert!(node.retired_ad_changes().unwrap().is_empty());
+        assert!(node.ad_reconciliation_changes().unwrap().is_empty());
         let (encoded, served) = node
             .cas_backend()
             .encode_slice(root, synch_core::ChunkRanges::single(0, 1))
@@ -2468,7 +2510,7 @@ mod tests {
         node.reconstruct_recovered_cloud_rows().await.unwrap();
         let recovered_pin = node.store().blob(&pinned.root).unwrap().unwrap();
         assert!(recovered_pin.durable && recovered_pin.pinned);
-        assert!(node.retired_ad_changes().unwrap().is_empty());
+        assert!(node.ad_reconciliation_changes().unwrap().is_empty());
 
         // Simulate a replacement container: only the database and remote
         // object survive. The first read refills the cache.

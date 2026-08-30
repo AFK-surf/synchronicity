@@ -378,7 +378,8 @@ synch-s3 serve --anonymous
 A bucket is explicitly read-only or read-write. Read-only buckets may select
 `newest`, `strict`, or one origin; a `strict` read answers a divergent key with
 `409 Conflict`. Read-write buckets require a local source and read this node's
-own view, so a successful mutation is immediately visible through that bucket.
+own view, following its current origin across identity adoption, so a successful
+mutation is immediately visible through that bucket.
 ETags are the selected version's quoted BLAKE3 root.
 
 On a read-write bucket, `DELETE` removes this node's copy and publishes a

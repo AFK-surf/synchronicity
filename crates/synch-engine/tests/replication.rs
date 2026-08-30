@@ -571,11 +571,12 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
     std::fs::write(publisher.space.path().join("big.bin"), vec![7u8; 4096]).unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
-    // A ceiling far below the object: nothing can be admitted.
+    // A zero-byte ceiling admits no non-empty object; it is not an alias for
+    // the absence of a ceiling.
     let replicating = replica.node.clone();
     off_runtime(move || {
         replicating
-            .add_replica("media", ReplicaPolicy::Current, Some(3600), Some(16), None)
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), Some(0), None)
             .unwrap();
     })
     .await;

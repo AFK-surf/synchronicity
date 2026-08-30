@@ -23,8 +23,9 @@ pub(crate) const BUCKETS_CONFIG: &str = "s3.buckets";
 /// Which version of each key a bucket's reads serve (§8).
 ///
 /// The daemon owns what these *mean* — it is the one that resolves a path under
-/// one. The gateway recognizes the three spellings so it can tell a foreign
-/// origin pin from our own, and passes the text through untouched otherwise.
+/// one. `Own` is resolved against the daemon for every read, so a writable
+/// bucket follows node identity adoption instead of pinning the name current
+/// when the bucket happened to be created.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Policy {
     /// The greatest `(mtime_ns, content_root, origin)`.
@@ -34,6 +35,8 @@ pub enum Policy {
     Origin(String),
     /// Refuse a divergent key, with `409 Conflict` naming the versions.
     Strict,
+    /// This node's current origin. Stored only for read-write buckets.
+    Own,
 }
 
 /// Whether a bucket may publish this node's view.
@@ -71,6 +74,7 @@ impl Policy {
         match text.trim() {
             "newest" => Ok(Policy::Newest),
             "strict" => Ok(Policy::Strict),
+            "own" => Ok(Policy::Own),
             other => match other.strip_prefix("origin=") {
                 Some(origin) if !origin.is_empty() => Ok(Policy::Origin(origin.to_string())),
                 _ => Err(S3Error::invalid(format!(
@@ -86,6 +90,7 @@ impl Policy {
             Policy::Newest => "newest".to_string(),
             Policy::Origin(origin) => format!("origin={origin}"),
             Policy::Strict => "strict".to_string(),
+            Policy::Own => "own".to_string(),
         }
     }
 
@@ -139,6 +144,14 @@ impl Bucket {
             ))),
         }
     }
+
+    /// The daemon version policy for a read performed now.
+    pub async fn read_policy(&self, daemon: &Daemon) -> S3Result<String> {
+        match &self.policy {
+            Policy::Own => Ok(format!("origin={}", daemon.origin().await?)),
+            _ => Ok(self.policy.render()),
+        }
+    }
 }
 
 /// Validates a bucket name against the S3 naming rules we enforce.
@@ -170,15 +183,19 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
             let [space, access, policy, ..] = rest else {
                 return None;
             };
-            Access::parse(access)
-                .ok()
-                .zip(Policy::parse(policy).ok())
-                .map(|(access, policy)| Bucket {
+            let (access, policy) = Access::parse(access).ok().zip(Policy::parse(policy).ok())?;
+            if matches!((&access, &policy), (Access::ReadWrite, Policy::Own))
+                || matches!((&access, &policy), (Access::ReadOnly, p) if !matches!(p, Policy::Own))
+            {
+                Some(Bucket {
                     name: name.to_string(),
                     space: space.to_string(),
                     access,
                     policy,
                 })
+            } else {
+                None
+            }
         },
     );
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -212,7 +229,13 @@ pub async fn add(
     validate_name(name)?;
     synch_core::validate_space(space).map_err(|e| S3Error::invalid(e.to_string()))?;
     let policy = match access {
-        Access::ReadOnly => select.map(Policy::parse).transpose()?.unwrap_or_default(),
+        Access::ReadOnly => {
+            let policy = select.map(Policy::parse).transpose()?.unwrap_or_default();
+            if policy == Policy::Own {
+                return Err(S3Error::invalid("own is reserved for read-write buckets"));
+            }
+            policy
+        }
         Access::ReadWrite if select.is_some() => {
             return Err(S3Error::invalid("--select is valid only with --read-only"));
         }
@@ -222,7 +245,7 @@ pub async fn add(
                     "read-write bucket requires a local source for {space}"
                 )));
             }
-            Policy::Origin(daemon.origin().await?)
+            Policy::Own
         }
     };
     let bucket = Bucket {
@@ -236,7 +259,13 @@ pub async fn add(
     // policy means it would work, and anything else comes back as the error a
     // first GET would otherwise have produced days later.
     daemon
-        .list(&bucket.space, "", None, 0, &bucket.policy.render())
+        .list(
+            &bucket.space,
+            "",
+            None,
+            0,
+            &bucket.read_policy(daemon).await?,
+        )
         .await?;
     daemon.append(BUCKETS_CONFIG, &bucket.record()).await?;
     Ok(bucket)
@@ -271,9 +300,10 @@ mod tests {
             "docs\tpapers\tread-only\tstrict",
             "photos\tmedia\tread-only\torigin=nas",
             "garbage\tmedia\tread-only\twhatever",
+            "legacy\tmedia\tread-write\torigin=old-name",
             "\t\t",
             "docs",
-            "docs\tother\tread-write\torigin=self",
+            "docs\tother\tread-write\town",
         ]));
         let names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["docs", "photos"]);
@@ -281,11 +311,12 @@ mod tests {
         assert_eq!(photos.policy, Policy::Origin("nas".to_string()));
         let docs = buckets.iter().find(|b| b.name == "docs").unwrap();
         assert_eq!(docs.space, "other");
+        assert_eq!(docs.policy, Policy::Own);
     }
 
     #[test]
     fn policies_round_trip() {
-        for text in ["newest", "strict", "origin=nas@cluster.example"] {
+        for text in ["newest", "strict", "origin=nas@cluster.example", "own"] {
             assert_eq!(Policy::parse(text).unwrap().render(), text);
         }
         assert!(Policy::parse("whatever").is_err());

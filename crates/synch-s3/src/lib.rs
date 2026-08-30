@@ -658,6 +658,7 @@ async fn list_objects(
     // know whether there is a next page; a delimiter can fold several of them
     // into one common prefix, so the loop below may ask for no more than it
     // was given and still stop short.
+    let policy = bucket.read_policy(&gateway.daemon).await?;
     let (listing, more, scan_cursor) = gateway
         .daemon
         .list(
@@ -665,7 +666,7 @@ async fn list_objects(
             &prefix,
             start_after.as_deref(),
             max_keys + 1,
-            &bucket.policy.render(),
+            &policy,
         )
         .await?;
 
@@ -749,7 +750,7 @@ async fn get_object(
     headers: &BTreeMap<String, String>,
     head_only: bool,
 ) -> S3Result<Response> {
-    let policy = bucket.policy.render();
+    let policy = bucket.read_policy(&gateway.daemon).await?;
     // Metadata first, and metadata only: `HeadObject` answers size, mtime, and
     // ETag straight from the entry, with no content fetched at all (§9.4).
     let entry = gateway

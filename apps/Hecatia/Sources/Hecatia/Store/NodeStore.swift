@@ -574,7 +574,7 @@ final class NodeStore {
       }
       // A folder that stopped replicating should not leave its old numbers
       // sitting under it.
-      let replicating = Set(parsed.rows.filter(\.isReplicating).map(\.id))
+      let replicating = Set(spaces.filter(\.isReplicating).map(\.id))
       replicaStatus = replicaStatus.filter { replicating.contains($0.key) }
     case .members:
       // `delegate ls` first, because a delegated device appears in *both*
@@ -767,7 +767,7 @@ final class NodeStore {
   /// Adds or adjusts one replica role; source state is never part of this call.
   func configureReplica(
     id: String, retention: ReplicaPolicy, grace: Int64? = nil, budget: UInt64? = nil,
-    checkout: String? = nil, noCheckout: Bool = false
+    noBudget: Bool = false, checkout: String? = nil, noCheckout: Bool = false
   ) async {
     houseworkRunning = true
     defer { houseworkRunning = false }
@@ -775,13 +775,14 @@ final class NodeStore {
     line += " --retention \(retention.wire)"
     if let grace { line += " --grace \(grace)s" }
     if let budget { line += " --budget \(budget)" }
+    if noBudget { line += " --no-budget" }
     if let checkout { line += " --checkout \(Shell.quote(checkout))" }
     if noCheckout { line += " --no-checkout" }
     if spaces.first(where: { $0.id == id })?.isReplicating == true {
       await run(
         Operations.require("replica.set"),
         Cmd.replicaSet(
-          id: id, retention: retention, grace: grace, budget: budget,
+          id: id, retention: retention, grace: grace, budget: budget, noBudget: noBudget,
           checkout: checkout, noCheckout: noCheckout),
         commandLine: line, deadline: .long)
     } else {

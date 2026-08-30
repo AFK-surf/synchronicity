@@ -137,14 +137,6 @@ impl Store {
         )? > 0)
     }
 
-    /// Drops every want one holder has when that replica role is removed.
-    pub fn drop_wants(&self, holder: &PinHolder) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM content_want WHERE holder = ?1",
-            params![holder.render()],
-        )?)
-    }
-
     /// Retires a want by taking possession, in one transaction.
     ///
     /// The two halves must not be separable. A pin written before the want is
@@ -168,10 +160,17 @@ impl Store {
             if !held {
                 return Ok(false);
             }
-            tx.execute(
+            let wanted = tx.execute(
                 "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
                 params![root.as_bytes().to_vec(), holder.render()],
             )?;
+            // Role removal deletes its wants before releasing its pins.  The
+            // delete and this check share the write transaction, so a fetch
+            // which finishes after that point cannot resurrect an orphaned
+            // source/replica claim.
+            if wanted == 0 {
+                return Ok(false);
+            }
             tx.execute(
                 "INSERT INTO pins (root, holder, created_at, release_after)
                  VALUES (?1, ?2, ?3, NULL)
@@ -484,6 +483,9 @@ impl Store {
                 "UPDATE pins SET release_after = ?2
                   WHERE holder = ?1
                     AND release_after IS NULL
+                    AND EXISTS (SELECT 1 FROM replicas r
+                                 WHERE 'replica:' || r.space = ?1
+                                   AND r.retention = 'current')
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND {VIEW_IS_COMPLETE}"
             ),
@@ -516,6 +518,9 @@ impl Store {
                 "UPDATE pins SET release_after = ?2
                   WHERE holder = ?1
                     AND release_after IS NULL
+                    AND EXISTS (SELECT 1 FROM replicas r
+                                 WHERE 'replica:' || r.space = ?1
+                                   AND r.retention = 'current')
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND (SELECT COUNT(*) FROM blob_providers p
                           WHERE p.object_root = pins.root AND p.complete != 0
@@ -781,6 +786,56 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_want_cannot_become_an_orphaned_pin() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        assert!(store.stage_want(&root, &media(), 7, None, 1).unwrap());
+        assert!(store.drop_want(&root, &media()).unwrap());
+
+        assert!(!store.take_possession(&root, &media(), 2).unwrap());
+        assert!(store.pins_for(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_source_drops_its_repair_intent_and_hold() {
+        let (_dir, store) = store();
+        let held = store.ingest_bytes(b"held", 0).unwrap();
+        let repairing = synch_core::Hash::new(b"missing");
+        let holder = PinHolder::Source("media".into());
+        store
+            .put_source("media", crate::SourceKind::Api, None)
+            .unwrap();
+        store.pin(&held, &holder, 1).unwrap();
+        store.stage_want(&repairing, &holder, 7, None, 1).unwrap();
+
+        assert!(store.remove_source("media").unwrap());
+        assert!(store.wants_of(&holder).unwrap().is_empty());
+        assert!(store.pins_for(&held).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replica_removal_preserves_exactly_the_holds_committed_before_it() {
+        let (_dir, store) = store();
+        configure_replica(&store, "media");
+        let held = store.ingest_bytes(b"held", 0).unwrap();
+        let fetching = store.ingest_bytes(b"fetching", 0).unwrap();
+        store.pin(&held, &media(), 1).unwrap();
+        store
+            .stage_want(&fetching, &media(), b"fetching".len() as u64, None, 1)
+            .unwrap();
+
+        assert!(store.remove_replica("media", true, 2).unwrap());
+        assert!(store.replica("media").unwrap().is_none());
+        assert!(store.wants_of(&media()).unwrap().is_empty());
+        assert_eq!(
+            store.pins_for(&held).unwrap()[0].holder,
+            PinHolder::Operator
+        );
+        assert!(!store.take_possession(&fetching, &media(), 3).unwrap());
+        assert!(store.pins_for(&fetching).unwrap().is_empty());
+    }
+
+    #[test]
     fn possession_of_content_that_is_not_here_is_refused() {
         let (_dir, store) = store();
         let absent = synch_core::Hash::new(b"absent");
@@ -793,6 +848,7 @@ mod tests {
     #[test]
     fn a_release_is_scheduled_when_nothing_names_the_root_and_cleared_when_something_does() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
@@ -814,6 +870,28 @@ mod tests {
             .unwrap();
         assert_eq!(store.clear_returned_releases(&media()).unwrap(), 1);
         assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
+    }
+
+    #[test]
+    fn forever_configuration_cancels_every_scheduled_release() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+        store.schedule_release(&root, &media(), 500).unwrap();
+
+        store
+            .put_replica(&crate::ReplicaRow {
+                space: "media".into(),
+                retention: ReplicaPolicy::Forever,
+                grace: None,
+                budget: None,
+                checkout_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
+        assert_eq!(store.schedule_stale_releases(&media(), 900).unwrap(), 0);
+        assert_eq!(store.expire_pins_of(&media(), i64::MAX).unwrap(), 0);
     }
 
     #[test]
@@ -917,6 +995,7 @@ mod tests {
     #[test]
     fn a_release_is_refused_while_a_head_sits_pending() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let first = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&first, &media(), 1).unwrap();
 
@@ -941,6 +1020,7 @@ mod tests {
     #[test]
     fn a_release_is_refused_while_a_bound_origin_has_published_nothing_here() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
@@ -987,6 +1067,7 @@ mod tests {
     #[test]
     fn the_replication_floor_does_not_count_this_node_as_a_peer() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"the last copy", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
         store

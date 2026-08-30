@@ -288,6 +288,12 @@ struct OptionalFieldTests {
     #expect(command.replicaAdd.checkout == "/tmp/notes")
   }
 
+  @Test func replicaSetCanRemoveAnExistingBudget() {
+    let command = Cmd.replicaSet(id: "notes", noBudget: true)
+    #expect(command.replicaSet.noBudget)
+    #expect(!command.replicaSet.hasBudget)
+  }
+
   @Test func repairRebuildsViews() {                // DiagnosticsPane
     #expect(Cmd.rebuildViews.hasRepairRebuildViews)
   }

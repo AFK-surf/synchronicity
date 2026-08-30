@@ -46,8 +46,8 @@ pub struct SocketRow {
     /// Whether the declaration re-arms itself on every content change.
     ///
     /// Correct for a path you are the only writer of, wrong for any path an S3
-    /// key, a fill or a take can reach. `synch doctor` lists these, because
-    /// that list is the honest answer to "what can execute here?".
+    /// key, an API write or a checkout can reach. `synch doctor` lists these,
+    /// because that list is the honest answer to "what can execute here?".
     pub auto: bool,
     /// A free-form operator note.
     pub note: String,

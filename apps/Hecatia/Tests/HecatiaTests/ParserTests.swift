@@ -14,6 +14,21 @@ import Testing
 /// `key:<52-char>` origin that is longer than its `{:<32}` field.
 struct ParserTests {
 
+  @Test func typedSpacesKeepEditableReplicaConfiguration() {
+    var info = Synch_Control_V1_SpaceInfo()
+    info.id = "media"
+    info.retention = "current"
+    info.graceSecs = 30 * 86_400
+    info.budget = 8 * (1 << 40)
+    info.checkoutPath = "/srv/media"
+
+    let space = Space(info)
+    #expect(space.replicate == .current)
+    #expect(space.graceSeconds == 30 * 86_400)
+    #expect(space.budgetBytes == 8 * (1 << 40))
+    #expect(space.checkoutPath == "/srv/media")
+  }
+
   @Test func replicaStatusFromALiveDaemon() {
     let key = "key:ao6bbsx33qwbyets4qzmxzhumx8tmtnq9m93e55m1qejcdh3m11o"
     let status = Listings.replicaStatus([

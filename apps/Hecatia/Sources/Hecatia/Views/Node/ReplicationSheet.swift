@@ -111,10 +111,8 @@ struct ReplicationSheet: View {
 
   /// Apply is not offered when there is provably nothing to send.
   ///
-  /// Only one case is provable: "off" on a folder that already does not
-  /// replicate. Any chosen policy always carries a grace and a budget, and this
-  /// sheet cannot know the folder's current ones — the summary line
-  /// does not include the budget — so it does not pretend to and always sends.
+  /// Only one case is provable without retaining a second editable snapshot:
+  /// "off" on a folder that already does not replicate.
   private var hasChange: Bool {
     if case .off = choice { return space.isReplicating }
     return true
@@ -124,6 +122,13 @@ struct ReplicationSheet: View {
     guard !loaded else { return }
     loaded = true
     choice = space.replicate.map(Choice.policy) ?? .off
+    if let grace = space.graceSeconds {
+      graceDays = Double(grace) / 86_400
+    }
+    if let budget = space.budgetBytes {
+      limitBudget = true
+      budgetGB = Double(budget) / 1_000_000_000
+    }
     materialize = space.checkoutPath != nil
     checkoutPath = space.checkoutPath ?? ""
   }
@@ -135,11 +140,18 @@ struct ReplicationSheet: View {
       let preserve = pinHeld
       node.enqueue { await node.removeReplica(id: id, pinHeld: preserve) }
     case .policy(let policy):
-      let grace = policy == .current ? Int64(graceDays * 86_400) : nil
-      let budget = limitBudget ? UInt64(budgetGB * 1_000_000_000) : nil
+      let originalGraceDays = space.graceSeconds.map { Double($0) / 86_400 }
+      let graceChanged = policy == .current
+        && (space.replicate != .current || originalGraceDays != graceDays)
+      let grace = graceChanged ? Int64((graceDays * 86_400).rounded()) : nil
+      let originalBudgetGB = space.budgetBytes.map { Double($0) / 1_000_000_000 }
+      let budgetChanged = limitBudget
+        && (originalBudgetGB == nil || originalBudgetGB != budgetGB)
+      let budget = budgetChanged ? UInt64((budgetGB * 1_000_000_000).rounded()) : nil
+      let noBudget = space.isReplicating && space.budgetBytes != nil && !limitBudget
       node.enqueue {
         await node.configureReplica(
-          id: id, retention: policy, grace: grace, budget: budget,
+          id: id, retention: policy, grace: grace, budget: budget, noBudget: noBudget,
           checkout: materialize ? checkoutPath : nil,
           noCheckout: !materialize && space.checkoutPath != nil)
       }

@@ -458,6 +458,34 @@ impl Store {
         put_provider_in(&conn, root, origin, ad)
     }
 
+    /// The advertisement one origin currently publishes for an object.
+    pub fn provider_for_origin(&self, root: &Hash, origin: &OriginId) -> Result<Option<BlobAd>> {
+        let encoded: Option<(i64, i64, Option<Vec<u8>>)> = self
+            .conn()
+            .query_row(
+                "SELECT size, complete, spans FROM blob_providers
+                  WHERE object_root = ?1 AND origin_id = ?2",
+                params![root.as_bytes().to_vec(), origin.canonical()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((size, complete, spans)) = encoded else {
+            return Ok(None);
+        };
+        let state: AdState = match spans {
+            Some(bytes) => synch_core::record::decode(&bytes)?,
+            None if complete != 0 && size > 0 => AdState {
+                spans: vec![(0, size as u64)],
+            },
+            None => AdState { spans: Vec::new() },
+        };
+        Ok(Some(BlobAd {
+            v: synch_core::RECORD_VERSION,
+            size: size as u64,
+            state,
+        }))
+    }
+
     /// Deletes one provider row.
     #[cfg(test)]
     pub(crate) fn delete_provider(&self, root: &Hash, origin: &OriginId) -> Result<()> {
@@ -623,17 +651,31 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a publisher role and its source-only socket declarations.
+    /// Removes a publisher role and every piece of state owned by that role.
     pub fn remove_source(&self, space: &str) -> Result<bool> {
         self.transaction(|txn| {
+            let exists: bool = txn.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE space = ?1)",
+                params![space],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
             txn.conn()
                 .execute("DELETE FROM socket_arms WHERE space = ?1", params![space])?;
             txn.conn()
                 .execute("DELETE FROM sockets WHERE space = ?1", params![space])?;
-            let n = txn
-                .conn()
+            txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
-            Ok(n > 0)
+            let holder = crate::PinHolder::Source(space.to_string()).render();
+            txn.conn().execute(
+                "DELETE FROM content_want WHERE holder = ?1",
+                params![holder.clone()],
+            )?;
+            txn.conn()
+                .execute("DELETE FROM pins WHERE holder = ?1", params![holder])?;
+            Ok(true)
         })
     }
 
@@ -660,32 +702,67 @@ impl Store {
 
     /// Registers a durable replica role for a space.
     pub fn put_replica(&self, replica: &ReplicaRow) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO replicas
-               (space, retention, grace_seconds, budget_bytes, checkout_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(space) DO UPDATE SET
-               retention = excluded.retention,
-               grace_seconds = excluded.grace_seconds,
-               budget_bytes = excluded.budget_bytes,
-               checkout_path = excluded.checkout_path",
-            params![
-                replica.space,
-                replica.retention.render(),
-                replica.grace,
-                replica.budget.map(|v| v as i64),
-                replica.checkout_path,
-            ],
-        )?;
-        Ok(())
+        self.transaction(|txn| {
+            txn.conn().execute(
+                "INSERT INTO replicas
+                   (space, retention, grace_seconds, budget_bytes, checkout_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(space) DO UPDATE SET
+                   retention = excluded.retention,
+                   grace_seconds = excluded.grace_seconds,
+                   budget_bytes = excluded.budget_bytes,
+                   checkout_path = excluded.checkout_path",
+                params![
+                    replica.space,
+                    replica.retention.render(),
+                    replica.grace,
+                    replica.budget.map(|v| v as i64),
+                    replica.checkout_path,
+                ],
+            )?;
+            if replica.retention == ReplicaPolicy::Forever {
+                txn.conn().execute(
+                    "UPDATE pins SET release_after = NULL WHERE holder = ?1",
+                    params![crate::PinHolder::Replica(replica.space.clone()).render()],
+                )?;
+            }
+            Ok(())
+        })
     }
 
-    /// Removes a durable replica role.
-    pub fn remove_replica(&self, space: &str) -> Result<bool> {
-        Ok(self
-            .conn()
-            .execute("DELETE FROM replicas WHERE space = ?1", params![space])?
-            > 0)
+    /// Removes a durable replica role and all state it owns atomically.
+    ///
+    /// A fetch finishing before this transaction is preserved by `pin_held`;
+    /// one finishing after it finds that its want no longer exists and cannot
+    /// recreate the removed holder.
+    pub fn remove_replica(&self, space: &str, pin_held: bool, now: i64) -> Result<bool> {
+        self.transaction(|txn| {
+            let holder = crate::PinHolder::Replica(space.to_string()).render();
+            let exists: bool = txn.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM replicas WHERE space = ?1)",
+                params![space],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            if pin_held {
+                txn.conn().execute(
+                    "INSERT OR IGNORE INTO pins (root, holder, created_at, release_after)
+                     SELECT root, 'operator', ?2, NULL FROM pins WHERE holder = ?1",
+                    params![holder.clone(), now],
+                )?;
+            }
+            txn.conn().execute(
+                "DELETE FROM content_want WHERE holder = ?1",
+                params![holder.clone()],
+            )?;
+            txn.conn()
+                .execute("DELETE FROM pins WHERE holder = ?1", params![holder])?;
+            txn.conn()
+                .execute("DELETE FROM replicas WHERE space = ?1", params![space])?;
+            Ok(true)
+        })
     }
 
     /// Every configured durable replica role.

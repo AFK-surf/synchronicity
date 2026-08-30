@@ -1224,10 +1224,10 @@ enum UIProbe {
 
   /// Shares `HECATIA_PROBE_SHARE` and checks its files turn up.
   ///
-  /// `SpaceAdd` starts a watcher, and a watcher reports changes — it says
-  /// nothing about the files already sitting there. So the folder listed as
-  /// empty, under a daemon message that says "indexing", until the scanner's
-  /// own interval came round.
+  /// Adding a filesystem source starts a watcher, and a watcher reports
+  /// changes — it says nothing about the files already sitting there. So the
+  /// folder listed as empty, under a daemon message that says "indexing", until
+  /// the scanner's own interval came round.
   static func addingAFullFolder(_ model: FilesModel, _ node: NodeStore) async {
     var failures: [String] = []
     guard let share = ProcessInfo.processInfo.environment["HECATIA_PROBE_SHARE"] else {

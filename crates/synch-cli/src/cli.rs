@@ -747,7 +747,7 @@ pub enum ReplicaCommand {
         #[arg(long, value_name = "DUR", value_parser = parse_duration)]
         grace: Option<std::time::Duration>,
         /// Stop acquiring new roots after this many held bytes.
-        #[arg(long, value_name = "BYTES")]
+        #[arg(long, value_name = "BYTES", value_parser = parse_byte_count)]
         budget: Option<u64>,
         /// Materialize the newest view into this directory.
         #[arg(long)]
@@ -764,7 +764,7 @@ pub enum ReplicaCommand {
         #[arg(long, value_name = "DUR", value_parser = parse_duration)]
         grace: Option<std::time::Duration>,
         /// Replace the byte ceiling.
-        #[arg(long, conflicts_with = "no_budget")]
+        #[arg(long, value_name = "BYTES", value_parser = parse_byte_count, conflicts_with = "no_budget")]
         budget: Option<u64>,
         /// Remove the byte ceiling.
         #[arg(long)]
@@ -987,6 +987,44 @@ pub(crate) fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> 
     Ok(std::time::Duration::from_secs(total))
 }
 
+/// Parses a byte count as an integer number of bytes or with a decimal/binary
+/// unit (`8TiB`, `500GB`). Fractional quantities stay out of the command
+/// surface so every accepted value maps to one exact durable ceiling.
+pub(crate) fn parse_byte_count(text: &str) -> anyhow::Result<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!("a byte count looks like 4096, 500GB, or 8TiB");
+    }
+    if let Ok(bytes) = text.parse::<u64>() {
+        return Ok(bytes);
+    }
+    let units = [
+        ("PiB", 1u64 << 50),
+        ("TiB", 1u64 << 40),
+        ("GiB", 1u64 << 30),
+        ("MiB", 1u64 << 20),
+        ("KiB", 1u64 << 10),
+        ("PB", 1_000_000_000_000_000),
+        ("TB", 1_000_000_000_000),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+        ("KB", 1_000),
+        ("B", 1),
+    ];
+    for (suffix, multiplier) in units {
+        let Some(number) = text.strip_suffix(suffix) else {
+            continue;
+        };
+        let quantity: u64 = number.parse().map_err(|_| {
+            anyhow::anyhow!("{text}: the quantity before {suffix} must be a whole number")
+        })?;
+        return quantity
+            .checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("{text} is larger than the maximum byte count"));
+    }
+    anyhow::bail!("{text:?} is not a byte count; use bytes, KB/MB/GB/TB/PB, or KiB/MiB/GiB/TiB/PiB")
+}
+
 /// A parsed `--range` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteRange {
@@ -1130,6 +1168,22 @@ mod tests {
         }
         for bad in ["", "soon", "1w", "1h30", "h"] {
             assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn byte_counts_parse() {
+        for (text, bytes) in [
+            ("0", 0),
+            ("4096", 4096),
+            ("500GB", 500_000_000_000),
+            ("8TiB", 8 * (1u64 << 40)),
+            (" 2MiB ", 2 * (1u64 << 20)),
+        ] {
+            assert_eq!(parse_byte_count(text).unwrap(), bytes, "{text}");
+        }
+        for bad in ["", "1.5GB", "8Gi", "many", "18446744073709551615PiB"] {
+            assert!(parse_byte_count(bad).is_err(), "{bad}");
         }
     }
 

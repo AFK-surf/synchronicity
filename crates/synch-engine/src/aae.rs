@@ -356,7 +356,7 @@ impl Node {
         // is retired next pass rather than lingering an interval — and so the
         // ad and the payload never disagree in the direction that has peers
         // dialling us for bytes we no longer have (§6.3).
-        contained("retiring ads", self.retire_ads());
+        contained("reconciling ads", self.reconcile_ads());
 
         let retention = self
             .config()

@@ -501,7 +501,7 @@ publishes no entries of its own:
 ```sh
 synch replica add media                         # current roots
 synch replica add archive --retention forever  # every root observed while active
-synch replica add media --grace 30d --budget 8796093022208
+synch replica add media --grace 30d --budget 8TiB
 synch replica set media --checkout /srv/media-view
 synch replica ls [media]
 synch replica sync [media]
@@ -511,7 +511,9 @@ synch replica rm media --pin-held
 
 `current` releases roots that leave the current tree after the grace period.
 `forever` retains every root observed while the replica is active. A budget is
-an admission ceiling: it stops new acquisitions and never evicts held data.
+an admission ceiling: suffixes such as `GB` and `TiB` are accepted, zero admits
+no non-empty object, and `--no-budget` removes the ceiling. It stops new
+acquisitions and never evicts held data.
 Removing a replica releases its holds; `--pin-held` converts them to explicit
 operator pins first.
 
@@ -1049,11 +1051,12 @@ synch-s3 serve --anonymous                                   # loopback only
 ```
 
 A bucket is explicitly read-only or read-write. A read-only bucket may select
-`newest`, `strict`, or one origin; a read-write bucket is fixed to this node's
-own view and requires a local source for its space. It rejects mutations early
-if that role is absent. ETags are the selected version's BLAKE3 root in hex,
-quoted. A strict bucket answers a divergent key with `409 Conflict` naming the
-versions. `PUT` and `DELETE` through a read-write bucket publish this node's
+`newest`, `strict`, or one origin; a read-write bucket follows this node's own
+current origin across identity adoption and requires a local source for its
+space. It rejects mutations early if that role is absent. ETags are the
+selected version's BLAKE3 root in hex, quoted. A strict bucket answers a
+divergent key with `409 Conflict` naming the versions. `PUT` and `DELETE`
+through a read-write bucket publish this node's
 view. Multipart upload is supported, which is what makes the gateway writable
 from Mountpoint for Amazon S3. Secrets are never positional: read one from the
 terminal prompt, a file, or standard input.

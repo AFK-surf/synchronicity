@@ -243,17 +243,12 @@ impl Node {
     /// Removes a replica and releases its holds, optionally preserving held
     /// roots as explicit operator pins.
     pub fn remove_replica(&self, id: &str, pin_held: bool) -> Result<()> {
-        let Some(replica) = self.store().replica(id)? else {
+        if !self
+            .store()
+            .remove_replica(id, pin_held, self.store().read_instant()?)?
+        {
             return Err(EngineError::not_found(format!("no replica {id}")));
-        };
-        let holder = replica.holder();
-        if pin_held {
-            self.store()
-                .promote_pins_to_operator(&holder, self.store().read_instant()?)?;
         }
-        self.store().drop_wants(&holder)?;
-        self.store().unpin_all(&holder)?;
-        self.store().remove_replica(id)?;
         self.replica_wake().notify_one();
         Ok(())
     }
@@ -438,7 +433,7 @@ impl Node {
                 // than going on to count every remaining candidate as
                 // over-budget in a report nobody can act on.
                 Some(_) if admitted.len() >= limit => break,
-                Some((held, budget)) if *budget > 0 && *held + want.size > *budget => {
+                Some((held, budget)) if held.saturating_add(want.size) > *budget => {
                     // Skipped, not stopped: a smaller want further down still
                     // fits, and rejecting one must not end the pass. Nothing is
                     // recorded against the row either — a budget is not the
@@ -579,10 +574,10 @@ impl Node {
 
     /// A space's `(bytes held, ceiling)`, or `None` when it is not replicated.
     ///
-    /// A ceiling of zero means no ceiling. Reaching one stops fetching and
-    /// never shortens a release: a replica that let go of its grace window
-    /// because a disk filled up would drop the recovery story exactly when
-    /// nobody was watching (§3.8).
+    /// A missing ceiling means no ceiling; zero admits no non-empty object.
+    /// Reaching a ceiling stops fetching and never shortens a release: a
+    /// replica that let go of its grace window because a disk filled up would
+    /// drop the recovery story exactly when nobody was watching (§3.8).
     ///
     /// Read once per space per pass, not once per object: `replica_coverage`
     /// aggregates over every pin the holder has, so asking it per candidate
@@ -596,7 +591,7 @@ impl Node {
                 return Ok(None);
             };
             let Some(budget) = row.budget else {
-                return Ok(Some((0, 0)));
+                return Ok(Some((0, u64::MAX)));
             };
             let coverage = store.replica_coverage(&row.holder(), UNREACHABLE_ATTEMPTS)?;
             Ok(Some((coverage.held_bytes, budget)))

@@ -56,8 +56,10 @@ Retention policies are:
   period;
 - `forever`: roots observed while the replica is active are never released.
 
-The optional budget is an admission ceiling. It stops new acquisitions; it
-does not evict already-held data or shorten grace periods.
+The optional budget is an admission ceiling. It accepts exact bytes or decimal
+and binary units such as `500GB` and `8TiB`; zero admits no non-empty object.
+It stops new acquisitions and does not evict already-held data or shorten grace
+periods. Omitting it, or using `replica set --no-budget`, removes the ceiling.
 
 Replica removal always removes the standing policy. By default its replica
 holds are released. `--pin-held` converts them to explicit operator pins first,

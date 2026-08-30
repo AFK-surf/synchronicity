@@ -1408,28 +1408,6 @@ impl Store {
         Ok(dropped > 0)
     }
 
-    /// Drops every claim one holder has, including a replica removal that
-    /// releases its durable holds. Returns how many went.
-    pub fn unpin_all(&self, holder: &PinHolder) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM pins WHERE holder = ?1",
-            params![holder.render()],
-        )?)
-    }
-
-    /// Converts every complete hold owned by `holder` into an operator pin.
-    ///
-    /// The copy and later holder removal are deliberately separate from blob
-    /// deletion: pins are provenance, and changing provenance must never make
-    /// bytes briefly collectable between statements.
-    pub fn promote_pins_to_operator(&self, holder: &PinHolder, now: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "INSERT OR IGNORE INTO pins (root, holder, created_at, release_after)
-             SELECT root, 'operator', ?2, NULL FROM pins WHERE holder = ?1",
-            params![holder.render(), now],
-        )?)
-    }
-
     /// Schedules one holder's claim to end, without ending it yet
     /// (`docs/REPLICATION.md` §3.4).
     ///
