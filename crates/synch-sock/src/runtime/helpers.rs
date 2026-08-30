@@ -1834,6 +1834,12 @@ fn h_ssh_channel_lane(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
+    // The taxonomy every helper keeps (`docs/HANDLES.md` §6): a handle that
+    // is not in the table at all is `SY_EBADF`; one that exists but is not an
+    // accepted channel of this connection is the wrong state, `SY_ESTATE`.
+    if inner.slot(channel as i64).is_none() {
+        return ret(errno::EBADF);
+    }
     let Some((session, channel_id, _)) = state.channel(channel as i64) else {
         return ret(errno::ESTATE);
     };
@@ -2792,6 +2798,7 @@ fn insert_object(inner: &Rc<Inner>, info: crate::ObjectInfo) -> i64 {
         pending: std::cell::Cell::new(false),
         result: std::cell::RefCell::new(None),
         want: std::cell::Cell::new((0, 0)),
+        closed: std::cell::Cell::new(false),
         ready: inner.ready.clone(),
     };
     match inner.insert(Slot::Object(Rc::new(slot))) {
@@ -2959,11 +2966,20 @@ fn h_pread(
             Ok(data) => {
                 // The charge was for what was asked; settle up for what came.
                 inner_for_task.release(charged.saturating_sub(data.len() as u64));
-                *slot.result.borrow_mut() = Some(Ok(data));
+                if slot.closed.get() {
+                    // The guest let go while the fetch was in flight: nothing
+                    // will ever collect this answer, so its charge goes back
+                    // now instead of at the end of the invocation.
+                    inner_for_task.release(data.len() as u64);
+                } else {
+                    *slot.result.borrow_mut() = Some(Ok(data));
+                }
             }
             Err(e) => {
                 inner_for_task.release(charged);
-                *slot.result.borrow_mut() = Some(Err(host_errno(&e)));
+                if !slot.closed.get() {
+                    *slot.result.borrow_mut() = Some(Err(host_errno(&e)));
+                }
             }
         }
         slot.ready.bump();

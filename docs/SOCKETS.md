@@ -408,6 +408,10 @@ cage as a **JSON handle** (§7.11), never as a C struct or a numbered enum. A
 guest compiled against a stale header used to read a renumbered enum wrong
 silently; a missing JSON key is an explicit `SY_ENOENT`.
 
+The descriptor model every family below follows — one handle table, a generic
+lifecycle plane (`sy_close`/`sy_poll`/`sy_errno`) over a typed data plane, and
+one meaning per errno — is specified in `docs/HANDLES.md`.
+
 ### 7.1 Diagnostics and configuration
 
 | Helper | What it does |
