@@ -32,18 +32,50 @@ invocation's.
 - **Negative values are errnos**, so every helper that returns a handle is
   checked with `< 0`, the same test as every other return.
 
-## 2. The eight kinds
+## 2. The eight kinds, in three classes
 
-| Kind | Obtained from | Its data verbs |
-| --- | --- | --- |
-| Unselected stream | handle `0` at entry, before a mode is chosen | none — the first ordinary operation selects raw mode; `sy_ssh_start` selects SSH |
-| Endpoint | `SY_SELF` once raw, `sy_tcp_connect`/`_ip`, `sy_ssh_channel_open`/`_lane`, `sy_process_stdio`, `sy_pty_open` | `sy_read`, `sy_write`, `sy_splice`, `sy_readable`, `sy_writable`, `sy_shutdown`, `sy_endpoint_info`, and as `sy_put_splice`'s source |
-| SSH control | handle `0` after `sy_ssh_start` | the `sy_ssh_*` connection family, addressed as `SY_SELF` |
-| Object | `sy_open`, `sy_open_from`, `sy_open_root` | `sy_stat`, `sy_pread` |
-| Cursor | `sy_list_open` | `sy_list_next` |
-| JSON value | `sy_json_*` constructors, and every helper that answers structured — `sy_peer_info`, `sy_stat`, `sy_process_status`, `sy_ssh_next` | the `sy_json_*` family; consumed by `sy_ssh_start`, `sy_pty_open`, the `sy_declare_*` family |
-| Process | `sy_process_spawn`, `sy_process_spawn_pty` | `sy_process_status`, `sy_process_signal`, `sy_process_stdio` |
-| Tree writer | `sy_put_open` | `sy_put_write`, `sy_put_commit`, `sy_put_commit_if`, `sy_put_delete`, and as `sy_put_splice`'s destination |
+Every kind belongs to exactly one **class**, and the class is what decides its
+lifecycle-plane behavior — the per-kind rows of the §7 matrix are instances of
+the three class rules below, never exceptions to them. A new kind picks its
+class first; a kind that fits none of the three is a proposal to amend this
+document, not a ninth special case.
+
+| Kind | Class | Obtained from | Its data verbs |
+| --- | --- | --- | --- |
+| Unselected stream | conduit | handle `0` at entry, before a mode is chosen | none — the first ordinary operation selects raw mode; `sy_ssh_start` selects SSH |
+| Endpoint | conduit | `SY_SELF` once raw, `sy_tcp_connect`/`_ip`, `sy_ssh_channel_open`/`_lane`, `sy_process_stdio`, `sy_pty_open` | `sy_read`, `sy_write`, `sy_splice`, `sy_readable`, `sy_writable`, `sy_shutdown`, `sy_endpoint_info`, and as `sy_put_splice`'s source |
+| SSH control | conduit | handle `0` after `sy_ssh_start` | the `sy_ssh_*` connection family, addressed as `SY_SELF` |
+| Object | operation | `sy_open`, `sy_open_from`, `sy_open_root` | `sy_stat`, `sy_pread` |
+| Cursor | value | `sy_list_open` | `sy_list_next` |
+| JSON value | value | `sy_json_*` constructors, and every helper that answers structured — `sy_peer_info`, `sy_stat`, `sy_process_status`, `sy_ssh_next` | the `sy_json_*` family; consumed by `sy_ssh_start`, `sy_pty_open`, the `sy_declare_*` family |
+| Process | operation | `sy_process_spawn`, `sy_process_spawn_pty` | `sy_process_status`, `sy_process_signal`, `sy_process_stdio` |
+| Tree writer | operation | `sy_put_open` | `sy_put_write`, `sy_put_commit`, `sy_put_commit_if`, `sy_put_delete`, and as `sy_put_splice`'s destination |
+
+- **A conduit** is a live channel whose readiness the far side drives: bytes
+  or events arrive on their own schedule, from a peer this program does not
+  control. Poll reports flow (`IN`/`OUT` and the hangup family); `sy_errno`
+  is the transport's sticky failure; quiet comes only at a *terminal* state —
+  hangup, closed, failed — because until then the far side can always speak.
+  Closing one is an orderly teardown of something still live: queued bytes
+  drain under the teardown budget, an SSH connection gets its disconnect, an
+  unselected stream is declined.
+- **An operation** is work this program dispatched to the host, with an
+  answer on its way back: a fetch, a commit, a child that will exit. Its
+  verbs follow the dispatch shape — `SY_EAGAIN`, poll, repeat the call to
+  collect — and poll reports the answer (`IN` parked, `ERR` failed).
+  `sy_errno` is the parked or sticky failure. Quiet exactly when no answer
+  can be coming: nothing in flight and nothing pending for an object, the
+  success delivered for a writer, and *never* for a process, whose exit is
+  always either coming or waiting to be collected. Closing one discards the
+  answer and lets in-flight work settle its own accounting (§8 rule 5) —
+  aborting an uncommitted writer, killing a process group, orphaning a fetch
+  that then returns its charge.
+- **A value** is host data fully materialized at creation: a listing page, a
+  JSON tree. Nothing outside the program can ever change it, so its readiness
+  is a *constant* — always `IN` for a cursor, whose answers wait to be
+  pulled; nothing ever for a JSON value, which is inert — and its quiet is
+  that constant's emptiness. `sy_errno` is always `0`; there is no failure a
+  value could be holding. Closing one only gives its footprint charge back.
 
 ## 3. Two planes: a generic lifecycle, a typed data plane
 
@@ -141,23 +173,25 @@ an array must not blind a program to the fifteen live ones beside it.
 
 ## 7. The lifecycle-plane matrix
 
-What each kind does on the generic verbs. **Quiet** is the kind's
+What each kind does on the generic verbs, grouped by its §2 class — each row
+is its class's rule applied to the kind, and a row that could not be derived
+that way would mean the kind is in the wrong class. **Quiet** is the kind's
 contribution to the runtime's nothing-can-ever-become-ready test: when every
 held handle is quiet, `sy_poll` returns `0` immediately rather than waiting
 out its timeout, telling the program it is finished. A kind may claim quiet
 only when nothing about it can ever become ready again — a poll cut short by
 a wrong quiet claim is a lie with consequences, which §8 records.
 
-| Kind | `sy_close` | `sy_poll` reports | `sy_errno` | Quiet when |
-| --- | --- | --- | --- | --- |
-| Unselected stream | Declines the caller's stream. | Watching it selects raw mode first, then as an endpoint. | `0` | Never — the caller can always speak. |
-| Endpoint | Frees the slot; queued bytes still drain in the background under the teardown budget. | `IN`/`OUT`/`RDHUP` by request; `ERR` and terminal `HUP` unmasked. | The transport's sticky errno. | Failed, closed, or terminal with nothing readable. |
-| SSH control | Best-effort disconnect, then teardown. | `IN` while an event is queued; `HUP` after the connection ends. | The connection's errno. | At `HUP` — no event will ever arrive again. |
-| Process | Kills the process group. | `IN` once exited (`watch_exit` bumps readiness on the child's exit); `ERR` if status refresh fails. | The refresh failure, or `0`. | Never — a running child will exit, an exited one has a status waiting. Close it once the status is collected. |
-| Object | Frees the parked answer; a fetch still in flight settles its own charge when it lands (§8). | `IN` when the read's answer is parked; `ERR` when it failed. | The parked failure, or `0`. | No fetch in flight and nothing parked. |
-| Cursor | Frees the page and its footprint charge. | Always `IN` — every answer it can give is already in memory. | `0` | Never while open — an answer is always waiting. |
-| JSON value | Scrubs strings and frees the charge. | Nothing, ever — inert data. | `0` | Always. |
-| Tree writer | Aborts uncommitted staging (a dispatched commit still completes atomically, its result discarded). | `OUT` while the staging buffer has room; `IN` when a dispatched result is parked; `ERR` on a parked refusal or sticky failure. | The sticky failure, else the parked refusal, else `0`. | Only once its success was delivered. |
+| Kind | Class | `sy_close` | `sy_poll` reports | `sy_errno` | Quiet when |
+| --- | --- | --- | --- | --- | --- |
+| Unselected stream | conduit | Declines the caller's stream. | Watching it selects raw mode first, then as an endpoint. | `0` | Never — the caller can always speak. |
+| Endpoint | conduit | Frees the slot; queued bytes still drain in the background under the teardown budget. | `IN`/`OUT`/`RDHUP` by request; `ERR` and terminal `HUP` unmasked. | The transport's sticky errno. | Failed, closed, or terminal with nothing readable. |
+| SSH control | conduit | Best-effort disconnect, then teardown. | `IN` while an event is queued; `HUP` after the connection ends. | The connection's errno. | At `HUP` — no event will ever arrive again. |
+| Object | operation | Frees the parked answer; a fetch still in flight settles its own charge when it lands (§8). | `IN` when the read's answer is parked; `ERR` when it failed. | The parked failure, or `0`. | No fetch in flight and nothing parked. |
+| Tree writer | operation | Aborts uncommitted staging (a dispatched commit still completes atomically, its result discarded). | `OUT` while the staging buffer has room; `IN` when a dispatched result is parked; `ERR` on a parked refusal or sticky failure. | The sticky failure, else the parked refusal, else `0`. | Only once its success was delivered. |
+| Process | operation | Kills the process group. | `IN` once exited (`watch_exit` bumps readiness on the child's exit); `ERR` if status refresh fails. | The refresh failure, or `0`. | Never — a running child will exit, an exited one has a status waiting. Close it once the status is collected. |
+| Cursor | value | Frees the page and its footprint charge. | Always `IN` — every answer it can give is already in memory. | `0` | Never while open — its constant readiness is an answer always waiting. |
+| JSON value | value | Scrubs strings and frees the charge. | Nothing, ever — inert data. | `0` | Always — its constant readiness is empty. |
 
 ## 8. Soundness rules, and what the first audit found
 
