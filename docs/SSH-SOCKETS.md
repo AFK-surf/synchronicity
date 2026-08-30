@@ -926,7 +926,11 @@ changes through `SETSTAT` or `FSETSTAT` return `SSH_FX_OP_UNSUPPORTED` instead
 of claiming that ignored metadata was preserved. `OPEN` likewise rejects
 unsupported initial metadata, but honors an initial size for a newly created
 file. A staged mutation failure poisons its handle: `CLOSE` aborts rather than
-publishing bytes the failed request may have written only partially.
+publishing bytes the failed request may have written only partially. Existing
+file replacements preserve the host's permission bits; later successful data
+writes still advance the host-stamped mtime normally. Rename preserves both
+the source permissions and mtime. A zero-length `WRITE` is a no-op, including
+when its offset is beyond EOF.
 
 Directory enumeration is paged from the virtual-tree storage API upward. An
 open directory handle retains only its storage cursor and last emitted child,

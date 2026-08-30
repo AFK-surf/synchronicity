@@ -743,6 +743,8 @@ impl SocketHost for TreeHost {
             modes,
             staged: None,
             staging_lost: false,
+            unix_mode: None,
+            mtime_ns: None,
             socket: self.socket.clone(),
             invocation: self.invocation,
             peer: self.peer.clone(),
@@ -902,6 +904,9 @@ struct TreeWriter {
     /// are no longer safe to publish or silently replace with empty staging,
     /// so every later operation refuses instead.
     staging_lost: bool,
+    /// Host-originated metadata to carry into an API-source record.
+    unix_mode: Option<u32>,
+    mtime_ns: Option<i64>,
     socket: String,
     invocation: u64,
     peer: String,
@@ -937,6 +942,10 @@ impl TreeWriter {
 #[async_trait::async_trait]
 impl SocketWriter for TreeWriter {
     async fn write(&mut self, data: Vec<u8>) -> std::result::Result<(), HostError> {
+        self.ensure_usable()?;
+        if data.is_empty() {
+            return Ok(());
+        }
         self.ensure_staged().await?;
         let mut adoption = self.staged.take().expect("just staged");
         let outcome = crate::blocking::offload(move || {
@@ -979,6 +988,10 @@ impl SocketWriter for TreeWriter {
     }
 
     async fn write_at(&mut self, offset: u64, data: Vec<u8>) -> std::result::Result<(), HostError> {
+        self.ensure_usable()?;
+        if data.is_empty() {
+            return Ok(());
+        }
         self.ensure_staged().await?;
         let mut adoption = self.staged.take().expect("just staged");
         let outcome = crate::blocking::offload(move || {
@@ -1028,6 +1041,45 @@ impl SocketWriter for TreeWriter {
         }
     }
 
+    async fn set_metadata(
+        &mut self,
+        unix_mode: Option<u32>,
+        mtime_ns: Option<i64>,
+    ) -> std::result::Result<(), HostError> {
+        self.ensure_usable()?;
+        if unix_mode.is_none() && mtime_ns.is_none() {
+            return Ok(());
+        }
+        self.ensure_staged().await?;
+        let mut adoption = self.staged.take().expect("just staged");
+        let outcome = crate::blocking::offload(move || {
+            let result = adoption.set_metadata(unix_mode, mtime_ns);
+            Ok((adoption, result))
+        })
+        .await;
+        match outcome {
+            Ok((adoption, Ok(()))) => {
+                self.staged = Some(adoption);
+                if unix_mode.is_some() {
+                    self.unix_mode = unix_mode;
+                }
+                if mtime_ns.is_some() {
+                    self.mtime_ns = mtime_ns;
+                }
+                Ok(())
+            }
+            Ok((adoption, Err(error))) => {
+                drop(adoption);
+                self.staging_lost = true;
+                Err(write_refusal(error))
+            }
+            Err(error) => {
+                self.staging_lost = true;
+                Err(write_refusal(error))
+            }
+        }
+    }
+
     async fn commit(
         &mut self,
         expected: PutCondition,
@@ -1060,13 +1112,20 @@ impl SocketWriter for TreeWriter {
         // From here down the staging is consumed: should any step below
         // fail, a retry must not quietly re-stage zero bytes.
         self.staging_lost = true;
+        let (unix_mode, mtime_ns) = (self.unix_mode, self.mtime_ns);
         let (root, size) = if api_source {
             let scratch = crate::blocking::offload(move || adoption.commit())
                 .await
                 .map_err(write_refusal)?;
             let committed = self
                 .node
-                .commit_api_file(&self.space, &self.path, &scratch, synch_core::now_ns())
+                .commit_api_file_with_metadata(
+                    &self.space,
+                    &self.path,
+                    &scratch,
+                    mtime_ns.unwrap_or_else(synch_core::now_ns),
+                    unix_mode,
+                )
                 .await;
             let cleanup = scratch.clone();
             let _ = crate::blocking::offload(move || {

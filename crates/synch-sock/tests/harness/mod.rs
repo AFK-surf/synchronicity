@@ -136,6 +136,14 @@ impl synch_sock::SocketWriter for FakeWriter {
         Ok(())
     }
 
+    async fn set_metadata(
+        &mut self,
+        _unix_mode: Option<u32>,
+        _mtime_ns: Option<i64>,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
     async fn commit(
         &mut self,
         expected: synch_sock::PutCondition,

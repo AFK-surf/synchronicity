@@ -220,6 +220,22 @@ pub trait SocketWriter: Send + 'static {
         ))
     }
 
+    /// Applies host-originated metadata to the staged payload.
+    ///
+    /// Protocol adapters use this to preserve attributes already present in
+    /// the tree (not to accept caller-supplied metadata). `None` leaves that
+    /// attribute under the host's normal stamping policy.
+    async fn set_metadata(
+        &mut self,
+        unix_mode: Option<u32>,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), HostError> {
+        let _ = (unix_mode, mtime_ns);
+        Err(HostError::Unavailable(
+            "staged metadata preservation is not supported by this host".into(),
+        ))
+    }
+
     /// Publishes the staged bytes as this node's own new version of the path.
     ///
     /// The condition is evaluated at commit against this node's own live

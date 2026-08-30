@@ -203,6 +203,17 @@ impl TreeSftp {
         writer.set_len(length).await.map_err(host_error)
     }
 
+    async fn preserve_metadata(
+        &self,
+        info: &ObjectInfo,
+        writer: &mut dyn SocketWriter,
+    ) -> Result<(), StatusCode> {
+        writer
+            .set_metadata((info.mode != 0).then_some(info.mode), Some(info.mtime_ns))
+            .await
+            .map_err(host_error)
+    }
+
     fn reserve_commits(&self, count: u32) -> Result<(), StatusCode> {
         self.commits
             .fetch_update(
@@ -569,6 +580,9 @@ impl russh_sftp::server::Handler for TreeSftp {
         } else {
             writer.set_len(initial_size).await.map_err(host_error)?;
         }
+        if let Some(info) = existing.as_ref() {
+            self.preserve_metadata(info, writer.as_mut()).await?;
+        }
         let handle = self.allocate(OpenHandle::WriteFile(WriteFile {
             writer: tokio::sync::Mutex::new(writer),
             _permit: permit,
@@ -661,6 +675,10 @@ impl russh_sftp::server::Handler for TreeSftp {
         if file.failed {
             self.handles.insert(handle, OpenHandle::WriteFile(file));
             return Err(StatusCode::Failure);
+        }
+        if data.is_empty() {
+            self.handles.insert(handle, OpenHandle::WriteFile(file));
+            return Ok(ok(id));
         }
         let offset = if file.append { file.size } else { offset };
         let Some(end) = offset.checked_add(data.len() as u64) else {
@@ -775,6 +793,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         self.copy_into_writer(&info, writer.as_mut(), info.size.min(size))
             .await?;
         writer.set_len(size).await.map_err(host_error)?;
+        self.preserve_metadata(&info, writer.as_mut()).await?;
         self.count_commit()?;
         writer
             .commit(PutCondition::Root(info.root))
@@ -906,6 +925,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         let (mut target, _target_permit) = self.open_writer(newpath, &new_capability).await?;
         self.copy_into_writer(&source, target.as_mut(), source.size)
             .await?;
+        self.preserve_metadata(&source, target.as_mut()).await?;
         target
             .commit(PutCondition::Absent)
             .await
@@ -947,6 +967,7 @@ mod tests {
 
     type CommitReplacement = Arc<std::sync::Mutex<Option<(String, String, Vec<u8>)>>>;
     type PartialWriteFailure = Arc<std::sync::Mutex<Option<usize>>>;
+    type PreservedMetadata = Arc<std::sync::Mutex<Vec<(String, Option<u32>, Option<i64>)>>>;
 
     /// An in-memory tree mirroring the integration harness's `FakeTree`
     /// semantics, with a `refused` set for entries the host deliberately
@@ -958,6 +979,7 @@ mod tests {
         refused: std::collections::HashSet<String>,
         replace_on_commit: CommitReplacement,
         fail_write_after: PartialWriteFailure,
+        preserved_metadata: PreservedMetadata,
     }
 
     impl FakeHost {
@@ -973,6 +995,7 @@ mod tests {
                 refused: std::collections::HashSet::new(),
                 replace_on_commit: Arc::new(std::sync::Mutex::new(None)),
                 fail_write_after: Arc::new(std::sync::Mutex::new(None)),
+                preserved_metadata: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -1108,6 +1131,7 @@ mod tests {
                 files: self.files.clone(),
                 replace_on_commit: self.replace_on_commit.clone(),
                 fail_write_after: self.fail_write_after.clone(),
+                preserved_metadata: self.preserved_metadata.clone(),
             }))
         }
     }
@@ -1119,6 +1143,7 @@ mod tests {
         files: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
         replace_on_commit: CommitReplacement,
         fail_write_after: PartialWriteFailure,
+        preserved_metadata: PreservedMetadata,
     }
 
     #[async_trait::async_trait]
@@ -1162,6 +1187,18 @@ mod tests {
             let len =
                 usize::try_from(len).map_err(|_| HostError::Denied("length too large".into()))?;
             self.staged.resize(len, 0);
+            Ok(())
+        }
+
+        async fn set_metadata(
+            &mut self,
+            unix_mode: Option<u32>,
+            mtime_ns: Option<i64>,
+        ) -> Result<(), HostError> {
+            self.preserved_metadata
+                .lock()
+                .unwrap()
+                .push((self.path.clone(), unix_mode, mtime_ns));
             Ok(())
         }
 
@@ -1810,6 +1847,81 @@ mod tests {
         );
         assert!(!host.files.lock().unwrap().contains_key("files/partial"));
         assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_writes_are_noops_even_beyond_eof() {
+        let host = Arc::new(FakeHost::with_files(&[]));
+        let capability = synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE,
+            prefix: "files".into(),
+            max_bytes: 1024,
+        };
+        let mut sftp = TreeSftp::new(
+            host.clone(),
+            "files".into(),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_RECURSIVE,
+            Some(capability),
+            commit_budget(),
+            writer_budget(),
+        );
+        let opened = sftp
+            .open(
+                1,
+                "empty".into(),
+                OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap();
+
+        sftp.write(2, opened.handle.clone(), 100, Vec::new())
+            .await
+            .unwrap();
+        let staged = sftp.fstat(3, opened.handle.clone()).await.unwrap();
+        assert_eq!(staged.attrs.size, Some(0));
+        sftp.close(4, opened.handle).await.unwrap();
+        assert_eq!(host.files.lock().unwrap().get("files/empty").unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn replacements_and_rename_preserve_host_metadata() {
+        let host = Arc::new(FakeHost::with_files(&[("files/source", "body")]));
+        let capability = synch_core::TreeWriteCapability {
+            id: 1,
+            modes: synch_core::TREE_WRITE_CREATE
+                | synch_core::TREE_WRITE_REPLACE
+                | synch_core::TREE_WRITE_DELETE,
+            prefix: "files".into(),
+            max_bytes: 1024,
+        };
+        let mut sftp = TreeSftp::new(
+            host.clone(),
+            "files".into(),
+            ACCESS_READ | ACCESS_WRITE | ACCESS_RECURSIVE,
+            Some(capability),
+            commit_budget(),
+            writer_budget(),
+        );
+
+        let opened = sftp
+            .open(
+                1,
+                "source".into(),
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap();
+        sftp.close(2, opened.handle).await.unwrap();
+        sftp.rename(3, "source".into(), "destination".into())
+            .await
+            .unwrap();
+
+        let preserved = host.preserved_metadata.lock().unwrap();
+        assert!(preserved.contains(&("files/source".into(), Some(0o644), Some(42))));
+        assert!(preserved.contains(&("files/destination".into(), Some(0o644), Some(42))));
     }
 
     #[tokio::test]
