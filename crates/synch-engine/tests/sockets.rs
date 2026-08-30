@@ -296,6 +296,82 @@ async fn a_self_connection_runs_the_activated_program() {
     node.shutdown().await.unwrap();
 }
 
+/// A re-activation is a new bargain, and admission serves it: re-activating
+/// with a rotated config reaches the next invocation with no content change at
+/// all. The property this guards is that the operator half of the policy —
+/// config and the stream cap — is read from the live activation row rather
+/// than carried on any cached socket state; the admission path computes it
+/// from the row it resolves under the authorization lock (`sockets.rs`), so a
+/// re-activation that lands mid-admission cannot hand a stale config through.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn a_reactivation_config_reaches_the_next_invocation() {
+    use synch_engine::sockets::SocketConnection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CONF: &str = r#"
+#include <synch.h>
+SY_MANIFEST("{\"manifest\":1,\"name\":\"conf\",\"max_streams\":4}");
+SY_ENTRY sy_s64 entry(void) {
+  char v[64];
+  sy_s64 n = sy_config_get(SY_STR("token"), v, sizeof v);
+  if (n < 0) sy_write_all(SY_SELF, SY_STR("none"), 5000);
+  else       sy_write_all(SY_SELF, v, (sy_u64)n, 5000);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+    let elf =
+        synch_cc::compile(CONF, "conf.c", &[("synch.h", synch_sock::sdk::HEADER)], &[]).unwrap();
+
+    let read_token = |node: Node| async move {
+        let connection = node
+            .connect_socket(node.origin(), "code", "conf.sock", Vec::new())
+            .await
+            .unwrap();
+        let SocketConnection::Local {
+            mut stream,
+            completion,
+            ..
+        } = connection
+        else {
+            panic!("a self-connection used the remote transport");
+        };
+        stream.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        completion.await.unwrap();
+        String::from_utf8(out).unwrap()
+    };
+
+    let (_data, space, node) = node_with_space().await;
+    write(space.path(), "conf.sock", &elf);
+    node.socket_activate(&SocketActivation {
+        config: vec![("token".into(), "one".into())],
+        ..activation("code", "conf.sock")
+    })
+    .unwrap();
+    node.scan_and_publish().unwrap();
+    assert_eq!(read_token(node.clone()).await, "one");
+
+    // Re-activate with a rotated config. The content root does not change, so
+    // this exercises the activation read alone, not a deployment.
+    node.socket_activate(&SocketActivation {
+        config: vec![("token".into(), "two".into())],
+        ..activation("code", "conf.sock")
+    })
+    .unwrap();
+    assert_eq!(
+        read_token(node.clone()).await,
+        "two",
+        "admission handed the guest a stale config after re-activation"
+    );
+    node.shutdown().await.unwrap();
+}
+
 /// Deployment end to end: content written over an activated path serves on
 /// the next connection, no further ceremony, and the program that answers is
 /// exactly the one the tree names.

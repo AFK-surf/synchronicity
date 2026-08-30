@@ -137,7 +137,7 @@ service Control {
 message Command {
   // 9 was `trust rebind`: a hand-made name is the only thing it could
   // re-point, and there are none (DESIGN.md 3.2).
-  reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 46;
+  reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 50;
   oneof kind {
     // `synch id`
     Id id = 1;

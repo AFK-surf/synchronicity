@@ -96,16 +96,26 @@ fn walk(elf: &[u8]) -> Result<Sections, ProgramManifestError> {
     }
 
     let header = |index: usize| -> Result<(u32, u32, u64, u64, u64), ProgramManifestError> {
+        // `shoff` is `e_shoff`, an attacker-controlled u64: the whole
+        // `at .. at + SHDR_LEN` range must be checked without any add that can
+        // wrap, or a huge `e_shoff` slips a wildly out-of-range `at` past the
+        // bound and the reads below fault. Both the multiply-add and the
+        // window end go through `checked_add`.
         let at = shoff
             .checked_add(index * SHDR_LEN)
-            .filter(|at| at + SHDR_LEN <= elf.len())
+            .filter(|at| at.checked_add(SHDR_LEN).is_some_and(|end| end <= elf.len()))
             .ok_or_else(|| bad("a section header is out of bounds"))?;
+        // The filter proved `at + SHDR_LEN <= elf.len()`, so every read below
+        // is in bounds; the fallible reads keep that a property of the code
+        // rather than of a comment, so a future change to the filter cannot
+        // reintroduce a panic.
+        let oob = || bad("a section header is out of bounds");
         Ok((
-            u32at(elf, at).expect("bounded above"),      // name offset
-            u32at(elf, at + 4).expect("bounded above"),  // type
-            u64at(elf, at + 8).expect("bounded above"),  // flags
-            u64at(elf, at + 24).expect("bounded above"), // offset
-            u64at(elf, at + 32).expect("bounded above"), // size
+            u32at(elf, at).ok_or_else(oob)?,      // name offset
+            u32at(elf, at + 4).ok_or_else(oob)?,  // type
+            u64at(elf, at + 8).ok_or_else(oob)?,  // flags
+            u64at(elf, at + 24).ok_or_else(oob)?, // offset
+            u64at(elf, at + 32).ok_or_else(oob)?, // size
         ))
     };
 
@@ -337,5 +347,28 @@ mod tests {
             manifest_declaration(&garbled),
             Err(ProgramManifestError::Manifest(_))
         ));
+    }
+
+    #[test]
+    fn a_wraparound_section_offset_is_a_refusal_not_a_panic() {
+        // `e_shoff` is attacker-controlled: a value near `u64::MAX` makes
+        // `at + SHDR_LEN` wrap to a small in-range number if the window end is
+        // added unchecked, slipping an out-of-range `at` past the bound. The
+        // bytes reach this walk straight off disk (`synch socket inspect`) and
+        // off the wire (admission of adopted or S3-written content), so a
+        // panic here is a reachable DoS and a broken refusal contract.
+        let mut object = vec![0u8; 64];
+        object[0..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2; // ELF64
+        object[5] = 1; // little-endian
+        object[40..48].copy_from_slice(&0xFFFF_FFFF_FFFF_FFF0u64.to_le_bytes()); // e_shoff
+        object[58..60].copy_from_slice(&(SHDR_LEN as u16).to_le_bytes()); // e_shentsize
+        object[60..62].copy_from_slice(&1u16.to_le_bytes()); // e_shnum
+        object[62..64].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+        assert!(matches!(
+            manifest_declaration(&object),
+            Err(ProgramManifestError::NotElf(_))
+        ));
+        assert!(!has_stream_section(&object));
     }
 }

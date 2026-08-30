@@ -318,7 +318,6 @@ impl Node {
                 "the program has no `synchronicity.stream` entrypoint".into(),
             ));
         }
-        let policy = self.socket_policy(&declared, &resolved.activation);
 
         // Authorization is deliberately not held across the CAS wait above,
         // so it is checked again while the registry slot is made live.
@@ -331,13 +330,16 @@ impl Node {
         let checked_root = resolved.root;
         let qualified_for_slot = qualified.clone();
         let peer_name = origin.canonical();
-        let max_streams = policy.max_streams;
         // The store read and the registry reservation are one blocking-pool
         // closure so the authorization read guard spans both; there is no
         // unchecked gap between them. A concurrent *deployment* — the content
         // replaced mid-admission — refuses this admission too: the caller
         // retries and lands on the new root, so a new invocation never runs
-        // bytes the tree no longer names.
+        // bytes the tree no longer names. The effective policy is computed from
+        // the activation this re-read observes, not the one taken before the
+        // CAS wait: a re-activation that rotated the config or tightened the
+        // stream cap in that window is a new bargain, and the slot is reserved
+        // against its cap.
         let prepared = crate::blocking::offload(move || {
             let _authorization = node.socket_authorization_read();
             let current = match node.resolve_socket(&space, &path)? {
@@ -357,6 +359,11 @@ impl Node {
                         .into(),
                 )));
             }
+            // The parsed manifest still matches the content, since the root is
+            // unchanged; the operator half of the policy comes from the row
+            // this closure just read under the lock.
+            let policy = node.socket_policy(&declared, &current.activation);
+            let max_streams = policy.max_streams;
 
             // The pool-wide bound, before the socket's own cap: one caller
             // who can reach many sockets must not be able to fill every
@@ -386,11 +393,11 @@ impl Node {
                     ),
                 )));
             };
-            Ok(Ok((id, slot)))
+            Ok(Ok((policy, id, slot)))
         })
         .await
         .map_err(|e| (RefuseCode::NotActivated, e.to_string()))?;
-        let (id, slot) = prepared?;
+        let (policy, id, slot) = prepared?;
 
         let peer_label = origin.canonical();
         Ok(Admission {
