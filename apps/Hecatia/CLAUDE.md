@@ -127,7 +127,7 @@ actor owning the gRPC transport and nothing else. Ordering comes from
 `NodeStore.enqueue`, a serial chain of Tasks, because the daemon takes a
 *global connection mutex* on every store read. `NodeStore`, `FilesModel` and
 `TransferQueue` are `@MainActor @Observable`; streamed frames hop back to the
-main actor and are buffered, flushed at most every 100ms, because `scan` emits a
+main actor and are buffered, flushed at most every 100ms, because source scans emit a
 progress frame per skipped file.
 
 **Success is "the response stream ended without a gRPC status" — never the
@@ -197,7 +197,7 @@ file needs no project edit — only `control.proto` changes need regeneration.
    instead of quietly joining the list. The read-only id set is duplicated
    verbatim in two tests — edit both.
 4. **Gates are pinned.** `key.retire`, `daemon.stop`, `trust.rm`,
-   `domain.clear` and `space.rm` must be `.typed`; `recover` must be
+   `domain.clear` and `source.rm` must be `.typed`; `recover` must be
    `.conditional`; every `surface == .files` operation must be on the allowlist
    of ids that name a file or folder.
 5. **`design-audit.sh` hard-fails** (in `Views/` and `App/` only) on `.shadow(`,
@@ -209,9 +209,9 @@ file needs no project edit — only `control.proto` changes need regeneration.
 6. **proto3 presence is load-bearing in `Cmd.swift`.** Optional strings are set
    only when non-nil *and* non-empty; `domainSet` must always send `delegate` (a
    bool has no presence, and omitting it strands a delegate node at "Waiting to
-   be named"); `spaceSet` must never be called with nothing to change. A removed
-   field is silently dropped by prost, so a stale field reports success and does
-   nothing — this shipped for three releases.
+   be named"); source and replica changes must never be called with nothing to
+   change. A removed field is silently dropped by prost, so a stale field reports
+   success and does nothing — this shipped for three releases.
 7. **Never split daemon text on fixed columns or single spaces.** The `{:<20}`
    widths are minimums, and values contain single spaces (`3m ago`, `cut off`).
    `Anchor.splitAtFirstPath` is legal only when the path is the last field. An

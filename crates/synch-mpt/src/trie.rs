@@ -81,7 +81,7 @@ pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 /// deliberate limit — but nothing observes it on the way there: diffs prune at
 /// the first equal hash and `MissingWalk` dedups, so an origin grows past it
 /// with no node ever running the walk that would say so, and the limit shows up
-/// only on *first cold materialization* (join, restore, `doctor --rebuild`).
+/// only on *first cold materialization* (join, restore, `repair rebuild-views`).
 /// Existing followers keep syncing it happily; the refusal at least names the
 /// situation rather than reading as one more unparseable record.
 const WALK_POSITION_CEILING: usize = 8_000_000;
@@ -96,7 +96,7 @@ const WALK_POSITION_CEILING: usize = 8_000_000;
 ///
 /// Deduping positions by node hash is *not* the fix: structural sharing means
 /// one leaf node legitimately sits at as many positions as there are keys with
-/// that value, so pruning repeats silently drops keys from `scan` and changes
+/// that value, so pruning repeats silently drops keys from source scans and changes
 /// from `diff`. Neither is classifying the shape — a former rule capping
 /// arrivals at a multiple of the *distinct* node count collapsed on an ordinary
 /// corpus: sixty thousand keys with one identical value make every leaf the
@@ -1087,7 +1087,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     }
 
     /// Drives one structural walk with an explicit heap stack: the hostile-trie
-    /// defences, held once for every descent (`scan`'s collect, `diff`'s
+    /// defences, held once for every descent (source-scan collection, `diff`'s
     /// lockstep walk).
     ///
     /// Depth is attacker-controlled — a peer's trie is fetched by hash and

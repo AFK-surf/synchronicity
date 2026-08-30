@@ -1,11 +1,11 @@
 /* http-status — a status page, over HTTP, from inside the cluster.
  *
  *   synch socket build examples/http-status.c -o http-status.o
- *   synch socket add ops/status.sock
+ *   synch socket declare ops/status.sock
  *   synch socket arm ops/status.sock
- *   synch connect nas:ops/status.sock --listen 127.0.0.1:8080 # then open it
+ *   synch socket connect nas:ops/status.sock --listen 127.0.0.1:8080 # then open it
  *
- * `synch connect --listen` puts a local listener in front of the stream, so a
+ * `synch socket connect --listen` puts a local listener in front of the stream, so a
  * socket that speaks HTTP is a page in a browser without anything on the node
  * listening on a port. The counter is in the socket map, so it survives the
  * invocation that incremented it and is shared by every stream of this socket

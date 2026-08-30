@@ -203,7 +203,7 @@ enum Versions {
   ///
   /// A named origin is rendered in full; a key-identified one is cut to `key:`
   /// plus **10 of its 52** characters. That truncated form is not a valid
-  /// reference — `synch take` will not accept it — so on a cluster with no
+  /// reference — `synch adopt path` will not accept it — so on a cluster with no
   /// membership zone, where every origin is key-identified, the attestor
   /// column of `status` names devices in a form nothing can act on.
   static func short(_ origin: String) -> String {
@@ -257,7 +257,7 @@ enum Versions {
   ///
   /// The placeholders are refused for the same reason. Where the daemon holds
   /// no name for a key it renders one in parentheses — `(untrusted)` in a
-  /// `peers` row, `(deleted)` for a tombstoned version — and a parenthesis is
+  /// `peer ls` row, `(deleted)` for a tombstoned version — and a parenthesis is
   /// not a character an origin can contain, so the shape is the test.
   static func isActionable(_ origin: String) -> Bool {
     guard !origin.isEmpty, !origin.hasPrefix("(") else { return false }

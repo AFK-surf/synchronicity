@@ -1,4 +1,4 @@
-//! `synch connect` — the caller's side of a socket (`docs/SOCKETS.md` §9.1).
+//! `synch socket connect` — the caller's side of a socket (`docs/SOCKETS.md` §9.1).
 //!
 //! This is a byte pump and nothing more. It executes no eBPF, holds no policy,
 //! and knows nothing about what it is talking to: it names a path, and
@@ -45,7 +45,7 @@ fn meta_pair(text: &str) -> Result<pb::MetaPair> {
     })
 }
 
-/// Runs `synch connect`.
+/// Runs `synch socket connect`.
 pub async fn run(
     data_dir: &Path,
     reference: &str,

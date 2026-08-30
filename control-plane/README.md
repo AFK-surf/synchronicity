@@ -78,7 +78,7 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   `_synchronicity-cp.<apex>` in the zone it already DNSSEC-validates, dials
   out over WSS, and proves itself with the device key this service already
   publishes — no command needed, for the tunnel is on unless a node's
-  operator opted it out with `synch cloud disable`. It is read-only by
+  operator opted it out with `synch control-plane disable`. It is read-only by
   construction — the tunnel encodes no write opcode and the API is GET-only —
   and fail-closed on the org's choice: an org admin must enable browsing for
   the network, and until then nothing is readable however many daemons are

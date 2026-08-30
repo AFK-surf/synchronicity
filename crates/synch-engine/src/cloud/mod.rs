@@ -14,7 +14,7 @@
 //!   default and answers for every space this node holds; which spaces a
 //!   dashboard may browse is decided on the other end, by the org admin's
 //!   toggle and the RBAC around it. The one local act is an opt-out —
-//!   `synch cloud disable` — and the supervisor drops an open tunnel on its
+//!   `synch control-plane disable` — and the supervisor drops an open tunnel on its
 //!   next pass, seconds later, not at the next reconnect.
 //! * **Nothing here can write.** [`frame`] encodes no write opcode, and the
 //!   handlers below call `unified_listing`, `versions`, `resolve_set`,
@@ -44,7 +44,7 @@ pub struct CloudSettings {
 /// What the attach task has achieved for one endpoint of one membership
 /// domain.
 ///
-/// Reported by `synch cloud status` and by nothing else: it is a running
+/// Reported by `synch control-plane status` and by nothing else: it is a running
 /// process's account of itself, so it lives in memory and dies with the
 /// daemon rather than pretending to be durable.
 ///
@@ -125,7 +125,7 @@ impl Node {
         );
     }
 
-    /// Forgets a domain the operator has removed, so `cloud status` does not
+    /// Forgets a domain the operator has removed, so `control-plane status` does not
     /// report on something that is no longer configured.
     pub(crate) fn forget_cloud_status(&self, domain: &str) {
         self.cloud_slot().retain(|(held, _), _| held != domain);
@@ -144,7 +144,7 @@ impl Node {
     /// Its own key, because nothing else can clear it: it names no endpoint,
     /// so the per-endpoint sweep never reaches it, and one transient resolver
     /// failure at startup would otherwise sit above the real rows in `synch
-    /// cloud status` for the life of the daemon.
+    /// control-plane status` for the life of the daemon.
     pub(crate) fn forget_cloud_endpoint_none(&self, domain: &str) {
         self.cloud_slot().remove(&(domain.to_string(), None));
     }
@@ -162,7 +162,7 @@ mod tests {
     /// domain has no validated record" — and the per-endpoint sweep cannot
     /// reach it, because it is keyed by an endpoint that is not there. One
     /// transient resolver failure at startup would otherwise leave a
-    /// permanent bogus line above the real ones in `synch cloud status`.
+    /// permanent bogus line above the real ones in `synch control-plane status`.
     #[tokio::test]
     async fn cloud_status_is_per_endpoint_and_forgettable() {
         let (_d, node) = node().await;

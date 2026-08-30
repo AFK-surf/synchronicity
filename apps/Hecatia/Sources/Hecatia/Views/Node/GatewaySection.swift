@@ -99,8 +99,8 @@ struct GatewaySection: View {
 
       // `From nas@x.example` is a whole origin inside a column label, so this
       // one truncates as readily as the name does.
-      TableColumn("Versions") { bucket in
-        Text(bucket.policy.label)
+      TableColumn("Access") { bucket in
+        Text(bucket.access == .readWrite ? "Read & write" : "Read only · \(bucket.policy.label)")
           .font(.caption).foregroundStyle(Theme.muted)
           .lineLimit(1).truncationMode(.middle)
           .help(bucket.policy.label).textSelection(.enabled)
@@ -169,12 +169,7 @@ struct GatewaySection: View {
     "The gateway accepts these. Only the id half ever reaches this app \u{2014} the secret is shown once, when the key is made, and is not stored here. A removal is appended rather than erased, so the secret stays in the config until the whole value is cleared: treat a withdrawn secret as spent, not as private again."
   }
 
-  /// The two things `synch-s3 bucket add` warns about, which the daemon stores
-  /// happily either way.
   private func warning(for bucket: GatewayBucket) -> String? {
-    if case .origin(let pinned) = bucket.policy, let ours = node.origin, pinned != ours {
-      return "Pins \(pinned), so writes here publish this Mac\u{2019}s view and reads keep serving \(pinned)\u{2019}s: effectively read-only."
-    }
     if !node.spaces.isEmpty, !node.spaces.contains(where: { $0.id == bucket.space }) {
       return "No space named \(bucket.space) on this Mac, so the bucket serves nothing until one publishes it."
     }
@@ -258,7 +253,7 @@ struct AccessKeyRow: Identifiable, Hashable {
     addingKey: .constant(false),
     confirmation: .constant(nil))
   .environment(NodeStore.preview(
-    buckets: [GatewayBucket(name: "scratch", space: "scratch", policy: .newest)]))
+    buckets: [GatewayBucket(name: "scratch", space: "scratch", access: .readOnly, policy: .newest)]))
   .padding(Theme.Space.xl)
   .frame(width: 760, height: 560)
 }

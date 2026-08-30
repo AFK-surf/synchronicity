@@ -2,8 +2,8 @@ import Foundation
 
 /// One frame of a `Run` command's output, kept apart by kind.
 ///
-/// `Frame.progress` is not noise: `scan` reports every skipped file on it and
-/// `mirror ls` puts its empty-state there, so it is retained and rendered
+/// `Frame.progress` is not noise: `source scan` reports every skipped file on it and
+/// `replica ls` puts its empty-state there, so it is retained and rendered
 /// rather than dropped the way the CLI drops it.
 enum RunFrame: Sendable, Equatable {
   case line(String)
@@ -21,7 +21,7 @@ struct RunOutput: Sendable, Equatable {
   ///
   /// The Activity window reads it once per row per body pass while a command
   /// is running, and it used to be `progress.last` — a whole new `[String]`
-  /// built by walking every frame, to read one element of it. A long `scan`
+  /// built by walking every frame, to read one element of it. A long source scan
   /// emits a frame per skipped file, so the cost grew with the run.
   private(set) var latestProgress: String?
 

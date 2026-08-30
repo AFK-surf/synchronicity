@@ -29,8 +29,8 @@ that daemon over a local control socket:
 ```sh
 synch init --domain cluster.example.com   # or plain `synch init` for a key identity
 synch daemon start                         # returns when the control socket is ready
-synch space add media /srv/media
-synch scan                                 # hash, publish a signed root
+synch source add media /srv/media
+synch source scan media                    # hash, publish a signed root
 synch id                                   # print the origin, device key, and address
 synch daemon status                        # what the running node is doing
 synch daemon stop                          # ask it to shut down
@@ -84,7 +84,7 @@ export SYNCH_CAS_CACHE_BYTES=10737418240     # 10 GiB maintenance target
 
 synch init --domain cluster.example.com     # once, only if restore found no database
 synch daemon start
-synch space add media --detached
+synch source add media --api
 ```
 
 Use `SYNCH_CAS_BACKEND=gcs` with `SYNCH_GCS_BUCKET` (and optionally
@@ -97,11 +97,11 @@ for the complete provider options. The storage-policy flags are `--cas-root`,
 `--cas-cache-bytes`, and `--cas-upload` when environment variables are not
 used.
 
-Only detached spaces are valid on a cloud-backed node. They have no scanner,
-watcher, or local checkout: gateway writes and `synch take` ingest directly into
+Only API sources are valid on a cloud-backed node. They have no scanner,
+watcher, or local directory: gateway writes and `synch adopt path` ingest directly into
 the cloud CAS, while `cat`, `get`, and gateway reads fill the ephemeral range
-cache on demand. A durable-disk node can still mirror a detached space when a
-checkout is wanted elsewhere.
+cache on demand. A durable-disk node can configure a replica checkout when a
+filesystem projection is wanted elsewhere.
 
 The default `SYNCH_CAS_UPLOAD=own+pinned` uploads content created by this node
 and peer content it pins. Use `own` to upload only locally created content, or
@@ -130,7 +130,7 @@ does not independently detect corruption at rest. The cloud CAS is sufficient
 as the only durable store for file bytes, but Litestream and signed peer heads
 remain necessary to recover filenames, versions, and pins.
 
-To convert an existing node, first ensure every space is detached, stop the
+To convert an existing node, first ensure every local source is API-only, stop the
 daemon, supply the destination provider settings above, and run:
 
 ```sh
@@ -163,7 +163,7 @@ synch delegate rm <their-device-key>
 Nothing is handed to the delegate: the grant is a record in the issuer's own trie, so
 every member learns it through ordinary replication and admits the key on its own.
 The delegate joins from the other side with the commands it would use anyway —
-`synch init`, then `synch domain add <domain>` or `synch trust add <issuer-key>` —
+`synch init`, then `synch domain set <domain>` or `synch trust add <issuer-key>` —
 because trust is unilateral and the two directions are separate problems.
 
 A delegate sees the spaces it was delegated and nothing else, down to the filenames:
@@ -268,11 +268,11 @@ synch ls media/talks --all                 # every version of every path, with a
 synch ls nas@cluster.example.com:media     # one origin's view instead
 synch status media/talks/keynote.mp4       # every version, side by side
 synch cat media/talks/keynote.mp4 --range 0..1048576
-synch cat media/notes.txt --from nas@cluster.example.com   # pin one origin
-synch cat media/notes.txt --strict         # refuse a divergent path, list its versions
+synch cat media/notes.txt --select origin=nas@cluster.example.com  # pin one origin
+synch cat media/notes.txt --select strict  # refuse a divergent path, list its versions
 synch get media/notes.txt -o notes.txt
-synch take nas@cluster.example.com:media/notes.txt   # adopt their version as ours
-synch take nas@cluster.example.com:media/gone.txt    # …including their deletion
+synch adopt path nas@cluster.example.com:media/notes.txt  # adopt their version as ours
+synch adopt path nas@cluster.example.com:media/gone.txt  # …including their deletion
 synch doctor                               # membership, heads, equivocation, storage
 ```
 
@@ -280,53 +280,43 @@ Reading a bare `<space>/<path>` has to pick one of the versions, and does it by
 an explicit policy: `newest` (the default — the greatest `(mtime, content root,
 origin)`, so every node picks the same one), `origin=<id>`, or `strict`.
 Selection is presentation, not resolution: nothing is written, no assertion
-changes, and the other versions stay visible until a `synch take` ends the
+changes, and the other versions stay visible until a `synch adopt path` ends the
 divergence. Deletions are adoptable the same way: taking a tombstone version
 removes the local copy and publishes our own tombstone, and once every
 publisher has done so the path leaves the tree.
 
-Fill a space's own directory — the writable one `synch space add` named — with
+Adopt a tree into a filesystem source — the directory `synch source add` named — with
 the content of the unified tree. One pass, and additive: a path missing here is
 written, a path whose bytes already match is left alone, and a path whose bytes
 differ is reported rather than overwritten. Nothing is ever removed.
 
 ```sh
-synch fill media                                           # newest, by default
-synch fill media/talks                                     # one directory of it
-synch fill media --from nas@cluster.example.com            # that origin's versions
-synch fill media --strict                                  # report divergent paths, skip them
-synch fill media --dry-run                                 # decide everything, write nothing
-synch fill media --force                                   # replace local files that differ
+synch adopt tree media                                     # newest, by default
+synch adopt tree media/talks                               # one directory of it
+synch adopt tree media --select origin=nas@cluster.example.com  # that origin's versions
+synch adopt tree media --select strict                         # report divergent paths, skip them
+synch adopt tree media --dry-run                           # decide everything, write nothing
+synch adopt tree media --replace                           # replace local files that differ
 ```
 
-`synch space sync` is the other half of the same wish and a different thing:
+`synch replica sync` is the other half of the same wish and a different thing:
 replication holds the *bytes* of every version in the store and materializes
-nothing, while a fill writes *files*, one selected version per path. On a
-replicated space the two compose — everything the fill wants is already local.
+nothing, while adoption writes *files*, one selected version per path, into a
+source. When the same namespace is also a replica, the two compose: retained objects need no network
+read during adoption.
 
-A fill does not publish. The files land where the scanner will find them, and
-the next scan publishes them as this node's own view — which is why a filled
-file carries the mtime and mode the origin published rather than this machine's
-clock: the version that gets republished is the one that was filled, not a
-newer one that would win every `newest` selection in the cluster. `--force` is
-`synch take`'s adoption in bulk, though not its publish, and it names every
-file it overwrote.
+Tree adoption scans, publishes, and pushes successful changes before returning.
+Written files carry the selected version's mtime and masked mode so adoption
+restates that version rather than minting a wall-clock winner. A node in key-loss
+recovery refuses adoption before writing anything; run `synch recover` first.
 
-A node in key-loss recovery refuses to fill. A scan would refuse there too, so
-everything filled would sit unannounced — and `--force`'s guard against
-overwriting a local edit no scan has published needs this node to be publishing
-something, so it would be inert while the fill wrote. Run `synch recover`
-first, then fill, then scan.
-
-Mirror a space into a directory, continuously, under a policy of its own:
+Materialize a replica's newest view into one managed checkout:
 
 ```sh
-synch mirror add media /mnt/media                          # newest, by default
-synch mirror add media /mnt/nas --policy origin=nas@cluster.example.com
-synch mirror add media /mnt/safe --policy strict           # skip divergent paths, report them
-synch mirror ls
-synch mirror sync
-synch mirror rm /mnt/safe
+synch replica add media --checkout /mnt/media
+synch replica set media --checkout /mnt/new-media
+synch replica sync media
+synch replica set media --no-checkout                      # leaves files in place
 ```
 
 Keep bytes around regardless of retention. A pin names an object root, or a
@@ -342,25 +332,24 @@ synch pin ls
 synch pin rm media/talks/keynote.mp4
 ```
 
-Hold a whole space instead of naming objects one at a time. A replicated space
-is one this node keeps every version of — every origin's version of every path,
+Hold a whole namespace instead of naming objects one at a time. A replica keeps
+every version — every origin's version of every path,
 not the one a policy selects — fetched as it appears and held for as long as
-its policy says. It materializes nothing: that is what a mirror is for, and the
-two compose.
+its retention says. A replica may optionally materialize one newest checkout.
 
 ```sh
-synch space add media /srv/media --replicate    # publish my copy, hold everyone else's
-synch space add photos --replicate              # a replica with no checkout at all
-synch space add cold --replicate=archive        # never release anything, ever
-synch space ls                                  # what this node does about each space
-synch space ls media                            # held, wanted, releasing, unreachable
-synch space set media --grace 90d               # how long a deleted version stays here
-synch space set media --no-replicate            # stop; `--release` also drops the bytes
+synch source add media /srv/media                # publish my copy
+synch replica add media                          # independently hold every current version
+synch replica add cold --retention forever       # never release observed roots
+synch ls                                         # namespace plus local roles
+synch replica ls media                           # held, wanted, releasing, unreachable
+synch replica set media --grace 90d              # deleted-root recovery window
+synch replica rm media                           # stop and release replica holds
 ```
 
-Under the default `tree` policy a replica holds what the tree names and lets a
+Under the default `current` retention a replica holds what the tree names and lets a
 root go once nothing names it — after `--grace`, which is the whole recovery
-story for an accidental deletion. `--replicate=archive` releases nothing and
+story for an accidental deletion. `--retention forever` releases nothing and
 costs the sum of every version ever published rather than the size of the tree.
 See [docs/REPLICATION.md](docs/REPLICATION.md).
 
@@ -377,22 +366,24 @@ daemon — it opens no database of its own — so a `synch daemon run` must be
 live on the same data directory for any `synch-s3` command to work:
 
 ```sh
-synch-s3 bucket add media media                            # newest, by default
-synch-s3 bucket add nas-media nas@cluster.example.com:media  # shorthand for an origin pin
-synch-s3 bucket add safe-media media --policy strict
-synch-s3 key add AKIAEXAMPLE <secret>
+synch-s3 bucket add media media --read-write
+synch-s3 bucket add nas-media media --read-only --select origin=nas@cluster.example.com
+synch-s3 bucket add safe-media media --read-only --select strict
+printf '%s' "$S3_SECRET" | synch-s3 access-key add AKIAEXAMPLE --secret-stdin
 synch-s3 serve --listen 127.0.0.1:9000
 # or, for local development only:
 synch-s3 serve --anonymous
 ```
 
-A bucket names a space of the unified tree plus a version policy; reads serve
-the selected version and ETags are that version's BLAKE3 root in hex, quoted. A
-`strict` bucket answers a divergent key with `409 Conflict` naming the
-versions.
+A bucket is explicitly read-only or read-write. Read-only buckets may select
+`newest`, `strict`, or one origin; a `strict` read answers a divergent key with
+`409 Conflict`. Read-write buckets require a local source and read this node's
+own view, following its current origin across identity adoption, so a successful
+mutation is immediately visible through that bucket.
+ETags are the selected version's quoted BLAKE3 root.
 
-`DELETE` removes this node's copy and publishes a tombstone, the same thing an
-`rm` in the space directory does — so, like a write, it publishes our own view.
+On a read-write bucket, `DELETE` removes this node's copy and publishes a
+tombstone, the same thing an `rm` in the source directory does.
 A key another origin still publishes stays readable until that origin tombstones
 it too, and the gateway says so in its log rather than in a status code S3 has
 no room for.
@@ -404,10 +395,7 @@ one gateway process can create it and another complete it; its parts are staged
 under `<data-dir>/s3-uploads/` and swept if nobody finishes them. Bodies that
 arrive `aws-chunked` are unframed and their trailing checksum verified, so a
 client that checksums while it streams is actually checked rather than taken at
-its word. Writes always publish the local node's own view — the version model
-forbids publishing someone else's — so a bucket pinned to a foreign origin
-accepts writes but keeps reading that origin's versions, and the gateway warns
-about that shape.
+its word. Read-only buckets reject every mutation before consuming its body.
 
 Expose a program instead of a file. A **socket** is a file in this node's
 published tree whose content is an eBPF ELF object; a peer that connects to it
@@ -417,8 +405,8 @@ runs it *here*, one invocation per incoming stream, under
 ```sh
 synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
 synch socket build git.c --clang -o git.o       # optimized; needs clang + llc on PATH
-synch socket add code/git.sock
-synch scan                                     # publish it as kind=Socket
+synch socket declare code/git.sock
+synch source scan                              # publish it as kind=Socket
 synch socket arm code/git.sock                 # inspect declarations and copy the token
 synch socket arm code/git.sock --review <token> # approve exactly what was inspected
 synch socket ls -l                             # armed root, drift, declarations
@@ -435,18 +423,18 @@ code. Six worked examples are in
 [`crates/synch-sock/examples/`](crates/synch-sock/examples/), and the test
 suite runs every one of them.
 
-From the other side, `synch connect` is a byte pump and nothing else — it names
+From the other side, `synch socket connect` is a byte pump and nothing else — it names
 a path, and everything that decides what runs is state the named node already
 holds:
 
 ```sh
-synch connect nas@cluster.example.com:code/git.sock
-synch connect nas@cluster.example.com:code/git.sock --listen 127.0.0.1:9418
+synch socket connect nas@cluster.example.com:code/git.sock
+synch socket connect nas@cluster.example.com:code/git.sock --listen 127.0.0.1:9418
 ```
 
 **A node executes only eBPF that is present in its own published tree.** So the
 connecting side ships no code, needs no runtime, and works anywhere — while
-adopting somebody's socket with `synch take` adopts its bytes and not its
+adopting somebody's socket with `synch adopt path` adopts its bytes and not its
 socket-ness, because the entry kind comes from a local declaration and is never
 taken from a peer. Publishing is not permission either: an arming record pins
 the BLAKE3 content root that was approved, and bytes that change leave the
@@ -462,7 +450,7 @@ async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 | `synch-mpt` | the Merkle-Patricia Trie: nodes, hashing, diff, proofs, cursors |
 | `synch-store` | the SQLite schema and the content-addressed blob store |
 | `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver, and the zone-key transparency verifier |
-| `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
+| `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, checkouts |
 | `synch-cli` | the `synch` binary: the daemon, the control service, the CLI client, and the MCP bridge |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
 | `synch-sock` | the socket runtime: the eBPF host APIs, the endpoint reactor, the program cache |

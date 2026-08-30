@@ -12,7 +12,7 @@ import SwiftUI
 /// What it must keep from the SwiftUI version, all of it load-bearing:
 /// the source-list material and selection, a "Spaces" section over the
 /// shared spaces and an "Add a Space…" row, an "On This Mac" section over
-/// the mirrors, a context menu per row, the local path as a tooltip, and a
+/// the checkouts, a context menu per row, the local path as a tooltip, and a
 /// spoken label that names the path as well as the folder.
 struct FolderListView: NSViewRepresentable {
   /// The folder list's own type.
@@ -23,18 +23,18 @@ struct FolderListView: NSViewRepresentable {
   final class FolderNSOutlineView: NSOutlineView {}
 
   let spaces: [Space]
-  let mirrors: [MirrorEntry]
+  let checkouts: [CheckoutEntry]
   let selected: String?
-  /// A device key rendered as a name, for the mirror rows.
+  /// A device key rendered as a name, for the checkout rows.
   let policyLabel: (String) -> String
   let onSelect: (String) -> Void
   let onAddFolder: () -> Void
-  let onRevealMirror: (MirrorEntry) -> Void
+  let onRevealCheckout: (CheckoutEntry) -> Void
   let onStopSharing: (Space) -> Void
-  /// `synch fill` — pull the cluster's content into this folder's own
+  /// `synch adopt tree` — pull the cluster's content into this folder's own
   /// directory. Offered here because this is where someone is when they have
   /// just added a folder that other devices already have files in.
-  let onFill: (Space) -> Void
+  let onAdopt: (Space) -> Void
 
   func makeNSView(context: Context) -> NSScrollView {
     let outline = FolderNSOutlineView()
@@ -60,7 +60,7 @@ struct FolderListView: NSViewRepresentable {
     outline.delegate = context.coordinator
     outline.menu = context.coordinator.makeMenu()
     // A single click, for the rows that are actions rather than selections:
-        // "Add a Space…" and a mirror, both of which refuse selection above.
+    // "Add a Space…" and a checkout, both of which refuse selection above.
     outline.target = context.coordinator
     outline.action = #selector(Coordinator.rowClicked(_:))
 
@@ -89,7 +89,7 @@ struct FolderListView: NSViewRepresentable {
     /// pointers stay identical across reloads, which is what keeps the
     /// selection and the disclosure state from resetting under it.
     final class Row: NSObject {
-      enum Kind { case header(String), space(Space), addFolder, mirror(MirrorEntry) }
+      enum Kind { case header(String), space(Space), addFolder, checkout(CheckoutEntry) }
       let kind: Kind
       init(_ kind: Kind) { self.kind = kind }
 
@@ -119,15 +119,15 @@ struct FolderListView: NSViewRepresentable {
         // the path, and whether there is a replication badge at all.
         + view.spaces.map { "s:\($0.id):\($0.localPath ?? "—"):\($0.isReplicating)" }
         + ["+"]
-        + (view.mirrors.isEmpty ? [] : ["h:On This Mac"])
-        + view.mirrors.map { "m:\($0.id):\($0.localPath):\($0.policy)" }
+        + (view.checkouts.isEmpty ? [] : ["h:On This Mac"])
+        + view.checkouts.map { "m:\($0.id):\($0.localPath):\($0.policy)" }
       if signature != builtFrom {
         builtFrom = signature
         rows = [Row(.header("Spaces"))]
           + view.spaces.map { Row(.space($0)) }
           + [Row(.addFolder)]
-        if !view.mirrors.isEmpty {
-          rows += [Row(.header("On This Mac"))] + view.mirrors.map { Row(.mirror($0)) }
+        if !view.checkouts.isEmpty {
+          rows += [Row(.header("On This Mac"))] + view.checkouts.map { Row(.checkout($0)) }
         }
         outline?.reloadData()
       }
@@ -158,7 +158,7 @@ struct FolderListView: NSViewRepresentable {
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
       guard let row = item as? Row else { return false }
       switch row.kind {
-      case .header, .addFolder, .mirror: return false
+      case .header, .addFolder, .checkout: return false
       case .space: return true
       }
     }
@@ -171,24 +171,23 @@ struct FolderListView: NSViewRepresentable {
       case .header(let title):
         return label(title, secondary: true)
       case .space(let space):
-        // A detached space has no directory — it holds the content and indexes
-        // nothing — so it gets its own symbol rather than a folder icon
-        // pointing at a folder that does not exist.
+        // An API source or replica-only namespace has no source directory, so
+        // it gets a symbol that does not imply a folder exists on this Mac.
         let cell = label(
-          space.id, symbol: space.isDetached ? "shippingbox" : "folder",
+          space.id, symbol: space.hasFilesystemSource ? "folder" : "shippingbox",
           tint: NSColor.controlAccentColor)
         cell.toolTip = space.pathLabel
-        cell.setAccessibilityLabel("\(space.id), \(space.isDetached ? "no local copy" : "at \(space.localPath ?? "")")")
+        cell.setAccessibilityLabel("\(space.id), \(space.hasFilesystemSource ? "at \(space.localPath ?? "")" : space.pathLabel)")
         return cell
       case .addFolder:
         let cell = label("Add a Space…", symbol: "plus", tint: NSColor.controlAccentColor)
         cell.textField?.textColor = .controlAccentColor
         return cell
-      case .mirror(let mirror):
-        let name = (mirror.localPath as NSString).lastPathComponent
+      case .checkout(let checkout):
+        let name = (checkout.localPath as NSString).lastPathComponent
         let cell = label(name, symbol: "arrow.down.doc")
-        cell.toolTip = "Reveal \(mirror.localPath) in Finder"
-        cell.detail = "\(mirror.space) · \(view.policyLabel(mirror.policy))"
+        cell.toolTip = "Reveal \(checkout.localPath) in Finder"
+        cell.detail = "\(checkout.space) · \(view.policyLabel(checkout.policy))"
         return cell
       }
     }
@@ -219,7 +218,7 @@ struct FolderListView: NSViewRepresentable {
       guard sender.clickedRow >= 0 else { return }
       switch rows[sender.clickedRow].kind {
       case .addFolder: view.onAddFolder()
-      case .mirror(let mirror): view.onRevealMirror(mirror)
+      case .checkout(let checkout): view.onRevealCheckout(checkout)
       case .header, .space: break
       }
     }
@@ -246,7 +245,7 @@ struct FolderListView: NSViewRepresentable {
       case .space(let space):
         guard let path = space.localPath else { return }
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
-      case .mirror(let mirror): view.onRevealMirror(mirror)
+      case .checkout(let checkout): view.onRevealCheckout(checkout)
       default: break
       }
     }
@@ -255,7 +254,7 @@ struct FolderListView: NSViewRepresentable {
       let path: String?
       switch clickedRow()?.kind {
       case .space(let space): path = space.localPath
-      case .mirror(let mirror): path = mirror.localPath
+      case .checkout(let checkout): path = checkout.localPath
       default: path = nil
       }
       guard let path else { return }
@@ -263,18 +262,18 @@ struct FolderListView: NSViewRepresentable {
       NSPasteboard.general.setString(path, forType: .string)
     }
 
-    @objc private func fillClicked() {
-      if case .space(let space)? = clickedRow()?.kind { view.onFill(space) }
+    @objc private func adoptClicked() {
+      if case .space(let space)? = clickedRow()?.kind { view.onAdopt(space) }
     }
 
     @objc private func stopSharingClicked() {
       if case .space(let space)? = clickedRow()?.kind { view.onStopSharing(space) }
     }
 
-    /// The mirror list is a Settings page now, and a `Settings` scene has no
+    /// The checkout list is a Settings page now, and a `Settings` scene has no
     /// window id — so this asks ``SettingsRoute`` rather than taking a closure
     /// down from the sidebar the way it used to.
-    @objc private func mirrorsClicked() { SettingsRoute.open(.mirrorsAndPins) }
+    @objc private func checkoutsClicked() { SettingsRoute.open(.spaces) }
   }
 }
 
@@ -288,23 +287,24 @@ extension FolderListView.Coordinator: NSMenuDelegate {
     switch row.kind {
     case .space(let space):
       menu.addItem(withTitle: "Open", action: #selector(openClicked), keyEquivalent: "")
-      // A detached space has no directory, so neither of these has anything to
-      // act on. Offering them would be offering two commands that do nothing.
-      if !space.isDetached {
+      // Only a filesystem source has a directory for these actions.
+      if space.hasFilesystemSource {
         menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealClicked), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(
-          withTitle: "Fill From the Cluster\u{2026}", action: #selector(fillClicked),
+          withTitle: "Adopt From the Cluster\u{2026}", action: #selector(adoptClicked),
           keyEquivalent: "")
         menu.addItem(withTitle: "Copy Path", action: #selector(copyPathClicked), keyEquivalent: "")
       }
-      menu.addItem(.separator())
-      menu.addItem(withTitle: "Stop Sharing…", action: #selector(stopSharingClicked), keyEquivalent: "")
-    case .mirror:
+      if space.isSource {
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Stop Sharing…", action: #selector(stopSharingClicked), keyEquivalent: "")
+      }
+    case .checkout:
       menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealClicked), keyEquivalent: "")
       menu.addItem(withTitle: "Copy Path", action: #selector(copyPathClicked), keyEquivalent: "")
       menu.addItem(.separator())
-      menu.addItem(withTitle: "Mirrors…", action: #selector(mirrorsClicked), keyEquivalent: "")
+      menu.addItem(withTitle: "Checkouts…", action: #selector(checkoutsClicked), keyEquivalent: "")
     case .header, .addFolder:
       break
     }
@@ -326,20 +326,20 @@ extension FolderListView.Coordinator: NSMenuDelegate {
 private struct FolderListPreview: View {
   let store: NodeStore
   let spaces: [Space]
-  let mirrors: [MirrorEntry]
+  let checkouts: [CheckoutEntry]
   @State private var selected: String?
 
-  init(store: NodeStore, mirrors: [MirrorEntry]? = nil) {
+  init(store: NodeStore, checkouts: [CheckoutEntry]? = nil) {
     self.store = store
     self.spaces = store.spaces
-    self.mirrors = mirrors ?? store.mirrors
+    self.checkouts = checkouts ?? store.checkouts
     _selected = State(initialValue: store.spaces.first?.id)
   }
 
   var body: some View {
     FolderListView(
       spaces: spaces,
-      mirrors: mirrors,
+      checkouts: checkouts,
       selected: selected,
       policyLabel: { wire in
         guard let policy = VersionPolicy(wire: wire) else { return wire }
@@ -348,16 +348,16 @@ private struct FolderListPreview: View {
       },
       onSelect: { selected = $0 },
       onAddFolder: {},
-      onRevealMirror: { _ in },
+      onRevealCheckout: { _ in },
       onStopSharing: { _ in },
-      onFill: { _ in })
+      onAdopt: { _ in })
   }
 }
 
 #Preview("Spaces") {
-  // Four spaces and a mirror. One of the spaces is detached — it holds the
-  // content and indexes no directory — so it is the row drawn with a box
-  // instead of a folder, and the mirror is the row that carries a second line.
+  // Four spaces and a checkout. One is an API source with no directory, so it
+  // is the row drawn with a box
+  // instead of a folder, and the checkout is the row that carries a second line.
   FolderListPreview(store: NodeStore.preview())
     .frame(width: 230, height: 420)
 }
@@ -365,13 +365,13 @@ private struct FolderListPreview: View {
 #Preview("No spaces shared") {
   // Nothing to list and nothing to select. The header and "Add a Space…"
   // stay, because that row is the way out of this state; the "On This Mac"
-  // header is gone with the mirrors, rather than standing over nothing.
-  FolderListPreview(store: NodeStore.preview(spaces: []), mirrors: [])
+  // header is gone with the checkouts, rather than standing over nothing.
+  FolderListPreview(store: NodeStore.preview(spaces: []), checkouts: [])
     .frame(width: 230, height: 420)
 }
 
 #Preview("Spaces, squeezed") {
-  // 200pt is the least `FilesWindow` lets this column be. The mirror row is
+  // 200pt is the least `FilesWindow` lets this column be. The checkout row is
   // what has to survive it: a name, a symbol and a line of detail under both.
   FolderListPreview(store: NodeStore.preview())
     .frame(width: 200, height: 420)

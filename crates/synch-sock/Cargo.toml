@@ -31,7 +31,7 @@ tracing.workspace = true
 # and `synch-engine`, which is meant to stay embeddable — still builds on
 # Windows. What is missing there is the runtime, not the crate: a node can
 # declare, publish, replicate and materialize socket entries anywhere, and
-# `synch connect` works everywhere because the connecting side executes nothing
+# `synch socket connect` works everywhere because the connecting side executes nothing
 # (`docs/SOCKETS.md` §1).
 [target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "openbsd"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 async-ebpf = "0.4.0-alpha.13"

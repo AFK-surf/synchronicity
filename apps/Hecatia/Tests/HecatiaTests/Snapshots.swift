@@ -112,8 +112,8 @@ struct Snapshots {
       Surface(name: "08-members", width: 780, view: AnyView(
         MembersPane(confirmation: empty).environment(node).frame(height: 520))),
 
-      Surface(name: "09-mirrors-and-pins", width: 720, view: AnyView(
-        MirrorsAndPinsPane(confirmation: empty).environment(node).frame(height: 520))),
+      Surface(name: "09-replicas-and-pins", width: 720, view: AnyView(
+        PinsPane(confirmation: empty).environment(node).frame(height: 520))),
 
       Surface(name: "10-remote-access", width: 720, view: AnyView(
         RemoteAccessPane(confirmation: empty).environment(node).frame(height: 560))),
@@ -125,7 +125,7 @@ struct Snapshots {
         AccessKeySheet(generated: { _ in }).environment(node))),
 
       Surface(name: "13-add-folder", width: 480, view: AnyView(
-        AddSpaceSheet().environment(node))),
+        AddSourceSheet().environment(node))),
 
       Surface(name: "14-network", width: 760, view: AnyView(
         NetworkPane().environment(node).frame(height: 460))),

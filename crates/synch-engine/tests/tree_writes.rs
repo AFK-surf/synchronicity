@@ -18,13 +18,13 @@ use synch_engine::{sockets::SocketConnection, Node, NodeConfig};
 use synch_store::SocketRow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// A node with one path-backed space, and the directory that space indexes.
+/// A node with one filesystem source and its directory.
 async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-    node.add_space("code", space.path()).unwrap();
+    node.add_filesystem_source("code", space.path()).unwrap();
     (data, space, node)
 }
 
@@ -43,7 +43,7 @@ fn compile(source: &str, name: &str) -> Vec<u8> {
 async fn install(node: &Node, space_dir: &Path, path: &str, source: &str) {
     let elf = compile(source, "prog.c");
     write(space_dir, path, &elf);
-    node.socket_add(&SocketRow::new("code", path, synch_core::now_ns()))
+    node.socket_declare(&SocketRow::new("code", path, synch_core::now_ns()))
         .unwrap();
     node.scan_and_publish().unwrap();
     let inspected = node.socket_inspect("code", path).await.unwrap();
@@ -141,7 +141,7 @@ async fn a_socket_write_publishes_this_nodes_own_version() {
     assert_eq!(entry.kind, EntryKind::File);
     assert_eq!(entry.content, Some(expected));
 
-    // ...and landed on disk in the space directory, like an S3 PUT.
+    // ...and landed on disk in the filesystem-source directory, like an S3 PUT.
     assert_eq!(
         std::fs::read(space.path().join("inbox/drop.bin")).unwrap(),
         payload
@@ -275,7 +275,7 @@ SY_ENTRY sy_s64 entry(void) {
 }
 
 #[tokio::test]
-async fn a_socket_writes_into_a_detached_space() {
+async fn a_socket_writes_into_an_api_source() {
     const DETACHED: &str = r#"
 #include <synch.h>
 
@@ -302,7 +302,7 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
     let (_data, space, node) = node_with_space().await;
-    node.add_detached_space("archive").unwrap();
+    node.add_api_source("archive").unwrap();
     install(&node, space.path(), "archiver.sock", DETACHED).await;
 
     let (status, _) = drive(&node, "archiver.sock", b"").await;
@@ -312,13 +312,13 @@ SY_ENTRY sy_s64 entry(void) {
         .store()
         .entry(node.origin(), "archive", "kept.bin")
         .unwrap()
-        .expect("the detached commit published an entry");
+        .expect("the API-source commit published an entry");
     assert_eq!(entry.kind, EntryKind::File);
     let root = entry.content.expect("a file version has a root");
     assert_eq!(root, Hash::new(b"held with no checkout"));
     assert!(
         node.store().blob(&root).unwrap().is_some(),
-        "the bytes went straight to the CAS: a detached space has no disk to hold them"
+        "the bytes went straight to the CAS: an API source has no disk to hold them"
     );
     node.shutdown().await.unwrap();
 }

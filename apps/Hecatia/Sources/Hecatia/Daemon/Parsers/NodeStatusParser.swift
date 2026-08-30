@@ -46,7 +46,9 @@ enum NodeStatusReader {
         status.address = address
       } else if line.hasPrefix("spaces: ") {
         status.spaceNames = spaceNames(in: line)
-        status.mirrorCount = Anchor.after("mirrors: ", in: line).flatMap(Int.init)
+        status.sourceCount = Anchor.after("sources: ", in: line)
+          .flatMap { $0.split(separator: " ").first }.flatMap(Int.init)
+        status.replicaCount = Anchor.after("replicas: ", in: line).flatMap(Int.init)
       } else if line.hasPrefix("head: ") {
         status.headSeq = Anchor.after("head: seq ", in: line)
           .flatMap { UInt64($0.prefix(while: \.isNumber)) }
@@ -68,7 +70,7 @@ enum NodeStatusReader {
     return status
   }
 
-  /// `spaces: {n} ({a, b, c}) · mirrors: {m}` — read from inside the
+  /// `sources: {n} · replicas: {m}` — read from inside the
   /// parentheses, which bound the list even when an id contains a space.
   private static func spaceNames(in line: String) -> [String] {
     guard let open = line.firstIndex(of: "("), let close = line.lastIndex(of: ")"), open < close

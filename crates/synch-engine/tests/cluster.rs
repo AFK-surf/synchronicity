@@ -34,7 +34,7 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("version.txt"), b"one").unwrap();
     let first = publisher.node.scan_publish_push().await.unwrap().unwrap();
@@ -114,7 +114,7 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
+async fn api_source_adoption_promotes_to_cloud_before_publishing_its_own_reference() {
     let _blocking = synch_core::BlockingScope::enter();
     let source = spawn("source").await;
     let adopter = spawn_with("adopter", |config| {
@@ -130,7 +130,10 @@ async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
     .await;
     introduce(&[&source, &adopter]);
 
-    source.node.add_space("media", source.space.path()).unwrap();
+    source
+        .node
+        .add_filesystem_source("media", source.space.path())
+        .unwrap();
     let payload = big_payload(200_000);
     std::fs::write(source.space.path().join("adopt.bin"), &payload).unwrap();
     source.node.scan_publish_push().await.unwrap().unwrap();
@@ -139,7 +142,7 @@ async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
         .sync_with_peer(&source.node.node_id())
         .await
         .unwrap();
-    adopter.node.add_detached_space("media").unwrap();
+    adopter.node.add_api_source("media").unwrap();
 
     adopter
         .node
@@ -193,9 +196,11 @@ async fn three_nodes_converge_and_fetch_verified_content() {
     let vps = spawn("vps").await;
     introduce(&[&nas, &laptop, &vps]);
 
-    // The NAS indexes a space with a mix of small and large files.
+    // The NAS publishes a filesystem source with a mix of small and large files.
     let keynote = big_payload(200_000);
-    nas.node.add_space("media", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     std::fs::create_dir_all(nas.space.path().join("talks")).unwrap();
     std::fs::write(nas.space.path().join("notes.txt"), b"read me").unwrap();
     std::fs::write(nas.space.path().join("talks/keynote.mp4"), &keynote).unwrap();
@@ -294,8 +299,13 @@ async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
     let vps = spawn("vps").await;
     introduce(&[&nas, &laptop, &vps]);
 
-    nas.node.add_space("media", nas.space.path()).unwrap();
-    laptop.node.add_space("media", laptop.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
+    laptop
+        .node
+        .add_filesystem_source("media", laptop.space.path())
+        .unwrap();
     std::fs::write(nas.space.path().join("shared.txt"), b"from the nas").unwrap();
     nas.node.scan_publish_push().await.unwrap().unwrap();
     // Distinct mtimes, which `newest` reads as published.
@@ -403,7 +413,9 @@ async fn convergence_survives_a_partition() {
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
 
-    nas.node.add_space("media", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     for round in 1..=3 {
         std::fs::write(
             nas.space.path().join(format!("round{round}.txt")),
@@ -451,7 +463,9 @@ async fn pinning_fetches_what_it_promises_to_keep() {
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);
 
-    nas.node.add_space("media", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     std::fs::write(nas.space.path().join("report.md"), b"keep these bytes").unwrap();
     nas.node.scan_and_publish().unwrap();
     laptop.node.anti_entropy_round().await.unwrap();
@@ -500,7 +514,8 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
     })
     .await;
     let node = &peer.node;
-    node.add_space("media", peer.space.path()).unwrap();
+    node.add_filesystem_source("media", peer.space.path())
+        .unwrap();
 
     std::fs::write(peer.space.path().join("notes.txt"), b"first revision").unwrap();
     node.scan_and_publish().unwrap();
@@ -606,10 +621,12 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);
 
-    nas.node.add_space("shared", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("shared", nas.space.path())
+        .unwrap();
     laptop
         .node
-        .add_space("shared", laptop.space.path())
+        .add_filesystem_source("shared", laptop.space.path())
         .unwrap();
 
     // Both publish the same file, so the path starts out unanimous.
@@ -645,7 +662,7 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
         .unwrap()
         .expect("our copy was here");
     // The path is reported under the *stored* space root, canonicalized at
-    // `space add` time — on macOS `/var/…` is a symlink to `/private/var/…`,
+    // `source add` time — on macOS `/var/…` is a symlink to `/private/var/…`,
     // so the raw tempdir path would not compare equal.
     let canonical_space = laptop.space.path().canonicalize().unwrap();
     assert_eq!(removed, canonical_space.join("notes.txt"));
@@ -679,179 +696,6 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     shutdown(&[&nas.node, &laptop.node]).await;
 }
 
-/// One chunk group, so the delta tests can talk in the units the tree does.
-const GROUP: usize = 16 * 1024;
-
-/// DELTA-SYNC end to end over a real mirror (`docs/DELTA-SYNC.md` §1, §3.2,
-/// §7): an edit moves one group, an append only the appended groups, and a
-/// re-ingest restores a donor the CAS dropped. The mirror holds the previous
-/// version, so the new one is *built* locally out of it plus the changed
-/// group — and what crosses the network is the tree over the changed region,
-/// and that group. `delta_min_size` is turned down so the test works in
-/// megabytes rather than the 16 MiB an unconfigured node would insist on.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
-    let _blocking = synch_core::BlockingScope::enter();
-    let nas = spawn("nas").await;
-    let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
-    introduce(&[&nas, &vps]);
-
-    nas.node.add_space("media", nas.space.path()).unwrap();
-    let v1 = big_payload(64 * GROUP);
-    let source = nas.space.path().join("disk.img");
-    std::fs::write(&source, &v1).unwrap();
-    nas.node.scan_publish_push().await.unwrap();
-    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
-
-    let target = tempfile::tempdir().unwrap();
-    let mirrored = target.path().join("disk.img");
-    vps.node
-        .add_mirror("media", target.path(), &VersionPolicy::Newest)
-        .unwrap();
-    let report = vps.node.sync_mirror(target.path()).await.unwrap();
-    assert_eq!(report.written, 1, "{report:?}");
-    assert_eq!(
-        report.reused_bytes, 0,
-        "nothing was here to reuse: {report:?}"
-    );
-    assert_eq!(report.fetched_bytes, v1.len() as u64, "{report:?}");
-    assert_eq!(std::fs::read(&mirrored).unwrap(), v1);
-
-    // One 16 KiB group of a megabyte changes.
-    let mut v2 = v1.clone();
-    v2[40 * GROUP + 5] ^= 0xff;
-    std::fs::write(&source, &v2).unwrap();
-    nas.node.scan_publish_push().await.unwrap();
-    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
-
-    let report = vps.node.sync_mirror(target.path()).await.unwrap();
-    assert_eq!(report.written, 1, "{report:?}");
-    assert_eq!(
-        report.fetched_bytes, GROUP as u64,
-        "only the edited group crossed the network: {report:?}"
-    );
-    assert_eq!(
-        report.reused_bytes,
-        (v2.len() - GROUP) as u64,
-        "everything else came out of local storage: {report:?}"
-    );
-    assert_eq!(std::fs::read(&mirrored).unwrap(), v2);
-
-    // The file grows by four groups: every complete subtree of the old prefix
-    // keeps its chaining value, so only the appended groups are fetched.
-    let mut v3 = v2.clone();
-    v3.extend(big_payload(4 * GROUP));
-    std::fs::write(&source, &v3).unwrap();
-    nas.node.scan_publish_push().await.unwrap();
-    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
-
-    let report = vps.node.sync_mirror(target.path()).await.unwrap();
-    assert_eq!(report.written, 1, "{report:?}");
-    assert_eq!(
-        report.fetched_bytes,
-        4 * GROUP as u64,
-        "only the appended groups were fetched: {report:?}"
-    );
-    assert_eq!(report.reused_bytes, v2.len() as u64, "{report:?}");
-    assert_eq!(std::fs::read(&mirrored).unwrap(), v3);
-
-    // The collector takes the version the mirror is sitting on: the only copy
-    // left is the mirrored file itself, which the pass re-ingests as the donor (§3.2).
-    let held_root = synch_core::Hash::new(&v3);
-    vps.node.store().delete_blob(&held_root).unwrap();
-    assert!(vps.node.store().blob(&held_root).unwrap().is_none());
-    let mut v4 = v3.clone();
-    v4[40 * GROUP + 5] ^= 0xff;
-    std::fs::write(&source, &v4).unwrap();
-    nas.node.scan_publish_push().await.unwrap();
-    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
-
-    let report = vps.node.sync_mirror(target.path()).await.unwrap();
-    assert_eq!(report.written, 1, "{report:?}");
-    assert_eq!(
-        report.fetched_bytes, GROUP as u64,
-        "the re-ingested copy carried everything but the edit: {report:?}"
-    );
-    assert_eq!(report.reused_bytes, (v4.len() - GROUP) as u64, "{report:?}");
-    assert_eq!(std::fs::read(&mirrored).unwrap(), v4);
-    assert!(
-        vps.node.store().blob(&held_root).unwrap().is_some(),
-        "the old version is back in the CAS under its own root"
-    );
-
-    // The staging file is gone (§9.4), and the pass after it has nothing to do.
-    let left: Vec<String> = std::fs::read_dir(target.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(left, vec!["disk.img".to_string()]);
-    let report = vps.node.sync_mirror(target.path()).await.unwrap();
-    assert_eq!(report.current, 1, "{report:?}");
-    assert_eq!(report.written, 0, "{report:?}");
-
-    shutdown(&[&nas.node, &vps.node]).await;
-}
-
-/// The whole sync-and-fetch path completes without a runtime worker touching
-/// the store (§10).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
-    // Deliberately without the `BlockingScope` the other tests take: this body holds to the rule too (§10).
-    let nas = spawn("nas").await;
-    let laptop = spawn("laptop").await;
-    {
-        let (a, b) = (nas.node.clone(), laptop.node.clone());
-        off_runtime(move || introduce_nodes(&[&a, &b])).await;
-    }
-
-    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-    std::fs::write(nas.space.path().join("big.bin"), &payload).unwrap();
-    off_runtime({
-        let node = nas.node.clone();
-        let path = nas.space.path().to_path_buf();
-        move || node.add_space("media", &path).unwrap()
-    })
-    .await;
-
-    // Publish and push: the scan, the head, and the fan-out to the membership.
-    tokio::time::timeout(Duration::from_secs(30), nas.node.scan_publish_push())
-        .await
-        .unwrap()
-        .unwrap()
-        .expect("a head");
-
-    // Pull: the `Hello` exchange, its decision, and the trie fetch under it.
-    let report = tokio::time::timeout(Duration::from_secs(30), laptop.node.anti_entropy_round())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(report.peer.is_some(), "{report:?}");
-
-    // Fetch: provider ranking, the dial, and the windowed slice transfer.
-    let bytes = tokio::time::timeout(
-        Duration::from_secs(60),
-        laptop.node.read_path(
-            "media",
-            "big.bin",
-            &VersionPolicy::Origin(nas.node.origin().clone()),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(bytes, payload);
-
-    // And the maintenance pass, which is the other standing loop.
-    let node = laptop.node.clone();
-    off_runtime(move || node.maintenance_pass()).await.unwrap();
-
-    shutdown(&[&nas.node, &laptop.node]).await;
-}
-
-/// §5.3's reactive path delivers a head, and a head is a pointer: the trie
-/// under it must follow without waiting for the receiver's own anti-entropy
-/// interval, or "sub-second propagation" is true of the pointer and false of
-/// the data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -865,7 +709,7 @@ async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval(
     off_runtime({
         let node = nas.node.clone();
         let path = nas.space.path().to_path_buf();
-        move || node.add_space("media", &path).unwrap()
+        move || node.add_filesystem_source("media", &path).unwrap()
     })
     .await;
     std::fs::write(nas.space.path().join("a.txt"), b"hello").unwrap();

@@ -5,7 +5,7 @@ import SwiftUI
 /// The version this replaces was a two-tab `TabView`, and the eight operator
 /// panes lived in a `Window` of their own that nothing on the path of someone
 /// moving a file ever opened. A version before *that* put keys, zones, trust
-/// and mirrors into a six-tab Settings scene and ran real operations there — "a
+/// and replicas into a six-tab Settings scene and ran real operations there — "a
 /// preferences window doing surgery" — and was rolled back into the Node
 /// window. Both objections are answered rather than forgotten: the list has no
 /// six-item ceiling to hit, and every dangerous operation keeps the gate it
@@ -58,7 +58,7 @@ struct PreferencesView: View {
     // now the only window most of them can be pressed from.
     .modifier(DaemonAlert())
     // Polled only for the page being read: the daemon takes a global mutex for
-    // every store read, and `peers` does one request per peer. A window that
+    // every store read, and `peer ls` does one request per peer. A window that
     // refreshed all nine pages would hold the daemon down for as long as it
     // was open.
     .task(id: route.pane) {
@@ -100,7 +100,7 @@ struct PreferencesView: View {
       case .members: MembersPane(confirmation: $confirmation)
       case .network: NetworkPane()
       case .spaces: SpacesPane(confirmation: $confirmation)
-      case .mirrorsAndPins: MirrorsAndPinsPane(confirmation: $confirmation)
+      case .pins: PinsPane(confirmation: $confirmation)
       case .remote: RemoteAccessPane(confirmation: $confirmation)
       case .diagnostics: DiagnosticsPane(confirmation: $confirmation)
       }
@@ -129,7 +129,7 @@ struct PreferencesView: View {
     case .connecting:
       return "Connecting to the daemon…"
     case .idle, .connected:
-      return "This app is not talking to a daemon. Nothing is being shared, mirrored or synchronised until it is."
+      return "This app is not talking to a daemon. Nothing is being published, replicated, or synchronised until it is."
     }
   }
 }

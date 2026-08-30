@@ -9,7 +9,7 @@
 //! Nothing here writes. Selection is presentation, not resolution: it picks
 //! which version a read returns and leaves every assertion exactly as its
 //! origin published it. Resolution only ever happens by a node adopting a
-//! version as its own (`synch take`).
+//! version as its own (`synch adopt path`).
 
 use std::str::FromStr;
 
@@ -226,7 +226,7 @@ impl VersionSet {
     /// rather than the path: §8's rule is that a path exists in the tree iff at
     /// least one origin currently publishes a live entry for it, and that the
     /// path stays visible until every publisher tombstones it. Pinned to an
-    /// origin the deletion is the answer — that mirror follows one origin's
+    /// origin the deletion is the answer — an origin-selected read follows one origin's
     /// view, deletions included.
     pub fn select(&self, policy: &VersionPolicy, now: i64) -> Selection {
         match policy {
@@ -406,7 +406,7 @@ impl Store {
     /// *lags* the cluster, every honest entry stamped above the reading
     /// collapses to it, the primary component ties, and selection falls
     /// through to ordering by content hash. A node restored from a snapshot
-    /// then picks the older edit, and a `newest` mirror on it writes different
+    /// then picks the older edit, and a `newest` checkout on it writes different
     /// bytes than every other node, unmarked — and flips back when NTP steps
     /// the clock forward.
     ///

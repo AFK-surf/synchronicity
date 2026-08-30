@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// `synch fill` — pull the cluster's content into a space this Mac publishes.
+/// `synch adopt tree` — adopt the cluster's content into a filesystem source.
 ///
 /// The operation someone reaches for after adding an existing shared space to
-/// a new Mac. It is not a download and it is not a mirror: it writes into the
-/// space this node already indexes, additively. It never removes anything,
+/// a new Mac. It is not a foreground download or a replica checkout: it writes into the
+/// filesystem source this node already publishes, additively. It never removes anything,
 /// leaves bytes that already match alone, reports differing ones instead of
 /// overwriting them, honours `.syncignore`, and stamps the published mtime so
 /// it does not mint a version that looks newer than what it copied.
@@ -12,7 +12,7 @@ import SwiftUI
 /// The dry run is not a nicety here — under `--dry-run` the daemon decides
 /// everything and writes nothing, so its report *is* the answer. This sheet
 /// always runs it first and shows it as the confirmation.
-struct FillSheet: View {
+struct AdoptTreeSheet: View {
   @Environment(NodeStore.self) private var node
   @Environment(\.dismiss) private var dismiss
 
@@ -30,7 +30,7 @@ struct FillSheet: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: Theme.Space.l) {
-      Text("Fill “\(space.id)” From the Cluster").font(.title3.weight(.semibold))
+      Text("Adopt “\(space.id)” From the Cluster").font(.title3.weight(.semibold))
       Text("Writes every file the cluster has for this space into \(space.pathLabel). Files already here with matching content are left alone, and nothing is ever removed.")
         .font(.callout).foregroundStyle(Theme.muted)
         .fixedSize(horizontal: false, vertical: true)
@@ -66,11 +66,11 @@ struct FillSheet: View {
       HStack {
         Spacer()
         Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-        Button(asked ? "Fill" : "Preview…") {
-          if asked { fill() } else { dryRun() }
+        Button(asked ? "Adopt" : "Preview…") {
+          if asked { adopt() } else { dryRun() }
         }
           .keyboardShortcut(.defaultAction)
-          .disabled(running || space.isDetached)
+          .disabled(running || !space.hasFilesystemSource)
       }
     }
     .padding(Theme.Space.xxl).frame(width: 560)
@@ -80,9 +80,9 @@ struct FillSheet: View {
     running = true
     failure = nil
     Task {
-      let lines = await node.fill(reference: space.id, dryRun: true)
+      let lines = await node.adoptTree(reference: space.id, dryRun: true)
       running = false
-      // `asked` is what turns the default button from `Preview…` into `Fill`,
+      // `asked` is what turns the default button from `Preview…` into `Adopt`,
       // and the dry run's report is the only confirmation this sheet raises.
       // So a preview that never reached the daemon must not set it: the
       // alternative, which is what shipped, drew the failure as `The daemon
@@ -100,17 +100,17 @@ struct FillSheet: View {
     }
   }
 
-  private func fill() {
+  private func adopt() {
     let reference = space.id
     let overwrite = force
-    node.enqueue { _ = await node.fill(reference: reference, force: overwrite) }
+    node.enqueue { _ = await node.adoptTree(reference: reference, replace: overwrite) }
     dismiss()
   }
 }
 
 #if DEBUG
-#Preview("Fill") {
-  FillSheet(space: Space(id: "media", localPath: "/Volumes/Big/Media"))
+#Preview("Adopt Tree") {
+  AdoptTreeSheet(space: Space(id: "media", localPath: "/Volumes/Big/Media"))
     .environment(NodeStore.preview())
 }
 #endif

@@ -185,48 +185,6 @@ struct OriginRecoveryTests {
   }
 }
 
-/// `mirror sync` stops at the first failure and says nothing about the rest.
-struct MirrorSyncAttributionTests {
-  private let mirrors = [
-    MirrorEntry(space: "a", localPath: "/m/alpha", policy: "newest"),
-    MirrorEntry(space: "b", localPath: "/m/beta", policy: "newest"),
-    MirrorEntry(space: "c", localPath: "/m/gamma", policy: "newest"),
-  ]
-
-  @Test func aCleanRunAttributesEveryMirror() {
-    let outcome = MirrorSyncOutcome.read(
-      lines: [
-        "/m/alpha  written 2 · current 0 · retouched 0 · removed 0 · skipped 0",
-        "/m/beta  written 0 · current 5 · retouched 0 · removed 0 · skipped 0",
-        "/m/gamma  written 1 · current 1 · retouched 0 · removed 0 · skipped 0",
-      ],
-      progress: ["/m/alpha …", "/m/beta …", "/m/gamma …"],
-      mirrors: mirrors, failed: false)
-    #expect(outcome.isClean)
-    #expect(outcome.succeeded.count == 3)
-  }
-
-  @Test func aFailurePartWayThroughNamesWhatWasNeverAttempted() {
-    // The daemon iterates in local-path order and propagates the first error,
-    // so gamma is untouched and nothing in the output says so.
-    let outcome = MirrorSyncOutcome.read(
-      lines: ["/m/alpha  written 2 · current 0 · retouched 0 · removed 0 · skipped 0"],
-      progress: ["/m/alpha …", "/m/beta …"],
-      mirrors: mirrors, failed: true)
-    #expect(outcome.succeeded == ["/m/alpha"])
-    #expect(outcome.failed == "/m/beta")
-    #expect(outcome.notAttempted == ["/m/gamma"])
-    #expect(outcome.isClean == false)
-  }
-
-  @Test func aFailureOnTheFirstMirrorStrandsTheRest() {
-    let outcome = MirrorSyncOutcome.read(
-      lines: [], progress: ["/m/alpha …"], mirrors: mirrors, failed: true)
-    #expect(outcome.failed == "/m/alpha")
-    #expect(outcome.notAttempted == ["/m/beta", "/m/gamma"])
-  }
-}
-
 /// The daemon records when a tunnel's state last changed and never renders it.
 struct ObservationLedgerTests {
   @MainActor

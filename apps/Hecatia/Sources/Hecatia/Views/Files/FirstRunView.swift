@@ -32,13 +32,13 @@ struct FirstRunView: View {
       case .notConnected:
         icon("bolt.horizontal.circle", Theme.warning)
         Text("Not connected").font(.title2.weight(.semibold))
-        Text("This app is not talking to a daemon. Nothing is being shared, mirrored or synchronised until it is.")
+        Text("This app is not talking to a daemon. Nothing is being published, replicated, or synchronised until it is.")
           .foregroundStyle(Theme.muted)
           .multilineTextAlignment(.center)
           .frame(maxWidth: 460)
         VStack(alignment: .leading, spacing: Theme.Space.snug) {
           // `daemon start`, not `daemon run`. `run` holds the terminal for the
-          // daemon's whole life, so closing that window stops sharing, mirrors
+          // daemon's whole life, so closing that window stops publishing, replicas
           // and the browser — the app was handing someone a command whose
           // consequence it never mentioned. `start` spawns a detached child,
           // puts the log in the data directory, and returns once the control

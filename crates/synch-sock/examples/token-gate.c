@@ -1,9 +1,9 @@
 /* token-gate — a shared secret, checked the way a shared secret has to be.
  *
  *   synch socket build examples/token-gate.c -o token-gate.o
- *   synch socket add ops/gate.sock --config token=hunter2
+ *   synch socket declare ops/gate.sock --config token=hunter2
  *   synch socket arm ops/gate.sock
- *   printf 'hunter2\n' | synch connect nas:ops/gate.sock
+ *   printf 'hunter2\n' | synch socket connect nas:ops/gate.sock
  *
  * Membership already decides who may open this socket, so a token here is a
  * second factor rather than the only one — a way to scope a socket more
@@ -59,7 +59,7 @@ SY_ENTRY sy_s64 entry(void) {
   if (want <= 0 || want >= (sy_s64)sizeof expected) {
     /* Refusing to run without a secret beats running without one. A socket
        that treats a missing config key as "no gate" is a gate that opens when
-       somebody mistypes `synch socket add`. */
+       somebody mistypes `synch socket declare`. */
     sy_log(SY_STR("no usable `token` in this socket's config\n"));
     return refuse("misconfigured\n", 1);
   }

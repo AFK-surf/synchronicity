@@ -91,81 +91,63 @@ enum Cmd {
   }
   static var domainClear: Command { make { $0.domainClear = .init() } }
   static var domainRefresh: Command { make { $0.domainRefresh = .init() } }
-  static var peers: Command { make { $0.peers = .init() } }
+  static var peerList: Command { make { $0.peerLs = .init() } }
 
-  // Folders
-  /// Every space, or one space's detailed replication report.
-  ///
-  /// The same call answers two very different things: with no id it is the
-  /// three-column table, and with one it is the `held`/`releasing`/`wanted`/
-  /// `unreachable` report. Two readers, one command — see ``Listings/spaces``
-  /// and ``Listings/replicaStatus``.
-  static func spaceLs(id: String? = nil) -> Command {
-    make { $0.spaceLs = .with { if let id, !id.isEmpty { $0.id = id } } }
+  // Sources
+  static func sourceAdd(id: String, path: String?, api: Bool = false) -> Command {
+    make { $0.sourceAdd = .with { $0.space = id; if let path { $0.path = path }; $0.api = api } }
   }
-  /// `path` is empty for a detached space, which is legal exactly when
-  /// something else gives the space a reason to exist — the daemon requires
-  /// `--detached` or `--replicate` in that case and refuses a bare empty path.
-  static func spaceAdd(
-    id: String, path: String, detached: Bool = false,
-    replicate: ReplicaPolicy? = nil, grace: Int64? = nil, budget: UInt64? = nil
+  static func sourceScan(id: String? = nil) -> Command {
+    make { $0.sourceScan = .with { if let id { $0.space = id } } }
+  }
+  static func sourceRm(id: String) -> Command {
+    make { $0.sourceRm = .with { $0.space = id } }
+  }
+
+  // Replicas
+  static func replicaLs(id: String? = nil) -> Command {
+    make { $0.replicaLs = .with { if let id { $0.space = id } } }
+  }
+  static func replicaAdd(
+    id: String, retention: ReplicaPolicy, grace: Int64? = nil,
+    budget: UInt64? = nil, checkout: String? = nil
   ) -> Command {
-    make {
-      $0.spaceAdd = .with {
-        $0.id = id
-        $0.path = path
-        $0.detached = detached
-        if let replicate { $0.replicate = replicate.wire }
-        if let grace { $0.grace = grace }
-        if let budget { $0.budget = budget }
-      }
-    }
+    make { $0.replicaAdd = .with {
+      $0.space = id; $0.retention = retention.wire
+      if let grace { $0.grace = grace }; if let budget { $0.budget = budget }
+      if let checkout { $0.checkout = checkout }
+    } }
   }
-  /// Changes one half of a space's configuration and leaves the other alone.
-  ///
-  /// The daemon rejects an empty set rather than treating it as a no-op, so a
-  /// caller with nothing to change must not call — see
-  /// ``NodeStore/setReplication(id:replicate:stop:release:grace:budget:)``,
-  /// which guards on exactly that.
-  static func spaceSet(
-    id: String, replicate: ReplicaPolicy? = nil, noReplicate: Bool = false,
-    release: Bool = false, grace: Int64? = nil, budget: UInt64? = nil
+  static func replicaSet(
+    id: String, retention: ReplicaPolicy? = nil, grace: Int64? = nil,
+    budget: UInt64? = nil, noBudget: Bool = false,
+    checkout: String? = nil, noCheckout: Bool = false
   ) -> Command {
-    make {
-      $0.spaceSet = .with {
-        $0.id = id
-        if let replicate { $0.replicate = replicate.wire }
-        $0.noReplicate = noReplicate
-        $0.release = release
-        if let grace { $0.grace = grace }
-        if let budget { $0.budget = budget }
-      }
-    }
+    make { $0.replicaSet = .with {
+      $0.space = id; if let retention { $0.retention = retention.wire }
+      if let grace { $0.grace = grace }; if let budget { $0.budget = budget }
+      $0.noBudget = noBudget; if let checkout { $0.checkout = checkout }
+      $0.noCheckout = noCheckout
+    } }
   }
-  /// Runs a reconciling replication sweep now, rather than at the daemon's next
-  /// 300-second interval. Empty id sweeps every replicated space.
-  static func spaceSync(id: String? = nil) -> Command {
-    make { $0.spaceSync = .with { if let id, !id.isEmpty { $0.id = id } } }
+  static func replicaRm(id: String, pinHeld: Bool = false) -> Command {
+    make { $0.replicaRm = .with { $0.space = id; $0.pinHeld = pinHeld } }
   }
-  /// `release` drops the pins this space's replication holds — potentially
-  /// terabytes. The daemon defaults it to false on purpose: releasing that much
-  /// should not follow from typing the opposite of `add`.
-  static func spaceRm(id: String, release: Bool = false) -> Command {
-    make { $0.spaceRm = .with { $0.id = id; $0.release = release } }
+  static func replicaSync(id: String? = nil) -> Command {
+    make { $0.replicaSync = .with { if let id { $0.space = id } } }
   }
   /// `[<origin>:]<space>[/<dir>]` — materialize the cluster's content into the
   /// space's own directory. Additive: it never removes, leaves matching bytes
   /// alone, and reports differing ones instead of overwriting unless forced.
-  static func fill(
-    reference: String, from: String? = nil, strict: Bool = false,
-    force: Bool = false, dryRun: Bool = false
+  static func adoptTree(
+    reference: String, select: String? = nil,
+    replace: Bool = false, dryRun: Bool = false
   ) -> Command {
     make {
-      $0.fill = .with {
+      $0.adoptTree = .with {
         $0.reference = reference
-        if let from, !from.isEmpty { $0.from = from }
-        $0.strict = strict
-        $0.force = force
+        if let select, !select.isEmpty { $0.select = select }
+        $0.replace = replace
         $0.dryRun = dryRun
       }
     }
@@ -175,8 +157,8 @@ enum Cmd {
   //
   // `Control.Read` answers a `<space>/<path>` at whatever version the policy
   // selects, which is the current one. It has no root field, so a superseded
-  // version — the one you want back after a bad `take`, and everything an
-  // `archive` replica is holding — cannot be asked for through it at all.
+  // version — the one you want back after an unwanted adoption, and everything a
+  // `forever` replica is holding — cannot be asked for through it at all.
   // These two can. Both stream the bytes back as `Frame.chunk`, so both need
   // `ControlClient.runCollectingChunks`.
 
@@ -203,8 +185,11 @@ enum Cmd {
   static func status(_ reference: String?) -> Command {
     make { $0.status = .with { if let reference { $0.reference = reference } } }
   }
-  static func take(_ reference: String) -> Command {
-    make { $0.take = .with { $0.reference = reference } }
+  static func adoptPath(_ reference: String, select: String? = nil) -> Command {
+    make { $0.adoptPath = .with {
+      $0.reference = reference
+      if let select, !select.isEmpty { $0.select = select }
+    } }
   }
   static func log(_ reference: String) -> Command {
     make { $0.log = .with { $0.reference = reference } }
@@ -222,21 +207,7 @@ enum Cmd {
     }
   }
 
-  // Replication
-  static var mirrorLs: Command { make { $0.mirrorLs = .init() } }
-  static func mirrorAdd(space: String, path: String, policy: VersionPolicy?) -> Command {
-    make {
-      $0.mirrorAdd = .with {
-        $0.space = space
-        $0.path = path
-        if let policy { $0.policy = policy.wire }
-      }
-    }
-  }
-  static func mirrorRm(path: String) -> Command {
-    make { $0.mirrorRm = .with { $0.path = path } }
-  }
-  static var mirrorSync: Command { make { $0.mirrorSync = .init() } }
+  // Explicit pins
   static var pinLs: Command { make { $0.pinLs = .init() } }
   static func pinAdd(_ target: String) -> Command {
     make { $0.pinAdd = .with { $0.target = target } }
@@ -246,8 +217,7 @@ enum Cmd {
   }
 
   // Upkeep
-  static var scan: Command { make { $0.scan = .init() } }
-  static var syncNow: Command { make { $0.syncNow = .init() } }
+  static var peerSync: Command { make { $0.peerSync = .init() } }
   static func recover(wait: String?, gap: UInt64?) -> Command {
     make {
       $0.recover = .with {
@@ -256,14 +226,13 @@ enum Cmd {
       }
     }
   }
-  static func doctor(rebuild: Bool) -> Command {
-    make { $0.doctor = .with { $0.rebuild = rebuild } }
-  }
+  static var doctor: Command { make { $0.doctor = .init() } }
+  static var rebuildViews: Command { make { $0.repairRebuildViews = .init() } }
 
   // Remote access
-  static var cloudStatus: Command { make { $0.cloudStatus = .init() } }
-  static var cloudEnable: Command { make { $0.cloudEnable = .init() } }
-  static var cloudDisable: Command { make { $0.cloudDisable = .init() } }
+  static var controlPlaneStatus: Command { make { $0.controlPlaneStatus = .init() } }
+  static var controlPlaneEnable: Command { make { $0.controlPlaneEnable = .init() } }
+  static var controlPlaneDisable: Command { make { $0.controlPlaneDisable = .init() } }
 
   /// `[<origin>:]<space>/<path>` — the daemon's reference grammar. The origin
   /// goes before the first colon, and a colon after the first `/` is part of

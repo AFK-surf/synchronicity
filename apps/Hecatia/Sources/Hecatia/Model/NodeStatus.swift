@@ -17,7 +17,8 @@ struct NodeStatus: Sendable, Equatable {
   var naming: Naming
   var address: String?
   var spaceNames: [String] = []
-  var mirrorCount: Int?
+  var sourceCount: Int?
+  var replicaCount: Int?
   var headSeq: UInt64?
   var peersSeen: Int?
   var trustSummary: String?

@@ -42,7 +42,7 @@ pub enum CloudService {
 /// Which fetched objects a cloud node promotes to remote durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudUploadPolicy {
-    /// Only content ingested locally through detached writes.
+    /// Only content ingested locally through API-source writes.
     Own,
     /// Locally ingested content plus every object pinned here.
     OwnPinned,

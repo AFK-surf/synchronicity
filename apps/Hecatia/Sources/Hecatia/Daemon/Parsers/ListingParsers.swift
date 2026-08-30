@@ -9,117 +9,6 @@ import Foundation
 /// re-parsed into something that would be a guess.
 enum Listings {
 
-  // MARK: - space ls  ·  "{:<20} {:<28} {}"
-
-  /// Three columns, not two.
-  ///
-  /// This read the first `/` to end of line as the local path, which was right
-  /// while the row was `{:<20} {}`. The daemon added a replication column and
-  /// emits it on *every* row — `—` when the space is not replicated — so the
-  /// old reader silently appended it to the path. Nothing landed in
-  /// `unrecognized`, so nothing warned: Reveal in Finder just stopped working.
-  ///
-  /// Anchored on what each field *is*, not on where the padding puts it and
-  /// not on the width of the separator.
-  ///
-  /// Neither of the easy readings survives this row. Splitting at fixed
-  /// offsets breaks the moment a value overruns its column. Splitting on runs
-  /// of two spaces breaks for the same rows and for a subtler reason: a value
-  /// that overruns `{:<20}` is followed by the format string's own single
-  /// space and nothing else, so the separator is one space exactly where the
-  /// line is hardest to read — and an id may contain a space, and so may a
-  /// path.
-  ///
-  /// What is invariant is the shape of the fields. The local path is absolute
-  /// or `—`. The replication cell is `—` or begins `replicate `. Both ends of
-  /// the line identify themselves, so the id is whatever is left in the middle.
-  static func spaces(_ lines: [String]) -> ParseResult<Space> {
-    var out = ParseResult<Space>()
-    for line in lines where !line.isEmpty {
-      guard let row = space(line) else {
-        out.unrecognized.append(line)
-        continue
-      }
-      out.rows.append(row)
-    }
-    return out
-  }
-
-  private static func space(_ line: String) -> Space? {
-    // The replication cell first, from the right: it is the only field whose
-    // vocabulary is closed.
-    // The `—` test comes first and the `replicate` search runs backwards, both
-    // for the same reason: a local path is user-chosen text that may contain
-    // the word. `/Users/me/replicate this/` would otherwise be split down the
-    // middle of the path on a row whose third column is a bare `—`.
-    var head = line
-    var summary: String?
-    if line.hasSuffix("—") {
-      head = String(line.dropLast())
-    } else if let range = line.range(of: "replicate ", options: .backwards) {
-      head = String(line[line.startIndex..<range.lowerBound])
-      summary = String(line[range.lowerBound...]).trimmingCharacters(in: .whitespaces)
-    } else {
-      // Neither form of the third column. Older daemons wrote two columns and
-      // this reader is for the three-column one; reporting the line is how the
-      // app says so rather than guessing.
-      return nil
-    }
-    head = head.trimmingCharacters(in: .whitespaces)
-
-    // Then the path, which is absolute — or `—` for a space with no checkout,
-    // and then it is all that is left at the end of the head.
-    var id = head
-    var path: String?
-    if let slash = head.firstIndex(of: "/") {
-      id = String(head[head.startIndex..<slash]).trimmingCharacters(in: .whitespaces)
-      path = String(head[slash...]).trimmingCharacters(in: .whitespaces)
-    } else if head.hasSuffix("—") {
-      id = String(head.dropLast()).trimmingCharacters(in: .whitespaces)
-    } else {
-      return nil
-    }
-
-    guard !id.isEmpty else { return nil }
-    return Space(
-      id: id, localPath: path, replicationSummary: summary,
-      replicate: summary.flatMap(Self.policy(inSummary:)))
-  }
-
-  /// The policy out of `replicate tree · grace 7d · 4096 B held`.
-  ///
-  /// Only the leading `replicate <policy>` is read. Everything after it is a
-  /// live counter, and the report that can be acted on is `space ls <id>`.
-  private static func policy(inSummary summary: String) -> ReplicaPolicy? {
-    guard let word = Anchor.after("replicate ", in: summary)?
-      .split(separator: " ").first
-    else { return nil }
-    return ReplicaPolicy(rawValue: String(word))
-  }
-
-  // MARK: - mirror ls  ·  "{:<20} {:<24} {}"
-
-  static func mirrors(_ lines: [String]) -> ParseResult<MirrorEntry> {
-    var out = ParseResult<MirrorEntry>()
-    for line in lines where !line.isEmpty {
-      guard let (head, path) = Anchor.splitAtFirstPath(line) else {
-        out.unrecognized.append(line)
-        continue
-      }
-      // The policy is the last token before the path and never contains a
-      // space (`newest` | `strict` | `origin=<id>`); everything before it is
-      // the space id, which may.
-      let parts = Anchor.tokens(head)
-      guard let policy = parts.last, parts.count >= 2 else {
-        out.unrecognized.append(line)
-        continue
-      }
-      let space = parts.dropLast().joined(separator: " ")
-      out.rows.append(MirrorEntry(space: space, localPath: path, policy: String(policy)))
-    }
-    return out
-  }
-
   // MARK: - pin ls  ·  "{root}  {size}  {holders}  {paths}"
 
   /// Four columns, and the holders one decides what the app may offer.
@@ -337,12 +226,12 @@ enum Listings {
     }
   }
 
-  // MARK: - cloud status  ·  "cloud: {state}" then "{:<32} {:<10} {endpoint}{error}"
+  // MARK: - control-plane status  ·  "control-plane: {state}" then "{:<32} {:<10} {endpoint}{error}"
 
   static func cloud(_ output: RunOutput) -> CloudState {
     var state = CloudState()
     for line in output.lines {
-      if let value = Anchor.after("cloud: ", in: line) {
+      if let value = Anchor.after("control-plane: ", in: line) {
         state.enabled = value.hasPrefix("enabled")
         continue
       }

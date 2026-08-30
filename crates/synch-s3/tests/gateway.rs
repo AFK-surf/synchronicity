@@ -37,23 +37,50 @@ impl Harness {
         let space = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
 
         let (stop, _) = broadcast::channel(1);
         let control = Server::bind(node.clone(), stop.clone()).await.unwrap();
         let served = tokio::spawn(control.run());
         let daemon = Daemon::new(data.path());
 
-        // The default policy, a pin on a foreign origin, and a strict bucket (§9.4).
-        buckets::add(&daemon, "my-media", "media", None)
-            .await
-            .unwrap();
-        buckets::add(&daemon, "nas-media", "nas@cluster.example:media", None)
-            .await
-            .unwrap();
-        buckets::add(&daemon, "strict-media", "media", Some("strict"))
-            .await
-            .unwrap();
+        // One writable source view and three explicitly read-only selected views.
+        buckets::add(
+            &daemon,
+            "my-media",
+            "media",
+            buckets::Access::ReadWrite,
+            None,
+        )
+        .await
+        .unwrap();
+        buckets::add(
+            &daemon,
+            "nas-media",
+            "media",
+            buckets::Access::ReadOnly,
+            Some("origin=nas@cluster.example"),
+        )
+        .await
+        .unwrap();
+        buckets::add(
+            &daemon,
+            "strict-media",
+            "media",
+            buckets::Access::ReadOnly,
+            Some("strict"),
+        )
+        .await
+        .unwrap();
+        buckets::add(
+            &daemon,
+            "newest-media",
+            "media",
+            buckets::Access::ReadOnly,
+            Some("newest"),
+        )
+        .await
+        .unwrap();
 
         let gateway = Gateway::new(daemon.clone(), auth).await.unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -271,7 +298,7 @@ async fn get_head_list_and_range_round_trip() {
 
     // ListObjectsV2 over the whole bucket.
     let body = harness
-        .get("/my-media?list-type=2")
+        .get("/newest-media?list-type=2")
         .await
         .text()
         .await
@@ -434,24 +461,25 @@ async fn writes_and_deletes_are_refused_while_the_node_is_in_recovery() {
     harness.stop().await;
 }
 
-/// §9.4: a write always publishes the *local* node's view, so a bucket
-/// pinned to a foreign origin still accepts it — but its reads keep serving
-/// the pinned origin.
+/// A read-only selected view refuses writes before they can enter a source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
+async fn a_read_only_bucket_rejects_writes() {
     // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let response = harness.put("/nas-media/ours.txt", b"ours".to_vec()).await;
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 403);
+    assert!(response.text().await.unwrap().contains("AccessDenied"));
+    assert_eq!(
+        harness
+            .request(reqwest::Method::PUT, "/nas-media")
+            .await
+            .status(),
+        403
+    );
 
-    // It landed in our own view...
+    // The writable local view has not changed.
     let response = harness.get("/my-media/ours.txt").await;
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.bytes().await.unwrap().as_ref(), b"ours");
-
-    // ...and not in the pinned origin's, which is what the bucket serves.
-    let response = harness.get("/nas-media/ours.txt").await;
     assert_eq!(response.status(), 404);
 
     harness.stop().await;
@@ -503,7 +531,7 @@ async fn divergent_keys_are_served_by_policy() {
     assert_eq!(body.matches("<Key>shared.txt</Key>").count(), 1, "{body}");
 
     // `newest` serves the winning version, and its ETag is that version's root.
-    let response = harness.get("/my-media/shared.txt").await;
+    let response = harness.get("/newest-media/shared.txt").await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers()["etag"].to_str().unwrap(),
@@ -1253,7 +1281,7 @@ async fn delete_object_removes_the_file_and_tombstones_the_key() {
         "204 carries no body"
     );
 
-    // Gone from the space directory, the listing, and a reader.
+    // Gone from the filesystem-source directory, the listing, and a reader.
     assert!(!harness.space_path.join("notes.txt").exists());
     let response = http
         .get(harness.url("/my-media/notes.txt"))

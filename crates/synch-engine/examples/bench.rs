@@ -58,12 +58,12 @@ async fn metadata(options: &Options, publisher: &Peer, follower: &Peer) {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     write_tree(publisher.space.path(), files);
 
     // Indexing: walk, stat, hash, stage, and turn the batch into one signed
-    // root. This is `synch scan` on a cold space.
+    // root. This is `synch source scan` on a cold space.
     let scan = time(|| {
         let (report, head) = publisher.node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, files);
@@ -188,7 +188,7 @@ fn lookups(options: &Options, publisher: &Peer, follower: &Peer) {
     per_op("entry by path (one origin)", entry, paths.len());
 
     // The §8 merge: every origin's claim about one path, resolved under a
-    // policy. This is what `cat`, `get`, mirrors and S3 all go through.
+    // policy. This is what `cat`, `get`, checkouts and S3 all go through.
     let resolve = time(|| {
         for path in &paths {
             follower

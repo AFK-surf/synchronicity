@@ -120,7 +120,7 @@ impl Node {
         // rotation window the retiring key is still bound to our own origin,
         // and filtering only the active key would leave the node dialling
         // itself and reporting itself unreachable — in exactly the window where
-        // an operator is watching `sync` and `key ls` the hardest (§3.4).
+        // an operator is watching `peer sync` and `key ls` the hardest (§3.4).
         let own: Vec<NodeId> = self
             .device_keys()?
             .into_iter()
@@ -356,7 +356,7 @@ impl Node {
         // is retired next pass rather than lingering an interval — and so the
         // ad and the payload never disagree in the direction that has peers
         // dialling us for bytes we no longer have (§6.3).
-        contained("retiring ads", self.retire_ads());
+        contained("reconciling ads", self.reconcile_ads());
 
         let retention = self
             .config()
@@ -628,8 +628,8 @@ pub(crate) fn jittered_floor(base: Duration) -> Duration {
 
 /// Runs a standing pass-per-wake loop until `shutdown` resolves.
 ///
-/// The skeleton `run_mirrors` and `run_replicas` each wrote out: one pass
-/// before the first wait, so a node restarted with a backlog starts working
+/// The standing replica workers run one pass before the first wait, so a node
+/// restarted with a backlog starts working
 /// through it rather than waiting out an interval; then one pass per ring of
 /// `wake` or per jittered `interval`, whichever comes first — the interval
 /// being the backstop for drift nobody rang a bell about.

@@ -8,6 +8,7 @@ struct BucketSheet: View {
   @State private var bucket = ""
   @State private var space = ""
   @State private var policy: VersionPolicy = .newest
+  @State private var access: GatewayBucket.Access = .readOnly
 
   private var nameProblem: String? { GatewayConfig.bucketNameProblem(bucket) }
   /// The fold is last-record-wins, so adding a name that already exists
@@ -20,6 +21,7 @@ struct BucketSheet: View {
   private var isValid: Bool {
     !bucket.isEmpty && !space.isEmpty && nameProblem == nil
       && !GatewayConfig.containsSeparator(bucket) && !GatewayConfig.containsSeparator(space)
+      && (access == .readOnly || node.spaces.first(where: { $0.id == space })?.isSource == true)
   }
 
   private var originChoices: [String] {
@@ -53,18 +55,21 @@ struct BucketSheet: View {
         Text("Choose\u{2026}").tag("")
         ForEach(node.spaces) { Text($0.id).tag($0.id) }
       }
-      Picker("Version", selection: $policy) {
-        Text("Newest").tag(VersionPolicy.newest)
-        Text("Strict").tag(VersionPolicy.strict)
-        // `origin=<id>` is a third of the policy grammar and was the third the
-        // sheet left out, though the browser has offered it all along.
-        ForEach(originChoices, id: \.self) { origin in
-          Text("From \(origin)").tag(VersionPolicy.origin(origin))
-        }
+      Picker("Access", selection: $access) {
+        Text("Read only").tag(GatewayBucket.Access.readOnly)
+        Text("Read and write").tag(GatewayBucket.Access.readWrite)
       }
-      if case .origin(let pinned) = policy, pinned != node.origin {
+      if access == .readOnly {
+        Picker("Version", selection: $policy) {
+          Text("Newest").tag(VersionPolicy.newest)
+          Text("Strict").tag(VersionPolicy.strict)
+          ForEach(originChoices, id: \.self) { origin in
+            Text("From \(origin)").tag(VersionPolicy.origin(origin))
+          }
+        }
+      } else if node.spaces.first(where: { $0.id == space })?.isSource != true {
         Label(
-          "Reads keep serving \(pinned)\u{2019}s version, while writes publish this Mac\u{2019}s, so the bucket is effectively read-only.",
+          "Read-write buckets require a source on this Mac.",
           systemImage: "exclamationmark.triangle.fill")
           .font(.caption).foregroundStyle(Theme.warning)
           .fixedSize(horizontal: false, vertical: true)
@@ -81,7 +86,9 @@ struct BucketSheet: View {
   }
 
   private func add() {
-    let record = GatewayConfig.bucketRecord(name: bucket, space: space, policy: policy)
+    let selected = access == .readWrite ? VersionPolicy.origin(node.origin ?? "self") : policy
+    let record = GatewayConfig.bucketRecord(
+      name: bucket, space: space, access: access, policy: selected)
     Task {
       do {
         try await node.client.appendConfig(key: GatewayConfig.bucketsKey, record: record)

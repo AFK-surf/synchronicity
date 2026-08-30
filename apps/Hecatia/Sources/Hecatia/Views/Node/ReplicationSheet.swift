@@ -1,10 +1,6 @@
 import SwiftUI
 
-/// `space set` — turning replication on, off, or adjusting it for one folder.
-///
-/// The daemon put replication on the command that already names spaces rather
-/// than inventing a noun for it, and this follows: it is a property of a
-/// folder, reached from the folder, not a separate thing to go and configure.
+/// Add, remove, or adjust the replica role for one namespace.
 struct ReplicationSheet: View {
   @Environment(NodeStore.self) private var node
   @Environment(\.dismiss) private var dismiss
@@ -18,7 +14,9 @@ struct ReplicationSheet: View {
   @State private var graceDays = 7.0
   @State private var limitBudget = false
   @State private var budgetGB = 100.0
-  @State private var release = false
+  @State private var pinHeld = false
+  @State private var materialize = false
+  @State private var checkoutPath = ""
   @State private var loaded = false
 
   enum Choice: Hashable {
@@ -31,7 +29,7 @@ struct ReplicationSheet: View {
   var body: some View {
     VStack(alignment: .leading, spacing: Theme.Space.l) {
       Text("Replication for “\(space.id)”").font(.title3.weight(.semibold))
-      Text("A replicating space holds other devices’ versions of its files on this Mac, as content rather than as files. Nothing appears in Finder — a mirror is what puts files on disk.")
+      Text("A replica durably holds content from other devices. It can optionally materialize one newest-view checkout for ordinary applications.")
         .font(.callout).foregroundStyle(Theme.muted)
         .fixedSize(horizontal: false, vertical: true)
 
@@ -49,10 +47,10 @@ struct ReplicationSheet: View {
           .fixedSize(horizontal: false, vertical: true)
           .padding(.leading, Theme.Space.xl)
 
-        // Grace only applies to `tree`. Under `archive` nothing is ever
+        // Grace only applies to `current`. Under `forever` nothing is ever
         // released, so a grace period would be a control with no effect —
         // the daemon does not even print the line.
-        if policy == .tree {
+        if policy == .current {
           HStack(spacing: Theme.Space.m) {
             Text("Grace").frame(width: 64, alignment: .trailing)
             Stepper(value: $graceDays, in: 0...365, step: 1) {
@@ -78,18 +76,24 @@ struct ReplicationSheet: View {
             .font(.caption).foregroundStyle(Theme.muted)
             .padding(.leading, Theme.Space.xxl)
         }
+
+        Toggle("Materialize a checkout", isOn: $materialize)
+        if materialize {
+          TextField("Checkout directory", text: $checkoutPath)
+            .textFieldStyle(.roundedBorder)
+        }
       }
 
       if isTurningOff {
         Divider()
-        Toggle(isOn: $release) {
-          Text("Also release the \(Bytes.short(heldBytes)) it is holding")
+        Toggle(isOn: $pinHeld) {
+          Text("Keep the \(Bytes.short(heldBytes)) it holds as explicit pins")
         }
-        Text(release
-          ? "Those bytes stop being held here. Anything no other device holds is gone from this Mac."
-          : "What it holds stays on this Mac. Turning replication off alone does not free any space.")
+        Text(pinHeld
+          ? "The replica is removed, but operator pins continue retaining every held object."
+          : "Replica holds are released. Cache policy may remove content that no remaining role or pin retains.")
           .font(.caption)
-          .foregroundStyle(release ? Theme.ink(Theme.danger) : Theme.muted)
+          .foregroundStyle(pinHeld ? Theme.muted : Theme.ink(Theme.danger))
           .fixedSize(horizontal: false, vertical: true)
       }
 
@@ -105,13 +109,10 @@ struct ReplicationSheet: View {
     .onAppear(perform: loadCurrent)
   }
 
-  /// The daemon refuses an empty `space set` rather than treating it as a
-  /// no-op, so Apply is not offered when there is provably nothing to send.
+  /// Apply is not offered when there is provably nothing to send.
   ///
-  /// Only one case is provable: "off" on a folder that already does not
-  /// replicate. Any chosen policy always carries a grace and a budget, and this
-  /// sheet cannot know the folder's current ones — `space ls`'s summary line
-  /// does not include the budget — so it does not pretend to and always sends.
+  /// Only one case is provable without retaining a second editable snapshot:
+  /// "off" on a folder that already does not replicate.
   private var hasChange: Bool {
     if case .off = choice { return space.isReplicating }
     return true
@@ -121,19 +122,38 @@ struct ReplicationSheet: View {
     guard !loaded else { return }
     loaded = true
     choice = space.replicate.map(Choice.policy) ?? .off
+    if let grace = space.graceSeconds {
+      graceDays = Double(grace) / 86_400
+    }
+    if let budget = space.budgetBytes {
+      limitBudget = true
+      budgetGB = Double(budget) / 1_000_000_000
+    }
+    materialize = space.checkoutPath != nil
+    checkoutPath = space.checkoutPath ?? ""
   }
 
   private func apply() {
     let id = space.id
     switch choice {
     case .off:
-      let alsoRelease = release
-      node.enqueue { await node.setReplication(id: id, stop: true, release: alsoRelease) }
+      let preserve = pinHeld
+      node.enqueue { await node.removeReplica(id: id, pinHeld: preserve) }
     case .policy(let policy):
-      let grace = policy == .tree ? Int64(graceDays * 86_400) : nil
-      let budget = limitBudget ? UInt64(budgetGB * 1_000_000_000) : nil
+      let originalGraceDays = space.graceSeconds.map { Double($0) / 86_400 }
+      let graceChanged = policy == .current
+        && (space.replicate != .current || originalGraceDays != graceDays)
+      let grace = graceChanged ? Int64((graceDays * 86_400).rounded()) : nil
+      let originalBudgetGB = space.budgetBytes.map { Double($0) / 1_000_000_000 }
+      let budgetChanged = limitBudget
+        && (originalBudgetGB == nil || originalBudgetGB != budgetGB)
+      let budget = budgetChanged ? UInt64((budgetGB * 1_000_000_000).rounded()) : nil
+      let noBudget = space.isReplicating && space.budgetBytes != nil && !limitBudget
       node.enqueue {
-        await node.setReplication(id: id, replicate: policy, grace: grace, budget: budget)
+        await node.configureReplica(
+          id: id, retention: policy, grace: grace, budget: budget, noBudget: noBudget,
+          checkout: materialize ? checkoutPath : nil,
+          noCheckout: !materialize && space.checkoutPath != nil)
       }
     }
     dismiss()

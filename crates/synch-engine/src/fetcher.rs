@@ -115,7 +115,7 @@ pub struct FetchReport {
     ///
     /// The total says a fetch was cheap; the breakdown says which of this
     /// node's objects made it cheap, which is what an operator looking at a
-    /// mirror that suddenly stopped reusing anything needs to see.
+    /// checkout that suddenly stopped reusing anything needs to see.
     pub reused: Vec<(Donor, ChunkRanges)>,
     /// How many providers were contacted, for proofs and for slices alike.
     pub providers_tried: usize,
@@ -175,7 +175,7 @@ impl Node {
         // to prevent.
         //
         // An unmeasured peer sorts into the middle rather than behind every
-        // measured one. `i64::MAX / 2` put a fast new local mirror behind a peer
+        // measured one. `i64::MAX / 2` put a fast new local checkout behind a peer
         // measured at 400 ms, and nothing would measure it until something else
         // happened to pick it — a peer with no measurement is unknown, not slow.
         let mut rng = jitter_state();
@@ -508,7 +508,7 @@ impl Node {
         if !report.fetched.is_empty() || !report.promoted.is_empty() {
             // Promoted groups count as progress exactly as fetched ones do:
             // they are verified, they are held, and the point of advertising
-            // them is that other mirrors of the same space can then delta from
+            // them is that other replicas of the same space can then delta from
             // *this* node rather than from the origin (§3.4, §6.3).
             //
             // Publishing an updated ad is a trie write and a signed head, so
@@ -567,7 +567,7 @@ impl Node {
     /// under `newest` leaves lying around.
     ///
     /// Candidates, not donors: whether this node holds any of them is
-    /// [`Node::donors_for`]'s question. A mirror asks this one because it needs
+    /// [`Node::donors_for`]'s question. A checkout asks this one because it needs
     /// the names of the versions it *fails* to hold — a root missing from the
     /// CAS that the file on its disk turns out to be is a donor one `ingest`
     /// away (§3.2).
@@ -967,14 +967,14 @@ impl Node {
     /// [`group_count`] counts an empty object as one group so that "complete"
     /// is representable, but bao encodes nothing over an empty tree, so every
     /// window comes back served-nothing, the fetch runs out of providers with
-    /// that group still missing, and a mirror reports the path as `no provider
+    /// that group still missing, and a checkout reports the path as `no provider
     /// could serve the content` (§6.4).
     ///
     /// Nobody has to serve it. An empty object's content is settled by its
     /// size, and its root is what BLAKE3 gives for no input — so this node can
     /// produce the object itself and get, byte for byte and hash for hash, what
     /// a provider would have sent. Ingesting it here is also what leaves the
-    /// CAS row every later read goes through: `synch cat`, `get`, and `take` of
+    /// CAS row every later read goes through: `synch cat`, `get`, and adoption of
     /// an empty file all resolve through the store like any other object.
     async fn take_empty_object(&self, root: &Hash) -> Result<FetchReport> {
         let mut report = FetchReport::default();
@@ -1010,8 +1010,8 @@ impl Node {
     /// hints it already has; and a root that nobody could name is remembered as
     /// a miss and left alone for a while (§6.3). Without either, a root nobody
     /// holds — an origin publishing `f:` records whose content hashes name
-    /// nothing — is re-planned by every mirror pass and re-dials every peer in
-    /// the cluster on each one, sequentially, so the victim's mirror can be
+    /// nothing — is re-planned by every checkout pass and re-dials every peer in
+    /// the cluster on each one, sequentially, so the victim's checkout can be
     /// made never to finish a pass and never to do the work it exists for.
     /// The miss expires, so a root that is published later is still picked up,
     /// and a root a local ad covers never reaches this at all.
@@ -1278,7 +1278,7 @@ impl Node {
             .intersect(&ChunkRanges::single(0, group_count(entry.size)));
         // Every read path resolved an entry to get here, which means the
         // lineage that makes delta possible is already in hand: `synch cat`, a
-        // `take`, and the gateway's reads all get the descent for the price of
+        // adoption and the gateway's reads all get the descent for the price of
         // one `VersionSet` lookup (§3.5).
         //
         // A *ranged* read has to earn it, though. Promotion works a span at a
@@ -1373,7 +1373,7 @@ impl Node {
     }
 
     /// Reads one origin's entry in full — the pinned form of
-    /// [`Node::read_path`], which is what `synch take` adopts from.
+    /// [`Node::read_path`], which is what `synch adopt path` adopts from.
     pub async fn read_entry(&self, origin: &OriginId, space: &str, path: &str) -> Result<Vec<u8>> {
         self.read_path(space, path, &VersionPolicy::Origin(origin.clone()))
             .await
@@ -1382,8 +1382,8 @@ impl Node {
     /// Materializes an object the CAS already holds onto the filesystem
     /// (`docs/DELTA-SYNC.md` §3.5).
     ///
-    /// The one way an object becomes a file. A mirror writing its copy (§7.2),
-    /// `synch take` adopting a peer's version (§8), and the gateway's
+    /// The one way an object becomes a file. A checkout writing its copy (§7.2),
+    /// `synch adopt path` adopting a peer's version (§8), and the gateway's
     /// fetch-to-file all come through here, and all of them get the same
     /// guarantees: the target is old-or-new and never half, no staging residue
     /// is left behind on any path, and the object is never held in memory.
@@ -1396,13 +1396,13 @@ impl Node {
     /// The payload is **cloned**, not copied. `FICLONE` on btrfs, XFS or
     /// bcachefs shares the CAS payload's extents with the new file: O(1),
     /// no data moved, and no second copy of the object on the disk until one of
-    /// the two is written to. Where the ioctl cannot apply — the mirror is on a
+    /// the two is written to. Where the ioctl cannot apply — the checkout is on a
     /// different filesystem from the CAS, ext4, a platform without it — the
     /// fallback is `std::fs::copy`, itself a kernel-side `copy_file_range` on
     /// Linux with no bounce through user space. Small objects live in the index
     /// rather than in a file (§6.2) and are written straight out of it.
     ///
-    /// Returns which of those happened, which is what a mirror reports.
+    /// Returns which of those happened, which is what a checkout reports.
     pub(crate) async fn materialize_blob(
         &self,
         root: &Hash,
@@ -1670,7 +1670,7 @@ mod tests {
     }
 
     /// Discovery stops at the first answer and backs off after a fruitless
-    /// round — or every mirror pass would re-dial the cluster (§6.3).
+    /// round — or every checkout pass would re-dial the cluster (§6.3).
     #[tokio::test]
     async fn provider_discovery_stops_early_and_then_backs_off() {
         let (_d, node) = node().await;

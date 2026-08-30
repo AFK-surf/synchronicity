@@ -47,7 +47,7 @@ extension View {
 }
 
 #if DEBUG
-/// The request the weaker gates get, from `space rm` — the operation whose
+/// The request the weaker gates get, from `source rm` — the operation whose
 /// consequence is mostly a correction of what the user thinks it does.
 private func previewStopSharing() -> ConfirmationRequest {
   ConfirmationRequest(
@@ -100,7 +100,7 @@ private struct ConfirmedActionPreview: View {
   ConfirmedActionPreview(
     ConfirmationRequest(
       title: "Stop the background service?",
-      consequence: "Sharing, mirrors and remote browsing stop immediately. This app loses its connection, and nothing on that socket can start the service again — you will need a terminal.",
+      consequence: "Publishing, replication, checkouts, and remote browsing stop immediately. This app loses its connection, and nothing on that socket can start the service again — you will need a terminal.",
       verb: "Stop",
       gate: .typed,
       typedPhrase: "stop",

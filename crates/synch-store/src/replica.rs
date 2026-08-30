@@ -1,7 +1,7 @@
-//! The replication tables: what a replicated space wants, and what it holds
+//! The replication tables: what a replica wants, and what it holds
 //! (`docs/REPLICATION.md` §3.3, §3.4).
 //!
-//! Two rows describe one object's journey through a replica. A `replica_want`
+//! Two rows describe one object's journey through a replica. A `content_want`
 //! row is *intent* — this space needs these bytes and does not have them — and
 //! a `pins` row is *possession*. Nothing is ever both: the fetch loop deletes
 //! the want and inserts the pin in one transaction, so a crash between them
@@ -55,7 +55,7 @@ use synch_core::Hash;
 
 use crate::{db::hash_column, db::Store, error::Result, PinHolder};
 
-/// One object a replicated space needs and does not hold.
+/// One object a replica needs and does not hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WantRow {
     /// The object root.
@@ -77,7 +77,7 @@ pub struct WantRow {
     pub last_error: Option<String>,
 }
 
-/// What a replicated space holds, wants, and is about to let go of.
+/// What a replica holds, wants, and is about to let go of.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplicaCoverage {
     /// Objects pinned for this space.
@@ -115,7 +115,7 @@ impl Store {
         now: i64,
     ) -> Result<bool> {
         let staged = self.conn().execute(
-            "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+            "INSERT INTO content_want (root, holder, size, prev, first_wanted)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(root, holder) DO NOTHING",
             params![
@@ -132,17 +132,9 @@ impl Store {
     /// Drops one want, whether it was satisfied or has stopped being wanted.
     pub fn drop_want(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
         Ok(self.conn().execute(
-            "DELETE FROM replica_want WHERE root = ?1 AND holder = ?2",
+            "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder.render()],
         )? > 0)
-    }
-
-    /// Drops every want one holder has, for `--no-replicate`.
-    pub fn drop_wants(&self, holder: &PinHolder) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM replica_want WHERE holder = ?1",
-            params![holder.render()],
-        )?)
     }
 
     /// Retires a want by taking possession, in one transaction.
@@ -168,10 +160,17 @@ impl Store {
             if !held {
                 return Ok(false);
             }
-            tx.execute(
-                "DELETE FROM replica_want WHERE root = ?1 AND holder = ?2",
+            let wanted = tx.execute(
+                "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
                 params![root.as_bytes().to_vec(), holder.render()],
             )?;
+            // Role removal deletes its wants before releasing its pins.  The
+            // delete and this check share the write transaction, so a fetch
+            // which finishes after that point cannot resurrect an orphaned
+            // source/replica claim.
+            if wanted == 0 {
+                return Ok(false);
+            }
             tx.execute(
                 "INSERT INTO pins (root, holder, created_at, release_after)
                  VALUES (?1, ?2, ?3, NULL)
@@ -191,7 +190,7 @@ impl Store {
         error: &str,
     ) -> Result<()> {
         self.conn().execute(
-            "UPDATE replica_want
+            "UPDATE content_want
                 SET attempts = attempts + 1, last_attempt = ?3, last_error = ?4
               WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder.render(), now, error],
@@ -221,7 +220,7 @@ impl Store {
     /// accumulated thousands of attempts cannot overflow it.
     /// `rotate` is which space leads this round. The interleave is fair over
     /// the whole window, but the caller admits only the first `limit` rows, and
-    /// `replicated_spaces` is ordered by id — so with more spaces than
+    /// `replicas` is ordered by id — so with more spaces than
     /// `replica_concurrency` the same leading few would be served for ever and
     /// the rest would wait out the first's backlog. Advancing it by one per
     /// pass gives every space the lead within one turn of the list.
@@ -241,7 +240,22 @@ impl Store {
         // at four objects a pass. Rarity is the right order *within* a space;
         // between spaces the only defensible order is a turn each.
         let mut per_space = Vec::new();
-        for space in self.replicated_spaces()? {
+        // Source repair is first: a published own entry is a stronger promise
+        // than filling out an additional replica copy.
+        for source in self.sources()? {
+            let holder = PinHolder::Source(source.space);
+            let ready = self.wants_ready_of(
+                &holder,
+                now,
+                min_backoff,
+                max_backoff,
+                limit * RARITY_WINDOW,
+            )?;
+            if !ready.is_empty() {
+                per_space.push(self.rank_rarest_first(ready)?.into_iter());
+            }
+        }
+        for space in self.replicas()? {
             let ready = self.wants_ready_of(
                 &space.holder(),
                 now,
@@ -282,10 +296,26 @@ impl Store {
         Ok(out)
     }
 
+    /// Ready wants for one holder, rarity-ranked. Used by an explicit
+    /// `replica sync <space>` so work for unrelated roles cannot consume its
+    /// bounded pass.
+    pub fn wants_to_attempt_of(
+        &self,
+        holder: &PinHolder,
+        now: i64,
+        min_backoff: i64,
+        max_backoff: i64,
+        limit: usize,
+    ) -> Result<Vec<WantRow>> {
+        let ready =
+            self.wants_ready_of(holder, now, min_backoff, max_backoff, limit * RARITY_WINDOW)?;
+        self.rank_rarest_first(ready)
+    }
+
     /// One holder's oldest ready wants, in `first_wanted` order.
     ///
     /// Filtered by holder, which is what lets SQLite walk
-    /// `replica_want_by_holder` and stop as soon as it has enough. A global
+    /// `content_want_by_holder` and stop as soon as it has enough. A global
     /// `ORDER BY first_wanted` over a holder-leading index cannot be served by
     /// it: the plan is a scan of the whole queue plus a temp-B-tree sort, on
     /// every pass, on the one write connection that publishes and GC also want.
@@ -302,7 +332,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT root, holder, size, prev, first_wanted, attempts, last_attempt, last_error
-               FROM replica_want
+               FROM content_want
               WHERE holder = ?1
                 AND (last_attempt IS NULL
                      OR last_attempt
@@ -347,7 +377,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT root, holder, size, prev, first_wanted, attempts, last_attempt, last_error
-               FROM replica_want WHERE holder = ?1 ORDER BY first_wanted ASC",
+               FROM content_want WHERE holder = ?1 ORDER BY first_wanted ASC",
         )?;
         let rows = stmt.query_map(params![holder.render()], want_row)?;
         collect_wants(rows)
@@ -371,7 +401,7 @@ impl Store {
     pub fn stage_space_wants(&self, space: &str, holder: &PinHolder, now: i64) -> Result<usize> {
         self.with_immediate_tx(|tx| {
             // Content already held durably needs a claim, not a fetch. A
-            // replicated space that also has a checkout would otherwise queue a
+            // replica that also has a checkout would otherwise queue a
             // want for every file it publishes itself — bytes it just ingested
             // — and send each one round the fetch loop to discover that. Gated
             // on `durable` rather than `complete`, because on a cloud backend a
@@ -391,14 +421,14 @@ impl Store {
             // header says cannot happen — and `replica_coverage` counts the
             // object in both totals while `complete` stays false for ever.
             tx.execute(
-                "DELETE FROM replica_want
+                "DELETE FROM content_want
                   WHERE holder = ?1
                     AND EXISTS (SELECT 1 FROM pins p
-                                 WHERE p.root = replica_want.root AND p.holder = ?1)",
+                                 WHERE p.root = content_want.root AND p.holder = ?1)",
                 params![holder.render()],
             )?;
             Ok(tx.execute(
-                "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+                "INSERT INTO content_want (root, holder, size, prev, first_wanted)
                  SELECT DISTINCT e.content, ?2, e.size, e.prev, ?3
                    FROM entries e
                   WHERE e.space = ?1
@@ -416,7 +446,7 @@ impl Store {
     ///
     /// Content that comes back is content that stays. The same root reappears
     /// often enough to be worth a statement of its own: another origin
-    /// publishing the same bytes, a `take` adopting them, a file restored from
+    /// publishing the same bytes, `adopt path` selecting them, a file restored from
     /// a copy — and in every case the release was decided against a tree that
     /// has since changed its mind.
     pub fn clear_returned_releases(&self, holder: &PinHolder) -> Result<usize> {
@@ -453,6 +483,9 @@ impl Store {
                 "UPDATE pins SET release_after = ?2
                   WHERE holder = ?1
                     AND release_after IS NULL
+                    AND EXISTS (SELECT 1 FROM replicas r
+                                 WHERE 'replica:' || r.space = ?1
+                                   AND r.retention = 'current')
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND {VIEW_IS_COMPLETE}"
             ),
@@ -485,6 +518,9 @@ impl Store {
                 "UPDATE pins SET release_after = ?2
                   WHERE holder = ?1
                     AND release_after IS NULL
+                    AND EXISTS (SELECT 1 FROM replicas r
+                                 WHERE 'replica:' || r.space = ?1
+                                   AND r.retention = 'current')
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND (SELECT COUNT(*) FROM blob_providers p
                           WHERE p.object_root = pins.root AND p.complete != 0
@@ -503,7 +539,7 @@ impl Store {
         }
         // The view predicate is here too, so a paused view is never reported as
         // the replication floor holding things back: they are different reasons
-        // and `space ls` prints them on different lines.
+        // and `replica ls` prints them on different lines.
         Ok(self.conn().query_row(
             &format!(
                 "SELECT COUNT(*) FROM pins
@@ -549,7 +585,7 @@ impl Store {
         Ok(out)
     }
 
-    /// What one space holds and wants, for `space ls <id>`.
+    /// What one replica holds and wants, for `replica ls <id>`.
     ///
     /// `unreachable_after` is how many failed attempts make a want an alarm
     /// rather than a backlog: those are versions whose last provider left
@@ -594,7 +630,7 @@ impl Store {
             "SELECT COUNT(*), COALESCE(SUM(size), 0),
                     COALESCE(SUM(attempts >= ?2), 0),
                     COALESCE(SUM(CASE WHEN attempts >= ?2 THEN size ELSE 0 END), 0)
-               FROM replica_want WHERE holder = ?1",
+               FROM content_want WHERE holder = ?1",
             params![holder, unreachable_after],
             |row| {
                 Ok((
@@ -626,7 +662,7 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT MIN(first_wanted) FROM replica_want
+                "SELECT MIN(first_wanted) FROM content_want
                   WHERE holder = ?1 AND attempts < ?2",
                 params![holder.render(), unreachable_after],
                 |row| row.get::<_, Option<i64>>(0),
@@ -664,7 +700,7 @@ impl Store {
     }
 }
 
-/// The columns of one `replica_want` row, before they become a [`WantRow`].
+/// The columns of one `content_want` row, before they become a [`WantRow`].
 type RawWant = (
     Vec<u8>,
     String,
@@ -697,11 +733,11 @@ where
     for row in rows {
         let (root, holder, size, prev, first_wanted, attempts, last_attempt, last_error) = row?;
         out.push(WantRow {
-            root: hash_column(root, "replica_want.root")?,
+            root: hash_column(root, "content_want.root")?,
             holder: PinHolder::parse(&holder),
             size: size as u64,
             prev: prev
-                .map(|bytes| hash_column(bytes, "replica_want.prev"))
+                .map(|bytes| hash_column(bytes, "content_want.prev"))
                 .transpose()?,
             first_wanted,
             attempts,
@@ -722,6 +758,18 @@ mod tests {
         PinHolder::Replica("media".into())
     }
 
+    fn configure_replica(store: &Store, space: &str) {
+        store
+            .put_replica(&crate::ReplicaRow {
+                space: space.into(),
+                retention: ReplicaPolicy::Current,
+                grace: Some(30 * 24 * 3600),
+                budget: None,
+                checkout_path: None,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn a_want_becomes_a_pin_and_never_both() {
         let (_dir, store) = store();
@@ -738,6 +786,56 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_want_cannot_become_an_orphaned_pin() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        assert!(store.stage_want(&root, &media(), 7, None, 1).unwrap());
+        assert!(store.drop_want(&root, &media()).unwrap());
+
+        assert!(!store.take_possession(&root, &media(), 2).unwrap());
+        assert!(store.pins_for(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_source_drops_its_repair_intent_and_hold() {
+        let (_dir, store) = store();
+        let held = store.ingest_bytes(b"held", 0).unwrap();
+        let repairing = synch_core::Hash::new(b"missing");
+        let holder = PinHolder::Source("media".into());
+        store
+            .put_source("media", crate::SourceKind::Api, None)
+            .unwrap();
+        store.pin(&held, &holder, 1).unwrap();
+        store.stage_want(&repairing, &holder, 7, None, 1).unwrap();
+
+        assert!(store.remove_source("media").unwrap());
+        assert!(store.wants_of(&holder).unwrap().is_empty());
+        assert!(store.pins_for(&held).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replica_removal_preserves_exactly_the_holds_committed_before_it() {
+        let (_dir, store) = store();
+        configure_replica(&store, "media");
+        let held = store.ingest_bytes(b"held", 0).unwrap();
+        let fetching = store.ingest_bytes(b"fetching", 0).unwrap();
+        store.pin(&held, &media(), 1).unwrap();
+        store
+            .stage_want(&fetching, &media(), b"fetching".len() as u64, None, 1)
+            .unwrap();
+
+        assert!(store.remove_replica("media", true, 2).unwrap());
+        assert!(store.replica("media").unwrap().is_none());
+        assert!(store.wants_of(&media()).unwrap().is_empty());
+        assert_eq!(
+            store.pins_for(&held).unwrap()[0].holder,
+            PinHolder::Operator
+        );
+        assert!(!store.take_possession(&fetching, &media(), 3).unwrap());
+        assert!(store.pins_for(&fetching).unwrap().is_empty());
+    }
+
+    #[test]
     fn possession_of_content_that_is_not_here_is_refused() {
         let (_dir, store) = store();
         let absent = synch_core::Hash::new(b"absent");
@@ -750,6 +848,7 @@ mod tests {
     #[test]
     fn a_release_is_scheduled_when_nothing_names_the_root_and_cleared_when_something_does() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
@@ -771,6 +870,28 @@ mod tests {
             .unwrap();
         assert_eq!(store.clear_returned_releases(&media()).unwrap(), 1);
         assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
+    }
+
+    #[test]
+    fn forever_configuration_cancels_every_scheduled_release() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+        store.schedule_release(&root, &media(), 500).unwrap();
+
+        store
+            .put_replica(&crate::ReplicaRow {
+                space: "media".into(),
+                retention: ReplicaPolicy::Forever,
+                grace: None,
+                budget: None,
+                checkout_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
+        assert_eq!(store.schedule_stale_releases(&media(), 900).unwrap(), 0);
+        assert_eq!(store.expire_pins_of(&media(), i64::MAX).unwrap(), 0);
     }
 
     #[test]
@@ -874,6 +995,7 @@ mod tests {
     #[test]
     fn a_release_is_refused_while_a_head_sits_pending() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let first = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&first, &media(), 1).unwrap();
 
@@ -898,6 +1020,7 @@ mod tests {
     #[test]
     fn a_release_is_refused_while_a_bound_origin_has_published_nothing_here() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
@@ -933,7 +1056,7 @@ mod tests {
             )
             .unwrap();
 
-        // A replicated space that also has a checkout publishes its own files;
+        // A replica that also has a checkout publishes its own files;
         // the bytes are in the CAS the moment the entry is. Sending them round
         // the fetch loop to discover that is work nobody needs.
         assert_eq!(store.stage_space_wants("media", &media(), 5).unwrap(), 0);
@@ -944,6 +1067,7 @@ mod tests {
     #[test]
     fn the_replication_floor_does_not_count_this_node_as_a_peer() {
         let (_dir, store) = store();
+        configure_replica(&store, "media");
         let root = store.ingest_bytes(b"the last copy", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
         store
@@ -1073,7 +1197,7 @@ mod tests {
         store.record_remote_durable_blob(&root, 4096, 1).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
-        // No entry names it — an `archive` replica's pins over superseded roots
+        // No entry names it — a `forever` replica's pins over superseded roots
         // stand for ever by design, and nothing else in the tree points at
         // them. The size is still known from this node's own row, and
         // `blob_providers` survives independently of `entries`, so the object
@@ -1089,12 +1213,8 @@ mod tests {
     #[test]
     fn one_space_with_a_backlog_does_not_starve_another() {
         let (_dir, store) = store();
-        store.put_detached_space("archive").unwrap();
-        store.put_detached_space("docs").unwrap();
         for id in ["archive", "docs"] {
-            store
-                .set_space_policy(id, Some(ReplicaPolicy::Tree))
-                .unwrap();
+            configure_replica(&store, id);
         }
         let archive = PinHolder::Replica("archive".into());
         let docs = PinHolder::Replica("docs".into());
@@ -1142,10 +1262,7 @@ mod tests {
         // property holds trivially.
         let ids = ["a", "b", "c", "d", "e", "f"];
         for (n, id) in ids.iter().enumerate() {
-            store.put_detached_space(id).unwrap();
-            store
-                .set_space_policy(id, Some(ReplicaPolicy::Tree))
-                .unwrap();
+            configure_replica(&store, id);
             store
                 .stage_want(
                     &synch_core::Hash::new(id.as_bytes()),
@@ -1199,31 +1316,23 @@ mod tests {
     }
 
     #[test]
-    fn replication_is_a_property_of_a_space_and_the_two_halves_are_independent() {
+    fn source_and_replica_rows_are_independent() {
         let (_dir, store) = store();
-        store.put_space("media", Some("/srv/media")).unwrap();
         store
-            .set_space_policy("media", Some(ReplicaPolicy::Tree))
+            .put_source("media", crate::SourceKind::Filesystem, Some("/srv/media"))
             .unwrap();
-        store.set_space_grace("media", 60).unwrap();
-        let space = store.space("media").unwrap().unwrap();
-        assert_eq!(space.local_path.as_deref(), Some("/srv/media"));
-        assert_eq!(space.replicate, Some(ReplicaPolicy::Tree));
-        assert_eq!(space.grace_secs(), 60);
-
-        // Re-pointing the checkout leaves the replication half alone.
-        store.put_space("media", Some("/srv/media2")).unwrap();
-        let space = store.space("media").unwrap().unwrap();
-        assert_eq!(space.replicate, Some(ReplicaPolicy::Tree));
-
-        // And turning replication off leaves the checkout alone.
-        store.set_space_policy("media", None).unwrap();
-        let space = store.space("media").unwrap().unwrap();
-        assert_eq!(space.local_path.as_deref(), Some("/srv/media2"));
-        assert!(space.replicate.is_none());
-        // The grace window survives the policy being cleared, because the two
-        // are set separately: turning replication back on must not silently
-        // hand the space a different recovery window from the one configured.
-        assert_eq!(space.grace_secs(), 60);
+        store
+            .put_replica(&crate::ReplicaRow {
+                space: "media".into(),
+                retention: ReplicaPolicy::Current,
+                grace: Some(60),
+                budget: None,
+                checkout_path: None,
+            })
+            .unwrap();
+        assert!(store.remove_source("media").unwrap());
+        let replica = store.replica("media").unwrap().unwrap();
+        assert_eq!(replica.retention, ReplicaPolicy::Current);
+        assert_eq!(replica.grace_secs(), 60);
     }
 }

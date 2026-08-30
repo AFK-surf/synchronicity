@@ -911,14 +911,14 @@ final class FilesModel {
         commandLine: "synch pin add \(previousRoot)", deadline: .long, quiet: true)
     }
     let reference = Cmd.reference(origin: attestor, space: entry.space, path: entry.path)
-    // `take` declares `.listing` among its dirties, so `run` refreshes the
+    // `adopt path` declares `.listing` among its dirties, so `run` refreshes the
     // listing itself and the window reloads from that. Calling `reload()` here
     // as well was a second listing for one click — and the version refresh
     // that followed it looked the new row up in `rows`, which the other reload
     // had just emptied, so it usually found nothing and skipped.
     await store.run(
-      Operations.require("take"), Cmd.take(reference),
-      commandLine: "synch take \(Shell.quote(reference))", deadline: .long)
+      Operations.require("adopt.path"), Cmd.adoptPath(reference),
+      commandLine: "synch adopt path \(Shell.quote(reference))", deadline: .long)
     await loadVersions(for: entry)
   }
 }

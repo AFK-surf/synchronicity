@@ -12,7 +12,7 @@ earlier draft of this design, this document has been corrected to describe the
 built thing, and says so at each point.
 
 A **socket** is a file in a node's published tree whose content is an eBPF ELF
-object. A peer runs `synch connect nas:code/git.sock`; the connection lands on
+object. A peer runs `synch socket connect nas:code/git.sock`; the connection lands on
 `nas`, which resolves that path *in its own trie*, loads the object from *its
 own* CAS, and runs it under [async-ebpf][ae] — one invocation per incoming
 stream. The caller supplies bytes and a verified identity. It never supplies
@@ -41,7 +41,7 @@ A socket has two sides and they are not mirror images.
 > Therefore the connecting side ships bytes, not programs — and needs no eBPF
 > runtime at all.
 
-The client half of `synch connect` is a byte pump. The server half is the whole
+The client half of `synch socket connect` is a byte pump. The server half is the whole
 of the runtime. That split is what makes the security story tractable: there is
 no code-shipping channel to audit, no signature scheme for programs in flight,
 no question of whose sandbox a peer's program runs in. The only thing a caller
@@ -58,7 +58,7 @@ the *gate* is that the callee already chose to publish and arm the program.
 
 It also buys portability where it matters. async-ebpf runs on Linux, macOS and
 OpenBSD, on x86-64 and arm64. Serving sockets is gated to those targets.
-`synch connect` is not, because it executes nothing.
+`synch socket connect` is not, because it executes nothing.
 
 ## 2. What a socket is in the tree
 
@@ -110,13 +110,13 @@ keeping `m:space/<id>` an exact key rather than a prefix, and it is decisive.
 
 The kind of an entry is what *this* origin says about *its own* copy — like
 `unix_mode`, and unlike content. It comes from a local declaration (`synch
-socket add`, §3), never from a peer. So:
+socket declare`, §3), never from a peer. So:
 
-- `synch take nas:code/git.sock` fetches the ELF bytes and writes them into the
+- `synch adopt path nas:code/git.sock` fetches the ELF bytes and writes them into the
   local space. The next scan publishes them as `EntryKind::File`, because this
   node never declared that path a socket. **Adopting a socket adopts its bytes,
   not its socket-ness** — and certainly not its executability.
-- `synch fill`, `synch mirror sync` and the S3 gateway behave identically: a
+- `synch adopt tree`, `synch replica sync` and the S3 gateway behave identically: a
   `Socket` entry materializes as a regular file containing the ELF, which is
   exactly what it is on the publisher's disk too.
 - A path where `nas` publishes `Socket` and `laptop` publishes `File` over the
@@ -126,7 +126,7 @@ socket add`, §3), never from a peer. So:
 ### 2.3 Selection does not apply
 
 Reading a bare `<space>/<path>` picks a version by policy — `newest`,
-`origin=`, `strict` (§8). **Connecting to one does not.** `synch connect`
+`origin=`, `strict` (§8). **Connecting to one does not.** `synch socket connect`
 requires an origin-qualified path, always, and the node resolves it in that
 origin's trie only. There is no "the socket at `code/git.sock`"; there is only
 "nas's socket".
@@ -139,20 +139,20 @@ here and never a dispatch one.
 ## 3. Arming: how code gets into a node's own tree
 
 "Only its own tree" is a strong rule, but a node's own tree is not a closed
-system. Several existing commands write bytes into a space directory that the
+system. Several existing commands write bytes into a filesystem-source directory that the
 scanner then publishes as this node's own view. Enumerating them is the whole
 threat model:
 
 - your editor, which is the intended path;
-- `synch take`, which adopts a peer's bytes;
-- `synch fill --force`, which does the same in bulk;
-- an S3 gateway `PUT`, which writes into a space directory over the network.
+- `synch adopt path`, which adopts a peer's bytes;
+- `synch adopt tree --replace`, which does the same in bulk;
+- an S3 gateway `PUT`, which writes into a filesystem-source directory over the network.
 
 Every one of these is an existing, sanctioned way to change what this node
 publishes. So publication is not, and must not be, the gate. Two locally-held
 gates stand between a published socket entry and an invocation:
 
-1. **Declaration.** `synch socket add code/git.sock` records that this path, in
+1. **Declaration.** `synch socket declare code/git.sock` records that this path, in
    this space, is a socket. That is what makes the scanner publish
    `kind: Socket`. It is local state, never adopted from a peer, and never
    replicated.
@@ -161,11 +161,11 @@ gates stand between a published socket entry and an invocation:
    { NotArmed }`, naming both roots. In-flight invocations keep running the root
    they started on.
 
-`synch socket add --auto` follows the file: it re-arms on every content change
+`synch socket declare --auto` follows the file: it re-arms on every content change
 and skips the second gate forever. It is correct for a path you are the only
-writer of and wrong for any path an S3 key, a fill or a take can reach. `synch
+writer of and wrong for any path a read-write S3 key or adoption can reach. `synch
 socket ls` marks every `--auto` socket, because that list is the honest answer
-to "what can execute here?", and `synch socket add` says what `--auto` costs at
+to "what can execute here?", and `synch socket declare` says what `--auto` costs at
 the moment it is asked for.
 
 ### 3.1 The init hook is what makes arming meaningful
@@ -421,7 +421,7 @@ one meaning per errno — is specified in `docs/HANDLES.md`.
 | `sy_monotonic_ns()` | Monotonic since invocation start. What a timeout should be written against. |
 | `sy_getrandom(out, len)` | CSPRNG bytes. |
 | `sy_version(out, len)` | The daemon's version string. |
-| `sy_config_get(k, klen, out, olen)` | Reads a key from `synch socket add --config k=v`. |
+| `sy_config_get(k, klen, out, olen)` | Reads a key from `synch socket declare --config k=v`. |
 | `sy_metric_add(name, len, delta)` | Bumps a named counter shown by `synch socket ps`. |
 | `sy_label_set(k, klen, v, vlen)` | Labels this invocation's row in `synch socket ps`. |
 
@@ -810,14 +810,14 @@ place the program sleeps.
 ## 9. Command surface
 
 ```
-synch socket add <space>/<path> [--config k=v]…       declare a path in one of my spaces
+synch socket declare <space>/<path> [--config k=v]…       declare a path in one of my spaces
                  [--max-streams <n>] [--auto]         to be a socket: the next scan
                                                       publishes it as kind=Socket
 synch socket arm <space>/<path>                       inspect the current root and what
                                                       the program declares
 synch socket arm <space>/<path> --review <hex>        approve exactly the inspection
 synch socket disarm <space>/<path>                    keep publishing it, stop running it
-synch socket rm <space>/<path>                        republish as an ordinary file
+synch socket undeclare <space>/<path>                        republish as an ordinary file
 synch socket ls [<space>] [-l]                        mine: armed root, drift, declarations
 synch socket ps [<space>/<path>]                      live invocations: peer, age, bytes,
                                                       handles, labels, counters
@@ -829,7 +829,7 @@ synch socket build <file.c> [-o <file.o>]             compile C to the eBPF obje
                    [-D NAME[=VALUE]]… [--clang]       socket is made of; --clang uses
                                                       optimized system clang/llc
 
-synch connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
+synch socket connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
               [--meta k=v]…                           stream → stdout, exit code from
               [--listen <addr:port>] [--once]         Closed{status}
 ```
@@ -882,7 +882,7 @@ build against the same runtime that serves them.
 
 DESIGN.md §9.1 is categorical that the daemon owns the node and the CLI is only
 a client of it — one endpoint, one lifecycle, no second iroh endpoint sharing
-the device key. `synch connect` obeys that: it opens a bidirectional
+the device key. `synch socket connect` obeys that: it opens a bidirectional
 control-socket stream, and the daemon bridges it to a QUIC stream on the remote
 node.
 
@@ -929,7 +929,7 @@ own.
 
 | What happens | Stream | And then |
 | --- | --- | --- |
-| Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch connect` exits `n & 0xff`. Bytes still queued to any endpoint drain first, inside §10's teardown budget. |
+| Program returns `n` | clean FIN | `Closed{Ok(n)}`. `synch socket connect` exits `n & 0xff`. Bytes still queued to any endpoint drain first, inside §10's teardown budget. |
 | Idle deadline reached | clean FIN | `Closed{Deadline}`, exit 73. The deadline is measured from the last progress, so a proxy with traffic never sees it; a caller holding a stream open with nothing happening is ended and told to come back. |
 | Caller's connection dies, or its stream resets | — | `Closed{Deadline}` to whoever still holds the control stream. Nothing the guest produces can be delivered to a caller whose transport has failed, so the runtime ends the invocation rather than holding a slot, a worker placement and its rings for it — one caller must not be able to pin every stream on a socket and then disconnect. The same ending covers a caller that FINs cleanly and *then* closes the connection: the stream itself never fails (the runtime's reader has already exited on the FIN), so `sync/sock/1` watches `Connection::closed` and signals the invocation separately. A caller's clean FIN alone is not this: a half-close is normal, and a proxy works past it. |
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
@@ -1006,7 +1006,7 @@ Worth building next:
   suit metrics and notification sockets, where a bidirectional stream is all
   overhead.
 - **`synch socket forward`** — a daemon-hosted listener with a lifecycle, for
-  the case `synch connect --listen` is currently standing in for.
+  the case `synch socket connect --listen` is currently standing in for.
 - **`sy_synch_connect(origin, path)`** — a socket calling another node's socket
   over iroh rather than TCP, so a composition of sockets stays inside the
   authenticated fabric instead of falling back to the network underneath it.

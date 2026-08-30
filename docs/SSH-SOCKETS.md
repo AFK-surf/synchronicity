@@ -59,7 +59,7 @@ authority. It grants access only to behavior the already-armed program can
 perform. Any effect behind the accepted connection remains governed by its own
 declaration.
 
-This matters when a member runs `synch connect --listen`: many ordinary TCP
+This matters when a member runs `synch socket connect --listen`: many ordinary TCP
 clients may then arrive under that member's authenticated Synchronicity
 identity. The eBPF program can use SSH authentication to distinguish them. The
 outer identity from `sy_peer_*` remains a transport-authenticated fact; SSH
@@ -1058,7 +1058,7 @@ The daemon logs the SHA-256 fingerprint when it loads or creates the key. A
 stock client can use the existing byte pump directly:
 
 ```sh
-ssh -o 'ProxyCommand=synch connect %h:code/ssh.sock' nas
+ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
 ```
 
 The first SSH host-key exchange already travels through a mutually
@@ -1690,7 +1690,7 @@ invocation's ordinary handle and channel limits.
 A stock client reaches it through the existing transport bridge:
 
 ```sh
-ssh -o 'ProxyCommand=synch connect %h:code/ssh.sock' nas
+ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
 ```
 
 ### 15.3 Tree-backed `authorized_keys` and fixed commands

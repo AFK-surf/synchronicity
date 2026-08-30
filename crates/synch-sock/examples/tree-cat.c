@@ -2,9 +2,9 @@
  * read it any other way.
  *
  *   synch socket build examples/tree-cat.c -o tree-cat.o
- *   synch socket add code/cat.sock
+ *   synch socket declare code/cat.sock
  *   synch socket arm code/cat.sock
- *   printf 'readme\n' | synch connect nas:code/cat.sock
+ *   printf 'readme\n' | synch socket connect nas:code/cat.sock
  *
  * A delegate holding only `code` still cannot sync `code/pub` unless somebody
  * delegated it; a socket is how a node lends out a *view* rather than a space.

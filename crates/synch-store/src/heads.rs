@@ -32,7 +32,7 @@ impl Slot {
 ///
 /// Both halves, because a rebuild has to do the origins it can *and* say which
 /// it could not: reporting success having silently skipped one is what
-/// `doctor --rebuild` exists to rule out, and failing outright on the first bad
+/// `repair rebuild-views` exists to rule out, and failing outright on the first bad
 /// row rebuilds nothing at all.
 #[derive(Debug, Default)]
 pub struct CompleteRoots {
@@ -202,7 +202,7 @@ impl Store {
     /// Every slot for every origin.
     ///
     /// A row that will not build is skipped, not propagated. This is the bulk
-    /// listing the maintenance sweep and `doctor --rebuild` walk. §12's rule is
+    /// listing the maintenance sweep and `repair rebuild-views` walk. §12's rule is
     /// that a record this node cannot read fails its own origin and no other; a
     /// point read still reports the failure for that origin.
     ///
@@ -222,7 +222,7 @@ impl Store {
     /// made it depend on `head_history` joining and on every signature parsing,
     /// neither of which it uses — so a row with an unreadable `sig` was silently
     /// absent from the listing and the rebuild reported success having skipped
-    /// that origin entirely, which is the one outcome `doctor --rebuild` exists
+    /// that origin entirely, which is the one outcome `repair rebuild-views` exists
     /// to rule out. Reading `heads` alone also drops the join, so a row is only
     /// unreadable here if its own two columns are — and such a row is returned in
     /// `unreadable` for the caller to name, not propagated.
@@ -1235,7 +1235,7 @@ mod tests {
     /// A rebuild sees the rows it can read and is told about the ones it cannot.
     ///
     /// Both halves matter and neither had a test: skipping a row silently is what
-    /// lets `doctor --rebuild` report success having rebuilt nothing for an
+    /// lets `repair rebuild-views` report success having rebuilt nothing for an
     /// origin, and propagating instead rebuilt nothing for *any* origin, because
     /// the whole list is materialized before the caller starts.
     #[test]

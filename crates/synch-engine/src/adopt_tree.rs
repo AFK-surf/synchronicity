@@ -1,46 +1,46 @@
 //! One-shot materialization into a space's *own* directory (§7.2).
 //!
-//! A mirror is the continuous, read-only half of materialization: it owns the
+//! A checkout is the continuous, read-only half of materialization: it owns the
 //! directory it writes into, removes whatever the tree stops carrying, and is
-//! never indexed back into the local origin trie. A fill is the other half. It
-//! writes into the writable directory `synch space add` named — the one this
-//! node indexes and publishes from — and so it may only ever *add*:
+//! never indexed back into the local origin trie. A tree adoption is the other half. It
+//! writes into the writable directory `synch source add` named — the one this
+//! node publishes from — and so it may only ever *add*:
 //!
 //! - nothing is removed, ever. A tombstoned version, a path the policy selects
 //!   nothing for, a local file no origin publishes: all left exactly as they
-//!   are. Deleting is what `synch take` of a tombstone is for, one deliberate
+//!   are. Deleting is what `synch adopt path` of a tombstone is for, one deliberate
 //!   path at a time.
 //! - a local file whose bytes already differ is reported and left alone.
-//!   `--force` replaces it, which is the bulk form of `synch take`.
+//!   `--replace` replaces it, which is the bulk form of `synch adopt path`.
 //!
-//! Nothing here publishes, and a node that *cannot* publish does not fill at
+//! Nothing here publishes, and a node that *cannot* publish does not tree adoption at
 //! all: a scan would refuse there too, so the tree would sit unannounced — and
-//! `--force`'s own-origin guard, which needs this node to publish something,
+//! `--replace`'s own-origin guard, which needs this node to publish something,
 //! would be inert while it wrote. `synch recover` first (§3.4).
 //!
 //! Nothing here publishes. The files land in an indexed directory, so the next
-//! scan — the watcher's, or an explicit `synch scan` — stages and publishes
+//! scan — the watcher's, or an explicit `synch source scan` — stages and publishes
 //! them as this node's own view (§7.1), exactly as it would files copied in by
 //! hand.
 //!
-//! Which is why a filled file carries the selected version's metadata as well
+//! Which is why a adopted file carries the selected version's metadata as well
 //! as its bytes. The mtime that scan publishes is then the one the origin
-//! published, so filling a path restates the version that was filled instead
+//! published, so adopting a path restates the version that was adopted instead
 //! of minting a newer one — and minting one would be no small thing: `newest`
-//! orders on `(mtime, content root, origin)`, so a fill stamped with the wall
+//! orders on `(mtime, content root, origin)`, so a tree adoption stamped with the wall
 //! clock would make this node win the selection for every path it touched,
 //! cluster-wide.
 //!
 //! Filesystems coarsen the stamp — NTFS to 100 ns, HFS+ to whole seconds — and
 //! only ever downward, so what the next scan publishes can sit a tick below the
-//! version that was filled. That direction is harmless: an mtime is not part of
+//! version that was adopted. That direction is harmless: an mtime is not part of
 //! a version's identity (`Version`, synch-store), so the two origins still
 //! collapse to one version with two attestors, and being fractionally *older*
 //! is the safe way to be wrong about a `newest` order.
 //!
 //! A symbolic link is the exception, and cannot help being one: stamping a
 //! link's own times needs a facility the standard library does not expose
-//! (§7.2), so a filled link does publish as newer than the version it came
+//! (§7.2), so a adopted link does publish as newer than the version it came
 //! from. The consequence is bounded — a link's target *is* its version, and the
 //! target is identical, so every node still converges on the same link — but
 //! the "restates rather than mints" rule above is a rule about files.
@@ -54,73 +54,73 @@ use synch_core::{EntryKind, Hash};
 use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
+    checkout::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
     error::{EngineError, Result},
     ignore::IgnoreSet,
-    mirror::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
 };
 
 #[cfg(windows)]
-use crate::mirror::unsafe_name;
+use crate::checkout::unsafe_name;
 
-/// How a fill treats what is already on disk.
+/// How a tree adoption treats what is already on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FillOptions {
+pub struct AdoptTreeOptions {
     /// Replace local files whose bytes differ from the selected version,
     /// rather than reporting them and leaving them alone.
-    pub force: bool,
+    pub replace: bool,
     /// Decide everything and write nothing: the report says what a real run
     /// would do, down to which files it would replace.
     pub dry_run: bool,
 }
 
-/// What one fill did, or — under [`FillOptions::dry_run`] — would do.
+/// What one tree adoption did, or — under [`AdoptTreeOptions::dry_run`] — would do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FillReport {
+pub struct AdoptTreeReport {
     /// Files and symlinks written: the ones that were missing, plus whatever
-    /// `--force` replaced.
-    pub filled: usize,
+    /// `--replace` replaced.
+    pub adopted: usize,
     /// Paths already holding the selected version's bytes.
     pub current: usize,
-    /// The paths `--force` overwrote — the subset of `filled` that had
+    /// The paths `--replace` overwrote — the subset of `adopted` that had
     /// different content here first. Named rather than counted: replacing a
-    /// local file is the one thing a fill does that loses something.
+    /// local file is the one thing a tree adoption does that loses something.
     pub replaced: Vec<String>,
     /// Paths whose local copy differs from the selected version and was left
-    /// alone. `--force`, or `synch take` per path, is what ends the standoff.
+    /// alone. `--replace`, or `synch adopt path` per path, is what ends the standoff.
     pub differing: Vec<String>,
-    /// Paths that are no longer the thing this fill was shown: a path the plan
-    /// found empty that something now stands at, and equally one whose file has
-    /// been rewritten since the plan stat'd it. Refused whatever the flags say
-    /// — `--force` answers for the file it was pointed at, not for whatever the
-    /// path became while an object was being fetched — so they are kept apart
-    /// from `differing`, which `--force` does resolve.
+    /// Paths that changed after this tree adoption was planned: a path the plan
+    /// found empty that something now stands at, or a file rewritten since the
+    /// plan stat'd it. Refused whatever the flags say — `--replace` answers for
+    /// the file it was pointed at, not for whatever the path became while an
+    /// object was being fetched — so they are kept apart from `differing`,
+    /// which `--replace` does resolve.
     pub appeared: Vec<String>,
-    /// Paths a fill could not write, with the reason — including every path a
-    /// `strict` fill refused to guess at.
+    /// Paths a tree adoption could not write, with the reason — including
+    /// every path a `strict` tree adoption refused to guess at.
     pub skipped: Vec<(String, String)>,
     /// Paths that *were* written but whose write was not everything it should
     /// have been: the metadata the filesystem refused, the scanner record that
     /// could not be dropped. Kept out of `skipped`, which means "not written",
-    /// so that `filled + skipped` never counts one path twice.
+    /// so that `adopted + skipped` never counts one path twice.
     pub warnings: Vec<(String, String)>,
-    /// Bytes that crossed the network for what this fill wrote.
+    /// Bytes that crossed the network for what this tree adoption wrote.
     pub fetched_bytes: u64,
     /// Bytes that did not, because a local donor already held them
     /// (`docs/DELTA-SYNC.md` §3.3).
     pub reused_bytes: u64,
     /// Files whose bytes were not copied at all, because the space and the CAS
-    /// share a filesystem. A subset of `filled`.
+    /// share a filesystem. A subset of `adopted`.
     pub reflinked: usize,
     /// Whether this report describes a run that wrote nothing on purpose.
     pub dry_run: bool,
-    /// Paths the space's ignore rules exclude, which a fill does not write
+    /// Paths the space's ignore rules exclude, which a tree adoption does not write
     /// because a scan would never publish them. Counted, not named: one rule
     /// like `node_modules/` covers arbitrarily many.
     pub ignored: usize,
     /// How many paths the unified tree carried under the prefix that was
-    /// filled, whatever became of them. Zero means the prefix names nothing —
+    /// adopted, whatever became of them. Zero means the prefix names nothing —
     /// which a caller cannot infer from the counters, since a path the policy
     /// selects nothing for and a tombstoned one are both passed over in
     /// silence.
@@ -128,90 +128,91 @@ pub struct FillReport {
 }
 
 impl Node {
-    /// Fills a space's configured directory with the unified tree's content
-    /// (§7.2, `synch fill`).
+    /// Adoptions a space's configured directory with the unified tree's content
+    /// (§7.2, `synch adopt tree`).
     ///
-    /// `prefix` narrows the fill to a directory within the space, empty for
-    /// all of it. The space must be one this node indexes: a fill writes where
+    /// `prefix` narrows the tree adoption to a directory within the space, empty for
+    /// all of it. The space must be one this node indexes: a tree adoption writes where
     /// the scanner will find it, and outside a space nothing would.
-    pub async fn fill_space(
+    pub async fn adopt_tree(
         &self,
         space_id: &str,
         prefix: &str,
         policy: &VersionPolicy,
-        options: FillOptions,
-    ) -> Result<FillReport> {
+        options: AdoptTreeOptions,
+    ) -> Result<AdoptTreeReport> {
         // Serialized against every other materialization pass on this node, so
-        // two fills of one space cannot plan against each other's half-written
-        // state. Mirrors take the same lock; their roots cannot overlap a
+        // two adopts of one space cannot plan against each other's half-written
+        // state. Checkouts take the same lock; their roots cannot overlap a
         // space's, so sharing it costs nothing but the wait.
         let _pass = self.lock_materialization().await;
         // Refused in recovery, before anything is written, for the reason every
         // other command that does irreversible work before publishing takes
-        // this gate — and for one more that is specific to a fill.
+        // this gate — and for one more that is specific to a tree adoption.
         //
         // A recovering node holds no complete head of its own (§3.4), which is
-        // exactly the state an operator reaches for a fill in: the checkout is
+        // exactly the state an operator reaches for a tree adoption in: the checkout is
         // gone and the cluster has the content. But a scan refuses in recovery
-        // too, so everything filled would sit unpublished and the closing line
-        // of the command — "the next scan publishes what was filled" — would be
-        // false. Worse, `--force`'s own-origin guard is *inert* here: it fires
+        // too, so everything adopted would sit unpublished and the closing line
+        // of the command — "the next scan publishes what was adopted" — would be
+        // false. Worse, `--replace`'s own-origin guard is *inert* here: it fires
         // when the selected version is this node's own, and a recovering node
         // publishes nothing under its own origin, so every path selects a
         // peer's version and every local file that differs is overwritten with
         // no version, no `prev` and no trace. The guard against silent loss is
         // missing precisely where the danger is greatest.
         //
-        // `synch recover` first, then fill, then scan. The error names it.
+        // `synch recover` first, then tree adoption, then scan. The error names it.
         {
             let node = self.clone();
             crate::blocking::offload(move || node.ensure_publishable()).await?;
         }
-        let plan = self.plan_fill(space_id, prefix, policy, options).await?;
-        self.write_fill(plan).await
+        let plan = self
+            .plan_adoption(space_id, prefix, policy, options)
+            .await?;
+        self.write_adoption(plan).await
     }
 
-    /// Everything a fill can settle before the network: which paths need
+    /// Everything a tree adoption can settle before the network: which paths need
     /// writing, and every decision that needs no bytes.
     ///
-    /// Split from [`Node::write_fill`] because the two halves are what a fill
+    /// Split from [`Node::write_adoption`] because the two halves are what a tree adoption
     /// *is* — and because the gap between them is where the interesting
     /// failures live, so a test has to be able to stand in it.
-    async fn plan_fill(
+    async fn plan_adoption(
         &self,
         space_id: &str,
         prefix: &str,
         policy: &VersionPolicy,
-        options: FillOptions,
-    ) -> Result<FillPlan> {
+        options: AdoptTreeOptions,
+    ) -> Result<AdoptTreePlan> {
         // The space row is read once and its root carried through the pass:
         // the write guard needs the root per path, and re-reading the row for
         // each would be one store acquisition per file in the space.
         let root_dir = {
             let (node, space_id) = (self.clone(), space_id.to_string());
             crate::blocking::offload(move || {
-                let space = node.store().space(&space_id)?.ok_or_else(|| {
+                let space = node.store().source(&space_id)?.ok_or_else(|| {
                     EngineError::not_found(format!(
-                        "no local space {space_id}: `synch space add {space_id} <dir>` names the \
-                         directory a fill writes into"
+                        "no filesystem source {space_id}: `synch source add {space_id} <dir>` \
+                         names the directory tree adoption writes into"
                     ))
                 })?;
-                // A detached space has no checkout to fill: its content lives
-                // in the cloud CAS and is read on demand. `synch mirror add` is
-                // what materializes one where a directory is wanted.
+                // An API source has no directory to adopt into. A replica
+                // checkout is a read-only projection, not a publishing source.
                 let local_path = space.local_path.ok_or_else(|| {
                     EngineError::invalid(format!(
-                        "space {space_id} is detached and has no local directory to fill; \
-                         `synch mirror add {space_id} <dir>` materializes one"
+                        "source {space_id} is API-only and has no local directory for tree adoption; \
+                         `synch replica add {space_id} --checkout <dir>` creates a read-only materialization"
                     ))
                 })?;
                 // The guard `scan_space_with_ingest` takes, for the same reason and the
                 // opposite failure. A vanished root — an unmounted drive, a
                 // renamed mount — must not read to the scanner as "every file
-                // deleted", and must not read to a fill as "every file
+                // deleted", and must not read to a tree adoption as "every file
                 // missing": nothing would stop it recreating the mount point on
                 // the underlying filesystem and materializing the whole tree
-                // into it, filling the system disk with a copy that the next
+                // into it, adopting the system disk with a copy that the next
                 // scan refuses to publish and the returning drive hides.
                 match std::fs::metadata(&local_path) {
                     Ok(meta) if meta.is_dir() => {}
@@ -231,7 +232,7 @@ impl Node {
             .await?
         };
 
-        // Blocking end to end for the reasons mirror.rs lays out: the listing
+        // Blocking end to end for the reasons checkout.rs lays out: the listing
         // is a range scan over every path in the space plus a version set each,
         // and deciding what a path needs is a stat and — where the scanner's
         // own record cannot answer — a whole-file hash.
@@ -239,19 +240,19 @@ impl Node {
         let (space, prefix) = (space_id.to_string(), prefix.to_string());
         let policy = policy.clone();
         crate::blocking::offload(move || {
-            // A fill writes into an *indexed* directory, so it is bound by the
+            // A tree adoption writes into an *indexed* directory, so it is bound by the
             // rules that indexing applies. Writing a path this space ignores
             // would put a file where the scanner will never look: never
             // published, never swept — it is in neither `local_files` nor the
-            // published tree — and reported `current` by every fill after it.
-            // A mirror needs none of this because nothing indexes what it
+            // published tree — and reported `current` by every tree adoption after it.
+            // A checkout needs none of this because nothing indexes what it
             // writes.
             let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
             let (report, wanted, links) = decide(
                 &node, &space, &root_dir, &listing, &policy, &ignore, options,
             )?;
-            Ok(FillPlan {
+            Ok(AdoptTreePlan {
                 space,
                 root_dir,
                 options,
@@ -264,8 +265,8 @@ impl Node {
     }
 
     /// Fetches and writes what the plan decided it must, and reports.
-    async fn write_fill(&self, plan: FillPlan) -> Result<FillReport> {
-        let FillPlan {
+    async fn write_adoption(&self, plan: AdoptTreePlan) -> Result<AdoptTreeReport> {
+        let AdoptTreePlan {
             space: space_id,
             root_dir,
             options,
@@ -276,7 +277,7 @@ impl Node {
         if options.dry_run {
             // The plan *is* the answer: everything it decided is already in the
             // report, and these two are what a real run would go and write.
-            report.filled += wanted.len() + links.len();
+            report.adopted += wanted.len() + links.len();
             report.replaced.extend(
                 links
                     .iter()
@@ -314,7 +315,7 @@ impl Node {
                 if escapes_via_symlink(&root, &guarded) {
                     return Ok(Err(ESCAPED.to_string()));
                 }
-                // Identity, not just existence: `--force` answers for the
+                // Identity, not just existence: `--replace` answers for the
                 // file the operator was shown, and a path that has become
                 // something else since is not it.
                 let over = match target.symlink_metadata() {
@@ -327,7 +328,7 @@ impl Node {
             .await?;
             match outcome {
                 Ok(over) => {
-                    report.filled += 1;
+                    report.adopted += 1;
                     if over {
                         report.replaced.push(path);
                     }
@@ -351,7 +352,7 @@ impl Node {
                 replacing,
                 was,
             } = want;
-            // A failure here is this path's, not the run's. A one-shot fill has
+            // A failure here is this path's, not the run's. A one-shot tree adoption has
             // no second pass to repair what an early `?` would abandon, and by
             // now some of these files are already on disk — so the run finishes
             // and the report names what went wrong, rather than the operator
@@ -380,17 +381,17 @@ impl Node {
             // what is left is the materialization, which the link loop — where
             // stat and write really are one step — does not have.
             //
-            // The escape guard is the mirror's, and describes the *directory*
+            // The escape guard is the checkout's, and describes the *directory*
             // the write lands in — `escapes_via_symlink` pops the last
             // component, so it says nothing about the target itself.
             //
-            // The second guard is the one a fill needs and a mirror does not.
-            // A mirror owns its root; a fill writes into the directory the user
+            // The second guard is the one a tree adoption needs and a checkout does not.
+            // A checkout owns its root; a tree adoption writes into the directory the user
             // works in, with the watcher running, so "nothing was here when we
             // planned" is a statement with a shelf life. Materialization ends
             // in a rename, which destroys whatever it lands on — so a file that
             // appeared during the fetch would be silently overwritten by a run
-            // that was never given `--force`. Re-stat, and refuse.
+            // that was never given `--replace`. Re-stat, and refuse.
             let (root, guarded) = (root_dir.clone(), path.clone());
             let stat_target = target.clone();
             let ready = crate::blocking::offload(move || {
@@ -402,13 +403,13 @@ impl Node {
                 }
                 Ok(match std::fs::symlink_metadata(&stat_target) {
                     // Planned as a replacement, and still the very file the
-                    // plan looked at: `--force` was given for exactly this.
+                    // plan looked at: `--replace` was given for exactly this.
                     Ok(stat) if replacing && was.as_ref() == Some(&signature(&stat)) => {
                         Ready::Write { over: true }
                     }
                     // Something is here that the operator was not shown — a
                     // path that was empty and is not, or one whose file has
-                    // been rewritten since. `--force` answers for the file it
+                    // been rewritten since. `--replace` answers for the file it
                     // was pointed at, not for whatever the path became while
                     // an object was being fetched, which on a large space is
                     // minutes of somebody else's work.
@@ -416,7 +417,7 @@ impl Node {
                     // Nothing here now — including the case where this path was
                     // planned as a replacement and the file has since been
                     // deleted by someone else. Writing is right either way; what
-                    // changes is that `replaced` must not claim a file this fill
+                    // changes is that `replaced` must not claim a file this tree adoption
                     // did not overwrite.
                     Err(_) => Ready::Write { over: false },
                 })
@@ -456,17 +457,17 @@ impl Node {
                             //
                             // It matters most where `file_identity` is `None` —
                             // every non-unix platform — because there the
-                            // comparison is only `(size, mtime)`, and a fill
-                            // stamps the selected version's mtime. A version
+                            // comparison is only `(size, mtime)`, and a tree
+                            // adoption stamps the selected version's mtime. A version
                             // tying this node's own published one on both (the
                             // tie `newest` breaks on content root) would leave
-                            // the scan calling a filled path unchanged and never
+                            // the scan calling an adopted path unchanged and never
                             // publishing it: the disk holding the peer's bytes
                             // while this node went on publishing its own. §7.2
                             // rests on that publish happening.
                             //
-                            // Per path rather than batched at the end: a fill of
-                            // a large space runs for minutes, and a client that
+                            // Per path rather than batched at the end: adopting
+                            // a large tree runs for minutes, and a client that
                             // hangs up drops this future at an await. A batch
                             // deferred to the end is a batch a Ctrl-C loses,
                             // which is exactly how the drift above gets in.
@@ -474,7 +475,7 @@ impl Node {
                             // Reported, never propagated: this is bookkeeping
                             // that runs *after* the bytes and the stamp landed,
                             // and a `?` here would throw away the account of
-                            // every file the fill had already written — the
+                            // every file the tree adoption had already written — the
                             // failure round two removed from the fetch and the
                             // donor lookup for the same reason.
                             let stale = node
@@ -490,13 +491,13 @@ impl Node {
             };
             match outcome {
                 Written::Fully(kind) | Written::WithoutMetadata(kind, _) => {
-                    report.filled += 1;
+                    report.adopted += 1;
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     // Counted here rather than at the fetch, so the pair
-                    // describes the bytes behind the files this fill wrote
+                    // describes the bytes behind the files this tree adoption wrote
                     // rather than including work the guards then turned away.
-                    report.fetched_bytes += crate::mirror::bytes_of(&fetched.fetched, size);
-                    report.reused_bytes += crate::mirror::bytes_of(&fetched.promoted, size);
+                    report.fetched_bytes += crate::checkout::bytes_of(&fetched.fetched, size);
+                    report.reused_bytes += crate::checkout::bytes_of(&fetched.promoted, size);
                     if over {
                         report.replaced.push(path.clone());
                     }
@@ -535,35 +536,38 @@ impl Node {
 impl Node {
     /// The plan half alone, so a test can let the world move between the plan
     /// and the write the way a slow fetch does.
-    pub(crate) async fn fill_plan_for_test(
+    pub(crate) async fn adoption_plan_for_test(
         &self,
         space_id: &str,
         policy: &VersionPolicy,
-    ) -> FillPlan {
-        self.plan_fill(space_id, "", policy, FillOptions::default())
+    ) -> AdoptTreePlan {
+        self.plan_adoption(space_id, "", policy, AdoptTreeOptions::default())
             .await
             .expect("the plan half should succeed")
     }
 
     /// The same, under options other than the default.
-    pub(crate) async fn fill_plan_with_options_for_test(
+    pub(crate) async fn adoption_plan_with_options_for_test(
         &self,
         space_id: &str,
         policy: &VersionPolicy,
-        options: FillOptions,
-    ) -> FillPlan {
-        self.plan_fill(space_id, "", policy, options)
+        options: AdoptTreeOptions,
+    ) -> AdoptTreePlan {
+        self.plan_adoption(space_id, "", policy, options)
             .await
             .expect("the plan half should succeed")
     }
 
     /// The write half alone, against a plan taken earlier.
-    pub(crate) async fn finish_fill_for_test(&self, plan: FillPlan) -> Result<FillReport> {
-        self.write_fill(plan).await
+    pub(crate) async fn finish_adoption_for_test(
+        &self,
+        plan: AdoptTreePlan,
+    ) -> Result<AdoptTreeReport> {
+        self.write_adoption(plan).await
     }
 }
 
-/// One path a fill has decided it must fetch and write.
+/// One path a tree adoption has decided it must fetch and write.
 #[derive(Debug)]
 struct Wanted {
     /// The path within the space, for the report.
@@ -579,10 +583,10 @@ struct Wanted {
     /// Where the bytes might already be, in §3.2 priority order.
     donors: Vec<Donor>,
     /// Whether a local file with different bytes is being overwritten, which
-    /// only `--force` reaches.
+    /// only `--replace` reaches.
     replacing: bool,
     /// What the plan saw at the target: `(len, mtime_ns, file_id)`, or `None`
-    /// where there was nothing. The write compares against it, so `--force`
+    /// where there was nothing. The write compares against it, so `--replace`
     /// overwrites the file the operator was shown and not whatever the path
     /// became while the object was being fetched.
     was: Option<(u64, i64, Option<Vec<u8>>)>,
@@ -603,7 +607,7 @@ enum Ready {
     /// Write it. `over` is whether something is actually there to be replaced,
     /// which the plan can only guess at and this stat knows.
     Write { over: bool },
-    /// The space's own directory has gone since the fill started.
+    /// The space's own directory has gone since the tree adoption started.
     RootGone(String),
     /// An ancestor is a symlink: the write would land outside the space.
     Escaped,
@@ -628,18 +632,18 @@ enum Written {
     Failed(String),
 }
 
-/// What one fill settled before any content was fetched.
+/// What one tree adoption settled before any content was fetched.
 #[derive(Debug)]
-pub(crate) struct FillPlan {
-    /// The space being filled, for the `local_files` rows the write half drops.
+pub(crate) struct AdoptTreePlan {
+    /// The space being adopted, for the `local_files` rows the write half drops.
     space: String,
     /// Its configured directory.
     root_dir: PathBuf,
     /// The options both halves branch on. Carried rather than passed again, so
     /// a plan cannot be written under options it was not decided under.
-    options: FillOptions,
+    options: AdoptTreeOptions,
     /// Everything already decided.
-    report: FillReport,
+    report: AdoptTreeReport,
     /// What is left for the network half to fetch.
     wanted: Vec<Wanted>,
     /// Symbolic links, which need no fetch — but are written by the same half
@@ -657,7 +661,7 @@ struct PendingLink {
     target: PathBuf,
     /// What the link should point at.
     link_target: String,
-    /// Whether something is being replaced, which only `--force` reaches.
+    /// Whether something is being replaced, which only `--replace` reaches.
     replacing: bool,
     /// What the plan saw at the target, as [`signature`]. The write compares
     /// against it for the same reason the object path does: `materialize_symlink`
@@ -666,9 +670,9 @@ struct PendingLink {
     was: Option<(u64, i64, Option<Vec<u8>>)>,
 }
 
-/// Decides, and performs, everything a fill can settle without the network.
+/// Decides, and performs, everything a tree adoption can settle without the network.
 ///
-/// Blocking from end to end: [`Node::plan_fill`] runs it on the blocking pool.
+/// Blocking from end to end: [`Node::plan_adoption`] runs it on the blocking pool.
 #[allow(clippy::too_many_arguments)]
 fn decide(
     node: &Node,
@@ -677,39 +681,39 @@ fn decide(
     listing: &[VersionSet],
     policy: &VersionPolicy,
     ignore: &IgnoreSet,
-    options: FillOptions,
-) -> Result<(FillReport, Vec<Wanted>, Vec<PendingLink>)> {
+    options: AdoptTreeOptions,
+) -> Result<(AdoptTreeReport, Vec<Wanted>, Vec<PendingLink>)> {
     // One clock reading for the pass, and the store's rather than the bare
     // clock, so every path selects against the same instant (`plan_pass`,
-    // mirror.rs).
+    // checkout.rs).
     let now = node.store().read_instant()?;
-    let mut report = FillReport {
+    let mut report = AdoptTreeReport {
         dry_run: options.dry_run,
-        ..FillReport::default()
+        ..AdoptTreeReport::default()
     };
     let mut wanted: Vec<Wanted> = Vec::new();
     let mut links: Vec<PendingLink> = Vec::new();
     // Paths this pass will make into symbolic links, so that what they shadow
-    // is judged against the tree the fill is about to create rather than the
+    // is judged against the tree the tree adoption is about to create rather than the
     // one it started with.
     let mut planned_links: Vec<String> = Vec::new();
     // What the listing carried, so the caller can tell "this prefix names
     // nothing" from "everything under it was already here or was passed over".
     report.considered = listing.len();
-    // Detected before anything is written, the way a mirror pass does it: the
+    // Detected before anything is written, the way a checkout pass does it: the
     // first claimant of a folded name wins and the rest are reported — but only
     // where this space's filesystem actually folds them.
     let mut claimed: HashMap<String, String> = HashMap::new();
 
     for set in listing {
-        // A mirror refuses these names on every platform, so that one mirror of
-        // one tree is the same directory everywhere. A fill has the opposite
+        // A checkout refuses these names on every platform, so that one projection of
+        // one tree is the same directory everywhere. A tree adoption has the opposite
         // obligation: it writes into *this* machine's directory, where this
         // machine's own scanner is the thing that published half these paths.
         // `2026-08-21T10:00:00.log` and `aux.txt` are ordinary names here, and
-        // refusing them would report a file as skipped on every fill while it
+        // refusing them would report a file as skipped on every tree adoption while it
         // sat on disk already current — and would make a peer's copy of such a
-        // path unfillable on the very platform that can hold it.
+        // path unadoptable on the very platform that can hold it.
         //
         // So the check is the platform's own. Safety does not rest on it in
         // either case: `target_within` below is what refuses a path that would
@@ -726,9 +730,9 @@ fn decide(
         // the plan promises what the write will not do, which under `--dry-run`
         // is the one thing a plan must never do.
         //
-        // The mirror gets this for free by materializing in listing order, so a
+        // The checkout gets this for free by materializing in listing order, so a
         // link written for `sub` is on disk before `sub/passwd` is judged
-        // (mirror.rs). A fill decides everything before it writes anything, so
+        // (checkout.rs). A tree adoption decides everything before it writes anything, so
         // it has to carry the knowledge instead of reading it off the disk. The
         // listing is sorted, so a link at `sub` is always seen before `sub/…`.
         if planned_links
@@ -738,7 +742,7 @@ fn decide(
             report.skipped.push((set.path.clone(), ESCAPED.to_string()));
             continue;
         }
-        // The same guard `synch take` and the S3 gateway write through: a
+        // The same guard `synch adopt path` and the S3 gateway write through: a
         // published path only ever lands inside the space it belongs to.
         let target = match target_within(root_dir, space_id, &set.path) {
             Ok(target) => target,
@@ -752,10 +756,10 @@ fn decide(
             synch_store::Selection::Selected(entry) => *entry,
             // The policy selects nothing here — an `origin=` pin on an origin
             // that publishes no version of this path — so the path is not in
-            // this fill's view. Whatever is on disk is ours and stays.
+            // this tree adoption's view. Whatever is on disk is ours and stays.
             synch_store::Selection::Absent => continue,
-            // A strict fill never guesses, and unlike a strict mirror it has
-            // nothing to take back: the local copy is this node's own
+            // Strict tree adoption never guesses, and it has nothing to remove:
+            // the local copy is this node's own
             // assertion, not a materialized guess, so the path is reported and
             // left exactly as it is.
             synch_store::Selection::Divergent => {
@@ -771,20 +775,20 @@ fn decide(
             }
         };
 
-        // A fill adds. A tombstone asks for a removal, which is the one thing
-        // it will not do — `synch take` of that version is how a deletion is
+        // A tree adoption adds. A tombstone asks for a removal, which is the one thing
+        // it will not do — `synch adopt path` of that version is how a deletion is
         // adopted, deliberately and one path at a time (§8).
         if selected.kind == EntryKind::Tombstone || selected.kind == EntryKind::Dir {
             continue;
         }
 
-        // Whatever this space excludes, a fill does not write: such a file
+        // Whatever this space excludes, a tree adoption does not write: such a file
         // would sit where the scanner never looks — never published, never
-        // swept, and reported `current` by every fill after it.
+        // swept, and reported `current` by every tree adoption after it.
         //
         // Counted rather than named, the way a scan counts them
         // (`ScanReport::ignored`): a peer that published `node_modules/` before
-        // this space had a `.syncignore` would otherwise turn every fill into a
+        // this space had a `.syncignore` would otherwise turn every tree adoption into a
         // hundred thousand lines of stdout. And asked here rather than at the
         // top of the loop, so a path the policy passes over in silence — a
         // tombstone, a version an `origin=` pin does not carry — stays silent
@@ -800,21 +804,21 @@ fn decide(
         if on_disk.as_ref().is_some_and(|m| m.is_dir()) {
             report.skipped.push((
                 set.path.clone(),
-                "a directory stands here, and a fill does not remove things".into(),
+                "a directory stands here, and a tree adoption does not remove things".into(),
             ));
             continue;
         }
 
         // The first claimant to a folded name wins and the rest are reported
-        // (`claim_folded_name`): without the claim, `--force` would write one
-        // over the other and call both of them filled.
+        // (`claim_folded_name`): without the claim, `--replace` would write one
+        // over the other and call both of them adopted.
         //
-        // Applied on every platform, as the mirror applies it. A fill could ask
+        // Applied on every platform, as the checkout applies it. A tree adoption could ask
         // the filesystem instead — and did, for three revisions — but the cost
         // of being wrong runs the other way: refusing a name is a report about
         // two files that are both there, while a wrong "does not fold" is a
         // silent clobber. §7.2 takes the conservative side.
-        if let Err(reason) = crate::mirror::claim_folded_name(&mut claimed, &set.path) {
+        if let Err(reason) = crate::checkout::claim_folded_name(&mut claimed, &set.path) {
             report.skipped.push((set.path.clone(), reason));
             continue;
         }
@@ -830,14 +834,14 @@ fn decide(
                 // Asked in the plan rather than at the write, so a dry run
                 // cannot promise a link this platform will refuse — on every
                 // non-unix one, that is all of them. And before the `differing`
-                // arm, so a path there is never told "--force replaces it" by a
-                // platform that will answer `--force` with this same refusal.
+                // arm, so a path there is never told "--replace replaces it" by a
+                // platform that will answer `--replace` with this same refusal.
                 report.skipped.push((set.path.clone(), reason));
-            } else if on_disk.is_some() && !options.force {
+            } else if on_disk.is_some() && !options.replace {
                 report.differing.push(set.path.clone());
             } else if on_disk.is_some() && selected.origin == *node.origin() {
                 // The same refusal the regular-file branch makes, for the same
-                // reason: `--force` adopts a peer's version, and this version is
+                // reason: `--replace` adopts a peer's version, and this version is
                 // ours. A link retargeted since the last scan is an unpublished
                 // edit, and recreating the published target would restore what
                 // we already publish — so the next scan would stage nothing and
@@ -870,26 +874,26 @@ fn decide(
                 LocalContent::Is(here) if here == content => {
                     // Right bytes. The metadata is left alone deliberately:
                     // what a file here carries is this node's own assertion,
-                    // and a fill that restamped it would republish every path
+                    // and a tree adoption that restamped it would republish every path
                     // it looked at.
                     report.current += 1;
                     continue;
                 }
                 // The bytes are readable and are not the selected version's.
                 LocalContent::Is(_) | LocalContent::WrongSize => {
-                    if !options.force {
+                    if !options.replace {
                         report.differing.push(set.path.clone());
                         continue;
                     }
                     // Our *own* published version, and the file here does not
                     // match it: the disk is a local edit this node has not
                     // scanned yet, and the entry is what it published last
-                    // time. Filling would overwrite the newer statement of our
+                    // time. Adopting would overwrite the newer statement of our
                     // view with the older one, and — because the old content
                     // root is the one we already publish — the next scan would
                     // stage nothing, so the edit would vanish leaving no
                     // version, no `prev`, and no trace anywhere in the cluster.
-                    // `--force` means "take theirs"; there is no theirs here.
+                    // `--replace` means "take theirs"; there is no theirs here.
                     if selected.origin == *node.origin() {
                         report
                             .skipped
@@ -899,7 +903,7 @@ fn decide(
                 }
                 // Something is here, it is the right length to be the version,
                 // and it could not be read. "Differs" would be a claim nothing
-                // established, and `--force` acts on that claim by renaming
+                // established, and `--replace` acts on that claim by renaming
                 // over the file — which needs no read permission at all. So a
                 // file this node cannot read is never replaced and never
                 // called differing.
@@ -948,7 +952,7 @@ fn decide(
 /// platform identity all match, and the hash was taken comfortably after the
 /// mtime it vouches for, so no same-size in-place rewrite can have shared the
 /// stamp. Anything less answers `None`, and the caller hashes.
-fn indexed_content(
+fn known_source_content(
     node: &Node,
     space_id: &str,
     relpath: &str,
@@ -968,11 +972,11 @@ fn indexed_content(
 /// Why the space root cannot be written into right now, or `None`.
 ///
 /// Taken again before every write, not just once in the plan. The plan's check
-/// is what stops a fill onto a root that was already gone; this is what stops
-/// one that is *unplugged halfway through* — a fill of a large tree runs for
+/// is what stops a tree adoption onto a root that was already gone; this is what stops
+/// one that is *unplugged halfway through* — a tree adoption of a large tree runs for
 /// hours, and materialization does `create_dir_all` on the target's parent,
 /// which for a top-level path is the root itself. Without this, minute five of
-/// a fill onto an unmounted drive recreates the mount point and materializes
+/// a tree adoption onto an unmounted drive recreates the mount point and materializes
 /// the rest of the tree onto the disk underneath it.
 ///
 /// One `stat` of a directory that is by now certainly in the page cache.
@@ -989,10 +993,10 @@ const ESCAPED: &str = "path resolves through a symlink; refusing to write outsid
 
 /// The marker the write guards use for a path that is no longer the thing the
 /// plan looked at. Never shown to anyone: the caller turns it into a
-/// [`FillReport::appeared`] entry, which the CLI describes in its own words.
-const APPEARED: &str = "a file appeared here while the fill ran";
+/// [`AdoptTreeReport::appeared`] entry, which the CLI describes in its own words.
+const APPEARED: &str = "a file appeared here while the tree adoption ran";
 
-/// Why `--force` declines a path whose selected version is this node's own.
+/// Why `--replace` declines a path whose selected version is this node's own.
 ///
 /// There is nothing to adopt: the file on disk is an edit no scan has
 /// published, and writing the published version over it would restore content
@@ -1000,7 +1004,7 @@ const APPEARED: &str = "a file appeared here while the fill ran";
 /// edit would be gone with no version, no `prev`, and no trace in the cluster.
 const OWN_VERSION_DIFFERS: &str =
     "the selected version is this node's own, and what is here differs from it: that is an edit \
-     no scan has published yet, not a version to adopt. Run `synch scan` to publish it";
+     no scan has published yet, not a version to adopt. Run `synch source scan` to publish it";
 
 /// What is on disk where the selected version belongs.
 #[derive(Debug)]
@@ -1017,10 +1021,10 @@ enum LocalContent {
 }
 
 /// Reads what is at `target` well enough to compare it with the version being
-/// filled, without ever reading more than it must.
+/// adopted, without ever reading more than it must.
 ///
 /// The scanner's own `local_files` record answers first wherever its stat still
-/// vouches for the file, which is what keeps a second fill of a large space
+/// vouches for the file, which is what keeps a second tree adoption of a large space
 /// from re-hashing it. Failing that, length settles almost every case for the
 /// price of a `stat`, and only a file that *could* be the version is hashed.
 ///
@@ -1038,7 +1042,7 @@ fn content_here(
     if !stat.is_file() {
         return LocalContent::WrongSize;
     }
-    if let Some(known) = indexed_content(node, space_id, relpath, stat) {
+    if let Some(known) = known_source_content(node, space_id, relpath, stat) {
         return LocalContent::Is(known);
     }
     if stat.len() != selected.size {
@@ -1144,9 +1148,9 @@ mod tests {
 
     /// The whole contract in one pass: what is missing arrives, what already
     /// matches is left alone, and what differs is reported rather than
-    /// overwritten — until `--force` says otherwise.
+    /// overwritten — until `--replace` says otherwise.
     #[tokio::test]
-    async fn a_fill_adds_and_reports_rather_than_overwrites() {
+    async fn tree_adoption_adds_and_reports_rather_than_overwrites() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "missing.txt", b"theirs", STAMP);
         publish(&node, &peer(), "same.txt", b"agreed", STAMP);
@@ -1155,10 +1159,15 @@ mod tests {
         std::fs::write(space.path().join("ours.txt"), b"mine").unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert_eq!(report.current, 1, "{report:?}");
         assert_eq!(report.differing, vec!["ours.txt".to_string()], "{report:?}");
         assert!(report.replaced.is_empty(), "{report:?}");
@@ -1175,26 +1184,31 @@ mod tests {
 
         // The second pass has nothing to do: the file it wrote is current now.
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(report.filled, 0, "{report:?}");
-        assert_eq!(report.current, 2, "{report:?}");
-
-        // `--force` is the bulk `synch take`: it names what it overwrote.
-        let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.adopted, 0, "{report:?}");
+        assert_eq!(report.current, 2, "{report:?}");
+
+        // `--replace` is the bulk `synch adopt path`: it names what it overwrote.
+        let report = node
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert_eq!(report.replaced, vec!["ours.txt".to_string()], "{report:?}");
         assert!(report.differing.is_empty(), "{report:?}");
         assert_eq!(
@@ -1204,10 +1218,10 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A fill only ever adds. A tombstoned version, and a local file nobody
+    /// A tree adoption only ever adds. A tombstoned version, and a local file nobody
     /// publishes, both survive it.
     #[tokio::test]
-    async fn a_fill_removes_nothing() {
+    async fn tree_adoption_removes_nothing() {
         let (_data, space, node) = node_with_space().await;
         std::fs::write(space.path().join("deleted.txt"), b"still here").unwrap();
         std::fs::write(space.path().join("private.txt"), b"only mine").unwrap();
@@ -1221,38 +1235,43 @@ mod tests {
             .unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert!(report.differing.is_empty(), "{report:?}");
         assert!(space.path().join("deleted.txt").exists());
         assert!(space.path().join("private.txt").exists());
 
-        // Not even under --force: replacing bytes is one thing, removing a
-        // path is `synch take` of the tombstone.
+        // Not even under --replace: replacing bytes is one thing, removing a
+        // path is `synch adopt path` of the tombstone.
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert!(space.path().join("deleted.txt").exists());
         node.shutdown().await.unwrap();
     }
 
-    /// The point of stamping: a filled path publishes as the version that was
-    /// filled, not as a newer one that would win every `newest` selection in
+    /// The point of stamping: a adopted path publishes as the version that was
+    /// adopted, not as a newer one that would win every `newest` selection in
     /// the cluster.
     #[tokio::test]
-    async fn filling_then_scanning_republishes_the_version_that_was_filled() {
+    async fn adopting_then_scanning_republishes_the_adopted_version() {
         let (_data, _space, node) = node_with_space().await;
         publish_with_mode(&node, &peer(), "f.txt", b"theirs", STAMP, Some(0o100640));
         let theirs = node
@@ -1262,24 +1281,29 @@ mod tests {
             .unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         node.scan_publish_push().await.unwrap();
 
         let ours = published(&node, "media", "f.txt");
         assert_eq!(ours.content, theirs.content, "the same object");
         // Not equality: filesystems coarsen. NTFS keeps 100 ns, HFS+ whole
         // seconds, and a stamp is only ever coarsened *downward* — so what the
-        // scan republishes can sit just below the version that was filled. What
+        // scan republishes can sit just below the version that was adopted. What
         // must never happen is the other direction, which is the half that
-        // matters: `newest` orders on the mtime, so a filled path publishing a
+        // matters: `newest` orders on the mtime, so a adopted path publishing a
         // *newer* one would flip the selection to this node, cluster-wide.
         let drift = theirs.mtime_ns - ours.mtime_ns;
         assert!(
-            (0..crate::mirror::MTIME_GRANULARITY_NS).contains(&drift),
-            "republished {} against the origin's {}: a filled path must never publish an mtime \
+            (0..crate::checkout::MTIME_GRANULARITY_NS).contains(&drift),
+            "republished {} against the origin's {}: a adopted path must never publish an mtime \
              newer than the version it came from, nor more than one filesystem tick below it",
             ours.mtime_ns,
             theirs.mtime_ns
@@ -1293,10 +1317,10 @@ mod tests {
     }
 
     /// `strict` reports a divergent path and touches nothing. Unlike a strict
-    /// mirror it removes no stale copy: what is here is this node's own
+    /// checkout it removes no stale copy: what is here is this node's own
     /// assertion, not a materialized guess.
     #[tokio::test]
-    async fn a_strict_fill_reports_divergence_and_leaves_the_local_copy() {
+    async fn strict_tree_adoption_reports_divergence_and_leaves_the_local_copy() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "split.txt", b"theirs", 100);
         publish(&node, &other(), "split.txt", b"others", 200);
@@ -1304,10 +1328,15 @@ mod tests {
         std::fs::write(space.path().join("split.txt"), b"mine").unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Strict, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Strict,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "the undisputed path is written");
+        assert_eq!(report.adopted, 1, "the undisputed path is written");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         assert_eq!(report.skipped[0].0, "split.txt");
         assert!(report.skipped[0].1.contains("strict"), "{report:?}");
@@ -1318,38 +1347,38 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// An `origin=` pin fills that origin's versions, and says nothing about
+    /// An `origin=` pin adopts that origin's versions, and says nothing about
     /// paths it does not publish.
     #[tokio::test]
-    async fn an_origin_pinned_fill_takes_that_origins_versions() {
+    async fn origin_selected_tree_adoption_uses_that_origins_versions() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "f.txt", b"theirs", 100);
         publish(&node, &other(), "f.txt", b"others", 200);
         publish(&node, &other(), "only-theirs.txt", b"x", 300);
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Origin(peer()),
-                FillOptions::default(),
+                AdoptTreeOptions::default(),
             )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert_eq!(
             std::fs::read(space.path().join("f.txt")).unwrap(),
             b"theirs"
         );
         assert!(
             !space.path().join("only-theirs.txt").exists(),
-            "a path the pinned origin does not publish is not in this fill's view"
+            "a path the pinned origin does not publish is not in this tree adoption's view"
         );
         node.shutdown().await.unwrap();
     }
 
     /// A dry run decides everything and writes nothing — including the list of
-    /// what `--force` would overwrite, which is what it is for.
+    /// what `--replace` would overwrite, which is what it is for.
     #[tokio::test]
     async fn a_dry_run_writes_nothing() {
         let (_data, space, node) = node_with_space().await;
@@ -1358,19 +1387,19 @@ mod tests {
         std::fs::write(space.path().join("ours.txt"), b"mine").unwrap();
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: true,
                 },
             )
             .await
             .unwrap();
         assert!(report.dry_run);
-        assert_eq!(report.filled, 2, "{report:?}");
+        assert_eq!(report.adopted, 2, "{report:?}");
         assert_eq!(report.replaced, vec!["ours.txt".to_string()], "{report:?}");
         assert!(!space.path().join("missing.txt").exists());
         assert_eq!(
@@ -1380,29 +1409,29 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A prefix narrows the fill to one directory of the space.
+    /// A prefix narrows the tree adoption to one directory of the space.
     #[tokio::test]
-    async fn a_prefix_fills_one_directory() {
+    async fn tree_adoption_of_a_prefix_writes_one_directory() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "talks/a.txt", b"a", STAMP);
         publish(&node, &peer(), "notes/b.txt", b"b", STAMP);
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "talks/",
                 &VersionPolicy::Newest,
-                FillOptions::default(),
+                AdoptTreeOptions::default(),
             )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert!(space.path().join("talks/a.txt").exists());
         assert!(!space.path().join("notes/b.txt").exists());
         node.shutdown().await.unwrap();
     }
 
-    /// A fill writes where the scanner will find it, so a space this node does
+    /// A tree adoption writes where the scanner will find it, so a space this node does
     /// not index is refused rather than materialized somewhere nothing
     /// publishes.
     #[tokio::test]
@@ -1410,16 +1439,19 @@ mod tests {
         let (_data, _space, node) = node_with_space().await;
         publish(&node, &peer(), "f.txt", b"theirs", STAMP);
         let refused = node
-            .fill_space(
+            .adopt_tree(
                 "elsewhere",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions::default(),
+                AdoptTreeOptions::default(),
             )
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("no local space elsewhere"), "{refused}");
+        assert!(
+            refused.contains("no filesystem source elsewhere"),
+            "{refused}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1434,7 +1466,12 @@ mod tests {
         std::fs::write(space.path().join("taken"), b"a real file").unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1456,7 +1493,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The guard that keeps a fill inside its space, at both the moments it is
+    /// The guard that keeps a tree adoption inside its space, at both the moments it is
     /// taken: when the path is planned, and again immediately before the write
     /// the plan led to.
     #[cfg(unix)]
@@ -1464,16 +1501,21 @@ mod tests {
     async fn a_symlinked_ancestor_is_refused() {
         let (_data, space, node) = node_with_space().await;
         let outside = tempfile::tempdir().unwrap();
-        // The shape a hostile peer plants: a link the fill would resolve
+        // The shape a hostile peer plants: a link the tree adoption would resolve
         // through, and a path beneath it.
         std::os::unix::fs::symlink(outside.path(), space.path().join("sub")).unwrap();
         publish(&node, &peer(), "sub/escaped.txt", b"not yours", STAMP);
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         assert!(
             report.skipped[0].1.contains("symlink"),
@@ -1482,45 +1524,45 @@ mod tests {
         );
         assert!(
             !outside.path().join("escaped.txt").exists(),
-            "a fill must never write outside the space root"
+            "a tree adoption must never write outside the space root"
         );
         node.shutdown().await.unwrap();
     }
 
-    /// A file that appears while the fill is fetching belongs to whoever wrote
-    /// it. Without `--force` the plan's "nothing was here" has a shelf life,
+    /// A file that appears while the tree adoption is fetching belongs to whoever wrote
+    /// it. Without `--replace` the plan's "nothing was here" has a shelf life,
     /// and materialization ends in a rename that would destroy it silently.
     #[tokio::test]
-    async fn a_file_that_appears_mid_fill_is_not_overwritten() {
+    async fn a_file_that_appears_mid_adoption_is_not_overwritten() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "late.txt", b"theirs", STAMP);
 
         // Planned as absent, then created behind the plan's back: the same
         // interleaving a slow fetch gives any editor working in the space.
         let plan = node
-            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .adoption_plan_for_test("media", &VersionPolicy::Newest)
             .await;
         std::fs::write(space.path().join("late.txt"), b"mine, just now").unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
         assert_eq!(
             std::fs::read(space.path().join("late.txt")).unwrap(),
             b"mine, just now",
-            "the file written during the fill must survive it"
+            "the file written during the tree adoption must survive it"
         );
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert_eq!(
             report.appeared,
             vec!["late.txt".to_string()],
-            "reported as appeared, not differing: this is no longer the file the fill was \
-             shown, so `--force` neither caused it nor resolves it"
+            "reported as appeared, not differing: this is no longer the file the tree adoption was \
+             shown, so `--replace` neither caused it nor resolves it"
         );
         assert!(report.differing.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
     /// A current file is left completely alone — its mtime included. Restamping
-    /// it would republish every path a fill looked at, and `newest` orders on
+    /// it would republish every path a tree adoption looked at, and `newest` orders on
     /// the mtime, so it would win the selection cluster-wide.
     #[tokio::test]
     async fn a_current_file_is_not_restamped_and_publishes_nothing() {
@@ -1533,15 +1575,20 @@ mod tests {
         publish(&node, &peer(), "f.txt", b"agreed", STAMP);
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(report.current, 1, "{report:?}");
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert_eq!(
             std::fs::metadata(&target).unwrap().modified().unwrap(),
             before,
-            "a fill must not restamp a file whose bytes are already right"
+            "a tree adoption must not restamp a file whose bytes are already right"
         );
         // And so the scan after it has nothing to say.
         assert!(
@@ -1559,7 +1606,7 @@ mod tests {
     async fn an_unreadable_file_is_reported_rather_than_replaced() {
         let (_data, space, node) = node_with_space().await;
         let target = space.path().join("secret.txt");
-        // The same length as the version being filled, so length cannot settle
+        // The same length as the version being adopted, so length cannot settle
         // it and the compare has to read.
         std::fs::write(&target, b"mine!!").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1577,25 +1624,25 @@ mod tests {
             return;
         }
 
-        for force in [false, true] {
+        for replace in [false, true] {
             let report = node
-                .fill_space(
+                .adopt_tree(
                     "media",
                     "",
                     &VersionPolicy::Newest,
-                    FillOptions {
-                        force,
+                    AdoptTreeOptions {
+                        replace,
                         dry_run: false,
                     },
                 )
                 .await
                 .unwrap();
-            assert!(report.differing.is_empty(), "force={force}: {report:?}");
-            assert!(report.replaced.is_empty(), "force={force}: {report:?}");
-            assert_eq!(report.skipped.len(), 1, "force={force}: {report:?}");
+            assert!(report.differing.is_empty(), "replace={replace}: {report:?}");
+            assert!(report.replaced.is_empty(), "replace={replace}: {report:?}");
+            assert_eq!(report.skipped.len(), 1, "replace={replace}: {report:?}");
             assert!(
                 report.skipped[0].1.contains("could not be read"),
-                "force={force}: {report:?}"
+                "replace={replace}: {report:?}"
             );
         }
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1603,12 +1650,12 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// `--force` adopts a peer's version. Where the selected version is this
+    /// `--replace` adopts a peer's version. Where the selected version is this
     /// node's *own*, there is nothing to adopt: the file on disk is an edit no
     /// scan has published yet, and overwriting it would leave no version, no
     /// `prev`, and no trace anywhere.
     #[tokio::test]
-    async fn force_will_not_revert_an_unscanned_local_edit() {
+    async fn replace_will_not_revert_an_unscanned_local_edit() {
         let (_data, space, node) = node_with_space().await;
         let target = space.path().join("mine.txt");
         std::fs::write(&target, b"published").unwrap();
@@ -1616,12 +1663,12 @@ mod tests {
         std::fs::write(&target, b"edited since the scan").unwrap();
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
@@ -1634,7 +1681,10 @@ mod tests {
         );
         assert!(report.replaced.is_empty(), "{report:?}");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].1.contains("synch scan"), "{report:?}");
+        assert!(
+            report.skipped[0].1.contains("synch source scan"),
+            "{report:?}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1652,11 +1702,16 @@ mod tests {
             .unwrap();
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
-            report.filled, 1,
+            report.adopted, 1,
             "the servable path still landed: {report:?}"
         );
         assert!(space.path().join("here.txt").exists());
@@ -1675,13 +1730,18 @@ mod tests {
         publish(&node, &peer(), "fold.txt", b"lower", STAMP);
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         // The listing is ordered, so the first claimant is the lexicographically
-        // first path — the same winner a mirror picks (§7.2).
+        // first path — the same winner a checkout picks (§7.2).
         assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
         assert!(report.skipped[0].1.contains("collides with Fold.txt"));
         assert_eq!(
@@ -1691,20 +1751,30 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A detached space has no checkout to fill, and says which command does
+    /// A API source has no checkout to tree adoption, and says which command does
     /// materialize one.
     #[tokio::test]
-    async fn a_detached_space_is_refused_with_the_command_that_fits() {
+    async fn an_api_source_is_refused_with_the_command_that_fits() {
         let (_data, _space, node) = node_with_space().await;
-        node.store().put_detached_space("cloud").unwrap();
+        node.store()
+            .put_source("cloud", synch_store::SourceKind::Api, None)
+            .unwrap();
         publish_in(&node, &peer(), "cloud", "f.txt", b"theirs", STAMP);
         let refused = node
-            .fill_space("cloud", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "cloud",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("detached"), "{refused}");
-        assert!(refused.contains("synch mirror add cloud"), "{refused}");
+        assert!(refused.contains("API-only"), "{refused}");
+        assert!(
+            refused.contains("synch replica add cloud --checkout"),
+            "{refused}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1719,23 +1789,28 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
 
         let refused = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap_err()
             .to_string();
         assert!(refused.contains("unavailable"), "{refused}");
         assert!(
             !root.exists(),
-            "a fill must not recreate a mount point and write the tree into it"
+            "a tree adoption must not recreate a mount point and write the tree into it"
         );
         node.shutdown().await.unwrap();
     }
 
-    /// A fill is bound by the rules that bind indexing: writing a path this
+    /// A tree adoption is bound by the rules that bind indexing: writing a path this
     /// space ignores would put a file where the scanner never looks — never
-    /// published, never swept, and reported current by every fill after it.
+    /// published, never swept, and reported current by every tree adoption after it.
     #[tokio::test]
-    async fn a_fill_does_not_write_what_the_space_ignores() {
+    async fn tree_adoption_does_not_write_what_the_space_ignores() {
         let (_data, space, node) = node_with_space().await;
         std::fs::write(
             space.path().join(".syncignore"),
@@ -1747,14 +1822,19 @@ mod tests {
         publish(&node, &peer(), "keep.txt", b"theirs", STAMP);
 
         let report = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(report.filled, 1, "{report:?}");
+        assert_eq!(report.adopted, 1, "{report:?}");
         assert!(space.path().join("keep.txt").exists());
         assert!(
             !space.path().join("raw/photo.raw").exists(),
-            "an ignored path would never be published, so a fill does not write it"
+            "an ignored path would never be published, so a tree adoption does not write it"
         );
         assert_eq!(
             report.ignored, 1,
@@ -1768,7 +1848,7 @@ mod tests {
     /// since the last scan is an unpublished edit, not a version to adopt.
     #[cfg(unix)]
     #[tokio::test]
-    async fn force_will_not_revert_an_unscanned_symlink_retarget() {
+    async fn replace_will_not_revert_an_unscanned_symlink_retarget() {
         let (_data, space, node) = node_with_space().await;
         let link = space.path().join("latest");
         std::fs::write(space.path().join("v1"), b"one").unwrap();
@@ -1780,12 +1860,12 @@ mod tests {
         std::os::unix::fs::symlink("v2", &link).unwrap();
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
@@ -1801,32 +1881,32 @@ mod tests {
             report
                 .skipped
                 .iter()
-                .any(|(p, why)| p == "latest" && why.contains("synch scan")),
+                .any(|(p, why)| p == "latest" && why.contains("synch source scan")),
             "{report:?}"
         );
         node.shutdown().await.unwrap();
     }
 
-    /// `--force` resolves `differing`, which is about files somebody looked at.
-    /// A file that arrived mid-fill was looked at by nobody, so it is refused
-    /// under `--force` too, and reported apart from the paths `--force` fixes.
+    /// `--replace` resolves `differing`, which is about files somebody looked at.
+    /// A file that arrived mid-tree adoption was looked at by nobody, so it is refused
+    /// under `--replace` too, and reported apart from the paths `--replace` fixes.
     #[tokio::test]
-    async fn a_file_that_appears_mid_fill_survives_force_too() {
+    async fn a_file_that_appears_mid_adoption_survives_replace_too() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "late.txt", b"theirs", STAMP);
 
         let plan = node
-            .fill_plan_with_options_for_test(
+            .adoption_plan_with_options_for_test(
                 "media",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
             .await;
         std::fs::write(space.path().join("late.txt"), b"mine, just now").unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
         assert_eq!(
             std::fs::read(space.path().join("late.txt")).unwrap(),
@@ -1846,18 +1926,18 @@ mod tests {
         publish_link(&node, &peer(), "latest", "v1");
 
         let plan = node
-            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .adoption_plan_for_test("media", &VersionPolicy::Newest)
             .await;
         std::fs::write(space.path().join("latest"), b"mine, just now").unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
         assert_eq!(
             std::fs::read(space.path().join("latest")).unwrap(),
             b"mine, just now",
-            "a link must not unlink a file that appeared while the fill ran"
+            "a link must not unlink a file that appeared while the tree adoption ran"
         );
         assert_eq!(report.appeared, vec!["latest".to_string()], "{report:?}");
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert!(report.replaced.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
@@ -1874,26 +1954,31 @@ mod tests {
         publish(&node, &peer(), "sub/escaped.txt", b"not yours", STAMP);
 
         let dry = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: false,
+                AdoptTreeOptions {
+                    replace: false,
                     dry_run: true,
                 },
             )
             .await
             .unwrap();
         let real = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap();
 
         assert_eq!(
-            dry.filled, real.filled,
+            dry.adopted, real.adopted,
             "a dry run promised {} and the real run wrote {}: dry {dry:?} real {real:?}",
-            dry.filled, real.filled
+            dry.adopted, real.adopted
         );
         assert_eq!(dry.skipped.len(), real.skipped.len(), "{dry:?} {real:?}");
         assert!(
@@ -1904,23 +1989,23 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The root guard is taken per write, not once: a fill of a large tree runs
+    /// The root guard is taken per write, not once: a tree adoption of a large tree runs
     /// for hours, and an unplugged drive mid-run must not have its mount point
     /// recreated and the rest of the tree written onto the disk underneath.
     #[tokio::test]
-    async fn a_root_that_vanishes_mid_fill_stops_the_writes() {
+    async fn a_root_that_vanishes_mid_adoption_stops_the_writes() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "a.txt", b"one", STAMP);
         publish(&node, &peer(), "b.txt", b"two", STAMP);
 
         let plan = node
-            .fill_plan_for_test("media", &VersionPolicy::Newest)
+            .adoption_plan_for_test("media", &VersionPolicy::Newest)
             .await;
         let root = space.path().to_path_buf();
         std::fs::remove_dir_all(&root).unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
-        assert_eq!(report.filled, 0, "{report:?}");
+        assert_eq!(report.adopted, 0, "{report:?}");
         assert_eq!(report.skipped.len(), 2, "{report:?}");
         assert!(
             report
@@ -1929,13 +2014,16 @@ mod tests {
                 .all(|(_, why)| why.contains("unavailable")),
             "{report:?}"
         );
-        assert!(!root.exists(), "the root must not be recreated mid-fill");
+        assert!(
+            !root.exists(),
+            "the root must not be recreated mid-tree adoption"
+        );
         node.shutdown().await.unwrap();
     }
 
-    /// Every writer into a space directory is bound by its ignore rules, not
+    /// Every writer into a filesystem-source directory is bound by its ignore rules, not
     /// just the multipart one: a plain `PutObject` takes `open_adoption`, and
-    /// `synch take` takes `adopt`/`adopt_from`. A write the scanner will never
+    /// `synch adopt path` takes `adopt`/`adopt_from`. A write the scanner will never
     /// look at is worse than a refused write — the bytes land in the operator's
     /// own directory, unpublished and unswept, and the client that sent them
     /// gets an error anyway when the publish finds nothing.
@@ -1958,22 +2046,22 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// `--force` answers for the file the operator was shown. A file *edited*
+    /// `--replace` answers for the file the operator was shown. A file *edited*
     /// during the fetch window is as much somebody else's work as one created
     /// there, and gets the same refusal.
     #[tokio::test]
-    async fn force_does_not_overwrite_a_file_edited_during_the_fetch() {
+    async fn replace_does_not_overwrite_a_file_edited_during_the_fetch() {
         let (_data, space, node) = node_with_space().await;
         let target = space.path().join("f.txt");
         std::fs::write(&target, b"what the plan saw").unwrap();
         publish(&node, &peer(), "f.txt", b"theirs", STAMP);
 
         let plan = node
-            .fill_plan_with_options_for_test(
+            .adoption_plan_with_options_for_test(
                 "media",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
@@ -1981,41 +2069,41 @@ mod tests {
         // Rewritten behind the plan's back, the way an editor saving into a
         // space does while a large object is still being fetched.
         std::fs::write(&target, b"edited since the plan looked").unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"edited since the plan looked",
-            "--force answers for the file it was pointed at, not for what the path became"
+            "--replace answers for the file it was pointed at, not for what the path became"
         );
         assert_eq!(report.appeared, vec!["f.txt".to_string()], "{report:?}");
         assert!(report.replaced.is_empty(), "{report:?}");
         node.shutdown().await.unwrap();
     }
 
-    /// The identity check covers links as well as objects: `--force` answers
+    /// The identity check covers links as well as objects: `--replace` answers
     /// for the file the operator was shown, and a link that unlinks whatever
     /// stands there loses it as completely as a rename does.
     #[cfg(unix)]
     #[tokio::test]
-    async fn force_does_not_unlink_a_file_edited_during_the_plan() {
+    async fn replace_does_not_unlink_a_file_edited_during_the_plan() {
         let (_data, space, node) = node_with_space().await;
         let target = space.path().join("latest");
         std::fs::write(&target, b"what the plan saw").unwrap();
         publish_link(&node, &peer(), "latest", "v1");
 
         let plan = node
-            .fill_plan_with_options_for_test(
+            .adoption_plan_with_options_for_test(
                 "media",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: true,
+                AdoptTreeOptions {
+                    replace: true,
                     dry_run: false,
                 },
             )
             .await;
         std::fs::write(&target, b"edited since the plan looked").unwrap();
-        let report = node.finish_fill_for_test(plan).await.unwrap();
+        let report = node.finish_adoption_for_test(plan).await.unwrap();
 
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -2036,18 +2124,18 @@ mod tests {
         publish(&node, &peer(), "sub/b.txt", b"two", STAMP);
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Newest,
-                FillOptions {
-                    force: false,
+                AdoptTreeOptions {
+                    replace: false,
                     dry_run: true,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(report.filled, 2, "{report:?}");
+        assert_eq!(report.adopted, 2, "{report:?}");
         assert_eq!(
             std::fs::read_dir(space.path()).unwrap().count(),
             0,
@@ -2057,12 +2145,14 @@ mod tests {
     }
 
     /// The last adoption entry point, and the one every gate had missed: a
-    /// detached commit promotes an object to the durable tier and stages a
+    /// API-source commit promotes an object to the durable tier and stages a
     /// reference, neither of which a node in recovery can publish.
     #[tokio::test]
-    async fn a_recovering_node_commits_no_detached_file() {
+    async fn a_recovering_node_commits_no_api_source_file() {
         let (_data, _space, node) = node_with_space().await;
-        node.store().put_detached_space("cloud").unwrap();
+        node.store()
+            .put_source("cloud", synch_store::SourceKind::Api, None)
+            .unwrap();
         let source = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(source.path(), b"payload").unwrap();
         node.store()
@@ -2077,7 +2167,7 @@ mod tests {
             .unwrap();
 
         let refused = node
-            .commit_detached_file("cloud", "f.txt", source.path(), now_ns())
+            .commit_api_file("cloud", "f.txt", source.path(), now_ns())
             .await
             .unwrap_err()
             .to_string();
@@ -2085,11 +2175,11 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A recovering node cannot publish, so a fill would write a tree nothing
-    /// would ever announce — and `--force`'s own-origin guard, which needs this
+    /// A recovering node cannot publish, so a tree adoption would write a tree nothing
+    /// would ever announce — and `--replace`'s own-origin guard, which needs this
     /// node to publish something, would be inert while it did.
     #[tokio::test]
-    async fn a_recovering_node_refuses_to_fill() {
+    async fn a_recovering_node_refuses_tree_adoption() {
         let (_data, space, node) = node_with_space().await;
         publish(&node, &peer(), "f.txt", b"theirs", STAMP);
         // The observation that puts a node into key-loss recovery (§3.4): a
@@ -2107,7 +2197,12 @@ mod tests {
             .unwrap();
 
         let refused = node
-            .fill_space("media", "", &VersionPolicy::Newest, FillOptions::default())
+            .adopt_tree(
+                "media",
+                "",
+                &VersionPolicy::Newest,
+                AdoptTreeOptions::default(),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -2119,7 +2214,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// `synch take` adopts by writing into the space and publishing after. On a
+    /// `synch adopt path` adopts by writing into the space and publishing after. On a
     /// node that cannot publish, doing the write first destroys the local copy
     /// and can tell nobody — so the gate is taken before anything is touched,
     /// for content and for a deletion alike.
@@ -2167,14 +2262,14 @@ mod tests {
     /// the record's own rule is about: the file is scanned, then rewritten in
     /// place at the same length with its mtime restored, so `(size, mtime,
     /// file_id)` still match and the record still vouches for content the disk
-    /// no longer holds. A fill that consults the record calls the path current;
+    /// no longer holds. A tree adoption that consults the record calls the path current;
     /// one that hashes the file finds different bytes and wants to write.
     ///
     /// A `chmod 000` was the earlier proof and was no proof at all: every
     /// container running as root reads straight through it, so the test passed
     /// whether or not the record was ever consulted.
     #[tokio::test]
-    async fn an_indexed_file_is_believed_without_a_read() {
+    async fn a_source_tracked_file_is_believed_without_a_read() {
         let (_data, space, node) = node_with_space().await;
         let target = space.path().join("f.txt");
         std::fs::write(&target, b"agreed").unwrap();
@@ -2200,17 +2295,17 @@ mod tests {
         publish(&node, &peer(), "f.txt", b"agreed", STAMP);
 
         let report = node
-            .fill_space(
+            .adopt_tree(
                 "media",
                 "",
                 &VersionPolicy::Origin(peer()),
-                FillOptions::default(),
+                AdoptTreeOptions::default(),
             )
             .await
             .unwrap();
         assert_eq!(
             report.current, 1,
-            "the record answered. A fill that hashed the file would have found \
+            "the record answered. A tree adoption that hashed the file would have found \
              `REVISE` against a published `agreed` and wanted to write: {report:?}"
         );
         assert!(report.differing.is_empty(), "{report:?}");

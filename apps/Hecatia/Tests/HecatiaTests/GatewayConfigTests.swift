@@ -12,21 +12,21 @@ struct GatewayConfigTests {
 
   @Test func laterRecordsWin() {
     let folded = GatewayConfig.buckets([
-      "photos\tmedia\tnewest",
-      "photos\tmedia\tstrict",
+      "photos\tmedia\tread-only\tnewest",
+      "photos\tmedia\tread-only\tstrict",
     ])
     #expect(folded.count == 1)
     #expect(folded[0].policy == .strict)
   }
 
   @Test func oneFieldIsARemoval() {
-    #expect(GatewayConfig.buckets(["photos\tmedia\tnewest", "photos"]).isEmpty)
+    #expect(GatewayConfig.buckets(["photos\tmedia\tread-only\tnewest", "photos"]).isEmpty)
     #expect(GatewayConfig.accessKeyIDs(["AKIA\tsecret", "AKIA"]).isEmpty)
   }
 
   @Test func aRemovedBucketCanComeBack() {
     let folded = GatewayConfig.buckets([
-      "docs\tpapers\tnewest", "docs", "docs\tpapers\tstrict",
+      "docs\tpapers\tread-only\tnewest", "docs", "docs\tpapers\tread-only\tstrict",
     ])
     #expect(folded.map(\.name) == ["docs"])
     #expect(folded[0].policy == .strict)
@@ -38,8 +38,8 @@ struct GatewayConfigTests {
   /// the removal.
   @Test func anUnreadableRecordDoesNotRemoveWhatItNames() {
     let folded = GatewayConfig.buckets([
-      "photos\tmedia\tnewest",
-      "photos\tmedia\tnonsense",
+      "photos\tmedia\tread-only\tnewest",
+      "photos\tmedia\tread-only\tnonsense",
     ])
     #expect(folded.count == 1)
     #expect(folded[0].policy == .newest)
@@ -48,22 +48,23 @@ struct GatewayConfigTests {
   @Test func twoFieldsIsNeitherAnAddNorARemoval() {
     // `(Some(space), None)` falls to `_ => continue` in the daemon: the record
     // is skipped whole and the previous mapping stands.
-    let folded = GatewayConfig.buckets(["photos\tmedia\tnewest", "photos\tmedia"])
+    let folded = GatewayConfig.buckets(["photos\tmedia\tread-only\tnewest", "photos\tmedia"])
     #expect(folded.count == 1)
     #expect(folded[0].space == "media")
   }
 
   @Test func originPinsSurviveTheRoundTrip() {
     let record = GatewayConfig.bucketRecord(
-      name: "archive", space: "media", policy: .origin("nas@cluster.example"))
-    #expect(record == "archive\tmedia\torigin=nas@cluster.example")
+      name: "archive", space: "media", access: .readOnly,
+      policy: .origin("nas@cluster.example"))
+    #expect(record == "archive\tmedia\tread-only\torigin=nas@cluster.example")
     #expect(GatewayConfig.buckets([record])[0].policy == .origin("nas@cluster.example"))
   }
 
   @Test func theGatewayTrimsBeforeParsingAPolicy() {
     // A stored `newest ` is a policy on the daemon side, so it has to be one
     // here or the app would show a bucket the gateway serves as unreadable.
-    #expect(GatewayConfig.buckets(["photos\tmedia\tnewest "]).count == 1)
+    #expect(GatewayConfig.buckets(["photos\tmedia\tread-only\tnewest "]).count == 1)
   }
 
   @Test func secretsNeverLeaveTheFold() {
@@ -79,7 +80,7 @@ struct GatewayConfigTests {
   }
 
   @Test func emptyNamesAreSkipped() {
-    #expect(GatewayConfig.buckets(["", "\tmedia\tnewest"]).isEmpty)
+    #expect(GatewayConfig.buckets(["", "\tmedia\tread-only\tnewest"]).isEmpty)
     #expect(GatewayConfig.accessKeyIDs(["", "\tsecret"]).isEmpty)
   }
 
@@ -105,9 +106,9 @@ struct GatewayConfigTests {
   /// about what is configured.
   @Test func agreesWithTheGatewayOnALiveLog() {
     let bucketLog = [
-      "photos\tdemo\tnewest",
-      "photos\tdemo\tstrict",
-      "scratch\tdemo\tnewest",
+      "photos\tdemo\tread-only\tnewest",
+      "photos\tdemo\tread-only\tstrict",
+      "scratch\tdemo\tread-only\tnewest",
       "scratch",
     ]
     let folded = GatewayConfig.buckets(bucketLog)

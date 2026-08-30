@@ -1,10 +1,10 @@
 import SwiftUI
 import QuickLook
 
-/// The pins half of the Mirrors & Pins page.
+/// Explicit operator pins.
 ///
 /// Shows operator pins only. `pin ls` reports every object anything holds now
-/// — a replicating folder's claims are rows in the same table, and one space
+/// — a replica's claims are rows in the same table, and one space
 /// can be four hundred thousand of them — so ``NodeStore`` filters them out
 /// before they get here. Listing them would bury the handful someone actually
 /// chose under a wall of bare hashes, and `pin rm` refuses every one of them.
@@ -15,7 +15,7 @@ struct PinsSection: View {
   @State private var selection: PinEntry.ID?
   @State private var quickLookURL: URL?
 
-  /// See ``MirrorsSection``: a `Table` brings no height with it, and the
+  /// A `Table` brings no height with it, and the
   /// window this is on can no longer be resized to give it one.
   private let tableHeight: CGFloat = 200
 
@@ -37,7 +37,7 @@ struct PinsSection: View {
         .disabled(selected == nil)
         Spacer()
         // Reading by content root, which is the only way to get at an object no
-        // current entry names — most of what an archive replica holds. `pin ls`
+        // current entry names — most of what a forever replica holds. `pin ls`
         // is the one place the daemon prints a root at full width, so it is the
         // one place these can be offered: `status` and `log` cut it to 16 hex
         // and `parse_root` wants all 64 (DAEMON-ISSUES D6).
@@ -62,11 +62,11 @@ struct PinsSection: View {
         "Nothing pinned", systemImage: "pin.slash",
         description: Text(
           node.heldByReplicas > 0
-            ? "Choose a file in the Files window and click Keep Offline to hold its bytes here. \(node.heldByReplicas) other objects are held on this Mac by a replicating space — see Spaces."
+            ? "Choose a file in the Files window and click Keep Offline to hold its bytes here. \(node.heldByReplicas) other objects are held on this Mac by a replica — see Spaces."
             : "Choose a file in the Files window and click Keep Offline to hold its bytes here."))
-        // A floor rather than a fixed height, for the reason ``MirrorsSection``
+        // A floor rather than a fixed height, for the reason this section
         // records: a fixed one clips an empty state that wants more room, and
-        // this one grows by a line whenever a replicating folder is holding
+        // this one grows by a line whenever a replica is holding
         // objects of its own.
         .frame(maxWidth: .infinity, minHeight: tableHeight)
     } else {
@@ -117,9 +117,9 @@ struct PinsSection: View {
   /// showing. A replica's claims are held on this Mac too and cannot be
   /// removed here, and that is the whole reason the number is worth printing.
   private var footer: String {
-    var text = "A pin holds one object's bytes on this Mac even when nothing else needs them. To hold every version of a whole space, use Replication in Spaces."
+    var text = "A pin holds one object's bytes on this Mac even when nothing else needs them. To hold every version of a whole space, add a replica in Spaces."
     if node.heldByReplicas > 0, !node.pins.isEmpty {
-      text += " \(node.heldByReplicas) more objects are held here by a replicating space; they are not pins and cannot be removed here."
+      text += " \(node.heldByReplicas) more objects are held here by a replica; they are not pins and cannot be removed here."
     }
     return text
   }
@@ -130,7 +130,7 @@ struct PinsSection: View {
 
   /// What to call the file once it is out of the object store.
   ///
-  /// The paths column is what names the object *now*; an archived version may
+  /// The paths column is what names the object *now*; a superseded version may
   /// be named by nothing at all, and then the root is the only name it has.
   private func name(for pin: PinEntry) -> String {
     let first = pin.paths.split(separator: " · ").first.map(String.init) ?? ""
@@ -145,11 +145,11 @@ struct PinsSection: View {
   private func requestUnpin(_ pin: PinEntry) {
     let root = pin.root
     // Say which of the two things this actually does. With another holder on
-    // the same root — a replicating folder — the pin goes and the bytes stay,
+    // the same root — a replica — the pin goes and the bytes stay,
     // and the old sentence promised the opposite. The daemon reports what
     // remains in its own reply, which the app shows in the transcript.
     let consequence = pin.hasOtherHolders
-      ? "The pin goes, but a replicating space still holds these bytes, so nothing is freed on this Mac yet. They go when that space releases them."
+      ? "The pin goes, but a replica still holds these bytes, so nothing is freed on this Mac yet. They go when that space releases them."
       : "The bytes become eligible for collection when nothing else needs them. They are not deleted now, and any file that still names them keeps working."
     confirmation = ConfirmationRequest(
       title: "Stop keeping this offline?",

@@ -1,6 +1,6 @@
 import Foundation
 
-/// One space's replication report, from `space ls <id>`.
+/// One space's replication report, from `replica ls <id>`.
 ///
 /// The daemon's own presentation rules travel with the data, because getting
 /// them wrong is how a replica that is stuck reads as one that is busy

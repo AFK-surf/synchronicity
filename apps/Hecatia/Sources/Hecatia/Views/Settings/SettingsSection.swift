@@ -59,7 +59,7 @@ struct SettingsSection<Content: View>: View {
 #Preview("Spaces") {
   SettingsSection(
     "Shared Spaces",
-    footer: "Spaces this Mac indexes and publishes. The name is shared across every device."
+    footer: "Filesystem and API sources this Mac publishes. The space name is shared across every device."
   ) {
     VStack(alignment: .leading, spacing: Theme.Space.xs) {
       DetailRow(label: "Spaces", value: "notes, archive, photos")
@@ -73,7 +73,7 @@ struct SettingsSection<Content: View>: View {
 #Preview("No name of its own") {
   // A section that follows one with a title, where a second heading would be
   // the same word twice.
-  SettingsSection(footer: "Stopping the service ends sharing, mirrors and remote browsing.") {
+  SettingsSection(footer: "Stopping the service ends sharing, checkout updates and remote browsing.") {
     Toggle("Show advanced operations", isOn: .constant(false))
   }
   .padding(Theme.Space.xl)
@@ -82,11 +82,11 @@ struct SettingsSection<Content: View>: View {
 
 #Preview("The daemon said something new") {
   SettingsSection(
-    "Mirrors & Pins",
-    footer: "Mirrors write the shared view into a normal folder on this Mac. Pins hold one object here even when nothing else needs it.",
+    "Checkouts & Pins",
+    footer: "A replica checkout writes the newest view into a normal folder. Pins hold one object even when no role needs it.",
     warnings: ["a line the daemon added in a later release"]
   ) {
-    DetailRow(label: "Mirrors", value: "1")
+    DetailRow(label: "Checkouts", value: "1")
   }
   .padding(Theme.Space.xl)
   .frame(width: 760)
@@ -97,7 +97,7 @@ struct SettingsSection<Content: View>: View {
   // on it: `Theme.measure` caps the line length, never the number of lines.
   SettingsSection(
     "Shared Spaces",
-    footer: "Spaces this Mac indexes and publishes. The name is shared across every device."
+    footer: "Filesystem and API sources this Mac publishes. The space name is shared across every device."
   ) {
     DetailRow(label: "Spaces", value: "notes")
   }

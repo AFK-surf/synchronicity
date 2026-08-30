@@ -149,7 +149,7 @@ pub enum FetchOutcome {
 pub struct Syncer {
     store: Arc<Store>,
     /// Rung when a promotion flips a head to complete: the unified tree just
-    /// changed, and anything materializing it — mirrors — should look again.
+    /// changed, and any checkout materializing it should look again.
     on_change: Option<Arc<tokio::sync::Notify>>,
     /// Rung by the same events as `on_change`, for the replication loop.
     ///
@@ -258,7 +258,7 @@ impl Syncer {
     /// own anti-entropy round next happened to dial a peer advertising it
     /// complete, one jittered interval later. What propagated in the sub-second
     /// §5.3 claims for reactive push was a pointer that no reading surface —
-    /// `entries`, mirrors, the S3 gateway — looks at, because all of them sit
+    /// `entries`, checkouts, the S3 gateway — looks at, because all of them sit
     /// behind promotion.
     pub(crate) fn on_pending(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
         self.on_pending = Some(wake);
@@ -551,7 +551,7 @@ impl Syncer {
     ///
     /// The flip and the materialization are one SQLite transaction (§5.2,
     /// §10): a crash between them would leave `entries` — what the unified
-    /// tree, mirrors, and `synch-s3` serve from — missing a promoted head's
+    /// tree, checkouts, and `synch-s3` serve from — missing a promoted head's
     /// delta, with nothing left to say so.
     ///
     /// An origin fault is condemned here, because this is the only place that

@@ -76,7 +76,7 @@ none of it. They are registered anyway so the count stays the daemon's.
 `cat` and `get` used to be omitted on the same reasoning as `ls`, and the
 reasoning was wrong: `ReadRequest` carries no content root, so it can only
 select the *current* version of a path, and everything a superseded version or
-an `archive` replica holds needs `--root`. Both are surfaced now.
+a `forever` replica holds needs `--root`. Both are surfaced now.
 
 A registry row is a claim, though, not a wire: an operation can be listed,
 titled and gated and still be reachable from nothing. `make audit` checks the
@@ -98,7 +98,7 @@ this window.
 its panes are pages of Settings now, in a source list rather than a tab bar,
 because a tab bar stops scaling at about six items and there are eight. Two
 groups: *General* (General, About) and *Node* (Identity & Keys, Members,
-Network, Spaces, Mirrors & Pins, Remote Access, Diagnostics). Overview dissolved
+Network, Sources & Replicas, Pins, Remote Access, Diagnostics). Overview dissolved
 into the pages that own its parts, and per-space replication lives in Spaces,
 where the daemon put it.
 
@@ -161,12 +161,12 @@ Four strengths of confirmation, and which one an operation gets is a field on
 its `Operation` value:
 
 1. A plain confirmation naming the object — and correcting the guess.
-   *"Stop mirroring? The files already in ~/Mirrors/media stay where they are."*
-2. A confirmation whose consequence the app computes — `take`, `trust add`,
-   `space add`.
+   *"Remove this replica? Its checkout files stay where they are."*
+2. A confirmation whose consequence the app computes — adoption, `trust add`,
+   and `source add`.
 3. A typed confirmation behind a disclosure that resets on quit. Five:
-   `key retire`, `daemon stop`, `trust rm`, `domain clear`, `space rm`, plus
-   `doctor --rebuild`.
+   `key retire`, `daemon stop`, `trust rm`, `domain clear`, `source rm`, plus
+   `repair rebuild-views`.
 4. No control at all until the condition exists — `recover` appears only when
    the daemon reports being in recovery.
 

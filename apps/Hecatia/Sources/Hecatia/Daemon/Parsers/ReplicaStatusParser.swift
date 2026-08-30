@@ -1,6 +1,6 @@
 import Foundation
 
-/// The reader for `space ls <id>` — one space's replication report.
+/// The reader for `replica ls <id>` — one space's replication report.
 ///
 /// Anchored on the label vocabulary, which is closed and written out in
 /// `render::replica_status`: `held`, `releasing`, `wanted`, `unreachable`,

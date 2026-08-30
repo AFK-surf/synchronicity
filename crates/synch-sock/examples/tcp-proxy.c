@@ -1,10 +1,10 @@
 /* tcp-proxy — one upstream, reachable through the cluster and nowhere else.
  *
  *   synch socket build examples/tcp-proxy.c -o tcp-proxy.o
- *   synch socket add code/git.sock
+ *   synch socket declare code/git.sock
  *   synch socket arm code/git.sock        # inspect and copy the printed root
  *   synch socket arm code/git.sock --review <token>
- *   synch connect nas:code/git.sock --listen 127.0.0.1:9418
+ *   synch socket connect nas:code/git.sock --listen 127.0.0.1:9418
  *
  * The upstream is a compile-time constant because it is a *declaration*: the
  * init hook runs at arm time, with no config and nothing to reach, and what it

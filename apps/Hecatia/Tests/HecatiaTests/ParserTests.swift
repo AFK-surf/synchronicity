@@ -14,107 +14,25 @@ import Testing
 /// `key:<52-char>` origin that is longer than its `{:<32}` field.
 struct ParserTests {
 
-  // MARK: - space ls · "{:<20} {:<28} {}"
+  @Test func typedSpacesKeepEditableReplicaConfiguration() {
+    var info = Synch_Control_V1_SpaceInfo()
+    info.id = "media"
+    info.retention = "current"
+    info.graceSecs = 30 * 86_400
+    info.budget = 8 * (1 << 40)
+    info.checkoutPath = "/srv/media"
 
-  @Test func spaceListAnchorsOnTheFirstSlash() {
-    let result = Listings.spaces([
-      "media                /srv/media                   —",
-      "notes                /Users/me/Documents/notes    —",
-    ])
-    #expect(result.isClean)
-    #expect(result.rows.map(\.id) == ["media", "notes"])
-    // The padding is stripped both sides: the old parser split on the first
-    // space and handed the UI a path with fourteen leading blanks, and the
-    // three-column daemon then made it swallow the replication cell too.
-    #expect(result.rows[0].localPath == "/srv/media")
-    #expect(result.rows[0].replicate == nil)
-  }
-
-  @Test func spaceIdMayContainSpacesAndOverrunItsColumn() {
-    // `validate_space` forbids only empty, >63 bytes, `/` and control
-    // characters — so both of these are legal ids a whitespace split mangles.
-    // The second overruns `{:<20}`, which leaves the format string's own
-    // single space as the whole separator.
-    let result = Listings.spaces([
-      "family photos        /Volumes/Big/Family Photos   —",
-      "a-very-long-space-identifier /srv/x               —",
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].id == "family photos")
-    #expect(result.rows[0].localPath == "/Volumes/Big/Family Photos")
-    #expect(result.rows[1].id == "a-very-long-space-identifier")
-    #expect(result.rows[1].localPath == "/srv/x")
-  }
-
-  /// The row the two-column reader dropped on the floor, on the machine whose
-  /// whole job it is: a dedicated replica has no local checkout, so its line
-  /// contains no `/` at all.
-  @Test func aDetachedSpaceHasNoLocalPath() {
-    let result = Listings.spaces([
-      "photos               —                            replicate archive · 880000 B held"
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].id == "photos")
-    #expect(result.rows[0].localPath == nil)
-    #expect(result.rows[0].isDetached)
-    #expect(result.rows[0].replicate == .archive)
-  }
-
-  @Test func aReplicatingSpaceKeepsItsSummaryButNotInItsPath() {
-    let result = Listings.spaces([
-      "media                /srv/media                   replicate tree · grace 7d · 4096 B held · 2 wanted"
-    ])
-    #expect(result.isClean)
-    // The whole of the bug: this used to read to end of line.
-    #expect(result.rows[0].localPath == "/srv/media")
-    #expect(result.rows[0].replicate == .tree)
-    #expect(result.rows[0].replicationSummary?.hasPrefix("replicate tree") == true)
-  }
-
-  /// Copied byte for byte from a live daemon, where the path overruns
-  /// `{:<28}` and the separator before the replication cell is therefore a
-  /// single space. This is the row the app actually sees, and the shape that
-  /// defeats every whitespace-counting reader.
-  @Test func spaceLineFromALiveDaemon() {
-    let result = Listings.spaces([
-      "demo                 /private/tmp/synch-desktop-demo/Dropbox —"
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].id == "demo")
-    #expect(result.rows[0].localPath == "/private/tmp/synch-desktop-demo/Dropbox")
-    #expect(result.rows[0].replicate == nil)
-  }
-
-  /// Also from a live daemon, this time replicating — and again the path
-  /// overruns its column, so `replicate` is one space away from it.
-  @Test func replicatingSpaceLineFromALiveDaemon() {
-    let result = Listings.spaces([
-      "probe-replica        /private/tmp/hecatia-replica-check replicate tree \u{00b7} grace 30d \u{00b7} 0 B held"
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].id == "probe-replica")
-    #expect(result.rows[0].localPath == "/private/tmp/hecatia-replica-check")
-    #expect(result.rows[0].replicate == .tree)
-  }
-
-  /// A path may contain the word the third column starts with. The reader must
-  /// not split there.
-  @Test func aPathContainingTheWordReplicateIsNotSplitInHalf() {
-    let result = Listings.spaces([
-      "notes                /Users/me/replicate this/notes   —",
-      "media                /Users/me/replicate this/media   replicate archive",
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].localPath == "/Users/me/replicate this/notes")
-    #expect(result.rows[0].replicate == nil)
-    #expect(result.rows[1].localPath == "/Users/me/replicate this/media")
-    #expect(result.rows[1].replicate == .archive)
+    let space = Space(info)
+    #expect(space.replicate == .current)
+    #expect(space.graceSeconds == 30 * 86_400)
+    #expect(space.budgetBytes == 8 * (1 << 40))
+    #expect(space.checkoutPath == "/srv/media")
   }
 
   @Test func replicaStatusFromALiveDaemon() {
     let key = "key:ao6bbsx33qwbyets4qzmxzhumx8tmtnq9m93e55m1qejcdh3m11o"
     let status = Listings.replicaStatus([
-      "probe-replica   indexed /private/tmp/hecatia-replica-check   replicate tree   grace 30d",
+      "probe-replica   indexed /private/tmp/hecatia-replica-check   current retention   grace 30d",
       "  held                  0 objects               0 B",
       "  view          complete — releases are running",
       "  claim   \(key) says it holds 0 objects (0 B, still fetching, tree, grace 30d)",
@@ -131,7 +49,7 @@ struct ParserTests {
   /// From a live daemon, with a budget set — the two-byte-count line.
   @Test func replicaStatusBudgetFromALiveDaemon() {
     let status = Listings.replicaStatus([
-      "probe-replica   indexed /private/tmp/hecatia-replica-check   replicate archive",
+      "probe-replica   indexed /private/tmp/hecatia-replica-check   forever retention",
       "  held                  0 objects               0 B",
       "  budget        500000000 B, 0 B of it used",
       "  view          complete — releases are running",
@@ -150,17 +68,11 @@ struct ParserTests {
     #expect(status.unrecognized.isEmpty)
   }
 
-  @Test func unreadableSpaceLineIsReportedNotDropped() {
-    let result = Listings.spaces(["something entirely unexpected"])
-    #expect(result.rows.isEmpty)
-    #expect(result.unrecognized == ["something entirely unexpected"])
-  }
-
-  // MARK: - space ls <id> · render::replica_status
+  // MARK: - replica ls <id> · render::replica_status
 
   @Test func replicaStatusReadsItsLabelsNotItsColumns() {
     let status = Listings.replicaStatus([
-      "media   indexed /srv/media   replicate tree   grace 7d",
+      "media   indexed /srv/media   current retention   grace 7d",
       "  held               4096 objects       4096000 B",
       "  releasing            12 objects         91000 B   (soonest leaves in 3d)",
       "  wanted                2 objects          2400 B   (oldest 6m ago)",
@@ -200,7 +112,7 @@ struct ParserTests {
   /// is reading because something is wrong.
   @Test func replicaStatusSurvivesCountsThatOverrunTheirColumn() {
     let status = Listings.replicaStatus([
-      "photos   indexed —   replicate archive",
+      "photos   indexed —   forever retention",
       "  held          412880123 objects  944892805120 B",
       "  view          incomplete, releases paused: 3 of 5 devices have not answered",
     ])
@@ -303,20 +215,6 @@ struct ParserTests {
     #expect(result.isClean)
   }
 
-  // MARK: - mirror ls · "{:<20} {:<24} {}"
-
-  @Test func mirrorListSeparatesPolicyFromASpacedFolderName() {
-    let result = Listings.mirrors([
-      "family photos        origin=nas@x.example     /Users/me/Mirrors/photos",
-      "media                newest                   /srv/mirror",
-    ])
-    #expect(result.isClean)
-    #expect(result.rows[0].space == "family photos")
-    #expect(result.rows[0].policy == "origin=nas@x.example")
-    #expect(result.rows[0].localPath == "/Users/me/Mirrors/photos")
-    #expect(result.rows[1].policy == "newest")
-  }
-
   // MARK: - pin ls · "{root}  {size}  {paths}"
 
   @Test func pinListRequiresA64CharacterRoot() {
@@ -349,7 +247,7 @@ struct ParserTests {
     let output = RunOutput(frames: [
       .line("origin nas@cluster.example.com · signing as a1b2c3d4e5"),
       .line("address: ybndrfg8ej via 192.168.1.10:4433"),
-      .line("spaces: 2 (media, notes) · mirrors: 1"),
+      .line("spaces: 2 (media, notes) · sources: 1 · replicas: 1"),
       .line("head: seq 88 · peers seen: 3"),
       .line("trust: rekor require · doh https://1.1.1.1/dns-query"),
       .line("(`synch doctor` for the full examination)"),
@@ -357,7 +255,8 @@ struct ParserTests {
     let status = NodeStatusReader.status(output)
     #expect(status?.origin == "nas@cluster.example.com")
     #expect(status?.spaceNames == ["media", "notes"])
-    #expect(status?.mirrorCount == 1)
+    #expect(status?.sourceCount == 1)
+    #expect(status?.replicaCount == 1)
     #expect(status?.headSeq == 88)
     #expect(status?.peersSeen == 3)
     #expect(status?.alarms.isEmpty == true)
@@ -487,11 +386,11 @@ struct ParserTests {
     #expect(merged.versions[0].attestors == ["nas", "laptop"])
   }
 
-  // MARK: - cloud status
+  // MARK: - control-plane status
 
   @Test func cloudStatusReadsTheProgressChannelToo() {
     let output = RunOutput(frames: [
-      .line("cloud: enabled"),
+      .line("control-plane: enabled"),
       // The only status in this family whose empty state is a progress frame
       // rather than a line. Reading only `lines` loses it entirely.
       .progress("(no attach attempts yet)"),
@@ -503,7 +402,7 @@ struct ParserTests {
 
   @Test func cloudEndpointErrorIsSeparated() {
     let output = RunOutput(frames: [
-      .line("cloud: enabled"),
+      .line("control-plane: enabled"),
       .line("cluster.example.com              detached   https://cp.example  last error: connection refused"),
     ])
     let state = Listings.cloud(output)

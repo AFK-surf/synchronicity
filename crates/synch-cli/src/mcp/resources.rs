@@ -210,7 +210,7 @@ pub(crate) async fn list(ctx: &Context, cursor: Option<&str>) -> Result<Value, T
         .collect();
 
     // Alphabetical, not insertion order: paging has to walk a stable sequence,
-    // and the daemon's row order is the store's, which a `space add` reorders.
+    // and the daemon's row order is the store's, which a `source add` reorders.
     let mut spaces = spaces;
     spaces.sort();
 

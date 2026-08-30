@@ -154,8 +154,8 @@ impl Store {
     ///
     /// Under the data dir rather than beside the target: an abandoned upload
     /// can sit for days, and leaving days of half-uploaded objects inside the
-    /// user's own space directory — visible to them, and orphaned outright by
-    /// a `space rm` — is not something a gateway should do behind their back.
+    /// user's own filesystem-source directory — visible to them, and orphaned outright by
+    /// a `source rm` — is not something a gateway should do behind their back.
     pub fn upload_dir(&self, id: &str) -> PathBuf {
         self.data_dir().join(UPLOADS_DIR).join(id)
     }

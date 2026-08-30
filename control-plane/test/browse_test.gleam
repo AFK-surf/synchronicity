@@ -458,7 +458,7 @@ fn replicates(spaces: List(String)) -> List(agent.ReplicaSpace) {
   list.map(spaces, fn(space) {
     agent.ReplicaSpace(
       space: space,
-      policy: "tree",
+      policy: "current",
       grace_secs: 2_592_000,
       budget: 0,
       held: 1,

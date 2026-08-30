@@ -17,12 +17,8 @@ enum SettingsPane: String, CaseIterable, Identifiable {
   case members = "Members"
   case network = "Network"
   case spaces = "Spaces"
-  /// Mirrors and pins. Not the daemon's "replication", which is a per-space
-  /// policy and lives in Spaces — the daemon deliberately put it on the
-  /// command that already names spaces. Two different things under one word
-  /// was a collision waiting to be read wrong, and the control plane's own
-  /// Replication panel contains neither of these.
-  case mirrorsAndPins = "Mirrors & Pins"
+  /// Explicit pins. Replica and checkout policy lives with each namespace.
+  case pins = "Pins"
   case remote = "Remote Access"
   case diagnostics = "Diagnostics"
 
@@ -46,7 +42,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
   var group: Group {
     switch self {
     case .general, .about: return .app
-    case .keys, .members, .network, .spaces, .mirrorsAndPins, .remote, .diagnostics: return .node
+    case .keys, .members, .network, .spaces, .pins, .remote, .diagnostics: return .node
     }
   }
 
@@ -76,7 +72,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case .members: return "person.2"
     case .network: return "network"
     case .spaces: return "square.stack.3d.up"
-    case .mirrorsAndPins: return "externaldrive"
+    case .pins: return "externaldrive"
     case .remote: return "cloud"
     case .diagnostics: return "stethoscope"
     }
@@ -95,7 +91,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case .members: return [.members, .domains]
     case .network: return [.peers]
     case .spaces: return [.spaces, .replication]
-    case .mirrorsAndPins: return [.mirrors, .pins]
+    case .pins: return [.pins]
     case .remote: return [.cloud, .s3]
     case .diagnostics: return [.status]
     }

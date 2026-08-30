@@ -8,16 +8,15 @@ import Foundation
 /// contradicting the chip beside it.
 enum Topic: String, CaseIterable, Sendable {
   case status        // daemon status, id
-  case spaces        // space ls
+  case spaces        // source ls plus replica ls
   case listing       // the browser's current folder
   case members       // trust ls, delegate ls
   case domains       // domain ls
-  case peers         // peers
+  case peers         // peer ls
   case keys          // key ls
-  case mirrors       // mirror ls
   case pins          // pin ls
-  case replication   // space ls <id> — per-space replica coverage
-  case cloud         // cloud status
+  case replication   // replica ls <id> — per-space replica coverage
+  case cloud         // control-plane status
   case uploads       // ListUploads
   case s3            // GetConfig
 }

@@ -17,7 +17,7 @@
 //!
 //! Two placements are worth stating because they are not obvious:
 //!
-//! - **The socket lifecycle is on the surface.** `socket add`, `arm`, `disarm`,
+//! - **The socket lifecycle is on the surface.** `socket declare`, `arm`, `disarm`,
 //!   `rm` and `kill` are writes and sit in the write tier. Arming is not a
 //!   blind approval of bytes: the program declares its external effects in a
 //!   `synchronicity.init` section, the review step prints that declaration, and
@@ -27,7 +27,7 @@
 //!   disarms it. That is a policy boundary, so it is exposed like any other
 //!   write rather than withheld.
 //!
-//! - **Connecting is a read.** `synch_connect` sits in the read tier because
+//! - **Connecting is a read.** `synch_socket_connect` sits in the read tier because
 //!   the connecting side executes nothing (`docs/SOCKETS.md` §1): it names a
 //!   path and pipes bytes. What the program does is bounded by the declaration
 //!   the *serving* node armed, which is that node's decision and not this
@@ -56,10 +56,10 @@ use crate::{
 /// it says so rather than ending mid-sentence.
 const MAX_RENDERED_BYTES: usize = 1024 * 1024;
 
-/// The default ceiling on one `synch_connect` invocation.
+/// The default ceiling on one `synch_socket_connect` invocation.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The longest a `synch_connect` invocation may be given.
+/// The longest a `synch_socket_connect` invocation may be given.
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The default page size of a listing.
@@ -294,7 +294,7 @@ impl Tool {
                 "readOnlyHint": self.tier == Tier::Read,
                 // Nothing here destroys data without saying so: a delete
                 // publishes a tombstone, which the version model can outlive.
-                // The one tool that can overwrite a local file is synch_fill
+                // The one tool that can overwrite a local file is synch_adopt_tree
                 // with force, and it declares itself below.
                 "destructiveHint": false,
                 "openWorldHint": true,
@@ -478,9 +478,8 @@ fn build_catalog() -> Vec<Tool> {
         Tool {
             name: "synch_spaces",
             title: "List spaces",
-            description: "Every space this node has configured: its id, the local \
-                          directory it indexes, and its replication policy. A space is \
-                          the top-level container every path lives in."
+            description: "Every known namespace and this node's independent source and \
+                          replica roles for it."
                 .into(),
             tier: Tier::Read,
             input: no_args.clone(),
@@ -493,12 +492,14 @@ fn build_catalog() -> Vec<Tool> {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string" },
-                                "local_path": { "type": ["string", "null"] },
-                                "replicate": { "type": ["string", "null"], "enum": ["tree", "archive", null] },
+                                "source_path": { "type": ["string", "null"] },
+                                "source_kind": { "type": ["string", "null"], "enum": ["filesystem", "api", null] },
+                                "retention": { "type": ["string", "null"], "enum": ["current", "forever", null] },
                                 "grace_secs": { "type": "integer" },
                                 "budget": { "type": ["integer", "null"] },
                                 "held_bytes": { "type": ["integer", "null"] },
                                 "wanted": { "type": ["integer", "null"] },
+                                "checkout_path": { "type": ["string", "null"] },
                             },
                             "required": ["id", "grace_secs"],
                         },
@@ -666,7 +667,7 @@ fn build_catalog() -> Vec<Tool> {
             })),
         },
         Tool {
-            name: "synch_peers",
+            name: "synch_peer_list",
             title: "List peers",
             description: "Live peers: addresses, when each last synced, and how far \
                           behind this node believes they are."
@@ -805,7 +806,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_connect",
+            name: "synch_socket_connect",
             title: "Call a socket",
             description: "Opens one invocation of a socket on any node, sends the input, \
                           and returns everything the program wrote before it closed. The \
@@ -849,7 +850,7 @@ fn build_catalog() -> Vec<Tool> {
         Tool {
             name: "synch_write",
             title: "Write a file",
-            description: "Writes a file into one of this node's own spaces and publishes \
+            description: "Writes a file into one of this node's sources and publishes \
                           it as this node's version. Replaces whatever this node \
                           previously published at that path."
                 .into(),
@@ -898,7 +899,7 @@ fn build_catalog() -> Vec<Tool> {
             })),
         },
         Tool {
-            name: "synch_take",
+            name: "synch_adopt_path",
             title: "Adopt a peer's version",
             description: "Adopts another origin's version of a path as this node's own, \
                           publishing it under this node's name."
@@ -907,18 +908,18 @@ fn build_catalog() -> Vec<Tool> {
             input: json!({
                 "type": "object",
                 "properties": {
-                    "origin": { "type": "string", "description": "The origin whose version to adopt." },
+                    "select": { "type": "string", "description": "newest, strict, or origin=<origin-id>." },
                     "space": { "type": "string" },
                     "path": { "type": "string" },
                 },
-                "required": ["origin", "space", "path"],
+                "required": ["space", "path"],
                 "additionalProperties": false,
             }),
             output: None,
         },
         Tool {
-            name: "synch_fill",
-            title: "Fill a space directory",
+            name: "synch_adopt_tree",
+            title: "Adopt a tree into a source",
             description: "Writes the unified tree's content into a space's own local \
                           directory. Additive: a missing path is written, a matching one \
                           left alone, a differing one reported. Defaults to a dry run — \
@@ -930,9 +931,8 @@ fn build_catalog() -> Vec<Tool> {
                 "properties": {
                     "space": { "type": "string" },
                     "dir": { "type": "string", "description": "A directory within the space, or omit for all of it." },
-                    "from": { "type": "string", "description": "Fill from this origin's version of every path." },
-                    "strict": { "type": "boolean", "description": "Report divergent paths instead of picking a version." },
-                    "force": { "type": "boolean", "description": "Replace local files whose content differs. This overwrites bytes on disk." },
+                    "select": { "type": "string", "description": "newest, strict, or origin=<origin-id>." },
+                    "replace": { "type": "boolean", "description": "Replace local files whose content differs. This overwrites bytes on disk." },
                     "dry_run": { "type": "boolean", "description": "Decide everything and write nothing. Defaults to true here." },
                 },
                 "required": ["space"],
@@ -955,6 +955,7 @@ fn build_catalog() -> Vec<Tool> {
                     "space": { "type": "string", "description": "With path, names the version to pin." },
                     "path": { "type": "string" },
                     "root": { "type": "string", "description": "A hex object root, instead of space and path." },
+                    "select": { "type": "string", "description": "For a path: newest, strict, or origin=<origin-id>." },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
@@ -962,7 +963,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_scan",
+            name: "synch_source_scan",
             title: "Scan and publish",
             description: "Scans every configured space and publishes the result. Run this \
                           after changing files on disk outside of synch_write."
@@ -972,7 +973,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_sync",
+            name: "synch_peer_sync",
             title: "Sync with peers now",
             description: "Runs one anti-entropy exchange with every dialable peer, now, \
                           rather than waiting for the next interval."
@@ -982,7 +983,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_socket_add",
+            name: "synch_socket_declare",
             title: "Declare a socket",
             description: "Declares that a path in one of this node's spaces is a socket, \
                           so the scanner publishes it as one. Declaring is not arming: \
@@ -1005,7 +1006,7 @@ fn build_catalog() -> Vec<Tool> {
                         "type": "boolean",
                         "description": "Re-arm on every content change, skipping review forever. \
                                         Correct only for a path you are the only writer of — \
-                                        wrong for any path a fill, a take, or an S3 key can reach.",
+                                        wrong for any path adoption or an S3 key can reach.",
                     },
                     "note": { "type": "string" },
                 },
@@ -1055,7 +1056,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_socket_remove",
+            name: "synch_socket_undeclare",
             title: "Undeclare a socket",
             description: "Undeclares a path; the next scan republishes it as an ordinary \
                           file."
@@ -1125,30 +1126,37 @@ pub(crate) async fn call(
         "synch_versions" => versions(ctx, args, reporter).await,
         "synch_history" => history(ctx, args, reporter).await,
         "synch_compare" => compare(ctx, args, reporter).await,
-        "synch_peers" => rendered(ctx, Cmd::Peers(pb::Peers {}), reporter).await,
-        "synch_doctor" => rendered(ctx, Cmd::Doctor(pb::Doctor { rebuild: false }), reporter).await,
+        "synch_peer_list" => rendered(ctx, Cmd::PeerLs(pb::PeerLs {}), reporter).await,
+        "synch_doctor" => rendered(ctx, Cmd::Doctor(pb::Doctor {}), reporter).await,
         "synch_socket_list" => socket_list(ctx, args, reporter).await,
         "synch_socket_ps" => socket_ps(ctx, args, reporter).await,
         "synch_socket_log" => socket_log(ctx, args, reporter).await,
         "synch_socket_sdk" => rendered(ctx, Cmd::SocketSdk(pb::SocketSdk {}), reporter).await,
         "synch_socket_build" => socket_build(args).await,
         "synch_socket_review" => socket_arm(ctx, args, reporter, None).await,
-        "synch_connect" => connect(ctx, args).await,
+        "synch_socket_connect" => connect(ctx, args).await,
 
         "synch_write" => write(ctx, args).await,
         "synch_delete" => delete(ctx, args).await,
-        "synch_take" => take(ctx, args, reporter).await,
-        "synch_fill" => fill(ctx, args, reporter).await,
+        "synch_adopt_path" => adopt_path(ctx, args, reporter).await,
+        "synch_adopt_tree" => adopt_tree(ctx, args, reporter).await,
         "synch_pin" => pin(ctx, args, reporter).await,
-        "synch_scan" => {
-            ctx.whole_node("synch_scan")?;
-            rendered(ctx, Cmd::Scan(pb::Scan {}), reporter).await
+        "synch_source_scan" => {
+            ctx.whole_node("synch_source_scan")?;
+            rendered(
+                ctx,
+                Cmd::SourceScan(pb::SourceScan {
+                    space: String::new(),
+                }),
+                reporter,
+            )
+            .await
         }
-        "synch_sync" => {
-            ctx.whole_node("synch_sync")?;
-            rendered(ctx, Cmd::SyncNow(pb::SyncNow {}), reporter).await
+        "synch_peer_sync" => {
+            ctx.whole_node("synch_peer_sync")?;
+            rendered(ctx, Cmd::PeerSync(pb::PeerSync {}), reporter).await
         }
-        "synch_socket_add" => socket_add(ctx, args, reporter).await,
+        "synch_socket_declare" => socket_declare(ctx, args, reporter).await,
         "synch_socket_arm" => {
             let token = need_str(args, "review_token")?.to_string();
             socket_arm(ctx, args, reporter, Some(token)).await
@@ -1159,9 +1167,9 @@ pub(crate) async fn call(
             })
             .await
         }
-        "synch_socket_remove" => {
+        "synch_socket_undeclare" => {
             socket_target(ctx, args, reporter, |target| {
-                Cmd::SocketRm(pb::SocketRm { target })
+                Cmd::SocketUndeclare(pb::SocketUndeclare { target })
             })
             .await
         }
@@ -1254,12 +1262,14 @@ async fn spaces(ctx: &Context) -> Result<Outcome, ToolError> {
         .map(|space| {
             json!({
                 "id": space.id,
-                "local_path": space.local_path,
-                "replicate": space.replicate,
+                "source_path": space.source_path,
+                "source_kind": space.source_kind,
+                "retention": space.retention,
                 "grace_secs": space.grace_secs,
                 "budget": space.budget,
                 "held_bytes": space.held_bytes,
                 "wanted": space.wanted,
+                "checkout_path": space.checkout_path,
             })
         })
         .collect();
@@ -1697,8 +1707,8 @@ async fn socket_arm(
     .await
 }
 
-/// `synch_socket_add`.
-async fn socket_add(
+/// `synch_socket_declare`.
+async fn socket_declare(
     ctx: &Context,
     args: &Value,
     reporter: &Reporter,
@@ -1717,7 +1727,7 @@ async fn socket_add(
     };
     rendered(
         ctx,
-        Cmd::SocketAdd(pb::SocketAdd {
+        Cmd::SocketDeclare(pb::SocketDeclare {
             target,
             config,
             max_streams,
@@ -1729,7 +1739,7 @@ async fn socket_add(
     .await
 }
 
-/// `synch_connect` — one invocation, driven to its close.
+/// `synch_socket_connect` — one invocation, driven to its close.
 async fn connect(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
     let origin = need_str(args, "origin")?;
     let space = need_str(args, "space")?;
@@ -1926,24 +1936,36 @@ async fn delete(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
     ))
 }
 
-/// `synch_take`.
-async fn take(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
+/// `synch_adopt_path`.
+async fn adopt_path(
+    ctx: &Context,
+    args: &Value,
+    reporter: &Reporter,
+) -> Result<Outcome, ToolError> {
     let space = need_str(args, "space")?;
     ctx.scope(space)?;
-    let reference = reference(
-        space,
-        need_str(args, "path")?,
-        Some(need_str(args, "origin")?),
-    )?;
-    rendered(ctx, Cmd::Take(pb::Take { reference }), reporter).await
+    let reference = reference(space, need_str(args, "path")?, None)?;
+    rendered(
+        ctx,
+        Cmd::AdoptPath(pb::AdoptPath {
+            reference,
+            select: opt_str(args, "select")?.map(str::to_string),
+        }),
+        reporter,
+    )
+    .await
 }
 
-/// `synch_fill`.
-async fn fill(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
+/// `synch_adopt_tree`.
+async fn adopt_tree(
+    ctx: &Context,
+    args: &Value,
+    reporter: &Reporter,
+) -> Result<Outcome, ToolError> {
     let space = need_str(args, "space")?;
     ctx.scope(space)?;
     let reference = reference(space, opt_path(args, "dir")?, None)?;
-    // Dry by default, unlike the CLI: a person typing `synch fill` has the
+    // Dry by default, unlike the CLI: a person typing `synch adopt tree` has the
     // directory in front of them, and a model calling it has not seen it.
     let dry_run = match args.get("dry_run") {
         None | Some(Value::Null) => true,
@@ -1951,11 +1973,10 @@ async fn fill(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcom
     };
     rendered(
         ctx,
-        Cmd::Fill(pb::Fill {
+        Cmd::AdoptTree(pb::AdoptTree {
             reference,
-            from: opt_str(args, "from")?.map(str::to_string),
-            strict: opt_bool(args, "strict")?,
-            force: opt_bool(args, "force")?,
+            select: opt_str(args, "select")?.map(str::to_string),
+            replace: opt_bool(args, "replace")?,
             dry_run,
         }),
         reporter,
@@ -1973,9 +1994,10 @@ async fn pin(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome
             reference(space, need_str(args, "path")?, None)?
         }
     };
+    let select = opt_str(args, "select")?.map(str::to_string);
     let command = match need_str(args, "action")? {
-        "add" => Cmd::PinAdd(pb::PinAdd { target }),
-        "rm" => Cmd::PinRm(pb::PinRm { target }),
+        "add" => Cmd::PinAdd(pb::PinAdd { target, select }),
+        "rm" => Cmd::PinRm(pb::PinRm { target, select }),
         other => {
             return Err(ToolError::execution(format!(
                 "{other:?} is not a pin action: use \"add\" or \"rm\""
@@ -2079,7 +2101,7 @@ mod tests {
         let names: Vec<&str> = read_only.catalog().iter().map(|t| t.name).collect();
         assert!(names.contains(&"synch_read"));
         assert!(names.contains(&"synch_socket_review"));
-        assert!(names.contains(&"synch_connect"));
+        assert!(names.contains(&"synch_socket_connect"));
         assert!(!names.contains(&"synch_write"));
         assert!(!names.contains(&"synch_socket_arm"));
 

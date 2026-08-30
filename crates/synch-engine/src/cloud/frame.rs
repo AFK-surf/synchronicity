@@ -244,7 +244,7 @@ pub(crate) enum Up {
         origin: String,
         /// The active device key, z-base-32.
         device: String,
-        /// The spaces this node holds — published or mirrored — as they stood
+        /// The spaces this node holds — published or replicated — as they stood
         /// when the session opened. A routing claim, not a boundary: the
         /// daemon serves whatever the control plane asks of it.
         spaces: Vec<String>,
@@ -303,11 +303,11 @@ pub(crate) enum Up {
         /// One row per `(issuer, subject)` pair, in the store's order.
         delegations: Vec<DelegationJson>,
     },
-    /// What this node replicates, one row per replicated space.
+    /// What this node replicates, one row per replica.
     Replication {
         /// The request id.
         id: u32,
-        /// The replicated spaces, in the store's order. Empty is an answer:
+        /// The replicas, in the store's order. Empty is an answer:
         /// this node replicates nothing, which is different from not having
         /// been asked.
         spaces: Vec<ReplicaSpaceJson>,
@@ -401,7 +401,7 @@ pub(crate) struct DelegationJson {
     pub note: Option<String>,
 }
 
-/// One replicated space, as this node reports it (`docs/REPLICATION.md` §8).
+/// One replica, as this node reports it (`docs/REPLICATION.md` §8).
 ///
 /// The counts are the store's, not a summary: `wanted` includes `unreachable`,
 /// because that is what the store means by it, and a reader that wants the
@@ -412,10 +412,10 @@ pub(crate) struct DelegationJson {
 pub(crate) struct ReplicaSpaceJson {
     /// The space's id.
     pub space: String,
-    /// `tree` or `archive`.
+    /// `current` or `forever`.
     pub policy: String,
     /// The grace window a superseded root gets, in seconds. Reported under
-    /// `archive` too, where it is inert: nothing is ever scheduled.
+    /// `forever` too, where it is inert: nothing is ever scheduled.
     pub grace_secs: i64,
     /// The ceiling on held bytes, if the space has one.
     pub budget: Option<u64>,
@@ -545,7 +545,7 @@ mod tests {
             id: 7,
             spaces: vec![ReplicaSpaceJson {
                 space: "media".into(),
-                policy: "tree".into(),
+                policy: "current".into(),
                 grace_secs: 2_592_000,
                 budget: Some(1 << 40),
                 held: 12,
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(json["id"], 7);
         let row = &json["spaces"][0];
         assert_eq!(row["space"], "media");
-        assert_eq!(row["policy"], "tree");
+        assert_eq!(row["policy"], "current");
         assert_eq!(row["grace_secs"], 2_592_000);
         assert_eq!(row["budget"], 1u64 << 40);
         assert_eq!(row["held"], 12);
@@ -599,7 +599,7 @@ mod tests {
             id: 1,
             spaces: vec![ReplicaSpaceJson {
                 space: "docs".into(),
-                policy: "archive".into(),
+                policy: "forever".into(),
                 grace_secs: 0,
                 budget: None,
                 held: 0,

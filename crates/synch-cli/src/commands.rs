@@ -16,9 +16,9 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        CasBackendArg, CasCommand, Cli, CloudCommand, Command, DaemonCommand, DelegateCommand,
-        DomainCommand, KeyCommand, MirrorCommand, PinCommand, SocketCommand, SpaceCommand,
-        TrustCommand,
+        AdoptCommand, CasBackendArg, CasCommand, Cli, Command, ControlPlaneCommand, DaemonCommand,
+        DelegateCommand, DomainCommand, KeyCommand, PeerCommand, PinCommand, RepairCommand,
+        ReplicaCommand, SocketCommand, SourceCommand, TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -204,11 +204,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         } => migrate_cas(&cli, &data_dir, *to).await,
         // Not a `Run` command: it is a bidirectional byte pipe, and rendering
         // it as lines of text would be rendering somebody else's protocol.
-        Command::Connect {
-            reference,
-            meta,
-            listen,
-            once,
+        Command::Socket {
+            command:
+                SocketCommand::Connect {
+                    reference,
+                    meta,
+                    listen,
+                    once,
+                },
         } => crate::connect::run(&data_dir, reference, meta, listen.as_deref(), *once).await,
         // Also not a `Run` command, and for a plainer reason: compiling a C
         // file needs no node, no daemon and no data directory. Sending it to
@@ -321,13 +324,13 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
         let checked = source_store.clone();
         let path_spaces = tokio::task::spawn_blocking(move || {
             let _scope = synch_core::BlockingScope::enter();
-            path_backed_space_ids(&checked)
+            filesystem_source_ids(&checked)
         })
         .await
         .context("the space inventory task did not complete")??;
         if !path_spaces.is_empty() {
             anyhow::bail!(
-                "cloud CAS migration requires detached spaces; path-backed space(s): {}",
+                "cloud CAS migration requires API sources; filesystem source(s): {}",
                 path_spaces.join(", ")
             );
         }
@@ -396,14 +399,14 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
     Ok(())
 }
 
-fn path_backed_space_ids(
+fn filesystem_source_ids(
     store: &synch_store::Store,
 ) -> std::result::Result<Vec<String>, synch_store::StoreError> {
     Ok(store
-        .spaces()?
+        .sources()?
         .into_iter()
         .filter(|space| space.local_path.is_some())
-        .map(|space| space.id)
+        .map(|space| space.space)
         .collect())
 }
 
@@ -690,7 +693,11 @@ fn build_migration_backend(
 fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
-        Command::Connect { .. } => unreachable!("handled before dispatch"),
+        Command::Socket {
+            command: SocketCommand::Connect { .. },
+        } => {
+            unreachable!("handled before dispatch")
+        }
         Command::Mcp { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
@@ -759,97 +766,103 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             DomainCommand::Refresh => Cmd::DomainRefresh(pb::DomainRefresh {}),
         },
 
-        Command::Peers => Cmd::Peers(pb::Peers {}),
-        Command::Sync => Cmd::SyncNow(pb::SyncNow {}),
+        Command::Peer { command } => match command {
+            PeerCommand::Ls => Cmd::PeerLs(pb::PeerLs {}),
+            PeerCommand::Sync => Cmd::PeerSync(pb::PeerSync {}),
+        },
 
-        Command::Space { command } => match command {
+        Command::Source { command } => match command {
             // The daemon's working directory is its own; a relative path is
             // resolved against the caller's before it crosses the socket.
-            SpaceCommand::Add {
-                id,
-                path,
-                detached,
-                replicate,
-                grace,
-                budget,
-            } => Cmd::SpaceAdd(pb::SpaceAdd {
-                id: id.clone(),
+            SourceCommand::Add { space, path, api } => Cmd::SourceAdd(pb::SourceAdd {
+                space: space.clone(),
                 path: path
                     .as_deref()
                     .map(absolute)
                     .transpose()?
                     .unwrap_or_default(),
-                detached: *detached,
-                replicate: replicate.clone(),
-                grace: grace.map(|d| d.as_secs() as i64),
-                budget: *budget,
+                api: *api,
             }),
-            SpaceCommand::Set {
-                id,
-                replicate,
-                no_replicate,
-                release,
-                grace,
-                budget,
-            } => Cmd::SpaceSet(pb::SpaceSet {
-                id: id.clone(),
-                replicate: replicate.clone(),
-                no_replicate: *no_replicate,
-                release: *release,
-                grace: grace.map(|d| d.as_secs() as i64),
-                budget: *budget,
+            SourceCommand::Ls { space } => Cmd::SourceLs(pb::SourceLs {
+                space: space.clone().unwrap_or_default(),
             }),
-            SpaceCommand::Ls { id } => Cmd::SpaceLs(pb::SpaceLs {
-                id: id.clone().unwrap_or_default(),
+            SourceCommand::Scan { space } => Cmd::SourceScan(pb::SourceScan {
+                space: space.clone().unwrap_or_default(),
             }),
-            SpaceCommand::Sync { id } => Cmd::SpaceSync(pb::SpaceSync {
-                id: id.clone().unwrap_or_default(),
-            }),
-            SpaceCommand::Rm { id, release } => Cmd::SpaceRm(pb::SpaceRm {
-                id: id.clone(),
-                release: *release,
+            SourceCommand::Rm { space } => Cmd::SourceRm(pb::SourceRm {
+                space: space.clone(),
             }),
         },
 
-        Command::Fill {
-            reference,
-            from,
-            strict,
-            force,
-            dry_run,
-        } => Cmd::Fill(pb::Fill {
-            reference: reference.clone(),
-            from: from.clone(),
-            strict: *strict,
-            force: *force,
-            dry_run: *dry_run,
-        }),
-
-        Command::Mirror { command } => match command {
-            MirrorCommand::Add {
+        Command::Replica { command } => match command {
+            ReplicaCommand::Add {
                 space,
-                path,
-                policy,
-            } => Cmd::MirrorAdd(pb::MirrorAdd {
+                retention,
+                grace,
+                budget,
+                checkout,
+            } => Cmd::ReplicaAdd(pb::ReplicaAdd {
                 space: space.clone(),
-                path: absolute(path)?,
-                policy: policy.clone(),
+                retention: retention.clone(),
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
+                checkout: checkout.as_deref().map(absolute).transpose()?,
             }),
-            MirrorCommand::Rm { path } => Cmd::MirrorRm(pb::MirrorRm {
-                path: absolute(path)?,
+            ReplicaCommand::Set {
+                space,
+                retention,
+                grace,
+                budget,
+                no_budget,
+                checkout,
+                no_checkout,
+            } => Cmd::ReplicaSet(pb::ReplicaSet {
+                space: space.clone(),
+                retention: retention.clone(),
+                grace: grace.map(|d| d.as_secs() as i64),
+                budget: *budget,
+                no_budget: *no_budget,
+                checkout: checkout.as_deref().map(absolute).transpose()?,
+                no_checkout: *no_checkout,
             }),
-            MirrorCommand::Ls => Cmd::MirrorLs(pb::MirrorLs {}),
-            MirrorCommand::Sync => Cmd::MirrorSync(pb::MirrorSync {}),
+            ReplicaCommand::Rm { space, pin_held } => Cmd::ReplicaRm(pb::ReplicaRm {
+                space: space.clone(),
+                pin_held: *pin_held,
+            }),
+            ReplicaCommand::Ls { space } => Cmd::ReplicaLs(pb::ReplicaLs {
+                space: space.clone().unwrap_or_default(),
+            }),
+            ReplicaCommand::Sync { space } => Cmd::ReplicaSync(pb::ReplicaSync {
+                space: space.clone().unwrap_or_default(),
+            }),
+        },
+
+        Command::Adopt { command } => match command {
+            AdoptCommand::Path { reference, select } => Cmd::AdoptPath(pb::AdoptPath {
+                reference: reference.clone(),
+                select: select.clone(),
+            }),
+            AdoptCommand::Tree {
+                reference,
+                select,
+                replace,
+                dry_run,
+            } => Cmd::AdoptTree(pb::AdoptTree {
+                reference: reference.clone(),
+                select: select.clone(),
+                replace: *replace,
+                dry_run: *dry_run,
+            }),
         },
 
         Command::Socket { command } => match command {
-            SocketCommand::Add {
+            SocketCommand::Declare {
                 target,
                 config,
                 max_streams,
                 auto,
                 note,
-            } => Cmd::SocketAdd(pb::SocketAdd {
+            } => Cmd::SocketDeclare(pb::SocketDeclare {
                 target: target.clone(),
                 config: config.clone(),
                 max_streams: max_streams.unwrap_or(0),
@@ -863,7 +876,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
                 target: target.clone(),
             }),
-            SocketCommand::Rm { target } => Cmd::SocketRm(pb::SocketRm {
+            SocketCommand::Undeclare { target } => Cmd::SocketUndeclare(pb::SocketUndeclare {
                 target: target.clone(),
             }),
             SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
@@ -885,23 +898,25 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             // build. Spelled out rather than left to `_`, so adding a socket
             // command that *does* need the daemon is a compile error here
             // rather than a silent no-op.
-            SocketCommand::Build { .. } => {
+            SocketCommand::Build { .. } | SocketCommand::Connect { .. } => {
                 anyhow::bail!("`synch socket build` runs in this process, not the daemon")
             }
         },
 
         Command::Pin { command } => match command {
-            PinCommand::Add { target } => Cmd::PinAdd(pb::PinAdd {
+            PinCommand::Add { target, select } => Cmd::PinAdd(pb::PinAdd {
                 target: target.clone(),
+                select: select.clone(),
             }),
-            PinCommand::Rm { target } => Cmd::PinRm(pb::PinRm {
+            PinCommand::Rm { target, select } => Cmd::PinRm(pb::PinRm {
                 target: target.clone(),
+                select: select.clone(),
             }),
             PinCommand::Ls => Cmd::PinLs(pb::PinLs {}),
         },
 
         Command::Ls { reference, all } => Cmd::Ls(pb::Ls {
-            reference: reference.clone(),
+            reference: reference.clone().unwrap_or_default(),
             all: *all,
         }),
         Command::Status { reference } => Cmd::Status(pb::Status {
@@ -910,30 +925,23 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         Command::Cat {
             reference,
             range,
-            from,
-            strict,
+            select,
             root,
         } => Cmd::Cat(pb::Cat {
             reference: reference.clone().unwrap_or_default(),
             range: range.clone(),
-            from: from.clone(),
-            strict: *strict,
             root: root.clone(),
+            select: select.clone(),
         }),
         Command::Get {
             reference,
-            from,
-            strict,
+            select,
             root,
             ..
         } => Cmd::Get(pb::Get {
             reference: reference.clone().unwrap_or_default(),
-            from: from.clone(),
-            strict: *strict,
             root: root.clone(),
-        }),
-        Command::Take { reference } => Cmd::Take(pb::Take {
-            reference: reference.clone(),
+            select: select.clone(),
         }),
         Command::Log { reference } => Cmd::Log(pb::Log {
             reference: reference.clone(),
@@ -960,13 +968,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 gap: *gap,
             })
         }
-        Command::Doctor { rebuild } => Cmd::Doctor(pb::Doctor { rebuild: *rebuild }),
-        Command::Scan => Cmd::Scan(pb::Scan {}),
-
-        Command::Cloud { command } => match command {
-            CloudCommand::Enable => Cmd::CloudEnable(pb::CloudEnable {}),
-            CloudCommand::Disable => Cmd::CloudDisable(pb::CloudDisable {}),
-            CloudCommand::Status => Cmd::CloudStatus(pb::CloudStatus {}),
+        Command::Doctor => Cmd::Doctor(pb::Doctor {}),
+        Command::Repair {
+            command: RepairCommand::RebuildViews,
+        } => Cmd::RepairRebuildViews(pb::RepairRebuildViews {}),
+        Command::ControlPlane { command } => match command {
+            ControlPlaneCommand::Enable => Cmd::ControlPlaneEnable(pb::ControlPlaneEnable {}),
+            ControlPlaneCommand::Disable => Cmd::ControlPlaneDisable(pb::ControlPlaneDisable {}),
+            ControlPlaneCommand::Status => Cmd::ControlPlaneStatus(pb::ControlPlaneStatus {}),
         },
     })
 }
@@ -1121,13 +1130,21 @@ mod tests {
     }
 
     #[test]
-    fn cloud_migration_preflight_names_path_backed_spaces() {
+    fn cloud_migration_preflight_names_filesystem_sources() {
         let data = tempfile::tempdir().unwrap();
         let store = synch_store::Store::open(data.path()).unwrap();
-        store.put_space("detached", None).unwrap();
-        store.put_space("checkout", Some("/srv/checkout")).unwrap();
+        store
+            .put_source("detached", synch_store::SourceKind::Api, None)
+            .unwrap();
+        store
+            .put_source(
+                "checkout",
+                synch_store::SourceKind::Filesystem,
+                Some("/srv/checkout"),
+            )
+            .unwrap();
         assert_eq!(
-            path_backed_space_ids(&store).unwrap(),
+            filesystem_source_ids(&store).unwrap(),
             vec!["checkout".to_string()]
         );
     }

@@ -418,9 +418,9 @@ pub struct ReplicaClaim {
     pub v: u8,
     /// When this node started replicating the space, in unix nanoseconds.
     pub since_ns: i64,
-    /// The policy, as `tree` or `archive`.
+    /// The retention policy, as `current` or `forever`.
     pub policy: String,
-    /// Seconds a released root is still held. Zero under `archive`, which
+    /// Seconds a released root is still held. Zero under `forever`, which
     /// releases nothing.
     pub grace_secs: i64,
     /// Objects held for the space.
@@ -588,8 +588,8 @@ pub fn parse_file_key(key: &[u8]) -> Result<(String, String), KeyError> {
     // when we build our own keys: a peer's origin trie is single-writer and
     // replicated wholesale, so a malicious peer can publish `f:space//etc/x`
     // or `f:space/../../x`; accepted, the raw path flows into the entries view
-    // and then `root_dir.join(path)` during mirror materialization, escaping
-    // the mirror root. Reject any key whose path is not already canonical.
+    // and then `root_dir.join(path)` during checkout materialization, escaping
+    // the checkout root. Reject any key whose path is not already canonical.
     let normalized = normalize_path(path).map_err(|_| KeyError::Malformed)?;
     if normalized != path {
         return Err(KeyError::Malformed);
@@ -854,7 +854,7 @@ mod tests {
     fn parse_rejects_non_normalized_paths() {
         // A peer's origin trie is attacker-controlled bytes. `parse_file_key`
         // must reject any path that is not already canonical, so a hand-crafted
-        // key can never flow into `root_dir.join(path)` and escape a mirror.
+        // key can never flow into `root_dir.join(path)` and escape a checkout.
         assert!(parse_file_key(b"f:media//etc/passwd").is_err()); // absolute
         assert!(parse_file_key(b"f:media/../../etc/passwd").is_err()); // dot-dot
         assert!(parse_file_key(b"f:media/a/../b").is_err()); // interior dot-dot

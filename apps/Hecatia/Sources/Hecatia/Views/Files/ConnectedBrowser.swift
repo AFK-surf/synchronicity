@@ -39,12 +39,12 @@ struct ConnectedBrowser: View {
       if node.loading.contains(.spaces), node.spaces.isEmpty {
         // Not "Add a space to get started" — the question has not been answered
         // yet. `connect()` publishes `.connected` before it runs the first
-        // `space ls`, and it has to: `refresh` is gated on the connection. So
+        // the space listing, and it has to: `refresh` is gated on the connection. So
         // between those two lines the app is connected with an empty list it
         // has never asked about — which on a first launch, and after the app's
         // own Stop, is every launch — and the whole first-run screen was drawn
         // over a daemon that had folders, then replaced by the file list.
-        // The same test ``MirrorsSection`` and ``PinsSection`` make before
+        // The same test ``PinsPane`` and ``PinsSection`` make before
         // asserting an empty state of their own.
         ProgressView()
           .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -95,7 +95,7 @@ struct ConnectedBrowser: View {
 }
 
 #Preview("Asking what there is") {
-  // Connected, with the first `space ls` still in flight. The list is empty for
+  // Connected, with the first space listing still in flight. The list is empty for
   // the same reason it is empty on every launch — nobody has asked yet — and
   // the screen above is what used to be drawn over it.
   let store = NodeStore.preview(spaces: [], loading: [.spaces])

@@ -150,7 +150,7 @@ pub(crate) const FAULT_QUARANTINE: usize = 8;
 /// See [`FAULT_QUARANTINE`].
 pub(crate) const FAULT_WINDOW: usize = 16;
 
-/// Caps for `synch connect --listen` (crates/synch-cli/src/connect.rs).
+/// Caps for `synch socket connect --listen` (crates/synch-cli/src/connect.rs).
 ///
 /// The listener is a pre-auth front door: a connection is admitted before any
 /// authentication happens, so a flood of accept()s would hold admission slots —

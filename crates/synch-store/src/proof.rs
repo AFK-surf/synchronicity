@@ -186,7 +186,7 @@ impl Proven {
 /// donor's own tree gives it the chaining value a proof chained to the new
 /// object's root.
 ///
-/// One shape of donor, deliberately. A mirror whose file on disk *is* a version
+/// One shape of donor, deliberately. A checkout whose file on disk *is* a version
 /// the CAS has since collected re-ingests that file rather than being offered
 /// here as a second kind of donor: the capability is preserved, the rare path
 /// pays for it, and nothing inside this module has to know that a donor might

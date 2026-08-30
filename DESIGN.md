@@ -203,7 +203,7 @@ waiting when they return.
 
 **Adopting a name** — a first one, or one that displaced it — happens on the next start,
 in one transaction, before the endpoint binds: the self binding moves, both head slots
-and the old origin's `entries` and `blob_providers` views are dropped, mirror policies
+and the old origin's `entries` and `blob_providers` views are dropped, read selections
 pinned to it (§7.2) are rewritten, and `publish_floor` is cleared. Blobs stay and the
 next scan republishes them; `head_history` is untouched, so heads signed under the old
 name survive as the fork evidence §4.4 makes of them. `synch domain set` and `synch
@@ -447,7 +447,7 @@ throughout recovery, a fork exists: when that peer returns, its retired-key head
 kept as **fork evidence** (heads verified while their signer was bound remain
 provable history, §4.4), `synch doctor` surfaces it on every node ("origin nas has
 unreconciled pre-recovery history at seq 100"), and the affected entries' content
-remains fetchable for manual salvage via `synch take`. The fork is resolved by the
+remains fetchable for manual salvage via `synch adopt path`. The fork is resolved by the
 origin's operator, never silently by the protocol.
 
 **During the window**, both keys could in principle sign competing heads; the
@@ -510,7 +510,7 @@ under its own origin *and* what it may read of everyone else's — and outside i
 data is not refused but never sent (§5.5). A space is a cluster-wide namespace, so
 delegating `photos` grants every member's `photos`: it has to, because the unified
 tree (§8) merges across origins by `(space, path)`, and a per-origin grant would
-describe a view no mirror policy could render.
+describe a view no reader could render.
 
 **A delegation binds `OriginId::Key` only.** If it could name a `Named` origin, any
 member could delegate `nas@cluster.example.com` and squat a label the DNS zone
@@ -594,7 +594,7 @@ mirrors directory structure, and a directory listing is a range scan over
 `f:<space>/<dir>/`.
 
 A **space** is a named sync root (like a Syncthing folder): a user configures
-`synch space add photos ~/Pictures`, and that subtree is indexed under `f:photos/...`.
+`synch source add photos ~/Pictures`, and that subtree is indexed under `f:photos/...`.
 Spaces are the unit of sharing policy and of local materialization.
 
 The keyspace is laid out so that **the redaction boundary falls on key prefixes**,
@@ -673,7 +673,7 @@ Notes:
   never resolved expires: if another origin still publishes a live version when
   the tombstone's TTL runs out, that live version becomes the only one and
   `newest` surfaces silently re-serve the file. The remedy for both is ending the
-  divergence while it is visible — `synch take` the deletion (§8) on the holdout,
+  divergence while it is visible — `synch adopt path` the deletion (§8) on the holdout,
   or the holdout deletes its copy — rather than letting the TTL decide.
 - **`BlobAd` granularity — one record per object per holder.** Advertising every
   hash-tree node individually is the obvious alternative and is unsound at scale: a
@@ -825,7 +825,7 @@ atomically, in ONE SQLite transaction:
     re-materialize changed leaves into `entries` / `blob_providers` (computed from
     the node-level diff between old and new root — only touched subtrees visited)
 // the flip and the materialization are the same transaction (§10): a crash can
-// never leave `entries` — what the unified tree, mirrors, and s3 serve from —
+// never leave `entries` — what the unified tree, checkouts, and S3 serve from —
 // missing a promoted head's delta. Local publishes obey the same rule: trie
 // writes, head, history, and materialization commit together or not at all.
 ```
@@ -939,7 +939,7 @@ are rolled back to it everywhere.
 
   A pushed head lands in the receiver's **pending** slot — by construction, since
   a head worth pushing names a root the receiver has never seen — and the head
-  alone moves nothing a reader looks at: `entries`, the unified tree, mirrors and
+  alone moves nothing a reader looks at: `entries`, the unified tree, checkouts and
   the S3 gateway all sit behind promotion. So the receiver's anti-entropy loop
   waits on that adoption as well as on its interval, and dials for the trie at
   once. Without that arm the "sub-second" above was true of the pointer and false
@@ -954,7 +954,7 @@ are rolled back to it everywhere.
   membership concurrently, so peer X's round is in flight while pushes from other
   origins land. A signal that keeps nothing for an unparked listener is therefore
   silent for precisely the pushes that matter, and the interval-length wait comes
-  straight back. The promotion signal that drives mirrors is the same shape for
+  straight back. The promotion signal that drives replica acquisition is the same shape for
   the same reason.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
@@ -1229,7 +1229,7 @@ The fetcher:
    CAS and the completeness bitmap immediately (progress survives restarts).
 3. Re-plans on provider failure: a provider that cannot help is dropped from the
    plan and its groups are re-split across the remainder. Fetching is on-demand and
-   request-scoped — the caller (`synch cat/get`, a mirror pass, the s3 gateway)
+   request-scoped — the caller (`synch cat/get`, replica acquisition, the S3 gateway)
    drives it and owns retry policy; there is no persistent download queue. Progress
    still survives restarts, because verified groups are committed to the CAS as
    they arrive and a re-issued fetch skips whatever is already held.
@@ -1245,7 +1245,7 @@ our control, but the heavy machinery (bao verification) is shared code.
 synchronicity is a **sync-directory** tool, not a mounted filesystem. Cross-platform
 behavior with zero kernel dependencies:
 
-### 7.1 Indexing pipeline (own spaces)
+### 7.1 Filesystem-source scanning and publication
 
 - **Watcher**: the `notify` crate (inotify / FSEvents / ReadDirectoryChangesW, with
   polling fallback) provides change hints per space. Hints are debounced (default
@@ -1267,132 +1267,42 @@ behavior with zero kernel dependencies:
 Ignore rules: `.syncignore` per space root (gitignore syntax), plus sensible built-in
 defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
 
-### 7.2 Materialization (the unified tree, under a policy)
+### 7.2 Materialization and adoption
 
-Materialization reads the unified tree (§8), so every materializing surface names a
-**version policy** — `newest` (default), `origin=<id>`, or `strict`:
+Materialization reads the unified tree (§8), so every read surface takes one
+selection policy: `--select newest` (default), `--select origin=<id>`, or
+`--select strict`. An origin-qualified reference is shorthand for the origin policy.
 
-- `synch get <space>/<path> [-o dest] [--from <origin>|--strict]` — single fetch of
-  the selected version into a local file. `synch get <origin>:<space>/<path>` remains
-  the origin-pinned form.
-- `synch mirror add <space> <local-dir> [--policy newest|origin=<id>|strict]` —
-  continuous read-only mirror of the unified tree for that space: the engine keeps
-  the directory in sync with the policy-selected version of every path (fetching
-  content via §6.4). A standing loop runs a pass the moment the tree changes — a
-  head flipping to complete on any exchange, a local publish, a newly added mirror
-  all ring it — once at startup, and on a 60 s backstop interval; a pass over an
-  unchanged tree costs the tree's stats, not its bytes (docs/DELTA-SYNC.md §3.5).
-  Under `strict`, divergent paths are skipped and reported —
-  the mirror never guesses. Mirrored trees are never indexed back into the local
-  origin trie (no echo).
-- `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to
-  stdout with verified random access; this is where hash-tree reads shine (e.g.
-  seeking in a large video).
-- `synch fill [<origin>:]<space>[/<dir>] [--from <origin>|--strict] [--force]
-  [--dry-run]` — not to be confused with `synch space sync`, which is the other
-  half of the same wish. Replication (`--replicate`, docs/REPLICATION.md) holds
-  the *bytes* of every version in the CAS and materializes nothing; a fill
-  writes *files*, one selected version per path, and holds nothing beyond what
-  the store already keeps. They compose: on a replicated space every object a
-  fill wants is already local, so the fill is materialization with no network
-  in it at all.
+- `synch cat` streams a selected version, with optional verified range reads.
+- `synch get` writes one selected version to an explicitly named destination.
+- `synch adopt path` writes one selected path into a local source and immediately
+  publishes it as this node's assertion. A selected tombstone removes the local
+  path and publishes that deletion.
+- `synch adopt tree` does the same additively for a subtree. Existing differing
+  files are reported unless `--replace` is explicit; `--dry-run` is a complete
+  preview. It never infers removal from absence. A successful non-dry run scans,
+  publishes, and pushes before returning.
 
-  A fill is
-  one-shot materialization into the *space's own* directory, the one `synch space
-  add` named. Where a mirror owns the directory it writes into, a fill writes into
-  the directory this node indexes and publishes from, so it may only ever add: a
-  missing path is written, a path whose bytes already match is left alone, and a
-  path whose bytes differ is reported rather than overwritten (`--force` replaces
-  it, which is `synch take`'s adoption in bulk — though not its publish: a fill
-  waits for the scan, where `take` publishes before it answers). **Nothing is
-  ever removed** — not a
-  tombstoned version, not a local file no origin publishes; adopting a deletion
-  stays the deliberate, one-path act `synch take` of a tombstone is. A fill does
-  not publish either: the files land where the scanner will find them and the next
-  scan (§7.1) publishes them as this node's own view.
+A replica may also have `--checkout <path>`. That directory is only a view of
+content the replica already holds: checkout never creates retention demand and
+never fetches. It continuously materializes the `newest` unified view, is never
+scanned or published, and has no independent command or policy. Removing the
+replica stops updating the checkout but leaves its files in place.
 
-  A node in recovery refuses to fill (§3.4), like every other command that does
-  irreversible work before publishing. A scan refuses there too, so a fill would
-  write a tree nothing would ever announce — and `--force`'s own-origin guard,
-  which needs this node to publish something, would be inert while it did: a
-  recovering node publishes nothing under its own origin, so every path selects
-  a peer's version and every local file that differs is overwritten. `synch
-  recover`, then fill, then scan.
+Adoption writes only to a filesystem source and obeys its `.syncignore`,
+missing-root, recovery, race, and path-validity guards. The engine rechecks the
+target immediately before replacement, so a file that appeared or changed after
+planning is left alone. It also refuses to replace an unpublished local edit with
+this node's own selected version. Written files carry the selected version's mtime
+and masked advisory mode; matching local files are not restamped.
 
-  A fill does not exclude the scanner: the two share no lock, and the fill's own
-  writes are what wake the watcher (§7.1), so a scan running during a fill is
-  the normal case rather than the exotic one. That is what the write-time guards
-  are written against, and why a filled path's `local_files` row is dropped as
-  the path is written rather than at the end.
+Checkout and source roots may not overlap. Trie paths are case-sensitive NFC UTF-8,
+while local filesystems may fold case or reject names, so colliding or invalid paths
+are skipped and reported rather than clobbered.
 
-  A fill is bound by the rules that bind indexing, and by the same guard on the
-  space root: it writes nothing the space's `.syncignore` excludes — such a file
-  would sit where the scanner never looks, never published and never swept, and
-  the exclusion covers a path under an excluded *directory*, which is what the
-  scanner gets for free by never descending into one — and it refuses a root
-  that has gone, before it starts and again before each write, since a fill of a
-  large tree runs for hours and an unplugged drive mid-run would otherwise have
-  its mount point recreated and the rest of the tree materialized onto the disk
-  underneath (§7.1 takes the same guard against the opposite misreading, that
-  every file was deleted).
-
-  Two refusals follow from writing into a directory somebody works in. A file
-  the operator was not shown is never overwritten, `--force` or not — one that
-  *appeared* at a path the plan found empty, and equally one whose bytes were
-  *rewritten* since the plan stat'd them, because `--force` answers for the file
-  it was pointed at rather than for whatever the path became while an object was
-  being fetched: the plan's "nothing was here" has a shelf life, and materialization ends
-  in a rename. And a file this node cannot *read* is never called differing and
-  never replaced — "differs" would be a claim the failed read did not establish,
-  and a rename needs no read permission to act on it. `--force` also declines
-  the one case where there is nothing to adopt: when the selected version is
-  this node's own and what is here differs from it — a file's bytes or a link's
-  target — the disk holds an edit no scan has published yet, and overwriting it
-  would lose that edit leaving no version, no `prev`, and no trace in the
-  cluster. A path that is *absent* locally is filled either way, including from
-  this node's own version: that is what makes a fill the way back from a lost
-  checkout, and it means a deletion made while the daemon was down is undone
-  rather than published — `synch scan` first if the deletion was meant.
-
-  Which is why the metadata rule below is load-bearing here rather than cosmetic.
-  The mtime a filled path is stamped with is the one the next scan publishes, so a
-  fill restates the version it filled instead of minting a newer one — and `newest`
-  orders on `(mtime, content root, origin)`, so a fill stamped with the wall clock
-  would make this node win the selection for every path it touched, cluster-wide.
-
-Materialized files carry the metadata their selected version published, not the
-metadata of the copy: the origin's `mtime_ns`, and the permission bits of its
-advisory `unix_mode` (§4.2, masked — setuid/setgid/sticky are never reproduced,
-since the mode is a peer's assertion and the daemon may be privileged). In a
-*mirror*, a file whose bytes are already current but whose mode or mtime has
-drifted is stamped back in place rather than refetched — the directory is the
-mirror's own and the published metadata is the whole of what it should say. A
-*fill* stamps only what it writes: a path already holding the right bytes is
-left completely alone, mtime included, because that metadata is this node's own
-assertion and restamping it would republish every path a fill looked at. A
-symbolic link's metadata is not
-reproduced: its target *is* its version (§8), and stamping a link's own times
-needs a facility the standard library does not expose.
-
-Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
-filesystems may not be. A fill applies the rule below on every platform, as a
-mirror does. It could ask the filesystem instead — and did, briefly — but the
-two ways of being wrong are not symmetric: refusing a name is a report about two
-files that are both sitting there, while a wrong "this filesystem does not fold"
-is a silent clobber. When two published paths collide under the target
-filesystem's case folding, materialization
-writes the lexicographically first and **skips and reports** the rest — never
-silently clobbers. Names invalid on the target platform (Windows reserved device
-names, trailing dot/space, forbidden characters) are likewise skipped and reported.
-And mirror targets may not overlap any configured space root (or vice versa):
-`synch mirror add` and `synch space add` refuse overlapping paths, which makes the
-"no echo" guarantee structural rather than conventional.
-
-Two-way "shared folder" workflows are the unified tree working as intended: both
-nodes index their own copy of a space (same space id), the tree shows one hierarchy,
-agreement renders as plain files, and divergence between the copies is marked and
-surfaced by `synch status` (§8) for explicit adoption with `synch take`.
-
+Two-way shared folders are two nodes holding filesystem source roles for the same
+namespace. Divergence remains visible in `synch status` and is resolved explicitly
+with `synch adopt path` or `synch adopt tree`.
 ---
 
 ## 8. The unified tree and its versions
@@ -1445,19 +1355,20 @@ content.** What it does do is aggregate:
     `touch -d` wins `newest` on every surface until its entries are outranked,
     adopted over, or the member is removed; and determinism holds only over *the
     same assertions* — two nodes that have synced different subsets of heads
-    select differently until anti-entropy converges them, so a lagging mirror
+    select differently until anti-entropy converges them, so a lagging checkout
     can briefly serve different bytes than a current one, unmarked. Deployments
     for which either is unacceptable use `strict` or an `origin=` pin.
-  - `origin=<id>` — pin to one origin's view (the old per-origin behavior, still the
-    right tool for "serve exactly what the NAS publishes").
+  - `origin=<id>` — select one origin's view, the right tool for "serve exactly
+    what the NAS publishes".
   - `strict` — refuse to read a divergent path, returning the version list instead;
     for workflows where silently reading either side is worse than failing.
-  Policy is a property of the reading surface: a flag on `cat`/`get` (`--from
-  <origin>`, `--strict`), a stored policy per mirror and per s3 bucket (§7.2, §9.4).
-- **Adoption is explicit — and deletions are adoptable**: `synch take
-  <origin>:<space>/<path>` makes that origin's version our own. For a live
+  Selection is explicit and uniform: `cat`, `get`, pinning, and adoption accept
+  `--select newest|strict|origin=<id>`. S3 bucket configuration stores the same
+  selection (§7.2, §9.4).
+- **Adoption is explicit — and deletions are adoptable**: `synch adopt path
+  <space>/<path> --select origin=<id>` makes that origin's version our own. For a live
   version, it fetches the content, writes it into the local space, and thereby
-  (via the indexing pipeline) publishes it as the local node's own new entry.
+  (via the filesystem-source scan) publishes it as the local node's own new entry.
   For a **tombstone** version, it deletes our local copy from the space, and the
   next scan publishes our own tombstone — adopting the deletion exactly as one
   adopts content. Adoption is how *all* divergence ends, deletion divergence
@@ -1534,13 +1445,12 @@ synch domain set|clear|ls|refresh            the DNSSEC zone this node belongs t
                                              cluster; refresh re-resolves now, set and
                                              clear change the name at the next start
                                              (§3.1) and clear drops the zone's bindings
-synch peers                                  live peers, addresses, last sync, lag
+synch peer ls|sync                           inspect peers or exchange metadata now
 
-synch space add <id> <path> [--replicate[=tree|archive]] [--grace <dur>] [--budget <n>]
-synch space add <id> --detached [--replicate…]  index a directory as a space, hold every
-synch space set <id> [--replicate…|--no-replicate [--release]]   version of it, or both
-synch space ls [<id>] | rm <id> [--release] | sync [<id>]   (§4.1, docs/REPLICATION.md)
-synch scan                                   walk every space now: hash changes, publish
+synch source add <id> <path>|--api           configure this node to publish a space
+synch source ls|scan|rm [<id>]               inspect, scan, or stop a publisher
+synch replica add|set|rm <id> [options]      configure independent durable retention
+synch replica ls|sync [<id>]                 coverage or an immediate content pass
 
 synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent paths
                                              marked with version counts; --all shows
@@ -1549,26 +1459,24 @@ synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent p
 synch status [<space>[/<path>]]              the version inspector: every version of
                                              a path, its attestors, side by side
 synch cat  [<origin>:]<space>/<path>         verified streaming read of the selected
-           [--range] [--from <o>|--strict]   version (§8 policy; default newest)
+           [--range] [--select <policy>]     version (§8 policy; default newest)
 synch cat|get --root <hex>                   read an object by content root, no path
                                              involved — how a superseded version is read
 synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
-           [--from <o>|--strict]
-synch take <origin>:<space>/<path>           adopt a version as my own (ends divergence)
+           [--select <policy>]
+synch adopt path [<origin>:]<space>/<path>   adopt one version as my own
+           [--select <policy>]
+synch adopt tree <space>[/<dir>]             additive bulk adoption into a source
+           [--select <policy>]
+           [--replace] [--dry-run]
 synch log  [<origin>:]<space>/<path>         per-origin publish history
 synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/deleted)
            [--from <origin>] [--json]        between two origins' published trees; no
                                              content fetched, --from defaults to self
-synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
-synch mirror rm|ls|sync                      tree under a version policy (§7.2)
-synch fill [<origin>:]<space>[/<dir>]        one-shot materialization into the space's
-           [--from <o>|--strict]             own directory: adds what is missing, never
-           [--force] [--dry-run]             removes, reports what differs (§7.2)
-
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
                                              (a path pins its selected version's root;
                                              `ls` and `rm` name every holder, since a
-                                             replicated space may hold it too)
+                                             replica may hold it too)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by
@@ -1608,7 +1516,7 @@ The service has two surfaces, which is what the split in `proto/control.proto` i
   coded error. The response is a server stream of `line`, `chunk`, and `progress`
   frames: `synch cat`, `synch get`, and a long `synch ls` stream their payload in
   bounded chunks, so a multi-gigabyte read is never buffered in either process, and
-  progress-reporting commands (`scan`, `mirror sync`) emit reports the CLI renders and
+  progress-reporting commands (`source scan`, `replica sync`) emit reports the CLI renders and
   discards.
 - **`List`, `Resolve`, `Read`, `Put`, `GetConfig`, `AppendConfig`** answer a *program*
   — the S3 gateway (§9.4) — in the data itself rather than in rendered lines, naming
@@ -1660,16 +1568,16 @@ through both directions **without either process buffering more than a chunk**.
     fetch.
   - `ListObjectsV2` — prefix + delimiter listing as a range scan over the `f:`
     namespace (§4.3); continuation tokens are trie cursor positions.
-  - `PutObject` — writes into the local space directory, then runs the normal
+  - `PutObject` — writes into the filesystem-source directory, then runs the normal
     ingest pipeline (hash → CAS → stage entry, §7.1); responds once durably staged,
     with the head publish following the usual batching.
   - `DeleteObject` — removes this node's copy and publishes its tombstone
-    through the ordinary indexing pipeline, exactly as an `rm` in the space
+    through the ordinary source scan, exactly as an `rm` in the source
     directory would (§8). It obeys the same rule a write does: a delete
     publishes *this node's own view*, because the version model cannot publish
     anyone else's. So if another origin still asserts the key, the key is still
     readable afterwards with one fewer version, and only that origin can retract
-    its own — which is what `synch take` of a tombstone is for. S3 has no status
+    its own — which is what `synch adopt path` of a tombstone is for. S3 has no status
     for "deleted my version of it", and inventing one would break every client
     that treats `rm` as a loop over keys, so the answer is the `204` S3 promises
     and the surviving publishers are logged. Idempotent: a key that is already
@@ -1725,7 +1633,7 @@ through both directions **without either process buffering more than a chunk**.
   real S3 does. A *part's* ETag is that part's own root, and a completion that
   echoes one back has it checked, which is the point of having issued it.
 - **Auth**: SigV4 with static access-key pairs configured on the gateway
-  (`synch-s3 key add`), or `--anonymous` for localhost-only development. The
+  (`synch-s3 access-key add`), or `--anonymous` for localhost-only development. The
   gateway authenticates S3 clients only; cluster access is the node's own
   membership (§3).
 - **Headers are refused, not ignored.** A header that says the payload is
@@ -1757,7 +1665,7 @@ read concurrency is deliberately traded away for that simplicity.
 the CAS are synchronous by design — `synch-store` has no async runtime
 dependency at all — and so is everything built directly on them: the scanner's
 directory walks and BLAKE3 hashing, publish transactions, slice encode and
-decode, mirror materialization, GC. None of that belongs on a tokio worker
+decode, checkout materialization, GC. None of that belongs on a tokio worker
 thread. A worker hashing a 10 GB file is a worker that is not polling the
 endpoint, the control socket, or a timer, and the multi-thread runtime has only
 one worker per core, so a few concurrent scans would stall the daemon outright.
@@ -1809,7 +1717,7 @@ after the fact, and four live violations were behind it.
 
 What the check covers is `Store::conn`, so it sees blocking work that reaches
 the connection and not blocking *CPU* that never does. That is most of it —
-the scanner, the CAS, GC and mirror writes all end at a row — but not all of
+the scanner, the CAS, GC and checkout writes all end at a row — but not all of
 it, and the gap is real: `Proven::absorb` is pure CPU and was found by reading,
 not by the checker.
 
@@ -1939,7 +1847,7 @@ CREATE TABLE entries (
   kind        INTEGER NOT NULL,
   size        INTEGER NOT NULL,
   mtime_ns    INTEGER NOT NULL,
-  unix_mode   INTEGER,                   -- advisory mode a mirror reproduces (§7.2)
+  unix_mode   INTEGER,                   -- advisory mode a checkout reproduces (§7.2)
   content     BLOB,                      -- object root hash
   seq         INTEGER NOT NULL,
   prev        BLOB,
@@ -1972,14 +1880,14 @@ CREATE TABLE blobs (
 );
 CREATE TABLE pins (                       -- who holds an object (docs/REPLICATION.md §3.1)
   root          BLOB NOT NULL,
-  holder        TEXT NOT NULL,            -- 'operator' | 'replica:<space>'
+  holder        TEXT NOT NULL,            -- 'operator' | 'source:<space>' | 'replica:<space>'
   created_at    INTEGER NOT NULL,
   release_after INTEGER,                  -- NULL = held; set = due to go then
   PRIMARY KEY (root, holder)
 );
 CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
 CREATE INDEX pins_by_holder ON pins (holder);
-CREATE TABLE replica_want (               -- content a replicated space lacks (§3.3)
+CREATE TABLE content_want (               -- content a durable role lacks (§3.3)
   root         BLOB NOT NULL,
   holder       TEXT NOT NULL,
   size         INTEGER NOT NULL,
@@ -1990,17 +1898,27 @@ CREATE TABLE replica_want (               -- content a replicated space lacks (�
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
+CREATE INDEX content_want_by_holder ON content_want (holder, first_wanted);
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,  -- NULL = detached
-                            replicate TEXT,      -- NULL | 'tree' | 'archive'
-                            grace INTEGER, budget INTEGER);
+CREATE TABLE sources (
+  space       TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL CHECK (kind IN ('filesystem', 'api')),
+  local_path  TEXT,
+  CHECK ((kind = 'filesystem' AND local_path IS NOT NULL) OR
+         (kind = 'api' AND local_path IS NULL))
+);
+CREATE TABLE replicas (
+  space          TEXT PRIMARY KEY,
+  retention      TEXT NOT NULL CHECK (retention IN ('current', 'forever')),
+  grace_seconds  INTEGER,
+  budget_bytes   INTEGER,
+  checkout_path  TEXT,
+  CHECK ((retention = 'current' AND grace_seconds IS NOT NULL) OR
+         (retention = 'forever' AND grace_seconds IS NULL))
+);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
-CREATE TABLE mirrors       (local_path TEXT PRIMARY KEY,   -- one mirror per directory
-                            space TEXT NOT NULL,
-                            policy TEXT NOT NULL);          -- 'newest' | 'origin=<id>' | 'strict' (§7.2)
 CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
                             last_sync INTEGER, latency_ewma_us INTEGER);
 
@@ -2043,8 +1961,8 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
 -- ---- sockets (`docs/SOCKETS.md` §3) --------------------------------------
 --
 -- Local operator state, never published and never replicated. Publication
--- cannot gate execution: `synch take`, `synch fill --force` and an S3 PUT all
--- write bytes into a space directory that the scanner then publishes as this
+-- cannot gate execution: `synch adopt path`, `synch adopt tree --replace` and an S3 PUT all
+-- write bytes into a filesystem-source directory that the scanner publishes as this
 -- node's own view. These two rows are the gate instead.
 
 -- The declaration. What makes the scanner publish kind=Socket for a path.
@@ -2072,7 +1990,7 @@ CREATE TABLE socket_arms (space TEXT NOT NULL, path TEXT NOT NULL,
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
-always be rebuilt from `trie_nodes` (`synch doctor --rebuild`).
+always be rebuilt from `trie_nodes` (`synch repair rebuild-views`).
 
 ---
 
@@ -2091,7 +2009,7 @@ synchronicity/
 │   ├── synch-store    # SQLite layer + CAS (bao-tree outboards, bitmaps, GC)
 │   ├── synch-net      # iroh endpoint, ALPN handlers: mptsync + blob protocols, DNSSEC resolver
 │   ├── synch-engine   # the embeddable node API: scanner/watcher/publisher, anti-entropy
-│   │                  # scheduler, fetcher, mirrors — everything a host app needs
+│   │                  # scheduler, fetcher, checkouts — everything a host app needs
 │   ├── synch-cli      # binary target `synch`: the daemon, the control service
 │   │                  # (schema, server, client), and the clap CLI that drives it
 │   └── synch-s3       # binary target `synch-s3`: S3-compatible gateway (§9.4)
@@ -2286,9 +2204,8 @@ CI (GitHub Actions):
   built on the same `BlobAd` availability data. The role such a policy would be
   placed on — a *replica* of a space, holding a whole copy of every version the
   unified tree currently names and releasing a root once the tree stops naming
-  it — is designed in [docs/REPLICATION.md](docs/REPLICATION.md) as a property
-  of a space rather than a surface of its own (`synch space add <id>
-  --replicate`), which proposes the role first and leaves cluster-wide placement
+  it — is implemented as an independent local role (`synch replica add <id>`),
+  while cluster-wide placement remains
   where this bullet has it. (Content replication in that sense, not the
   trie-scope sense of §5.5; and on a cloud backend, a claim and a cache rather
   than a bill — `docs/SERVERLESS.md` §6.5.)
@@ -2305,7 +2222,7 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
 0. Each ran `synch init --domain cluster.example.com` and had its printed device key
    published in one TXT record. Each daemon resolved the zone at startup, found the
    record naming its own key, and took that record's `id=` as its name (§3.1).
-1. `nas` runs `synch space add media /srv/media`. The scanner hashes 40 k files,
+1. `nas` runs `synch source add media /srv/media`. The scanner hashes 40 k files,
    the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and 40 k
    per-object `b:` ads.
 2. `laptop` connects (dns-discovered membership, iroh-dialed), `Hello` exchanges heads,
@@ -2317,16 +2234,17 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    each seek is a new verified range read. Fetched groups land in laptop's CAS, and
    its next milestone ad update (§6.3) advertises its partial — later complete —
    copy of the object.
-4. `vps` (which runs `synch mirror add media /srv/mirror` — unified tree, default
-   `newest` policy) later fetches the same file — provider resolution now returns
-   `{nas, laptop}` and it pulls from both in parallel.
+4. `vps` runs `synch replica add media --checkout /srv/media-view`. Its replica
+   first durably acquires the content, then projects the unified newest view.
+   Provider resolution returns `{nas, laptop}` and it can pull from both.
 5. `nas` edits a file; `laptop` had edited its own copy of the same path an hour
    earlier. Watcher → rescan → head `(seq=2, r2)` → `HeadPush` to both peers; each
    pulls exactly the changed path's trie nodes. `synch ls media` on any node still
    shows one tree, with that path marked `⑂2`: two versions, one asserted by `nas`,
    one by `laptop`. `synch cat media/that/file` reads the newest deterministically;
-   `--from laptop` reads the other; `synch status media/that/file` lays both out —
-   divergence visible, nothing auto-resolved, adoption one `synch take` away, after
+  `--select origin=laptop@cluster.example` reads the other; `synch status
+  media/that/file` lays both out —
+   divergence visible, nothing auto-resolved, adoption one `synch adopt path` away, after
    which the path collapses back to a single unanimous version.
 6. `nas`'s operator rotates its key: `synch key rotate`, publish the second
    `id=nas nk=<K_new>` TXT record, wait for propagation, then `synch key activate

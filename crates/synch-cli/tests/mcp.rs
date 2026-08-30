@@ -66,7 +66,7 @@ impl Daemon {
         Daemon { node, stop, served }
     }
 
-    /// Adds a path-backed space with files already in it.
+    /// Adds a filesystem source with files already in it.
     async fn space_with(&self, id: &str, dir: &Path, files: &[(&str, &[u8])]) {
         for (path, bytes) in files {
             let target = dir.join(path);
@@ -76,7 +76,7 @@ impl Daemon {
             std::fs::write(target, bytes).unwrap();
         }
         let (node, id, dir) = (self.node.clone(), id.to_string(), dir.to_path_buf());
-        off_runtime(move || node.add_space(&id, &dir))
+        off_runtime(move || node.add_filesystem_source(&id, &dir))
             .await
             .unwrap();
         // The same scan the daemon runs, through the same engine entry point
@@ -297,12 +297,14 @@ async fn the_tree_is_listed_read_and_described_through_the_typed_calls() {
     // verbatim \\?\ path. Comparing against the tempdir as handed out passes
     // on Linux and fails on the other two.
     assert_eq!(
-        listed[0]["local_path"],
+        listed[0]["source_path"],
         std::fs::canonicalize(checkout.path())
             .unwrap()
             .to_string_lossy()
             .as_ref()
     );
+    assert_eq!(listed[0]["source_kind"], "filesystem");
+    assert!(listed[0]["retention"].is_null());
 
     let listing = client.tool("synch_list", json!({ "space": "media" })).await;
     let entries = listing["structuredContent"]["entries"].as_array().unwrap();
@@ -860,14 +862,14 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
         .await;
     client
         .tool(
-            "synch_socket_add",
+            "synch_socket_declare",
             json!({ "space": "code", "path": "echo.o", "note": "from mcp" }),
         )
         .await;
     // Declaring makes the *scanner* publish the path as a socket, so the
     // republish is a step of the lifecycle rather than an implementation
     // detail — and the whole of it is reachable over the protocol.
-    client.tool("synch_scan", json!({})).await;
+    client.tool("synch_source_scan", json!({})).await;
 
     // Declaring is not arming: the listing says so before any approval.
     let listed = client
@@ -962,7 +964,7 @@ async fn a_cancelled_request_that_was_still_running_is_never_answered() {
     client
         .send(
             "tools/call",
-            json!({ "name": "synch_scan", "arguments": {} }),
+            json!({ "name": "synch_source_scan", "arguments": {} }),
             20,
         )
         .await;
@@ -1047,7 +1049,7 @@ async fn progress_reaches_a_client_that_asked_for_it() {
 
     let mut client = writer(data.path());
     let id = 42;
-    let mut params = json!({ "name": "synch_scan", "arguments": {} });
+    let mut params = json!({ "name": "synch_source_scan", "arguments": {} });
     params["_meta"] = json!({
         "io.modelcontextprotocol/protocolVersion": VERSION,
         "io.modelcontextprotocol/clientCapabilities": {},

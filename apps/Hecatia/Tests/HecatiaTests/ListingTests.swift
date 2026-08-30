@@ -422,7 +422,7 @@ struct TypedPhraseTests {
 /// The command lines the app shows and offers to copy.
 @Suite("Shell quoting")
 struct ShellQuoteTests {
-  /// A space id is allowed to contain a space, so `synch space rm Family
+  /// A space id is allowed to contain a space, so `synch source rm Family
   /// Photos` was a command that means something else, under a button labelled
   /// "Copy as a synch command".
   @Test("A token with a space is quoted")

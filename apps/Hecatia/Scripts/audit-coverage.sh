@@ -9,10 +9,9 @@
 # something outside the file that declares it.
 #
 # And it checks the count against `control.proto` rather than against a number
-# someone wrote down. That is the check that was missing: the registry said 55
-# and the test that guarded it counted the registry, so `space set`, `space
-# sync` and `fill` shipped in the daemon and stayed green here for three
-# releases. `make check-proto` keeps that proto identical to the daemon's, so
+# someone wrote down. That is the check that was missing: a stale literal once
+# let new daemon operations ship without a caller while every local count stayed
+# green. `make check-proto` keeps that proto identical to the daemon's, so
 # counting it is counting the daemon.
 
 set -eu

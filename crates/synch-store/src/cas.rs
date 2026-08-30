@@ -27,9 +27,77 @@ use synch_core::{
 };
 
 use crate::{
-    db::{hash_column, Store},
+    db::{hash_column, Store, Txn},
     error::{Result, StoreError},
 };
+
+impl Txn<'_> {
+    /// Verifies durable possession and installs the source hold used by the
+    /// publication transaction.
+    pub fn hold_source_blob(&self, space: &str, root: &Hash, size: u64, now: i64) -> Result<()> {
+        let configured: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE space = ?1)",
+            params![space],
+            |row| row.get(0),
+        )?;
+        if !configured {
+            return Err(StoreError::Invalid(format!(
+                "cannot publish into {space}: this node has no source role"
+            )));
+        }
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT size, durable FROM blobs WHERE root = ?1",
+                params![root.as_bytes().to_vec()],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((recorded, true)) if recorded == size => {}
+            Some((recorded, true)) => {
+                return Err(StoreError::Invalid(format!(
+                    "source {space} tried to publish {root} as {size} bytes, but durable storage records {recorded}"
+                )))
+            }
+            _ => {
+                return Err(StoreError::Invalid(format!(
+                    "source {space} cannot publish {root}: complete durable content is not present"
+                )))
+            }
+        }
+        self.conn().execute(
+            "INSERT INTO pins (root, holder, created_at, release_after)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+            params![
+                root.as_bytes().to_vec(),
+                PinHolder::Source(space.to_string()).render(),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Releases source holds no live own-origin entry in `space` names after
+    /// the new head has been materialized.
+    pub fn reconcile_source_holds(&self, origin: &synch_core::OriginId, space: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM pins
+              WHERE holder = ?1
+                AND NOT EXISTS (
+                  SELECT 1 FROM entries
+                   WHERE origin_id = ?2 AND space = ?3 AND content = pins.root
+                )",
+            params![
+                PinHolder::Source(space.to_string()).render(),
+                origin.canonical(),
+                space,
+            ],
+        )?;
+        Ok(())
+    }
+}
 
 /// The bao block size synchronicity uses everywhere: 16 KiB chunk groups.
 pub(crate) const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(CHUNK_GROUP_LOG2);
@@ -105,7 +173,9 @@ fn write_and_sync(
 pub enum PinHolder {
     /// `synch pin add`: an operator asked for this by hand.
     Operator,
-    /// A replicated space holds this for as long as its policy says.
+    /// A source's current published tree promises these bytes.
+    Source(String),
+    /// A replica holds this for as long as its policy says.
     Replica(String),
     /// A spelling this build does not know, kept verbatim.
     ///
@@ -120,6 +190,7 @@ impl PinHolder {
     pub fn render(&self) -> String {
         match self {
             PinHolder::Operator => "operator".to_string(),
+            PinHolder::Source(space) => format!("source:{space}"),
             PinHolder::Replica(space) => format!("replica:{space}"),
             PinHolder::Other(text) => text.clone(),
         }
@@ -129,15 +200,16 @@ impl PinHolder {
     pub fn parse(text: &str) -> PinHolder {
         match text.split_once(':') {
             Some(("replica", space)) if !space.is_empty() => PinHolder::Replica(space.to_string()),
+            Some(("source", space)) if !space.is_empty() => PinHolder::Source(space.to_string()),
             _ if text == "operator" => PinHolder::Operator,
             _ => PinHolder::Other(text.to_string()),
         }
     }
 
-    /// The space this claim is on behalf of, if it is a replica's.
+    /// The space this claim is on behalf of, if it belongs to a standing role.
     pub fn space(&self) -> Option<&str> {
         match self {
-            PinHolder::Replica(space) => Some(space),
+            PinHolder::Source(space) | PinHolder::Replica(space) => Some(space),
             _ => None,
         }
     }
@@ -769,7 +841,7 @@ impl Store {
     /// Folds newly verified groups into an object's row, atomically (§10).
     ///
     /// Two writers of one root is the ordinary case rather than an exotic one:
-    /// a mirror pass, a `synch cat` and the gateway's range read all resolve to
+    /// checkout reconciliation, a `synch cat` and the gateway's range read all resolve to
     /// the same content, and a promotion commits a whole span in a single step.
     /// Reading the bitmap, unioning, and writing it back as three separate
     /// statements loses one of two interleaved writers' progress every time —
@@ -1039,13 +1111,14 @@ impl Store {
                 // is the point: a root no entry names is still re-fetchable
                 // from any provider that has it, and `blob_providers` survives
                 // independently of `entries`. Dropping such a claim silently
-                // would lose exactly the objects an `archive` replica is bought
+                // would lose exactly the objects a `forever` replica is bought
                 // to keep, since nothing else names a superseded version.
                 tx.execute(
-                    "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+                    "INSERT INTO content_want (root, holder, size, prev, first_wanted)
                      SELECT p.root, p.holder, ?2, NULL, ?3
                        FROM pins p
-                      WHERE p.root = ?1 AND p.holder LIKE 'replica:%'
+                      WHERE p.root = ?1
+                        AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
                      ON CONFLICT(root, holder) DO NOTHING",
                     params![key.clone(), size.unwrap_or(0), synch_core::now_ns()],
                 )?;
@@ -1055,11 +1128,51 @@ impl Store {
                 // and a vanished object is something they should be told about
                 // rather than have quietly rewritten.
                 tx.execute(
-                    "DELETE FROM pins WHERE root = ?1 AND holder LIKE 'replica:%'",
+                    "DELETE FROM pins WHERE root = ?1
+                       AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
                     params![key],
                 )?;
             }
             Ok(changed > 0)
+        })
+    }
+
+    /// Invalidates a local complete claim after the payload is missing or
+    /// truncated, preserving every standing role as a repair intent.
+    fn heal_missing_local_blob(&self, root: &Hash) -> Result<()> {
+        self.with_immediate_tx(|tx| {
+            let key = root.as_bytes().to_vec();
+            let size: Option<i64> = tx
+                .query_row(
+                    "SELECT size FROM blobs WHERE root = ?1",
+                    params![key.clone()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(size) = size else {
+                return Ok(());
+            };
+            tx.execute(
+                "UPDATE blobs
+                    SET complete = 0, durable = 0, bitmap = NULL, inline = NULL
+                  WHERE root = ?1",
+                params![key.clone()],
+            )?;
+            tx.execute(
+                "INSERT INTO content_want (root, holder, size, prev, first_wanted)
+                 SELECT p.root, p.holder, ?2, NULL, ?3
+                   FROM pins p
+                  WHERE p.root = ?1
+                    AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
+                 ON CONFLICT(root, holder) DO NOTHING",
+                params![key.clone(), size, synch_core::now_ns()],
+            )?;
+            tx.execute(
+                "DELETE FROM pins WHERE root = ?1
+                   AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
+                params![key],
+            )?;
+            Ok(())
         })
     }
 
@@ -1295,15 +1408,6 @@ impl Store {
         Ok(dropped > 0)
     }
 
-    /// Drops every claim one holder has, for `space rm --release` and
-    /// `--no-replicate --release`. Returns how many went.
-    pub fn unpin_all(&self, holder: &PinHolder) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM pins WHERE holder = ?1",
-            params![holder.render()],
-        )?)
-    }
-
     /// Schedules one holder's claim to end, without ending it yet
     /// (`docs/REPLICATION.md` §3.4).
     ///
@@ -1537,7 +1641,19 @@ impl Store {
         let mut out = vec![0u8; (end - offset) as usize];
         match &blob.inline {
             Some(data) => out.copy_from_slice(&data[offset as usize..end as usize]),
-            None => File::open(self.blob_path(root))?.read_exact_at(offset, &mut out)?,
+            None => {
+                let result = File::open(self.blob_path(root))
+                    .and_then(|file| file.read_exact_at(offset, &mut out));
+                if let Err(error) = result {
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                    ) {
+                        self.heal_missing_local_blob(root)?;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
         Ok(out)
     }
@@ -1966,6 +2082,29 @@ mod tests {
 
         assert!(store.heal_missing_durable_blob(&root).unwrap());
         assert!(store.blob(&root).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_missing_source_blob_becomes_a_repair_want() {
+        let (_dir, store) = crate::testutil::store();
+        store
+            .put_source("media", crate::SourceKind::Api, None)
+            .unwrap();
+        let bytes = vec![7u8; 100_000];
+        let root = store.ingest_bytes(&bytes, 1).unwrap();
+        let holder = crate::PinHolder::Source("media".into());
+        store.pin(&root, &holder, 1).unwrap();
+
+        std::fs::remove_file(store.blob_path(&root)).unwrap();
+        assert!(store.read_all(&root).is_err());
+
+        let blob = store.blob(&root).unwrap().unwrap();
+        assert!(!blob.complete);
+        assert!(!blob.durable);
+        let wants = store.wants_of(&holder).unwrap();
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].root, root);
+        assert_eq!(wants[0].size, bytes.len() as u64);
     }
 
     #[test]

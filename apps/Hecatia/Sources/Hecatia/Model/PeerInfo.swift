@@ -1,6 +1,6 @@
 import Foundation
 
-/// One peer, from `peers`.
+/// One peer, from `peer ls`.
 struct PeerInfo: Identifiable, Hashable, Sendable {
   var id: String { key }
   let key: String

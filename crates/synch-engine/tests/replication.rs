@@ -1,6 +1,6 @@
-//! A replicated space, end to end over two real nodes (`docs/REPLICATION.md`).
+//! A replica, end to end over two real nodes (`docs/REPLICATION.md`).
 //!
-//! The publisher indexes a directory; the replica indexes nothing and holds
+//! The publisher serves a filesystem source; the replica publishes nothing and holds
 //! everything. What is being tested is the lifecycle a version goes through
 //! there — wanted, held, superseded, scheduled, released — and the discipline
 //! that decides the last two.
@@ -22,7 +22,7 @@ async fn converge(replica: &Node, publisher: &Node) {
     replica.sync_with_peer(&publisher.node_id()).await.unwrap();
     let sweeping = replica.clone();
     off_runtime(move || sweeping.sweep_replicas(None).unwrap()).await;
-    replica.fetch_replica_wants().await.unwrap();
+    replica.fetch_content_wants().await.unwrap();
 }
 
 /// What the replica holds and wants for `media`.
@@ -48,18 +48,17 @@ async fn a_replica_holds_what_the_publisher_publishes_and_keeps_what_it_supersed
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("keynote.mp4"), b"first cut").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     // The replica holds no checkout of `media` at all: replication is not a
-    // mirror, and the space it replicates is one it never indexes.
+    // source, and the space it replicates is one it never publishes.
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), Some(3600), None, false)
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), None, None)
             .unwrap();
     })
     .await;
@@ -122,16 +121,15 @@ async fn a_promotion_stages_and_schedules_without_any_sweep() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("keynote.mp4"), b"first cut").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), Some(3600), None, false)
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), None, None)
             .unwrap();
     })
     .await;
@@ -150,7 +148,7 @@ async fn a_promotion_stages_and_schedules_without_any_sweep() {
     assert_eq!(staged.held, 0, "and nothing is held until the fetch runs");
 
     // Fetch it, then supersede it — again with no sweep anywhere.
-    replica.node.fetch_replica_wants().await.unwrap();
+    replica.node.fetch_content_wants().await.unwrap();
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     std::fs::write(
@@ -180,7 +178,7 @@ async fn a_promotion_stages_and_schedules_without_any_sweep() {
 
 /// The standing loop converges on its own, without anyone calling the sweep.
 ///
-/// Every other test here drives `sweep_replicas` and `fetch_replica_wants` by
+/// Every other test here drives `sweep_replicas` and `fetch_content_wants` by
 /// hand, which is precisely how a missing wake goes unnoticed: the loop was
 /// rung only by a configuration change, so a replica lagged a whole interval
 /// behind every publish and an operator saw a claim of zero while the node held
@@ -193,8 +191,8 @@ async fn the_standing_loop_converges_without_being_driven() {
     let node = peer.node.clone();
     let path = peer.space.path().to_path_buf();
     off_runtime(move || {
-        node.add_space("media", &path).unwrap();
-        node.set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+        node.add_filesystem_source("media", &path).unwrap();
+        node.add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
@@ -247,16 +245,15 @@ async fn a_deleted_version_survives_its_grace_window_and_not_a_moment_longer() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("notes.txt"), b"keep me").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), Some(3600), None, false)
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), None, None)
             .unwrap();
     })
     .await;
@@ -289,9 +286,9 @@ async fn a_deleted_version_survives_its_grace_window_and_not_a_moment_longer() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
-/// §2.1: under `archive` nothing is ever released, whatever the tree does.
+/// Under `forever` nothing is ever released, whatever the tree does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_policy_releases_nothing() {
+async fn forever_retention_releases_nothing() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let replica = spawn("replica").await;
@@ -299,16 +296,15 @@ async fn an_archive_policy_releases_nothing() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("draft.txt"), b"v1").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Archive), None, None, false)
+            .add_replica("media", ReplicaPolicy::Forever, None, None, None)
             .unwrap();
     })
     .await;
@@ -343,16 +339,15 @@ async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("a.bin"), b"content").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), Some(0), None, false)
+            .add_replica("media", ReplicaPolicy::Current, Some(0), None, None)
             .unwrap();
     })
     .await;
@@ -397,8 +392,7 @@ async fn an_unfetchable_want_persists_and_backs_off() {
 
     let node = replica.node.clone();
     let (wanted, first_attempt) = off_runtime(move || {
-        node.add_detached_space("media").unwrap();
-        node.set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+        node.add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
         // An entry naming content nobody here holds and nobody advertises: the
         // shape of a version whose last provider left before this node
@@ -427,7 +421,7 @@ async fn an_unfetchable_want_persists_and_backs_off() {
     assert_eq!(first_attempt, 1);
 
     // The fetch cannot succeed, and the failure is recorded rather than lost.
-    let report = replica.node.fetch_replica_wants().await.unwrap();
+    let report = replica.node.fetch_content_wants().await.unwrap();
     assert_eq!(report.held, 0);
     assert_eq!(report.failed, 1);
 
@@ -450,11 +444,9 @@ async fn an_unfetchable_want_persists_and_backs_off() {
     shutdown(&[&replica.node]).await;
 }
 
-/// A space this node only replicates publishes no tombstones when it is
-/// removed: `space rm` is an unpublish, and there is nothing here to unpublish
-/// (§3.2, §8).
+/// Removing a source leaves the independent replica and its holds intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_a_replicated_space_publishes_nothing() {
+async fn removing_a_source_does_not_remove_its_replica() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let replica = spawn("replica").await;
@@ -462,40 +454,41 @@ async fn removing_a_replicated_space_publishes_nothing() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("a.bin"), b"content").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
+        replicating.add_api_source("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
     converge(&replica.node, &publisher.node).await;
 
     let node = replica.node.clone();
-    let (staged, held_after, released_after) = off_runtime(move || {
-        let staged = node.remove_space("media", false).unwrap();
-        let held = node.store().pins().unwrap().len();
-        // And again with `--release`, which is the only thing that drops it.
-        node.add_detached_space("media").unwrap();
-        node.set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
-            .unwrap();
-        node.remove_space("media", true).unwrap();
-        (staged, held, node.store().pins().unwrap().len())
+    let staged = off_runtime(move || node.source_removal("media").unwrap()).await;
+    replica.node.publish(&staged).unwrap();
+    replica.node.finish_source_removal("media").unwrap();
+    let node = replica.node.clone();
+    let held_after = off_runtime(move || {
+        assert!(node.store().source("media").unwrap().is_none());
+        assert!(node.store().replica("media").unwrap().is_some());
+        node.store().pins().unwrap().len()
     })
     .await;
+    assert_eq!(held_after, 1, "the independent replica keeps its content");
 
-    assert!(
-        staged.is_empty(),
-        "a space this node never published into has nothing to unpublish, got {staged:?}"
-    );
-    assert_eq!(held_after, 1, "and its content stays unless asked");
-    assert_eq!(released_after, 0, "`--release` is what drops it");
+    let node = replica.node.clone();
+    let released_after = off_runtime(move || {
+        node.remove_replica("media", false).unwrap();
+        node.store().pins().unwrap().len()
+    })
+    .await;
+    assert_eq!(released_after, 0, "removing the replica releases its holds");
 
     shutdown(&[&publisher.node, &replica.node]).await;
 }
@@ -517,7 +510,7 @@ async fn a_mixed_batch_records_each_outcome_against_its_own_want() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("real.bin"), b"fetchable").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
@@ -525,9 +518,8 @@ async fn a_mixed_batch_records_each_outcome_against_its_own_want() {
     let replicating = replica.node.clone();
     let unreachable = synch_core::Hash::new(b"no provider will ever serve this");
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
@@ -547,7 +539,7 @@ async fn a_mixed_batch_records_each_outcome_against_its_own_want() {
     })
     .await;
 
-    let report = replica.node.fetch_replica_wants().await.unwrap();
+    let report = replica.node.fetch_content_wants().await.unwrap();
     assert_eq!(report.held, 1, "exactly the fetchable object was held");
     assert_eq!(report.failed, 1, "exactly the unreachable one failed");
 
@@ -574,23 +566,17 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("big.bin"), vec![7u8; 4096]).unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
-    // A ceiling far below the object: nothing can be admitted.
+    // A zero-byte ceiling admits no non-empty object; it is not an alias for
+    // the absence of a ceiling.
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication(
-                "media",
-                Some(ReplicaPolicy::Tree),
-                Some(3600),
-                Some(16),
-                false,
-            )
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), Some(0), None)
             .unwrap();
     })
     .await;
@@ -615,17 +601,11 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
     let raising = replica.node.clone();
     off_runtime(move || {
         raising
-            .set_space_replication(
-                "media",
-                Some(ReplicaPolicy::Tree),
-                None,
-                Some(1 << 20),
-                false,
-            )
+            .set_replica("media", None, None, Some(Some(1 << 20)), None)
             .unwrap();
     })
     .await;
-    replica.node.fetch_replica_wants().await.unwrap();
+    replica.node.fetch_content_wants().await.unwrap();
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     shutdown(&[&publisher.node, &replica.node]).await;
@@ -659,16 +639,15 @@ async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("a.bin"), b"paid for once").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
@@ -742,9 +721,9 @@ async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
 }
 
 /// A space this node only replicates is not one it publishes: it advertises no
-/// `m:space` record, so `space rm` has none to strand (§3.2).
+/// `m:space` record, so `source rm` has none to strand (§3.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replicated_space_advertises_nothing_of_its_own() {
+async fn a_replica_advertises_nothing_of_its_own() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let replica = spawn("replica").await;
@@ -752,7 +731,7 @@ async fn a_replicated_space_advertises_nothing_of_its_own() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("a.bin"), b"content").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
@@ -761,13 +740,12 @@ async fn a_replicated_space_advertises_nothing_of_its_own() {
     // publishes nothing at all — it is testing that the two are told apart.
     replica
         .node
-        .add_space("mine", replica.space.path())
+        .add_filesystem_source("mine", replica.space.path())
         .unwrap();
     let replicating = replica.node.clone();
     off_runtime(move || {
-        replicating.add_detached_space("media").unwrap();
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
@@ -776,25 +754,29 @@ async fn a_replicated_space_advertises_nothing_of_its_own() {
     converge(&replica.node, &publisher.node).await;
 
     let node = replica.node.clone();
-    let (own, replicated) = off_runtime(move || {
+    let (own, replicated, source_role, replica_role) = off_runtime(move || {
         (
             node.space_info_of(node.origin(), "mine").unwrap(),
             node.space_info_of(node.origin(), "media").unwrap(),
+            node.store().source("media").unwrap(),
+            node.store().replica("media").unwrap(),
         )
     })
     .await;
-    assert!(own.is_some(), "a space this node indexes is advertised");
+    assert!(own.is_some(), "a filesystem source is advertised");
     assert!(
         replicated.is_none(),
-        "a space it only replicates is not, so `space rm` strands no record"
+        "a replica-only namespace publishes no source manifest"
     );
+    assert!(source_role.is_none());
+    assert!(replica_role.is_some());
 
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
 /// A replica of a space it also indexes is two independent halves of one row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_space_can_be_indexed_and_replicated_at_once() {
+async fn source_and_replica_roles_can_coexist() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let both = spawn("both").await;
@@ -802,17 +784,19 @@ async fn a_space_can_be_indexed_and_replicated_at_once() {
 
     publisher
         .node
-        .add_space("media", publisher.space.path())
+        .add_filesystem_source("media", publisher.space.path())
         .unwrap();
     std::fs::write(publisher.space.path().join("theirs.bin"), b"theirs").unwrap();
     publisher.node.scan_publish_push().await.unwrap();
 
     // This node publishes its own copy of `media` *and* holds everyone else's.
-    both.node.add_space("media", both.space.path()).unwrap();
+    both.node
+        .add_filesystem_source("media", both.space.path())
+        .unwrap();
     let replicating = both.node.clone();
     off_runtime(move || {
         replicating
-            .set_space_replication("media", Some(ReplicaPolicy::Tree), None, None, false)
+            .add_replica("media", ReplicaPolicy::Current, None, None, None)
             .unwrap();
     })
     .await;
@@ -830,45 +814,39 @@ async fn a_space_can_be_indexed_and_replicated_at_once() {
     assert!(both.space.path().join("mine.bin").exists());
     assert!(
         !both.space.path().join("theirs.bin").exists(),
-        "replication materializes nothing; that is what a mirror is for"
+        "replication without a checkout materializes nothing"
     );
 
     let node = both.node.clone();
-    let path = off_runtime(move || node.store().space("media").unwrap().unwrap().local_path).await;
+    let path = off_runtime(move || node.store().source("media").unwrap().unwrap().local_path).await;
     assert!(path.is_some(), "and the space is still indexed");
 
     shutdown(&[&publisher.node, &both.node]).await;
 }
 
-/// Turning replication off leaves the checkout alone, and the reverse.
+/// Source and replica roles can be removed independently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn the_two_halves_of_a_space_are_set_independently() {
+async fn source_and_replica_are_set_independently() {
     let _blocking = synch_core::BlockingScope::enter();
     let peer = spawn("peer").await;
     let node = peer.node.clone();
     let path = peer.space.path().to_path_buf();
 
     off_runtime(move || {
-        node.add_space("media", &path).unwrap();
-        node.set_space_replication(
-            "media",
-            Some(ReplicaPolicy::Archive),
-            Some(60),
-            Some(99),
-            false,
-        )
-        .unwrap();
-        let row = node.store().space("media").unwrap().unwrap();
-        assert_eq!(row.replicate, Some(ReplicaPolicy::Archive));
-        assert_eq!(row.grace_secs(), 60);
-        assert_eq!(row.budget, Some(99));
-        assert!(row.local_path.is_some());
-
-        node.set_space_replication("media", None, None, None, false)
+        node.add_filesystem_source("media", &path).unwrap();
+        node.add_replica("media", ReplicaPolicy::Forever, None, Some(99), None)
             .unwrap();
-        let row = node.store().space("media").unwrap().unwrap();
-        assert!(row.replicate.is_none(), "replication is off");
-        assert!(row.local_path.is_some(), "and the checkout is untouched");
+        let row = node.store().replica("media").unwrap().unwrap();
+        assert_eq!(row.retention, ReplicaPolicy::Forever);
+        assert_eq!(row.budget, Some(99));
+        assert!(node.store().source("media").unwrap().is_some());
+
+        node.remove_replica("media", false).unwrap();
+        assert!(node.store().replica("media").unwrap().is_none());
+        assert!(
+            node.store().source("media").unwrap().is_some(),
+            "source remains"
+        );
     })
     .await;
 

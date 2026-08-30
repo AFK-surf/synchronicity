@@ -17,7 +17,7 @@ use crate::{error::Result, node::Node};
 /// Whether an event could have changed what a scan would find.
 ///
 /// Reading is not changing, and the distinction is not a nicety here: a scan
-/// opens and reads every space directory and every file it has to hash, and
+/// opens and reads every filesystem-source directory and every file it has to hash, and
 /// inotify reports those opens, reads, and closes as events in their own
 /// right. Hinting on them makes the watcher chase its own tail — hint,
 /// rescan, read, hint — one full rescan of every space per debounce window,
@@ -78,7 +78,7 @@ impl SpaceWatcher {
     pub(crate) fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
         Ok(node
             .store()
-            .spaces()?
+            .sources()?
             .into_iter()
             .filter_map(|space| space.local_path.map(PathBuf::from))
             .collect())
@@ -87,7 +87,7 @@ impl SpaceWatcher {
     /// Registers spaces added since the last pass and drops ones removed,
     /// given a configured set that has already been read.
     ///
-    /// A daemon runs for weeks and `synch space add` lands whenever an
+    /// A daemon runs for weeks and `synch source add` lands whenever an
     /// operator says so, so the watched set cannot be fixed at startup: an
     /// unregistered space would be covered only by the hourly rescan, and a
     /// removed one would keep waking the watcher for a directory nobody
@@ -168,7 +168,7 @@ impl Node {
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
-                // `space add` / `space rm` ring this so a new root is watched
+                // `source add` / `source rm` ring this so a new root is watched
                 // at once rather than at the next filesystem hint.
                 _ = spaces_changed.notified() => {
                     match spaces(self.clone()).await {
@@ -258,13 +258,13 @@ mod tests {
 
     #[tokio::test]
     async fn spaces_added_and_removed_while_running_are_re_registered() {
-        // A daemon runs for weeks; `space add` lands whenever an operator says
+        // A daemon runs for weeks; `source add` lands whenever an operator says
         // so. A watcher fixed at startup would leave the new root covered only
         // by the hourly rescan (§7.1).
         let (_d, node) = node().await;
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        node.add_space("one", first.path()).unwrap();
+        node.add_filesystem_source("one", first.path()).unwrap();
 
         let resync = |watcher: &mut SpaceWatcher, node: &Node| {
             watcher.resync_to(&SpaceWatcher::configured_spaces(node).unwrap())
@@ -273,13 +273,13 @@ mod tests {
         let mut watcher = SpaceWatcher::start_with(&node, &configured).unwrap();
         assert_eq!(watcher.watching.len(), 1);
 
-        node.add_space("two", second.path()).unwrap();
+        node.add_filesystem_source("two", second.path()).unwrap();
         assert_eq!(resync(&mut watcher, &node), 1);
         assert_eq!(watcher.watching.len(), 2);
         // Re-registering an unchanged set is a no-op.
         assert_eq!(resync(&mut watcher, &node), 0);
 
-        node.remove_space("two", false).unwrap();
+        node.finish_source_removal("two").unwrap();
         assert_eq!(resync(&mut watcher, &node), 1);
         assert_eq!(watcher.watching.len(), 1);
         node.shutdown().await.unwrap();

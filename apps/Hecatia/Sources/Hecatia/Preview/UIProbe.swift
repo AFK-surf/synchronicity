@@ -1224,10 +1224,10 @@ enum UIProbe {
 
   /// Shares `HECATIA_PROBE_SHARE` and checks its files turn up.
   ///
-  /// `SpaceAdd` starts a watcher, and a watcher reports changes — it says
-  /// nothing about the files already sitting there. So the folder listed as
-  /// empty, under a daemon message that says "indexing", until the scanner's
-  /// own interval came round.
+  /// Adding a filesystem source starts a watcher, and a watcher reports
+  /// changes — it says nothing about the files already sitting there. So the
+  /// folder listed as empty, under a daemon message that says "indexing", until
+  /// the scanner's own interval came round.
   static func addingAFullFolder(_ model: FilesModel, _ node: NodeStore) async {
     var failures: [String] = []
     guard let share = ProcessInfo.processInfo.environment["HECATIA_PROBE_SHARE"] else {
@@ -1237,7 +1237,7 @@ enum UIProbe {
     let expected = (try? FileManager.default.contentsOfDirectory(atPath: share))?
       .filter { !$0.hasPrefix(".") }.count ?? 0
     note("  [add] sharing \(share), which already holds \(expected) file(s)")
-    await node.addSpace(id: "probe-full", path: share)
+    await node.addSource(id: "probe-full", path: share)
     await settle(1.5)
     model.select(space: "probe-full")
     for _ in 0..<40 {
@@ -1258,7 +1258,7 @@ enum UIProbe {
 
   /// Writes a file into the shared directory behind the app's back.
   ///
-  /// `HECATIA_PROBE_SHARE` names the folder the selected space indexes. The
+  /// `HECATIA_PROBE_SHARE` names the folder the selected filesystem source publishes. The
   /// daemon's watcher publishes it; nothing tells the app. Until the listing
   /// watch existed the table was a snapshot of whenever it was last navigated.
   static func externalChange(_ model: FilesModel, _ node: NodeStore? = nil) async {

@@ -4,7 +4,7 @@
 //! vendored code with the server and so cannot notice a disagreement with the
 //! world's actual client. Here the stock `ssh` binary logs into the
 //! `ssh-shell.c` example over a local TCP bridge — the same byte stream
-//! `synch connect --listen` would carry — and runs a command in the declared
+//! `synch socket connect --listen` would carry — and runs a command in the declared
 //! bash. Skipped where no OpenSSH client is installed, because a machine
 //! without one cannot answer the question and a red test that means "no ssh"
 //! teaches people to ignore red tests.

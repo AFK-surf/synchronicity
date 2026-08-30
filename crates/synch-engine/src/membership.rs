@@ -1039,7 +1039,7 @@ impl Node {
     }
 
     /// Rebuilds `entries` and `blob_providers` from the authoritative trie
-    /// (`synch doctor --rebuild`, §10).
+    /// (`synch repair rebuild-views`, §10).
     ///
     /// Per origin, and one origin's failure does not stop the others. Each
     /// `rematerialize` is its own transaction, so a failure rolls back and is
@@ -1347,7 +1347,7 @@ mod tests {
             "an undelegated node reads the whole keyspace"
         );
         let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         node.scan_and_publish().unwrap();
 

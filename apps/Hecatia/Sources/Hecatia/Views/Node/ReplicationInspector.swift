@@ -205,13 +205,13 @@ private struct InspectorPreview: View {
 }
 
 #Preview("Releases paused") {
-  // The detached replica: nowhere on disk to put files, a budget, and a pause
+  // A replica without a checkout: no projected files, a budget, and a pause
   // that replaces the releasing count rather than sitting beside it.
   InspectorPreview(space: sampleSpace("media"), status: SampleData.replicaStatus["media"])
 }
 
 #Preview("Waiting for the report") {
-  // Replicating, and `space ls <id>` has not answered yet. Zeroes here would
+  // Replicating, and `replica ls <id>` has not answered yet. Zeroes here would
   // read as "nothing is held".
   InspectorPreview(space: sampleSpace("archive"))
 }

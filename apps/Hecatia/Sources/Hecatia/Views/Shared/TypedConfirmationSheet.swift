@@ -78,7 +78,7 @@ struct TypedConfirmationSheet: View {
       verb: "Stop Sharing",
       gate: .typed,
       typedPhrase: "archive",
-      commandLine: "synch space rm archive",
+      commandLine: "synch source rm archive",
       perform: {}),
     dismiss: {})
   .environment(NodeStore.preview())

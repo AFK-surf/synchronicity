@@ -38,9 +38,8 @@ same trie, same protocols — with three properties:
 2. **Its CAS backend is cloud object storage through OpenDAL.** Local disk
    holds only backend-internal cache and staging, all of it reconstructible or
    unacknowledged (§6).
-3. **It has no path-backed spaces.** Every space it publishes into is
-   *detached* (§10): writes ingest straight to the CAS and publish, with no
-   checkout, no scanner, and no watcher.
+3. **It has API sources, not filesystem sources.** Writes ingest straight to
+   the CAS and publish, with no source directory, scanner, or watcher.
 
 One assumption is delegated to the environment rather than designed for:
 **at most one daemon per data directory / identity, ever** — enforced by the
@@ -107,7 +106,7 @@ neither implementation keeps independent metadata.
 
 The node constructs exactly one `Arc<dyn CasBackend>` and supplies that same
 object to the engine, peer `BlobProtocol`, gateway/control write paths, scanner,
-mirror materializer, and maintenance loop. Network receive paths therefore
+checkout materializer, and maintenance loop. Network receive paths therefore
 commit through the configured backend rather than accidentally writing the
 local scratch codec directly. No component selects behavior by asking which
 provider is configured.
@@ -115,7 +114,7 @@ provider is configured.
 Two consequences of that cut, named up front:
 
 - **`blob_path` is no longer a public API.** The former CAS payload-path API
-  escaped the store crate and was reflinked into mirror targets
+  escaped the store crate and was reflinked into checkout targets
   (`Adoption::clone_from` via `fetcher.rs`). That call site is now
   `backend.materialize(root, target)`: the local backend reflinks where the
   filesystem allows, the cloud backend downloads through its cache. Nothing
@@ -203,7 +202,7 @@ pub trait CasBackend: Send + Sync + 'static {
     /// durable row bit. No-op apart from validation on LocalFs.
     async fn finalize(&self, root: Hash, size: u64) -> Result<()>;
 
-    /// Write the object's bytes to a local file (mirror / `synch get`
+    /// Write the object's bytes to a local file (checkout / `synch get`
     /// materialization), atomically replacing the target. LocalFs reflinks
     /// where possible; Cloud downloads through its cache.
     async fn materialize(&self, root: Hash, size: u64,
@@ -632,20 +631,16 @@ leak.
 
 ---
 
-## 10. Detached spaces — serving and writing without a checkout
+## 10. API sources — serving and writing without a filesystem source
 
 Reads do not need a checkout: `cat`/`get`/S3 `GET`/`HEAD`/`List` resolve from
-replicated `entries` and stream from the CAS. Detached spaces make the write
+replicated `entries` and stream from the CAS. API sources make the write
 path equally checkout-free: `PutObject`, multipart completion,
-`DeleteObject`, and `synch take` publish CAS references directly rather than
+`DeleteObject`, and `synch adopt path` publish CAS references directly rather than
 funneling through `adoption_target`, `local_path`, and a full scan:
 
-```sql
--- spaces.local_path becomes nullable; NULL = detached
-```
-
-- `synch space add <id> --detached` creates the row with no path. The
-  scanner, watcher, and overlap guards skip detached spaces; aggregate scans
+- `synch source add <id> --api` creates a source with no path. The
+  scanner, watcher, and overlap guards skip API sources; aggregate scans
   simply omit them, while any direct operation requiring a checkout refuses
   them as not-scannable. The
   present-but-empty-directory mass-tombstone hazard cannot arise for a
@@ -657,22 +652,22 @@ funneling through `adoption_target`, `local_path`, and a full scan:
   `DeleteObject` stages the tombstone directly. This is the same
   trie/publish machinery the scanner drives; the scanner stops being the
   only way to reach it.
-- **`synch take` becomes adoption by reference** on a detached space:
+- **`synch adopt path` is adoption by reference** on an API source:
   fetch the chosen version's content to durability (finalize, per the pin
   path), then publish our own `f:` entry naming the same content root,
   `prev` set as §8 of DESIGN.md specifies. Taking a tombstone publishes
   our tombstone. No local file ever exists, which is consistent with what
   adoption *means* — asserting a version as our own — rather than with
   how the scanner happens to detect it.
-- `held_spaces` (cloud attach) counts detached spaces, so the control
+- cloud attachment counts sources and replicas, so the control
   plane routes reads to a node that can serve them.
 - `m:space` records stop publishing `local_path` as the space
-  description — for all spaces, not just detached ones; broadcasting
+  description — for all spaces, not just API sources; broadcasting
   local filesystem paths cluster-wide was an accident of convenience.
 
-Mirrors remain the tool for keeping a checkout *somewhere*: any
-durable-disk node can `mirror add` a space a serverless node publishes
-into. Local checked-out data stays local; it just stops being a
+Replica checkouts provide a filesystem projection elsewhere: any
+durable-disk node can `replica add <space> --checkout <path>`. Checked-out
+data stays local; it just stops being a
 prerequisite for serving.
 
 ---
@@ -697,7 +692,7 @@ without default features and with only Tokio, the reqwest
 service features. That preserves the workspace's process-wide `aws-lc-rs` TLS
 choice and avoids pulling in a second rustls provider. Hashing between awaits
 is bounded or offloaded. Sync flows that reach the CAS (scanner ingest and
-mirror materialization) restructure so their CAS steps are awaited by the
+checkout materialization) restructure so their CAS steps are awaited by the
 async orchestration that already wraps them. The standing rule "no
 `Store::conn` inside a transaction" gains a sibling: no backend await while
 holding a connection. LocalFs retains its short row-delete/unlink critical
@@ -732,7 +727,7 @@ replicas: 1, strategy: Recreate
 ```
 
 **Backend migration.** `synch cas migrate --to s3|gcs|azblob` first refuses a
-node with path-backed spaces: detaching a checkout is an explicit metadata and
+node with filesystem sources: converting one to an API source is an explicit
 publication decision, not a storage-side effect. The command owns the same
 cross-platform lifecycle lock a daemon takes before opening its Store or iroh
 endpoint, so a daemon cannot start and acknowledge a source-only write

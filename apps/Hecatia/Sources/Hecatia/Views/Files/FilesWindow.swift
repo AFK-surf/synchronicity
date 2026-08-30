@@ -3,7 +3,7 @@ import SwiftUI
 /// The browser window — the product.
 ///
 /// Nothing that does not name a file or a folder is allowed in here. Identity,
-/// keys, trust, zones, mirrors and pins live in the Node window, which has
+/// keys, trust, zones, replicas and pins live in the Node window, which has
 /// never been opened when a user first launches the app.
 struct FilesWindow: View {
   @Environment(NodeStore.self) private var node

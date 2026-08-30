@@ -12,8 +12,8 @@ every build; the end-to-end engine tests are
 `crates/synch-engine/tests/tree_writes.rs`.
 
 A **tree write** is a socket program publishing a file version into the node's
-own origin trie: the same act as saving a file into a space directory, an S3
-`PutObject`, or a `synch take` — a new assertion of *this node's* view, entering
+own origin trie: the same act as saving a file into a filesystem-source directory, an S3
+`PutObject`, or a `synch adopt path` — a new assertion of *this node's* view, entering
 through the same ingest-and-publish path they all share. The caller supplies
 bytes and a verified identity. It still never supplies code, and it still never
 publishes anything: the program decides what is written, and the program is the
@@ -72,11 +72,11 @@ own view. DESIGN.md §12 says that plainly (§9 below).
 - A committed write publishes `kind: File` under `f:<space>/<path>` in this
   node's own trie: content root and size from the staged bytes, `mtime_ns`
   stamped by the host at commit, `prev` set to the node's own previous root for
-  the path. On a path-backed space the file also lands in the space directory,
-  atomically, exactly where an S3 `PUT` would put it; on a detached space the
-  bytes go straight to CAS and the entry is staged directly, exactly as
-  `commit_detached_file` does today.
-- A delete publishes this node's own tombstone, and on a path-backed space
+  the path. On a filesystem source the file also lands in the filesystem-source directory,
+  atomically, exactly where an S3 `PUT` would put it; on an API source the
+  bytes go straight to CAS and the entry is staged directly through
+  `commit_api_file`.
+- A delete publishes this node's own tombstone, and on a filesystem source
   removes the local file — `adopt_deletion`, verbatim. It retires *our*
   version; other origins' versions survive it, per §8 of the design.
 - **`mtime_ns` is now-stamped and wins `newest`.** That is not a leak, it is
@@ -88,7 +88,7 @@ own view. DESIGN.md §12 says that plainly (§9 below).
 - **Files only.** No symlinks (a peer-influenced link target materializing
   into an operator's directory is an attack surface with no matching need), no
   explicit directories (parents come into being as they do for a `PUT`: created
-  on disk for path-backed spaces, implicit in the trie), no mode bits in v1.
+  on disk for filesystem sources, implicit in the trie), no mode bits in v1.
 - **Never a socket.** A path that has a row in the `sockets` table — declared,
   armed or not, `--auto` or not — is not writable and not deletable through
   this API, `SY_EPERM`, checked at open and re-checked inside the commit. This
@@ -125,14 +125,14 @@ extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
   component, never by string prefix — `code/inbox` does not admit
   `code/inbox-evil`. There is no way to spell "every space": a prefix begins
   with a space id or the declaration is invalid. The space does not have to
-  exist at arm time (an operator may arm before `space add`); a write into a
-  space this node has not configured fails at open with `SY_ENOENT`.
+  exist at arm time (an operator may arm before `source add`); a write into a
+  space this node does not publish fails at open with `SY_ENOENT`.
 - `allow` — every mode named must be known, as with process flags:
   - `create` — commit to a path where this node currently publishes no live
     version of its own (absent, or tombstoned by us).
   - `replace` — commit over this node's own live version.
   - `delete` — publish our tombstone (and unlink the local file on a
-    path-backed space).
+    filesystem source).
 
   `create` without `replace` is the append-only inbox, and it is why the two
   are separate: it lets an operator grant "accept new files" without granting
@@ -176,7 +176,7 @@ $ synch socket arm code/drop.sock
 
 Bytes drifting disarms as always; a widened prefix is a changed root is a fresh
 review. `--auto` re-arms tree-write declarations like any others — the §3
-warning at `synch socket add --auto` time should name writes explicitly, since
+warning at `synch socket declare --auto` time should name writes explicitly, since
 `--auto` plus tree-write means "whatever these bytes become may publish under
 this prefix without me looking". `synch socket ls -l` lists armed tree-write
 lines beside egress, and every commit is logged: socket, invocation, peer
@@ -232,7 +232,7 @@ extern sy_s64 sy_put_commit_if(sy_s64 writer, const void *expected32,
                                void *root32);
 
 /* Publishes this node's tombstone for the path (and removes the local
- * file on a path-backed space). Requires the `delete` mode; refuses a
+ * file on a filesystem source). Requires the `delete` mode; refuses a
  * writer that has staged bytes (SY_ESTATE). Idempotent like an S3
  * delete: a path we already do not publish live returns 0. */
 extern sy_s64 sy_put_delete(sy_s64 writer);
@@ -295,11 +295,11 @@ lands, so two socket commits of one path cannot interleave the check and the
 write. (An earlier draft claimed "inside the publish transaction, so there is
 no window"; the built thing is the lock, and the honest statement is narrower:
 the window that is closed is against *other socket writers*.) The scanner does
-not take that lock — on a path-backed space the comparison checks the
+not take that lock — on a filesystem source the comparison checks the
 published entry, not the disk, so an unscanned local edit under the target
 path can be overwritten and a simultaneous local save races the commit,
 exactly as either races an S3 `PUT` today. That is inherited deliberately —
-the fill-style shelf-life guards protect a directory the *operator* edits, and
+the tree-adoption shelf-life guards protect a directory the *operator* edits, and
 a directory the operator edits by hand is a poor candidate for a `replace`
 grant, which the arm prompt is where to notice.
 
@@ -316,15 +316,15 @@ what the control-service `Put` handler already does, gate for gate:
 
 - open: `ensure_adoptable` (publishable + `.syncignore`),
   `normalized_adoption_path`, the declared-socket refusal, then
-  `Node::open_adoption` — path-backed spaces staging beside the target with the
-  parent dirfd pinned, detached spaces staging in the daemon's scratch, both
+  `Node::open_adoption` — filesystem sources staging beside the target with the
+  parent dirfd pinned, API sources staging in the daemon's scratch, both
   behind `Adoption`'s single choke point.
 - write: `Adoption::write` on the blocking pool.
 - commit: under the node's tree-write lock, the condition (§5.3) and the
   socket refusal are re-checked; then `Adoption::commit` (fsync + rename);
-  then detached → `commit_detached_file` (CAS ingest,
-  `stage_detached_reference` with `prev` and the `b:` ad) plus a
-  `flush_staged`, path-backed → `scan_publish_push`. The reported root is
+  then API source → `commit_api_file` (CAS ingest,
+  `stage_api_reference` with `prev` and the `b:` ad) plus a
+  `flush_staged`, filesystem source → `scan_publish_push`. The reported root is
   taken from the staged bytes (`hash_staged`), describing what this call
   assembled rather than whatever the tree holds by the time a scan reaches
   it — the multipart completion's answer semantics.
@@ -456,7 +456,7 @@ Additions to the §10 tables of `docs/SOCKETS.md`:
 | Open outside every declared prefix, or mode not declared | `SY_EPERM`, logged once per socket per hour, like undeclared egress. |
 | Target path has a `sockets` row | `SY_EPERM`, at open and re-checked in the commit transaction. |
 | Space unknown on this node | `SY_ENOENT`. |
-| Path `.syncignore`d (path-backed space) | `SY_EPERM` at open — the file would be invisible to the scanner forever. Deletes skip the check, as `delete_object` does. |
+| Path `.syncignore`d (filesystem source) | `SY_EPERM` at open — the file would be invisible to the scanner forever. Deletes skip the check, as `delete_object` does. |
 | Node in recovery | `SY_EPERM` at open and again at commit. |
 | `commit_if` expectation does not hold | `SY_ESTALE`; nothing published, writer still committable. `SY_EPERM` refusals from the commit's condition leave the writer usable the same way. |
 | `create` commit finds our own live version | `SY_EPERM` (the mode's condition, evaluated in the transaction). |
@@ -470,7 +470,7 @@ All applied in the change that built this:
 
 - **`docs/SOCKETS.md`** — §12 drops the first non-goal, pointing here; §7.12
   names the `sy_put_*` family and §7.9 gains `sy_declare_tree_write`; the §10
-  tables gain the rows above; the `--auto` warning at `synch socket add` names
+  tables gain the rows above; the `--auto` warning at `synch socket declare` names
   writes.
 - **`docs/SSH-SOCKETS.md` §7.2** — the "read-only in v1" rationale gains its
   second half: upload support becomes a follow-up that commits through this
