@@ -25,6 +25,7 @@ enum Operations {
   static let all: [Operation] = typed + run
 
   static let typed: [Operation] = [
+    .init("rpc.listSpaces", "Spaces", "synch ls", surface: .files, provides: [.spaces]),
     .init("rpc.list", "Browse", "synch ls <space>", surface: .files, provides: [.listing]),
     .init("rpc.resolve", "Inspect", "synch status <space>/<path>", surface: .files),
     .init("rpc.read", "Download", "synch get <space>/<path>", surface: .files),
@@ -72,30 +73,28 @@ enum Operations {
     .init("domain.set", "Use a Membership Zone…", "synch domain set <domain>", gate: .consequence, surface: .node, dirties: [.domains, .members, .status]),
     .init("domain.clear", "Stop Using the Zone…", "synch domain clear", gate: .typed, surface: .node, dirties: [.domains, .members, .status]),
     .init("domain.refresh", "Check Now", "synch domain refresh", surface: .node, dirties: [.domains, .members]),
-    .init("peers", "Network", "synch peers", surface: .node, provides: [.peers]),
-    // Spaces
-    // Provides two slices because it answers two questions: bare, it is the
-    // space table; with an id, it is that space's replication report. One
-    // oneof tag, so one row here — a second row would put the registry three
-    // ahead of the daemon in the same way it was three behind.
-    .init("space.ls", "Spaces", "synch space ls [<id>]", surface: .files, provides: [.spaces, .replication]),
-    .init("space.add", "Add a Space…", "synch space add <id> <path>", gate: .consequence, surface: .files, dirties: [.spaces, .status, .listing]),
-    .init("space.rm", "Stop Sharing a Space…", "synch space rm <id>", gate: .typed, surface: .node, dirties: [.spaces, .status, .listing, .pins, .replication]),
-    // Replicating a space — the daemon put this on the command that already
-    // names spaces rather than inventing a noun, and so does the app: it is a
-    // property of a space, shown where the space is.
-    .init("space.set", "Replicate This Space…", "synch space set <id> --replicate", gate: .consequence, surface: .node, dirties: [.spaces, .replication, .pins]),
-    .init("space.sync", "Replicate Now", "synch space sync <id>", surface: .node, dirties: [.replication, .pins, .status]),
+    .init("peers", "Network", "synch peer ls", surface: .node, provides: [.peers]),
+    // Independent local roles. Namespace discovery itself uses ListSpaces.
+    .init("source.ls", "—", "synch source ls [<id>]", surface: .notSurfaced,
+          omission: "The typed ListSpaces call supplies the same role records without parsing text."),
+    .init("source.add", "Publish a Source…", "synch source add <id> <path>", gate: .consequence, surface: .files, dirties: [.spaces, .status, .listing]),
+    .init("source.rm", "Stop Publishing…", "synch source rm <id>", gate: .typed, surface: .node, dirties: [.spaces, .status, .listing]),
+    .init("source.scan", "Scan Sources Now", "synch source scan [<id>]", surface: .files, dirties: [.listing, .status]),
+    .init("replica.ls", "Replicas", "synch replica ls [<id>]", surface: .node, provides: [.spaces, .replication]),
+    .init("replica.add", "Add a Replica…", "synch replica add <id>", gate: .consequence, surface: .node, dirties: [.spaces, .replication, .pins]),
+    .init("replica.set", "Configure Replica…", "synch replica set <id>", gate: .consequence, surface: .node, dirties: [.spaces, .replication, .pins]),
+    .init("replica.rm", "Remove Replica…", "synch replica rm <id>", gate: .confirm, surface: .node, dirties: [.spaces, .replication, .pins]),
+    .init("replica.sync", "Sync Replica Now", "synch replica sync [<id>]", surface: .node, dirties: [.replication, .pins, .status]),
     // `.consequence` here is satisfied by the sheet, not by a
     // `ConfirmationRequest`, and that is deliberate rather than an omission —
     // written down because two audits have now read the gap as a missing
-    // confirmation. ``FillSheet`` cannot reach its Fill button until a
+    // confirmation. ``AdoptTreeSheet`` cannot reach its Adopt button until a
     // `--dry-run` has come back and been drawn, and under `--dry-run` the
     // daemon decides everything and writes nothing, so that report *is* the
     // consequence, itemised, rather than a sentence predicting it. Overwriting
     // is a second opt-in on top: a toggle that defaults off, with the
     // unrecoverable part named in the danger colour beside it.
-    .init("fill", "Fill From the Cluster…", "synch fill <space> --dry-run", gate: .consequence, surface: .files, dirties: [.listing, .status]),
+    .init("adopt.tree", "Adopt a Tree…", "synch adopt tree <space> --dry-run", gate: .consequence, surface: .files, dirties: [.listing, .status]),
     // Browsing, covered by typed rpcs
     .init("ls", "—", "synch ls", surface: .notSurfaced,
           omission: "Control.List answers the same thing with a schema; the text form would add a parser and no capability."),
@@ -109,28 +108,24 @@ enum Operations {
     .init("get", "Download an Old Version…", "synch get --root <hex>", surface: .files),
     // Versions
     .init("status", "Versions", "synch status <space>/<path>", surface: .files),
-    .init("take", "Use This Version", "synch take <origin>:<space>/<path>", gate: .consequence, surface: .files, dirties: [.listing, .status]),
+    .init("adopt.path", "Use This Version", "synch adopt path <origin>:<space>/<path>", gate: .consequence, surface: .files, dirties: [.listing, .status]),
     .init("log", "History", "synch log <space>/<path>", surface: .files),
     .init("compare", "Compare With…", "synch compare <space> --to <origin> --json", surface: .files),
-    // Replication
-    .init("mirror.ls", "Mirrors", "synch mirror ls", surface: .node, provides: [.mirrors]),
-    .init("mirror.add", "Mirror a Space…", "synch mirror add <space> <dir>", gate: .consequence, surface: .node, dirties: [.mirrors]),
-    .init("mirror.rm", "Stop Mirroring…", "synch mirror rm <dir>", gate: .confirm, surface: .node, dirties: [.mirrors]),
-    .init("mirror.sync", "Sync Mirrored Spaces Now", "synch mirror sync", surface: .node, dirties: [.mirrors]),
+    // Explicit pins
     .init("pin.ls", "Kept offline", "synch pin ls", surface: .node, provides: [.pins]),
     .init("pin.add", "Keep Offline", "synch pin add <target>", gate: .consequence, surface: .files, dirties: [.pins]),
     .init("pin.rm", "Stop Keeping Offline", "synch pin rm <target>", gate: .confirm, surface: .files, dirties: [.pins]),
     // Upkeep
-    .init("scan", "Scan Now", "synch scan", surface: .files, dirties: [.listing, .status]),
-    .init("sync", "Sync Now", "synch sync", surface: .ambient, // `.listing` too: `SyncNow` pulls a peer's entries into this node's store, so
+    .init("sync", "Sync Now", "synch peer sync", surface: .ambient, // `.listing` too: `SyncNow` pulls a peer's entries into this node's store, so
     // it changes what the browser is showing and used not to refresh it.
     dirties: [.peers, .status, .listing]),
     .init("recover", "Resume Publishing…", "synch recover", gate: .conditional, surface: .node, dirties: [.status]),
     .init("doctor", "Run Diagnostics", "synch doctor", surface: .node, dirties: []),
+    .init("repair.rebuildViews", "Rebuild Derived Views", "synch repair rebuild-views", gate: .typed, surface: .node, dirties: [.status, .spaces, .listing]),
     // Remote access
-    .init("cloud.status", "Remote access", "synch cloud status", surface: .node, provides: [.cloud]),
-    .init("cloud.enable", "Allow remote browsing", "synch cloud enable", gate: .confirm, surface: .node, dirties: [.cloud]),
-    .init("cloud.disable", "Stop remote browsing", "synch cloud disable", gate: .confirm, surface: .node, dirties: [.cloud]),
+    .init("cloud.status", "Remote access", "synch control-plane status", surface: .node, provides: [.cloud]),
+    .init("cloud.enable", "Allow remote browsing", "synch control-plane enable", gate: .confirm, surface: .node, dirties: [.cloud]),
+    .init("cloud.disable", "Stop remote browsing", "synch control-plane disable", gate: .confirm, surface: .node, dirties: [.cloud]),
     // Sockets (oneof 47…55), none of them surfaced.
     //
     // v3 publishes a socket as an entry of its own kind, arms it against a
@@ -148,13 +143,13 @@ enum Operations {
     // `CoverageTests.everyMutationInvalidatesSomething` exempts `.notSurfaced`
     // for exactly that reason, and the exemption ends the moment one gets a
     // button.
-    .init("socket.add", "—", "synch socket add <space>/<path>", surface: .notSurfaced,
+    .init("socket.add", "—", "synch socket declare <space>/<path>", surface: .notSurfaced,
           omission: "Publishes an eBPF object as a runnable entry; nothing in this app builds, inspects or reviews one."),
     .init("socket.arm", "—", "synch socket arm <space>/<path>", surface: .notSurfaced,
           omission: "Approves one review token to execute, which is a review decision — a button without the review it approves is the wrong half of the feature."),
     .init("socket.disarm", "—", "synch socket disarm <space>/<path>", surface: .notSurfaced,
           omission: "Stops a socket serving, and there is no armed state shown anywhere for a person to want stopped."),
-    .init("socket.rm", "—", "synch socket rm <space>/<path>", surface: .notSurfaced,
+    .init("socket.rm", "—", "synch socket undeclare <space>/<path>", surface: .notSurfaced,
           omission: "Withdraws the socket entry; the browser can name a socket row now but offers it only `rpc.delete`, which is a different question from retiring a published program."),
     .init("socket.ls", "—", "synch socket ls [<space>]", surface: .notSurfaced,
           omission: "The sockets of a space, with no pane to list them in and no Topic for them to fill."),

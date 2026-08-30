@@ -24,7 +24,7 @@ async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
     let space = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-    node.add_space("code", space.path()).unwrap();
+    node.add_filesystem_source("code", space.path()).unwrap();
     (data, space, node)
 }
 
@@ -302,7 +302,7 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
     let (_data, space, node) = node_with_space().await;
-    node.add_detached_space("archive").unwrap();
+    node.add_api_source("archive").unwrap();
     install(&node, space.path(), "archiver.sock", DETACHED).await;
 
     let (status, _) = drive(&node, "archiver.sock", b"").await;
@@ -312,13 +312,13 @@ SY_ENTRY sy_s64 entry(void) {
         .store()
         .entry(node.origin(), "archive", "kept.bin")
         .unwrap()
-        .expect("the detached commit published an entry");
+        .expect("the API-source commit published an entry");
     assert_eq!(entry.kind, EntryKind::File);
     let root = entry.content.expect("a file version has a root");
     assert_eq!(root, Hash::new(b"held with no checkout"));
     assert!(
         node.store().blob(&root).unwrap().is_some(),
-        "the bytes went straight to the CAS: a detached space has no disk to hold them"
+        "the bytes went straight to the CAS: a API source has no disk to hold them"
     );
     node.shutdown().await.unwrap();
 }

@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use synch_s3::{
     auth::{self, AccessKey, AuthMode},
-    buckets,
+    buckets::{self, Access},
     daemon::Daemon,
     is_loopback, Gateway,
 };
@@ -45,7 +45,7 @@ enum Command {
         command: BucketCommand,
     },
     /// Manage static access keys.
-    Key {
+    AccessKey {
         #[command(subcommand)]
         command: KeyCommand,
     },
@@ -57,12 +57,26 @@ enum BucketCommand {
     Add {
         /// The bucket name.
         bucket: String,
-        /// The space, or `<origin>:<space>` as shorthand for an origin pin.
-        reference: String,
-        /// Which version of each key reads serve: `newest` (default),
+        /// The space namespace.
+        space: String,
+        /// Refuse all mutations.
+        #[arg(
+            long,
+            required_unless_present = "read_write",
+            conflicts_with = "read_write"
+        )]
+        read_only: bool,
+        /// Publish mutations through this node's source.
+        #[arg(
+            long,
+            required_unless_present = "read_only",
+            conflicts_with = "read_only"
+        )]
+        read_write: bool,
+        /// Which version read-only keys serve: `newest` (default),
         /// `origin=<id>`, or `strict`.
-        #[arg(long)]
-        policy: Option<String>,
+        #[arg(long, requires = "read_only")]
+        select: Option<String>,
     },
     /// Remove a bucket mapping.
     Rm {
@@ -79,8 +93,12 @@ enum KeyCommand {
     Add {
         /// The access key id.
         id: String,
-        /// The secret access key.
-        secret: String,
+        /// Read the secret from this file.
+        #[arg(long, conflicts_with = "secret_stdin")]
+        secret_file: Option<PathBuf>,
+        /// Read the secret from standard input.
+        #[arg(long)]
+        secret_stdin: bool,
     },
     /// Remove an access key.
     Rm {
@@ -123,14 +141,25 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
         Command::Bucket { command } => match command {
             BucketCommand::Add {
                 bucket,
-                reference,
-                policy,
+                space,
+                read_only,
+                read_write: _,
+                select,
             } => {
-                let bucket = buckets::add(daemon, &bucket, &reference, policy.as_deref()).await?;
-                println!("{} -> {} ({})", bucket.name, bucket.space, bucket.policy);
-                if let Some(warning) = bucket.foreign_pin_warning(&daemon.origin().await?) {
-                    println!("warning: {warning}");
-                }
+                let access = if read_only {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                };
+                let bucket =
+                    buckets::add(daemon, &bucket, &space, access, select.as_deref()).await?;
+                println!(
+                    "{} -> {} ({}; {})",
+                    bucket.name,
+                    bucket.space,
+                    bucket.access.render(),
+                    bucket.policy
+                );
                 // Mapping a bucket before its space first syncs is legal;
                 // mapping one onto a typo would otherwise look the same.
                 if !daemon.space_known(&bucket.space).await? {
@@ -152,12 +181,32 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                     eprintln!("(no buckets mapped; add one with `synch-s3 bucket add`)");
                 }
                 for bucket in buckets {
-                    println!("{:<24} {:<20} {}", bucket.name, bucket.space, bucket.policy);
+                    println!(
+                        "{:<24} {:<20} {:<10} {}",
+                        bucket.name,
+                        bucket.space,
+                        bucket.access.render(),
+                        bucket.policy
+                    );
                 }
             }
         },
-        Command::Key { command } => match command {
-            KeyCommand::Add { id, secret } => {
+        Command::AccessKey { command } => match command {
+            KeyCommand::Add {
+                id,
+                secret_file,
+                secret_stdin,
+            } => {
+                let secret = match (secret_file, secret_stdin) {
+                    (Some(path), false) => std::fs::read_to_string(path)?.trim_end().to_string(),
+                    (None, true) => {
+                        let mut secret = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut secret)?;
+                        secret.trim_end().to_string()
+                    }
+                    (None, false) => rpassword::prompt_password("Secret access key: ")?,
+                    (Some(_), true) => unreachable!("clap rejects conflicting secret inputs"),
+                };
                 auth::put_key(
                     daemon,
                     &AccessKey {
@@ -192,7 +241,7 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 if !is_loopback(&listen) {
                     bail!(
                         "--anonymous requires a loopback listen address, got {listen}; \
-                         configure access keys with `synch-s3 key add` instead"
+                         configure access keys with `synch-s3 access-key add` instead"
                     );
                 }
                 AuthMode::Anonymous
@@ -203,7 +252,7 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 let keys = auth::load_keys(daemon).await?;
                 if keys.is_empty() {
                     bail!(
-                        "no access keys configured; add one with `synch-s3 key add <id> <secret>` \
+                        "no access keys configured; add one with `synch-s3 access-key add <id>` \
                          or use --anonymous on loopback"
                     );
                 }
@@ -220,11 +269,13 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 daemon.data_dir().display()
             );
             for bucket in buckets::load(daemon).await? {
-                println!("  {} -> {} ({})", bucket.name, bucket.space, bucket.policy);
-                if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
-                    tracing::warn!("{warning}");
-                    println!("  warning: {warning}");
-                }
+                println!(
+                    "  {} -> {} ({}; {})",
+                    bucket.name,
+                    bucket.space,
+                    bucket.access.render(),
+                    bucket.policy
+                );
             }
             axum::serve(listener, gateway.router())
                 .with_graceful_shutdown(async {

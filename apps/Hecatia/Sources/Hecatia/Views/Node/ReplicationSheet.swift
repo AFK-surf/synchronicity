@@ -19,6 +19,8 @@ struct ReplicationSheet: View {
   @State private var limitBudget = false
   @State private var budgetGB = 100.0
   @State private var release = false
+  @State private var materialize = false
+  @State private var checkoutPath = ""
   @State private var loaded = false
 
   enum Choice: Hashable {
@@ -31,7 +33,7 @@ struct ReplicationSheet: View {
   var body: some View {
     VStack(alignment: .leading, spacing: Theme.Space.l) {
       Text("Replication for “\(space.id)”").font(.title3.weight(.semibold))
-      Text("A replicating space holds other devices’ versions of its files on this Mac, as content rather than as files. Nothing appears in Finder — a mirror is what puts files on disk.")
+      Text("A replica durably holds content from other devices. It can optionally materialize one newest-view checkout for ordinary applications.")
         .font(.callout).foregroundStyle(Theme.muted)
         .fixedSize(horizontal: false, vertical: true)
 
@@ -52,7 +54,7 @@ struct ReplicationSheet: View {
         // Grace only applies to `tree`. Under `archive` nothing is ever
         // released, so a grace period would be a control with no effect —
         // the daemon does not even print the line.
-        if policy == .tree {
+        if policy == .current {
           HStack(spacing: Theme.Space.m) {
             Text("Grace").frame(width: 64, alignment: .trailing)
             Stepper(value: $graceDays, in: 0...365, step: 1) {
@@ -77,6 +79,12 @@ struct ReplicationSheet: View {
           Text("At the ceiling nothing new is fetched. No release is shortened to make room.")
             .font(.caption).foregroundStyle(Theme.muted)
             .padding(.leading, Theme.Space.xxl)
+        }
+
+        Toggle("Materialize a checkout", isOn: $materialize)
+        if materialize {
+          TextField("Checkout directory", text: $checkoutPath)
+            .textFieldStyle(.roundedBorder)
         }
       }
 
@@ -121,6 +129,8 @@ struct ReplicationSheet: View {
     guard !loaded else { return }
     loaded = true
     choice = space.replicate.map(Choice.policy) ?? .off
+    materialize = space.checkoutPath != nil
+    checkoutPath = space.checkoutPath ?? ""
   }
 
   private func apply() {
@@ -128,12 +138,15 @@ struct ReplicationSheet: View {
     switch choice {
     case .off:
       let alsoRelease = release
-      node.enqueue { await node.setReplication(id: id, stop: true, release: alsoRelease) }
+      node.enqueue { await node.removeReplica(id: id, pinHeld: !alsoRelease) }
     case .policy(let policy):
-      let grace = policy == .tree ? Int64(graceDays * 86_400) : nil
+      let grace = policy == .current ? Int64(graceDays * 86_400) : nil
       let budget = limitBudget ? UInt64(budgetGB * 1_000_000_000) : nil
       node.enqueue {
-        await node.setReplication(id: id, replicate: policy, grace: grace, budget: budget)
+        await node.configureReplica(
+          id: id, retention: policy, grace: grace, budget: budget,
+          checkout: materialize ? checkoutPath : nil,
+          noCheckout: !materialize && space.checkoutPath != nil)
       }
     }
     dismiss()

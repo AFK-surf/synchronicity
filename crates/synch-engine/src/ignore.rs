@@ -26,8 +26,8 @@ pub(crate) const BUILTIN_DEFAULTS: &[&str] = &[
     // fragment and publish it as this node's own assertion.
     "*.synch-part",
     // The same hazard from the other write path: `materialize_blob` stages the
-    // object beside its target and renames, so while a `synch take` or a
-    // `synch fill` is materializing into a space there is a growing file next
+    // object beside its target and renames, so while a `synch adopt path` or a
+    // `synch adopt tree` is materializing into a space there is a growing file next
     // to the real one (`Store::materialize`, synch-store/src/backend.rs). A
     // scan racing it would hash whatever length it had reached and publish
     // *that* — a truncated file under a plausible name, replicated to every

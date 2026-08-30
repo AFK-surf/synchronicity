@@ -48,7 +48,7 @@ struct BrowserDialogs: ViewModifier {
         }
         exporting = nil
       }
-      .sheet(isPresented: $addingSpace) { AddSpaceSheet() }
+      .sheet(isPresented: $addingSpace) { AddSourceSheet() }
       .sheet(isPresented: $model.compareRequested) {
         if let space { CompareSheet(space: space, prefix: prefix) }
       }

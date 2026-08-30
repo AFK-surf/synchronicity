@@ -1,14 +1,11 @@
-//! Bucket mapping: a bucket names a space of the unified tree plus a version
-//! policy (§9.4).
+//! Bucket mapping: a bucket names a space, an access mode, and a read view.
 //!
-//! Reads serve the policy-selected version of each key (§8). Writes are always
-//! publishes of the *local* node's own view — the version model forbids
-//! publishing someone else's — so every bucket is writable, and a bucket that
-//! pins a foreign origin is effectively read-only in practice, since reads
-//! would not see our writes. The gateway warns about exactly that shape.
+//! Read-only buckets may select any view. Read-write buckets require a source
+//! and read this node's own origin, so a successful write is immediately
+//! visible through the same bucket.
 //!
 //! The map lives in the daemon's `s3.buckets` config value, reached over the
-//! control socket, and it is an **append-only log of records**: three
+//! control socket, and it is an **append-only log of records**: four
 //! tab-separated fields add or replace a bucket, one field removes it, and the
 //! last record naming a bucket wins. Nothing rewrites the list in place,
 //! because a read-modify-write of the whole list drops whichever concurrent
@@ -37,6 +34,35 @@ pub enum Policy {
     Origin(String),
     /// Refuse a divergent key, with `409 Conflict` naming the versions.
     Strict,
+}
+
+/// Whether a bucket may publish this node's view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Reads only; any selection policy is allowed.
+    ReadOnly,
+    /// Reads and writes against this node's own source view.
+    ReadWrite,
+}
+
+impl Access {
+    fn parse(text: &str) -> S3Result<Self> {
+        match text {
+            "read-only" => Ok(Self::ReadOnly),
+            "read-write" => Ok(Self::ReadWrite),
+            _ => Err(S3Error::invalid(
+                "bucket access must be read-only or read-write",
+            )),
+        }
+    }
+
+    /// The stored spelling.
+    pub fn render(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
 }
 
 impl Policy {
@@ -85,6 +111,8 @@ pub struct Bucket {
     pub name: String,
     /// The space of the unified tree the bucket serves.
     pub space: String,
+    /// Whether mutations are accepted.
+    pub access: Access,
     /// Which version of each path reads return (§8).
     pub policy: Policy,
 }
@@ -92,21 +120,24 @@ pub struct Bucket {
 impl Bucket {
     /// The record that adds or replaces this mapping.
     fn record(&self) -> String {
-        format!("{}\t{}\t{}", self.name, self.space, self.policy.render())
+        format!(
+            "{}\t{}\t{}\t{}",
+            self.name,
+            self.space,
+            self.access.render(),
+            self.policy.render()
+        )
     }
 
-    /// The warning §9.4 asks the gateway to log for such a bucket.
-    pub fn foreign_pin_warning(&self, ours: &str) -> Option<String> {
-        self.policy
-            .pinned_origin()
-            .filter(|o| *o != ours)
-            .map(|origin| {
-                format!(
-                    "bucket {} pins {origin}, so writes to it publish {ours}'s view \
-                     and reads keep serving {origin}'s: it is effectively read-only",
-                    self.name,
-                )
-            })
+    /// Refuses a mutation before its body is consumed.
+    pub fn require_writable(&self) -> S3Result<()> {
+        match self.access {
+            Access::ReadWrite => Ok(()),
+            Access::ReadOnly => Err(S3Error::access_denied(format!(
+                "bucket {} is read-only",
+                self.name
+            ))),
+        }
     }
 }
 
@@ -136,14 +167,18 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
         records,
         |bucket: &Bucket| &bucket.name,
         |name, rest| {
-            let [space, policy, ..] = rest else {
+            let [space, access, policy, ..] = rest else {
                 return None;
             };
-            Policy::parse(policy).ok().map(|policy| Bucket {
-                name: name.to_string(),
-                space: space.to_string(),
-                policy,
-            })
+            Access::parse(access)
+                .ok()
+                .zip(Policy::parse(policy).ok())
+                .map(|(access, policy)| Bucket {
+                    name: name.to_string(),
+                    space: space.to_string(),
+                    access,
+                    policy,
+                })
         },
     );
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -166,29 +201,34 @@ pub async fn find(daemon: &Daemon, name: &str) -> S3Result<Bucket> {
 
 /// Adds or replaces a bucket mapping.
 ///
-/// `reference` is a space — `media` — or the origin-pinned shorthand
-/// `<origin>:<space>`, which is the same thing as `--policy origin=<origin>`.
+/// `space` is a namespace id. Read-only selection is supplied independently.
 pub async fn add(
     daemon: &Daemon,
     name: &str,
-    reference: &str,
-    policy: Option<&str>,
+    space: &str,
+    access: Access,
+    select: Option<&str>,
 ) -> S3Result<Bucket> {
     validate_name(name)?;
-    let (pinned, space) = split_reference(reference)?;
-    let policy = match (&pinned, policy) {
-        (Some(_), Some(_)) => {
-            return Err(S3Error::invalid(
-                "the reference already pins an origin; drop --policy or the <origin>: prefix",
-            ))
+    synch_core::validate_space(space).map_err(|e| S3Error::invalid(e.to_string()))?;
+    let policy = match access {
+        Access::ReadOnly => select.map(Policy::parse).transpose()?.unwrap_or_default(),
+        Access::ReadWrite if select.is_some() => {
+            return Err(S3Error::invalid("--select is valid only with --read-only"));
         }
-        (Some(origin), None) => Policy::Origin(origin.clone()),
-        (None, Some(text)) => Policy::parse(text)?,
-        (None, None) => Policy::default(),
+        Access::ReadWrite => {
+            if !daemon.has_source(space).await? {
+                return Err(S3Error::invalid(format!(
+                    "read-write bucket requires a local source for {space}"
+                )));
+            }
+            Policy::Origin(daemon.origin().await?)
+        }
     };
     let bucket = Bucket {
         name: name.to_string(),
-        space,
+        space: space.to_string(),
+        access,
         policy,
     };
     // The daemon is the authority on what a space id and an origin are, so the
@@ -215,30 +255,6 @@ pub async fn remove(daemon: &Daemon, name: &str) -> S3Result<bool> {
     Ok(existed)
 }
 
-/// Splits `<origin>:<space>` into its parts, or takes a bare space.
-///
-/// A bucket maps to a whole space, so there is no path to confuse the split
-/// with: everything before the last colon is the origin, and a key-identified
-/// origin's own colon survives it.
-fn split_reference(reference: &str) -> S3Result<(Option<String>, String)> {
-    let (origin, space) = match reference.rsplit_once(':') {
-        Some((origin, space)) => (Some(origin.to_string()), space),
-        None => (None, reference),
-    };
-    if space.contains('/') {
-        return Err(S3Error::invalid(
-            "a bucket maps to a whole space, not a path within one",
-        ));
-    }
-    synch_core::validate_space(space).map_err(|e| S3Error::invalid(e.to_string()))?;
-    if origin.as_deref().is_some_and(str::is_empty) {
-        return Err(S3Error::invalid(format!(
-            "{reference:?} names no origin before its colon"
-        )));
-    }
-    Ok((origin, space.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,13 +267,13 @@ mod tests {
     #[test]
     fn the_last_record_naming_a_bucket_wins() {
         let buckets = fold(&records(&[
-            "photos\tmedia\tnewest",
-            "docs\tpapers\tstrict",
-            "photos\tmedia\torigin=nas",
-            "garbage\tmedia\twhatever",
+            "photos\tmedia\tread-only\tnewest",
+            "docs\tpapers\tread-only\tstrict",
+            "photos\tmedia\tread-only\torigin=nas",
+            "garbage\tmedia\tread-only\twhatever",
             "\t\t",
             "docs",
-            "docs\tother\tnewest",
+            "docs\tother\tread-write\torigin=self",
         ]));
         let names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["docs", "photos"]);
@@ -278,39 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn references_split_into_an_origin_and_a_space() {
-        for (text, expect) in [
-            ("media", (None, "media")),
-            ("nas:media", (Some("nas"), "media")),
-            ("key:abcdef:media", (Some("key:abcdef"), "media")),
-        ] {
-            let got = split_reference(text).unwrap();
-            assert_eq!(got, (expect.0.map(String::from), expect.1.to_string()));
-        }
-        assert!(split_reference("nas:media/sub").is_err());
-        assert!(split_reference(":media").is_err());
-        assert!(split_reference("").is_err());
-    }
-
-    #[test]
-    fn a_foreign_pin_is_named_as_one() {
-        let ours = "laptop@cluster.example";
-        let bucket = Bucket {
-            name: "nas-media".into(),
+    fn only_read_write_buckets_accept_mutations() {
+        let mut bucket = Bucket {
+            name: "media".into(),
             space: "media".into(),
-            policy: Policy::Origin("nas@cluster.example".into()),
+            access: Access::ReadOnly,
+            policy: Policy::Newest,
         };
-        let warning = bucket.foreign_pin_warning(ours).unwrap();
-        assert!(warning.contains("read-only"));
-
-        for policy in [Policy::Origin(ours.into()), Policy::Strict] {
-            let bucket = Bucket {
-                name: "mine".into(),
-                space: "media".into(),
-                policy,
-            };
-            assert!(bucket.foreign_pin_warning(ours).is_none());
-        }
+        assert!(bucket.require_writable().is_err());
+        bucket.access = Access::ReadWrite;
+        assert!(bucket.require_writable().is_ok());
     }
 
     #[test]

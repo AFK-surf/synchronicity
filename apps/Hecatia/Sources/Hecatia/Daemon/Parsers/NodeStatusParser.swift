@@ -46,7 +46,9 @@ enum NodeStatusReader {
         status.address = address
       } else if line.hasPrefix("spaces: ") {
         status.spaceNames = spaceNames(in: line)
-        status.mirrorCount = Anchor.after("mirrors: ", in: line).flatMap(Int.init)
+        status.sourceCount = Anchor.after("sources: ", in: line)
+          .flatMap { $0.split(separator: " ").first }.flatMap(Int.init)
+        status.replicaCount = Anchor.after("replicas: ", in: line).flatMap(Int.init)
       } else if line.hasPrefix("head: ") {
         status.headSeq = Anchor.after("head: seq ", in: line)
           .flatMap { UInt64($0.prefix(while: \.isNumber)) }

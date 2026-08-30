@@ -10,7 +10,7 @@
 //! - `publish_quiesce` (default 2 s) passes with nothing new staged, or
 //! - the buffer reaches `publish_batch_max` (default 1000) entries.
 //!
-//! Callers that must publish before they return — `synch scan`, `synch take` —
+//! Callers that must publish before they return — `synch source scan`, `synch adopt path` —
 //! flush explicitly instead of waiting for either.
 
 use std::{sync::Mutex, time::Duration};
@@ -142,7 +142,7 @@ impl Node {
     /// Publishes everything staged so far as one new signed root and pushes it
     /// to reachable peers (§7.1).
     ///
-    /// This is the whole batch, not one caller's share of it: a `synch scan`
+    /// This is the whole batch, not one caller's share of it: a `synch source scan`
     /// that lands while a watcher-triggered rescan is still buffered publishes
     /// both, which is the point of batching.
     ///
@@ -158,7 +158,7 @@ impl Node {
             // This node's own origin's tree just moved, and both the mirrors
             // and the replicated spaces follow the unified tree — which
             // includes it.
-            self.mirror_wake().notify_one();
+            self.checkout_wake().notify_one();
             self.replica_wake().notify_one();
         }
         Ok(head)
@@ -282,15 +282,20 @@ mod tests {
 
     /// A node whose batch triggers are set for a test rather than for a desk.
     async fn node(quiesce: Duration, batch_max: usize) -> (tempfile::TempDir, Node) {
-        node_with(move |config| {
+        let (dir, node) = node_with(move |config| {
             config.publish_quiesce = quiesce;
             config.publish_batch_max = batch_max;
         })
-        .await
+        .await;
+        node.store()
+            .put_source("s", synch_store::SourceKind::Api, None)
+            .unwrap();
+        (dir, node)
     }
 
     fn entry(node: &Node, path: &str) -> StagedChange {
-        let entry = synch_core::FileEntry::file(1, 0, synch_core::Hash::new(path.as_bytes()), 1);
+        let root = node.store().ingest_bytes(path.as_bytes(), 0).unwrap();
+        let entry = synch_core::FileEntry::file(path.len() as u64, 0, root, 1);
         (
             node.key_for("s", path).unwrap(),
             Some(postcard::to_stdvec(&entry).unwrap()),

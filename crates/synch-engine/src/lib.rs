@@ -9,6 +9,7 @@
 
 pub mod aae;
 mod blocking;
+pub mod checkout;
 pub mod cloud;
 pub mod compare;
 pub mod config;
@@ -18,7 +19,6 @@ pub mod fill;
 pub mod ignore;
 mod join;
 pub mod membership;
-pub mod mirror;
 pub mod node;
 pub mod publisher;
 pub mod reconcile;

@@ -1347,7 +1347,7 @@ mod tests {
             "an undelegated node reads the whole keyspace"
         );
         let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         node.scan_and_publish().unwrap();
 

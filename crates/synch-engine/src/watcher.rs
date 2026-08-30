@@ -78,7 +78,7 @@ impl SpaceWatcher {
     pub(crate) fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
         Ok(node
             .store()
-            .spaces()?
+            .sources()?
             .into_iter()
             .filter_map(|space| space.local_path.map(PathBuf::from))
             .collect())
@@ -87,7 +87,7 @@ impl SpaceWatcher {
     /// Registers spaces added since the last pass and drops ones removed,
     /// given a configured set that has already been read.
     ///
-    /// A daemon runs for weeks and `synch space add` lands whenever an
+    /// A daemon runs for weeks and `synch source add` lands whenever an
     /// operator says so, so the watched set cannot be fixed at startup: an
     /// unregistered space would be covered only by the hourly rescan, and a
     /// removed one would keep waking the watcher for a directory nobody
@@ -264,7 +264,7 @@ mod tests {
         let (_d, node) = node().await;
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        node.add_space("one", first.path()).unwrap();
+        node.add_filesystem_source("one", first.path()).unwrap();
 
         let resync = |watcher: &mut SpaceWatcher, node: &Node| {
             watcher.resync_to(&SpaceWatcher::configured_spaces(node).unwrap())
@@ -273,13 +273,13 @@ mod tests {
         let mut watcher = SpaceWatcher::start_with(&node, &configured).unwrap();
         assert_eq!(watcher.watching.len(), 1);
 
-        node.add_space("two", second.path()).unwrap();
+        node.add_filesystem_source("two", second.path()).unwrap();
         assert_eq!(resync(&mut watcher, &node), 1);
         assert_eq!(watcher.watching.len(), 2);
         // Re-registering an unchanged set is a no-op.
         assert_eq!(resync(&mut watcher, &node), 0);
 
-        node.remove_space("two", false).unwrap();
+        node.finish_source_removal("two").unwrap();
         assert_eq!(resync(&mut watcher, &node), 1);
         assert_eq!(watcher.watching.len(), 1);
         node.shutdown().await.unwrap();

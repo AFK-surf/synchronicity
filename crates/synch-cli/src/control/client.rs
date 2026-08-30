@@ -320,8 +320,8 @@ impl Client {
         Ok(out)
     }
 
-    /// Every space this node has configured, as data rather than as the line
-    /// `synch space ls` prints (§9.4).
+    /// Every known namespace and local role, as structured data rather than
+    /// the lines bare `synch ls` prints (§9.4).
     pub async fn list_spaces(&mut self) -> Result<Vec<SpaceInfo>, ControlError> {
         let mut stream = self
             .inner
@@ -332,12 +332,14 @@ impl Client {
         while let Some(space) = stream.message().await? {
             out.push(SpaceInfo {
                 id: space.id,
-                local_path: space.local_path,
-                replicate: space.replicate,
+                source_path: space.source_path,
+                source_kind: space.source_kind,
+                retention: space.retention,
                 grace_secs: space.grace_secs,
                 budget: space.budget,
                 held_bytes: space.held_bytes,
                 wanted: space.wanted,
+                checkout_path: space.checkout_path,
             });
         }
         Ok(out)
@@ -704,12 +706,13 @@ fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
 pub struct SpaceInfo {
     /// The space id.
     pub id: String,
-    /// The local directory being indexed, or `None` for a detached space.
-    pub local_path: Option<String>,
-    /// The replication policy — `tree` or `archive` — or `None` when this node
-    /// holds only what it publishes and reads.
-    pub replicate: Option<String>,
-    /// Seconds a released root is still held, under `tree`.
+    /// The filesystem root, when this node has a filesystem source.
+    pub source_path: Option<String>,
+    /// `filesystem` or `api`, when this node has a source.
+    pub source_kind: Option<String>,
+    /// `current` or `forever`, when this node has a replica.
+    pub retention: Option<String>,
+    /// Seconds a stale current root remains held.
     pub grace_secs: i64,
     /// A ceiling on bytes held for this space, or `None` for no ceiling.
     pub budget: Option<u64>,
@@ -717,6 +720,8 @@ pub struct SpaceInfo {
     pub held_bytes: Option<u64>,
     /// Objects wanted and not yet held, or `None` when not replicating.
     pub wanted: Option<u64>,
+    /// The replica's newest checkout, when configured.
+    pub checkout_path: Option<String>,
 }
 
 /// What a delete left behind.

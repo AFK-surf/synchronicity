@@ -958,35 +958,54 @@ impl Control for ControlService {
         _request: Request<pb::ListSpacesRequest>,
     ) -> Result<Response<Self::ListSpacesStream>, Status> {
         let node = self.served.node()?.clone();
-        // The coverage counts come from the same reading as the rows, so a
-        // space cannot be reported as replicating with a coverage taken before
-        // it was — the shape `Run(SpaceLs)` already reads it in.
         let spaces = read(&node, |n| {
             let mut out = Vec::new();
-            for space in n.store().spaces()? {
-                let coverage = match space.replicate {
-                    Some(_) => Some(
+            let sources: std::collections::HashMap<_, _> = n
+                .store()
+                .sources()?
+                .into_iter()
+                .map(|row| (row.space.clone(), row))
+                .collect();
+            let replicas: std::collections::HashMap<_, _> = n
+                .store()
+                .replicas()?
+                .into_iter()
+                .map(|row| (row.space.clone(), row))
+                .collect();
+            let mut names = n.store().known_spaces()?;
+            names.extend(sources.keys().cloned());
+            names.extend(replicas.keys().cloned());
+            names.sort();
+            names.dedup();
+            for name in names {
+                let source = sources.get(&name).cloned();
+                let replica = replicas.get(&name).cloned();
+                let coverage = replica
+                    .as_ref()
+                    .map(|row| {
                         n.store()
-                            .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)?,
-                    ),
-                    None => None,
-                };
-                out.push((space, coverage));
+                            .replica_coverage(&row.holder(), UNREACHABLE_ATTEMPTS)
+                    })
+                    .transpose()?;
+                out.push((name, source, replica, coverage));
             }
             Ok(out)
         })
         .await?;
-        let stream = tokio_stream::iter(spaces.into_iter().map(|(space, coverage)| {
-            Ok(pb::SpaceInfo {
-                grace_secs: space.grace_secs(),
-                id: space.id,
-                local_path: space.local_path,
-                replicate: space.replicate.map(|policy| policy.to_string()),
-                budget: space.budget,
-                held_bytes: coverage.as_ref().map(|c| c.held_bytes),
-                wanted: coverage.as_ref().map(|c| c.wanted),
-            })
-        }));
+        let stream =
+            tokio_stream::iter(spaces.into_iter().map(|(id, source, replica, coverage)| {
+                Ok(pb::SpaceInfo {
+                    id,
+                    source_path: source.as_ref().and_then(|row| row.local_path.clone()),
+                    source_kind: source.as_ref().map(|row| row.kind.render().to_string()),
+                    retention: replica.as_ref().map(|row| row.retention.to_string()),
+                    grace_secs: replica.as_ref().map(|row| row.grace_secs()).unwrap_or(0),
+                    budget: replica.as_ref().and_then(|row| row.budget),
+                    held_bytes: coverage.as_ref().map(|c| c.held_bytes),
+                    wanted: coverage.as_ref().map(|c| c.wanted),
+                    checkout_path: replica.and_then(|row| row.checkout_path),
+                })
+            }));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -1803,13 +1822,13 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 render::addr(&node.net().direct_addr())
             ))
             .await?;
-            let spaces = read(node, |n| Ok(n.store().spaces()?)).await?;
-            let names: Vec<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
+            let spaces = read(node, |n| Ok(n.store().known_spaces()?)).await?;
             out.line(format!(
-                "spaces: {} ({}) · mirrors: {}",
+                "spaces: {} ({}) · sources: {} · replicas: {}",
                 spaces.len(),
-                names.join(", "),
-                read(node, |n| Ok(n.store().mirrors()?.len())).await?
+                spaces.join(", "),
+                read(node, |n| Ok(n.store().sources()?.len())).await?,
+                read(node, |n| Ok(n.store().replicas()?.len())).await?
             ))
             .await?;
             let head = {
@@ -1858,14 +1877,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
         }
 
-        Command::Doctor(pb::Doctor { rebuild }) => {
-            if rebuild {
-                // A rebuild re-materializes every leaf of every origin's trie.
-                let rebuilding = node.clone();
-                let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
-                out.line(format!("rebuilt {n} derived rows from the trie"))
-                    .await?;
-            }
+        Command::RepairRebuildViews(pb::RepairRebuildViews {}) => {
+            let rebuilding = node.clone();
+            let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
+            out.line(format!("rebuilt {n} derived rows from the trie"))
+                .await?;
+        }
+
+        Command::Doctor(pb::Doctor {}) => {
             // The examination asks the trie whether each origin's root is held
             // whole — a full walk the first time it is asked of a root — and
             // counts every entry of every space to do it.
@@ -2222,128 +2241,72 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SpaceAdd(pb::SpaceAdd {
-            id,
-            path,
-            detached,
-            replicate,
-            grace,
-            budget,
-        }) => {
+        Command::SourceAdd(pb::SourceAdd { space, path, api }) => {
+            if api == !path.is_empty() {
+                return Err(ControlError::invalid(
+                    "source add requires exactly one of a filesystem path or API mode",
+                ));
+            }
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
             //
             // The `stat` goes over with the store work rather than inline: on a
             // hung mount it blocks for the mount's timeout, and a runtime
             // worker that stops polling is the thing §10 exists to prevent.
-            // A space asked to replicate with no path is detached by
-            // construction: replication materializes nothing, so there is no
-            // third state between "a directory is indexed here" and "there
-            // isn't one" for it to occupy.
-            if detached || (path.is_empty() && replicate.is_some()) {
-                let detached_id = id.clone();
+            if api {
+                let source = space.clone();
                 read(node, move |n| {
-                    n.add_detached_space(&detached_id)?;
+                    n.add_api_source(&source)?;
                     Ok(())
                 })
                 .await?;
-                out.line(format!("holding detached space {id}")).await?;
-                apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
+                out.line(format!("publishing {space} through APIs")).await?;
                 return Ok(());
             }
             let created = {
-                let (id, path) = (id.clone(), path.clone());
+                let (space, path) = (space.clone(), path.clone());
                 read(node, move |n| {
                     let created = !std::path::Path::new(&path).is_dir();
-                    n.add_space(&id, &path)?;
+                    n.add_filesystem_source(&space, &path)?;
                     Ok(created)
                 })
                 .await?
             };
-            out.line(format!("indexing {path} as {id}")).await?;
+            out.line(format!("publishing {path} as {space}")).await?;
             if created {
                 out.line(format!("note: created {path}, which did not exist"))
                     .await?;
             }
-            apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
         }
 
-        Command::SpaceLs(pb::SpaceLs { id }) => {
-            // Naming one space asks a different question from listing them —
-            // "what is this node doing about `media`" rather than "what is this
-            // node for" — and answers at a different length.
-            if !id.is_empty() {
-                let reporting = id.clone();
-                let status = read(node, move |n| Ok(n.replica_status(&reporting)?)).await?;
-                for line in crate::render::replica_status(&status)? {
-                    out.line(line).await?;
+        Command::SourceLs(pb::SourceLs { space }) => {
+            let sources = read(node, move |n| {
+                if space.is_empty() {
+                    Ok(n.store().sources()?)
+                } else {
+                    Ok(n.store().source(&space)?.into_iter().collect())
                 }
-                return Ok(());
-            }
-            let spaces = read(node, |n| {
-                let spaces = n.store().spaces()?;
-                let mut out = Vec::new();
-                for space in spaces {
-                    let coverage = space.replicate.map(|_| {
-                        n.store()
-                            .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)
-                    });
-                    out.push((space, coverage.transpose()?));
-                }
-                Ok(out)
             })
             .await?;
-            if spaces.is_empty() {
-                out.progress("(no local spaces; add one with `synch space add`)")
-                    .await?;
+            if sources.is_empty() {
+                out.progress("(no sources configured)").await?;
             }
-            for (space, coverage) in spaces {
-                out.line(crate::render::space_line(&space, coverage.as_ref()))
-                    .await?;
+            for source in sources {
+                out.line(match source.local_path {
+                    Some(path) => format!("{}  filesystem  {path}", source.space),
+                    None => format!("{}  api", source.space),
+                })
+                .await?;
             }
         }
 
-        Command::SpaceSet(pb::SpaceSet {
-            id,
-            replicate,
-            no_replicate,
-            release,
-            grace,
-            budget,
-        }) => {
-            if no_replicate {
-                let (space, dropping) = (id.clone(), release);
-                read(node, move |n| {
-                    Ok(n.set_space_replication(&space, None, None, None, dropping)?)
-                })
-                .await?;
-                out.line(match release {
-                    true => format!("{id} is no longer replicated; its content was released"),
-                    false => format!(
-                        "{id} is no longer replicated; what it held stays pinned \
-                         (`--release` drops it)"
-                    ),
-                })
-                .await?;
-                return Ok(());
-            }
-            if replicate.is_none() && grace.is_none() && budget.is_none() {
-                return Err(ControlError::invalid(
-                    "space set needs something to set: --replicate, --no-replicate, \
-                     --grace or --budget",
-                ));
-            }
-            apply_replication(node, &id, replicate.as_deref(), grace, budget, out).await?;
-        }
-
-        Command::SpaceSync(pb::SpaceSync { id }) => {
+        Command::ReplicaSync(pb::ReplicaSync { space: id }) => {
             let sweeping = node.clone();
             let only = (!id.is_empty()).then(|| id.clone());
             let reports = offload(move || Ok(sweeping.sweep_replicas(only.as_deref())?)).await?;
             if reports.is_empty() {
                 out.progress(match id.is_empty() {
-                    true => "(no replicated spaces; add one with `synch space set --replicate`)"
-                        .to_string(),
+                    true => "(no replicas; add one with `synch replica add`)".to_string(),
                     false => format!("({id} is not replicated here)"),
                 })
                 .await?;
@@ -2358,34 +2321,70 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             // The sweep only decides; the fetching is what takes time, and an
             // explicit sync should not answer before it has done a pass of it.
-            let fetched = node.fetch_replica_wants().await?;
+            let fetched = if id.is_empty() {
+                node.fetch_content_wants().await?
+            } else {
+                node.fetch_replica_wants_for(&id).await?
+            };
             out.line(format!(
                 "held {} · failed {} · fetched {} B · reused {} B",
                 fetched.held, fetched.failed, fetched.fetched_bytes, fetched.reused_bytes
             ))
             .await?;
+            let checkouts = if id.is_empty() {
+                node.sync_all_checkouts().await?
+            } else {
+                let has_checkout = {
+                    let id = id.clone();
+                    read(node, move |n| {
+                        Ok(n.store()
+                            .replica(&id)?
+                            .is_some_and(|r| r.checkout_path.is_some()))
+                    })
+                    .await?
+                };
+                if has_checkout {
+                    vec![(id.clone(), node.sync_checkout(&id).await)]
+                } else {
+                    Vec::new()
+                }
+            };
+            for (checkout, report) in checkouts {
+                let report = report?;
+                out.line(format!(
+                    "checkout {checkout}  written {} · current {} · removed {} · blocked {}",
+                    report.written,
+                    report.current,
+                    report.removed,
+                    report.skipped.len()
+                ))
+                .await?;
+            }
             // What this node says it holds should not be left behind by a sync
             // the operator ran deliberately: the standing loop publishes its
             // claims at the end of a pass, and this is the same pass by hand.
             node.publish_material_claims().await;
         }
 
-        Command::SpaceRm(pb::SpaceRm { id, release }) => {
+        Command::SourceRm(pb::SourceRm { space: id }) => {
             // Unpublishing a space scans its whole prefix out of the trie.
             let removing = node.clone();
             let removed_id = id.clone();
-            let dropping = release;
-            let staged = offload(move || Ok(removing.remove_space(&removed_id, dropping)?)).await?;
+            let staged = offload(move || Ok(removing.source_removal(&removed_id)?)).await?;
             let removed = staged.len();
             // Explicit commands publish before they answer, so the count they
             // report is one that peers can already see (§7.1).
             node.stage(staged);
             node.flush_staged().await?;
-            out.line(format!("removed {id} and unpublished {removed} record(s)"))
-                .await?;
+            let removed_id = id.clone();
+            read(node, move |n| Ok(n.finish_source_removal(&removed_id)?)).await?;
+            out.line(format!(
+                "removed source {id} and unpublished {removed} record(s)"
+            ))
+            .await?;
         }
 
-        Command::Scan(pb::Scan {}) => {
+        Command::SourceScan(pb::SourceScan { space }) => {
             // Refuse before hashing rather than after: a scan records what it
             // hashed, so a scan whose publish is refused would leave the node
             // believing it had published files it never did (§3.4).
@@ -2393,7 +2392,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // The engine owns the blocking handoff and the selected CAS
             // backend. Keeping the old synchronous scanner here would bypass a
             // cloud backend and publish scratch-only content.
-            let (report, spaces) = node.scan_and_stage_async_with_reports().await?;
+            let (report, spaces) = if space.is_empty() {
+                node.scan_and_stage_async_with_reports().await?
+            } else {
+                let report = node.scan_source_and_stage_async(&space).await?;
+                (report.clone(), vec![(space, report)])
+            };
             for (space, one) in spaces {
                 out.progress(format!(
                     "scanned {space}: hashed {} · unchanged {} · deleted {}",
@@ -2428,6 +2432,43 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::Ls(pb::Ls { reference, all }) => {
+            if reference.is_empty() {
+                let rows = read(node, |n| {
+                    let mut roles = std::collections::BTreeMap::<String, Vec<String>>::new();
+                    for space in n.store().known_spaces()? {
+                        roles.entry(space).or_default();
+                    }
+                    for source in n.store().sources()? {
+                        roles
+                            .entry(source.space)
+                            .or_default()
+                            .push(match source.local_path {
+                                Some(path) => format!("source {path}"),
+                                None => "source api".to_string(),
+                            });
+                    }
+                    for replica in n.store().replicas()? {
+                        let mut role = format!("replica {}", replica.retention);
+                        if let Some(path) = replica.checkout_path {
+                            role.push_str(&format!(" · checkout {path}"));
+                        }
+                        roles.entry(replica.space).or_default().push(role);
+                    }
+                    Ok(roles)
+                })
+                .await?;
+                if rows.is_empty() {
+                    out.progress("(no known spaces)").await?;
+                }
+                for (space, roles) in rows {
+                    out.line(match roles.is_empty() {
+                        true => format!("{space}  remote only"),
+                        false => format!("{space}  {}", roles.join(" · ")),
+                    })
+                    .await?;
+                }
+                return Ok(());
+            }
             let reference = parse_reference(&reference)?;
             // An unknown space and an empty listing print the same nothing,
             // and only one of them is fine: silence must mean "empty", never
@@ -2532,9 +2573,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::Cat(pb::Cat {
             reference,
             range,
-            from,
-            strict,
             root,
+            select,
         }) => {
             let range = match &range {
                 Some(text) => crate::cli::ByteRange::parse(text)
@@ -2551,7 +2591,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 }
                 None => {
                     let reference = parse_reference(&reference)?;
-                    let policy = policy_for(&reference, from.as_deref(), strict)?;
+                    let policy = policy_for_select(&reference, select.as_deref())?;
                     node.prepare_range(
                         &reference.space,
                         &reference.path,
@@ -2567,15 +2607,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::Get(pb::Get {
             reference,
-            from,
-            strict,
             root,
+            select,
         }) => {
             let prepared = match &root {
                 Some(root) => node.prepare_root_range(&parse_root(root)?, 0, None).await?,
                 None => {
                     let reference = parse_reference(&reference)?;
-                    let policy = policy_for(&reference, from.as_deref(), strict)?;
+                    let policy = policy_for_select(&reference, select.as_deref())?;
                     node.prepare_range(&reference.space, &reference.path, &policy, 0, None)
                         .await?
                 }
@@ -2583,11 +2622,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             stream_range(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
-        Command::Take(pb::Take { reference }) => {
+        Command::AdoptPath(pb::AdoptPath { reference, select }) => {
             let reference = parse_reference(&reference)?;
-            let origin = reference.origin.clone().ok_or_else(|| {
-                ControlError::invalid("take needs an explicit <origin>:<space>/<path>")
-            })?;
+            let policy = policy_for_select(&reference, select.as_deref())?;
+            let theirs = {
+                let (space, path, policy) =
+                    (reference.space.clone(), reference.path.clone(), policy);
+                read(node, move |n| Ok(n.resolve(&space, &path, &policy)?)).await?
+            };
+            let origin = theirs.origin.clone();
             if origin == *node.origin() {
                 return Err(ControlError::invalid(
                     "that is already this node's own entry",
@@ -2596,14 +2639,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // A tombstone is an assertion like any other, and §8 makes it
             // adoptable the same way: take the deletion, and let the next scan
             // publish our own.
-            let theirs = {
-                let (space, path, pinned) = (
-                    reference.space.clone(),
-                    reference.path.clone(),
-                    VersionPolicy::Origin(origin.clone()),
-                );
-                read(node, move |n| Ok(n.resolve(&space, &path, &pinned)?)).await?
-            };
             if theirs.kind == synch_core::EntryKind::Tombstone {
                 let (space, path) = (reference.space.clone(), reference.path.clone());
                 match read(node, move |n| Ok(n.adopt_deletion(&space, &path)?)).await? {
@@ -2688,23 +2723,22 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::Fill(pb::Fill {
+        Command::AdoptTree(pb::AdoptTree {
             reference,
-            from,
-            strict,
-            force,
+            select,
+            replace,
             dry_run,
         }) => {
             let reference = parse_reference(&reference)?;
-            let policy = policy_for(&reference, from.as_deref(), strict)?;
-            // Space first and origin second, the order `ls` states its reason
+            let policy = policy_for_select(&reference, select.as_deref())?;
+            // Namespace first and origin second, the order `ls` states its reason
             // for: one typo should be reported as the same mistake whichever
             // command met it.
             //
             // A space nobody publishes and a space nobody indexes fail for
-            // different reasons, and the second is the one `fill` is picky
-            // about: it writes into the directory `synch space add` named, so
-            // an unindexed space has nowhere to put anything. `fill_space`
+            // different reasons, and the second is the one adoption is picky
+            // about: it writes into the filesystem source directory, so an
+            // unindexed namespace has nowhere to put anything. `fill_space`
             // says so; this is the other half, so a typo'd id does not report
             // "no local space" when the real answer is "no such space at all".
             ensure_known_space(node, &reference.space).await?;
@@ -2716,7 +2750,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             if let VersionPolicy::Origin(origin) = &policy {
                 ensure_known_origin(node, origin).await?;
             }
-            let options = synch_engine::FillOptions { force, dry_run };
+            let options = synch_engine::FillOptions {
+                force: replace,
+                dry_run,
+            };
             let report = node
                 .fill_space(&reference.space, &reference.dir_prefix(), &policy, options)
                 .await?;
@@ -2767,7 +2804,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // about — under `--dry-run` the list *is* the command's answer, and
             // under `--strict` the skipped paths are the entire reason the
             // command was run. Splitting one decision list across two streams
-            // so that `synch fill media --strict > plan` wrote the count and
+            // so that `synch adopt tree media --select strict > plan` wrote the count and
             // dropped the paths would be the worst of both.
             for path in &report.replaced {
                 out.line(format!(
@@ -2822,96 +2859,119 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             if report.filled > 0 && !report.dry_run {
-                out.line("the next scan publishes what was filled as this node's own view")
-                    .await?;
+                match node.scan_publish_push().await? {
+                    Some(head) => out.line(format!("published seq {}", head.seq)).await?,
+                    None => out.line("adopted content was already published").await?,
+                }
             }
         }
 
-        Command::MirrorAdd(pb::MirrorAdd {
+        Command::ReplicaAdd(pb::ReplicaAdd {
             space,
-            path,
-            policy,
+            retention,
+            grace,
+            budget,
+            checkout,
         }) => {
-            let policy = parse_policy(policy.as_deref())?;
-            let stored = {
-                let (space, path, policy) = (space.clone(), path.clone(), policy.clone());
-                read(node, move |n| Ok(n.add_mirror(&space, &path, &policy)?)).await?
+            let retention: ReplicaPolicy =
+                retention
+                    .parse()
+                    .map_err(|e: synch_store::error::StoreError| {
+                        ControlError::invalid(e.to_string())
+                    })?;
+            let checkout = if let Some(path) = checkout {
+                let (space, path) = (space.clone(), path.clone());
+                Some(read(node, move |n| Ok(n.checkout_path(&space, &path)?)).await?)
+            } else {
+                None
             };
-            out.line(format!("mirroring {space} into {stored} ({policy})"))
+            let adding = space.clone();
+            read(node, move |n| {
+                Ok(n.add_replica(&adding, retention, grace, budget, checkout)?)
+            })
+            .await?;
+            out.line(format!("replicating {space} with {retention} retention"))
                 .await?;
-            // Configuring the mirror before the space first syncs is a
-            // legitimate order of operations; doing it to a typo'd id is not,
-            // and nothing else in the exchange tells the two apart.
-            if ensure_known_space(node, &space).await.is_err() {
-                out.line(format!(
-                    "note: no origin publishes {space} yet; the mirror stays empty until one does"
-                ))
-                .await?;
-            }
         }
 
-        Command::MirrorRm(pb::MirrorRm { path }) => {
-            let dropped = {
-                let path = path.clone();
-                read(node, move |n| Ok(n.remove_mirror(&path)?)).await?
+        Command::ReplicaSet(pb::ReplicaSet {
+            space,
+            retention,
+            grace,
+            budget,
+            no_budget,
+            checkout,
+            no_checkout,
+        }) => {
+            if retention.is_none()
+                && grace.is_none()
+                && budget.is_none()
+                && !no_budget
+                && checkout.is_none()
+                && !no_checkout
+            {
+                return Err(ControlError::invalid("replica set needs something to set"));
+            }
+            let retention = retention.map(|value| value.parse()).transpose().map_err(
+                |e: synch_store::error::StoreError| ControlError::invalid(e.to_string()),
+            )?;
+            let checkout = if let Some(path) = checkout {
+                let (space, path) = (space.clone(), path.clone());
+                Some(Some(
+                    read(node, move |n| Ok(n.checkout_path(&space, &path)?)).await?,
+                ))
+            } else if no_checkout {
+                Some(None)
+            } else {
+                None
             };
-            if !dropped {
-                return Err(ControlError::new(
-                    ErrorCode::NotFound,
-                    format!("no mirror at {path}"),
-                ));
-            }
-            out.line("removed").await?;
+            let budget = if no_budget {
+                Some(None)
+            } else {
+                budget.map(Some)
+            };
+            let setting = space.clone();
+            read(node, move |n| {
+                Ok(n.set_replica(&setting, retention, grace, budget, checkout)?)
+            })
+            .await?;
+            out.line(format!("updated replica {space}")).await?;
         }
 
-        Command::MirrorLs(pb::MirrorLs {}) => {
-            let mirrors = read(node, |n| Ok(n.store().mirrors()?)).await?;
-            if mirrors.is_empty() {
-                out.progress("(no mirrors configured)").await?;
-            }
-            for mirror in mirrors {
-                out.line(format!(
-                    "{:<20} {:<24} {}",
-                    mirror.space,
-                    mirror.policy.render(),
-                    mirror.local_path
-                ))
-                .await?;
-            }
+        Command::ReplicaRm(pb::ReplicaRm { space, pin_held }) => {
+            let removing = space.clone();
+            read(node, move |n| Ok(n.remove_replica(&removing, pin_held)?)).await?;
+            out.line(match pin_held {
+                true => format!("removed replica {space}; held roots are operator-pinned"),
+                false => format!("removed replica {space}; its replica holds were released"),
+            })
+            .await?;
         }
 
-        Command::MirrorSync(pb::MirrorSync {}) => {
-            // One mirror at a time, so the report of each arrives while the
-            // next is still being materialized.
-            for mirror in read(node, |n| Ok(n.store().mirrors()?)).await? {
-                out.progress(format!("{} …", mirror.local_path)).await?;
-                let report = node.sync_mirror(&mirror.local_path).await?;
+        Command::ReplicaLs(pb::ReplicaLs { space }) => {
+            if !space.is_empty() {
+                let reporting = space.clone();
+                let status = read(node, move |n| Ok(n.replica_status(&reporting)?)).await?;
+                for line in crate::render::replica_status(&status)? {
+                    out.line(line).await?;
+                }
+                return Ok(());
+            }
+            let replicas = read(node, |n| Ok(n.store().replicas()?)).await?;
+            if replicas.is_empty() {
+                out.progress("(no replicas configured)").await?;
+            }
+            for replica in replicas {
                 out.line(format!(
-                    "{}  written {} · current {} · retouched {} · removed {} · skipped {}",
-                    mirror.local_path,
-                    report.written,
-                    report.current,
-                    report.retouched,
-                    report.removed,
-                    report.skipped.len()
+                    "{:<20} {:<10}{}",
+                    replica.space,
+                    replica.retention,
+                    replica
+                        .checkout_path
+                        .map(|p| format!("  checkout {p}"))
+                        .unwrap_or_default(),
                 ))
                 .await?;
-                if report.reused_bytes > 0 || report.reflinked > 0 {
-                    // Only when there is something to say: a pass that reused
-                    // nothing and shared nothing is the ordinary case and needs
-                    // no extra line.
-                    out.line(format!(
-                        "{}  reused {} B · fetched {} B · reflinked {}",
-                        mirror.local_path,
-                        report.reused_bytes,
-                        report.fetched_bytes,
-                        report.reflinked
-                    ))
-                    .await?;
-                }
-                for (path, reason) in &report.skipped {
-                    out.progress(format!("  skipped {path}: {reason}")).await?;
-                }
             }
         }
 
@@ -2952,8 +3012,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 )
                 .await?;
             }
-            out.line("next: `synch scan`, then `synch socket arm` to approve it".to_string())
-                .await?;
+            out.line(
+                "next: `synch source scan`, then `synch socket arm` to approve it".to_string(),
+            )
+            .await?;
             if row.auto {
                 out.line(
                     "warning: --auto re-arms on every content change — tree-write grants \
@@ -3171,14 +3233,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::PinAdd(pb::PinAdd { target }) => {
-            let (root, size) = pin_target(node, &target).await?;
+        Command::PinAdd(pb::PinAdd { target, select }) => {
+            let (root, size) = pin_target(node, &target, select.as_deref()).await?;
             node.pin_object(&root, size).await?;
             out.line(format!("pinned {root}")).await?;
         }
 
-        Command::PinRm(pb::PinRm { target }) => {
-            let (root, _) = pin_target(node, &target).await?;
+        Command::PinRm(pb::PinRm { target, select }) => {
+            let (root, _) = pin_target(node, &target, select.as_deref()).await?;
             if !node.unpin_object(&root).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
@@ -3240,7 +3302,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // worker (§10).
             let (spaces, domains) = read(node, |n| {
                 n.enable_cloud()?;
-                Ok((n.store().spaces()?, n.domain()?))
+                let mut spaces: Vec<String> =
+                    n.store().sources()?.into_iter().map(|s| s.space).collect();
+                spaces.extend(n.store().replicas()?.into_iter().map(|r| r.space));
+                spaces.sort();
+                spaces.dedup();
+                Ok((spaces, n.domain()?))
             })
             .await?;
             out.line(format!(
@@ -3250,7 +3317,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 } else {
                     spaces
                         .iter()
-                        .map(|s| s.id.as_str())
+                        .map(String::as_str)
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
@@ -3303,11 +3370,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(format!(
                     "{:<32} {:<10} {}{}",
                     endpoint.domain,
-                    if endpoint.attached {
-                        "attached"
-                    } else {
-                        "detached"
-                    },
+                    if endpoint.attached { "attached" } else { "api" },
                     endpoint
                         .endpoint
                         .as_deref()
@@ -3498,7 +3561,7 @@ async fn receive(
 
     let detached = {
         let space = header.space.clone();
-        read(node, move |n| Ok(n.is_detached_space(&space)?)).await?
+        read(node, move |n| Ok(n.is_api_source(&space)?)).await?
     };
     let reported_path = if detached {
         let (committing, space, path, source) = (
@@ -3508,7 +3571,7 @@ async fn receive(
             target.clone(),
         );
         let result = committing
-            .commit_detached_file(&space, &path, &source, synch_core::now_ns())
+            .commit_api_file(&space, &path, &source, synch_core::now_ns())
             .await;
         // The content-addressed payload is durable now, or the operation
         // failed and the client owns the retry. The pre-hash scratch is never
@@ -3520,9 +3583,9 @@ async fn receive(
         target.display().to_string()
     };
 
-    // Path-backed writes enter through the scanner; detached writes already
+    // Path-backed writes enter through the scanner; API-source writes already
     // staged their CAS-direct `f:`/`b:` pair above. `scan_publish_push` skips
-    // detached spaces but flushes the shared batch in either case.
+    // API sources but flushes the shared batch in either case.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
     let (set, now) = {
@@ -3735,7 +3798,8 @@ async fn recover(node: &Node, out: &mut Frames, wait: Option<String>, gap: Optio
 async fn ensure_known_space(node: &Node, space: &str) -> Result<(), ControlError> {
     let owned = space.to_string();
     let known = read(node, move |n| {
-        Ok(n.store().spaces()?.iter().any(|s| s.id == owned)
+        Ok(n.store().source(&owned)?.is_some()
+            || n.store().replica(&owned)?.is_some()
             || n.store().known_spaces()?.iter().any(|s| s == &owned))
     })
     .await?;
@@ -3912,6 +3976,25 @@ fn policy_for(
         (None, false) => Ok(VersionPolicy::Newest),
     }
 }
+
+fn policy_for_select(
+    reference: &EntryRef,
+    select: Option<&str>,
+) -> Result<VersionPolicy, ControlError> {
+    let (from, strict) = match select.unwrap_or("newest") {
+        "newest" => (None, false),
+        "strict" => (None, true),
+        value if value.starts_with("origin=") && value.len() > "origin=".len() => {
+            (Some(&value["origin=".len()..]), false)
+        }
+        value => {
+            return Err(ControlError::invalid(format!(
+                "invalid selection {value:?}; use newest, strict, or origin=<origin-id>"
+            )))
+        }
+    };
+    policy_for(reference, from, strict)
+}
 /// How long a delegation lasts when `--until` is not given.
 ///
 /// Expiry has one job here (§3.5): bounding how long a member that was
@@ -3970,78 +4053,6 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
 /// on for a large space has just committed the node to fetching all of it, and
 /// under the default policy has also just decided how long a deletion stays
 /// recoverable.
-async fn apply_replication(
-    node: &Node,
-    id: &str,
-    policy: Option<&str>,
-    grace: Option<i64>,
-    budget: Option<u64>,
-    out: &mut Frames,
-) -> Result<(), ControlError> {
-    let Some(policy) = policy else {
-        // `--grace`/`--budget` alone tune a space that is already replicating,
-        // and must not go near its policy. Reading the policy and writing it
-        // back would look equivalent and is not: a value this build cannot
-        // parse reads as "not replicated", so tuning the grace window on a
-        // space configured by a newer build would silently turn replication
-        // off.
-        if grace.is_some() || budget.is_some() {
-            let space = id.to_string();
-            read(node, move |n| {
-                Ok(n.set_space_tunables(&space, grace, budget)?)
-            })
-            .await?;
-        }
-        return Ok(());
-    };
-    let policy: ReplicaPolicy = policy
-        .parse()
-        .map_err(|e: synch_store::error::StoreError| ControlError::invalid(e.to_string()))?;
-    let (space, applied) = (id.to_string(), policy);
-    read(node, move |n| {
-        Ok(n.set_space_replication(&space, Some(applied), grace, budget, false)?)
-    })
-    .await?;
-    let configured = {
-        let space = id.to_string();
-        read(node, move |n| {
-            Ok(n.store()
-                .space(&space)?
-                .ok_or_else(|| synch_engine::error::EngineError::not_found(space))?)
-        })
-        .await?
-    };
-    out.line(format!(
-        "replicating {id} ({policy}), holding every version of every path",
-    ))
-    .await?;
-    match policy {
-        ReplicaPolicy::Tree => {
-            out.line(format!(
-                "a deleted version stays recoverable here for {} — that is the whole \
-                 recovery story under this policy",
-                crate::render::duration(configured.grace_secs())
-            ))
-            .await?;
-        }
-        ReplicaPolicy::Archive => {
-            out.line(
-                "nothing is ever released, so this space costs the sum of every version \
-                 ever published rather than the size of the tree"
-                    .to_string(),
-            )
-            .await?;
-        }
-    }
-    if let Some(budget) = configured.budget {
-        out.line(format!(
-            "budget {budget} B: reaching it stops fetching and never releases anything"
-        ))
-        .await?;
-    }
-    Ok(())
-}
-
 /// Reads a `--root` argument.
 ///
 /// Its own function because the error an operator gets for a typo'd hash should
@@ -4078,8 +4089,17 @@ fn render_holders(pins: &[synch_store::PinRow]) -> String {
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
-async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
+async fn pin_target(
+    node: &Node,
+    text: &str,
+    select: Option<&str>,
+) -> Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
+        if select.is_some() {
+            return Err(ControlError::invalid(
+                "--select applies only when pinning a path",
+            ));
+        }
         return Ok((root, None));
     }
     // A reference always carries a path, so anything without a separator was
@@ -4096,7 +4116,7 @@ async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), Cont
     if reference.is_space_root() {
         return Err(malformed());
     }
-    let policy = policy_for(&reference, None, false)?;
+    let policy = policy_for_select(&reference, select)?;
     let entry = read(node, move |n| {
         Ok(n.resolve(&reference.space, &reference.path, &policy)?)
     })

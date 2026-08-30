@@ -1,5 +1,13 @@
 # Delta sync for large files
 
+> **Architecture note.** This document originally described the removed
+> integrated mirror pass. The current design separates durable acquisition
+> (`replica`) from newest-view filesystem projection (`checkout`); the hash,
+> proof, promotion, and CAS safety sections below remain the implementation
+> contract for replica acquisition. Materialization discussion records the
+> origin of the checkout algorithms and is not a separate CLI mode. See
+> [REPLICATION.md](REPLICATION.md) for the current role model.
+
 Status: **implemented**. `synch-core` carries the messages and the chaining-value
 helpers, `synch-store::proof` the proof walk and donor promotion, `synch-net` the
 exchange, `synch-engine` the descent and the mirror's write. Section 8 is the
@@ -273,7 +281,7 @@ Whatever remains after round 2 goes to the ordinary `fetch_groups` machinery
 untouched: fanout split, `SliceEnd` re-planning, per-group verification,
 bitmap commits. `FetchReport` carries `promoted: ChunkRanges` and a
 `reused: Vec<(Donor, ChunkRanges)>` breakdown of which donor supplied what, so
-callers (and `synch mirror sync` progress reports over the control service)
+callers (and `synch replica sync` progress reports over the control service)
 can say "reused 98.9 GB, fetched 1.1 GB".
 
 If round 1 shows nothing in common — an encrypted container re-keyed, a
@@ -352,7 +360,7 @@ the changed bytes roughly once (§6.3's O(N) swarm property, now for updates too
 ### 3.5 Materialization: one path onto the filesystem
 
 `materialize_blob` is the only way an object becomes a file. The mirror pass
-(§7.2), `synch fill` of a space (§7.2), `synch take`/`adopt_from` (§8) and the
+(§7.2), `synch adopt tree` of a space (§7.2), `synch adopt path`/`adopt_from` (§8) and the
 gateway's fetch-to-file all go through it, and all get the same guarantees: the target is old-or-new and never
 half, no staging residue is left on any path, and the object is never held in
 memory.

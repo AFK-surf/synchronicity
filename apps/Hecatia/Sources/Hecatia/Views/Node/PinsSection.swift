@@ -1,7 +1,7 @@
 import SwiftUI
 import QuickLook
 
-/// The pins half of the Mirrors & Pins page.
+/// Explicit operator pins.
 ///
 /// Shows operator pins only. `pin ls` reports every object anything holds now
 /// — a replicating folder's claims are rows in the same table, and one space
@@ -15,7 +15,7 @@ struct PinsSection: View {
   @State private var selection: PinEntry.ID?
   @State private var quickLookURL: URL?
 
-  /// See ``MirrorsSection``: a `Table` brings no height with it, and the
+  /// A `Table` brings no height with it, and the
   /// window this is on can no longer be resized to give it one.
   private let tableHeight: CGFloat = 200
 
@@ -64,7 +64,7 @@ struct PinsSection: View {
           node.heldByReplicas > 0
             ? "Choose a file in the Files window and click Keep Offline to hold its bytes here. \(node.heldByReplicas) other objects are held on this Mac by a replicating space — see Spaces."
             : "Choose a file in the Files window and click Keep Offline to hold its bytes here."))
-        // A floor rather than a fixed height, for the reason ``MirrorsSection``
+        // A floor rather than a fixed height, for the reason this section
         // records: a fixed one clips an empty state that wants more room, and
         // this one grows by a line whenever a replicating folder is holding
         // objects of its own.

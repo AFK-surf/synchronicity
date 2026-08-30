@@ -267,9 +267,9 @@ fn the_command_surface_works_over_the_socket() {
     assert!(id.contains(&origin), "{id}");
     assert!(id.contains("active"), "{id}");
 
-    cli.run(&["space", "add", "media", &space.path().to_string_lossy()]);
-    assert!(cli.run(&["space", "ls"]).contains("media"));
-    let scan = cli.run(&["scan"]);
+    cli.run(&["source", "add", "media", &space.path().to_string_lossy()]);
+    assert!(cli.run(&["source", "ls"]).contains("media"));
+    let scan = cli.run(&["source", "scan", "media"]);
     assert!(scan.contains("hashed 2"), "{scan}");
     assert!(scan.contains("published seq"), "{scan}");
 
@@ -285,29 +285,26 @@ fn the_command_surface_works_over_the_socket() {
     cli.run(&["get", "media/notes.txt", "-o", &target.to_string_lossy()]);
     assert_eq!(std::fs::read(&target).unwrap(), b"hello");
 
-    // A mirror actually materializes content on disk.
-    let mirror_dir = tempfile::tempdir().unwrap();
+    // A replica checkout materializes only content held by the replica.
+    let checkout_dir = tempfile::tempdir().unwrap();
     cli.run(&[
-        "mirror",
+        "replica",
         "add",
         "media",
-        &mirror_dir.path().to_string_lossy(),
-        "--policy",
-        "newest",
+        "--checkout",
+        &checkout_dir.path().to_string_lossy(),
     ]);
-    assert!(cli.run(&["mirror", "ls"]).contains("newest"));
-    cli.run(&["mirror", "sync"]);
+    assert!(cli.run(&["replica", "ls", "media"]).contains("current"));
+    cli.run(&["replica", "sync", "media"]);
     assert_eq!(
-        std::fs::read(mirror_dir.path().join("notes.txt")).unwrap(),
+        std::fs::read(checkout_dir.path().join("notes.txt")).unwrap(),
         b"hello"
     );
-    assert!(cli
-        .run(&["mirror", "rm", &mirror_dir.path().to_string_lossy()])
-        .contains("removed"));
+    assert!(cli.run(&["replica", "rm", "media"]).contains("removed"));
 
     // A fill of a space whose every path this node already holds has nothing
     // to do, and says so without writing anything.
-    let fill = cli.run(&["fill", "media", "--dry-run"]);
+    let fill = cli.run(&["adopt", "tree", "media", "--dry-run"]);
     assert!(fill.contains("would fill 0"), "{fill}");
     assert!(fill.contains("current 2"), "{fill}");
 
@@ -315,8 +312,16 @@ fn the_command_surface_works_over_the_socket() {
     let root = blake3::hash(b"hello").to_hex().to_string();
     assert!(cli.run(&["pin", "add", "media/notes.txt"]).contains(&root));
     assert!(cli.run(&["pin", "ls"]).contains(&root));
-    assert!(cli.run(&["pin", "rm", "media/notes.txt"]).contains(&root));
-    assert!(!cli.run(&["pin", "ls"]).contains(&root));
+    let unpinned = cli.run(&["pin", "rm", "media/notes.txt"]);
+    assert!(unpinned.contains(&root), "{unpinned}");
+    assert!(
+        unpinned.contains("still held by source:media"),
+        "{unpinned}"
+    );
+    let pins = cli.run(&["pin", "ls"]);
+    assert!(pins.contains(&root), "{pins}");
+    assert!(pins.contains("source:media"), "{pins}");
+    assert!(!pins.contains("operator"), "{pins}");
 
     // A daemon-side failure is this process's exit status, not a transport error.
     let (ok, _, stderr) = cli.try_run(&["pin", "add", "nothex"]);
@@ -374,8 +379,13 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     ]);
     laptop.run(&["trust", "add", &nas_key, "--addr", &nas_daemon.address]);
 
-    nas.run(&["space", "add", "media", &nas_space.path().to_string_lossy()]);
-    nas.run(&["scan"]);
+    nas.run(&[
+        "source",
+        "add",
+        "media",
+        &nas_space.path().to_string_lossy(),
+    ]);
+    nas.run(&["source", "scan", "media"]);
 
     // The push is reactive; the periodic round repairs what the push missed.
     let deadline = Instant::now() + Duration::from_secs(90);

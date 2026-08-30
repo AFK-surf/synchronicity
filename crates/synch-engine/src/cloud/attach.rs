@@ -409,24 +409,23 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
 
 /// The spaces this node claims to hold, as they stood when the session opened.
 ///
-/// A publish root and a mirror hold a space equally — both leave the unified
-/// tree and its content local — so both claim it, and a node that only mirrors
-/// a space is routable for it rather than a bystander. The claim is taken once
+/// A source or replica is explicit local participation, so either makes the
+/// namespace routable. The claim is taken once
 /// per session: a space added after attach is not routable until the next
 /// reconnect, which is the same grain the whole tunnel works at — the control
 /// plane may ask for anything, and this says what it will find.
 fn held_spaces(node: &Node) -> Result<Vec<String>> {
     let mut held: Vec<String> = node
         .store()
-        .spaces()?
+        .sources()?
         .into_iter()
-        .map(|space| space.id)
+        .map(|source| source.space)
         .collect();
     held.extend(
         node.store()
-            .mirrors()?
+            .replicas()?
             .into_iter()
-            .map(|mirror| mirror.space),
+            .map(|replica| replica.space),
     );
     held.sort_unstable();
     held.dedup();
@@ -1213,16 +1212,14 @@ async fn replication(node: &Node, id: u32) -> Result<Up> {
         let view = node.view_state()?;
         let floor = node.config().replica_release_floor;
         let mut spaces = Vec::new();
-        for space in node.store().replicated_spaces()? {
-            let policy = space
-                .replicate
-                .expect("replicated_spaces filters on the parsed policy");
+        for space in node.store().replicas()? {
+            let policy = space.retention;
             let holder = space.holder();
             let coverage = node
                 .store()
                 .replica_coverage(&holder, crate::replica::UNREACHABLE_ATTEMPTS)?;
             spaces.push(ReplicaSpaceJson {
-                space: space.id.clone(),
+                space: space.space.clone(),
                 policy: policy.render().to_string(),
                 grace_secs: space.grace_secs(),
                 budget: space.budget,
@@ -1571,14 +1568,15 @@ mod tests {
 
         // One replicated space and one ordinary one. The ordinary one exists to
         // be missing from the answer.
-        node.add_space("local", dir.path().join("local")).unwrap();
-        node.add_detached_space("media").unwrap();
-        node.set_space_replication(
+        node.add_filesystem_source("local", dir.path().join("local"))
+            .unwrap();
+        node.add_api_source("media").unwrap();
+        node.add_replica(
             "media",
-            Some(synch_store::ReplicaPolicy::Tree),
+            synch_store::ReplicaPolicy::Current,
             Some(3600),
             Some(1 << 30),
-            false,
+            None,
         )
         .unwrap();
 
@@ -1611,7 +1609,7 @@ mod tests {
 
         let row = &spaces[0];
         assert_eq!(row.space, "media");
-        assert_eq!(row.policy, "tree");
+        assert_eq!(row.policy, "current");
         assert_eq!(row.grace_secs, 3600);
         assert_eq!(row.budget, Some(1 << 30));
         assert_eq!(row.held, 0);
@@ -1640,7 +1638,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_ls_resolve_and_read_over_the_wire() {
         let (_blocking, dir, node) = scoped_node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
+        node.add_filesystem_source("media", dir.path().join("media"))
+            .unwrap();
         // Larger than one chunk, so the CHUNK framing and multi-chunk credit path run.
         let payload = vec![0xABu8; MAX_CHUNK + 4321];
         let root = node
@@ -1799,20 +1798,25 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A mirror leaves a space as local as a publish root does — its tree and
-    /// its bytes are both on this node — so the attach claim names it, and a
-    /// mirror-only node is routable for what it mirrors.
+    /// A replica-only node is routable for what it holds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_claim_covers_mirrored_spaces_too() {
+    async fn the_claim_covers_replica_only_spaces_too() {
         let (_blocking, dir, node) = scoped_node().await;
-        node.add_space("docs", dir.path().join("docs")).unwrap();
-        let mirror = tempfile::tempdir().unwrap();
-        node.add_mirror("media", mirror.path(), &VersionPolicy::Newest)
+        node.add_filesystem_source("docs", dir.path().join("docs"))
             .unwrap();
+        node.add_replica(
+            "media",
+            synch_store::ReplicaPolicy::Current,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(held_spaces(&node).unwrap(), ["docs", "media"]);
 
-        // A space both published and mirrored is one claim, not two.
-        node.add_space("media", dir.path().join("media")).unwrap();
+        // A space with both roles is one routing claim, not two.
+        node.add_filesystem_source("media", dir.path().join("media"))
+            .unwrap();
         assert_eq!(held_spaces(&node).unwrap(), ["docs", "media"]);
         node.shutdown().await.unwrap();
     }
@@ -1822,7 +1826,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_produces_nothing_without_credit() {
         let (_blocking, dir, node) = scoped_node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
+        node.add_filesystem_source("media", dir.path().join("media"))
+            .unwrap();
         let payload = vec![7u8; MAX_CHUNK * 3];
         let root = node
             .store()
@@ -1942,7 +1947,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_listing_collapses_subdirectories() {
         let (_blocking, dir, node) = scoped_node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
+        node.add_filesystem_source("media", dir.path().join("media"))
+            .unwrap();
         for path in [
             "a.txt",
             "photos/1.jpg",

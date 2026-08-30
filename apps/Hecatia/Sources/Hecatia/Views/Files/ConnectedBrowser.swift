@@ -44,7 +44,7 @@ struct ConnectedBrowser: View {
         // has never asked about — which on a first launch, and after the app's
         // own Stop, is every launch — and the whole first-run screen was drawn
         // over a daemon that had folders, then replaced by the file list.
-        // The same test ``MirrorsSection`` and ``PinsSection`` make before
+        // The same test ``PinsPane`` and ``PinsSection`` make before
         // asserting an empty state of their own.
         ProgressView()
           .frame(maxWidth: .infinity, maxHeight: .infinity)

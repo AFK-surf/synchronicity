@@ -9,7 +9,7 @@
 //! Nothing here writes. Selection is presentation, not resolution: it picks
 //! which version a read returns and leaves every assertion exactly as its
 //! origin published it. Resolution only ever happens by a node adopting a
-//! version as its own (`synch take`).
+//! version as its own (`synch adopt path`).
 
 use std::str::FromStr;
 

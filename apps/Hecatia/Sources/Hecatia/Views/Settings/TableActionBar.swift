@@ -5,7 +5,7 @@ import SwiftUI
 /// The shape Finder's sharing list and System Settings' user list both use:
 /// the table owns a rectangle, and ＋ and － live on its edge rather than in a
 /// header at the top of the page, a table's height away from the rows they add
-/// to and remove. Named actions — "Fill From the Cluster…" — go on the same
+/// to and remove. Named actions — "Adopt From the Cluster…" — go on the same
 /// bar, at the trailing end.
 ///
 /// The box is this view's, not the table's: a `Table` draws no border of its
@@ -84,7 +84,7 @@ private let previewFolders = [
       TableActionButton(symbol: "plus", name: "Share another space") {}
       TableActionButton(symbol: "minus", name: "Stop sharing the selected space") {}
     Spacer()
-    Button("Fill From the Cluster…") {}
+    Button("Adopt From the Cluster…") {}
   }
   .padding(Theme.Space.xl)
   .frame(width: 720)

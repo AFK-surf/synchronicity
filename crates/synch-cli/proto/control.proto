@@ -38,7 +38,7 @@ service Control {
   // A verified byte range of the version a policy selects.
   rpc Read(ReadRequest) returns (stream Chunk);
 
-  // A streamed write into one of this node's own spaces (§7.1, §9.4).
+  // A streamed write into one of this node's sources (§7.1, §9.4).
   //
   // The first message carries the header; the daemon takes its gates —
   // publishability, a resolvable target — before it answers, so the response
@@ -50,7 +50,7 @@ service Control {
   // Pipes bytes to and from one socket invocation on another node
   // (`docs/SOCKETS.md` §9.1).
   //
-  // The daemon owns the only iroh endpoint (§9.1), so `synch connect` cannot
+  // The daemon owns the only iroh endpoint (§9.1), so `synch socket connect` cannot
   // dial for itself; it opens one of these and the daemon bridges it to a QUIC
   // stream on the remote node. In `--listen` mode the TCP listener stays in the
   // CLI process and each accepted connection opens another of these, so the
@@ -64,8 +64,8 @@ service Control {
 
   // Every space this node has configured, and what it is doing about each.
   //
-  // `Run(SpaceLs)` answers the same question for a person, in a column-aligned
-  // line. This answers it for a program (§9.4): the MCP bridge publishes one
+  // Bare `synch ls` answers the same question for a person, in column-aligned
+  // lines. This answers it for a program (§9.4): the MCP bridge publishes one
   // resource per space and has to know their ids, and a caller that recovered
   // them by splitting a rendered line would be coupled to the width of that
   // column rather than to the data.
@@ -137,7 +137,10 @@ service Control {
 message Command {
   // 9 was `trust rebind`: a hand-made name is the only thing it could
   // re-point, and there are none (DESIGN.md 3.2).
-  reserved 9;
+  reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 46;
+  reserved "space_add", "space_ls", "space_rm", "space_set", "space_sync",
+           "mirror_add", "mirror_rm", "mirror_ls", "mirror_sync", "scan",
+           "take", "fill";
   oneof kind {
     // `synch id`
     Id id = 1;
@@ -169,12 +172,6 @@ message Command {
     DomainRefresh domain_refresh = 15;
     // `synch peers`
     Peers peers = 16;
-    // `synch space add <id> <path>`
-    SpaceAdd space_add = 17;
-    // `synch space ls`
-    SpaceLs space_ls = 18;
-    // `synch space rm <id>`
-    SpaceRm space_rm = 19;
     // `synch ls [<origin>:]<space>[/<dir>]`
     Ls ls = 20;
     // `synch status [<space>[/<path>]]`
@@ -183,20 +180,10 @@ message Command {
     Cat cat = 22;
     // `synch get [<origin>:]<space>/<path>`
     Get get = 23;
-    // `synch take <origin>:<space>/<path>`
-    Take take = 24;
     // `synch log [<origin>:]<space>/<path>`
     Log log = 25;
     // `synch compare <space>[/<dir>] --to <origin> [--from <origin>]`
     Compare compare = 26;
-    // `synch mirror add <space> <dir> [--policy ...]`
-    MirrorAdd mirror_add = 27;
-    // `synch mirror rm <dir>`
-    MirrorRm mirror_rm = 28;
-    // `synch mirror ls`
-    MirrorLs mirror_ls = 29;
-    // `synch mirror sync`
-    MirrorSync mirror_sync = 30;
     // `synch pin add <root>|<space>/<path>`
     PinAdd pin_add = 31;
     // `synch pin rm <root>|<space>/<path>`
@@ -207,8 +194,6 @@ message Command {
     Recover recover = 34;
     // `synch doctor`
     Doctor doctor = 35;
-    // `synch scan`
-    Scan scan = 36;
     // `synch sync`
     SyncNow sync_now = 37;
     // `synch cloud enable`
@@ -223,13 +208,6 @@ message Command {
     DelegateRm delegate_rm = 42;
     // `synch delegate ls`
     DelegateLs delegate_ls = 43;
-    // `synch space set <id> [--replicate[=policy]|--no-replicate] ...`
-    SpaceSet space_set = 44;
-    // `synch space sync [<id>]`
-    SpaceSync space_sync = 45;
-    // `synch fill [<origin>:]<space>[/<dir>] [--from <o>|--strict] [--force]
-    // [--dry-run]`
-    Fill fill = 46;
     // `synch socket add <space>/<path> ...`
     SocketAdd socket_add = 47;
     // `synch socket arm <space>/<path>`
@@ -248,6 +226,18 @@ message Command {
     SocketKill socket_kill = 54;
     // `synch socket log <space>/<path>`
     SocketLog socket_log = 55;
+    SourceAdd source_add = 56;
+    SourceLs source_ls = 57;
+    SourceRm source_rm = 58;
+    SourceScan source_scan = 59;
+    ReplicaAdd replica_add = 60;
+    ReplicaRm replica_rm = 61;
+    ReplicaLs replica_ls = 62;
+    ReplicaSync replica_sync = 63;
+    ReplicaSet replica_set = 64;
+    RepairRebuildViews repair_rebuild_views = 65;
+    AdoptPath adopt_path = 66;
+    AdoptTree adopt_tree = 67;
   }
 }
 
@@ -351,53 +341,53 @@ message DomainRefresh {}
 
 message Peers {}
 
-message SpaceAdd {
-  // The space id.
-  string id = 1;
-  // The local directory, already made absolute by the client.
+message SourceAdd {
+  string space = 1;
   string path = 2;
-  // True when this space deliberately has no local checkout.
-  bool detached = 3;
-  // `--replicate[=tree|archive]`: hold every version the tree names (§2).
-  optional string replicate = 4;
-  // `--grace <dur>`: seconds a released root is still held.
-  optional int64 grace = 5;
-  // `--budget <size>`: a ceiling on bytes held for this space.
-  optional uint64 budget = 6;
+  bool api = 3;
 }
 
-// Changes one half of a space's configuration, leaving the other alone.
-message SpaceSet {
-  // The space id.
-  string id = 1;
-  // `--replicate[=tree|archive]`, when the policy is being turned on or changed.
-  optional string replicate = 2;
-  // `--no-replicate`: stop replicating.
-  bool no_replicate = 3;
-  // `--release`: drop the pins this space's replication holds.
-  bool release = 4;
-  // `--grace <dur>`: seconds a released root is still held.
-  optional int64 grace = 5;
-  // `--budget <size>`: a ceiling on bytes held for this space.
-  optional uint64 budget = 6;
+message SourceLs {
+  string space = 1;
 }
 
-message SpaceLs {
-  // One space id, for the detailed report. Empty lists them all.
-  string id = 1;
+message SourceScan {
+  string space = 1;
 }
 
-// Runs a reconciling replication sweep now, rather than at the next interval.
-message SpaceSync {
-  // One space id. Empty sweeps every replicated space.
-  string id = 1;
+message SourceRm {
+  string space = 1;
 }
 
-message SpaceRm {
-  // The space id.
-  string id = 1;
-  // `--release`: also drop the pins this space's replication holds.
-  bool release = 2;
+message ReplicaAdd {
+  string space = 1;
+  string retention = 2;
+  optional int64 grace = 3;
+  optional uint64 budget = 4;
+  optional string checkout = 5;
+}
+
+message ReplicaSet {
+  string space = 1;
+  optional string retention = 2;
+  optional int64 grace = 3;
+  optional uint64 budget = 4;
+  bool no_budget = 5;
+  optional string checkout = 6;
+  bool no_checkout = 7;
+}
+
+message ReplicaLs {
+  string space = 1;
+}
+
+message ReplicaSync {
+  string space = 1;
+}
+
+message ReplicaRm {
+  string space = 1;
+  bool pin_held = 2;
 }
 
 message Ls {
@@ -413,32 +403,32 @@ message Status {
 }
 
 message Cat {
+  reserved 3, 4;
+  reserved "from", "strict";
   // The entry reference. Empty when `root` names the object instead.
   string reference = 1;
   // A byte range, as `START..END`, `START..`, or `..END`.
   optional string range = 2;
-  // `--from <origin>`: read that origin's version.
-  optional string from = 3;
-  // `--strict`: refuse a divergent path.
-  bool strict = 4;
   // `--root <hex>`: read an object by content root, with no path involved.
   optional string root = 5;
+  // `--select newest|origin=<id>|strict`.
+  optional string select = 6;
 }
 
 message Get {
+  reserved 2, 3;
+  reserved "from", "strict";
   // The entry reference. Empty when `root` names the object instead.
   string reference = 1;
-  // `--from <origin>`: fetch that origin's version.
-  optional string from = 2;
-  // `--strict`: refuse a divergent path.
-  bool strict = 3;
   // `--root <hex>`: fetch an object by content root, with no path involved.
   optional string root = 4;
+  // `--select newest|origin=<id>|strict`.
+  optional string select = 5;
 }
 
-message Take {
-  // The entry reference.
+message AdoptPath {
   string reference = 1;
+  optional string select = 2;
 }
 
 message Log {
@@ -457,48 +447,25 @@ message Compare {
   bool json = 4;
 }
 
-message MirrorAdd {
-  // The space of the unified tree to materialize.
-  string space = 1;
-  // The local directory, already made absolute by the client.
-  string path = 2;
-  // The version policy, as the user typed it (§8).
-  optional string policy = 3;
-}
-
-message MirrorRm {
-  // The local directory, already made absolute by the client.
-  string path = 1;
-}
-
-message MirrorLs {}
-
-message MirrorSync {}
-
-message Fill {
-  // `[<origin>:]<space>[/<dir>]` — the space to fill, and optionally one
-  // directory within it.
+message AdoptTree {
   string reference = 1;
-  // `--from <origin>`: fill from that origin's version of every path.
-  optional string from = 2;
-  // `--strict`: report divergent paths instead of picking a version.
-  bool strict = 3;
-  // `--force`: replace local files whose content differs.
-  bool force = 4;
-  // `--dry-run`: decide everything, write nothing.
-  bool dry_run = 5;
+  optional string select = 2;
+  bool replace = 3;
+  bool dry_run = 4;
 }
 
 message PinAdd {
   // A hex object root, or a `<space>/<path>` whose selected version's root is
   // pinned (§8).
   string target = 1;
+  optional string select = 2;
 }
 
 message PinRm {
   // A hex object root, or a `<space>/<path>` whose selected version's root is
   // unpinned (§8).
   string target = 1;
+  optional string select = 2;
 }
 
 message PinLs {}
@@ -510,12 +477,8 @@ message Recover {
   optional uint64 gap = 2;
 }
 
-message Doctor {
-  // Rebuild the derived views from the authoritative trie first.
-  bool rebuild = 1;
-}
-
-message Scan {}
+message Doctor { reserved 1; }
+message RepairRebuildViews {}
 
 // Reopens the tunnel after `cloud disable`.
 //
@@ -691,23 +654,15 @@ message ListSpacesRequest {}
 
 // One configured space, as a program reads it.
 message SpaceInfo {
-  // The space id.
   string id = 1;
-  // The local directory being indexed, unset for a detached space.
-  optional string local_path = 2;
-  // The replication policy — `tree` or `archive` — unset when this node holds
-  // only what it publishes and reads.
-  optional string replicate = 3;
-  // Seconds a released root is still held. Only meaningful under `tree`.
+  optional string source_path = 2;
+  optional string retention = 3;
   int64 grace_secs = 4;
-  // A ceiling on bytes held for this space, unset for no ceiling.
   optional uint64 budget = 5;
-  // Bytes this space's replication holds. Unset when not replicating —
-  // which is not the same as zero, and the difference is the whole reason
-  // it is optional.
   optional uint64 held_bytes = 6;
-  // Objects wanted and not yet held, when replicating.
   optional uint64 wanted = 7;
+  optional string source_kind = 8;
+  optional string checkout_path = 9;
 }
 
 message GetConfigRequest {
@@ -942,7 +897,7 @@ message SocketLog {
   string target = 1;
 }
 
-// One `synch connect` message.
+// One `synch socket connect` message.
 message ConnectRequest {
   oneof kind {
     // Sent once, first.
@@ -989,7 +944,7 @@ message ConnectOpened {
 }
 
 message ConnectClosed {
-  // What `synch connect` exits with.
+  // What `synch socket connect` exits with.
   int32 exit_code = 1;
   // How it ended, in words.
   string status = 2;

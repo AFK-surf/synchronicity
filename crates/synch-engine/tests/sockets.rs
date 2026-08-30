@@ -19,7 +19,7 @@ async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
     let space = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-    node.add_space("code", space.path()).unwrap();
+    node.add_filesystem_source("code", space.path()).unwrap();
     (data, space, node)
 }
 
@@ -256,7 +256,7 @@ async fn a_socket_cannot_be_declared_in_a_detached_space() {
     let data = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-    node.add_detached_space("code").unwrap();
+    node.add_api_source("code").unwrap();
     let err = node.socket_add(&declaration("code", "git.sock"));
     assert!(err.is_err(), "a space with no scanner accepted a socket");
 }
@@ -372,7 +372,7 @@ fn a_daemon_style_runtime_can_arm_and_run_a_self_socket() {
 
     // These are the daemon command handler's synchronous operations; that
     // handler already offloads them. Here setup happens outside any runtime.
-    node.add_space("code", space.path()).unwrap();
+    node.add_filesystem_source("code", space.path()).unwrap();
     let elf = synch_cc::compile(
         include_str!("../../synch-sock/examples/echo.c"),
         "echo.c",
@@ -572,7 +572,7 @@ async fn the_arming_record_survives_a_restart_and_the_map_does_not() {
     Node::init(data.path(), None).unwrap();
     let root = {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-        node.add_space("code", space.path()).unwrap();
+        node.add_filesystem_source("code", space.path()).unwrap();
         write(space.path(), "git.sock", b"\x7fELF");
         node.socket_add(&declaration("code", "git.sock")).unwrap();
         node.scan_and_publish().unwrap();

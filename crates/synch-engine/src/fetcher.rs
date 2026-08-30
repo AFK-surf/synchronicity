@@ -1010,7 +1010,7 @@ impl Node {
     /// hints it already has; and a root that nobody could name is remembered as
     /// a miss and left alone for a while (§6.3). Without either, a root nobody
     /// holds — an origin publishing `f:` records whose content hashes name
-    /// nothing — is re-planned by every mirror pass and re-dials every peer in
+    /// nothing — is re-planned by every checkout pass and re-dials every peer in
     /// the cluster on each one, sequentially, so the victim's mirror can be
     /// made never to finish a pass and never to do the work it exists for.
     /// The miss expires, so a root that is published later is still picked up,
@@ -1373,7 +1373,7 @@ impl Node {
     }
 
     /// Reads one origin's entry in full — the pinned form of
-    /// [`Node::read_path`], which is what `synch take` adopts from.
+    /// [`Node::read_path`], which is what `synch adopt path` adopts from.
     pub async fn read_entry(&self, origin: &OriginId, space: &str, path: &str) -> Result<Vec<u8>> {
         self.read_path(space, path, &VersionPolicy::Origin(origin.clone()))
             .await
@@ -1383,7 +1383,7 @@ impl Node {
     /// (`docs/DELTA-SYNC.md` §3.5).
     ///
     /// The one way an object becomes a file. A mirror writing its copy (§7.2),
-    /// `synch take` adopting a peer's version (§8), and the gateway's
+    /// `synch adopt path` adopting a peer's version (§8), and the gateway's
     /// fetch-to-file all come through here, and all of them get the same
     /// guarantees: the target is old-or-new and never half, no staging residue
     /// is left behind on any path, and the object is never held in memory.
@@ -1670,7 +1670,7 @@ mod tests {
     }
 
     /// Discovery stops at the first answer and backs off after a fruitless
-    /// round — or every mirror pass would re-dial the cluster (§6.3).
+    /// round — or every checkout pass would re-dial the cluster (§6.3).
     #[tokio::test]
     async fn provider_discovery_stops_early_and_then_backs_off() {
         let (_d, node) = node().await;

@@ -4,7 +4,7 @@ import Foundation
 ///
 /// A space id, a mirror's local path and a folder name are all allowed to
 /// contain spaces — `validate_space` forbids only a slash, control characters
-/// and 63 bytes — so `synch space rm Family Photos` was a command that means
+/// and 63 bytes — so `synch source rm Family Photos` is a command that means
 /// something else, offered under a button labelled "Copy as a synch command".
 enum Shell {
   /// The token as a shell would have to be given it.

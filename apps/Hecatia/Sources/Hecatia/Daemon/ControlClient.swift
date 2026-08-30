@@ -46,7 +46,7 @@ actor ControlClient {
   /// (`NodeStore` turns it into `.needsUpdate` and `FirstRunView` takes the
   /// window).
   ///
-  /// Three, because the daemon's interceptor compares this header for
+  /// Four, because the daemon's interceptor compares this header for
   /// *equality* on every call (`control/server.rs:306`) rather than for a
   /// floor. Announcing "2" to a v3 daemon is therefore not a degraded
   /// connection but no connection at all: even the `daemon status` round trip
@@ -57,7 +57,7 @@ actor ControlClient {
   /// token rather than by content root, which was a change to work in flight
   /// on its side: sockets and v3 landed together, so no shipped version of
   /// this protocol ever had the other kind.
-  static let controlVersion = "3"
+  static let controlVersion = "4"
   /// Identifies this app's multipart uploads so a listing can show only its
   /// own. An upload id is a bearer token; a listing across principals would
   /// make it a public one.
@@ -232,6 +232,19 @@ actor ControlClient {
   }
 
   // MARK: - Listing
+
+  /// The namespace and this node's independent source/replica roles.
+  func listSpaces() async throws -> [Synch_Control_V1_SpaceInfo] {
+    let call = try client(.fast).makeListSpacesCall(.init())
+    var spaces: [Synch_Control_V1_SpaceInfo] = []
+    do {
+      for try await space in call.responseStream { spaces.append(space) }
+      return spaces
+    } catch {
+      throw DaemonFailure.classify(
+        error, trailers: try? await call.trailingMetadata, operation: "list spaces")
+    }
+  }
 
   /// One page of entries, and deliberately no "is this the end" flag.
   ///

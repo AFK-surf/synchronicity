@@ -164,6 +164,9 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
     }
 
     let bucket = buckets::find(&gateway.daemon, bucket_name).await?;
+    if matches!(parts.method, Method::PUT | Method::POST | Method::DELETE) {
+        bucket.require_writable()?;
+    }
 
     // Multipart routing comes first, because every one of these requests would
     // otherwise land on an existing arm and be answered as something else: a
@@ -256,9 +259,6 @@ async fn delete_object(
     headers: &BTreeMap<String, String>,
 ) -> S3Result<Response> {
     check_headers(headers)?;
-    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
-        tracing::warn!("{warning}");
-    }
     let deleted = gateway
         .daemon
         .delete(&bucket.space, key)
@@ -343,9 +343,6 @@ async fn create_upload(
     // Refused at creation rather than at the first part: a client that names a
     // header this gateway will not honor should find out before it streams.
     check_headers(headers)?;
-    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
-        tracing::warn!("{warning}");
-    }
     let upload_id = gateway
         .daemon
         .create_upload(&bucket.space, key, principal)
@@ -841,14 +838,7 @@ async fn put_object(
     // the wrong thing to do, so the request is refused rather than answered
     // with an object built from the body it does not have.
     check_headers(headers)?;
-    // §9.4: a write is always a publish of the local node's own view — the
-    // version model forbids publishing someone else's — so every bucket is
-    // writable. A bucket pinned to a foreign origin still accepts the write,
-    // but its reads keep serving the pinned origin, which is worth saying out
-    // loud rather than silently surprising the client.
-    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
-        tracing::warn!("{warning}");
-    }
+    bucket.require_writable()?;
     // The body streams over the socket into the daemon's ingest pipeline —
     // space directory, hash, CAS, stage, publish (§7.1) — and comes back as the
     // published entry, so the ETag is the root the daemon computed rather than

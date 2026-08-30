@@ -69,7 +69,7 @@ impl Node {
     /// approval happens after the declaration is printed.
     pub fn socket_add(&self, row: &SocketRow) -> Result<()> {
         let _authorization = self.socket_authorization_write();
-        let Some(space) = self.store().space(&row.space)? else {
+        let Some(space) = self.store().source(&row.space)? else {
             return Err(EngineError::invalid(format!(
                 "`{}` is not a space this node indexes",
                 row.space
@@ -77,7 +77,7 @@ impl Node {
         };
         if space.local_path.is_none() {
             return Err(EngineError::invalid(format!(
-                "`{}` is detached and has no scanner that can publish a socket",
+                "source `{}` is API-only and has no scanner that can publish a socket",
                 row.space
             )));
         }
@@ -122,7 +122,7 @@ impl Node {
                 .ok_or_else(|| {
                     EngineError::invalid(format!(
                 "`{space}/{path}` is declared a socket but this node publishes no entry for it \
-                 — run `synch scan` first"
+                 — run `synch source scan` first"
             ))
                 })?;
         let elf = self.socket_program(&resolved).await?;
@@ -841,7 +841,7 @@ impl SocketHost for TreeHost {
         if self
             .node
             .store()
-            .space(space)
+            .source(space)
             .map_err(|e| HostError::Io(e.to_string()))?
             .is_none()
         {
@@ -969,9 +969,9 @@ fn evaluate_put_condition(
 ///
 /// A re-composition of what the control-service `Put` handler does, gate for
 /// gate: bytes stream into an [`Adoption`](crate::Adoption) beside the target
-/// — or the daemon's scratch, for a detached space — and a commit is the
+/// — or the daemon's scratch, for a API source — and a commit is the
 /// adoption's rename plus the ordinary publish path (`scan_publish_push` for
-/// a path-backed space, `commit_detached_file` plus a flush for a detached
+/// a path-backed space, `commit_api_file` plus a flush for a detached
 /// one). Dropping it uncommitted drops the adoption, whose own `Drop` removes
 /// the staging file.
 struct TreeWriter {
@@ -1047,7 +1047,7 @@ impl SocketWriter for TreeWriter {
         let (space, path, modes) = (self.space.clone(), self.path.clone(), self.modes);
         let (condition, detached) = crate::blocking::offload(move || {
             check.ensure_publishable()?;
-            let detached = check.is_detached_space(&space)?;
+            let detached = check.is_api_source(&space)?;
             Ok((
                 evaluate_put_condition(&check, &space, &path, modes, expected),
                 detached,
@@ -1069,7 +1069,7 @@ impl SocketWriter for TreeWriter {
                 .map_err(write_refusal)?;
             let committed = self
                 .node
-                .commit_detached_file(&self.space, &self.path, &scratch, synch_core::now_ns())
+                .commit_api_file(&self.space, &self.path, &scratch, synch_core::now_ns())
                 .await;
             let cleanup = scratch.clone();
             let _ = crate::blocking::offload(move || {

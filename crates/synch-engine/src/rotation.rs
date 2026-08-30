@@ -401,7 +401,11 @@ mod tests {
         assert!(err.to_string().contains("already the active key"), "{err}");
 
         // Publish something, so the re-signed head carries a real root.
-        let entry = synch_core::FileEntry::file(3, 0, synch_core::Hash::new(b"c"), 1);
+        node.store()
+            .put_source("s", synch_store::SourceKind::Api, None)
+            .unwrap();
+        let root = node.store().ingest_bytes(b"ccc", 0).unwrap();
+        let entry = synch_core::FileEntry::file(3, 0, root, 1);
         let first = node
             .publish(&[(
                 node.key_for("s", "a.txt").unwrap(),

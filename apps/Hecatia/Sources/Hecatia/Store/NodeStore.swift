@@ -41,7 +41,6 @@ final class NodeStore {
   private(set) var peers: [PeerInfo] = []
   private(set) var deviceKeys: [DeviceKey] = []
   private(set) var keyReport: [String] = []
-  private(set) var mirrors: [MirrorEntry] = []
   /// Operator pins only — see the `.pins` refresh for why.
   private(set) var pins: [PinEntry] = []
   /// Objects `pin ls` reported that a replica holds and the operator did not.
@@ -53,8 +52,6 @@ final class NodeStore {
   private(set) var replicaStatus: [String: ReplicaStatus] = [:]
   private(set) var cloud = CloudState()
   private(set) var doctorReport: [String] = []
-  /// The last `mirror sync`, attributed per mirror.
-  private(set) var lastMirrorSync: MirrorSyncOutcome?
   /// The gateway's live bucket map and access key ids, folded out of the
   /// append-only logs the two config values actually hold.
   private(set) var s3Buckets: [GatewayBucket] = []
@@ -138,6 +135,14 @@ final class NodeStore {
   }
 
   var origin: String? { status?.origin }
+
+  var checkouts: [CheckoutEntry] {
+    spaces.compactMap { space in
+      space.checkoutPath.map {
+        CheckoutEntry(space: space.id, localPath: $0, policy: "newest")
+      }
+    }
+  }
 
   /// What to call this node where a person is reading rather than an operator.
   ///
@@ -248,7 +253,7 @@ final class NodeStore {
 
   private func clearCaches() {
     members = []; domains = []; peers = []; deviceKeys = []; keyReport = []
-    mirrors = []; pins = []; cloud = CloudState(); doctorReport = []
+    pins = []; cloud = CloudState(); doctorReport = []
     s3Buckets = []; s3KeyIDs = []; s3RecordCount = 0; parseWarnings = [:]
   }
 
@@ -560,11 +565,13 @@ final class NodeStore {
       // A node the zone has not named yet serves a reduced surface and refuses
       // this, so it is not even asked.
       guard !isWaitingToBeNamed else { spaces = []; return }
-      guard let output = await run(op("space.ls"), Cmd.spaceLs(), deadline: .fast, quiet: true)
-      else { return }
-      let parsed = Listings.spaces(output.lines)
-      spaces = parsed.rows
-      note(.spaces, parsed.unrecognized)
+      do {
+        spaces = try await client.listSpaces().map(Space.init)
+        note(.spaces, [])
+      } catch {
+        lastFailure = DaemonFailure.classify(error, operation: "list spaces")
+        return
+      }
       // A folder that stopped replicating should not leave its old numbers
       // sitting under it.
       let replicating = Set(parsed.rows.filter(\.isReplicating).map(\.id))
@@ -611,12 +618,6 @@ final class NodeStore {
       let parsed = NodeStatusReader.identity(output)
       identity = parsed
       deviceKeys = parsed.keys
-    case .mirrors:
-      guard let output = await run(op("mirror.ls"), Cmd.mirrorLs, deadline: .fast, quiet: true)
-      else { return }
-      let parsed = Listings.mirrors(output.lines)
-      mirrors = parsed.rows
-      note(.mirrors, parsed.unrecognized)
     case .pins:
       guard let output = await run(op("pin.ls"), Cmd.pinLs, deadline: .fast, quiet: true)
       else { return }
@@ -639,7 +640,7 @@ final class NodeStore {
       var reports: [String: ReplicaStatus] = [:]
       for space in spaces where space.isReplicating {
         guard let output = await run(
-          op("space.ls"), Cmd.spaceLs(id: space.id), deadline: .fast, quiet: true)
+          op("replica.ls"), Cmd.replicaLs(id: space.id), deadline: .fast, quiet: true)
         else { continue }
         reports[space.id] = Listings.replicaStatus(output.lines)
       }
@@ -706,18 +707,6 @@ final class NodeStore {
     note(.keys, parsed.unrecognized)
   }
 
-  /// Runs `mirror sync` and works out which mirrors it never reached.
-  ///
-  /// The command stops at the first failure, so "no error" is the only thing
-  /// its exit status distinguishes. This turns a silent partial run into a
-  /// precise one.
-  /// True while a mirror sync is in flight.
-  ///
-  /// On the store, because the pane that shows it is destroyed when you leave
-  /// it: as the pane's own `@State` the spinner reset and the button became
-  /// live again mid-sync, and `enqueue` serialises rather than rejects, so a
-  /// second `mirror sync` simply queued up behind the first.
-  private(set) var mirrorSyncRunning = false
   /// True while `doctor` is in flight, for the same reason: the pane that
   /// shows it is destroyed when you leave it.
   private(set) var doctorRunning = false
@@ -741,7 +730,7 @@ final class NodeStore {
     enqueue {
       self.houseworkRunning = true
       defer { self.houseworkRunning = false }
-      await self.run(Operations.require("scan"), Cmd.scan, deadline: .long)
+      await self.run(Operations.require("source.scan"), Cmd.sourceScan(), deadline: .long)
     }
   }
 
@@ -753,83 +742,74 @@ final class NodeStore {
     }
   }
 
-  /// Shares a folder, and indexes what is already in it.
-  ///
-  /// Both halves, together, because the second was forgotten once: `SpaceAdd`
-  /// registers the folder and starts a watcher over it, and a watcher reports
-  /// *changes* — it emits nothing for the files already on disk. A folder
-  /// added with a thousand files in it listed none of them, under a daemon
-  /// message that says "indexing", until the scanner's own interval came
-  /// round.
-  /// A detached space is the exception: it has no directory, so there is
-  /// nothing on disk to index and the scan afterwards would be a long walk over
-  /// nothing. That scan used to be unconditional.
-  func addSpace(
-    id: String, path: String, detached: Bool = false,
-    replicate: ReplicaPolicy? = nil, grace: Int64? = nil, budget: UInt64? = nil
-  ) async {
+  /// Adds a filesystem source, then explicitly scans its existing files.
+  func addSource(id: String, path: String) async {
     houseworkRunning = true
     defer { houseworkRunning = false }
-    var line = "synch space add \(Shell.quote(id))"
-    if detached {
-      line += " --detached"
-    } else {
-      line += " \(Shell.quote(path))"
-    }
-    if let replicate { line += " --replicate=\(replicate.wire)" }
-    if let grace { line += " --grace \(grace)s" }
-    if let budget { line += " --budget \(budget)" }
+    var line = "synch source add \(Shell.quote(id))"
+    line += " \(Shell.quote(path))"
     await run(
-      Operations.require("space.add"),
-      Cmd.spaceAdd(
-        id: id, path: detached ? "" : path, detached: detached,
-        replicate: replicate, grace: grace, budget: budget),
+      Operations.require("source.add"),
+      Cmd.sourceAdd(id: id, path: path),
       commandLine: line)
-    guard !detached else { return }
-    await run(Operations.require("scan"), Cmd.scan, deadline: .long)
+    await run(Operations.require("source.scan"), Cmd.sourceScan(id: id), deadline: .long)
   }
 
-  /// Turns replication on, off, or adjusts it — one call, whatever changed.
-  ///
-  /// The daemon refuses an empty set rather than treating it as a no-op, so a
-  /// caller with nothing to say must not call.
-  func setReplication(
-    id: String, replicate: ReplicaPolicy? = nil, stop: Bool = false,
-    release: Bool = false, grace: Int64? = nil, budget: UInt64? = nil
-  ) async {
-    guard replicate != nil || stop || release || grace != nil || budget != nil else { return }
+  func removeReplica(id: String, pinHeld: Bool) async {
     houseworkRunning = true
     defer { houseworkRunning = false }
-    var line = "synch space set \(Shell.quote(id))"
-    if let replicate { line += " --replicate=\(replicate.wire)" }
-    if stop { line += " --no-replicate" }
-    if release { line += " --release" }
+    await run(
+      Operations.require("replica.rm"), Cmd.replicaRm(id: id, pinHeld: pinHeld),
+      commandLine: "synch replica rm \(Shell.quote(id))\(pinHeld ? " --pin-held" : "")",
+      deadline: .long)
+  }
+
+  /// Adds or adjusts one replica role; source state is never part of this call.
+  func configureReplica(
+    id: String, retention: ReplicaPolicy, grace: Int64? = nil, budget: UInt64? = nil,
+    checkout: String? = nil, noCheckout: Bool = false
+  ) async {
+    houseworkRunning = true
+    defer { houseworkRunning = false }
+    var line = "synch replica set \(Shell.quote(id))"
+    line += " --retention \(retention.wire)"
     if let grace { line += " --grace \(grace)s" }
     if let budget { line += " --budget \(budget)" }
-    await run(
-      Operations.require("space.set"),
-      Cmd.spaceSet(
-        id: id, replicate: replicate, noReplicate: stop, release: release,
-        grace: grace, budget: budget),
-      commandLine: line, deadline: .long)
+    if let checkout { line += " --checkout \(Shell.quote(checkout))" }
+    if noCheckout { line += " --no-checkout" }
+    if spaces.first(where: { $0.id == id })?.isReplicating == true {
+      await run(
+        Operations.require("replica.set"),
+        Cmd.replicaSet(
+          id: id, retention: retention, grace: grace, budget: budget,
+          checkout: checkout, noCheckout: noCheckout),
+        commandLine: line, deadline: .long)
+    } else {
+      await run(
+        Operations.require("replica.add"),
+        Cmd.replicaAdd(
+          id: id, retention: retention, grace: grace, budget: budget, checkout: checkout),
+        commandLine: line.replacingOccurrences(of: " replica set ", with: " replica add "),
+        deadline: .long)
+    }
   }
 
   /// A reconciling sweep now, instead of at the daemon's next 300-second
   /// interval. `.long`, because the handler blocks on a real fetch pass.
-  func replicateNow(id: String? = nil) {
+  func syncReplica(id: String? = nil) {
     enqueue {
       self.houseworkRunning = true
       defer { self.houseworkRunning = false }
       await self.run(
-        Operations.require("space.sync"), Cmd.spaceSync(id: id),
-        commandLine: "synch space sync\(id.map { " " + Shell.quote($0) } ?? "")",
+        Operations.require("replica.sync"), Cmd.replicaSync(id: id),
+        commandLine: "synch replica sync\(id.map { " " + Shell.quote($0) } ?? "")",
         deadline: .long)
     }
   }
 
   /// Materializes the cluster's content into a space's own directory.
   ///
-  /// Returns the daemon's own lines so the caller can show them: `fill`'s
+  /// Returns the daemon's own lines so the caller can show them: the adoption
   /// report *is* the answer, especially under `--dry-run`, where deciding
   /// everything and writing nothing is the entire operation.
   ///
@@ -837,23 +817,22 @@ final class NodeStore {
   /// They arrived here as the same empty array, and the sheet that asks for
   /// the dry run drew both as a report — so a preview that never reached the
   /// daemon read as "there is nothing to do" and armed the write behind it.
-  func fill(
-    reference: String, from: String? = nil, strict: Bool = false,
-    force: Bool = false, dryRun: Bool = false
+  func adoptTree(
+    reference: String, select: String? = nil,
+    replace: Bool = false, dryRun: Bool = false
   ) async -> [String]? {
     houseworkRunning = true
     defer { houseworkRunning = false }
-    var line = "synch fill \(Shell.quote(reference))"
-    if let from, !from.isEmpty { line += " --from \(Shell.quote(from))" }
-    if strict { line += " --strict" }
-    if force { line += " --force" }
+    var line = "synch adopt tree \(Shell.quote(reference))"
+    if let select, !select.isEmpty { line += " --select \(Shell.quote(select))" }
+    if replace { line += " --replace" }
     if dryRun { line += " --dry-run" }
     let output = await run(
-      Operations.require("fill"),
-      Cmd.fill(reference: reference, from: from, strict: strict, force: force, dryRun: dryRun),
+      Operations.require("adopt.tree"),
+      Cmd.adoptTree(reference: reference, select: select, replace: replace, dryRun: dryRun),
       // The split `compare` already needed (`CompareSheet.swift:183-189`): the
       // dry run is listed in Activity like any other command, and only the
-      // modal is suppressed, because `FillSheet` is where the reader is and it
+      // modal is suppressed, because `AdoptTreeSheet` is where the reader is and it
       // shows that failure itself. It used to be `quiet: dryRun`, which hid the
       // Activity row too, so a failed preview left the daemon's message
       // nowhere in the app at all. The price is that a successful dry run now
@@ -863,27 +842,12 @@ final class NodeStore {
     return output?.transcript
   }
 
-  func syncMirrors() async {
-    mirrorSyncRunning = true
-    defer { mirrorSyncRunning = false }
-    await refresh([.mirrors])
-    let known = mirrors
-    let output = await run(
-      Operations.require("mirror.sync"), Cmd.mirrorSync, deadline: .long)
-    lastMirrorSync = MirrorSyncOutcome.read(
-      lines: output?.lines ?? [],
-      progress: output?.progress ?? [],
-      mirrors: known,
-      failed: output == nil)
-    await refresh([.mirrors])
-  }
-
   func runDoctor(rebuild: Bool) async {
     doctorRunning = true
     defer { doctorRunning = false }
     guard let output = await run(
-      op("doctor"), Cmd.doctor(rebuild: rebuild),
-      commandLine: rebuild ? "synch doctor --rebuild" : "synch doctor",
+      op(rebuild ? "repair.rebuildViews" : "doctor"), rebuild ? Cmd.rebuildViews : Cmd.doctor,
+      commandLine: rebuild ? "synch repair rebuild-views" : "synch doctor",
       deadline: .long)
     else { return }
     doctorReport = output.lines
@@ -954,9 +918,6 @@ extension NodeStore {
     store.deviceKeys = [
       DeviceKey(key: String(repeating: "y", count: 52), state: .active, peersHolding: "3 of 3 reachable peer(s)"),
       DeviceKey(key: String(repeating: "n", count: 52), state: .staged, peersHolding: "1 of 3 reachable peer(s)"),
-    ]
-    store.mirrors = [
-      MirrorEntry(space: "notes", localPath: "/Users/me/Mirrors/notes", policy: "newest")
     ]
     for transfer in transfers {
       store.transfers.add(transfer) { _ in }

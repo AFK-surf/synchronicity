@@ -70,9 +70,9 @@ impl ScanReport {
 
 impl Node {
     /// Whether a configured space deliberately has no local checkout.
-    pub fn is_detached_space(&self, space_id: &str) -> Result<bool> {
+    pub fn is_api_source(&self, space_id: &str) -> Result<bool> {
         self.store()
-            .space(space_id)?
+            .source(space_id)?
             .map(|space| space.local_path.is_none())
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))
     }
@@ -84,11 +84,11 @@ impl Node {
     ) -> Result<ScanReport> {
         let space = self
             .store()
-            .space(space_id)?
+            .source(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let local_path = space.local_path.as_deref().ok_or_else(|| {
             EngineError::invalid(format!(
-                "space {space_id} is detached and cannot be scanned"
+                "source {space_id} is API-only and cannot be scanned"
             ))
         })?;
         let root_dir = PathBuf::from(local_path);
@@ -361,7 +361,7 @@ impl Node {
         // `prev` records one-step lineage so a UI can tell "adopted theirs on
         // top of X" from "changed independently" (§8).
         // The kind comes from a *local* declaration, never from a peer
-        // (`docs/SOCKETS.md` §2.2). That is what makes `synch take` of
+        // (`docs/SOCKETS.md` §2.2). That is what makes `synch adopt path` of
         // someone's socket adopt its bytes and not its socket-ness: this node
         // publishes what it has declared, and it has declared nothing about a
         // path it merely received.
@@ -419,7 +419,7 @@ impl Node {
         ingest: &mut impl FnMut(&Path) -> Result<(Hash, u64)>,
     ) -> Result<ScanReport> {
         let mut report = ScanReport::default();
-        for space in self.store().spaces()? {
+        for space in self.store().sources()? {
             if space.local_path.is_none() {
                 continue;
             }
@@ -434,15 +434,15 @@ impl Node {
             // publishing it as a live file at its old content root forever.
             //
             // Reported rather than swallowed: the space appears in `skipped`,
-            // which is what `synch scan` prints and what `doctor` reads.
-            match self.scan_space_with_ingest(&space.id, ingest) {
+            // which is what `synch source scan` prints and what `doctor` reads.
+            match self.scan_space_with_ingest(&space.space, ingest) {
                 Ok(one) => {
-                    on_space(&space.id, &one);
+                    on_space(&space.space, &one);
                     report.merge(one);
                 }
                 Err(e) => {
-                    tracing::warn!(space = %space.id, error = %e, "space skipped by this scan");
-                    report.skipped.push((space.id.clone(), e.to_string()));
+                    tracing::warn!(space = %space.space, error = %e, "space skipped by this scan");
+                    report.skipped.push((space.space.clone(), e.to_string()));
                 }
             }
         }
@@ -634,6 +634,26 @@ impl Node {
         .await
     }
 
+    /// Scans one filesystem source and stages its changes.
+    pub async fn scan_source_and_stage_async(&self, space: &str) -> Result<ScanReport> {
+        let node = self.clone();
+        let backend = self.cas_backend().clone();
+        let space = space.to_string();
+        crate::blocking::offload(move || {
+            node.ensure_publishable()?;
+            let runtime = tokio::runtime::Handle::current();
+            let mut report = node.scan_space_with_ingest(&space, &mut |path| {
+                let ingested =
+                    runtime.block_on(backend.ingest_file(path.to_path_buf(), now_ns()))?;
+                Ok((ingested.root, ingested.size))
+            })?;
+            node.stage(report.staged.iter().cloned());
+            report.staged.clear();
+            Ok(report)
+        })
+        .await
+    }
+
     /// Re-indexes local paths whose staged changes never reached a root.
     ///
     /// A scan records `(size, mtime_ns, file_id)` in `local_files` as it
@@ -652,17 +672,17 @@ impl Node {
         let root = self.current_root()?;
         let trie = Trie::new(self.store().as_ref());
         let mut dropped = 0;
-        for space in self.store().spaces()? {
+        for space in self.store().sources()? {
             if space.local_path.is_none() {
                 continue;
             }
-            for row in self.store().local_file_rows(&space.id)? {
+            for row in self.store().local_file_rows(&space.space)? {
                 // The signal a row records is the content root for a file and
                 // the hashed link target for a symlink, so the published entry
                 // has to be read the same way or every open would re-index
                 // every link.
                 let published = trie
-                    .get(root, &file_key(&space.id, &row.relpath)?)?
+                    .get(root, &file_key(&space.space, &row.relpath)?)?
                     .as_deref()
                     .map(decode_entry)
                     .transpose()?
@@ -671,18 +691,18 @@ impl Node {
                     continue;
                 }
                 tracing::debug!(
-                    space = %space.id,
+                    space = %space.space,
                     path = %row.relpath,
                     "re-indexing a path the published root does not corroborate"
                 );
-                self.store().remove_local_file(&space.id, &row.relpath)?;
+                self.store().remove_local_file(&space.space, &row.relpath)?;
                 dropped += 1;
             }
         }
         Ok(dropped)
     }
 
-    /// Adopts a peer's version of a path as our own (§8, `synch take`).
+    /// Adopts a peer's version of a path as our own (§8, `synch adopt path`).
     ///
     /// The bytes are written into the local space directory and the ordinary
     /// indexing pipeline republishes them as this node's entry, with `prev`
@@ -698,7 +718,7 @@ impl Node {
     }
 
     /// Adopts one origin's version of a path, streaming it into the local
-    /// space directory (§8, `synch take`).
+    /// space directory (§8, `synch adopt path`).
     ///
     /// The bytes-in-hand [`Node::adopt`] is what a caller with a small payload
     /// uses; this is the form that never has the payload in hand. `take` of a
@@ -726,7 +746,7 @@ impl Node {
             let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
             crate::blocking::offload(move || {
                 node.ensure_adoptable(&space_id, &path)?;
-                node.is_detached_space(&space_id)
+                node.is_api_source(&space_id)
             })
             .await?
         };
@@ -741,7 +761,7 @@ impl Node {
             let reported = PathBuf::from(format!("{space_id}/{path}"));
             let (node, space, path) = (self.clone(), space_id.to_string(), path.to_string());
             crate::blocking::offload(move || {
-                node.stage_detached_reference(&space, &path, range.root, range.size, now_ns())
+                node.stage_api_reference(&space, &path, range.root, range.size, now_ns())
             })
             .await?;
             return Ok(reported);
@@ -793,7 +813,7 @@ impl Node {
         Ok(target)
     }
 
-    /// Adopts a peer's *deletion* of a path as our own (§8, `synch take`).
+    /// Adopts a peer's *deletion* of a path as our own (§8, `synch adopt path`).
     ///
     /// Deletions are adoptable exactly as content is: our local copy goes, and
     /// the next scan publishes our own tombstone through the ordinary indexing
@@ -808,7 +828,7 @@ impl Node {
         // The publishability half only: an excluded path is exactly the stray
         // file a deletion is here to clear up (`refuse_if_ignored`).
         self.ensure_publishable()?;
-        if self.is_detached_space(space_id)? {
+        if self.is_api_source(space_id)? {
             let normalized = normalized_adoption_path(path)?;
             let previous = self
                 .store()
@@ -849,7 +869,7 @@ impl Node {
     /// the control socket — where holding the object in memory to call the
     /// other one is exactly what must not happen.
     pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
-        if self.is_detached_space(space_id)? {
+        if self.is_api_source(space_id)? {
             self.ensure_adoptable(space_id, path)?;
             let _ = normalized_adoption_path(path)?;
             let target = self.store().staging_dir().join(format!(
@@ -861,12 +881,12 @@ impl Node {
         Adoption::into_space(self, space_id, path)
     }
 
-    /// Ingests a committed detached-space staging file and stages its records.
+    /// Ingests a committed API-source staging file and stages its records.
     ///
     /// The durable CAS row lands before the `f:` and `b:` records enter the
     /// publisher. Until the caller acknowledges, `source` is unacknowledged
     /// backend-private scratch and may be discarded after this returns.
-    pub async fn commit_detached_file(
+    pub async fn commit_api_file(
         &self,
         space_id: &str,
         path: &str,
@@ -891,9 +911,9 @@ impl Node {
             // the blob if the daemon restarts first.
             //
             // `refuse_if_ignored` is the other half and is a no-op here: a
-            // detached space has no directory to hold a `.syncignore`.
+            // API source has no directory to hold a `.syncignore`.
             node.ensure_publishable()?;
-            if !node.is_detached_space(&checked_space)? {
+            if !node.is_api_source(&checked_space)? {
                 return Err(EngineError::invalid(format!(
                     "space {checked_space} has a local checkout"
                 )));
@@ -912,20 +932,14 @@ impl Node {
         debug_assert_eq!(ingested.size, size);
         let (node, space) = (self.clone(), space_id.to_string());
         crate::blocking::offload(move || {
-            node.stage_detached_reference(
-                &space,
-                &normalized,
-                ingested.root,
-                ingested.size,
-                mtime_ns,
-            )?;
+            node.stage_api_reference(&space, &normalized, ingested.root, ingested.size, mtime_ns)?;
             Ok((ingested.root, ingested.size))
         })
         .await
     }
 
     /// Stages a detached file entry and its durable-holder advertisement.
-    pub(crate) fn stage_detached_reference(
+    pub(crate) fn stage_api_reference(
         &self,
         space_id: &str,
         path: &str,
@@ -961,7 +975,7 @@ impl Node {
     /// and an adoption that writes before finding that out has destroyed the
     /// local copy and can tell nobody — no version, no `prev`, no trace. That
     /// is the reasoning `Node::delete_object` already states over the very same
-    /// `adopt_deletion` this guards; `synch take` reached the gate only at its
+    /// `adopt_deletion` this guards; `synch adopt path` reached the gate only at its
     /// publish, which is after the file is gone.
     ///
     /// Then the space's own ignore rules.
@@ -972,7 +986,7 @@ impl Node {
 
     /// Refuses a write at a path the space's own ignore rules exclude.
     ///
-    /// Taken by every writer into a space directory — `synch take` in both its
+    /// Taken by every writer into a space directory — `synch adopt path` in both its
     /// forms, and the streamed write an S3 `PutObject` becomes — because a file
     /// written where the scanner will never look is worse than a refused write:
     /// it is never published, never swept (it is in neither `local_files` nor
@@ -985,7 +999,7 @@ impl Node {
     /// how a stray file like that gets cleaned up, and S3 `DELETE` is
     /// idempotent besides.
     pub(crate) fn refuse_if_ignored(&self, space_id: &str, path: &str) -> Result<()> {
-        let Some(space) = self.store().space(space_id)? else {
+        let Some(space) = self.store().source(space_id)? else {
             return Ok(());
         };
         let Some(local_path) = space.local_path.as_deref() else {
@@ -1004,7 +1018,7 @@ impl Node {
     /// Where a path lives locally, refusing anything outside a configured
     /// space.
     ///
-    /// The guard is the same for content and for deletions: `synch take` may
+    /// The guard is the same for content and for deletions: `synch adopt path` may
     /// only ever write inside a space this node indexes, because outside one
     /// nothing would publish the adoption and the write would be a silent
     /// no-op with a filesystem side effect.
@@ -1021,11 +1035,11 @@ impl Node {
     ) -> Result<(PathBuf, (PathBuf, String))> {
         let space = self
             .store()
-            .space(space_id)?
+            .source(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let local_path = space.local_path.ok_or_else(|| {
             EngineError::invalid(format!(
-                "space {space_id} is detached and has no filesystem adoption target"
+                "source {space_id} is API-only and has no filesystem adoption target"
             ))
         })?;
         let root = PathBuf::from(local_path);
@@ -1052,7 +1066,7 @@ pub(crate) fn target_within_checked(
     // or the delete lands outside every space as whatever uid the daemon
     // runs as. The mirror loop has always checked this; every other writer
     // needs the same check, and a deletion needs it as much as a write does.
-    if crate::mirror::escapes_via_symlink(root, &normalized) {
+    if crate::checkout::escapes_via_symlink(root, &normalized) {
         return Err(EngineError::invalid(format!(
             "{space_id}/{path} resolves through a symlinked directory and would leave the space"
         )));
@@ -1064,7 +1078,7 @@ pub(crate) fn target_within_checked(
 ///
 /// [`Node::adoption_target`] is the form that reads the space row first; this
 /// is the form for a caller holding the root already and asking it of many
-/// paths in a row (`synch fill`, fill.rs), where re-reading that row per path
+/// paths in a row (`synch adopt tree`, fill.rs), where re-reading that row per path
 /// would be one store acquisition per file in the space.
 pub(crate) fn target_within(root: &Path, space_id: &str, path: &str) -> Result<PathBuf> {
     Ok(target_within_checked(root, space_id, path)?.0)
@@ -1545,7 +1559,7 @@ impl Adoption {
     /// cannot redirect the write. A write that was not opened against a
     /// space root (the mirror's materializations) has nothing pinned and
     /// keeps the plain rename, exactly as before; its own guard runs in the
-    /// same blocking step ([`crate::mirror`]).
+    /// same blocking step ([`crate::checkout`]).
     #[cfg(unix)]
     fn rename_into_place(&mut self, file: std::fs::File) -> Result<()> {
         match self.parent.take() {
@@ -2336,8 +2350,8 @@ mod tests {
     #[tokio::test]
     async fn detached_spaces_publish_cas_direct_and_never_scan_a_checkout() {
         let (_data, node) = crate::testkit::node().await;
-        node.add_detached_space("media").unwrap();
-        assert!(node.is_detached_space("media").unwrap());
+        node.add_api_source("media").unwrap();
+        assert!(node.is_api_source("media").unwrap());
         // The scan path's own re-check: a space that turns detached between
         // the caller's listing and the per-space scan is refused, not walked.
         assert!(node
@@ -2351,7 +2365,7 @@ mod tests {
         let source = source_dir.path().join("incoming");
         std::fs::write(&source, b"detached payload").unwrap();
         let (root, size) = node
-            .commit_detached_file("media", "nested/a.txt", &source, 42)
+            .commit_api_file("media", "nested/a.txt", &source, 42)
             .await
             .unwrap();
         node.flush_staged().await.unwrap().unwrap();
@@ -2391,14 +2405,14 @@ mod tests {
             cache_bytes: Some(512 * 1024 * 1024),
         });
         let node = Node::open(config).await.unwrap();
-        node.add_detached_space("media").unwrap();
+        node.add_api_source("media").unwrap();
 
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("incoming");
         let payload = vec![13u8; 100_000];
         std::fs::write(&source, &payload).unwrap();
         let (root, size) = node
-            .commit_detached_file("media", "large.bin", &source, 99)
+            .commit_api_file("media", "large.bin", &source, 99)
             .await
             .unwrap();
         let row = node.store().blob(&root).unwrap().unwrap();
@@ -2484,8 +2498,8 @@ mod tests {
     /// Ages every scan record past the racy window: fresh records are racily
     /// clean and re-hashed next scan, which stat-trust tests don't exercise.
     fn age_quick_checks(node: &Node) {
-        for space in node.store().spaces().unwrap() {
-            for mut row in node.store().local_file_rows(&space.id).unwrap() {
+        for space in node.store().sources().unwrap() {
+            for mut row in node.store().local_file_rows(&space.space).unwrap() {
                 row.scanned_at += super::RACY_WINDOW_NS;
                 node.store().put_local_file(&row).unwrap();
             }
@@ -2502,7 +2516,7 @@ mod tests {
         let mut config = NodeConfig::loopback(data.path());
         config.tombstone_ttl = ttl;
         let node = Node::open(config).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
         (data, space, node)
     }
 
@@ -2749,7 +2763,7 @@ mod tests {
         // `/var` to `/private/var` on macOS).
         let root = PathBuf::from(
             node.store()
-                .space("media")
+                .source("media")
                 .unwrap()
                 .unwrap()
                 .local_path
@@ -2786,7 +2800,7 @@ mod tests {
         let (_d, _space, node) = node_with_space().await;
         let root = PathBuf::from(
             node.store()
-                .space("media")
+                .source("media")
                 .unwrap()
                 .unwrap()
                 .local_path
@@ -2821,7 +2835,7 @@ mod tests {
         let (_d, _space, node) = node_with_space().await;
         let root = PathBuf::from(
             node.store()
-                .space("media")
+                .source("media")
                 .unwrap()
                 .unwrap()
                 .local_path
@@ -2875,7 +2889,7 @@ mod tests {
         let (_d, _space, node) = node_with_space().await;
         let root = PathBuf::from(
             node.store()
-                .space("media")
+                .source("media")
                 .unwrap()
                 .unwrap()
                 .local_path
@@ -3134,7 +3148,7 @@ mod tests {
         let rows = if cfg!(unix) { 2 } else { 1 };
         {
             let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
-            node.add_space("media", space.path()).unwrap();
+            node.add_filesystem_source("media", space.path()).unwrap();
             std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
             #[cfg(unix)]
             std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();

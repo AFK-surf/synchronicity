@@ -1,12 +1,6 @@
 import SwiftUI
 
-/// Spaces this Mac indexes — `space ls`, `space add`, `space set`, `space rm`.
-///
-/// Replication lives here rather than in a pane of its own, because the daemon
-/// put it on the command that already names spaces: "No new noun. Replication
-/// is a flag on the command that already names spaces" (`REPLICATION.md` §6).
-/// The pane that used to be called Replication is Mirrors & Pins now — it never
-/// held either of the things the daemon means by the word.
+/// Independent source and replica roles for each known namespace.
 struct SpacesPane: View {
   @Environment(NodeStore.self) private var node
   @Binding var confirmation: ConfirmationRequest?
@@ -41,10 +35,10 @@ struct SpacesPane: View {
             // and then a confirmation that has to be typed out. Only the
             // button's place on the page changed.
             TableActionButton(symbol: "minus", name: "Stop Sharing…") { requestRemove() }
-              .disabled(selection == nil || !node.advancedUnlocked)
+              .disabled(selected?.isSource != true || !node.advancedUnlocked)
             Spacer()
-            Button("Fill From the Cluster…") { filling = selected }
-              .disabled(selected == nil || selected?.isDetached == true)
+            Button("Adopt From the Cluster…") { filling = selected }
+              .disabled(selected?.hasFilesystemSource != true)
           }
           // Directly under the bar it unlocks, rather than at the foot of the
           // page: － is the control it governs.
@@ -59,18 +53,18 @@ struct SpacesPane: View {
               space: selected,
               status: node.replicaStatus[selected.id],
               onConfigure: { configuring = selected },
-              onSyncNow: { node.replicateNow(id: selected.id) })
+              onSyncNow: { node.syncReplica(id: selected.id) })
           }
         }
       }
       .padding(Theme.Space.xl)
     }
-    .sheet(isPresented: $adding) { AddSpaceSheet() }
+    .sheet(isPresented: $adding) { AddSourceSheet() }
     .sheet(item: $configuring) { space in
       ReplicationSheet(
         space: space, heldBytes: node.replicaStatus[space.id]?.heldBytes ?? 0)
     }
-    .sheet(item: $filling) { space in FillSheet(space: space) }
+    .sheet(item: $filling) { space in AdoptTreeSheet(space: space) }
   }
 
   /// Name, path, replication — and only the path grows.
@@ -99,7 +93,7 @@ struct SpacesPane: View {
     HStack(spacing: Theme.Space.snug) {
       Text(space.pathLabel)
         .font(Theme.Font.mono(.subheadline))
-        .foregroundStyle(space.isDetached ? Theme.muted : Color.primary)
+        .foregroundStyle(space.isRemoteOnly ? Theme.muted : Color.primary)
         .lineLimit(1).truncationMode(.middle)
         // Truncated in the middle by design, so the whole path has to be
         // readable and copyable some other way.
@@ -134,35 +128,25 @@ struct SpacesPane: View {
   private func requestRemove() {
     guard let space = selected else { return }
     let id = space.id
-    // The consequence has to say what actually happens to *this* folder. On a
-    // replicating one, `space rm` stops the replication too, and what it holds
-    // stays pinned unless `--release` is sent — neither of which the old
-    // sentence ("only the publishing stops") mentioned.
-    let held = node.replicaStatus[id]?.heldBytes ?? 0
-    var consequence = "Every device and every mirror in your cluster sees this Mac’s entries for “\(id)” disappear."
-    if space.isDetached {
-      consequence += " This space has no local copy, so there are no files to keep."
+    var consequence = "Every device in your cluster sees this Mac’s entries for “\(id)” disappear."
+    if !space.hasFilesystemSource {
+      consequence += " This source has no filesystem directory, so there are no files to keep."
     } else {
       consequence += " Your files stay on this Mac exactly where they are — only the publishing stops."
     }
-    if space.isReplicating {
-      consequence += " Replication stops as well"
-      consequence += held > 0
-        ? ", and the \(Bytes.short(held)) it holds stays on this Mac. Turn replication off first if you want that space back."
-        : ". What it holds stays on this Mac."
-    }
+    if space.isReplicating { consequence += " The independent replica is unchanged." }
     confirmation = ConfirmationRequest(
       title: "Stop sharing “\(id)”?",
       consequence: consequence,
       verb: "Stop Sharing",
       gate: .typed,
       typedPhrase: id,
-      commandLine: "synch space rm \(Shell.quote(id))",
+      commandLine: "synch source rm \(Shell.quote(id))",
       perform: {
         node.enqueue {
           await node.run(
-            Operations.require("space.rm"), Cmd.spaceRm(id: id),
-            commandLine: "synch space rm \(Shell.quote(id))")
+            Operations.require("source.rm"), Cmd.sourceRm(id: id),
+            commandLine: "synch source rm \(Shell.quote(id))")
         }
       }
     )

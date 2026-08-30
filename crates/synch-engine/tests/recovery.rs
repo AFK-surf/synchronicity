@@ -58,7 +58,9 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     let lost_key = nas.node.node_id();
 
     // The NAS publishes three roots; the laptop replicates them.
-    nas.node.add_space("media", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     for round in 1..=3 {
         write(&nas, &format!("round{round}.txt"), "content");
         nas.node.scan_and_publish().unwrap();
@@ -106,13 +108,15 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
 
     // Publishing is refused, and the error says what to run — before the
     // scan, so nothing is recorded as published that was not.
-    recovered.add_space("media", nas.space.path()).unwrap();
+    recovered
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     let err = recovered.scan_and_publish().unwrap_err();
     let message = err.to_string();
     assert!(message.contains("synch recover"), "{message}");
     assert!(message.contains("seq 3"), "{message}");
     assert!(recovered.store().local_files("media").unwrap().is_empty());
-    assert!(recovered.remove_space("media", false).is_err());
+    assert!(recovered.source_removal("media").is_err());
 
     // `--wait 0` collects one round and returns promptly.
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -172,7 +176,9 @@ async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
     trust_all(&[&nas, &laptop, &vps]);
     let lost_key = nas.node.node_id();
 
-    nas.node.add_space("media", nas.space.path()).unwrap();
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     write(&nas, "a.txt", "one");
     nas.node.scan_and_publish().unwrap();
     // The laptop replicates seq 1 and then falls behind.
@@ -212,7 +218,9 @@ async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
     assert_eq!(report.observed_seq, Some(1));
     assert_eq!(report.floor, Some(2));
 
-    recovered.add_space("media", nas.space.path()).unwrap();
+    recovered
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
     let head = recovered.scan_publish_push().await.unwrap().unwrap();
     assert_eq!(head.seq, 2);
 

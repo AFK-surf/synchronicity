@@ -67,9 +67,9 @@ struct CoverageTests {
   @Test func readsInvalidateNothing() {
     let readOnly: Set<String> = [
       "id", "daemon.status", "key.ls", "trust.ls", "delegate.ls", "domain.ls",
-      "peers", "space.ls", "mirror.ls", "pin.ls", "cloud.status", "doctor",
+      "peers", "source.ls", "replica.ls", "pin.ls", "cloud.status", "doctor",
       "status", "log", "compare", "rpc.list", "rpc.resolve", "rpc.read",
-      "rpc.getConfig", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
+      "rpc.getConfig", "rpc.listSpaces", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
     ]
     for operation in Operations.all where readOnly.contains(operation.id) {
       #expect(
@@ -84,9 +84,9 @@ struct CoverageTests {
     // impossible to introduce by forgetting.
     let readOnly: Set<String> = [
       "id", "daemon.status", "key.ls", "trust.ls", "delegate.ls", "domain.ls",
-      "peers", "space.ls", "mirror.ls", "pin.ls", "cloud.status", "doctor",
+      "peers", "source.ls", "replica.ls", "pin.ls", "cloud.status", "doctor",
       "status", "log", "compare", "rpc.list", "rpc.resolve", "rpc.read",
-      "rpc.getConfig", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
+      "rpc.getConfig", "rpc.listSpaces", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
     ]
     // `.notSurfaced` is exempt, and it is honest rather than convenient to
     // exempt it: nothing can invoke those, so what they would invalidate is a
@@ -107,7 +107,7 @@ struct CoverageTests {
     // The seven that cannot be undone, plus the one that only exists when it is
     // the fix. Anything added to this list without a gate fails here.
     let mustBeTyped = [
-      "key.retire", "daemon.stop", "trust.rm", "domain.clear", "space.rm",
+      "key.retire", "daemon.stop", "trust.rm", "domain.clear", "source.rm",
     ]
     for id in mustBeTyped {
       #expect(Operations.find(id)?.gate == .typed, "\(id) is missing its typed gate")
@@ -120,12 +120,12 @@ struct CoverageTests {
     // or a folder, it belongs in the Node window.
     let allowed: Set<String> = [
       "rpc.list", "rpc.resolve", "rpc.read", "rpc.put", "rpc.delete",
-      "space.ls", "space.add", "status", "take", "log", "compare",
-      "pin.add", "pin.rm", "scan",
+      "rpc.listSpaces", "source.ls", "source.add", "status", "adopt.path", "log", "compare",
+      "pin.add", "pin.rm", "source.scan",
       // `fill` names a folder and writes into it. `cat` and `get` name one
       // object by its content root, which is a version of a file — the only
       // route to one no path selects any more.
-      "fill", "cat", "get",
+      "adopt.tree", "cat", "get",
     ]
     for operation in Operations.all where operation.surface == .files {
       #expect(allowed.contains(operation.id), "\(operation.id) does not belong in the Files window")
@@ -281,13 +281,15 @@ struct OptionalFieldTests {
     #expect(command.compare.hasFrom == false)
   }
 
-  @Test func mirrorAddCarriesItsPolicy() {          // MirrorSheet
-    let command = Cmd.mirrorAdd(space: "notes", path: "/tmp/m", policy: .strict)
-    #expect(command.mirrorAdd.policy == "strict")
+  @Test func replicaAddCarriesRetentionAndCheckout() {
+    let command = Cmd.replicaAdd(
+      id: "notes", retention: .current, grace: 60, checkout: "/tmp/notes")
+    #expect(command.replicaAdd.retention == "current")
+    #expect(command.replicaAdd.checkout == "/tmp/notes")
   }
 
-  @Test func doctorCanRebuild() {                   // DiagnosticsPane
-    #expect(Cmd.doctor(rebuild: true).doctor.rebuild)
+  @Test func repairRebuildsViews() {                // DiagnosticsPane
+    #expect(Cmd.rebuildViews.hasRepairRebuildViews)
   }
 
   @Test func referencesFollowTheDaemonsGrammar() {

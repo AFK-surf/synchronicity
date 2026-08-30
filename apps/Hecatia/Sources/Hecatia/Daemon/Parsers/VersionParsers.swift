@@ -203,7 +203,7 @@ enum Versions {
   ///
   /// A named origin is rendered in full; a key-identified one is cut to `key:`
   /// plus **10 of its 52** characters. That truncated form is not a valid
-  /// reference — `synch take` will not accept it — so on a cluster with no
+  /// reference — `synch adopt path` will not accept it — so on a cluster with no
   /// membership zone, where every origin is key-identified, the attestor
   /// column of `status` names devices in a form nothing can act on.
   static func short(_ origin: String) -> String {

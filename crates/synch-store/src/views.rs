@@ -15,7 +15,6 @@ use crate::replica::NOT_SELF;
 use crate::{
     db::{hash_column, origin_column, Store, Txn},
     error::{Result, StoreError},
-    unified::VersionPolicy,
 };
 
 /// One row of the `entries` view.
@@ -103,24 +102,24 @@ fn kind_from_int(value: i64) -> Result<EntryKind> {
 /// How much of a space this node holds (`docs/REPLICATION.md` §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaPolicy {
-    /// Hold what the tree names, and release a root once it stops naming it.
-    Tree,
-    /// Hold everything ever seen, and release nothing.
-    Archive,
+    /// Hold what current trees name, releasing stale roots after the grace period.
+    Current,
+    /// Hold everything observed while the role is active.
+    Forever,
 }
 
 impl ReplicaPolicy {
     /// The stored and command-line spelling.
     pub fn render(self) -> &'static str {
         match self {
-            ReplicaPolicy::Tree => "tree",
-            ReplicaPolicy::Archive => "archive",
+            ReplicaPolicy::Current => "current",
+            ReplicaPolicy::Forever => "forever",
         }
     }
 
     /// True if this policy ever lets go of a root.
     pub fn releases(self) -> bool {
-        matches!(self, ReplicaPolicy::Tree)
+        matches!(self, ReplicaPolicy::Current)
     }
 }
 
@@ -135,10 +134,10 @@ impl std::str::FromStr for ReplicaPolicy {
 
     fn from_str(text: &str) -> Result<ReplicaPolicy> {
         match text {
-            "tree" => Ok(ReplicaPolicy::Tree),
-            "archive" => Ok(ReplicaPolicy::Archive),
+            "current" => Ok(ReplicaPolicy::Current),
+            "forever" => Ok(ReplicaPolicy::Forever),
             other => Err(StoreError::Invalid(format!(
-                "{other} is not a replication policy; use tree or archive"
+                "{other} is not a replica retention policy; use current or forever"
             ))),
         }
     }
@@ -160,31 +159,54 @@ pub(crate) const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 /// long a read cache keeps what nobody references, while this is the entire
 /// recovery story for an accidental deletion under the `tree` policy. The one
 /// an operator regrets is the short one.
-pub(crate) const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
+pub const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
 
-/// A configured space (§4.1, `docs/SERVERLESS.md` §10, `docs/REPLICATION.md`).
-///
-/// A row is this node's participation in a space, and the two halves are
-/// independent: `local_path` says whether a directory is indexed here,
-/// `replicate` whether every origin's version of every path is held here.
-/// Either, both, or — briefly, between `space add` and `space set` — neither.
+/// The kind of local publisher for a space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A scanner/watcher-backed filesystem publisher.
+    Filesystem,
+    /// A publisher driven only by API operations.
+    Api,
+}
+
+impl SourceKind {
+    /// The stored and command-line spelling.
+    pub fn render(self) -> &'static str {
+        match self {
+            SourceKind::Filesystem => "filesystem",
+            SourceKind::Api => "api",
+        }
+    }
+}
+
+/// A configured local publisher role.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpaceRow {
-    /// The space id, used in `f:<space>/...` keys.
-    pub id: String,
-    /// The local directory being indexed, or `None` for a detached space.
+pub struct SourceRow {
+    /// The space namespace.
+    pub space: String,
+    /// Whether publication is filesystem- or API-driven.
+    pub kind: SourceKind,
+    /// The scanner root for filesystem sources.
     pub local_path: Option<String>,
-    /// The replication policy, or `None` when this node holds only what it
-    /// publishes and reads.
-    pub replicate: Option<ReplicaPolicy>,
-    /// Seconds a released root is still held. `None` takes
-    /// `DEFAULT_REPLICA_GRACE_SECS`.
+}
+
+/// A configured durable replica role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaRow {
+    /// The space namespace.
+    pub space: String,
+    /// Which roots remain held after they leave current trees.
+    pub retention: ReplicaPolicy,
+    /// Seconds a stale current root remains held.
     pub grace: Option<i64>,
     /// A ceiling on bytes held for this space, or `None` for no ceiling.
     pub budget: Option<u64>,
+    /// The optional newest filesystem projection.
+    pub checkout_path: Option<String>,
 }
 
-impl SpaceRow {
+impl ReplicaRow {
     /// The grace window in effect, in seconds.
     pub fn grace_secs(&self) -> i64 {
         self.grace.unwrap_or(DEFAULT_REPLICA_GRACE_SECS)
@@ -192,7 +214,7 @@ impl SpaceRow {
 
     /// The pin holder that stands for this space's claims.
     pub fn holder(&self) -> crate::PinHolder {
-        crate::PinHolder::Replica(self.id.clone())
+        crate::PinHolder::Replica(self.space.clone())
     }
 }
 
@@ -213,20 +235,6 @@ pub struct LocalFile {
     pub content: Option<Hash>,
     /// When the file was last scanned.
     pub scanned_at: i64,
-}
-
-/// A configured read-only mirror of the unified tree (§7.2).
-///
-/// Keyed by the directory it writes into: a mirror materializes one space of
-/// the unified tree under a version policy, rather than one origin's view.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MirrorRow {
-    /// The local directory the mirror materializes into.
-    pub local_path: String,
-    /// The space being mirrored.
-    pub space: String,
-    /// Which version of each path the mirror writes (§8).
-    pub policy: VersionPolicy,
 }
 
 /// A peer we have seen, for ranking and `synch peers` (§6.4, §9.2).
@@ -597,98 +605,109 @@ impl Store {
         })
     }
 
-    // ---- spaces -----------------------------------------------------------
+    // ---- local roles ------------------------------------------------------
 
-    /// Registers a local space, leaving its replication half as it was.
-    pub fn put_space(&self, id: &str, local_path: Option<&str>) -> Result<()> {
+    /// Registers a publisher role for a space.
+    pub fn put_source(
+        &self,
+        space: &str,
+        kind: SourceKind,
+        local_path: Option<&str>,
+    ) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO spaces (id, local_path) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET local_path = excluded.local_path",
-            params![id, local_path],
+            "INSERT INTO sources (space, kind, local_path) VALUES (?1, ?2, ?3)
+             ON CONFLICT(space) DO UPDATE SET
+               kind = excluded.kind, local_path = excluded.local_path",
+            params![space, kind.render(), local_path],
         )?;
         Ok(())
     }
 
-    /// Registers a space with no checkout, scanner, or watcher root.
-    pub fn put_detached_space(&self, id: &str) -> Result<()> {
-        self.put_space(id, None)
-    }
-
-    /// Removes a local space.
-    pub fn remove_space(&self, id: &str) -> Result<bool> {
+    /// Removes a publisher role and its source-only socket declarations.
+    pub fn remove_source(&self, space: &str) -> Result<bool> {
         self.transaction(|txn| {
             txn.conn()
-                .execute("DELETE FROM socket_arms WHERE space = ?1", params![id])?;
+                .execute("DELETE FROM socket_arms WHERE space = ?1", params![space])?;
             txn.conn()
-                .execute("DELETE FROM sockets WHERE space = ?1", params![id])?;
+                .execute("DELETE FROM sockets WHERE space = ?1", params![space])?;
             let n = txn
                 .conn()
-                .execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
+                .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             Ok(n > 0)
         })
     }
 
-    /// Every configured local space.
-    pub fn spaces(&self) -> Result<Vec<SpaceRow>> {
+    /// Every configured publisher role.
+    pub fn sources(&self) -> Result<Vec<SourceRow>> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT id, local_path, replicate, grace, budget FROM spaces ORDER BY id")?;
-        let rows = stmt.query_map([], space_row)?;
+        let mut stmt =
+            conn.prepare("SELECT space, kind, local_path FROM sources ORDER BY space")?;
+        let rows = stmt.query_map([], source_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Every space this node replicates.
-    pub fn replicated_spaces(&self) -> Result<Vec<SpaceRow>> {
-        Ok(self
-            .spaces()?
-            .into_iter()
-            .filter(|space| space.replicate.is_some())
-            .collect())
-    }
-
-    /// Sets or clears a space's replication policy, leaving its tunables and
-    /// its checkout alone.
-    pub fn set_space_policy(&self, id: &str, policy: Option<ReplicaPolicy>) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE spaces SET replicate = ?2 WHERE id = ?1",
-            params![id, policy.map(|p| p.render())],
-        )?;
-        Ok(changed > 0)
-    }
-
-    /// Sets a space's grace window, leaving everything else alone.
-    ///
-    /// One column per call, because the alternative — one statement writing
-    /// every replication column from whatever flags an invocation happened to
-    /// carry — silently clears the ones it was not told about. `space set
-    /// --budget` would then reset a 90-day grace window to the default, which
-    /// is the whole recovery story for a deletion under the `tree` policy, and
-    /// say nothing about having done it.
-    pub fn set_space_grace(&self, id: &str, grace: i64) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE spaces SET grace = ?2 WHERE id = ?1",
-            params![id, grace],
-        )?;
-        Ok(changed > 0)
-    }
-
-    /// Sets a space's byte ceiling, leaving everything else alone.
-    pub fn set_space_budget(&self, id: &str, budget: u64) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE spaces SET budget = ?2 WHERE id = ?1",
-            params![id, budget as i64],
-        )?;
-        Ok(changed > 0)
-    }
-
-    /// One configured local space.
-    pub fn space(&self, id: &str) -> Result<Option<SpaceRow>> {
+    /// One configured publisher role.
+    pub fn source(&self, space: &str) -> Result<Option<SourceRow>> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, local_path, replicate, grace, budget FROM spaces WHERE id = ?1",
-                params![id],
-                space_row,
+                "SELECT space, kind, local_path FROM sources WHERE space = ?1",
+                params![space],
+                source_row,
+            )
+            .optional()?)
+    }
+
+    /// Registers a durable replica role for a space.
+    pub fn put_replica(&self, replica: &ReplicaRow) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO replicas
+               (space, retention, grace_seconds, budget_bytes, checkout_path)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(space) DO UPDATE SET
+               retention = excluded.retention,
+               grace_seconds = excluded.grace_seconds,
+               budget_bytes = excluded.budget_bytes,
+               checkout_path = excluded.checkout_path",
+            params![
+                replica.space,
+                replica.retention.render(),
+                replica.grace,
+                replica.budget.map(|v| v as i64),
+                replica.checkout_path,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a durable replica role.
+    pub fn remove_replica(&self, space: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM replicas WHERE space = ?1", params![space])?
+            > 0)
+    }
+
+    /// Every configured durable replica role.
+    pub fn replicas(&self) -> Result<Vec<ReplicaRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT space, retention, grace_seconds, budget_bytes, checkout_path
+               FROM replicas ORDER BY space",
+        )?;
+        let rows = stmt.query_map([], replica_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// One configured durable replica role.
+    pub fn replica(&self, space: &str) -> Result<Option<ReplicaRow>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT space, retention, grace_seconds, budget_bytes, checkout_path
+                   FROM replicas WHERE space = ?1",
+                params![space],
+                replica_row,
             )
             .optional()?)
     }
@@ -912,60 +931,6 @@ impl Store {
         Ok(())
     }
 
-    // ---- mirrors ----------------------------------------------------------
-
-    /// Registers (or re-points) the mirror at a local directory.
-    pub fn put_mirror(&self, local_path: &str, space: &str, policy: &VersionPolicy) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO mirrors (local_path, space, policy) VALUES (?1, ?2, ?3)
-             ON CONFLICT(local_path) DO UPDATE SET
-               space = excluded.space, policy = excluded.policy",
-            params![local_path, space, policy.render()],
-        )?;
-        Ok(())
-    }
-
-    /// Removes the mirror at a local directory.
-    pub fn remove_mirror(&self, local_path: &str) -> Result<bool> {
-        let n = self.conn().execute(
-            "DELETE FROM mirrors WHERE local_path = ?1",
-            params![local_path],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// The mirror configured for a local directory, if any.
-    pub fn mirror(&self, local_path: &str) -> Result<Option<MirrorRow>> {
-        Ok(self
-            .mirrors()?
-            .into_iter()
-            .find(|m| m.local_path == local_path))
-    }
-
-    /// Every configured mirror.
-    pub fn mirrors(&self) -> Result<Vec<MirrorRow>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT local_path, space, policy FROM mirrors ORDER BY local_path")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (local_path, space, policy) = row?;
-            out.push(MirrorRow {
-                local_path,
-                space,
-                policy: policy.parse()?,
-            });
-        }
-        Ok(out)
-    }
-
     // ---- peers ------------------------------------------------------------
 
     /// Records that a peer was seen.
@@ -1140,43 +1105,33 @@ impl Txn<'_> {
             params![origin.canonical()],
         )?)
     }
-
-    /// Repoints every `origin=<id>` mirror policy from one origin to another.
-    ///
-    /// A policy is stored as the text `VersionPolicy` renders (§7.2), so a node
-    /// that adopts a new name leaves every pin on its old one selecting
-    /// nothing — and selecting nothing is indistinguishable, in a mirror, from
-    /// an origin that has published nothing. Part of the identity migration's
-    /// transaction (§3.1) for that reason.
-    pub fn rewrite_mirror_policies(
-        &self,
-        previous: &OriginId,
-        adopted: &OriginId,
-    ) -> Result<usize> {
-        Ok(self.conn().execute(
-            "UPDATE mirrors SET policy = ?2 WHERE policy = ?1",
-            params![
-                format!("origin={}", previous.canonical()),
-                format!("origin={}", adopted.canonical()),
-            ],
-        )?)
-    }
 }
 
-/// Reads one `spaces` row.
-///
-/// A policy spelling this build does not understand reads as no replication
-/// rather than as an error: a row is configuration, and refusing to list the
-/// space would make one bad value hide every good one beside it. The value
-/// itself is left in place, so a downgrade does not quietly rewrite it.
-fn space_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceRow> {
-    let replicate: Option<String> = row.get(2)?;
-    Ok(SpaceRow {
-        id: row.get(0)?,
-        local_path: row.get(1)?,
-        replicate: replicate.and_then(|text| text.parse().ok()),
-        grace: row.get(3)?,
-        budget: row.get::<_, Option<i64>>(4)?.map(|b| b as u64),
+fn source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
+    let kind = match row.get::<_, String>(1)?.as_str() {
+        "filesystem" => SourceKind::Filesystem,
+        "api" => SourceKind::Api,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(SourceRow {
+        space: row.get(0)?,
+        kind,
+        local_path: row.get(2)?,
+    })
+}
+
+fn replica_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicaRow> {
+    let retention = match row.get::<_, String>(1)?.as_str() {
+        "current" => ReplicaPolicy::Current,
+        "forever" => ReplicaPolicy::Forever,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(ReplicaRow {
+        space: row.get(0)?,
+        retention,
+        grace: row.get(2)?,
+        budget: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+        checkout_path: row.get(4)?,
     })
 }
 
@@ -1205,7 +1160,7 @@ struct ReplicaTarget {
 impl ReplicaTargets {
     /// Read on the connection the head flip is running on, so the policy in
     /// effect is the one the transaction can see rather than one a concurrent
-    /// `space set` changed underneath it.
+    /// `replica set` changed underneath it.
     fn of(conn: &rusqlite::Connection) -> Result<ReplicaTargets> {
         // Read on the same connection as everything else here: the live release
         // path runs inside the head-flip transaction, where there is no engine
@@ -1221,29 +1176,18 @@ impl ReplicaTargets {
             .unwrap_or(DEFAULT_REPLICA_RELEASE_FLOOR);
         let mut by_space = std::collections::HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT id, local_path, replicate, grace, budget
-               FROM spaces WHERE replicate IS NOT NULL",
+            "SELECT space, retention, grace_seconds, budget_bytes, checkout_path
+               FROM replicas",
         )?;
-        let rows = stmt.query_map([], space_row)?;
-        for space in rows {
-            let space = space?;
-            // The SQL filters on the column and `space_row` parses it, and the
-            // two can disagree: a `replicate` value no `ReplicaPolicy` renders
-            // is non-NULL to the query and `None` to the parse. Deciding on the
-            // parsed value here is what keeps this predicate the same one
-            // `replicated_spaces` uses — otherwise the live path would stage
-            // wants for a space the sweep and the fetch loop do not consider
-            // replicated, and the rows would sit in the queue for ever. Nothing
-            // writes such a value today; the point is that nothing has to.
-            let Some(policy) = space.replicate else {
-                continue;
-            };
+        let rows = stmt.query_map([], replica_row)?;
+        for replica in rows {
+            let replica = replica?;
             by_space.insert(
-                space.id.clone(),
+                replica.space.clone(),
                 ReplicaTarget {
-                    holder: space.holder().render(),
-                    grace_ns: space.grace_secs().saturating_mul(1_000_000_000),
-                    releases: policy.releases(),
+                    holder: replica.holder().render(),
+                    grace_ns: replica.grace_secs().saturating_mul(1_000_000_000),
+                    releases: replica.retention.releases(),
                     release_floor,
                 },
             );
@@ -1288,7 +1232,7 @@ fn current_content(
 /// another origin publishes the same bytes, when a `take` adopts them, or when
 /// a file is restored from a copy, and in each case the release was decided
 /// against a tree that has since changed its mind.
-fn replica_wants(
+fn content_wants(
     tx: &rusqlite::Connection,
     target: &ReplicaTarget,
     entry: &FileEntry,
@@ -1312,7 +1256,7 @@ fn replica_wants(
         params![root.as_bytes().to_vec(), target.holder, now],
     )?;
     tx.execute(
-        "INSERT INTO replica_want (root, holder, size, prev, first_wanted)
+        "INSERT INTO content_want (root, holder, size, prev, first_wanted)
          SELECT ?1, ?2, ?3, ?4, ?5
           WHERE NOT EXISTS (SELECT 1 FROM pins WHERE root = ?1 AND holder = ?2)
          ON CONFLICT(root, holder) DO NOTHING",
@@ -1377,7 +1321,7 @@ fn replica_releases(
     // A want for something on its way out is work nobody needs doing: the
     // cheaper order is to drop the intent rather than fetch and then release.
     tx.execute(
-        "DELETE FROM replica_want WHERE root = ?1 AND holder = ?2",
+        "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
         params![root.as_bytes().to_vec(), target.holder],
     )?;
     tx.execute(
@@ -1456,7 +1400,7 @@ fn apply_change(
                 put_entry_in(tx, origin, &space, &path, &entry)?;
                 if let Some(target) = target {
                     if let Some(root) = entry.content {
-                        replica_wants(tx, target, &entry, &root, now)?;
+                        content_wants(tx, target, &entry, &root, now)?;
                     }
                     // A tombstone supersedes its own content, and so does a
                     // rewrite. Both land here; the reference check inside
@@ -2031,40 +1975,38 @@ mod tests {
     }
 
     #[test]
-    fn spaces_and_mirrors() {
+    fn sources_and_replicas_are_independent() {
         let (_d, store) = store();
-        store.put_space("media", Some("/srv/media")).unwrap();
-        store.put_space("media", Some("/srv/media2")).unwrap();
-        assert_eq!(store.spaces().unwrap().len(), 1);
+        store
+            .put_source("media", SourceKind::Filesystem, Some("/srv/media"))
+            .unwrap();
+        store
+            .put_source("media", SourceKind::Filesystem, Some("/srv/media2"))
+            .unwrap();
+        assert_eq!(store.sources().unwrap().len(), 1);
         assert_eq!(
-            store.space("media").unwrap().unwrap().local_path.as_deref(),
+            store
+                .source("media")
+                .unwrap()
+                .unwrap()
+                .local_path
+                .as_deref(),
             Some("/srv/media2")
         );
-        store.put_detached_space("cloud").unwrap();
-        assert_eq!(store.space("cloud").unwrap().unwrap().local_path, None);
-        assert!(store.remove_space("media").unwrap());
-        assert!(!store.remove_space("media").unwrap());
-
-        // A mirror is keyed by the directory it writes into, and carries the
-        // version policy it materializes under (§7.2).
+        store.put_source("cloud", SourceKind::Api, None).unwrap();
+        assert_eq!(store.source("cloud").unwrap().unwrap().local_path, None);
         store
-            .put_mirror("/mnt/nas-media", "media", &VersionPolicy::Newest)
+            .put_replica(&ReplicaRow {
+                space: "media".into(),
+                retention: ReplicaPolicy::Current,
+                grace: Some(60),
+                budget: Some(1024),
+                checkout_path: Some("/mnt/media".into()),
+            })
             .unwrap();
-        assert_eq!(store.mirrors().unwrap().len(), 1);
-        let policy = VersionPolicy::Origin(origin_named("nas"));
-        store
-            .put_mirror("/mnt/nas-media", "media", &policy)
-            .unwrap();
-        let mirrors = store.mirrors().unwrap();
-        assert_eq!(mirrors.len(), 1, "re-pointing a directory is an update");
-        assert_eq!(mirrors[0].policy, policy);
-        assert_eq!(
-            store.mirror("/mnt/nas-media").unwrap().unwrap().space,
-            "media"
-        );
-        assert!(store.mirror("/elsewhere").unwrap().is_none());
-        assert!(store.remove_mirror("/mnt/nas-media").unwrap());
-        assert!(!store.remove_mirror("/mnt/nas-media").unwrap());
+        assert!(store.remove_source("media").unwrap());
+        assert!(store.replica("media").unwrap().is_some());
+        assert!(!store.remove_source("media").unwrap());
 
         // Scanner state round-trips the same way.
         let f = LocalFile {

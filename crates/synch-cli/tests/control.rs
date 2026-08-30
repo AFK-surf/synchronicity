@@ -298,9 +298,8 @@ fn cat(reference: &str, range: Option<&str>, from: Option<&str>) -> Command {
     Command::Cat(pb::Cat {
         reference: reference.into(),
         range: range.map(String::from),
-        from: from.map(String::from),
-        strict: false,
         root: None,
+        select: from.map(|origin| format!("origin={origin}")),
     })
 }
 
@@ -341,10 +340,14 @@ fn key_ls() -> Command {
     Command::KeyLs(pb::KeyLs {})
 }
 fn space_ls() -> Command {
-    Command::SpaceLs(pb::SpaceLs { id: String::new() })
+    Command::SourceLs(pb::SourceLs {
+        space: String::new(),
+    })
 }
 fn scan() -> Command {
-    Command::Scan(pb::Scan {})
+    Command::SourceScan(pb::SourceScan {
+        space: String::new(),
+    })
 }
 fn sync_now() -> Command {
     Command::SyncNow(pb::SyncNow {})
@@ -388,33 +391,42 @@ fn domain_clear() -> Command {
     Command::DomainClear(pb::DomainClear {})
 }
 fn fill(reference: &str, from: Option<&str>, force: bool, dry_run: bool) -> Command {
-    Command::Fill(pb::Fill {
+    Command::AdoptTree(pb::AdoptTree {
         reference: reference.into(),
-        from: from.map(String::from),
-        strict: false,
-        force,
+        select: from.map(|origin| format!("origin={origin}")),
+        replace: force,
         dry_run,
     })
 }
 fn mirror_add(space: &str, path: &str, policy: Option<&str>) -> Command {
-    Command::MirrorAdd(pb::MirrorAdd {
+    Command::ReplicaAdd(pb::ReplicaAdd {
         space: space.into(),
-        path: path.into(),
-        policy: policy.map(String::from),
+        retention: policy.unwrap_or("current").into(),
+        grace: None,
+        budget: None,
+        checkout: Some(path.into()),
     })
 }
 fn mirror_ls() -> Command {
-    Command::MirrorLs(pb::MirrorLs {})
+    Command::ReplicaLs(pb::ReplicaLs {
+        space: String::new(),
+    })
 }
 fn mirror_sync() -> Command {
-    Command::MirrorSync(pb::MirrorSync {})
+    Command::ReplicaSync(pb::ReplicaSync {
+        space: String::new(),
+    })
 }
-fn mirror_rm(path: &str) -> Command {
-    Command::MirrorRm(pb::MirrorRm { path: path.into() })
+fn replica_rm(path: &str) -> Command {
+    Command::ReplicaRm(pb::ReplicaRm {
+        space: path.into(),
+        pin_held: false,
+    })
 }
 fn pin_add(target: &str) -> Command {
     Command::PinAdd(pb::PinAdd {
         target: target.into(),
+        select: None,
     })
 }
 fn pin_ls() -> Command {
@@ -423,10 +435,15 @@ fn pin_ls() -> Command {
 fn pin_rm(target: &str) -> Command {
     Command::PinRm(pb::PinRm {
         target: target.into(),
+        select: None,
     })
 }
 fn doctor(rebuild: bool) -> Command {
-    Command::Doctor(pb::Doctor { rebuild })
+    if rebuild {
+        Command::RepairRebuildViews(pb::RepairRebuildViews {})
+    } else {
+        Command::Doctor(pb::Doctor {})
+    }
 }
 fn daemon_status() -> Command {
     Command::DaemonStatus(pb::DaemonStatus {})
@@ -453,57 +470,50 @@ fn cloud_enable() -> Command {
     Command::CloudEnable(pb::CloudEnable {})
 }
 fn replicating_space_add(id: &str, path: &str, policy: &str, grace: i64) -> Command {
-    Command::SpaceAdd(pb::SpaceAdd {
-        id: id.into(),
-        path: path.into(),
-        detached: false,
-        replicate: Some(policy.into()),
+    let _ = path;
+    Command::ReplicaAdd(pb::ReplicaAdd {
+        space: id.into(),
+        retention: policy.into(),
         grace: Some(grace),
         budget: None,
+        checkout: None,
     })
 }
 fn space_set(id: &str, grace: Option<i64>, budget: Option<u64>) -> Command {
-    Command::SpaceSet(pb::SpaceSet {
-        id: id.into(),
-        replicate: None,
-        no_replicate: false,
-        release: false,
+    Command::ReplicaSet(pb::ReplicaSet {
+        space: id.into(),
+        retention: None,
         grace,
         budget,
+        no_budget: false,
+        checkout: None,
+        no_checkout: false,
     })
 }
 fn space_ls_one(id: &str) -> Command {
-    Command::SpaceLs(pb::SpaceLs { id: id.into() })
+    Command::ReplicaLs(pb::ReplicaLs { space: id.into() })
 }
 fn space_add(id: &str, path: &str) -> Command {
-    Command::SpaceAdd(pb::SpaceAdd {
-        id: id.into(),
+    Command::SourceAdd(pb::SourceAdd {
+        space: id.into(),
         path: path.into(),
-        detached: false,
-        replicate: None,
-        grace: None,
-        budget: None,
+        api: false,
     })
 }
-fn detached_space_add(id: &str) -> Command {
-    Command::SpaceAdd(pb::SpaceAdd {
-        id: id.into(),
+fn api_source_add(id: &str) -> Command {
+    Command::SourceAdd(pb::SourceAdd {
+        space: id.into(),
         path: String::new(),
-        detached: true,
-        replicate: None,
-        grace: None,
-        budget: None,
+        api: true,
     })
 }
 fn space_rm(id: &str) -> Command {
-    Command::SpaceRm(pb::SpaceRm {
-        id: id.into(),
-        release: false,
-    })
+    Command::SourceRm(pb::SourceRm { space: id.into() })
 }
 fn take(reference: &str) -> Command {
-    Command::Take(pb::Take {
+    Command::AdoptPath(pb::AdoptPath {
         reference: reference.into(),
+        select: None,
     })
 }
 
@@ -696,33 +706,29 @@ async fn every_command_variant_round_trips() {
         "there is nothing left to clear"
     );
 
-    // Mirrors.
-    let mirror_dir = tempfile::tempdir().unwrap();
-    let mirror_path = mirror_dir.path().to_string_lossy().into_owned();
-    let mirroring = says(
+    // Replica checkout.
+    let checkout_dir = tempfile::tempdir().unwrap();
+    let checkout_path = checkout_dir.path().to_string_lossy().into_owned();
+    let replicating = says(
         data_dir,
-        mirror_add("media", &mirror_path, Some("origin=laptop@cluster.example")),
-        "mirroring",
+        mirror_add("media", &checkout_path, None),
+        "replicating",
     )
     .await;
-    assert!(
-        mirroring.contains("origin=laptop@cluster.example"),
-        "{mirroring}"
-    );
-    let mirror_ls = says(data_dir, mirror_ls(), "media").await;
-    assert!(
-        mirror_ls.contains("origin=laptop@cluster.example"),
-        "{mirror_ls}"
-    );
+    assert!(replicating.contains("current"), "{replicating}");
+    let replica_ls = says(data_dir, mirror_ls(), "media").await;
+    assert!(replica_ls.contains("checkout"), "{replica_ls}");
     let _ = frames(data_dir, mirror_sync()).await.unwrap();
-    says(data_dir, mirror_rm(&mirror_path), "removed").await;
+    says(data_dir, replica_rm("media"), "removed").await;
 
     // Pins, by root.
     let root = blake3::hash(b"hello").to_hex().to_string();
     says(data_dir, pin_add(&root), &root).await;
     says(data_dir, pin_ls(), &root).await;
     says(data_dir, pin_rm(&root), &root).await;
-    assert!(lines(data_dir, pin_ls()).await.is_empty());
+    let pins = lines(data_dir, pin_ls()).await;
+    assert!(pins.contains("source:media"), "{pins}");
+    assert!(!pins.contains("operator"), "{pins}");
 
     // Reports.
     let diag = says(data_dir, doctor(false), "origin: nas@cluster.example").await;
@@ -798,14 +804,15 @@ async fn errors_cross_the_socket_with_their_code() {
         (ls("stranger@cluster.example:media"), ErrorCode::NotFound),
         (status(Some("media/gone.txt")), ErrorCode::NotFound),
         (space_rm("ghost"), ErrorCode::NotFound),
-        (mirror_rm("/no/such/mirror"), ErrorCode::NotFound),
+        (replica_rm("/no/such/replica"), ErrorCode::NotFound),
         (fill("nospace", None, false, false), ErrorCode::NotFound),
         (
             key_activate(&SecretKey::generate().public().to_z32()),
             ErrorCode::NotFound,
         ),
-        // A key-identified origin has no name to rebind; `take` of our own
-        // entry is a mistake rather than a not-found.
+        // A key-identified origin has no name to rebind. Adoption still
+        // resolves the path before it can decide who published it, so an
+        // absent own path is not found.
         (
             cat(
                 "nas@cluster.example:media/pinned.txt",
@@ -816,20 +823,24 @@ async fn errors_cross_the_socket_with_their_code() {
         ),
         (pin_add("not-hex"), ErrorCode::Invalid),
         (trust_add("not-a-key", None, None), ErrorCode::Invalid),
-        (take("nas@cluster.example:media/a.txt"), ErrorCode::Invalid),
+        (take("nas@cluster.example:media/a.txt"), ErrorCode::NotFound),
         // Zero peers reached is a failure, the per-peer lines streaming first.
         (sync_now(), ErrorCode::Unavailable),
     ];
     for (command, code) in cases {
-        assert_eq!(failure(data_dir, command.clone()).await, *code);
+        assert_eq!(
+            failure(data_dir, command.clone()).await,
+            *code,
+            "unexpected error class for {command:?}"
+        );
     }
 
     daemon.shutdown().await;
 }
 
-/// `synch fill` over the socket (§7.2): a peer's content lands in the space
+/// `synch adopt tree` over the socket (§7.2): a peer's content lands in the space
 /// this node publishes from, a local file that differs is reported rather than
-/// overwritten, and the scan afterwards publishes what was filled as ours.
+/// overwritten, and the adoption publishes what it placed before returning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
     let dir = tempfile::tempdir().unwrap();
@@ -873,7 +884,7 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
 
     let filled = says(data_dir, fill("media", None, false, false), "filled 1").await;
     assert!(filled.contains("differing media/mine.txt"), "{filled}");
-    assert!(filled.contains("the next scan publishes"), "{filled}");
+    assert!(filled.contains("published seq"), "{filled}");
     assert_eq!(
         std::fs::read(space.path().join("theirs.txt")).unwrap(),
         b"theirs"
@@ -884,8 +895,8 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
         "a fill never overwrites what is here without --force"
     );
 
-    // And now it is ours as well: one version, two attestors.
-    says(data_dir, scan(), "published seq").await;
+    // It was published before adoption returned, so it is already ours as
+    // well: one version, two attestors.
     says(
         data_dir,
         status(Some("media/theirs.txt")),
@@ -920,11 +931,10 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
         .await;
     let strict = says(
         data_dir,
-        Command::Fill(pb::Fill {
+        Command::AdoptTree(pb::AdoptTree {
             reference: "media".into(),
-            from: None,
-            strict: true,
-            force: false,
+            select: Some("strict".into()),
+            replace: false,
             dry_run: false,
         }),
         "skipped media/split.txt",
@@ -1007,13 +1017,13 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
 
     // Scanning refuses before hashing anything: the state, not the request,
     // is what is wrong, so the code says "unavailable" (§3.4).
-    let error = failure_message(data_dir, Command::Scan(pb::Scan {})).await;
+    let error = failure_message(data_dir, scan()).await;
     assert_eq!(error.code, ErrorCode::Unavailable, "{error:?}");
     assert!(error.message.contains("synch recover"), "{error:?}");
     assert!(error.message.contains("seq 100"), "{error:?}");
 
     // Doctor says the same thing in its own words.
-    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor {})).await;
     assert!(doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
     assert!(doctor.contains("seq 100"), "{doctor}");
 
@@ -1042,9 +1052,9 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     assert!(text.contains("publishing resumes at seq 105"), "{text}");
 
     // And the node publishes again, above everything that was advertised.
-    let scan = lines(data_dir, Command::Scan(pb::Scan {})).await;
+    let scan = lines(data_dir, scan()).await;
     assert!(scan.contains("published seq 105"), "{scan}");
-    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor {})).await;
     assert!(!doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
 
     daemon.shutdown().await;
@@ -1192,17 +1202,21 @@ async fn replication_is_configured_and_reported_over_the_socket() {
 
     let added = lines(
         data_dir,
-        replicating_space_add("media", &space.path().to_string_lossy(), "tree", 7 * 86400),
+        replicating_space_add(
+            "media",
+            &space.path().to_string_lossy(),
+            "current",
+            7 * 86400,
+        ),
     )
     .await;
-    assert!(added.contains("replicating media (tree)"), "{added}");
     assert!(
-        added.contains("recoverable here for 7d"),
-        "the reply must state the recovery window it just committed to: {added}"
+        added.contains("replicating media with current retention"),
+        "{added}"
     );
 
     let listed = lines(data_dir, space_ls_one("media")).await;
-    assert!(listed.contains("replicate tree"), "{listed}");
+    assert!(listed.contains("current"), "{listed}");
     assert!(listed.contains("grace 7d"), "{listed}");
 
     // Tuning the budget must not touch the grace window.
@@ -1364,8 +1378,8 @@ async fn a_detached_space_put_publishes_from_the_cas_without_a_checkout() {
     let data_dir = dir.path();
     says(
         data_dir,
-        detached_space_add("media"),
-        "holding detached space media",
+        api_source_add("media"),
+        "publishing media through APIs",
     )
     .await;
 
@@ -1380,7 +1394,7 @@ async fn a_detached_space_put_publishes_from_the_cas_without_a_checkout() {
     let (bytes, local_path, local_files) = synch_core::offload(move || {
         Ok::<_, synch_engine::EngineError>((
             inspecting.store().read_all(&root)?,
-            inspecting.store().space("media")?.unwrap().local_path,
+            inspecting.store().source("media")?.unwrap().local_path,
             inspecting.store().local_files("media")?,
         ))
     })
@@ -1574,7 +1588,7 @@ async fn one_daemon_per_datadir_until_the_old_one_is_fully_gone() {
     }
 }
 
-/// §8: `synch take` of a tombstone deletes our copy and publishes our own.
+/// §8: `synch adopt path` of a tombstone deletes our copy and publishes our own.
 /// The live form, checked first here, is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn take_adopts_a_peers_deletion_over_the_socket() {
@@ -1665,7 +1679,7 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
         let space_path = space.path().to_path_buf();
         let (peer_id, peer_addr) = (silent.id(), silent_addr.clone());
         off_runtime(move || {
-            seeding.add_space("s", &space_path).unwrap();
+            seeding.add_filesystem_source("s", &space_path).unwrap();
             seeding
                 .store()
                 .put_binding(&synch_store::Binding {
@@ -1757,7 +1771,7 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     let status = lines(data_dir, Command::DaemonStatus(pb::DaemonStatus {})).await;
     assert!(status.contains("NO RESOLVER"), "{status}");
     assert!(status.contains("membership cannot refresh"), "{status}");
-    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor {})).await;
     assert!(doctor.contains("no DNSKEY records"), "{doctor}");
 
     // A refresh over the socket uses the daemon's resolver, and refuses
@@ -1778,7 +1792,7 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     assert!(status.contains("rekor require"), "{status}");
     assert!(status.contains("anchor icann-root"), "{status}");
     assert!(status.contains("log key(s) pinned"), "{status}");
-    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor {})).await;
     assert!(doctor.contains("log key "), "{doctor}");
     assert!(doctor.contains("clock: usable"), "{doctor}");
 
@@ -1819,7 +1833,10 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
     let dir = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
-    daemon.node.add_space("code", space.path()).unwrap();
+    daemon
+        .node
+        .add_filesystem_source("code", space.path())
+        .unwrap();
 
     let elf = synch_cc::compile(
         include_str!("../../synch-sock/examples/echo.c"),

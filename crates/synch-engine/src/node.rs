@@ -8,14 +8,14 @@ use std::{
 use iroh::EndpointAddr;
 use iroh_base::SecretKey;
 use synch_core::{
-    blob_key, file_key, manifest_key, now_ns, validate_space, BlobAd, Delegation, Hash, NodeId,
-    NodeManifest, OriginId, SignedHead, SpaceInfo, SOFTWARE,
+    blob_key, file_key, manifest_key, now_ns, parse_file_key, validate_space, BlobAd, Delegation,
+    EntryKind, Hash, NodeId, NodeManifest, OriginId, SignedHead, SpaceInfo, SOFTWARE,
 };
 use synch_mpt::Trie;
 use synch_net::Net;
 
 use crate::reconcile::Syncer;
-use synch_store::{Binding, BindingSource, KeyState, Slot, Store};
+use synch_store::{Binding, BindingSource, KeyState, Slot, SourceKind, Store};
 
 use crate::{
     config::NodeConfig,
@@ -96,11 +96,11 @@ struct NodeInner {
     /// `root_retention`. The entries expire, so a root that later becomes
     /// available is picked up.
     provider_misses: std::sync::Mutex<std::collections::HashMap<Hash, ProviderMiss>>,
-    /// What the running mirror passes believe about the file at each target
+    /// What the running checkout passes believe about the file at each target
     /// path, and the stat that belief is anchored to — so a quiet pass can
     /// skip re-hashing every file it has already written or read
     /// (`docs/DELTA-SYNC.md` §3.5).
-    mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
+    checkout_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, CheckoutWrite>>,
     /// Socket program bytes, shared across the admissions of one content root.
     program_bytes: Arc<crate::sockets::ProgramBytesCache>,
     /// The socket worker pool, or `None` where this build has no eBPF runtime
@@ -133,17 +133,17 @@ struct NodeInner {
     dns_resolver: std::sync::Mutex<crate::membership::ResolverSlot>,
     /// Rung when the unified tree may have changed — an accepted head flipped
     /// complete, a local publish landed, a mirror was added — so the standing
-    /// mirror loop materializes it without waiting out its interval (§7.2).
-    mirror_wake: Arc<tokio::sync::Notify>,
+    /// checkout loop materializes it without waiting out its interval (§7.2).
+    checkout_wake: Arc<tokio::sync::Notify>,
     replica_wake: Arc<tokio::sync::Notify>,
     replica_rotation: Arc<std::sync::atomic::AtomicUsize>,
     /// Rung when a head lands in the pending slot: its trie has to be fetched
     /// and only an anti-entropy round does that.
     pending_wake: Arc<tokio::sync::Notify>,
-    /// Serializes mirror passes, whether the standing loop or `synch mirror
+    /// Serializes checkout passes, whether the standing loop or `synch replica
     /// sync` asked: two passes over one root would plan against each other's
     /// half-written state.
-    mirror_lock: tokio::sync::Mutex<()>,
+    checkout_lock: tokio::sync::Mutex<()>,
     /// Serializes socket tree-write commits (`docs/TREE-WRITES.md` §5.3): a
     /// conditional commit's check and the staging that follows it must not
     /// interleave with another socket writer's commit of the same path. The
@@ -165,12 +165,12 @@ struct NodeInner {
     >,
 }
 
-/// What mirror passes believe about the file at one target, and the stat
+/// What checkout passes believe about the file at one target, and the stat
 /// that belief is anchored to.
 ///
-/// See [`Node::note_mirror_write`] for why a pass remembers anything at all.
+/// See [`Node::note_checkout_write`] for why a pass remembers anything at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MirrorWrite {
+pub(crate) struct CheckoutWrite {
     /// The content root the file is believed to be.
     pub(crate) content: Hash,
     /// The file's length when recorded.
@@ -183,14 +183,14 @@ pub(crate) struct MirrorWrite {
     pub(crate) recorded_at: i64,
 }
 
-impl MirrorWrite {
+impl CheckoutWrite {
     /// A record for the file now at `target`, believed to be `content`: the
     /// stat the belief is anchored to, taken just after the write or hash
     /// that established it. `None` if the file is already gone, in which case
     /// there is nothing to anchor.
-    pub(crate) fn of(target: &Path, content: Hash) -> Option<MirrorWrite> {
+    pub(crate) fn of(target: &Path, content: Hash) -> Option<CheckoutWrite> {
         let stat = std::fs::metadata(target).ok().filter(|m| m.is_file())?;
-        Some(MirrorWrite {
+        Some(CheckoutWrite {
             content,
             size: stat.len(),
             mtime_ns: crate::scanner::mtime_nanos(&stat),
@@ -377,7 +377,6 @@ impl Node {
                 txn.delete_origin_entries(previous)?;
                 txn.delete_origin_providers(previous)?;
                 txn.clear_observed_head(previous)?;
-                txn.rewrite_mirror_policies(previous, &adopted)?;
                 // The floor was a promise about seqs under the old name; the
                 // new one has no history for it to bound (§3.4).
                 txn.clear_publish_floor()?;
@@ -572,14 +571,14 @@ impl Node {
             let store = Store::open(&data_dir)?;
             if desired_backend != "local" {
                 let path_spaces: Vec<String> = store
-                    .spaces()?
+                    .sources()?
                     .into_iter()
                     .filter(|space| space.local_path.is_some())
-                    .map(|space| space.id)
+                    .map(|space| space.space)
                     .collect();
                 if !path_spaces.is_empty() {
                     return Err(EngineError::invalid(format!(
-                        "cloud CAS requires detached spaces; path-backed space(s): {}",
+                        "cloud CAS requires API sources; path-backed space(s): {}",
                         path_spaces.join(", ")
                     )));
                 }
@@ -688,14 +687,14 @@ impl Node {
         // the mirror bell. One syncer does both: it is handed to the endpoint
         // as the head sink the serve side reconciles through, and it is the
         // same object this node's own rounds dial with.
-        let mirror_wake = Arc::new(tokio::sync::Notify::new());
+        let checkout_wake = Arc::new(tokio::sync::Notify::new());
         let replica_wake = Arc::new(tokio::sync::Notify::new());
         // And every head adopted as *pending* rings the anti-entropy loop: its
         // trie is not here, and until somebody dials for it the head is a
         // pointer no reading surface follows (§5.3).
         let pending_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone())
-            .on_change(mirror_wake.clone())
+            .on_change(checkout_wake.clone())
             .on_replica(replica_wake.clone())
             .on_pending(pending_wake.clone());
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
@@ -774,18 +773,18 @@ impl Node {
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 provider_misses: std::sync::Mutex::new(Default::default()),
-                mirror_writes: std::sync::Mutex::new(Default::default()),
+                checkout_writes: std::sync::Mutex::new(Default::default()),
                 program_bytes: crate::sockets::ProgramBytesCache::new(),
                 sockets: socket_pool,
                 socket_authorization: std::sync::RwLock::new(()),
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
-                mirror_wake,
+                checkout_wake,
                 replica_wake,
                 replica_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_wake,
-                mirror_lock: tokio::sync::Mutex::new(()),
+                checkout_lock: tokio::sync::Mutex::new(()),
                 tree_write_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
                 cloud: std::sync::Mutex::new(Default::default()),
@@ -1219,43 +1218,45 @@ impl Node {
             .and_then(|bytes| decode_addr(*node_id, &bytes)))
     }
 
-    // ---- spaces -----------------------------------------------------------
+    // ---- sources ----------------------------------------------------------
 
     /// Registers a local directory as a space (§4.1).
     ///
-    /// Space roots may not overlap a mirror target, which is what makes the
+    /// Source roots may not overlap a replica checkout, which is what makes the
     /// "no echo" guarantee structural rather than conventional (§7.2).
-    pub fn add_space(&self, id: &str, path: impl AsRef<Path>) -> Result<()> {
+    pub fn add_filesystem_source(&self, id: &str, path: impl AsRef<Path>) -> Result<()> {
         if self.cas_backend().remote_upload_parts() {
             return Err(EngineError::invalid(
-                "a cloud-CAS node may only add detached spaces; use `synch space add <id> --detached`",
+                "a cloud-CAS node may only add API sources; use `synch source add <id> --api`",
             ));
         }
         validate_space(id)?;
         let path = canonical_dir(path.as_ref())?;
-        for mirror in self.store().mirrors()? {
-            if paths_overlap(&path, &stored_root(&mirror.local_path)) {
-                return Err(EngineError::invalid(format!(
-                    "space root {} overlaps mirror {}",
-                    path.display(),
-                    mirror.local_path
-                )));
+        for replica in self.store().replicas()? {
+            if let Some(checkout) = replica.checkout_path {
+                if paths_overlap(&path, &stored_root(&checkout)) {
+                    return Err(EngineError::invalid(format!(
+                        "source root {} overlaps replica checkout {}",
+                        path.display(),
+                        checkout
+                    )));
+                }
             }
         }
-        for space in self.store().spaces()? {
+        for space in self.store().sources()? {
             let Some(local_path) = space.local_path.as_deref() else {
-                if space.id == id {
+                if space.space == id {
                     return Err(EngineError::invalid(format!(
-                        "space {id} is detached; remove it before attaching a local directory"
+                        "source {id} is API-only; remove it before attaching a local directory"
                     )));
                 }
                 continue;
             };
-            if space.id != id && paths_overlap(&path, &stored_root(local_path)) {
+            if space.space != id && paths_overlap(&path, &stored_root(local_path)) {
                 return Err(EngineError::invalid(format!(
-                    "space root {} overlaps space {}",
+                    "source root {} overlaps source {}",
                     path.display(),
-                    space.id
+                    space.space
                 )));
             }
             // Re-pointing an existing space at a different directory is
@@ -1263,7 +1264,7 @@ impl Node {
             // deletion. `put_space` upserts `local_path` and clears neither
             // `local_files` nor `entries`, so the next scan walks the new root,
             // finds none of the old paths, and tombstones every one of them —
-            // then every mirror in the cluster deletes its copy. The operator
+            // then every checkout following the view deletes its copy. The operator
             // asking for this usually means "re-sync this space from my peers",
             // which is the exact opposite.
             //
@@ -1271,12 +1272,12 @@ impl Node {
             // directory, with the same reasoning in its comment; this is the
             // sibling case it does not test, where the root is present, is a
             // directory, and is simply somewhere else.
-            if space.id == id {
+            if space.space == id {
                 let current = stored_root(local_path);
                 if current != path {
                     return Err(EngineError::invalid(format!(
-                        "space {id} is already rooted at {}. Re-pointing it at {} would publish a \
-                         deletion for every path under the old root: remove the space first if \
+                        "source {id} is already rooted at {}. Re-pointing it at {} would publish a \
+                         deletion for every path under the old root: remove the source first if \
                          that is what you want, or move the directory into place instead",
                         current.display(),
                         path.display()
@@ -1284,37 +1285,38 @@ impl Node {
                 }
             }
         }
-        self.store().put_space(id, Some(&path.to_string_lossy()))?;
+        self.store()
+            .put_source(id, SourceKind::Filesystem, Some(&path.to_string_lossy()))?;
         self.spaces_changed();
         Ok(())
     }
 
-    /// Registers a space without a local checkout (`docs/SERVERLESS.md` §10).
-    pub fn add_detached_space(&self, id: &str) -> Result<()> {
+    /// Registers an API-only publisher (`docs/SERVERLESS.md` §10).
+    pub fn add_api_source(&self, id: &str) -> Result<()> {
         validate_space(id)?;
-        if let Some(space) = self.store().space(id)? {
-            return match space.local_path {
+        if let Some(source) = self.store().source(id)? {
+            return match source.local_path {
                 None => Ok(()),
                 Some(path) => Err(EngineError::invalid(format!(
-                    "space {id} is already rooted at {path}; remove it before detaching it"
+                    "source {id} is already rooted at {path}; remove it before making it API-only"
                 ))),
             };
         }
-        self.store().put_detached_space(id)?;
+        self.store().put_source(id, SourceKind::Api, None)?;
         self.spaces_changed();
         Ok(())
     }
 
-    /// Removes a space and its published entries.
+    /// Plans removal of a source's published entries.
     ///
     /// Staging the removal is half of a publish, so it takes the same recovery
-    /// gate (§3.4): a node that cannot publish must not drop the space either,
+    /// gate (§3.4): a node that cannot publish must not drop the source either,
     /// or the unpublish would be lost with it.
-    pub fn remove_space(&self, id: &str, release: bool) -> Result<Vec<StagedChange>> {
+    pub fn source_removal(&self, id: &str) -> Result<Vec<StagedChange>> {
         // "removed ghost and unpublished 0 record(s)" for a space that never
         // existed is a lie with a friendly face.
-        let Some(space) = self.store().space(id)? else {
-            return Err(EngineError::NotFound(format!("no space {id}")));
+        let Some(_source) = self.store().source(id)? else {
+            return Err(EngineError::NotFound(format!("no source {id}")));
         };
         // A space this node only replicates has nothing of its own under the
         // prefix, so the scan below would stage nothing and the outcome would
@@ -1323,40 +1325,31 @@ impl Node {
         // and a node that cannot publish must not be stopped from giving up a
         // space it never published into (`docs/REPLICATION.md` §3.2).
         // Or has published: a record advertised under an earlier answer to that
-        // predicate must still be retractable, or `space rm` leaves it behind.
-        let publishes_here = publishes_into(&space, self.store().count_entries(self.origin(), id)?)
-            || self.space_info_of(self.origin(), id)?.is_some();
-        if publishes_here {
-            self.ensure_publishable()?;
-        }
+        // predicate must still be retractable, or `source rm` leaves it behind.
+        self.ensure_publishable()?;
         let mut staged = Vec::new();
-        if publishes_here {
-            let root = self.current_root()?;
-            let trie = Trie::new(self.store().as_ref());
-            let prefix = synch_core::space_prefix(id)?;
-            for (key, _) in trie.scan(root, &prefix, None, None)? {
-                staged.push((key, None));
-            }
-            // The space's advertised record goes with its entries; leaving it
-            // would advertise a space this node no longer has.
-            staged.push(self.space_info_removal(id)?);
+        let root = self.current_root()?;
+        let trie = Trie::new(self.store().as_ref());
+        let prefix = synch_core::space_prefix(id)?;
+        for (key, _) in trie.scan(root, &prefix, None, None)? {
+            staged.push((key, None));
         }
-        self.store().remove_space(id)?;
+        staged.push(self.space_info_removal(id)?);
+        Ok(staged)
+    }
+
+    /// Commits local source-role removal after its trie removal has published.
+    /// Keeping this second prevents a failed publish from leaving live own
+    /// entries behind with no source role able to retract them.
+    pub fn finish_source_removal(&self, id: &str) -> Result<()> {
+        if !self.store().remove_source(id)? {
+            return Err(EngineError::NotFound(format!("no source {id}")));
+        }
         for path in self.store().local_files(id)? {
             self.store().remove_local_file(id, &path)?;
         }
-        // Whatever this space replicated stops being wanted either way; the
-        // pins it already holds go only when asked, because re-fetching
-        // terabytes is not something a command should do because an operator
-        // typed the opposite of `add`.
-        let holder = space.holder();
-        self.store().drop_wants(&holder)?;
-        if release {
-            self.store().unpin_all(&holder)?;
-        }
         self.spaces_changed();
-        self.replica_wake().notify_one();
-        Ok(staged)
+        Ok(())
     }
 
     /// Tells the watcher that the set of spaces changed (§7.1).
@@ -1376,14 +1369,14 @@ impl Node {
     }
 
     /// The bell that wakes the standing mirror loop (§7.2).
-    pub(crate) fn mirror_wake(&self) -> Arc<tokio::sync::Notify> {
-        self.inner.mirror_wake.clone()
+    pub(crate) fn checkout_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.checkout_wake.clone()
     }
 
     /// The bell a replication sweep waits on (`docs/REPLICATION.md` §3.4).
     ///
     /// Its own rather than shared with the mirrors': the two react to the same
-    /// events but at different costs, and a mirror pass over an unchanged tree
+    /// events but at different costs, and a checkout pass over an unchanged tree
     /// must not drag a sweep of four million entries along with it.
     pub(crate) fn replica_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.replica_wake.clone()
@@ -1401,9 +1394,9 @@ impl Node {
     }
 
     /// Serializes one materialization pass against every other on this node:
-    /// a mirror pass (§7.2) and a `synch fill` of a space (fill.rs) alike.
+    /// a checkout pass (§7.2) and a `synch adopt tree` of a space (fill.rs) alike.
     pub(crate) async fn lock_materialization(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.inner.mirror_lock.lock().await
+        self.inner.checkout_lock.lock().await
     }
 
     /// The resolver slot every membership refresh in this process reads from.
@@ -1501,11 +1494,35 @@ impl Node {
 
                 let trie = Trie::new(txn);
                 let mut root = old_root;
+                let mut changed_spaces = std::collections::HashSet::new();
+                let mut source_ads = std::collections::HashMap::new();
                 for (key, value) in staged {
+                    if let Ok((space, _path)) = parse_file_key(key) {
+                        changed_spaces.insert(space.to_string());
+                        if let Some(bytes) = value {
+                            let entry = crate::scanner::decode_entry(bytes)?;
+                            if matches!(entry.kind, EntryKind::File | EntryKind::Socket) {
+                                let content = entry.content.ok_or_else(|| {
+                                    EngineError::invalid(format!(
+                                        "live own entry in {space} has no content root"
+                                    ))
+                                })?;
+                                txn.hold_source_blob(&space, &content, entry.size, now)?;
+                                source_ads.insert(content, entry.size);
+                            }
+                        }
+                    }
                     root = match value {
                         Some(v) => trie.insert(root, key, v)?,
                         None => trie.remove(root, key)?,
                     };
+                }
+                // Publication owns the invariant: callers cannot accidentally
+                // publish an own live file without also advertising the
+                // complete durable content that the source hold just proved.
+                for (content, size) in source_ads {
+                    let ad = synch_core::record::encode(&BlobAd::complete(size))?;
+                    root = trie.insert(root, &blob_key(&content), &ad)?;
                 }
                 if root == old_root {
                     return Ok(None);
@@ -1522,6 +1539,9 @@ impl Node {
                 // own when it took the slot (§10, v11).
                 txn.put_head(Slot::Complete, &head, now, now)?;
                 txn.materialize_diff(&origin, old_root, root)?;
+                for space in changed_spaces {
+                    txn.reconcile_source_holds(&origin, &space)?;
+                }
                 Ok(Some(head))
             })?;
 
@@ -1559,29 +1579,8 @@ impl Node {
     /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §5.5).
     pub(crate) fn space_info_changes(&self) -> Result<Vec<StagedChange>> {
         let mut out = Vec::new();
-        for space in self.store().spaces()? {
-            let entry_count = self.store().count_entries(self.origin(), &space.id)?;
-            // A space this node only replicates is not a space it publishes.
-            // The record says "here is my view of this space, and here is how
-            // much of it I have", and a replica's answer to the second half is
-            // permanently zero — advertising that would claim a space this node
-            // publishes nothing into (`docs/REPLICATION.md` §3.2). The
-            // predicate is shared with `remove_space`, so what is advertised
-            // and what is withdrawn cannot drift apart.
-            if !publishes_into(&space, entry_count) {
-                // Withdraw rather than merely stop refreshing. The predicate
-                // depends on `count_entries`, so it changes under a space that
-                // is standing still: a detached space that took gateway writes
-                // qualifies until its last tombstone ages out at
-                // `tombstone_ttl`, and after that nothing would refresh the
-                // record and `remove_space` would see the same answer and skip
-                // its removal. The record would sit in this node's own trie for
-                // ever, claiming a space it no longer participates in.
-                if self.space_info_of(self.origin(), &space.id)?.is_some() {
-                    out.push(self.space_info_removal(&space.id)?);
-                }
-                continue;
-            }
+        for source in self.store().sources()? {
+            let entry_count = self.store().count_entries(self.origin(), &source.space)?;
             let info = SpaceInfo {
                 v: synch_core::RECORD_VERSION,
                 // Local paths are host-private implementation details and are
@@ -1590,7 +1589,7 @@ impl Node {
                 entry_count,
             };
             let bytes = synch_core::record::encode(&info)?;
-            out.push((synch_core::space_info_key(&space.id)?, Some(bytes)));
+            out.push((synch_core::space_info_key(&source.space)?, Some(bytes)));
         }
         Ok(out)
     }
@@ -1658,7 +1657,7 @@ impl Node {
         Ok(Some((blob_key(root), Some(bytes))))
     }
 
-    /// Records what a mirror pass believes about the file at `target`, and
+    /// Records what a checkout pass believes about the file at `target`, and
     /// the stat that belief is anchored to (`docs/DELTA-SYNC.md` §3.5).
     ///
     /// The belief comes from one of two moments: the pass wrote the file
@@ -1685,27 +1684,27 @@ impl Node {
     ///   rotted before a pass wrote from it — are invisible until the next
     ///   restart's hash. That is the filesystem-integrity domain, and §2.1
     ///   delegates it there.
-    pub(crate) fn note_mirror_write(&self, target: &Path, write: MirrorWrite) {
-        self.mirror_writes().insert(target.to_path_buf(), write);
+    pub(crate) fn note_checkout_write(&self, target: &Path, write: CheckoutWrite) {
+        self.checkout_writes().insert(target.to_path_buf(), write);
     }
 
     /// What passes believe about `target`, if this process believes anything.
-    pub(crate) fn mirror_write_was(&self, target: &Path) -> Option<MirrorWrite> {
-        self.mirror_writes().get(target).cloned()
+    pub(crate) fn checkout_write_was(&self, target: &Path) -> Option<CheckoutWrite> {
+        self.checkout_writes().get(target).cloned()
     }
 
     /// Forgets what was believed about `target` — called when the file leaves
     /// the mirror, when the file is gone or the wrong length, and when a
     /// fresh write or hash re-anchors the belief.
-    pub(crate) fn forget_mirror_write(&self, target: &Path) {
-        self.mirror_writes().remove(target);
+    pub(crate) fn forget_checkout_write(&self, target: &Path) {
+        self.checkout_writes().remove(target);
     }
 
-    fn mirror_writes(
+    fn checkout_writes(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PathBuf, MirrorWrite>> {
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PathBuf, CheckoutWrite>> {
         self.inner
-            .mirror_writes
+            .checkout_writes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1813,16 +1812,6 @@ impl Node {
     pub fn key_for(&self, space: &str, path: &str) -> Result<Vec<u8>> {
         Ok(file_key(space, path)?)
     }
-}
-
-/// Whether this node publishes into a space, as opposed to only replicating it.
-///
-/// A checkout means it does — that is what the scanner walks — and so does
-/// having published an entry, which is how a detached space serves gateway
-/// writes without one. A space with neither is one this node holds copies of
-/// and asserts nothing about.
-fn publishes_into(space: &synch_store::SpaceRow, own_entries: u64) -> bool {
-    space.local_path.is_some() || own_entries > 0
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf> {
@@ -1961,21 +1950,13 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A zone's answer migrates everything keyed by the old name — mirror
-    /// pins, the floor, the record (§3.1).
+    /// A zone's answer migrates identity-bound state and clears the old floor.
     #[test]
     fn adopting_a_name_migrates_everything_keyed_by_the_old_one() {
         let dir = node_dir();
         let report = Node::init(dir.path(), None).unwrap();
         let previous = OriginId::Key(report.node_id);
         let store = Store::open(dir.path()).unwrap();
-        store
-            .put_mirror(
-                "/srv/mirror",
-                "media",
-                &synch_store::VersionPolicy::Origin(previous.clone()),
-            )
-            .unwrap();
         store.raise_publish_floor(500).unwrap();
 
         let named = OriginId::named("orb", "cluster.example").unwrap();
@@ -1994,11 +1975,6 @@ mod tests {
             .is_bound(&previous, &report.node_id, now_ns())
             .unwrap());
         assert!(store.complete_head(&previous).unwrap().is_none());
-        // The pin follows the name; left behind it selects nothing at all.
-        assert_eq!(
-            store.mirrors().unwrap()[0].policy.render(),
-            format!("origin={}", named.canonical())
-        );
         // The floor bounded seqs under a name nobody holds any more.
         assert_eq!(store.publish_floor().unwrap(), None);
 
@@ -2363,7 +2339,7 @@ mod tests {
     async fn manifests_round_trip_through_the_trie() {
         let (_d, node) = node().await;
         let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
         let mut staged = vec![node.manifest_change().unwrap()];
         staged.extend(node.space_info_changes().unwrap());
         node.publish(&staged).unwrap().unwrap();
@@ -2382,29 +2358,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spaces_may_not_overlap_mirrors() {
+    async fn sources_may_not_overlap_replica_checkouts() {
         let (_d, node) = node().await;
         let shared = tempfile::tempdir().unwrap();
         node.store()
-            .put_mirror(
-                &shared.path().to_string_lossy(),
-                "media",
-                &synch_store::VersionPolicy::Newest,
-            )
+            .put_replica(&synch_store::ReplicaRow {
+                space: "media".into(),
+                retention: synch_store::ReplicaPolicy::Current,
+                grace: Some(60),
+                budget: None,
+                checkout_path: Some(shared.path().to_string_lossy().into_owned()),
+            })
             .unwrap();
-        let err = node.add_space("media", shared.path()).unwrap_err();
-        assert!(err.to_string().contains("overlaps mirror"));
+        let err = node
+            .add_filesystem_source("media", shared.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("overlaps replica checkout"));
 
         // And a nested subdirectory is caught too, so "no echo" is structural.
         let nested = shared.path().join("sub");
-        assert!(node.add_space("nested", &nested).is_err());
+        assert!(node.add_filesystem_source("nested", &nested).is_err());
 
         // Spaces may not overlap each other either; re-adding the same space
         // id at the same path is a legal update.
         let a = tempfile::tempdir().unwrap();
-        node.add_space("a", a.path()).unwrap();
-        assert!(node.add_space("b", a.path().join("sub")).is_err());
-        node.add_space("a", a.path()).unwrap();
+        node.add_filesystem_source("a", a.path()).unwrap();
+        assert!(node
+            .add_filesystem_source("b", a.path().join("sub"))
+            .is_err());
+        node.add_filesystem_source("a", a.path()).unwrap();
 
         node.shutdown().await.unwrap();
     }
@@ -2440,7 +2422,11 @@ mod tests {
         Node::init(data.path(), None).unwrap();
         Store::open(data.path())
             .unwrap()
-            .put_space("media", Some(&checkout.path().to_string_lossy()))
+            .put_source(
+                "media",
+                synch_store::SourceKind::Filesystem,
+                Some(&checkout.path().to_string_lossy()),
+            )
             .unwrap();
         let mut config = NodeConfig::loopback(data.path());
         config.cloud = Some(synch_store::cloud::CloudConfig {
@@ -2500,7 +2486,7 @@ mod tests {
         // at all; an undecodable record fails the last of those steps.
         let (_d, node) = node().await;
         let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
+        node.add_filesystem_source("media", space.path()).unwrap();
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         let (_, head) = node.scan_and_publish().unwrap();
         let before = head.unwrap();
@@ -2515,7 +2501,7 @@ mod tests {
             Some(vec![0xffu8; 8]),
         )];
         let err = node.publish(&poison).unwrap_err().to_string();
-        assert!(err.contains("corrupt record"), "{err}");
+        assert!(err.contains("record:"), "{err}");
 
         // Nothing moved: not the head, not the history, not the views, not the
         // trie.
@@ -2538,6 +2524,43 @@ mod tests {
         std::fs::write(space.path().join("b.txt"), b"hello").unwrap();
         let (_, after) = node.scan_and_publish().unwrap();
         assert_eq!(after.unwrap().seq, before.seq + 1);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn own_file_publication_requires_and_advertises_durable_content() {
+        let (_d, node) = node().await;
+        node.add_api_source("media").unwrap();
+        let absent = Hash::new(b"not in the cas");
+        let entry = synch_core::FileEntry::file(14, now_ns(), absent, 1);
+        let staged = vec![(
+            file_key("media", "a.txt").unwrap(),
+            Some(synch_core::record::encode(&entry).unwrap()),
+        )];
+        let error = node.publish(&staged).unwrap_err().to_string();
+        assert!(
+            error.contains("complete durable content is not present"),
+            "{error}"
+        );
+        assert!(node.own_head().unwrap().is_none());
+
+        let root = node
+            .store()
+            .ingest_bytes(b"durable bytes", now_ns())
+            .unwrap();
+        let entry = synch_core::FileEntry::file(13, now_ns(), root, 1);
+        let staged = vec![(
+            file_key("media", "a.txt").unwrap(),
+            Some(synch_core::record::encode(&entry).unwrap()),
+        )];
+        node.publish(&staged).unwrap();
+        assert_eq!(
+            node.published_ad(&root).unwrap(),
+            Some(BlobAd::complete(13))
+        );
+        assert!(node.store().pins().unwrap().iter().any(|pin| {
+            pin.root == root && pin.holder == synch_store::PinHolder::Source("media".into())
+        }));
         node.shutdown().await.unwrap();
     }
 }

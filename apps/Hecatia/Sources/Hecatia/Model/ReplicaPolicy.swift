@@ -8,9 +8,9 @@ import Foundation
 /// version the current tree names, from every origin.
 enum ReplicaPolicy: String, CaseIterable, Hashable, Sendable {
   /// Hold what the tree names, and release a root once it stops naming it.
-  case tree
+  case current
   /// Hold everything ever seen, and release nothing.
-  case archive
+  case forever
 
   /// `ReplicaPolicy::render()` emits exactly this, and `FromStr` reads exactly
   /// this, so the string is the wire form in both directions.
@@ -18,18 +18,18 @@ enum ReplicaPolicy: String, CaseIterable, Hashable, Sendable {
 
   var label: String {
     switch self {
-    case .tree: return "Tree"
-    case .archive: return "Archive"
+    case .current: return "Current"
+    case .forever: return "Forever"
     }
   }
 
   /// Said in the second person, for the sheet that turns this on.
   var explanation: String {
     switch self {
-    case .tree:
+    case .current:
       return "Hold every version the folder currently names. When a file stops "
         + "being named, its bytes are released after the grace period."
-    case .archive:
+    case .forever:
       return "Hold everything this Mac has ever seen, and release nothing. "
         + "The grace period does not apply."
     }

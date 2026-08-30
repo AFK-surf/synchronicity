@@ -1,44 +1,55 @@
 import Foundation
 
-/// A folder this node indexes, as `space ls` reports it.
+/// One known namespace plus this node's independent local roles.
 struct Space: Identifiable, Hashable, Sendable {
   let id: String
-  /// The absolute local directory, or nil for a space with no checkout.
-  ///
-  /// Optional since the daemon grew detached spaces: a dedicated replica holds
-  /// a space's bytes as objects with no directory to put them in, and reports
-  /// `—` in this column. It used to be `String`, so those rows failed to parse
-  /// and the machine whose whole job is holding the cluster's bytes showed no
-  /// folders at all.
+  /// Filesystem source path. Nil for API sources and nodes that do not publish.
   let localPath: String?
-  /// The third column of `space ls`, verbatim: `—`, `replicate tree`, or
-  /// `replicate tree · grace 7d · 4096 B held · 2 wanted`.
-  ///
-  /// Kept as the daemon's own text rather than re-parsed into fields. The
-  /// numbers in it are a *summary*; the report that can actually be acted on
-  /// comes from `space ls <id>` and lands in ``ReplicaStatus``. Re-deriving
-  /// them from here would be two sources for one fact.
+  let sourceKind: String?
   let replicationSummary: String?
-  /// Parsed out of the summary, because the UI has to branch on it: whether to
-  /// offer "Replicate Now", whether Stop Sharing needs to mention released
-  /// bytes, whether to fetch a detail report at all.
   let replicate: ReplicaPolicy?
+  let checkoutPath: String?
+  let heldBytes: UInt64?
+  let wanted: UInt64?
 
   init(
-    id: String, localPath: String?, replicationSummary: String? = nil,
-    replicate: ReplicaPolicy? = nil
+    id: String, localPath: String?, sourceKind: String? = nil,
+    replicationSummary: String? = nil, replicate: ReplicaPolicy? = nil,
+    checkoutPath: String? = nil, heldBytes: UInt64? = nil, wanted: UInt64? = nil
   ) {
     self.id = id
     self.localPath = localPath
+    self.sourceKind = sourceKind ?? (localPath == nil ? nil : "filesystem")
     self.replicationSummary = replicationSummary
     self.replicate = replicate
+    self.checkoutPath = checkoutPath
+    self.heldBytes = heldBytes
+    self.wanted = wanted
+  }
+
+  init(_ info: Synch_Control_V1_SpaceInfo) {
+    id = info.id
+    localPath = info.hasSourcePath ? info.sourcePath : nil
+    sourceKind = info.hasSourceKind ? info.sourceKind : nil
+    replicate = info.hasRetention ? ReplicaPolicy(rawValue: info.retention) : nil
+    checkoutPath = info.hasCheckoutPath ? info.checkoutPath : nil
+    heldBytes = info.hasHeldBytes ? info.heldBytes : nil
+    wanted = info.hasWanted ? info.wanted : nil
+    replicationSummary = replicate.map { policy in
+      var value = "\(policy.label.lowercased()) retention"
+      if let heldBytes { value += " · \(heldBytes) B held" }
+      if let wanted { value += " · \(wanted) wanted" }
+      return value
+    }
   }
 
   var isReplicating: Bool { replicate != nil }
-  /// A replica with nowhere to put files — `space add <id> --detached
-  /// --replicate`. It holds objects and indexes nothing.
-  var isDetached: Bool { localPath == nil }
+  var isRemoteOnly: Bool { sourceKind == nil }
+  var hasFilesystemSource: Bool { sourceKind == "filesystem" }
+  var isSource: Bool { sourceKind != nil }
 
   /// What to show where a path would go.
-  var pathLabel: String { localPath ?? "No local copy — holds content only" }
+  var pathLabel: String {
+    localPath ?? (sourceKind == "api" ? "API source" : "Not published by this Mac")
+  }
 }

@@ -49,7 +49,7 @@ pub(crate) async fn node_as(origin: &synch_core::OriginId) -> (tempfile::TempDir
 pub(crate) async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
     let (data, node) = node().await;
     let space = tempfile::tempdir().unwrap();
-    node.add_space("media", space.path()).unwrap();
+    node.add_filesystem_source("media", space.path()).unwrap();
     (data, space, node)
 }
 

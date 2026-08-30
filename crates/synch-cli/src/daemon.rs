@@ -474,10 +474,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         &stop_tx,
         |node, shutdown| async move { node.run_maintenance(shutdown).await },
     );
-    // The standing mirror loop: materializes the unified tree whenever it
+    // The standing checkout loop: projects replicas whenever the tree
     // changes, and once at startup (§7.2).
-    let mirrors = spawn_loop("mirrors", &node, &stop_tx, |node, shutdown| async move {
-        node.run_mirrors(shutdown).await
+    let checkouts = spawn_loop("checkouts", &node, &stop_tx, |node, shutdown| async move {
+        node.run_checkouts(shutdown).await
     });
     // The standing replication loop: reconciles what the replicated spaces
     // should hold against what they do, and fetches the difference
@@ -560,7 +560,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         maintenance,
         publisher,
         dns,
-        mirrors,
+        checkouts,
         replicas,
         uploads,
         cloud
@@ -578,7 +578,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         ("maintenance", outcomes.4.is_err()),
         ("publisher", outcomes.5.is_err()),
         ("dns", outcomes.6.is_err()),
-        ("mirrors", outcomes.7.is_err()),
+        ("checkouts", outcomes.7.is_err()),
         ("replicas", outcomes.8.is_err()),
         ("uploads", outcomes.9.is_err()),
         ("cloud", outcomes.10.is_err()),

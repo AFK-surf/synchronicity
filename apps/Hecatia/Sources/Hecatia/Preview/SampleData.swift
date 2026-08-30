@@ -12,13 +12,13 @@ enum SampleData {
     Space(id: "family photos", localPath: "/Volumes/Big/Family Photos"),
     Space(
       id: "archive", localPath: "/Users/me/Archive",
-      replicationSummary: "replicate tree · grace 7d · 4096 B held · 2 wanted",
-      replicate: .tree),
+      replicationSummary: "current retention · grace 7d · 4096 B held · 2 wanted",
+      replicate: .current),
     // A dedicated replica: no local checkout at all. The row every preview
     // was missing, and the row the old parser dropped on the floor.
     Space(
       id: "media", localPath: nil,
-      replicationSummary: "replicate archive · 880 GiB held", replicate: .archive),
+      replicationSummary: "forever retention · 880 GiB held", replicate: .forever),
   ]
 
   static let replicaStatus: [String: ReplicaStatus] = [
@@ -129,7 +129,8 @@ enum SampleData {
     naming: .named(origin: "laptop@cluster.example.com", signingAs: "a1b2c3d4e5"),
     address: "ybndrfg8ejkmcpqxot via 192.168.1.10:4433",
     spaceNames: ["notes", "family photos", "archive"],
-    mirrorCount: 1,
+    sourceCount: 2,
+    replicaCount: 1,
     headSeq: 88,
     peersSeen: 3,
     trustSummary: "rekor require · doh https://1.1.1.1/dns-query · anchor icann-root")
@@ -186,8 +187,8 @@ enum SampleData {
   ]
 
   static let buckets: [GatewayBucket] = [
-    GatewayBucket(name: "notes", space: "notes", policy: .newest),
-    GatewayBucket(name: "photos-readonly", space: "family photos", policy: .origin("nas@x.example")),
+    GatewayBucket(name: "notes", space: "notes", access: .readWrite, policy: .newest),
+    GatewayBucket(name: "photos-readonly", space: "family photos", access: .readOnly, policy: .origin("nas@x.example")),
   ]
 
   static let keyIDs = ["AKIAPREVIEW00000001", "AKIAPREVIEW00000002"]
@@ -217,10 +218,10 @@ enum SampleData {
     {
       var run = ActivityRun(
         id: UUID(uuidString: "00000000-0000-0000-0000-00000000a001")!,
-        title: "Sync mirrors", commandLine: "synch mirror sync",
+        title: "Sync mirrors", commandLine: "synch replica sync",
         startedAt: day(0))
       run.output = RunOutput(frames: [
-        .line("notes -> /Users/me/Mirrors/notes: 3 written, 1 unchanged"),
+        .line("notes -> /Users/me/Checkouts/notes: 3 written, 1 unchanged"),
         .progress("family photos: up to date"),
       ])
       run.finishedAt = day(0).addingTimeInterval(4.2)
@@ -230,7 +231,7 @@ enum SampleData {
     {
       var run = ActivityRun(
         id: UUID(uuidString: "00000000-0000-0000-0000-00000000a002")!,
-        title: "Share folder “archive”", commandLine: "synch space add archive /Users/me/Archive",
+        title: "Share folder “archive”", commandLine: "synch source add archive /Users/me/Archive",
         startedAt: day(0).addingTimeInterval(-90))
       run.output = RunOutput(frames: [.progress("scanning /Users/me/Archive… 4,118 files")])
       return run

@@ -94,10 +94,10 @@ here and no output drifts from what `synch` prints.
 | --- | --- |
 | `synch_write` | `Put` |
 | `synch_delete` | `Delete` |
-| `synch_take` | `Run(Take)` |
-| `synch_fill` | `Run(Fill)` — `dry_run` defaults to true here |
+| `synch_adopt_path` | `Run(AdoptPath)` |
+| `synch_adopt_tree` | `Run(AdoptTree)` — `dry_run` defaults to true here |
 | `synch_pin` | `Run(PinAdd)` / `Run(PinRm)` |
-| `synch_scan` | `Run(Scan)` |
+| `synch_source_scan` | `Run(SourceScan)` |
 | `synch_sync` | `Run(SyncNow)` |
 | `synch_socket_add` | `Run(SocketAdd)` |
 | `synch_socket_arm` | `Run(SocketArm)` with a review token |
@@ -126,7 +126,7 @@ Two placements are worth stating because they are not obvious:
 The whole socket lifecycle is reachable over the protocol without a single
 filesystem write outside a space: `synch_socket_build` takes C source and
 returns the object base64-encoded, `synch_write` puts it in a space,
-`synch_socket_add` declares it, `synch_scan` republishes it as a socket, and
+`synch_socket_add` declares it, `synch_source_scan` republishes it as a socket, and
 `synch_socket_review` then `synch_socket_arm` approve it.
 
 ### `--space`
@@ -145,7 +145,7 @@ exists to prevent. So under `--space`, `synch_socket_list` fills in the confined
 space when there is exactly one and asks which when there are several.
 
 Three tools take no space at all and act on everything the node holds:
-`synch_scan`, `synch_sync`, and `synch_socket_ps` when it names no socket. There
+`synch_source_scan`, `synch_sync`, and `synch_socket_ps` when it names no socket. There
 is nothing in them to narrow, so under `--space` they are refused rather than
 allowed to reach past the confinement. Without `--space` they behave as before.
 

@@ -14,9 +14,8 @@ enum Topic: String, CaseIterable, Sendable {
   case domains       // domain ls
   case peers         // peers
   case keys          // key ls
-  case mirrors       // mirror ls
   case pins          // pin ls
-  case replication   // space ls <id> — per-space replica coverage
+  case replication   // replica ls <id> — per-space replica coverage
   case cloud         // cloud status
   case uploads       // ListUploads
   case s3            // GetConfig

@@ -13,7 +13,7 @@ every build; the end-to-end engine tests are
 
 A **tree write** is a socket program publishing a file version into the node's
 own origin trie: the same act as saving a file into a space directory, an S3
-`PutObject`, or a `synch take` — a new assertion of *this node's* view, entering
+`PutObject`, or a `synch adopt path` — a new assertion of *this node's* view, entering
 through the same ingest-and-publish path they all share. The caller supplies
 bytes and a verified identity. It still never supplies code, and it still never
 publishes anything: the program decides what is written, and the program is the
@@ -73,9 +73,9 @@ own view. DESIGN.md §12 says that plainly (§9 below).
   node's own trie: content root and size from the staged bytes, `mtime_ns`
   stamped by the host at commit, `prev` set to the node's own previous root for
   the path. On a path-backed space the file also lands in the space directory,
-  atomically, exactly where an S3 `PUT` would put it; on a detached space the
-  bytes go straight to CAS and the entry is staged directly, exactly as
-  `commit_detached_file` does today.
+  atomically, exactly where an S3 `PUT` would put it; on an API source the
+  bytes go straight to CAS and the entry is staged directly through
+  `commit_api_file`.
 - A delete publishes this node's own tombstone, and on a path-backed space
   removes the local file — `adopt_deletion`, verbatim. It retires *our*
   version; other origins' versions survive it, per §8 of the design.
@@ -176,7 +176,7 @@ $ synch socket arm code/drop.sock
 
 Bytes drifting disarms as always; a widened prefix is a changed root is a fresh
 review. `--auto` re-arms tree-write declarations like any others — the §3
-warning at `synch socket add --auto` time should name writes explicitly, since
+warning at `synch socket declare --auto` time should name writes explicitly, since
 `--auto` plus tree-write means "whatever these bytes become may publish under
 this prefix without me looking". `synch socket ls -l` lists armed tree-write
 lines beside egress, and every commit is logged: socket, invocation, peer
@@ -317,13 +317,13 @@ what the control-service `Put` handler already does, gate for gate:
 - open: `ensure_adoptable` (publishable + `.syncignore`),
   `normalized_adoption_path`, the declared-socket refusal, then
   `Node::open_adoption` — path-backed spaces staging beside the target with the
-  parent dirfd pinned, detached spaces staging in the daemon's scratch, both
+  parent dirfd pinned, API sources staging in the daemon's scratch, both
   behind `Adoption`'s single choke point.
 - write: `Adoption::write` on the blocking pool.
 - commit: under the node's tree-write lock, the condition (§5.3) and the
   socket refusal are re-checked; then `Adoption::commit` (fsync + rename);
-  then detached → `commit_detached_file` (CAS ingest,
-  `stage_detached_reference` with `prev` and the `b:` ad) plus a
+  then API source → `commit_api_file` (CAS ingest,
+  `stage_api_reference` with `prev` and the `b:` ad) plus a
   `flush_staged`, path-backed → `scan_publish_push`. The reported root is
   taken from the staged bytes (`hash_staged`), describing what this call
   assembled rather than whatever the tree holds by the time a scan reaches
@@ -470,7 +470,7 @@ All applied in the change that built this:
 
 - **`docs/SOCKETS.md`** — §12 drops the first non-goal, pointing here; §7.12
   names the `sy_put_*` family and §7.9 gains `sy_declare_tree_write`; the §10
-  tables gain the rows above; the `--auto` warning at `synch socket add` names
+  tables gain the rows above; the `--auto` warning at `synch socket declare` names
   writes.
 - **`docs/SSH-SOCKETS.md` §7.2** — the "read-only in v1" rationale gains its
   second half: upload support becomes a follow-up that commits through this

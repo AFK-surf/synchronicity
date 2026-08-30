@@ -294,7 +294,7 @@ impl Tool {
                 "readOnlyHint": self.tier == Tier::Read,
                 // Nothing here destroys data without saying so: a delete
                 // publishes a tombstone, which the version model can outlive.
-                // The one tool that can overwrite a local file is synch_fill
+                // The one tool that can overwrite a local file is synch_adopt_tree
                 // with force, and it declares itself below.
                 "destructiveHint": false,
                 "openWorldHint": true,
@@ -478,9 +478,8 @@ fn build_catalog() -> Vec<Tool> {
         Tool {
             name: "synch_spaces",
             title: "List spaces",
-            description: "Every space this node has configured: its id, the local \
-                          directory it indexes, and its replication policy. A space is \
-                          the top-level container every path lives in."
+            description: "Every known namespace and this node's independent source and \
+                          replica roles for it."
                 .into(),
             tier: Tier::Read,
             input: no_args.clone(),
@@ -493,12 +492,14 @@ fn build_catalog() -> Vec<Tool> {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string" },
-                                "local_path": { "type": ["string", "null"] },
-                                "replicate": { "type": ["string", "null"], "enum": ["tree", "archive", null] },
+                                "source_path": { "type": ["string", "null"] },
+                                "source_kind": { "type": ["string", "null"], "enum": ["filesystem", "api", null] },
+                                "retention": { "type": ["string", "null"], "enum": ["current", "forever", null] },
                                 "grace_secs": { "type": "integer" },
                                 "budget": { "type": ["integer", "null"] },
                                 "held_bytes": { "type": ["integer", "null"] },
                                 "wanted": { "type": ["integer", "null"] },
+                                "checkout_path": { "type": ["string", "null"] },
                             },
                             "required": ["id", "grace_secs"],
                         },
@@ -898,7 +899,7 @@ fn build_catalog() -> Vec<Tool> {
             })),
         },
         Tool {
-            name: "synch_take",
+            name: "synch_adopt_path",
             title: "Adopt a peer's version",
             description: "Adopts another origin's version of a path as this node's own, \
                           publishing it under this node's name."
@@ -907,17 +908,17 @@ fn build_catalog() -> Vec<Tool> {
             input: json!({
                 "type": "object",
                 "properties": {
-                    "origin": { "type": "string", "description": "The origin whose version to adopt." },
+                    "select": { "type": "string", "description": "newest, strict, or origin=<origin-id>." },
                     "space": { "type": "string" },
                     "path": { "type": "string" },
                 },
-                "required": ["origin", "space", "path"],
+                "required": ["space", "path"],
                 "additionalProperties": false,
             }),
             output: None,
         },
         Tool {
-            name: "synch_fill",
+            name: "synch_adopt_tree",
             title: "Fill a space directory",
             description: "Writes the unified tree's content into a space's own local \
                           directory. Additive: a missing path is written, a matching one \
@@ -930,9 +931,8 @@ fn build_catalog() -> Vec<Tool> {
                 "properties": {
                     "space": { "type": "string" },
                     "dir": { "type": "string", "description": "A directory within the space, or omit for all of it." },
-                    "from": { "type": "string", "description": "Fill from this origin's version of every path." },
-                    "strict": { "type": "boolean", "description": "Report divergent paths instead of picking a version." },
-                    "force": { "type": "boolean", "description": "Replace local files whose content differs. This overwrites bytes on disk." },
+                    "select": { "type": "string", "description": "newest, strict, or origin=<origin-id>." },
+                    "replace": { "type": "boolean", "description": "Replace local files whose content differs. This overwrites bytes on disk." },
                     "dry_run": { "type": "boolean", "description": "Decide everything and write nothing. Defaults to true here." },
                 },
                 "required": ["space"],
@@ -955,6 +955,7 @@ fn build_catalog() -> Vec<Tool> {
                     "space": { "type": "string", "description": "With path, names the version to pin." },
                     "path": { "type": "string" },
                     "root": { "type": "string", "description": "A hex object root, instead of space and path." },
+                    "select": { "type": "string", "description": "For a path: newest, strict, or origin=<origin-id>." },
                 },
                 "required": ["action"],
                 "additionalProperties": false,
@@ -962,7 +963,7 @@ fn build_catalog() -> Vec<Tool> {
             output: None,
         },
         Tool {
-            name: "synch_scan",
+            name: "synch_source_scan",
             title: "Scan and publish",
             description: "Scans every configured space and publishes the result. Run this \
                           after changing files on disk outside of synch_write."
@@ -1126,7 +1127,7 @@ pub(crate) async fn call(
         "synch_history" => history(ctx, args, reporter).await,
         "synch_compare" => compare(ctx, args, reporter).await,
         "synch_peers" => rendered(ctx, Cmd::Peers(pb::Peers {}), reporter).await,
-        "synch_doctor" => rendered(ctx, Cmd::Doctor(pb::Doctor { rebuild: false }), reporter).await,
+        "synch_doctor" => rendered(ctx, Cmd::Doctor(pb::Doctor {}), reporter).await,
         "synch_socket_list" => socket_list(ctx, args, reporter).await,
         "synch_socket_ps" => socket_ps(ctx, args, reporter).await,
         "synch_socket_log" => socket_log(ctx, args, reporter).await,
@@ -1137,12 +1138,19 @@ pub(crate) async fn call(
 
         "synch_write" => write(ctx, args).await,
         "synch_delete" => delete(ctx, args).await,
-        "synch_take" => take(ctx, args, reporter).await,
-        "synch_fill" => fill(ctx, args, reporter).await,
+        "synch_adopt_path" => take(ctx, args, reporter).await,
+        "synch_adopt_tree" => fill(ctx, args, reporter).await,
         "synch_pin" => pin(ctx, args, reporter).await,
-        "synch_scan" => {
-            ctx.whole_node("synch_scan")?;
-            rendered(ctx, Cmd::Scan(pb::Scan {}), reporter).await
+        "synch_source_scan" => {
+            ctx.whole_node("synch_source_scan")?;
+            rendered(
+                ctx,
+                Cmd::SourceScan(pb::SourceScan {
+                    space: String::new(),
+                }),
+                reporter,
+            )
+            .await
         }
         "synch_sync" => {
             ctx.whole_node("synch_sync")?;
@@ -1254,12 +1262,14 @@ async fn spaces(ctx: &Context) -> Result<Outcome, ToolError> {
         .map(|space| {
             json!({
                 "id": space.id,
-                "local_path": space.local_path,
-                "replicate": space.replicate,
+                "source_path": space.source_path,
+                "source_kind": space.source_kind,
+                "retention": space.retention,
                 "grace_secs": space.grace_secs,
                 "budget": space.budget,
                 "held_bytes": space.held_bytes,
                 "wanted": space.wanted,
+                "checkout_path": space.checkout_path,
             })
         })
         .collect();
@@ -1926,24 +1936,28 @@ async fn delete(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
     ))
 }
 
-/// `synch_take`.
+/// `synch_adopt_path`.
 async fn take(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
     let space = need_str(args, "space")?;
     ctx.scope(space)?;
-    let reference = reference(
-        space,
-        need_str(args, "path")?,
-        Some(need_str(args, "origin")?),
-    )?;
-    rendered(ctx, Cmd::Take(pb::Take { reference }), reporter).await
+    let reference = reference(space, need_str(args, "path")?, None)?;
+    rendered(
+        ctx,
+        Cmd::AdoptPath(pb::AdoptPath {
+            reference,
+            select: opt_str(args, "select")?.map(str::to_string),
+        }),
+        reporter,
+    )
+    .await
 }
 
-/// `synch_fill`.
+/// `synch_adopt_tree`.
 async fn fill(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
     let space = need_str(args, "space")?;
     ctx.scope(space)?;
     let reference = reference(space, opt_path(args, "dir")?, None)?;
-    // Dry by default, unlike the CLI: a person typing `synch fill` has the
+    // Dry by default, unlike the CLI: a person typing `synch adopt tree` has the
     // directory in front of them, and a model calling it has not seen it.
     let dry_run = match args.get("dry_run") {
         None | Some(Value::Null) => true,
@@ -1951,11 +1965,10 @@ async fn fill(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcom
     };
     rendered(
         ctx,
-        Cmd::Fill(pb::Fill {
+        Cmd::AdoptTree(pb::AdoptTree {
             reference,
-            from: opt_str(args, "from")?.map(str::to_string),
-            strict: opt_bool(args, "strict")?,
-            force: opt_bool(args, "force")?,
+            select: opt_str(args, "select")?.map(str::to_string),
+            replace: opt_bool(args, "replace")?,
             dry_run,
         }),
         reporter,
@@ -1973,9 +1986,10 @@ async fn pin(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome
             reference(space, need_str(args, "path")?, None)?
         }
     };
+    let select = opt_str(args, "select")?.map(str::to_string);
     let command = match need_str(args, "action")? {
-        "add" => Cmd::PinAdd(pb::PinAdd { target }),
-        "rm" => Cmd::PinRm(pb::PinRm { target }),
+        "add" => Cmd::PinAdd(pb::PinAdd { target, select }),
+        "rm" => Cmd::PinRm(pb::PinRm { target, select }),
         other => {
             return Err(ToolError::execution(format!(
                 "{other:?} is not a pin action: use \"add\" or \"rm\""

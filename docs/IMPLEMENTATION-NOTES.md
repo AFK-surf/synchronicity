@@ -7,6 +7,12 @@ acceptance rule, or binding checks — those are implemented exactly as specifie
 
 Sections refer to `DESIGN.md`.
 
+> **Role-refactor note.** Sections that discuss the former combined `space`
+> row, mirror policies, or `--from` record the pre-refactor implementation and
+> are retained only as design history. The current source/replica/checkout and
+> uniform `--select` contract is in [ROLE-CLI-REFACTOR.md](ROLE-CLI-REFACTOR.md)
+> and [REPLICATION.md](REPLICATION.md).
+
 ## Deferred, with the module boundary in place
 
 ### §7.1 — ignore rules
@@ -39,7 +45,7 @@ not restart it.
 Expiry stages the trie-key removals and lets the publisher (§7.1) turn them
 into one root, so retiring a thousand tombstones costs one head rather than a
 thousand. It runs in two places: the periodic maintenance pass, beside binding
-expiry and GC, and every scan — including an explicit `synch scan`, which is
+expiry and GC, and every scan — including an explicit `synch source scan`, which is
 how an operator forces it, and which reports `expired N` when there was
 anything to retire.
 
@@ -58,14 +64,14 @@ waiting for an answer:
 
 - The watcher and the periodic rescan **stage** and return. This is the case
   batching exists for: a burst of editor saves is one batch and one head.
-- `synch scan`, `synch take`, and `synch space rm` **flush** before they answer.
+- `synch source scan`, `synch adopt path`, and `synch source rm` **flush** before they answer.
   Each is already one batch by construction, so flushing costs no extra head,
   and it keeps their output (`published seq N`, `unpublished N record(s)`)
   describing something peers can already ask for. `synch-s3`'s `PutObject`
   keeps its own, stricter timing — see §9.4 below.
 
 A flush publishes the *whole* buffer, not the flushing caller's share of it, so
-a `synch scan` that lands while a watcher rescan is still buffered publishes
+a `synch source scan` that lands while a watcher rescan is still buffered publishes
 both. A publish that is refused (§3.4) puts its batch back rather than dropping
 it; a *push* that fails does not fail the flush, because the head exists and
 the next anti-entropy round carries it. A clean daemon stop flushes what is
@@ -426,7 +432,7 @@ out of their own bindings table.
 
 ### §8 — adopting a deletion
 
-`synch take` of a tombstone version removes the local copy and lets the *next
+`synch adopt path` of a tombstone version removes the local copy and lets the *next
 scan* publish our own tombstone — the same path a deletion made with `rm`
 takes, rather than a second way of minting one. `take` already flushes before
 it answers (§7.1), so the tombstone is published by the time the command

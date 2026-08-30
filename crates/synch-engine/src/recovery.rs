@@ -610,8 +610,12 @@ mod tests {
     use crate::testkit::node_as;
 
     /// One staged file entry, encoded the way the scanner encodes them.
-    fn staged_file() -> crate::node::StagedChange {
-        let entry = synch_core::FileEntry::file(3, 0, Hash::new(b"payload"), 1);
+    fn staged_file(node: &Node) -> crate::node::StagedChange {
+        node.store()
+            .put_source("s", synch_store::SourceKind::Api, None)
+            .unwrap();
+        let root = node.store().ingest_bytes(b"payload", 0).unwrap();
+        let entry = synch_core::FileEntry::file(7, 0, root, 1);
         (
             synch_core::file_key("s", "a.txt").unwrap(),
             Some(postcard::to_stdvec(&entry).unwrap()),
@@ -651,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn holding_our_own_head_settles_the_question() {
         let (_d, node) = node_as(&nas()).await;
-        node.publish(&[staged_file()]).unwrap().unwrap();
+        node.publish(&[staged_file(&node)]).unwrap().unwrap();
         observe(&node, 100, None);
         assert!(!node.recovery_state().unwrap().in_recovery);
         node.ensure_publishable().unwrap();
@@ -713,7 +717,7 @@ mod tests {
         // Holding our own head, the echo of our published history leaves the
         // floor alone; an accidental re-run would otherwise burn another gap.
         let (_d, node) = node_as(&nas()).await;
-        node.publish(&[staged_file()]).unwrap().unwrap();
+        node.publish(&[staged_file(&node)]).unwrap().unwrap();
         let own = node.store().complete_head(node.origin()).unwrap().unwrap();
         node.store()
             .record_observed_head(node.origin(), own.seq, &own.root, true, None, now_ns())

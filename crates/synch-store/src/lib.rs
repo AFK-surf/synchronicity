@@ -35,4 +35,7 @@ pub use unified::{Selection, Version, VersionPolicy, VersionSet};
 pub use uploads::{
     CompleteStart, Upload, UploadPart, UploadState, MAX_PART_NUMBER, MAX_PART_SIZE, MIN_PART_SIZE,
 };
-pub use views::{EntryRow, LocalFile, MirrorRow, ReplicaPolicy, SpaceRow};
+pub use views::{
+    EntryRow, LocalFile, ReplicaPolicy, ReplicaRow, SourceKind, SourceRow,
+    DEFAULT_REPLICA_GRACE_SECS,
+};

@@ -11,7 +11,7 @@
 //! - the **sweep** ([`Node::sweep_replicas`]) reconciles what the tree
 //!   references against what this node holds and wants, and is the only place
 //!   that decides anything from a *listing*;
-//! - the **fetch loop** ([`Node::fetch_replica_wants`]) is the only one that
+//! - the **fetch loop** ([`Node::fetch_content_wants`]) is the only one that
 //!   touches the network, and so the only one that needs rate limiting;
 //! - the **live path** (`Store::apply_change`, inside the transaction that
 //!   flips a head) reacts to one promotion at a time and is the only one that
@@ -29,7 +29,7 @@
 use std::time::Duration;
 
 use synch_core::{now_ns, Hash};
-use synch_store::{PinHolder, ReplicaCoverage, ReplicaPolicy, SpaceRow};
+use synch_store::{PinHolder, ReplicaCoverage, ReplicaPolicy, ReplicaRow};
 
 use crate::{
     error::{EngineError, Result},
@@ -124,7 +124,7 @@ impl ViewState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaStatus {
     /// The space.
-    pub space: SpaceRow,
+    pub replica: ReplicaRow,
     /// What it holds and wants.
     pub coverage: ReplicaCoverage,
     /// When the oldest outstanding want was first wanted.
@@ -143,90 +143,117 @@ pub struct ReplicaStatus {
 }
 
 impl Node {
-    /// Turns replication on, off, or over to another policy for a space.
-    ///
-    /// `release` drops what the space was holding. It is not the default and
-    /// should not become one: `--no-replicate` on a space of consequence is
-    /// undone by typing it again, while `--no-replicate --release` is undone by
-    /// re-fetching every byte from whoever still has them, if anyone does.
-    pub fn set_space_replication(
+    /// Adds a durable replica role independently of any local source.
+    pub fn add_replica(
         &self,
         id: &str,
-        policy: Option<ReplicaPolicy>,
+        retention: ReplicaPolicy,
         grace: Option<i64>,
         budget: Option<u64>,
-        release: bool,
+        checkout_path: Option<String>,
     ) -> Result<()> {
-        let Some(space) = self.store().space(id)? else {
-            return Err(EngineError::not_found(format!("no space {id}")));
-        };
+        if self.store().replica(id)?.is_some() {
+            return Err(EngineError::invalid(format!(
+                "replica {id} already exists; use `synch replica set {id}`"
+            )));
+        }
         // A delegate holds what it may read and no more. The scope decides what
         // its `entries` ever contained, so replicating outside it would be a
         // standing want for content this node can never learn the size of.
-        if policy.is_some() {
-            if let Some(scope) = self.store().local_scope()? {
-                if !scope.iter().any(|granted| granted == id) {
-                    return Err(EngineError::invalid(format!(
-                        "this node's read scope does not cover {id}, so it cannot replicate it"
-                    )));
-                }
+        if let Some(scope) = self.store().local_scope()? {
+            if !scope.iter().any(|granted| granted == id) {
+                return Err(EngineError::invalid(format!(
+                    "this node's read scope does not cover {id}, so it cannot replicate it"
+                )));
             }
         }
-        // The live release path runs inside the head-flip transaction and reads
-        // this from `config`, because there is no engine to ask down there.
-        // Written whenever replication is configured, so the two paths cannot
-        // disagree about the floor.
+        if retention == ReplicaPolicy::Forever && grace.is_some() {
+            return Err(EngineError::invalid(
+                "--grace applies only to current retention",
+            ));
+        }
         self.store().set_config(
             "replica.release_floor",
             &self.config().replica_release_floor.to_string(),
         )?;
-        if let Some(grace) = grace {
-            self.store().set_space_grace(id, grace)?;
-        }
-        if let Some(budget) = budget {
-            self.store().set_space_budget(id, budget)?;
-        }
-        self.store().set_space_policy(id, policy)?;
-        if policy.is_none() {
-            let holder = space.holder();
-            self.store().drop_wants(&holder)?;
-            if release {
-                self.store().unpin_all(&holder)?;
-            }
-        }
+        let checkout_path = checkout_path
+            .map(|path| self.checkout_path(id, path))
+            .transpose()?;
+        self.store().put_replica(&ReplicaRow {
+            space: id.to_string(),
+            retention,
+            grace: match retention {
+                ReplicaPolicy::Current => {
+                    Some(grace.unwrap_or(synch_store::DEFAULT_REPLICA_GRACE_SECS))
+                }
+                ReplicaPolicy::Forever => None,
+            },
+            budget,
+            checkout_path,
+        })?;
         self.replica_wake().notify_one();
         Ok(())
     }
 
-    /// Adjusts a replicated space's grace window or budget, and nothing else.
-    ///
-    /// Separate from [`Node::set_space_replication`] because the policy is not
-    /// a value a tuning command should have an opinion about — not even the
-    /// opinion "put back what was there", which is wrong the moment the stored
-    /// value is one this build cannot read.
-    pub fn set_space_tunables(
+    /// Replaces a replica's configuration while leaving source state alone.
+    pub fn set_replica(
         &self,
         id: &str,
+        retention: Option<ReplicaPolicy>,
         grace: Option<i64>,
-        budget: Option<u64>,
+        budget: Option<Option<u64>>,
+        checkout_path: Option<Option<String>>,
     ) -> Result<()> {
-        if self.store().space(id)?.is_none() {
-            return Err(EngineError::not_found(format!("no space {id}")));
+        let Some(mut replica) = self.store().replica(id)? else {
+            return Err(EngineError::not_found(format!("no replica {id}")));
+        };
+        if let Some(retention) = retention {
+            replica.retention = retention;
         }
-        // The live release path runs inside the head-flip transaction and reads
-        // this from `config`, because there is no engine to ask down there.
-        // Written whenever replication is configured, so the two paths cannot
-        // disagree about the floor.
+        if replica.retention == ReplicaPolicy::Forever && grace.is_some() {
+            return Err(EngineError::invalid(
+                "--grace applies only to current retention",
+            ));
+        }
+        replica.grace = match replica.retention {
+            ReplicaPolicy::Current => Some(
+                grace
+                    .or(replica.grace)
+                    .unwrap_or(synch_store::DEFAULT_REPLICA_GRACE_SECS),
+            ),
+            ReplicaPolicy::Forever => None,
+        };
+        if let Some(budget) = budget {
+            replica.budget = budget;
+        }
+        if let Some(checkout_path) = checkout_path {
+            replica.checkout_path = checkout_path
+                .map(|path| self.checkout_path(id, path))
+                .transpose()?;
+        }
         self.store().set_config(
             "replica.release_floor",
             &self.config().replica_release_floor.to_string(),
         )?;
-        if let Some(grace) = grace {
-            self.store().set_space_grace(id, grace)?;
+        self.store().put_replica(&replica)?;
+        self.replica_wake().notify_one();
+        Ok(())
+    }
+
+    /// Removes a replica and releases its holds, optionally preserving held
+    /// roots as explicit operator pins.
+    pub fn remove_replica(&self, id: &str, pin_held: bool) -> Result<()> {
+        let Some(replica) = self.store().replica(id)? else {
+            return Err(EngineError::not_found(format!("no replica {id}")));
+        };
+        let holder = replica.holder();
+        if pin_held {
+            self.store()
+                .promote_pins_to_operator(&holder, self.store().read_instant()?)?;
         }
-        if let Some(budget) = budget {
-            self.store().set_space_budget(id, budget)?;
-        }
+        self.store().drop_wants(&holder)?;
+        self.store().unpin_all(&holder)?;
+        self.store().remove_replica(id)?;
         self.replica_wake().notify_one();
         Ok(())
     }
@@ -242,8 +269,8 @@ impl Node {
         let now = self.store().read_instant()?;
         let view = self.view_state()?;
         let mut out = Vec::new();
-        for space in self.store().replicated_spaces()? {
-            if only.is_some_and(|id| id != space.id) {
+        for space in self.store().replicas()? {
+            if only.is_some_and(|id| id != space.space) {
                 continue;
             }
             let holder = space.holder();
@@ -251,25 +278,24 @@ impl Node {
             // arrived at another inside one interval is never briefly marked
             // for release on the strength of the half of that the sweep saw.
             let reprieved = self.store().clear_returned_releases(&holder)?;
-            let wanted = self.store().stage_space_wants(&space.id, &holder, now)?;
-            let scheduled =
-                if space.replicate.is_some_and(ReplicaPolicy::releases) && view.is_complete() {
-                    let at = now.saturating_add(space.grace_secs().saturating_mul(1_000_000_000));
-                    self.store().schedule_stale_releases_above(
-                        &holder,
-                        at,
-                        self.config().replica_release_floor,
-                    )?
-                } else {
-                    0
-                };
+            let wanted = self.store().stage_space_wants(&space.space, &holder, now)?;
+            let scheduled = if space.retention.releases() && view.is_complete() {
+                let at = now.saturating_add(space.grace_secs().saturating_mul(1_000_000_000));
+                self.store().schedule_stale_releases_above(
+                    &holder,
+                    at,
+                    self.config().replica_release_floor,
+                )?
+            } else {
+                0
+            };
             // Expiry runs even when the view is incomplete. These releases were
             // decided when it was complete — by the live path, or by an earlier
             // sweep — and holding them back would mean one unreachable peer
             // froze every space's grace window indefinitely.
             let released = self.store().expire_pins_of(&holder, now)?;
             out.push((
-                space.id.clone(),
+                space.space.clone(),
                 SweepReport {
                     wanted,
                     reprieved,
@@ -315,17 +341,36 @@ impl Node {
         Ok(ViewState::Complete)
     }
 
-    /// Fetches what the replicated spaces want, rarest first.
+    /// Fetches source repairs and replica wants, rarest first.
     ///
     /// One pass takes at most `replica_concurrency` objects. Everything about
     /// the fetch itself is the ordinary §6.4 path — provider fanout, delta
     /// descent against the recorded donor, resumption — so a replica gets the
     /// best case of the descent for free: it is fetching version *n+1* of a
     /// file whose version *n* it is guaranteed to hold.
-    pub async fn fetch_replica_wants(&self) -> Result<FetchReport> {
+    pub async fn fetch_content_wants(&self) -> Result<FetchReport> {
+        self.fetch_wants(None).await
+    }
+
+    /// Fetches one named replica's wants without spending the pass on other
+    /// replicas or source repairs.
+    pub async fn fetch_replica_wants_for(&self, space: &str) -> Result<FetchReport> {
+        let store = self.store().clone();
+        let replica_space = space.to_string();
+        let exists = crate::blocking::offload(move || Ok(store.replica(&replica_space)?))
+            .await?
+            .is_some();
+        if !exists {
+            return Err(EngineError::not_found(format!("no replica {space}")));
+        }
+        let holder = PinHolder::Replica(space.to_string());
+        self.fetch_wants(Some(holder)).await
+    }
+
+    async fn fetch_wants(&self, only: Option<PinHolder>) -> Result<FetchReport> {
         let mut report = FetchReport::default();
         let limit = self.config().replica_concurrency.max(1);
-        // Candidates are drawn per space and then ranked together. One global
+        // Candidates are drawn per holder and then ranked together. One global
         // queue ordered by age would let a space with a large old backlog
         // starve every other replicated space outright, and would leave the
         // `(holder, first_wanted)` index unusable — a global `ORDER BY` over a
@@ -341,13 +386,22 @@ impl Node {
             let store = self.store().clone();
             crate::blocking::offload(move || {
                 let now = store.read_instant()?;
-                Ok(store.wants_to_attempt(
-                    now,
-                    MIN_BACKOFF.as_nanos() as i64,
-                    MAX_BACKOFF.as_nanos() as i64,
-                    limit,
-                    rotate,
-                )?)
+                match only {
+                    Some(holder) => Ok(store.wants_to_attempt_of(
+                        &holder,
+                        now,
+                        MIN_BACKOFF.as_nanos() as i64,
+                        MAX_BACKOFF.as_nanos() as i64,
+                        limit,
+                    )?),
+                    None => Ok(store.wants_to_attempt(
+                        now,
+                        MIN_BACKOFF.as_nanos() as i64,
+                        MAX_BACKOFF.as_nanos() as i64,
+                        limit,
+                        rotate,
+                    )?),
+                }
             })
             .await?
         };
@@ -363,6 +417,13 @@ impl Node {
                 // another version's row, and §3.1 keeps those.
                 continue;
             };
+            if matches!(want.holder, PinHolder::Source(_)) {
+                if admitted.len() >= limit {
+                    break;
+                }
+                admitted.push(WantPlan { want, space });
+                continue;
+            }
             if !budgets.contains_key(&space) {
                 budgets.insert(space.clone(), self.budget_state(&space).await?);
             }
@@ -531,7 +592,7 @@ impl Node {
         let store = self.store().clone();
         let space = space.to_string();
         crate::blocking::offload(move || {
-            let Some(row) = store.space(&space)?.filter(|row| row.replicate.is_some()) else {
+            let Some(row) = store.replica(&space)? else {
                 return Ok(None);
             };
             let Some(budget) = row.budget else {
@@ -545,8 +606,8 @@ impl Node {
 
     /// What `space ls <id>` reports.
     pub fn replica_status(&self, id: &str) -> Result<ReplicaStatus> {
-        let Some(space) = self.store().space(id)? else {
-            return Err(EngineError::not_found(format!("no space {id}")));
+        let Some(space) = self.store().replica(id)? else {
+            return Err(EngineError::not_found(format!("no replica {id}")));
         };
         let holder = space.holder();
         Ok(ReplicaStatus {
@@ -560,7 +621,7 @@ impl Node {
             // `archive` nothing is ever let go, so "too few peers advertise
             // these to let them go" would imply a release that peers could
             // unblock — and none is waiting on them.
-            held_back: match space.replicate.is_some_and(ReplicaPolicy::releases) {
+            held_back: match space.retention.releases() {
                 true => self
                     .store()
                     .held_back_by_replication_floor(&holder, self.config().replica_release_floor)?,
@@ -568,7 +629,7 @@ impl Node {
             },
             by_origin: self.store().held_bytes_by_origin(&holder)?,
             claims: self.replica_claims_on(id)?,
-            space,
+            replica: space,
         })
     }
 
@@ -582,8 +643,8 @@ impl Node {
     pub(crate) fn replica_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
         let mut out = Vec::new();
         let mut claimed = std::collections::HashSet::new();
-        for space in self.store().replicated_spaces()? {
-            let policy = space.replicate.expect("replicated_spaces filters on it");
+        for space in self.store().replicas()? {
+            let policy = space.retention;
             let coverage = self
                 .store()
                 .replica_coverage(&space.holder(), UNREACHABLE_ATTEMPTS)?;
@@ -607,8 +668,8 @@ impl Node {
                 complete: coverage.wanted == 0 && coverage.held > 0,
             };
             let bytes = synch_core::record::encode(&claim)?;
-            out.push((synch_core::replica_claim_key(&space.id)?, Some(bytes)));
-            claimed.insert(space.id.clone());
+            out.push((synch_core::replica_claim_key(&space.space)?, Some(bytes)));
+            claimed.insert(space.space.clone());
         }
         // Withdraw a claim over a space this node has stopped replicating. The
         // published set is the authority on what to withdraw, since the
@@ -772,7 +833,7 @@ impl Node {
         // nothing has either drained the queue or hit every backoff, and either
         // way the next wake is soon enough.
         loop {
-            match self.fetch_replica_wants().await {
+            match self.fetch_content_wants().await {
                 Ok(report) if report.held > 0 => {
                     tracing::info!(
                         held = report.held,

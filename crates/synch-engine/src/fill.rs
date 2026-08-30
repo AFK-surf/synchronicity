@@ -1,17 +1,17 @@
 //! One-shot materialization into a space's *own* directory (§7.2).
 //!
-//! A mirror is the continuous, read-only half of materialization: it owns the
+//! A checkout is the continuous, read-only half of materialization: it owns the
 //! directory it writes into, removes whatever the tree stops carrying, and is
 //! never indexed back into the local origin trie. A fill is the other half. It
-//! writes into the writable directory `synch space add` named — the one this
+//! writes into the writable directory `synch source add` named — the one this
 //! node indexes and publishes from — and so it may only ever *add*:
 //!
 //! - nothing is removed, ever. A tombstoned version, a path the policy selects
 //!   nothing for, a local file no origin publishes: all left exactly as they
-//!   are. Deleting is what `synch take` of a tombstone is for, one deliberate
+//!   are. Deleting is what `synch adopt path` of a tombstone is for, one deliberate
 //!   path at a time.
 //! - a local file whose bytes already differ is reported and left alone.
-//!   `--force` replaces it, which is the bulk form of `synch take`.
+//!   `--force` replaces it, which is the bulk form of `synch adopt path`.
 //!
 //! Nothing here publishes, and a node that *cannot* publish does not fill at
 //! all: a scan would refuse there too, so the tree would sit unannounced — and
@@ -19,7 +19,7 @@
 //! would be inert while it wrote. `synch recover` first (§3.4).
 //!
 //! Nothing here publishes. The files land in an indexed directory, so the next
-//! scan — the watcher's, or an explicit `synch scan` — stages and publishes
+//! scan — the watcher's, or an explicit `synch source scan` — stages and publishes
 //! them as this node's own view (§7.1), exactly as it would files copied in by
 //! hand.
 //!
@@ -54,15 +54,15 @@ use synch_core::{EntryKind, Hash};
 use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
+    checkout::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
     error::{EngineError, Result},
     ignore::IgnoreSet,
-    mirror::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
     node::Node,
     scanner::target_within,
 };
 
 #[cfg(windows)]
-use crate::mirror::unsafe_name;
+use crate::checkout::unsafe_name;
 
 /// How a fill treats what is already on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,7 +88,7 @@ pub struct FillReport {
     /// local file is the one thing a fill does that loses something.
     pub replaced: Vec<String>,
     /// Paths whose local copy differs from the selected version and was left
-    /// alone. `--force`, or `synch take` per path, is what ends the standoff.
+    /// alone. `--force`, or `synch adopt path` per path, is what ends the standoff.
     pub differing: Vec<String>,
     /// Paths that are no longer the thing this fill was shown: a path the plan
     /// found empty that something now stands at, and equally one whose file has
@@ -129,7 +129,7 @@ pub struct FillReport {
 
 impl Node {
     /// Fills a space's configured directory with the unified tree's content
-    /// (§7.2, `synch fill`).
+    /// (§7.2, `synch adopt tree`).
     ///
     /// `prefix` narrows the fill to a directory within the space, empty for
     /// all of it. The space must be one this node indexes: a fill writes where
@@ -143,7 +143,7 @@ impl Node {
     ) -> Result<FillReport> {
         // Serialized against every other materialization pass on this node, so
         // two fills of one space cannot plan against each other's half-written
-        // state. Mirrors take the same lock; their roots cannot overlap a
+        // state. Checkouts take the same lock; their roots cannot overlap a
         // space's, so sharing it costs nothing but the wait.
         let _pass = self.lock_materialization().await;
         // Refused in recovery, before anything is written, for the reason every
@@ -190,19 +190,18 @@ impl Node {
         let root_dir = {
             let (node, space_id) = (self.clone(), space_id.to_string());
             crate::blocking::offload(move || {
-                let space = node.store().space(&space_id)?.ok_or_else(|| {
+                let space = node.store().source(&space_id)?.ok_or_else(|| {
                     EngineError::not_found(format!(
-                        "no local space {space_id}: `synch space add {space_id} <dir>` names the \
-                         directory a fill writes into"
+                        "no filesystem source {space_id}: `synch source add {space_id} <dir>` \
+                         names the directory tree adoption writes into"
                     ))
                 })?;
-                // A detached space has no checkout to fill: its content lives
-                // in the cloud CAS and is read on demand. `synch mirror add` is
-                // what materializes one where a directory is wanted.
+                // An API source has no directory to adopt into. A replica
+                // checkout is a read-only projection, not a publishing source.
                 let local_path = space.local_path.ok_or_else(|| {
                     EngineError::invalid(format!(
-                        "space {space_id} is detached and has no local directory to fill; \
-                         `synch mirror add {space_id} <dir>` materializes one"
+                        "source {space_id} is API-only and has no local directory for tree adoption; \
+                         `synch replica add {space_id} --checkout <dir>` creates a read-only materialization"
                     ))
                 })?;
                 // The guard `scan_space_with_ingest` takes, for the same reason and the
@@ -231,7 +230,7 @@ impl Node {
             .await?
         };
 
-        // Blocking end to end for the reasons mirror.rs lays out: the listing
+        // Blocking end to end for the reasons checkout.rs lays out: the listing
         // is a range scan over every path in the space plus a version set each,
         // and deciding what a path needs is a stat and — where the scanner's
         // own record cannot answer — a whole-file hash.
@@ -244,7 +243,7 @@ impl Node {
             // would put a file where the scanner will never look: never
             // published, never swept — it is in neither `local_files` nor the
             // published tree — and reported `current` by every fill after it.
-            // A mirror needs none of this because nothing indexes what it
+            // A checkout needs none of this because nothing indexes what it
             // writes.
             let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
@@ -380,12 +379,12 @@ impl Node {
             // what is left is the materialization, which the link loop — where
             // stat and write really are one step — does not have.
             //
-            // The escape guard is the mirror's, and describes the *directory*
+            // The escape guard is the checkout's, and describes the *directory*
             // the write lands in — `escapes_via_symlink` pops the last
             // component, so it says nothing about the target itself.
             //
-            // The second guard is the one a fill needs and a mirror does not.
-            // A mirror owns its root; a fill writes into the directory the user
+            // The second guard is the one a fill needs and a checkout does not.
+            // A checkout owns its root; a fill writes into the directory the user
             // works in, with the watcher running, so "nothing was here when we
             // planned" is a statement with a shelf life. Materialization ends
             // in a rename, which destroys whatever it lands on — so a file that
@@ -495,8 +494,8 @@ impl Node {
                     // Counted here rather than at the fetch, so the pair
                     // describes the bytes behind the files this fill wrote
                     // rather than including work the guards then turned away.
-                    report.fetched_bytes += crate::mirror::bytes_of(&fetched.fetched, size);
-                    report.reused_bytes += crate::mirror::bytes_of(&fetched.promoted, size);
+                    report.fetched_bytes += crate::checkout::bytes_of(&fetched.fetched, size);
+                    report.reused_bytes += crate::checkout::bytes_of(&fetched.promoted, size);
                     if over {
                         report.replaced.push(path.clone());
                     }
@@ -681,7 +680,7 @@ fn decide(
 ) -> Result<(FillReport, Vec<Wanted>, Vec<PendingLink>)> {
     // One clock reading for the pass, and the store's rather than the bare
     // clock, so every path selects against the same instant (`plan_pass`,
-    // mirror.rs).
+    // checkout.rs).
     let now = node.store().read_instant()?;
     let mut report = FillReport {
         dry_run: options.dry_run,
@@ -696,13 +695,13 @@ fn decide(
     // What the listing carried, so the caller can tell "this prefix names
     // nothing" from "everything under it was already here or was passed over".
     report.considered = listing.len();
-    // Detected before anything is written, the way a mirror pass does it: the
+    // Detected before anything is written, the way a checkout pass does it: the
     // first claimant of a folded name wins and the rest are reported — but only
     // where this space's filesystem actually folds them.
     let mut claimed: HashMap<String, String> = HashMap::new();
 
     for set in listing {
-        // A mirror refuses these names on every platform, so that one mirror of
+        // A checkout refuses these names on every platform, so that one mirror of
         // one tree is the same directory everywhere. A fill has the opposite
         // obligation: it writes into *this* machine's directory, where this
         // machine's own scanner is the thing that published half these paths.
@@ -726,9 +725,9 @@ fn decide(
         // the plan promises what the write will not do, which under `--dry-run`
         // is the one thing a plan must never do.
         //
-        // The mirror gets this for free by materializing in listing order, so a
+        // The checkout gets this for free by materializing in listing order, so a
         // link written for `sub` is on disk before `sub/passwd` is judged
-        // (mirror.rs). A fill decides everything before it writes anything, so
+        // (checkout.rs). A fill decides everything before it writes anything, so
         // it has to carry the knowledge instead of reading it off the disk. The
         // listing is sorted, so a link at `sub` is always seen before `sub/…`.
         if planned_links
@@ -738,7 +737,7 @@ fn decide(
             report.skipped.push((set.path.clone(), ESCAPED.to_string()));
             continue;
         }
-        // The same guard `synch take` and the S3 gateway write through: a
+        // The same guard `synch adopt path` and the S3 gateway write through: a
         // published path only ever lands inside the space it belongs to.
         let target = match target_within(root_dir, space_id, &set.path) {
             Ok(target) => target,
@@ -772,7 +771,7 @@ fn decide(
         };
 
         // A fill adds. A tombstone asks for a removal, which is the one thing
-        // it will not do — `synch take` of that version is how a deletion is
+        // it will not do — `synch adopt path` of that version is how a deletion is
         // adopted, deliberately and one path at a time (§8).
         if selected.kind == EntryKind::Tombstone || selected.kind == EntryKind::Dir {
             continue;
@@ -809,12 +808,12 @@ fn decide(
         // (`claim_folded_name`): without the claim, `--force` would write one
         // over the other and call both of them filled.
         //
-        // Applied on every platform, as the mirror applies it. A fill could ask
+        // Applied on every platform, as the checkout applies it. A fill could ask
         // the filesystem instead — and did, for three revisions — but the cost
         // of being wrong runs the other way: refusing a name is a report about
         // two files that are both there, while a wrong "does not fold" is a
         // silent clobber. §7.2 takes the conservative side.
-        if let Err(reason) = crate::mirror::claim_folded_name(&mut claimed, &set.path) {
+        if let Err(reason) = crate::checkout::claim_folded_name(&mut claimed, &set.path) {
             report.skipped.push((set.path.clone(), reason));
             continue;
         }
@@ -1000,7 +999,7 @@ const APPEARED: &str = "a file appeared here while the fill ran";
 /// edit would be gone with no version, no `prev`, and no trace in the cluster.
 const OWN_VERSION_DIFFERS: &str =
     "the selected version is this node's own, and what is here differs from it: that is an edit \
-     no scan has published yet, not a version to adopt. Run `synch scan` to publish it";
+     no scan has published yet, not a version to adopt. Run `synch source scan` to publish it";
 
 /// What is on disk where the selected version belongs.
 #[derive(Debug)]
@@ -1181,7 +1180,7 @@ mod tests {
         assert_eq!(report.filled, 0, "{report:?}");
         assert_eq!(report.current, 2, "{report:?}");
 
-        // `--force` is the bulk `synch take`: it names what it overwrote.
+        // `--force` is the bulk `synch adopt path`: it names what it overwrote.
         let report = node
             .fill_space(
                 "media",
@@ -1230,7 +1229,7 @@ mod tests {
         assert!(space.path().join("private.txt").exists());
 
         // Not even under --force: replacing bytes is one thing, removing a
-        // path is `synch take` of the tombstone.
+        // path is `synch adopt path` of the tombstone.
         let report = node
             .fill_space(
                 "media",
@@ -1278,7 +1277,7 @@ mod tests {
         // *newer* one would flip the selection to this node, cluster-wide.
         let drift = theirs.mtime_ns - ours.mtime_ns;
         assert!(
-            (0..crate::mirror::MTIME_GRANULARITY_NS).contains(&drift),
+            (0..crate::checkout::MTIME_GRANULARITY_NS).contains(&drift),
             "republished {} against the origin's {}: a filled path must never publish an mtime \
              newer than the version it came from, nor more than one filesystem tick below it",
             ours.mtime_ns,
@@ -1419,7 +1418,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("no local space elsewhere"), "{refused}");
+        assert!(
+            refused.contains("no filesystem source elsewhere"),
+            "{refused}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1634,7 +1636,10 @@ mod tests {
         );
         assert!(report.replaced.is_empty(), "{report:?}");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].1.contains("synch scan"), "{report:?}");
+        assert!(
+            report.skipped[0].1.contains("synch source scan"),
+            "{report:?}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1681,7 +1686,7 @@ mod tests {
         assert_eq!(report.filled, 1, "{report:?}");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         // The listing is ordered, so the first claimant is the lexicographically
-        // first path — the same winner a mirror picks (§7.2).
+        // first path — the same winner a checkout picks (§7.2).
         assert_eq!(report.skipped[0].0, "fold.txt", "{report:?}");
         assert!(report.skipped[0].1.contains("collides with Fold.txt"));
         assert_eq!(
@@ -1691,20 +1696,25 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A detached space has no checkout to fill, and says which command does
+    /// A API source has no checkout to fill, and says which command does
     /// materialize one.
     #[tokio::test]
     async fn a_detached_space_is_refused_with_the_command_that_fits() {
         let (_data, _space, node) = node_with_space().await;
-        node.store().put_detached_space("cloud").unwrap();
+        node.store()
+            .put_source("cloud", synch_store::SourceKind::Api, None)
+            .unwrap();
         publish_in(&node, &peer(), "cloud", "f.txt", b"theirs", STAMP);
         let refused = node
             .fill_space("cloud", "", &VersionPolicy::Newest, FillOptions::default())
             .await
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("detached"), "{refused}");
-        assert!(refused.contains("synch mirror add cloud"), "{refused}");
+        assert!(refused.contains("API-only"), "{refused}");
+        assert!(
+            refused.contains("synch replica add cloud --checkout"),
+            "{refused}"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1801,7 +1811,7 @@ mod tests {
             report
                 .skipped
                 .iter()
-                .any(|(p, why)| p == "latest" && why.contains("synch scan")),
+                .any(|(p, why)| p == "latest" && why.contains("synch source scan")),
             "{report:?}"
         );
         node.shutdown().await.unwrap();
@@ -1935,7 +1945,7 @@ mod tests {
 
     /// Every writer into a space directory is bound by its ignore rules, not
     /// just the multipart one: a plain `PutObject` takes `open_adoption`, and
-    /// `synch take` takes `adopt`/`adopt_from`. A write the scanner will never
+    /// `synch adopt path` takes `adopt`/`adopt_from`. A write the scanner will never
     /// look at is worse than a refused write — the bytes land in the operator's
     /// own directory, unpublished and unswept, and the client that sent them
     /// gets an error anyway when the publish finds nothing.
@@ -2057,12 +2067,14 @@ mod tests {
     }
 
     /// The last adoption entry point, and the one every gate had missed: a
-    /// detached commit promotes an object to the durable tier and stages a
+    /// API-source commit promotes an object to the durable tier and stages a
     /// reference, neither of which a node in recovery can publish.
     #[tokio::test]
     async fn a_recovering_node_commits_no_detached_file() {
         let (_data, _space, node) = node_with_space().await;
-        node.store().put_detached_space("cloud").unwrap();
+        node.store()
+            .put_source("cloud", synch_store::SourceKind::Api, None)
+            .unwrap();
         let source = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(source.path(), b"payload").unwrap();
         node.store()
@@ -2077,7 +2089,7 @@ mod tests {
             .unwrap();
 
         let refused = node
-            .commit_detached_file("cloud", "f.txt", source.path(), now_ns())
+            .commit_api_file("cloud", "f.txt", source.path(), now_ns())
             .await
             .unwrap_err()
             .to_string();
@@ -2119,7 +2131,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// `synch take` adopts by writing into the space and publishing after. On a
+    /// `synch adopt path` adopts by writing into the space and publishing after. On a
     /// node that cannot publish, doing the write first destroys the local copy
     /// and can tell nobody — so the gate is taken before anything is touched,
     /// for content and for a deletion alike.

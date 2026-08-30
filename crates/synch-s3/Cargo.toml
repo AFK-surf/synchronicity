@@ -27,6 +27,7 @@ clap.workspace = true
 crc.workspace = true
 hex.workspace = true
 hmac.workspace = true
+rpassword = "7"
 sha2.workspace = true
 synch-cli.workspace = true
 synch-core.workspace = true

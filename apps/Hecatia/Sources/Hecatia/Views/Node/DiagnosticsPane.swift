@@ -77,9 +77,8 @@ struct DiagnosticsPane: View {
         DetailRow(
           label: "Spaces",
           value: status.spaceNames.isEmpty ? "none" : status.spaceNames.joined(separator: ", "))
-        if let mirrors = status.mirrorCount {
-          DetailRow(label: "Mirrors", value: "\(mirrors)")
-        }
+        if let sources = status.sourceCount { DetailRow(label: "Sources", value: "\(sources)") }
+        if let replicas = status.replicaCount { DetailRow(label: "Replicas", value: "\(replicas)") }
         DetailRow(
           label: "Published",
           value: status.headSeq.map { "seq \($0)" } ?? "nothing published yet")
@@ -114,7 +113,7 @@ struct DiagnosticsPane: View {
         // wants a fixed height to scroll inside; an empty state is a glyph over
         // two lines of prose and wants a floor it can exceed — given the same
         // fixed height it is centred and then clipped, which takes the glyph
-        // off the top. The same mistake ``MirrorsSection`` records.
+        // off the top. The same rule applies to every table in this pane.
         if node.doctorReport.isEmpty {
           DoctorEmptyState(running: node.doctorRunning)
             .frame(maxWidth: .infinity, minHeight: 200)

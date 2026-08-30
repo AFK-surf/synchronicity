@@ -314,7 +314,7 @@ extension FilesModel {
   /// wrongly. Recorded as E10 in docs/DAEMON-ISSUES.md.
   ///
   /// The suggestion names no remedy, because both obvious ones were tried
-  /// against the daemon that produces this and neither works. `synch scan`
+  /// against the daemon that produces this and neither works. `synch source scan`
   /// reports "unchanged 10" and changes nothing — the daemon agrees the folder
   /// and the index match. `synch doctor` reports the head as "servable, 10
   /// entries" and does not mention it. Telling someone to run either would be

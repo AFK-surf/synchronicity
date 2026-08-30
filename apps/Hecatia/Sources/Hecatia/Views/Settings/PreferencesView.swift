@@ -100,7 +100,7 @@ struct PreferencesView: View {
       case .members: MembersPane(confirmation: $confirmation)
       case .network: NetworkPane()
       case .spaces: SpacesPane(confirmation: $confirmation)
-      case .mirrorsAndPins: MirrorsAndPinsPane(confirmation: $confirmation)
+      case .pins: PinsPane(confirmation: $confirmation)
       case .remote: RemoteAccessPane(confirmation: $confirmation)
       case .diagnostics: DiagnosticsPane(confirmation: $confirmation)
       }

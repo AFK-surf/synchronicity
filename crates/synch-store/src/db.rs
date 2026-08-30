@@ -1610,13 +1610,9 @@ mod tests {
             "v3 drops it"
         );
         assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
-        // v4 carried the mirror over as an origin pin; v5 did the same for
-        // the bucket map, and v8 moved it into the `s3.*` namespace.
-        let mirrors = store.mirrors().unwrap();
-        assert_eq!(mirrors.len(), 1);
-        assert_eq!(mirrors[0].local_path, "/mnt/nas");
-        assert_eq!(mirrors[0].space, "media");
-        assert_eq!(mirrors[0].policy.render(), "origin=nas@x.example");
+        // v23 removes standalone mirror configuration rather than silently
+        // converting one selected view into an all-versions replica.
+        assert!(store.replicas().unwrap().is_empty());
         assert_eq!(store.config("s3_buckets").unwrap(), None);
         assert_eq!(
             store.config("s3.buckets").unwrap().as_deref(),
@@ -1629,6 +1625,54 @@ mod tests {
             observed[0].claimed_by, None,
             "an observation from before the column knows no claimant"
         );
+    }
+
+    #[test]
+    fn v23_backfills_source_holds_and_repair_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let held = Hash::new(b"held");
+        let missing = Hash::new(b"missing");
+        {
+            let conn = database_at(dir.path(), 22);
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES ('self_origin_id', ?1)",
+                params![origin.canonical()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO spaces (id, local_path) VALUES ('media', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs (root, size, complete, bitmap, inline, last_access, durable)
+                 VALUES (?1, 4, 1, NULL, ?2, 1, 1)",
+                params![held.as_bytes().to_vec(), b"held".as_slice()],
+            )
+            .unwrap();
+            for (path, root, size) in [("held", held, 4i64), ("missing", missing, 7)] {
+                conn.execute(
+                    "INSERT INTO entries
+                     (origin_id, space, path, kind, size, mtime_ns, content, seq)
+                     VALUES (?1, 'media', ?2, 0, ?3, 1, ?4, 1)",
+                    params![origin.canonical(), path, size, root.as_bytes().to_vec()],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        let holder = crate::PinHolder::Source("media".into());
+        assert!(store
+            .pins_for(&held)
+            .unwrap()
+            .iter()
+            .any(|pin| pin.holder == holder));
+        let wants = store.wants_of(&holder).unwrap();
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].root, missing);
+        assert_eq!(wants[0].size, 7);
     }
 
     /// v6 rebuilds `entries` to carry a symlink's target (§8 version identity), and every existing row comes through it, indexes included.

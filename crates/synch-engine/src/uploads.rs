@@ -98,7 +98,7 @@ impl Node {
     /// Resolved at creation rather than at completion so a path the space
     /// cannot hold is refused before the client streams a single part.
     pub fn upload_target(&self, space: &str, path: &str) -> Result<PathBuf> {
-        if self.is_detached_space(space)? {
+        if self.is_api_source(space)? {
             let normalized = synch_core::normalize_path(path)
                 .map_err(|error| EngineError::invalid(error.to_string()))?;
             return Ok(PathBuf::from(format!("{space}/{normalized}")));
@@ -121,7 +121,7 @@ impl Node {
     ) -> Result<String> {
         // A space that does not exist cannot hold an upload; `refuse_if_ignored`
         // passes over one rather than inventing an error, so it is named here.
-        if self.store().space(space)?.is_none() {
+        if self.store().source(space)?.is_none() {
             return Err(EngineError::not_found(format!("space {space}")));
         }
         // A key the scanner would skip can never become an object, and finding
@@ -368,7 +368,7 @@ impl Node {
         let dir = self.store().upload_dir(upload);
         let detached = {
             let (node, space) = (self.clone(), space.to_string());
-            crate::blocking::offload(move || node.is_detached_space(&space)).await?
+            crate::blocking::offload(move || node.is_api_source(&space)).await?
         };
         let remote_parts = self.cas_backend().remote_upload_parts();
         if remote_parts && !detached {
@@ -411,7 +411,7 @@ impl Node {
             output.sync_all().await?;
             drop(output);
             let committed = self
-                .commit_detached_file(space, path, &target, synch_core::now_ns())
+                .commit_api_file(space, path, &target, synch_core::now_ns())
                 .await;
             let _ = tokio::fs::remove_file(&target).await;
             committed?
@@ -442,13 +442,13 @@ impl Node {
             .await?;
             if detached {
                 let committed = self
-                    .commit_detached_file(space, path, &target, synch_core::now_ns())
+                    .commit_api_file(space, path, &target, synch_core::now_ns())
                     .await;
                 let _ = tokio::fs::remove_file(&target).await;
                 let committed = committed?;
                 if committed != assembled {
                     return Err(EngineError::invalid(
-                        "multipart assembly changed during detached ingest",
+                        "multipart assembly changed during API-source ingest",
                     ));
                 }
                 committed
@@ -458,7 +458,7 @@ impl Node {
         };
 
         // Publication is part of the completion promise, especially for a
-        // detached space with no watcher to repair it later.
+        // API source with no watcher to repair it later.
         self.scan_publish_push().await?;
 
         let (node, upload_id) = (self.clone(), upload.to_string());
@@ -968,7 +968,7 @@ mod tests {
             cache_bytes: Some(512 * 1024 * 1024),
         });
         let node = Node::open(config).await.unwrap();
-        node.add_detached_space("media").unwrap();
+        node.add_api_source("media").unwrap();
         let target = node.upload_target("media", "joined.bin").unwrap();
         let upload = node
             .create_upload("media", "joined.bin", None, &target)

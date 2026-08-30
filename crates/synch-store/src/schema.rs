@@ -87,13 +87,103 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V20_SERVERLESS_FOUNDATION),
     Migration::Sql(V21_REPLICATION),
     Migration::Sql(V22_SOCKETS),
+    Migration::Sql(V23_SOURCE_REPLICA_ROLES),
 ];
+
+/// v23 — local participation is two independent roles.
+///
+/// A space is a wire namespace, not a local resource.  Filesystem/API
+/// publication belongs to `sources`; durable content retention belongs to
+/// `replicas`.  A replica's optional newest checkout replaces the standalone
+/// mirror subsystem.  The migration intentionally drops mirror configuration:
+/// converting a one-version mirror to an all-versions replica could silently
+/// commit the operator to orders of magnitude more storage.
+const V23_SOURCE_REPLICA_ROLES: &str = r#"
+CREATE TABLE sources (
+  space       TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL CHECK (kind IN ('filesystem', 'api')),
+  local_path  TEXT,
+  CHECK (
+    (kind = 'filesystem' AND local_path IS NOT NULL) OR
+    (kind = 'api' AND local_path IS NULL)
+  )
+);
+
+CREATE TABLE replicas (
+  space          TEXT PRIMARY KEY,
+  retention      TEXT NOT NULL CHECK (retention IN ('current', 'forever')),
+  grace_seconds  INTEGER,
+  budget_bytes   INTEGER,
+  checkout_path  TEXT,
+  CHECK (
+    (retention = 'current' AND grace_seconds IS NOT NULL) OR
+    (retention = 'forever' AND grace_seconds IS NULL)
+  )
+);
+
+CREATE TABLE content_want (
+  root         BLOB NOT NULL,
+  holder       TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  prev         BLOB,
+  first_wanted INTEGER NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_error   TEXT,
+  PRIMARY KEY (root, holder)
+);
+INSERT INTO content_want
+SELECT root, holder, size, prev, first_wanted, attempts, last_attempt, last_error
+  FROM replica_want;
+DROP TABLE replica_want;
+CREATE INDEX content_want_by_holder ON content_want (holder, first_wanted);
+
+INSERT INTO sources (space, kind, local_path)
+SELECT id,
+       CASE WHEN local_path IS NULL THEN 'api' ELSE 'filesystem' END,
+       local_path
+FROM spaces;
+
+-- Preserve the publication promise for own live entries that predate source
+-- holders. Complete durable objects become source holds; anything else becomes
+-- repair intent instead of being silently advertised as durable.
+INSERT OR IGNORE INTO pins (root, holder, created_at, release_after)
+SELECT e.content, 'source:' || e.space, 0, NULL
+  FROM entries e
+  JOIN sources s ON s.space = e.space
+  JOIN config self ON self.key = 'self_origin_id' AND self.value = e.origin_id
+  JOIN blobs b ON b.root = e.content
+ WHERE e.kind IN (0, 4) AND e.content IS NOT NULL
+   AND b.complete != 0 AND b.durable != 0;
+
+INSERT OR IGNORE INTO content_want (root, holder, size, prev, first_wanted)
+SELECT e.content, 'source:' || e.space, e.size, e.prev, 0
+  FROM entries e
+  JOIN sources s ON s.space = e.space
+  JOIN config self ON self.key = 'self_origin_id' AND self.value = e.origin_id
+  LEFT JOIN blobs b ON b.root = e.content
+ WHERE e.kind IN (0, 4) AND e.content IS NOT NULL
+   AND (b.root IS NULL OR b.complete = 0 OR b.durable = 0);
+
+INSERT INTO replicas (space, retention, grace_seconds, budget_bytes, checkout_path)
+SELECT id,
+       CASE replicate WHEN 'archive' THEN 'forever' ELSE 'current' END,
+       CASE WHEN replicate = 'archive' THEN NULL
+            ELSE COALESCE(grace, 2592000) END,
+       budget,
+       NULL
+FROM spaces
+WHERE replicate IS NOT NULL;
+
+DROP TABLE mirrors;
+DROP TABLE spaces;
+"#;
 
 /// v22 — socket declarations and their arming records (`docs/SOCKETS.md` §3).
 ///
 /// Both tables are **local operator state**. Neither is ever published,
 /// replicated, or derived from a peer's trie, and that is the whole point: a
-/// node's own tree is not a closed system — `synch take`, `synch fill --force`
+/// node's own tree is not a closed system — `synch adopt path`, `synch adopt tree --replace`
 /// and an S3 `PUT` all write bytes into a space directory that the scanner then
 /// publishes as this node's own view — so publication cannot be the gate on
 /// execution. These rows are the gate.
@@ -143,7 +233,7 @@ CREATE TABLE socket_arms (
 /// whose local cache is empty. Local-filesystem rows are backfilled because a
 /// complete local object already passed the fsync-before-row invariant.
 ///
-/// A nullable space path is the representation of a detached space. It has no
+/// A nullable space path is the representation of an API source. It has no
 /// scanner or watcher root, but remains a space this origin can publish into.
 const V20_SERVERLESS_FOUNDATION: &str = r#"
 ALTER TABLE blobs ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
@@ -187,7 +277,7 @@ DROP TABLE spaces_v19;
 ///
 /// `spaces` gains the replication policy in the same step, because v20 already
 /// made a row mean "this node's participation in this space" — a nullable
-/// `local_path` for detached spaces — and holding every version of a space is
+/// `local_path` for API sources — and holding every version of a space is
 /// the second kind of participation that row can describe. One per space, so a
 /// column rather than a table.
 const V21_REPLICATION: &str = r#"
@@ -799,7 +889,7 @@ CREATE TABLE pins (                       -- who holds an object, and until when
 );
 CREATE INDEX pins_pending_release ON pins (release_after) WHERE release_after IS NOT NULL;
 CREATE INDEX pins_by_holder ON pins (holder);
-CREATE TABLE replica_want (               -- content a replicated space wants (§3.3)
+CREATE TABLE content_want (               -- content a durable role wants (§3.3)
   root         BLOB NOT NULL,
   holder       TEXT NOT NULL,
   size         INTEGER NOT NULL,
@@ -810,17 +900,26 @@ CREATE TABLE replica_want (               -- content a replicated space wants (�
   last_error   TEXT,
   PRIMARY KEY (root, holder)
 );
-CREATE INDEX replica_want_by_holder ON replica_want (holder, first_wanted);
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT,
-                            replicate TEXT, grace INTEGER, budget INTEGER);
+CREATE INDEX content_want_by_holder ON content_want (holder, first_wanted);
+CREATE TABLE sources (
+  space       TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL CHECK (kind IN ('filesystem', 'api')),
+  local_path  TEXT,
+  CHECK ((kind = 'filesystem' AND local_path IS NOT NULL) OR
+         (kind = 'api' AND local_path IS NULL))
+);
+CREATE TABLE replicas (
+  space          TEXT PRIMARY KEY,
+  retention      TEXT NOT NULL CHECK (retention IN ('current', 'forever')),
+  grace_seconds  INTEGER,
+  budget_bytes   INTEGER,
+  checkout_path  TEXT,
+  CHECK ((retention = 'current' AND grace_seconds IS NOT NULL) OR
+         (retention = 'forever' AND grace_seconds IS NULL))
+);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
-CREATE TABLE mirrors (
-  local_path TEXT PRIMARY KEY,
-  space      TEXT NOT NULL,
-  policy     TEXT NOT NULL
-);
 CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
                             last_sync INTEGER, latency_ewma_us INTEGER);
 CREATE TABLE observed_heads (

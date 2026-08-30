@@ -8,7 +8,7 @@ use synch_engine::{
     replica::ReplicaStatus, CompareReport, CompareStatus, EntryRef, Node, RekorPolicy,
     ResolverStatus, VersionPolicy, VersionSet,
 };
-use synch_store::{EntryRow, ReplicaCoverage, ReplicaPolicy, SpaceRow};
+use synch_store::{EntryRow, ReplicaPolicy};
 
 use crate::control::ControlError;
 
@@ -146,39 +146,7 @@ pub fn duration(seconds: i64) -> String {
     }
 }
 
-/// One line of `synch space ls`: what this node does about a space.
-///
-/// The two halves of a row are independent and the line has to show both, or
-/// an operator cannot tell a detached replica from a checkout that replicates
-/// nothing — which are opposite answers to "what is this machine for".
-pub(crate) fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -> String {
-    let replication = match (space.replicate, coverage) {
-        (None, _) => "—".to_string(),
-        (Some(policy), None) => format!("replicate {policy}"),
-        (Some(policy), Some(coverage)) => {
-            let grace = match policy {
-                ReplicaPolicy::Tree => format!(" · grace {}", duration(space.grace_secs())),
-                ReplicaPolicy::Archive => String::new(),
-            };
-            format!(
-                "replicate {policy}{grace} · {} B held{}",
-                coverage.held_bytes,
-                match coverage.wanted {
-                    0 => String::new(),
-                    n => format!(" · {n} wanted"),
-                }
-            )
-        }
-    };
-    format!(
-        "{:<20} {:<28} {}",
-        space.id,
-        space.local_path.as_deref().unwrap_or("—"),
-        replication
-    )
-}
-
-/// The detailed report of `synch space ls <id>`.
+/// The detailed report of `synch replica ls <id>`.
 ///
 /// Three of these lines exist to be read on a bad day. `unreachable` is never
 /// folded into `wanted`: objects with no provider are not a backlog, they are
@@ -188,23 +156,19 @@ pub(crate) fn space_line(space: &SpaceRow, coverage: Option<&ReplicaCoverage>) -
 /// running at all, because "paused" is the difference between a replica that is
 /// behaving and one that is stuck.
 pub fn replica_status(status: &ReplicaStatus) -> Lines {
-    let space = &status.space;
+    let space = &status.replica;
     let mut out = vec![format!(
-        "{}   indexed {}   {}",
-        space.id,
-        space.local_path.as_deref().unwrap_or("—"),
-        match space.replicate {
-            None => "not replicated".to_string(),
-            Some(policy @ ReplicaPolicy::Tree) => format!(
-                "replicate {policy}   grace {}",
-                duration(space.grace_secs())
-            ),
-            Some(policy) => format!("replicate {policy}"),
+        "{}   {}{}",
+        space.space,
+        match space.retention {
+            ReplicaPolicy::Current => format!("current   grace {}", duration(space.grace_secs())),
+            ReplicaPolicy::Forever => "forever".to_string(),
+        },
+        match &space.checkout_path {
+            Some(path) => format!("   checkout {path}"),
+            None => String::new(),
         }
     )];
-    if space.replicate.is_none() {
-        return Ok(out);
-    }
     let coverage = &status.coverage;
     out.push(format!(
         "  held          {:>9} objects  {:>14} B",
@@ -664,11 +628,11 @@ pub fn doctor(node: &Node) -> Lines {
     // because the two lines that matter here are ones nobody thinks to look
     // for: content no provider will serve, and releases that have stopped
     // running. Both mean a replica is not doing what it was asked to.
-    for space in node.store().replicated_spaces()? {
-        let status = node.replica_status(&space.id)?;
+    for space in node.store().replicas()? {
+        let status = node.replica_status(&space.space)?;
         out.push(format!(
             "replicating {}: {} objects held, {} wanted{}",
-            space.id,
+            space.space,
             status.coverage.held,
             status.coverage.wanted,
             match status.coverage.unreachable {

@@ -32,12 +32,13 @@ enum GatewayConfig {
       case 1:
         // One field alone is a removal.
         mapping = nil
-      case 3...:
+      case 4...:
         // The gateway trims before parsing, so a stored `newest ` is a policy
         // there and must be one here too.
-        guard let policy = VersionPolicy(wire: fields[2].trimmingCharacters(in: .whitespaces))
+        guard let access = GatewayBucket.Access(rawValue: fields[2]),
+              let policy = VersionPolicy(wire: fields[3].trimmingCharacters(in: .whitespaces))
         else { continue }
-        mapping = GatewayBucket(name: name, space: fields[1], policy: policy)
+        mapping = GatewayBucket(name: name, space: fields[1], access: access, policy: policy)
       default:
         // Two fields is neither an add nor a removal, and is skipped whole.
         continue
@@ -68,8 +69,10 @@ enum GatewayConfig {
 
   // MARK: - The records that change them
 
-  static func bucketRecord(name: String, space: String, policy: VersionPolicy) -> String {
-    "\(name)\t\(space)\t\(policy.wire)"
+  static func bucketRecord(
+    name: String, space: String, access: GatewayBucket.Access, policy: VersionPolicy
+  ) -> String {
+    "\(name)\t\(space)\t\(access.rawValue)\t\(policy.wire)"
   }
 
   static func bucketRemoval(_ name: String) -> String { name }

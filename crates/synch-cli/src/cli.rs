@@ -326,21 +326,29 @@ pub enum Command {
         #[command(subcommand)]
         command: DomainCommand,
     },
-    /// Live peers, addresses, last sync, lag.
-    Peers,
-    /// Run one anti-entropy exchange with every dialable peer, now.
-    Sync,
-    /// Index a local directory as a space.
-    Space {
-        /// The space subcommand.
+    /// Inspect peers or exchange metadata with them.
+    Peer {
+        /// The peer subcommand.
         #[command(subcommand)]
-        command: SpaceCommand,
+        command: PeerCommand,
+    },
+    /// Configure this node as a publisher for a space.
+    Source {
+        /// The source subcommand.
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    /// Configure durable all-version retention for a space.
+    Replica {
+        /// The replica subcommand.
+        #[command(subcommand)]
+        command: ReplicaCommand,
     },
     /// List the unified tree, divergent paths marked with their version count.
     Ls {
         /// `[<origin>:]<space>[/<dir>]`. The origin-prefixed form lists one
         /// origin's view instead of the unified tree.
-        reference: String,
+        reference: Option<String>,
         /// Show every version of every path, with its attestors.
         #[arg(long)]
         all: bool,
@@ -359,17 +367,13 @@ pub enum Command {
         /// A byte range, as `START..END`, `START..`, or `..END`.
         #[arg(long)]
         range: Option<String>,
-        /// Read this origin's version — the same thing as pinning it in the
-        /// reference.
-        #[arg(long, value_name = "ORIGIN")]
-        from: Option<String>,
-        /// Refuse to read a divergent path, and list its versions instead.
-        #[arg(long, conflicts_with = "from")]
-        strict: bool,
+        /// Version selection: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
         /// Read an object by its content root, with no path involved — what
         /// `synch log` prints, and the only way to read a superseded version
         /// (§8).
-        #[arg(long, value_name = "HEX", conflicts_with_all = ["from", "strict"])]
+        #[arg(long, value_name = "HEX", conflicts_with = "select")]
         root: Option<String>,
     },
     /// Fetch to a file.
@@ -381,20 +385,18 @@ pub enum Command {
         /// itself when `--root` names the object.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Fetch this origin's version.
-        #[arg(long, value_name = "ORIGIN")]
-        from: Option<String>,
-        /// Refuse to fetch a divergent path, and list its versions instead.
-        #[arg(long, conflicts_with = "from")]
-        strict: bool,
+        /// Version selection: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
         /// Fetch an object by its content root, with no path involved.
-        #[arg(long, value_name = "HEX", conflicts_with_all = ["from", "strict"])]
+        #[arg(long, value_name = "HEX", conflicts_with = "select")]
         root: Option<String>,
     },
-    /// Adopt a peer's version as this node's own.
-    Take {
-        /// `<origin>:<space>/<path>`.
-        reference: String,
+    /// Adopt content into this node's published source.
+    Adopt {
+        /// The adoption subcommand.
+        #[command(subcommand)]
+        command: AdoptCommand,
     },
     /// Per-origin publish history for a path.
     Log {
@@ -420,72 +422,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Fill a space's own directory with the content of the unified tree.
-    ///
-    /// One-shot, and additive: a path missing here is written, a path whose
-    /// bytes already match is left alone, and a path whose bytes differ is
-    /// reported rather than overwritten. Nothing is ever removed — that is the
-    /// difference between filling the directory this node publishes from and
-    /// mirroring into one it owns.
-    ///
-    /// Filling does not publish. The files land where the scanner will find
-    /// them, and the next scan publishes them as this node's own view.
-    Fill {
-        /// `[<origin>:]<space>[/<dir>]`. The origin-prefixed form fills from
-        /// one origin's versions instead of the unified tree's selection.
-        reference: String,
-        /// Fill from this origin's version of every path.
-        #[arg(long, value_name = "ORIGIN")]
-        from: Option<String>,
-        /// Report divergent paths instead of picking one of their versions.
-        #[arg(long, conflicts_with = "from")]
-        strict: bool,
-        /// Replace local files whose content differs from the selected
-        /// version. Without it they are reported and left alone.
-        #[arg(long)]
-        force: bool,
-        /// Decide everything and write nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Continuous read-only materialization.
-    Mirror {
-        /// The mirror subcommand.
-        #[command(subcommand)]
-        command: MirrorCommand,
-    },
     /// Declare, arm and inspect this node's sockets (`docs/SOCKETS.md`).
     Socket {
         /// The socket subcommand.
         #[command(subcommand)]
         command: SocketCommand,
-    },
-    /// Connect to a socket on any node, including this one.
-    ///
-    /// The connecting side executes nothing: it names a path, and everything
-    /// that decides what runs is state the named node already holds.
-    Connect {
-        /// `<origin>:<space>/<path>` — origin-qualified, always.
-        ///
-        /// There is no version policy here. A socket is served by the node that
-        /// published it, so there is nothing to select between: `newest` would
-        /// let any member's mtime decide whose program answers.
-        reference: String,
-        /// `k=v` metadata the program can read with `sy_conn_meta`. Untrusted
-        /// by the program, which is told so.
-        #[arg(long = "meta", value_name = "K=V")]
-        meta: Vec<String>,
-        /// Listen on `ADDR:PORT` and open one invocation per accepted
-        /// connection, instead of piping stdio.
-        ///
-        /// The listener lives in this process, not the daemon: closing this
-        /// command ends the exposure, and the daemon never holds a listening
-        /// socket it was not configured with.
-        #[arg(long, value_name = "ADDR:PORT")]
-        listen: Option<String>,
-        /// With --listen, serve one connection and exit.
-        #[arg(long, requires = "listen")]
-        once: bool,
     },
     /// Keep content in the local store regardless of policy.
     Pin {
@@ -505,17 +446,17 @@ pub enum Command {
         #[arg(long)]
         gap: Option<u64>,
     },
-    /// Connectivity, membership, equivocation, and GC report.
-    Doctor {
-        /// Rebuild the derived views from the authoritative trie.
-        #[arg(long)]
-        rebuild: bool,
+    /// Read-only connectivity, membership, equivocation, and GC report.
+    Doctor,
+    /// Repair reconstructible local state.
+    Repair {
+        /// The repair subcommand.
+        #[command(subcommand)]
+        command: RepairCommand,
     },
-    /// Scan every configured space and publish the result.
-    Scan,
     /// The read-only tunnel to the control plane the zone names, on by
     /// default.
-    Cloud {
+    ControlPlane {
         /// The cloud subcommand.
         #[command(subcommand)]
         command: CloudCommand,
@@ -540,8 +481,8 @@ pub enum Command {
     /// need it say so, naming the command that starts one, rather than the
     /// process failing before the client has finished launching it.
     Mcp {
-        /// Also serve the tools that change state: writes, deletes, takes,
-        /// pins, scans, and the socket lifecycle.
+        /// Also serve the tools that change state: writes, deletes, adoption,
+        /// pins, source scans, and the socket lifecycle.
         ///
         /// Without it the surface is read-only, and the tool list says so —
         /// a client is shown exactly the authority it was given.
@@ -573,7 +514,7 @@ pub enum CasCommand {
     },
 }
 
-/// `synch cloud ...`
+/// `synch control-plane ...`
 ///
 /// The tunnel is on by default: a daemon attaches to the control plane its
 /// membership zone names and answers its read requests for every space this
@@ -584,7 +525,7 @@ pub enum CasCommand {
 /// membership.
 #[derive(Debug, Subcommand)]
 pub enum CloudCommand {
-    /// Reopen the tunnel after `cloud disable`. It is on by default, so this
+    /// Reopen the tunnel after `control-plane disable`. It is on by default, so this
     /// is only ever an undo.
     Enable,
     /// Stop answering the control plane and drop any open tunnel.
@@ -594,6 +535,49 @@ pub enum CloudCommand {
     /// plane and this daemon holds a tunnel to each, so one node being down
     /// is its own line rather than a verdict on the domain.
     Status,
+}
+
+/// `synch peer ...`
+#[derive(Debug, Subcommand)]
+pub enum PeerCommand {
+    /// List live peers, addresses, last sync, and lag.
+    Ls,
+    /// Run one anti-entropy metadata exchange with every dialable peer now.
+    Sync,
+}
+
+/// `synch repair ...`
+#[derive(Debug, Subcommand)]
+pub enum RepairCommand {
+    /// Rebuild derived views from the authoritative trie.
+    RebuildViews,
+}
+
+/// `synch adopt ...`
+#[derive(Debug, Subcommand)]
+pub enum AdoptCommand {
+    /// Adopt one peer path as this node's own version.
+    Path {
+        /// `[<origin>:]<space>/<path>`.
+        reference: String,
+        /// Version selection: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
+    },
+    /// Materialize a selected tree into a filesystem source.
+    Tree {
+        /// `[<origin>:]<space>[/<dir>]`.
+        reference: String,
+        /// Version selection: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
+        /// Replace differing files. Adoption is additive by default.
+        #[arg(long)]
+        replace: bool,
+        /// Decide everything and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// `synch key ...`
@@ -718,109 +702,98 @@ pub enum DomainCommand {
     Refresh,
 }
 
-/// `synch space ...`
+/// `synch source ...`
 #[derive(Debug, Subcommand)]
-pub enum SpaceCommand {
-    /// Add a path-backed or detached space, optionally replicating it.
+pub enum SourceCommand {
+    /// Add a filesystem or API-only publisher.
     Add {
-        /// The space id.
-        id: String,
-        /// The local directory. Omit with `--detached`.
-        #[arg(
-            required_unless_present_any = ["detached", "replicate"],
-            conflicts_with = "detached"
-        )]
+        /// The space namespace.
+        space: String,
+        /// The local directory. Omit with `--api`.
+        #[arg(required_unless_present = "api", conflicts_with = "api")]
         path: Option<PathBuf>,
-        /// Publish into the space without a local checkout, scanner, or watcher.
+        /// Publish only through APIs, without a scanner or watcher.
         #[arg(long)]
-        detached: bool,
-        /// Hold every version of every path in this space, from every origin
-        /// (`docs/REPLICATION.md`). `tree` releases a root once the tree stops
-        /// naming it; `archive` releases nothing.
-        #[arg(long, value_name = "POLICY", num_args = 0..=1, default_missing_value = "tree")]
-        replicate: Option<String>,
-        /// How long a released root is still held. Only meaningful under
-        /// `--replicate=tree`, where it is the whole recovery story for an
-        /// accidental deletion.
-        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
-        grace: Option<std::time::Duration>,
-        /// A ceiling on bytes held for this space. Reaching it stops fetching;
-        /// it never releases anything.
-        #[arg(long, value_name = "BYTES")]
-        budget: Option<u64>,
+        api: bool,
     },
-    /// Change one half of a space's configuration, leaving the other alone.
-    Set {
-        /// The space id.
-        id: String,
-        /// Start replicating, or change the policy.
-        #[arg(
-            long,
-            value_name = "POLICY",
-            num_args = 0..=1,
-            default_missing_value = "tree",
-            conflicts_with = "no_replicate"
-        )]
-        replicate: Option<String>,
-        /// Stop replicating. The pins stay unless `--release` says otherwise.
-        #[arg(long)]
-        no_replicate: bool,
-        /// With `--no-replicate`, also drop what this space's replication holds.
-        #[arg(long, requires = "no_replicate")]
-        release: bool,
-        /// How long a released root is still held.
-        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
-        grace: Option<std::time::Duration>,
-        /// A ceiling on bytes held for this space.
-        #[arg(long, value_name = "BYTES")]
-        budget: Option<u64>,
-    },
-    /// List configured spaces, or report on one.
+    /// List publisher roles.
     Ls {
-        /// One space id, for the detailed report.
-        id: Option<String>,
+        /// One space namespace.
+        space: Option<String>,
     },
-    /// Bring one replicated space — or every one — up to date now.
-    Sync {
-        /// One space id. Omit to sweep them all.
-        id: Option<String>,
+    /// Scan and publish one filesystem source, or every filesystem source.
+    Scan {
+        /// One space namespace.
+        space: Option<String>,
     },
-    /// Stop indexing a space and unpublish its entries.
+    /// Stop publishing this node's view of a space.
     Rm {
-        /// The space id.
-        id: String,
-        /// Also drop what this space's replication holds.
-        #[arg(long)]
-        release: bool,
+        /// The space namespace.
+        space: String,
     },
 }
 
-/// `synch mirror ...`
-///
-/// A mirror materializes one space of the unified tree into a directory under
-/// a version policy (§7.2), so it is named by the directory it writes into.
+/// `synch replica ...`
 #[derive(Debug, Subcommand)]
-pub enum MirrorCommand {
-    /// Mirror a space of the unified tree into a local directory.
+pub enum ReplicaCommand {
+    /// Add a durable all-version replica.
     Add {
-        /// The space id.
+        /// The space namespace.
         space: String,
-        /// The local directory.
-        path: PathBuf,
-        /// Which version of each path to write: `newest` (default),
-        /// `origin=<id>`, or `strict`.
+        /// Retain current roots, or every root observed while active.
+        #[arg(long, default_value = "current")]
+        retention: String,
+        /// How long stale current roots remain held.
+        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// Stop acquiring new roots after this many held bytes.
+        #[arg(long, value_name = "BYTES")]
+        budget: Option<u64>,
+        /// Materialize the newest view into this directory.
         #[arg(long)]
-        policy: Option<String>,
+        checkout: Option<PathBuf>,
     },
-    /// Stop mirroring into a directory.
+    /// Change a replica's retention, limits, or checkout.
+    Set {
+        /// The space namespace.
+        space: String,
+        /// Replace the retention policy.
+        #[arg(long)]
+        retention: Option<String>,
+        /// Replace the current-retention grace period.
+        #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+        grace: Option<std::time::Duration>,
+        /// Replace the byte ceiling.
+        #[arg(long, conflicts_with = "no_budget")]
+        budget: Option<u64>,
+        /// Remove the byte ceiling.
+        #[arg(long)]
+        no_budget: bool,
+        /// Add or move the newest checkout.
+        #[arg(long, conflicts_with = "no_checkout")]
+        checkout: Option<PathBuf>,
+        /// Stop managing a checkout, leaving its files in place.
+        #[arg(long)]
+        no_checkout: bool,
+    },
+    /// Remove a replica and release its holds.
     Rm {
-        /// The local directory.
-        path: PathBuf,
+        /// The space namespace.
+        space: String,
+        /// Convert held roots to operator pins before removing the role.
+        #[arg(long)]
+        pin_held: bool,
     },
-    /// List mirrors.
-    Ls,
-    /// Bring every mirror up to date now.
-    Sync,
+    /// List replicas, or report one in detail.
+    Ls {
+        /// One space namespace.
+        space: Option<String>,
+    },
+    /// Reconcile and fetch one replica, or every replica.
+    Sync {
+        /// One space namespace.
+        space: Option<String>,
+    },
 }
 
 /// `synch socket ...`
@@ -831,7 +804,7 @@ pub enum SocketCommand {
     /// Declaring is not arming. It makes the scanner publish the path as a
     /// socket; `synch socket arm` is where the program's own declaration is
     /// printed and approved.
-    Add {
+    Declare {
         /// `<space>/<path>`.
         target: String,
         /// `k=v`, readable by the program through `sy_config_get`.
@@ -843,7 +816,7 @@ pub enum SocketCommand {
         /// Re-arm on every content change, without asking.
         ///
         /// Correct for a path you are the only writer of, and wrong for any
-        /// path an S3 key, a fill or a take can reach — those are all ways
+        /// path an S3 key or adoption can reach — those are all ways
         /// bytes you did not write become bytes this node publishes.
         #[arg(long)]
         auto: bool,
@@ -868,9 +841,23 @@ pub enum SocketCommand {
         target: String,
     },
     /// Undeclare a path; the next scan republishes it as an ordinary file.
-    Rm {
+    Undeclare {
         /// `<space>/<path>`.
         target: String,
+    },
+    /// Connect to a socket on any node, including this one.
+    Connect {
+        /// `<origin>:<space>/<path>` — origin-qualified, always.
+        reference: String,
+        /// `k=v` metadata the program can read with `sy_conn_meta`.
+        #[arg(long = "meta", value_name = "K=V")]
+        meta: Vec<String>,
+        /// Listen on `ADDR:PORT` and invoke once per accepted connection.
+        #[arg(long, value_name = "ADDR:PORT")]
+        listen: Option<String>,
+        /// With --listen, serve one connection and exit.
+        #[arg(long, requires = "listen")]
+        once: bool,
     },
     /// List this node's declared sockets.
     Ls {
@@ -941,11 +928,17 @@ pub enum PinCommand {
         /// A hex object root, or `<space>/<path>` — whose selected version's
         /// content root is the one pinned (§8).
         target: String,
+        /// Version selection for a path: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
     },
     /// Unpin an object root, or the version a path selects.
     Rm {
         /// A hex object root, or `<space>/<path>`.
         target: String,
+        /// Version selection for a path: newest, strict, or origin=<origin-id>.
+        #[arg(long, value_name = "POLICY")]
+        select: Option<String>,
     },
     /// List pinned objects.
     Ls,

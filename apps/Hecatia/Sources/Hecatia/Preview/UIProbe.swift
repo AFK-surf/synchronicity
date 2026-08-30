@@ -1237,7 +1237,7 @@ enum UIProbe {
     let expected = (try? FileManager.default.contentsOfDirectory(atPath: share))?
       .filter { !$0.hasPrefix(".") }.count ?? 0
     note("  [add] sharing \(share), which already holds \(expected) file(s)")
-    await node.addSpace(id: "probe-full", path: share)
+    await node.addSource(id: "probe-full", path: share)
     await settle(1.5)
     model.select(space: "probe-full")
     for _ in 0..<40 {

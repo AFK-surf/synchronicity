@@ -66,10 +66,8 @@ impl Daemon {
 
     /// This node's own origin, canonically rendered.
     ///
-    /// Read from the first line of the daemon's identity report, which is the
-    /// one thing in it the gateway needs: a bucket pinned to a *foreign* origin
-    /// is writable but reads back someone else's view, and saying so requires
-    /// knowing which origin is ours (§9.4).
+    /// Read from the first line of the daemon's identity report. Read-write
+    /// buckets pin reads to this origin so their own writes are visible.
     pub async fn origin(&self) -> S3Result<String> {
         self.lines(Command::Id(pb::Id {}))
             .await?
@@ -95,6 +93,17 @@ impl Daemon {
             Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether this node has a publisher role for `space`.
+    pub async fn has_source(&self, space: &str) -> S3Result<bool> {
+        Ok(self
+            .connect()
+            .await?
+            .list_spaces()
+            .await?
+            .into_iter()
+            .any(|row| row.id == space && row.source_kind.is_some()))
     }
 
     /// The version a policy selects for one path, with no content fetched —
