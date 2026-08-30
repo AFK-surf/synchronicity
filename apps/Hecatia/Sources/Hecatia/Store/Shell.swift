@@ -2,7 +2,7 @@ import Foundation
 
 /// Quoting, for the command lines the app shows and offers to copy.
 ///
-/// A space id, a mirror's local path and a folder name are all allowed to
+/// A space id, a checkout path and a folder name are all allowed to
 /// contain spaces — `validate_space` forbids only a slash, control characters
 /// and 63 bytes — so `synch source rm Family Photos` is a command that means
 /// something else, offered under a button labelled "Copy as a synch command".

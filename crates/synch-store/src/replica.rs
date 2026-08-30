@@ -1,4 +1,4 @@
-//! The replication tables: what a replicated space wants, and what it holds
+//! The replication tables: what a replica wants, and what it holds
 //! (`docs/REPLICATION.md` §3.3, §3.4).
 //!
 //! Two rows describe one object's journey through a replica. A `content_want`
@@ -55,7 +55,7 @@ use synch_core::Hash;
 
 use crate::{db::hash_column, db::Store, error::Result, PinHolder};
 
-/// One object a replicated space needs and does not hold.
+/// One object a replica needs and does not hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WantRow {
     /// The object root.
@@ -77,7 +77,7 @@ pub struct WantRow {
     pub last_error: Option<String>,
 }
 
-/// What a replicated space holds, wants, and is about to let go of.
+/// What a replica holds, wants, and is about to let go of.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplicaCoverage {
     /// Objects pinned for this space.
@@ -137,7 +137,7 @@ impl Store {
         )? > 0)
     }
 
-    /// Drops every want one holder has, for `--no-replicate`.
+    /// Drops every want one holder has when that replica role is removed.
     pub fn drop_wants(&self, holder: &PinHolder) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM content_want WHERE holder = ?1",
@@ -402,7 +402,7 @@ impl Store {
     pub fn stage_space_wants(&self, space: &str, holder: &PinHolder, now: i64) -> Result<usize> {
         self.with_immediate_tx(|tx| {
             // Content already held durably needs a claim, not a fetch. A
-            // replicated space that also has a checkout would otherwise queue a
+            // replica that also has a checkout would otherwise queue a
             // want for every file it publishes itself — bytes it just ingested
             // — and send each one round the fetch loop to discover that. Gated
             // on `durable` rather than `complete`, because on a cloud backend a
@@ -447,7 +447,7 @@ impl Store {
     ///
     /// Content that comes back is content that stays. The same root reappears
     /// often enough to be worth a statement of its own: another origin
-    /// publishing the same bytes, a `take` adopting them, a file restored from
+    /// publishing the same bytes, `adopt path` selecting them, a file restored from
     /// a copy — and in every case the release was decided against a tree that
     /// has since changed its mind.
     pub fn clear_returned_releases(&self, holder: &PinHolder) -> Result<usize> {
@@ -534,7 +534,7 @@ impl Store {
         }
         // The view predicate is here too, so a paused view is never reported as
         // the replication floor holding things back: they are different reasons
-        // and `space ls` prints them on different lines.
+        // and `replica ls` prints them on different lines.
         Ok(self.conn().query_row(
             &format!(
                 "SELECT COUNT(*) FROM pins
@@ -580,7 +580,7 @@ impl Store {
         Ok(out)
     }
 
-    /// What one space holds and wants, for `space ls <id>`.
+    /// What one replica holds and wants, for `replica ls <id>`.
     ///
     /// `unreachable_after` is how many failed attempts make a want an alarm
     /// rather than a backlog: those are versions whose last provider left
@@ -976,7 +976,7 @@ mod tests {
             )
             .unwrap();
 
-        // A replicated space that also has a checkout publishes its own files;
+        // A replica that also has a checkout publishes its own files;
         // the bytes are in the CAS the moment the entry is. Sending them round
         // the fetch loop to discover that is work nobody needs.
         assert_eq!(store.stage_space_wants("media", &media(), 5).unwrap(), 0);
@@ -1116,7 +1116,7 @@ mod tests {
         store.record_remote_durable_blob(&root, 4096, 1).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
-        // No entry names it — an `archive` replica's pins over superseded roots
+        // No entry names it — a `forever` replica's pins over superseded roots
         // stand for ever by design, and nothing else in the tree points at
         // them. The size is still known from this node's own row, and
         // `blob_providers` survives independently of `entries`, so the object

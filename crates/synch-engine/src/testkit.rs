@@ -3,7 +3,7 @@
 //! The async node fixture (a tempdir, `Node::init`, `Node::open` over a
 //! loopback config) and the small helpers around it — published-entry lookup,
 //! reopen-after-shutdown, and "soon, not at 50 ms" polling — were duplicated
-//! across the inline test modules of `mirror`, `scanner`, `cloud`, `recovery`,
+//! across the inline test modules of checkout, scanner, control-plane, recovery,
 //! `compare`, `tree`, `watcher`, `publisher`, and `aae`. They live here once.
 
 use std::path::Path;

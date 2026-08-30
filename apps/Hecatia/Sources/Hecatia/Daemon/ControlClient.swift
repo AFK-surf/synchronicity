@@ -22,7 +22,7 @@ actor ControlClient {
     case fast
     /// Anything that touches content or a peer on its way to an answer.
     case standard
-    /// Scans, mirror passes, recovery, and `key ls`, which dials every peer in
+    /// Source scans, checkout reconciliation, recovery, and `key ls`, which dial every peer in
     /// turn and can legitimately take minutes.
     case long
 
@@ -195,7 +195,7 @@ actor ControlClient {
   /// are the only way to read an object by its content root. `Control.Read`
   /// takes a `<space>/<path>` and a version policy, with no root field at all,
   /// so it can only ever answer with the *current* version of a path; a
-  /// superseded one, or anything an `archive` replica is holding, is
+  /// superseded one, or anything a `forever` replica is holding, is
   /// unreachable through it.
   ///
   /// `onProgress` is fed the running byte count rather than a fraction: the

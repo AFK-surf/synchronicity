@@ -94,10 +94,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 ///
 /// A space is a wire namespace, not a local resource.  Filesystem/API
 /// publication belongs to `sources`; durable content retention belongs to
-/// `replicas`.  A replica's optional newest checkout replaces the standalone
-/// mirror subsystem.  The migration intentionally drops mirror configuration:
-/// converting a one-version mirror to an all-versions replica could silently
-/// commit the operator to orders of magnitude more storage.
+/// `replicas`. A replica may additionally own one newest-view checkout.
+/// Filesystem projection settings are not converted into durable retention,
+/// because that could silently commit the operator to much more storage.
 const V23_SOURCE_REPLICA_ROLES: &str = r#"
 CREATE TABLE sources (
   space       TEXT PRIMARY KEY,
@@ -184,7 +183,7 @@ DROP TABLE spaces;
 /// Both tables are **local operator state**. Neither is ever published,
 /// replicated, or derived from a peer's trie, and that is the whole point: a
 /// node's own tree is not a closed system — `synch adopt path`, `synch adopt tree --replace`
-/// and an S3 `PUT` all write bytes into a space directory that the scanner then
+/// and an S3 `PUT` all write bytes into a filesystem-source directory that the scanner then
 /// publishes as this node's own view — so publication cannot be the gate on
 /// execution. These rows are the gate.
 ///
@@ -482,19 +481,17 @@ CREATE TABLE observed_heads (
 /// table never had a producer or a consumer.
 const V3_DROP_WANT: &str = "DROP TABLE want;";
 
-/// v4 — a mirror materializes the *unified tree* under a version policy
-/// (§7.2, §8), so it is keyed by the directory it writes into and no longer
-/// names an origin. Existing rows keep behaving exactly as they did, as an
-/// `origin=` pin on the origin they used to name.
+/// v4 — filesystem projections use unified-tree version selection and are
+/// keyed by their destination directory.
 const V4_MIRROR_POLICIES: &str = r#"
 ALTER TABLE mirrors RENAME TO mirrors_v3;
 CREATE TABLE mirrors (
-  local_path TEXT PRIMARY KEY,           -- one mirror per directory
+  local_path TEXT PRIMARY KEY,
   space      TEXT NOT NULL,
   policy     TEXT NOT NULL               -- 'newest' | 'origin=<id>' | 'strict' (§7.2)
 );
 -- Plain INSERT, not INSERT OR REPLACE. The key moves from
--- (origin_id, space) to local_path, so two v3 mirrors that pointed at one
+-- (origin_id, space) to local_path, so two old projections that pointed at one
 -- directory would collide here — and the survivor's sweep would then delete
 -- the other origin's materialized files. Failing loudly is the right outcome
 -- for an ambiguous upgrade.
@@ -502,7 +499,7 @@ CREATE TABLE mirrors (
 -- Worth knowing before reading that as an operator trap it is not: there has
 -- never been a released build whose chain stopped at v3. v1 through v8 landed
 -- in one commit, so a fresh database replays v1 — which creates an empty
--- `mirrors` — and reaches this SELECT with no rows to collide. A database that
+-- an empty projection table — and reaches this SELECT with no rows to collide. A database that
 -- could fail here would have to be hand-built at v3, and `Store::open` is the
 -- only way in, so recovering it means hand-editing either way.
 INSERT INTO mirrors (local_path, space, policy)
@@ -615,10 +612,10 @@ UPDATE config SET key = 's3.buckets' WHERE key = 's3_buckets';
 UPDATE config SET key = 's3.keys'    WHERE key = 's3_access_keys';
 "#;
 
-/// v9 — a file's advisory unix mode (§4.2) is metadata a mirror has to
+/// v9 — a file's advisory unix mode (§4.2) is metadata a checkout has to
 /// reproduce (§7.2), and `entries` is what every materializing surface reads.
 /// The scanner has always published the mode in its `f:` records; this view
-/// dropped it on the way in, so no reader could ever see it and every mirrored
+/// dropped it on the way in, so no reader could ever see it and every checkout
 /// file came out with whatever mode the copy happened to create.
 ///
 /// The column is nullable because the mode genuinely is optional: a Windows
@@ -626,7 +623,7 @@ UPDATE config SET key = 's3.keys'    WHERE key = 's3_access_keys';
 /// backfilled — the authoritative value is in each origin's trie, not here, and
 /// re-deriving it means re-materializing every leaf of every trie inside a
 /// migration transaction. Rows refresh as their origins republish, and
-/// `synch doctor --rebuild` repopulates all of them at once.
+/// `synch repair rebuild-views` repopulates all of them at once.
 ///
 /// Rebuilt rather than `ALTER ... ADD COLUMN` for the same reason as v6 and v7:
 /// the stored DDL should read in declaration order.
@@ -784,7 +781,7 @@ fn v12_history_recorded_at(tx: &Transaction<'_>) -> Result<()> {
 /// and nothing serves "what does this origin advertise?", which is a full table
 /// scan over *objects × advertising origins*. Two readers ask it:
 /// `provider_roots_for_origin`, once per maintenance pass, and
-/// `delete_origin_providers`, once per origin inside `doctor --rebuild`'s write
+/// `delete_origin_providers`, once per origin inside `repair rebuild-views`'s write
 /// transaction — so the rebuild was one scan per origin, holding the write
 /// connection throughout. `entries` has had both a covering primary key and a
 /// secondary index from the start; this table got neither.

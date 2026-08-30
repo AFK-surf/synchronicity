@@ -188,7 +188,7 @@ fn lookups(options: &Options, publisher: &Peer, follower: &Peer) {
     per_op("entry by path (one origin)", entry, paths.len());
 
     // The §8 merge: every origin's claim about one path, resolved under a
-    // policy. This is what `cat`, `get`, mirrors and S3 all go through.
+    // policy. This is what `cat`, `get`, checkouts and S3 all go through.
     let resolve = time(|| {
         for path in &paths {
             follower

@@ -80,7 +80,7 @@ pub(crate) fn trust(node: &Node, peer: &Node) {
     node.remember_peer(&peer.net().direct_addr()).unwrap();
 }
 
-/// Every node in `peers` trusts and can dial every other.
+/// Every node in the peer set trusts and can dial every other.
 #[allow(dead_code)]
 pub(crate) fn trust_all(peers: &[&Peer]) {
     for a in peers {

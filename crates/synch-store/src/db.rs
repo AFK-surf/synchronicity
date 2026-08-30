@@ -299,7 +299,7 @@ impl WriteWindow {
 
 /// Marks an object as being written, until dropped.
 ///
-/// A count rather than a flag: two fetches of one root — a mirror pass and a
+/// A count rather than a flag: two fetches of one root — replica acquisition and a
 /// `synch cat`, say — overlap legitimately, and the first to finish must not
 /// clear the mark the second is relying on.
 #[derive(Debug)]
@@ -1563,7 +1563,9 @@ mod tests {
         conn
     }
 
-    /// A v2 database — the oldest layout still real — upgrades with its data intact: `want` drops, mirrors become pins, the s3 bucket map moves namespace, and observed heads from before v7 come through unclaimed.
+    /// A v2 database — the oldest layout still real — upgrades with its durable
+    /// data intact, moves gateway configuration, and preserves old observations
+    /// without inventing claimants for them.
     #[test]
     fn a_v2_database_upgrades_with_its_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -1610,8 +1612,8 @@ mod tests {
             "v3 drops it"
         );
         assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
-        // v23 removes standalone mirror configuration rather than silently
-        // converting one selected view into an all-versions replica.
+        // Filesystem projection settings do not silently become an
+        // all-versions replica.
         assert!(store.replicas().unwrap().is_empty());
         assert_eq!(store.config("s3_buckets").unwrap(), None);
         assert_eq!(

@@ -13,7 +13,7 @@ use synch_core::{EntryKind, Hash};
 use synch_engine::{Node, NodeConfig};
 use synch_store::{ArmCandidate, SocketRow};
 
-/// A node with one space, and the directory that space indexes.
+/// A node with one filesystem source and its directory.
 async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
@@ -40,7 +40,8 @@ async fn a_declared_path_is_published_as_a_socket_and_an_undeclared_one_is_not()
     write(space.path(), "git.sock", b"\x7fELF not really");
     write(space.path(), "readme.md", b"hello");
 
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     let socket = node
@@ -73,7 +74,8 @@ async fn declaring_an_unchanged_published_file_changes_its_kind() {
         EntryKind::File
     );
 
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
     assert_eq!(
         node.store()
@@ -92,7 +94,8 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
     // withdrawing the assertion has to change what it publishes.
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF");
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
     assert_eq!(
         node.store()
@@ -103,7 +106,7 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
         EntryKind::Socket
     );
 
-    assert!(node.socket_rm("code", "git.sock").unwrap());
+    assert!(node.socket_undeclare("code", "git.sock").unwrap());
     node.scan_and_publish().unwrap();
 
     assert_eq!(
@@ -121,7 +124,8 @@ async fn removing_the_declaration_republishes_it_as_an_ordinary_file() {
 async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF v1");
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     let first = node.resolve_socket("code", "git.sock").unwrap().unwrap();
@@ -161,7 +165,8 @@ async fn arming_pins_the_bytes_and_a_change_disarms_without_unpublishing() {
 async fn approval_is_compare_and_set_against_the_reviewed_state() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF reviewed");
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
@@ -241,30 +246,32 @@ async fn adopting_someone_elses_socket_adopts_its_bytes_and_not_its_socket_ness(
 }
 
 #[tokio::test]
-async fn a_socket_cannot_be_declared_outside_a_space_this_node_indexes() {
+async fn a_socket_cannot_be_declared_outside_a_filesystem_source() {
     let (_data, _space, node) = node_with_space().await;
-    assert!(node.socket_add(&declaration("nowhere", "x.sock")).is_err());
+    assert!(node
+        .socket_declare(&declaration("nowhere", "x.sock"))
+        .is_err());
     assert!(
-        node.socket_add(&declaration("code", "../escape.sock"))
+        node.socket_declare(&declaration("code", "../escape.sock"))
             .is_err(),
         "a path that leaves the space must be refused at declaration"
     );
 }
 
 #[tokio::test]
-async fn a_socket_cannot_be_declared_in_a_detached_space() {
+async fn a_socket_cannot_be_declared_in_an_api_source() {
     let data = tempfile::tempdir().unwrap();
     Node::init(data.path(), None).unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
     node.add_api_source("code").unwrap();
-    let err = node.socket_add(&declaration("code", "git.sock"));
+    let err = node.socket_declare(&declaration("code", "git.sock"));
     assert!(err.is_err(), "a space with no scanner accepted a socket");
 }
 
 #[tokio::test]
 async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
     let (_data, _space, node) = node_with_space().await;
-    node.socket_add(&declaration("code", "missing.sock"))
+    node.socket_declare(&declaration("code", "missing.sock"))
         .unwrap();
     assert!(node
         .resolve_socket("code", "missing.sock")
@@ -280,7 +287,8 @@ async fn a_declared_path_with_nothing_published_resolves_to_nothing() {
 async fn a_node_can_connect_to_its_own_socket() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "local.sock", b"\x7fELF not armed");
-    node.socket_add(&declaration("code", "local.sock")).unwrap();
+    node.socket_declare(&declaration("code", "local.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     let err = node
@@ -312,7 +320,8 @@ async fn a_self_connection_runs_the_armed_program() {
     )
     .unwrap();
     write(space.path(), "echo.sock", &elf);
-    node.socket_add(&declaration("code", "echo.sock")).unwrap();
+    node.socket_declare(&declaration("code", "echo.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
     let inspected = node.socket_inspect("code", "echo.sock").await.unwrap();
     node.socket_approve("code", "echo.sock", &inspected.review)
@@ -381,7 +390,8 @@ fn a_daemon_style_runtime_can_arm_and_run_a_self_socket() {
     )
     .unwrap();
     write(space.path(), "echo.sock", &elf);
-    node.socket_add(&declaration("code", "echo.sock")).unwrap();
+    node.socket_declare(&declaration("code", "echo.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     runtime.block_on(async {
@@ -436,7 +446,7 @@ async fn a_discovery_only_peer_can_connect_to_a_socket() {
     .unwrap();
     write(server_space.path(), "echo.sock", &elf);
     server
-        .socket_add(&declaration("code", "echo.sock"))
+        .socket_declare(&declaration("code", "echo.sock"))
         .unwrap();
     server.scan_and_publish().unwrap();
     let inspected = server.socket_inspect("code", "echo.sock").await.unwrap();
@@ -496,9 +506,9 @@ async fn auto_follows_the_file_and_the_default_does_not() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "manual.sock", b"\x7fELF a");
     write(space.path(), "auto.sock", b"\x7fELF a");
-    node.socket_add(&declaration("code", "manual.sock"))
+    node.socket_declare(&declaration("code", "manual.sock"))
         .unwrap();
-    node.socket_add(&SocketRow {
+    node.socket_declare(&SocketRow {
         auto: true,
         ..declaration("code", "auto.sock")
     })
@@ -552,7 +562,8 @@ async fn a_dropped_node_is_actually_dropped() {
 async fn a_socket_that_is_not_declared_here_never_resolves_however_it_is_named() {
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "a/b/c.sock", b"\x7fELF");
-    node.socket_add(&declaration("code", "a/b/c.sock")).unwrap();
+    node.socket_declare(&declaration("code", "a/b/c.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
 
     assert!(node.resolve_socket("code", "a/b/c.sock").unwrap().is_some());
@@ -574,7 +585,8 @@ async fn the_arming_record_survives_a_restart_and_the_map_does_not() {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         node.add_filesystem_source("code", space.path()).unwrap();
         write(space.path(), "git.sock", b"\x7fELF");
-        node.socket_add(&declaration("code", "git.sock")).unwrap();
+        node.socket_declare(&declaration("code", "git.sock"))
+            .unwrap();
         node.scan_and_publish().unwrap();
         let resolved = node.resolve_socket("code", "git.sock").unwrap().unwrap();
         node.store()
@@ -611,7 +623,8 @@ async fn resolving_ignores_what_other_origins_publish() {
     // decide whose program a connection lands on.
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "git.sock", b"\x7fELF mine");
-    node.socket_add(&declaration("code", "git.sock")).unwrap();
+    node.socket_declare(&declaration("code", "git.sock"))
+        .unwrap();
     node.scan_and_publish().unwrap();
     let mine = node.resolve_socket("code", "git.sock").unwrap().unwrap();
 

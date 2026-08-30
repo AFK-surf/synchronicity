@@ -2,8 +2,7 @@
 
 Status: **implemented**.
 
-Synchronicity separates three local facts that used to be combined as
-“replication modes”:
+Synchronicity models three independent local facts:
 
 - a **source** publishes this node's assertions for a space;
 - a **replica** durably retains content published by every visible origin;
@@ -111,7 +110,3 @@ both, or neither may exist for a namespace. The `pins` holder and
 | filesystem/API source | yes | own live content | filesystem source only |
 | replica | no | yes | optional checkout |
 | source + replica | yes | yes | source and optional checkout |
-
-The former `space` and `mirror` commands and the `tree`/`archive` policy names
-are removed. This is a breaking CLI and local-control-protocol change; no
-compatibility aliases are retained.

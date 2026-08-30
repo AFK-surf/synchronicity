@@ -1205,7 +1205,7 @@ async fn delegations(node: &Node, id: u32) -> Result<Up> {
 /// The view is read once rather than per space. It is a property of this
 /// node's whole picture — a pending head, or a bound origin it has never
 /// synced — and asking per space would re-run the same two scans of `heads`
-/// and `bindings` for every replicated space to reach the same verdict.
+/// and `bindings` for every replica to reach the same verdict.
 async fn replication(node: &Node, id: u32) -> Result<Up> {
     let node = node.clone();
     crate::blocking::offload(move || {
@@ -1232,7 +1232,7 @@ async fn replication(node: &Node, id: u32) -> Result<Up> {
                 unreachable: coverage.unreachable,
                 unreachable_bytes: coverage.unreachable_bytes,
                 // Meaningless where the policy never releases, and reported as
-                // zero there rather than as a count: under `archive` nothing is
+                // zero there rather than as a count: under `forever` nothing is
                 // waiting on peers, so "too few peers to let these go" would
                 // describe a release that is not pending.
                 held_back: match policy.releases() {
@@ -1566,7 +1566,7 @@ mod tests {
     async fn serve_answers_a_replication_query_for_this_node_alone() {
         let (_blocking, dir, node) = scoped_node().await;
 
-        // One replicated space and one ordinary one. The ordinary one exists to
+        // One replica and one ordinary one. The ordinary one exists to
         // be missing from the answer.
         node.add_filesystem_source("local", dir.path().join("local"))
             .unwrap();
@@ -1601,11 +1601,7 @@ mod tests {
             panic!("expected a replication answer")
         };
         assert_eq!(id, 9);
-        assert_eq!(
-            spaces.len(),
-            1,
-            "only the replicated space is reported: {spaces:?}"
-        );
+        assert_eq!(spaces.len(), 1, "only the replica is reported: {spaces:?}");
 
         let row = &spaces[0];
         assert_eq!(row.space, "media");

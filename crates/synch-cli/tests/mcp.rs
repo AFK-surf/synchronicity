@@ -66,7 +66,7 @@ impl Daemon {
         Daemon { node, stop, served }
     }
 
-    /// Adds a path-backed space with files already in it.
+    /// Adds a filesystem source with files already in it.
     async fn space_with(&self, id: &str, dir: &Path, files: &[(&str, &[u8])]) {
         for (path, bytes) in files {
             let target = dir.join(path);
@@ -862,7 +862,7 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
         .await;
     client
         .tool(
-            "synch_socket_add",
+            "synch_socket_declare",
             json!({ "space": "code", "path": "echo.o", "note": "from mcp" }),
         )
         .await;

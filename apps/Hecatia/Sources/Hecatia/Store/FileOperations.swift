@@ -601,9 +601,9 @@ extension FilesModel {
   /// window — so there was no way to tell which of the two would do anything.
   /// Only an operator pin counts. `store.pins` already holds nothing else —
   /// the replica rows are filtered out on the way in — but the test says what
-  /// it means rather than relying on that: a replicating folder holds the same
+  /// it means rather than relying on that: a replica holds the same
   /// roots, and treating its claim as a pin showed "Keep Offline" as already
-  /// on for every file in a replicated folder, then failed on the way back off.
+  /// on for every file in a replica, then failed on the way back off.
   func isPinned(_ entry: RemoteEntry) -> Bool {
     guard let root = entry.rootHex else { return false }
     return store.pins.contains { $0.root == root && $0.isOperatorPinned }
@@ -611,7 +611,7 @@ extension FilesModel {
 
   /// What removing this pin actually does, which depends on who else holds it.
   ///
-  /// A replicating folder holds the same content roots. Where one does, `pin
+  /// A replica holds the same content roots. Where one does, `pin
   /// rm` removes the operator's pin and frees nothing — the daemon says so in
   /// its own reply, `unpinned {root} (still held by …)`. Promising a reclaim
   /// there was promising the opposite of what happens.
@@ -620,7 +620,7 @@ extension FilesModel {
       store.pins.contains { $0.root == root && $0.hasOtherHolders }
     } ?? false
     return alsoHeld
-      ? "A replicating folder still holds these bytes, so nothing is freed on this Mac yet. They go when that folder releases them."
+      ? "A replica still holds these bytes, so nothing is freed on this Mac yet. They go when that replica releases them."
       : "The bytes may be reclaimed the next time the daemon needs the space. The file stays in the listing and is fetched again when it is opened."
   }
 

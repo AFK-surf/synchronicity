@@ -1245,7 +1245,7 @@ our control, but the heavy machinery (bao verification) is shared code.
 synchronicity is a **sync-directory** tool, not a mounted filesystem. Cross-platform
 behavior with zero kernel dependencies:
 
-### 7.1 Indexing pipeline (own spaces)
+### 7.1 Filesystem-source scanning and publication
 
 - **Watcher**: the `notify` crate (inotify / FSEvents / ReadDirectoryChangesW, with
   polling fallback) provides change hints per space. Hints are debounced (default
@@ -1358,16 +1358,17 @@ content.** What it does do is aggregate:
     select differently until anti-entropy converges them, so a lagging checkout
     can briefly serve different bytes than a current one, unmarked. Deployments
     for which either is unacceptable use `strict` or an `origin=` pin.
-  - `origin=<id>` — pin to one origin's view (the old per-origin behavior, still the
-    right tool for "serve exactly what the NAS publishes").
+  - `origin=<id>` — select one origin's view, the right tool for "serve exactly
+    what the NAS publishes".
   - `strict` — refuse to read a divergent path, returning the version list instead;
     for workflows where silently reading either side is worse than failing.
-  Policy is a property of the reading surface: a flag on `cat`/`get` (`--from
-  <origin>`, `--strict`), and a stored policy per S3 bucket (§7.2, §9.4).
+  Selection is explicit and uniform: `cat`, `get`, pinning, and adoption accept
+  `--select newest|strict|origin=<id>`. S3 bucket configuration stores the same
+  selection (§7.2, §9.4).
 - **Adoption is explicit — and deletions are adoptable**: `synch adopt path
-  <origin>:<space>/<path>` makes that origin's version our own. For a live
+  <space>/<path> --select origin=<id>` makes that origin's version our own. For a live
   version, it fetches the content, writes it into the local space, and thereby
-  (via the indexing pipeline) publishes it as the local node's own new entry.
+  (via the filesystem-source scan) publishes it as the local node's own new entry.
   For a **tombstone** version, it deletes our local copy from the space, and the
   next scan publishes our own tombstone — adopting the deletion exactly as one
   adopts content. Adoption is how *all* divergence ends, deletion divergence
@@ -1458,14 +1459,15 @@ synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent p
 synch status [<space>[/<path>]]              the version inspector: every version of
                                              a path, its attestors, side by side
 synch cat  [<origin>:]<space>/<path>         verified streaming read of the selected
-           [--range] [--from <o>|--strict]   version (§8 policy; default newest)
+           [--range] [--select <policy>]     version (§8 policy; default newest)
 synch cat|get --root <hex>                   read an object by content root, no path
                                              involved — how a superseded version is read
 synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
-           [--from <o>|--strict]
-synch adopt path <origin>:<space>/<path>      adopt one version as my own
+           [--select <policy>]
+synch adopt path [<origin>:]<space>/<path>   adopt one version as my own
+           [--select <policy>]
 synch adopt tree <space>[/<dir>]             additive bulk adoption into a source
-           [--from <o>|--strict]
+           [--select <policy>]
            [--replace] [--dry-run]
 synch log  [<origin>:]<space>/<path>         per-origin publish history
 synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/deleted)
@@ -1474,7 +1476,7 @@ synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
                                              (a path pins its selected version's root;
                                              `ls` and `rm` name every holder, since a
-                                             replicated space may hold it too)
+                                             replica may hold it too)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by
@@ -1566,11 +1568,11 @@ through both directions **without either process buffering more than a chunk**.
     fetch.
   - `ListObjectsV2` — prefix + delimiter listing as a range scan over the `f:`
     namespace (§4.3); continuation tokens are trie cursor positions.
-  - `PutObject` — writes into the local space directory, then runs the normal
+  - `PutObject` — writes into the filesystem-source directory, then runs the normal
     ingest pipeline (hash → CAS → stage entry, §7.1); responds once durably staged,
     with the head publish following the usual batching.
   - `DeleteObject` — removes this node's copy and publishes its tombstone
-    through the ordinary indexing pipeline, exactly as an `rm` in the space
+    through the ordinary source scan, exactly as an `rm` in the source
     directory would (§8). It obeys the same rule a write does: a delete
     publishes *this node's own view*, because the version model cannot publish
     anyone else's. So if another origin still asserts the key, the key is still
@@ -1631,7 +1633,7 @@ through both directions **without either process buffering more than a chunk**.
   real S3 does. A *part's* ETag is that part's own root, and a completion that
   echoes one back has it checked, which is the point of having issued it.
 - **Auth**: SigV4 with static access-key pairs configured on the gateway
-  (`synch-s3 key add`), or `--anonymous` for localhost-only development. The
+  (`synch-s3 access-key add`), or `--anonymous` for localhost-only development. The
   gateway authenticates S3 clients only; cluster access is the node's own
   membership (§3).
 - **Headers are refused, not ignored.** A header that says the payload is
@@ -1960,7 +1962,7 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
 --
 -- Local operator state, never published and never replicated. Publication
 -- cannot gate execution: `synch adopt path`, `synch adopt tree --replace` and an S3 PUT all
--- write bytes into a space directory that the scanner then publishes as this
+-- write bytes into a filesystem-source directory that the scanner publishes as this
 -- node's own view. These two rows are the gate instead.
 
 -- The declaration. What makes the scanner publish kind=Socket for a path.
@@ -1988,7 +1990,7 @@ CREATE TABLE socket_arms (space TEXT NOT NULL, path TEXT NOT NULL,
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
-always be rebuilt from `trie_nodes` (`synch doctor --rebuild`).
+always be rebuilt from `trie_nodes` (`synch repair rebuild-views`).
 
 ---
 
@@ -2240,7 +2242,8 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    pulls exactly the changed path's trie nodes. `synch ls media` on any node still
    shows one tree, with that path marked `⑂2`: two versions, one asserted by `nas`,
    one by `laptop`. `synch cat media/that/file` reads the newest deterministically;
-   `--from laptop` reads the other; `synch status media/that/file` lays both out —
+  `--select origin=laptop@cluster.example` reads the other; `synch status
+  media/that/file` lays both out —
    divergence visible, nothing auto-resolved, adoption one `synch adopt path` away, after
    which the path collapses back to a single unanimous version.
 6. `nas`'s operator rotates its key: `synch key rotate`, publish the second

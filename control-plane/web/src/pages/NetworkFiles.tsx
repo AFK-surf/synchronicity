@@ -162,7 +162,7 @@ function Disabled({
       <p className="mt-1 text-sm text-neutral-500">
         An org admin can enable it here. Nodes of this cluster attach on
         their own once it is on — an operator can still opt one out with{' '}
-        <code className="text-neutral-300">synch cloud disable</code>.
+        <code className="text-neutral-300">synch control-plane disable</code>.
       </p>
       {isAdmin ? (
         <div className="mt-4">
@@ -195,7 +195,7 @@ function NoDaemon() {
         Daemons attach on their own — there is no command to run. Check that a
         node of this cluster is running <code className="text-neutral-300">
         synch daemon run</code> and has not opted out with{' '}
-        <code className="text-neutral-300">synch cloud disable</code>.
+        <code className="text-neutral-300">synch control-plane disable</code>.
       </p>
       <p className="mt-3 text-sm text-neutral-500">
         There is no URL to configure either way. The node finds this control

@@ -302,11 +302,11 @@ fn the_command_surface_works_over_the_socket() {
     );
     assert!(cli.run(&["replica", "rm", "media"]).contains("removed"));
 
-    // A fill of a space whose every path this node already holds has nothing
+    // A adoption of a space whose every path this node already holds has nothing
     // to do, and says so without writing anything.
-    let fill = cli.run(&["adopt", "tree", "media", "--dry-run"]);
-    assert!(fill.contains("would fill 0"), "{fill}");
-    assert!(fill.contains("current 2"), "{fill}");
+    let adoption = cli.run(&["adopt", "tree", "media", "--dry-run"]);
+    assert!(adoption.contains("would adopt 0"), "{adoption}");
+    assert!(adoption.contains("current 2"), "{adoption}");
 
     // A pin may name a path; the reading policy's version supplies the root (§8).
     let root = blake3::hash(b"hello").to_hex().to_string();

@@ -269,7 +269,7 @@ fn space_with(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
-/// A fresh daemon with a space added and scanned; returns the scan's output.
+/// A fresh daemon with a filesystem source added and scanned.
 async fn daemon_with_space(
     files: &[(&str, &[u8])],
 ) -> (tempfile::TempDir, Daemon, tempfile::TempDir, String) {
@@ -279,10 +279,10 @@ async fn daemon_with_space(
     let data_dir = dir.path();
     lines(
         data_dir,
-        space_add("media", &space.path().to_string_lossy()),
+        source_add("media", &space.path().to_string_lossy()),
     )
     .await;
-    let scan = lines(data_dir, scan()).await;
+    let scan = lines(data_dir, source_scan()).await;
     (dir, daemon, space, scan)
 }
 
@@ -294,12 +294,12 @@ async fn says(data_dir: &Path, command: Command, needle: &str) -> String {
 }
 
 /// The most common command shapes, so the sweep reads as one call per command.
-fn cat(reference: &str, range: Option<&str>, from: Option<&str>) -> Command {
+fn cat(reference: &str, range: Option<&str>, origin: Option<&str>) -> Command {
     Command::Cat(pb::Cat {
         reference: reference.into(),
         range: range.map(String::from),
         root: None,
-        select: from.map(|origin| format!("origin={origin}")),
+        select: origin.map(|origin| format!("origin={origin}")),
     })
 }
 
@@ -339,24 +339,24 @@ fn id() -> Command {
 fn key_ls() -> Command {
     Command::KeyLs(pb::KeyLs {})
 }
-fn space_ls() -> Command {
+fn source_ls() -> Command {
     Command::SourceLs(pb::SourceLs {
         space: String::new(),
     })
 }
-fn scan() -> Command {
+fn source_scan() -> Command {
     Command::SourceScan(pb::SourceScan {
         space: String::new(),
     })
 }
-fn sync_now() -> Command {
-    Command::SyncNow(pb::SyncNow {})
+fn peer_sync() -> Command {
+    Command::PeerSync(pb::PeerSync {})
 }
 fn trust_ls() -> Command {
     Command::TrustLs(pb::TrustLs {})
 }
-fn peers() -> Command {
-    Command::Peers(pb::Peers {})
+fn peer_ls() -> Command {
+    Command::PeerLs(pb::PeerLs {})
 }
 fn status(reference: Option<&str>) -> Command {
     Command::Status(pb::Status {
@@ -390,15 +390,15 @@ fn domain_refresh() -> Command {
 fn domain_clear() -> Command {
     Command::DomainClear(pb::DomainClear {})
 }
-fn fill(reference: &str, from: Option<&str>, force: bool, dry_run: bool) -> Command {
+fn adopt_tree(reference: &str, origin: Option<&str>, replace: bool, dry_run: bool) -> Command {
     Command::AdoptTree(pb::AdoptTree {
         reference: reference.into(),
-        select: from.map(|origin| format!("origin={origin}")),
-        replace: force,
+        select: origin.map(|origin| format!("origin={origin}")),
+        replace,
         dry_run,
     })
 }
-fn mirror_add(space: &str, path: &str, policy: Option<&str>) -> Command {
+fn replica_with_checkout_add(space: &str, path: &str, policy: Option<&str>) -> Command {
     Command::ReplicaAdd(pb::ReplicaAdd {
         space: space.into(),
         retention: policy.unwrap_or("current").into(),
@@ -407,12 +407,12 @@ fn mirror_add(space: &str, path: &str, policy: Option<&str>) -> Command {
         checkout: Some(path.into()),
     })
 }
-fn mirror_ls() -> Command {
+fn replica_ls() -> Command {
     Command::ReplicaLs(pb::ReplicaLs {
         space: String::new(),
     })
 }
-fn mirror_sync() -> Command {
+fn replica_sync() -> Command {
     Command::ReplicaSync(pb::ReplicaSync {
         space: String::new(),
     })
@@ -460,16 +460,16 @@ fn key_activate(key: &str) -> Command {
 fn key_retire(key: &str) -> Command {
     Command::KeyRetire(pb::KeyRetire { key: key.into() })
 }
-fn cloud_status() -> Command {
-    Command::CloudStatus(pb::CloudStatus {})
+fn control_plane_status() -> Command {
+    Command::ControlPlaneStatus(pb::ControlPlaneStatus {})
 }
-fn cloud_disable() -> Command {
-    Command::CloudDisable(pb::CloudDisable {})
+fn control_plane_disable() -> Command {
+    Command::ControlPlaneDisable(pb::ControlPlaneDisable {})
 }
-fn cloud_enable() -> Command {
-    Command::CloudEnable(pb::CloudEnable {})
+fn control_plane_enable() -> Command {
+    Command::ControlPlaneEnable(pb::ControlPlaneEnable {})
 }
-fn replicating_space_add(id: &str, path: &str, policy: &str, grace: i64) -> Command {
+fn replica_add(id: &str, path: &str, policy: &str, grace: i64) -> Command {
     let _ = path;
     Command::ReplicaAdd(pb::ReplicaAdd {
         space: id.into(),
@@ -479,7 +479,7 @@ fn replicating_space_add(id: &str, path: &str, policy: &str, grace: i64) -> Comm
         checkout: None,
     })
 }
-fn space_set(id: &str, grace: Option<i64>, budget: Option<u64>) -> Command {
+fn replica_set(id: &str, grace: Option<i64>, budget: Option<u64>) -> Command {
     Command::ReplicaSet(pb::ReplicaSet {
         space: id.into(),
         retention: None,
@@ -490,10 +490,10 @@ fn space_set(id: &str, grace: Option<i64>, budget: Option<u64>) -> Command {
         no_checkout: false,
     })
 }
-fn space_ls_one(id: &str) -> Command {
+fn replica_ls_one(id: &str) -> Command {
     Command::ReplicaLs(pb::ReplicaLs { space: id.into() })
 }
-fn space_add(id: &str, path: &str) -> Command {
+fn source_add(id: &str, path: &str) -> Command {
     Command::SourceAdd(pb::SourceAdd {
         space: id.into(),
         path: path.into(),
@@ -507,10 +507,10 @@ fn api_source_add(id: &str) -> Command {
         api: true,
     })
 }
-fn space_rm(id: &str) -> Command {
+fn source_rm(id: &str) -> Command {
     Command::SourceRm(pb::SourceRm { space: id.into() })
 }
-fn take(reference: &str) -> Command {
+fn adopt_path(reference: &str) -> Command {
     Command::AdoptPath(pb::AdoptPath {
         reference: reference.into(),
         select: None,
@@ -561,11 +561,11 @@ async fn every_command_variant_round_trips() {
     assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
     assert_eq!(keys.lines().count(), 2, "{keys}");
     // A manual round with nobody to run it against says so and succeeds.
-    says(data_dir, sync_now(), "no dialable peers").await;
+    says(data_dir, peer_sync(), "no dialable peers").await;
 
     // Spaces, scanning, and listing. The scan streams progress as it goes (§9.3).
-    says(data_dir, space_ls(), "media").await;
-    let progress = progress_of(data_dir, scan()).await;
+    says(data_dir, source_ls(), "media").await;
+    let progress = progress_of(data_dir, source_scan()).await;
     assert!(
         progress.iter().any(|l| l.contains("scanned media")),
         "{progress:?}"
@@ -603,7 +603,7 @@ async fn every_command_variant_round_trips() {
     )
     .await;
     says(data_dir, trust_ls(), "a test peer").await;
-    says(data_dir, peers(), &peer_key).await;
+    says(data_dir, peer_ls(), &peer_key).await;
 
     // Dropping one key's binding by name, then the whole origin: a
     // key-identified origin holds one binding, so both spellings are the same
@@ -711,14 +711,14 @@ async fn every_command_variant_round_trips() {
     let checkout_path = checkout_dir.path().to_string_lossy().into_owned();
     let replicating = says(
         data_dir,
-        mirror_add("media", &checkout_path, None),
+        replica_with_checkout_add("media", &checkout_path, None),
         "replicating",
     )
     .await;
     assert!(replicating.contains("current"), "{replicating}");
-    let replica_ls = says(data_dir, mirror_ls(), "media").await;
+    let replica_ls = says(data_dir, replica_ls(), "media").await;
     assert!(replica_ls.contains("checkout"), "{replica_ls}");
-    let _ = frames(data_dir, mirror_sync()).await.unwrap();
+    let _ = frames(data_dir, replica_sync()).await.unwrap();
     says(data_dir, replica_rm("media"), "removed").await;
 
     // Pins, by root.
@@ -767,13 +767,13 @@ async fn every_command_variant_round_trips() {
     assert_eq!(keys.lines().count(), 2, "{keys}");
 
     // Cloud attach: config reads/writes like every other command (§10).
-    says(data_dir, cloud_status(), "cloud: enabled").await;
-    says(data_dir, cloud_disable(), "disabled").await;
-    says(data_dir, cloud_status(), "opted out").await;
-    says(data_dir, cloud_enable(), "media").await;
+    says(data_dir, control_plane_status(), "control-plane: enabled").await;
+    says(data_dir, control_plane_disable(), "disabled").await;
+    says(data_dir, control_plane_status(), "opted out").await;
+    says(data_dir, control_plane_enable(), "media").await;
 
     // Removing the space unpublishes its entries.
-    says(data_dir, space_rm("media"), "unpublished").await;
+    says(data_dir, source_rm("media"), "unpublished").await;
 
     daemon.shutdown().await;
 }
@@ -786,7 +786,7 @@ async fn errors_cross_the_socket_with_their_code() {
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
 
-    // A peer with no address fails its dial immediately, keeping SyncNow fast.
+    // A peer with no address fails its dial immediately, keeping PeerSync fast.
     lines(
         data_dir,
         trust_add(&SecretKey::generate().public().to_z32(), None, None),
@@ -803,9 +803,12 @@ async fn errors_cross_the_socket_with_their_code() {
         (ls("nospace"), ErrorCode::NotFound),
         (ls("stranger@cluster.example:media"), ErrorCode::NotFound),
         (status(Some("media/gone.txt")), ErrorCode::NotFound),
-        (space_rm("ghost"), ErrorCode::NotFound),
+        (source_rm("ghost"), ErrorCode::NotFound),
         (replica_rm("/no/such/replica"), ErrorCode::NotFound),
-        (fill("nospace", None, false, false), ErrorCode::NotFound),
+        (
+            adopt_tree("nospace", None, false, false),
+            ErrorCode::NotFound,
+        ),
         (
             key_activate(&SecretKey::generate().public().to_z32()),
             ErrorCode::NotFound,
@@ -823,9 +826,12 @@ async fn errors_cross_the_socket_with_their_code() {
         ),
         (pin_add("not-hex"), ErrorCode::Invalid),
         (trust_add("not-a-key", None, None), ErrorCode::Invalid),
-        (take("nas@cluster.example:media/a.txt"), ErrorCode::NotFound),
+        (
+            adopt_path("nas@cluster.example:media/a.txt"),
+            ErrorCode::NotFound,
+        ),
         // Zero peers reached is a failure, the per-peer lines streaming first.
-        (sync_now(), ErrorCode::Unavailable),
+        (peer_sync(), ErrorCode::Unavailable),
     ];
     for (command, code) in cases {
         assert_eq!(
@@ -842,7 +848,7 @@ async fn errors_cross_the_socket_with_their_code() {
 /// this node publishes from, a local file that differs is reported rather than
 /// overwritten, and the adoption publishes what it placed before returning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
+async fn tree_adoption_adds_a_peers_content_to_the_published_source() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
@@ -862,29 +868,39 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
         .unwrap();
     lines(
         data_dir,
-        space_add("media", &space.path().to_string_lossy()),
+        source_add("media", &space.path().to_string_lossy()),
     )
     .await;
-    says(data_dir, scan(), "published seq").await;
+    says(data_dir, source_scan(), "published seq").await;
 
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
     daemon
         .peer_file(&peer, "media", "theirs.txt", b"theirs", 1_700_000_000, 1)
         .await;
     // The same path, published with newer bytes: the local copy is this node's
-    // own assertion and a fill leaves it standing.
+    // own assertion and an adoption leaves it standing.
     daemon
         .peer_file(&peer, "media", "mine.txt", b"not mine", 2_000_000_000, 1)
         .await;
 
     // The dry run decides everything and writes nothing.
-    let planned = says(data_dir, fill("media", None, false, true), "would fill 1").await;
+    let planned = says(
+        data_dir,
+        adopt_tree("media", None, false, true),
+        "would adopt 1",
+    )
+    .await;
     assert!(planned.contains("differing media/mine.txt"), "{planned}");
     assert!(!space.path().join("theirs.txt").exists(), "{planned}");
 
-    let filled = says(data_dir, fill("media", None, false, false), "filled 1").await;
-    assert!(filled.contains("differing media/mine.txt"), "{filled}");
-    assert!(filled.contains("published seq"), "{filled}");
+    let adopted = says(
+        data_dir,
+        adopt_tree("media", None, false, false),
+        "adopted 1",
+    )
+    .await;
+    assert!(adopted.contains("differing media/mine.txt"), "{adopted}");
+    assert!(adopted.contains("published seq"), "{adopted}");
     assert_eq!(
         std::fs::read(space.path().join("theirs.txt")).unwrap(),
         b"theirs"
@@ -892,7 +908,7 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
     assert_eq!(
         std::fs::read(space.path().join("mine.txt")).unwrap(),
         b"mine",
-        "a fill never overwrites what is here without --force"
+        "an adoption never overwrites what is here without --replace"
     );
 
     // It was published before adoption returned, so it is already ours as
@@ -904,16 +920,26 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
     )
     .await;
 
-    // Nothing left to do, and `--force` is what ends the standoff.
-    says(data_dir, fill("media", None, false, false), "filled 0").await;
-    let forced = says(data_dir, fill("media", None, true, false), "filled 1").await;
+    // Nothing left to do, and `--replace` is what ends the standoff.
+    says(
+        data_dir,
+        adopt_tree("media", None, false, false),
+        "adopted 0",
+    )
+    .await;
+    let forced = says(
+        data_dir,
+        adopt_tree("media", None, true, false),
+        "adopted 1",
+    )
+    .await;
     assert!(forced.contains("replaced media/mine.txt"), "{forced}");
     assert_eq!(
         std::fs::read(space.path().join("mine.txt")).unwrap(),
         b"not mine"
     );
 
-    // A strict fill's whole answer is the paths it refused, so those reach
+    // A strict adoption's whole answer is the paths it refused, so those reach
     // stdout with everything else: `lines()` drops progress frames, so this
     // assertion fails if they are ever demoted to progress.
     daemon
@@ -945,11 +971,11 @@ async fn fill_adds_a_peers_content_to_the_space_it_publishes_from() {
     // A prefix that names nothing is a typo, not an empty directory.
     let typo = says(
         data_dir,
-        fill("media/nosuchdir", None, false, false),
+        adopt_tree("media/nosuchdir", None, false, false),
         "note: no path in media starts with nosuchdir/",
     )
     .await;
-    assert!(typo.contains("filled 0"), "{typo}");
+    assert!(typo.contains("adopted 0"), "{typo}");
 
     daemon.shutdown().await;
 }
@@ -969,7 +995,7 @@ async fn a_write_floored_mid_stream_does_not_commit() {
     let space = space_with(&[("kept.txt", b"kept")]);
     lines(
         data_dir,
-        space_add("media", &space.path().to_string_lossy()),
+        source_add("media", &space.path().to_string_lossy()),
     )
     .await;
 
@@ -1007,7 +1033,7 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     let space = space_with(&[("notes.txt", b"hello")]);
     lines(
         data_dir,
-        space_add("media", &space.path().to_string_lossy()),
+        source_add("media", &space.path().to_string_lossy()),
     )
     .await;
 
@@ -1017,7 +1043,7 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
 
     // Scanning refuses before hashing anything: the state, not the request,
     // is what is wrong, so the code says "unavailable" (§3.4).
-    let error = failure_message(data_dir, scan()).await;
+    let error = failure_message(data_dir, source_scan()).await;
     assert_eq!(error.code, ErrorCode::Unavailable, "{error:?}");
     assert!(error.message.contains("synch recover"), "{error:?}");
     assert!(error.message.contains("seq 100"), "{error:?}");
@@ -1052,7 +1078,7 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     assert!(text.contains("publishing resumes at seq 105"), "{text}");
 
     // And the node publishes again, above everything that was advertised.
-    let scan = lines(data_dir, scan()).await;
+    let scan = lines(data_dir, source_scan()).await;
     assert!(scan.contains("published seq 105"), "{scan}");
     let doctor = lines(data_dir, Command::Doctor(pb::Doctor {})).await;
     assert!(!doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
@@ -1186,13 +1212,12 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
 /// answering in entry metadata, naming space, path, and policy as fields —
 /// an S3 key may contain a colon, which the text reference form reads as an
 /// origin.
-/// The replication half of `space` over the socket: what `add` says, what `ls`
-/// reports, and that tuning one knob leaves the other alone.
+/// Replica configuration over the socket: what `add` says, what `ls` reports,
+/// and that tuning one knob leaves the other alone.
 ///
-/// The last of those is the one worth a test. `space set --budget` writing every
-/// replication column would reset the grace window to its default — the whole
-/// recovery story for a deletion under `tree` — and say nothing about having
-/// done it.
+/// The last of those is the one worth a test. Updating the budget must not reset
+/// the grace window to its default — the whole recovery story for a deletion
+/// under `current` — and say nothing about having done it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replication_is_configured_and_reported_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
@@ -1202,7 +1227,7 @@ async fn replication_is_configured_and_reported_over_the_socket() {
 
     let added = lines(
         data_dir,
-        replicating_space_add(
+        replica_add(
             "media",
             &space.path().to_string_lossy(),
             "current",
@@ -1215,13 +1240,13 @@ async fn replication_is_configured_and_reported_over_the_socket() {
         "{added}"
     );
 
-    let listed = lines(data_dir, space_ls_one("media")).await;
+    let listed = lines(data_dir, replica_ls_one("media")).await;
     assert!(listed.contains("current"), "{listed}");
     assert!(listed.contains("grace 7d"), "{listed}");
 
     // Tuning the budget must not touch the grace window.
-    lines(data_dir, space_set("media", None, Some(4096))).await;
-    let listed = lines(data_dir, space_ls_one("media")).await;
+    lines(data_dir, replica_set("media", None, Some(4096))).await;
+    let listed = lines(data_dir, replica_ls_one("media")).await;
     assert!(
         listed.contains("grace 7d"),
         "setting a budget cleared the grace window: {listed}"
@@ -1229,8 +1254,8 @@ async fn replication_is_configured_and_reported_over_the_socket() {
     assert!(listed.contains("budget        4096 B"), "{listed}");
 
     // And the reverse.
-    lines(data_dir, space_set("media", Some(3600), None)).await;
-    let listed = lines(data_dir, space_ls_one("media")).await;
+    lines(data_dir, replica_set("media", Some(3600), None)).await;
+    let listed = lines(data_dir, replica_ls_one("media")).await;
     assert!(listed.contains("grace 1h"), "{listed}");
     assert!(
         listed.contains("budget        4096 B"),
@@ -1372,7 +1397,7 @@ async fn a_dropped_write_publishes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_detached_space_put_publishes_from_the_cas_without_a_checkout() {
+async fn an_api_source_put_publishes_from_the_cas_without_a_checkout() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
@@ -1553,10 +1578,14 @@ async fn one_daemon_per_datadir_until_the_old_one_is_fully_gone() {
     let data_dir = dir.path();
 
     // While the old daemon is up, a second bind for the datadir fails.
-    let taken = Server::bind(daemon.node.clone(), broadcast::channel(1).0)
+    let bind_error = Server::bind(daemon.node.clone(), broadcast::channel(1).0)
         .await
         .expect_err("a second daemon for one datadir is refused");
-    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse, "{taken}");
+    assert_eq!(
+        bind_error.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "{bind_error}"
+    );
     assert!(synch_cli::control::transport::token_path(data_dir).exists());
 
     daemon.shutdown().await;
@@ -1588,10 +1617,9 @@ async fn one_daemon_per_datadir_until_the_old_one_is_fully_gone() {
     }
 }
 
-/// §8: `synch adopt path` of a tombstone deletes our copy and publishes our own.
-/// The live form, checked first here, is unchanged.
+/// §8: `synch adopt path` handles both live entries and tombstones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn take_adopts_a_peers_deletion_over_the_socket() {
+async fn adopt_path_adopts_a_peers_deletion_over_the_socket() {
     let (dir, daemon, space, _scan) =
         daemon_with_space(&[("shared.txt", b"ours"), ("kept.txt", b"ours")]).await;
     let data_dir = dir.path();
@@ -1611,18 +1639,26 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
         )
         .await;
 
-    // Taking a live version still works exactly as it did.
-    let taken = lines(data_dir, take("laptop@cluster.example:media/kept.txt")).await;
-    assert!(taken.contains("adopted into"), "{taken}");
+    // A live version is copied into this node's filesystem source.
+    let adopted = lines(
+        data_dir,
+        adopt_path("laptop@cluster.example:media/kept.txt"),
+    )
+    .await;
+    assert!(adopted.contains("adopted into"), "{adopted}");
     assert_eq!(
         std::fs::read(space.path().join("kept.txt")).unwrap(),
         b"theirs"
     );
 
-    // Taking a deletion removes our copy and publishes our own tombstone.
-    let taken = lines(data_dir, take("laptop@cluster.example:media/shared.txt")).await;
-    assert!(taken.contains("removed"), "{taken}");
-    assert!(taken.contains("published seq"), "{taken}");
+    // A deletion removes our copy and publishes our own tombstone.
+    let adopted = lines(
+        data_dir,
+        adopt_path("laptop@cluster.example:media/shared.txt"),
+    )
+    .await;
+    assert!(adopted.contains("removed"), "{adopted}");
+    assert!(adopted.contains("published seq"), "{adopted}");
     assert!(!space.path().join("shared.txt").exists());
 
     daemon.shutdown().await;
@@ -1807,8 +1843,8 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
 
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
-fn socket_add(target: &str) -> Command {
-    Command::SocketAdd(pb::SocketAdd {
+fn socket_declare(target: &str) -> Command {
+    Command::SocketDeclare(pb::SocketDeclare {
         target: target.into(),
         config: vec![],
         max_streams: 32,
@@ -1848,7 +1884,7 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
     std::fs::write(space.path().join("echo.sock"), elf).unwrap();
     daemon
         .node
-        .socket_add(&synch_store::SocketRow::new(
+        .socket_declare(&synch_store::SocketRow::new(
             "code",
             "echo.sock",
             synch_core::now_ns(),
@@ -1910,11 +1946,11 @@ async fn a_socket_is_declared_listed_and_undeclared() {
 
     lines(
         dir.path(),
-        space_add("code", space.path().to_str().unwrap()),
+        source_add("code", space.path().to_str().unwrap()),
     )
     .await;
 
-    let out = lines(dir.path(), socket_add("code/git.sock")).await;
+    let out = lines(dir.path(), socket_declare("code/git.sock")).await;
     assert!(out.contains("declared code/git.sock"), "{out}");
     assert!(
         out.contains("socket arm"),
@@ -1941,7 +1977,7 @@ async fn a_socket_is_declared_listed_and_undeclared() {
 
     let out = lines(
         dir.path(),
-        Command::SocketRm(pb::SocketRm {
+        Command::SocketUndeclare(pb::SocketUndeclare {
             target: "code/git.sock".into(),
         }),
     )
@@ -1963,16 +1999,20 @@ async fn a_socket_target_must_name_this_nodes_own_space_and_path() {
     // that publishes it, so naming somebody else's tree here is a mistake
     // worth saying out loud rather than quietly dropping.
     assert_eq!(
-        failure(dir.path(), socket_add("nas@cluster.example:code/git.sock")).await,
+        failure(
+            dir.path(),
+            socket_declare("nas@cluster.example:code/git.sock")
+        )
+        .await,
         ErrorCode::Invalid
     );
     assert_eq!(
-        failure(dir.path(), socket_add("nopathhere")).await,
+        failure(dir.path(), socket_declare("nopathhere")).await,
         ErrorCode::Invalid
     );
     // A space this node does not index has nothing to declare in.
     assert_eq!(
-        failure(dir.path(), socket_add("absent/git.sock")).await,
+        failure(dir.path(), socket_declare("absent/git.sock")).await,
         ErrorCode::Invalid
     );
 
@@ -2001,10 +2041,10 @@ async fn the_live_surface_answers_when_nothing_is_running() {
     let daemon = Daemon::start(dir.path()).await;
     lines(
         dir.path(),
-        space_add("code", space.path().to_str().unwrap()),
+        source_add("code", space.path().to_str().unwrap()),
     )
     .await;
-    lines(dir.path(), socket_add("code/git.sock")).await;
+    lines(dir.path(), socket_declare("code/git.sock")).await;
 
     // An empty answer is an answer, and saying so beats printing nothing and
     // leaving an operator wondering whether the command worked.

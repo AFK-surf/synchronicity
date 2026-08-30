@@ -203,7 +203,7 @@ function DelegatedTrust({ slug, network }: { slug: string; network: string }) {
 /// node against it would be a number about nothing.
 ///
 /// Like the panel above, this has no buttons. What a node replicates is set
-/// with `synch space set` on that node; the control plane can report it and
+/// with `synch replica add` or `synch replica set` on that node; the control plane can report it and
 /// nothing more.
 function ReplicationPanel({
   slug,
@@ -258,8 +258,8 @@ function ReplicationPanel({
               {measured ? (
                 <>
                   No attached node replicates a space in this network. Turn it
-                  on with <code className="text-neutral-400">synch space set</code>{' '}
-                  <code className="text-neutral-400">--replicate tree</code> on
+                  on with <code className="text-neutral-400">synch replica add</code>{' '}
+                  <code className="text-neutral-400">&lt;space&gt;</code> on
                   a node that should hold every version.
                 </>
               ) : (
@@ -382,7 +382,7 @@ function SpaceRow({
       <td className="px-4 py-2">
         <div>{space.policy}</div>
         <div className="text-xs text-neutral-500">
-          {space.policy === 'tree'
+          {space.policy === 'current'
             ? `grace ${duration(space.grace_secs)}`
             : 'releases nothing'}
         </div>

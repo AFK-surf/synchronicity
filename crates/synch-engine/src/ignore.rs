@@ -1,4 +1,4 @@
-//! Ignore rules for indexed spaces (§7.1).
+//! Ignore rules for filesystem sources (§7.1).
 //!
 //! A `.syncignore` at the space root, plus built-in defaults. The pattern
 //! language is the common gitignore subset: `*` and `?` globs, `**` for
@@ -31,8 +31,8 @@ pub(crate) const BUILTIN_DEFAULTS: &[&str] = &[
     // to the real one (`Store::materialize`, synch-store/src/backend.rs). A
     // scan racing it would hash whatever length it had reached and publish
     // *that* — a truncated file under a plausible name, replicated to every
-    // peer, then tombstoned by the scan after. `fill` makes the race a bulk
-    // one: thousands of such files, for as long as the fill runs.
+    // peer, then tombstoned by the source scan after. Tree adoption makes the race a bulk
+    // one: thousands of such files, for as long as tree adoption runs.
     "*.synch-materialize",
 ];
 

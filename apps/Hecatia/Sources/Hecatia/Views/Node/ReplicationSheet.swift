@@ -1,10 +1,6 @@
 import SwiftUI
 
-/// `space set` — turning replication on, off, or adjusting it for one folder.
-///
-/// The daemon put replication on the command that already names spaces rather
-/// than inventing a noun for it, and this follows: it is a property of a
-/// folder, reached from the folder, not a separate thing to go and configure.
+/// Add, remove, or adjust the replica role for one namespace.
 struct ReplicationSheet: View {
   @Environment(NodeStore.self) private var node
   @Environment(\.dismiss) private var dismiss
@@ -18,7 +14,7 @@ struct ReplicationSheet: View {
   @State private var graceDays = 7.0
   @State private var limitBudget = false
   @State private var budgetGB = 100.0
-  @State private var release = false
+  @State private var pinHeld = false
   @State private var materialize = false
   @State private var checkoutPath = ""
   @State private var loaded = false
@@ -51,7 +47,7 @@ struct ReplicationSheet: View {
           .fixedSize(horizontal: false, vertical: true)
           .padding(.leading, Theme.Space.xl)
 
-        // Grace only applies to `tree`. Under `archive` nothing is ever
+        // Grace only applies to `current`. Under `forever` nothing is ever
         // released, so a grace period would be a control with no effect —
         // the daemon does not even print the line.
         if policy == .current {
@@ -90,14 +86,14 @@ struct ReplicationSheet: View {
 
       if isTurningOff {
         Divider()
-        Toggle(isOn: $release) {
-          Text("Also release the \(Bytes.short(heldBytes)) it is holding")
+        Toggle(isOn: $pinHeld) {
+          Text("Keep the \(Bytes.short(heldBytes)) it holds as explicit pins")
         }
-        Text(release
-          ? "Those bytes stop being held here. Anything no other device holds is gone from this Mac."
-          : "What it holds stays on this Mac. Turning replication off alone does not free any space.")
+        Text(pinHeld
+          ? "The replica is removed, but operator pins continue retaining every held object."
+          : "Replica holds are released. Cache policy may remove content that no remaining role or pin retains.")
           .font(.caption)
-          .foregroundStyle(release ? Theme.ink(Theme.danger) : Theme.muted)
+          .foregroundStyle(pinHeld ? Theme.muted : Theme.ink(Theme.danger))
           .fixedSize(horizontal: false, vertical: true)
       }
 
@@ -113,12 +109,11 @@ struct ReplicationSheet: View {
     .onAppear(perform: loadCurrent)
   }
 
-  /// The daemon refuses an empty `space set` rather than treating it as a
-  /// no-op, so Apply is not offered when there is provably nothing to send.
+  /// Apply is not offered when there is provably nothing to send.
   ///
   /// Only one case is provable: "off" on a folder that already does not
   /// replicate. Any chosen policy always carries a grace and a budget, and this
-  /// sheet cannot know the folder's current ones — `space ls`'s summary line
+  /// sheet cannot know the folder's current ones — the summary line
   /// does not include the budget — so it does not pretend to and always sends.
   private var hasChange: Bool {
     if case .off = choice { return space.isReplicating }
@@ -137,8 +132,8 @@ struct ReplicationSheet: View {
     let id = space.id
     switch choice {
     case .off:
-      let alsoRelease = release
-      node.enqueue { await node.removeReplica(id: id, pinHeld: !alsoRelease) }
+      let preserve = pinHeld
+      node.enqueue { await node.removeReplica(id: id, pinHeld: preserve) }
     case .policy(let policy):
       let grace = policy == .current ? Int64(graceDays * 86_400) : nil
       let budget = limitBudget ? UInt64(budgetGB * 1_000_000_000) : nil

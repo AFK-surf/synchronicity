@@ -119,8 +119,8 @@ final class NodeStore {
   private var statusProbeFailures = 0
   /// How many of this app's own deadline-less commands are in flight.
   ///
-  /// The daemon takes one global mutex for every store read, so a `scan` or a
-  /// `doctor --rebuild` of ours can make it stop answering the status probe —
+  /// The daemon takes one global mutex for every store read, so a source scan or
+  /// `repair rebuild-views` can make it stop answering the status probe —
   /// and a probe that cannot tell that apart from a daemon that has died will
   /// eventually declare one that is merely busy on our behalf.
   private var longRunsInFlight = 0
@@ -296,7 +296,7 @@ final class NodeStore {
     guard !Task.isCancelled, connection.isConnected else { return }
     // Only the code that means *gone*. A `.fast` deadline expiry lands on
     // `.internalError`, and the daemon takes one global mutex for every store
-    // read — so a `doctor --rebuild` or a `scan` of this app's own, which run
+    // read — so `repair rebuild-views` or a source scan, which run
     // with no deadline at all, can hold it past twenty seconds twice running.
     // Counting that as a death was worse than not noticing: it wiped the
     // caches and then reconnected, and reconnecting opens by closing the
@@ -459,7 +459,7 @@ final class NodeStore {
   /// Collects output frames, and publishes them ten times a second.
   ///
   /// One publish per line was one full re-render of every open window per
-  /// line, and `scan` reports every skipped file on a progress frame. With the
+  /// line, and `source scan` reports every skipped file on a progress frame. With the
   /// Activity window open it was worse: its transcript is one `Text` of the
   /// whole joined output, so the entire transcript was re-joined and re-laid
   /// out for each line that arrived.
@@ -608,7 +608,7 @@ final class NodeStore {
       zonePending = parsed.unrecognized.first { $0.hasPrefix("pending:") }
       note(.domains, parsed.unrecognized.filter { !$0.hasPrefix("pending:") })
     case .peers:
-      guard let output = await run(op("peers"), Cmd.peers, deadline: .fast, quiet: true)
+      guard let output = await run(op("peer.ls"), Cmd.peerList, deadline: .fast, quiet: true)
       else { return }
       let parsed = Listings.peers(output.lines)
       peers = parsed.rows
@@ -624,7 +624,7 @@ final class NodeStore {
       let parsed = Listings.pins(output.lines)
       // Only the operator's own pins are "Kept offline". `pin ls` reports
       // everything anything holds now, and a replica's claims are rows in the
-      // same table — one replicated space can be hundreds of thousands of them.
+      // same table — one replica can be hundreds of thousands of them.
       // They were never a choice someone made here, `pin rm` refuses them, and
       // listing them buries the handful that were chosen.
       //
@@ -634,7 +634,7 @@ final class NodeStore {
       heldByReplicas = parsed.rows.count - pins.count
       note(.pins, parsed.unrecognized)
     case .replication:
-      // One detail report per replicating folder. Only replicating ones: the
+      // One detail report per replica. Only replicas: the
       // daemon answers for the others with a one-line "not replicated" and
       // there is nothing to draw from it.
       var reports: [String: ReplicaStatus] = [:]
@@ -647,11 +647,11 @@ final class NodeStore {
       replicaStatus = reports
       note(.replication, reports.values.flatMap(\.unrecognized))
     case .cloud:
-      guard let output = await run(op("cloud.status"), Cmd.cloudStatus, deadline: .fast, quiet: true)
+      guard let output = await run(op("control-plane.status"), Cmd.controlPlaneStatus, deadline: .fast, quiet: true)
       else { return }
       cloud = Listings.cloud(output)
       for domain in cloud.domains {
-        // Keyed by the row, not by the domain. `cloud status` is one line per
+        // Keyed by the row, not by the domain. `control-plane status` is one line per
         // *endpoint* now, so an apex with a replica down writes "attached" and
         // "detached" under one key within a single refresh, and the ledger
         // reset its clock on every poll — every row then claimed "unchanged
@@ -687,7 +687,7 @@ final class NodeStore {
     case .listing:
       // Owned by each window's FilesModel, which is why this cannot reload it
       // directly — but it can say that it is stale. Without this the topic was
-      // a dead end: `scan` declares `dirties: [.listing]`, and running it from
+      // a dead end: `source scan` declares `dirties: [.listing]`, and running it from
       // the menu bar or from Command-R left every open browser showing the rows
       // from before the scan.
       listingGeneration &+= 1
@@ -738,7 +738,7 @@ final class NodeStore {
     enqueue {
       self.houseworkRunning = true
       defer { self.houseworkRunning = false }
-      await self.run(Operations.require("sync"), Cmd.syncNow)
+      await self.run(Operations.require("peer.sync"), Cmd.peerSync)
     }
   }
 

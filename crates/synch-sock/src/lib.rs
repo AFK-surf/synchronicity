@@ -14,7 +14,7 @@
 //! builds everywhere: the ABI, the limits, the policy and the SDK header are
 //! portable, and [`SUPPORTED`] says whether the runtime behind them exists.
 //! What a node without it loses is *serving*: it can still declare, publish,
-//! replicate and materialize socket entries, and `synch connect` works from
+//! replicate and materialize socket entries, and `synch socket connect` works from
 //! anywhere, because the connecting side executes nothing
 //! (`docs/SOCKETS.md` §1).
 //!
@@ -62,7 +62,7 @@ pub use stream::DuplexStream;
 ///
 /// A node without one answers an inbound `Open` with
 /// [`RefuseCode::Unsupported`](synch_core::RefuseCode::Unsupported), and
-/// `synch socket add` says so at declaration time rather than at 3am.
+/// `synch socket declare` says so at declaration time rather than at 3am.
 pub const SUPPORTED: bool = cfg!(all(
     any(
         target_os = "linux",

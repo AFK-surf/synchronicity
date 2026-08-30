@@ -112,7 +112,7 @@ struct Snapshots {
       Surface(name: "08-members", width: 780, view: AnyView(
         MembersPane(confirmation: empty).environment(node).frame(height: 520))),
 
-      Surface(name: "09-mirrors-and-pins", width: 720, view: AnyView(
+      Surface(name: "09-replicas-and-pins", width: 720, view: AnyView(
         PinsPane(confirmation: empty).environment(node).frame(height: 520))),
 
       Surface(name: "10-remote-access", width: 720, view: AnyView(

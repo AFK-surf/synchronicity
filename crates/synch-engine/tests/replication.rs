@@ -1,6 +1,6 @@
-//! A replicated space, end to end over two real nodes (`docs/REPLICATION.md`).
+//! A replica, end to end over two real nodes (`docs/REPLICATION.md`).
 //!
-//! The publisher indexes a directory; the replica indexes nothing and holds
+//! The publisher serves a filesystem source; the replica publishes nothing and holds
 //! everything. What is being tested is the lifecycle a version goes through
 //! there — wanted, held, superseded, scheduled, released — and the discipline
 //! that decides the last two.
@@ -54,7 +54,7 @@ async fn a_replica_holds_what_the_publisher_publishes_and_keeps_what_it_supersed
     publisher.node.scan_publish_push().await.unwrap();
 
     // The replica holds no checkout of `media` at all: replication is not a
-    // mirror, and the space it replicates is one it never indexes.
+    // source, and the space it replicates is one it never publishes.
     let replicating = replica.node.clone();
     off_runtime(move || {
         replicating
@@ -286,9 +286,9 @@ async fn a_deleted_version_survives_its_grace_window_and_not_a_moment_longer() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
-/// §2.1: under `archive` nothing is ever released, whatever the tree does.
+/// Under `forever` nothing is ever released, whatever the tree does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_policy_releases_nothing() {
+async fn forever_retention_releases_nothing() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let replica = spawn("replica").await;
@@ -720,9 +720,9 @@ async fn a_gc_pass_between_the_fetch_and_the_pin_leaves_the_object_alone() {
 }
 
 /// A space this node only replicates is not one it publishes: it advertises no
-/// `m:space` record, so `space rm` has none to strand (§3.2).
+/// `m:space` record, so `source rm` has none to strand (§3.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replicated_space_advertises_nothing_of_its_own() {
+async fn a_replica_advertises_nothing_of_its_own() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let replica = spawn("replica").await;
@@ -762,7 +762,7 @@ async fn a_replicated_space_advertises_nothing_of_its_own() {
         )
     })
     .await;
-    assert!(own.is_some(), "a space this node indexes is advertised");
+    assert!(own.is_some(), "a filesystem source is advertised");
     assert!(
         replicated.is_none(),
         "a replica-only namespace publishes no source manifest"
@@ -775,7 +775,7 @@ async fn a_replicated_space_advertises_nothing_of_its_own() {
 
 /// A replica of a space it also indexes is two independent halves of one row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_space_can_be_indexed_and_replicated_at_once() {
+async fn source_and_replica_roles_can_coexist() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let both = spawn("both").await;
@@ -813,7 +813,7 @@ async fn a_space_can_be_indexed_and_replicated_at_once() {
     assert!(both.space.path().join("mine.bin").exists());
     assert!(
         !both.space.path().join("theirs.bin").exists(),
-        "replication materializes nothing; that is what a mirror is for"
+        "replication without a checkout materializes nothing"
     );
 
     let node = both.node.clone();

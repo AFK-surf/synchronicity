@@ -1,38 +1,33 @@
 # Delta sync for large files
 
-> **Architecture note.** This document originally described the removed
-> integrated mirror pass. The current design separates durable acquisition
-> (`replica`) from newest-view filesystem projection (`checkout`); the hash,
-> proof, promotion, and CAS safety sections below remain the implementation
-> contract for replica acquisition. Materialization discussion records the
-> origin of the checkout algorithms and is not a separate CLI mode. See
-> [REPLICATION.md](REPLICATION.md) for the current role model.
+This document covers delta transfer during replica acquisition and the
+optional newest-view checkout that may materialize the acquired content. See
+[REPLICATION.md](REPLICATION.md) for the role model.
 
 Status: **implemented**. `synch-core` carries the messages and the chaining-value
 helpers, `synch-store::proof` the proof walk and donor promotion, `synch-net` the
-exchange, `synch-engine` the descent and the mirror's write. Section 8 is the
+exchange, `synch-engine` the descent and checkout materialization. Section 8 is the
 order it landed in; where the built thing differs from what was proposed, this
 document has been corrected to describe the built thing.
 
 ## 1. Problem
 
-A mirror pass treats content as all-or-nothing per object. `plan_pass`
-(`crates/synch-engine/src/mirror.rs`) decides "current or wanted" by comparing
-the on-disk file's whole-content hash against the selected entry's root; when
-they differ, phase 2 fetches the *new* root and materializes it.
+Without delta transfer, replica acquisition treats content as all-or-nothing
+per object. A changed entry names a *new* root even when nearly all of its
+bytes match an object already held in the CAS.
 
 The fetch already skips groups verified locally — but only groups verified
 **under the same root** (`fetch_groups` subtracts `local_groups(root)`). A
 changed file has a new root, so its local-groups set starts empty even when
 99% of its bytes are identical to the previous version sitting in the CAS. The
-result, for the workloads mirrors exist for (§14: VM images, databases, media
+result, for replica workloads such as VM images, databases, media
 libraries, append-heavy logs):
 
 - **Network**: a 100 GB image with 50 MB changed in place costs a 100 GB fetch.
 - **Disk**: the CAS writes 100 GB of payload it already holds a near-copy of,
-  and the mirror then writes 100 GB more.
+  and an enabled checkout may then write 100 GB more.
 - **Swarm**: until the fetch completes past an ad milestone, this node
-  advertises nothing of the new root, so other mirrors cannot lean on it.
+  advertises nothing of the new root, so other replicas cannot lean on it.
 
 ## 2. What makes delta cheap here
 
@@ -93,10 +88,10 @@ What still verifies, and always will:
 | Proof off the network | every pair recomputed up to the root the entry named |
 | Promotion | donor CV (from its tree) equals a CV proved against the new root, **before** any byte is written |
 | A promoted subtree's interior nodes | recombined on the way up to the proved CV, so a rotted donor *tree* cannot poison a tree this node will serve |
-| Re-ingest of a mirrored file | `ingest_file` hashes by construction |
+| Re-ingest of a checkout file | `ingest_file` hashes by construction |
 | A range read | `read_range` is a bao decode against the root |
 | Serving a slice | `encode_ranges_validated` |
-| The mirror's currency check | the target file is user-mutable, so a path no record vouches for is re-hashed; a file the pass wrote or hashed itself is believed by its stat — drift detection, not CAS scrubbing |
+| The checkout's currency check | the target file is user-mutable, so a path no record vouches for is re-hashed; a file reconciliation wrote or hashed itself is believed by its stat — drift detection, not CAS scrubbing |
 
 ## 3. Design overview
 
@@ -113,7 +108,7 @@ the write side is downstream of it and has no delta logic of its own.
   4. promote equal runs       old CAS blob → new CAS blob     │
   5. GetSlice(R', changed)    existing fetch path, fanout     │
         │                                                     │
-        └── mirror write: clone the finished CAS blob, rename
+        └── checkout write: clone the finished CAS blob, rename
 ```
 
 ### 3.1 Wire: `GetProof` on `sync/blob/1`
@@ -179,23 +174,23 @@ one. In priority order:
 1. **The new root itself** — groups already in the bitmap (today's behavior,
    unchanged; a resumed fetch stays free).
 2. **The entry's `prev` root** (§4.2, §8: 1-step lineage) when the CAS holds
-   it, complete or partially. This is the common mirror case: the pass that
+   it, complete or partially. This is the common checkout case: reconciliation
    materialized the old version fetched it into the CAS.
 3. **Other versions of the same path** in its `VersionSet` — divergent
    origins' roots, and the losing versions under `newest`. Same mechanics as
    `prev`, just more candidates for the span comparison.
 
-There is deliberately no fourth kind. An earlier shape of this had the mirror's
+There is deliberately no fourth kind. An earlier shape had the checkout's
 on-disk file as a donor of its own, which meant promotion had to cope with a
 donor that has no tree, no bitmap and no row — every comparison it could not
-make cheaply falling back to hashing bytes — and it meant the mirror had to
+make cheaply falling back to hashing bytes — and it meant the checkout had to
 reason about which promoted groups were "the file's own" to decide what its
 write could keep. Both are gone.
 
 The one capability that donor bought is kept, and paid for where it belongs.
 When the lineage names versions this node holds **none** of — the collector took
-the old object — and the file at the mirror's own destination turns out to *be*
-one of those versions, the mirror `ingest_file`s it and the ordinary CAS-to-CAS
+the old object — and the file at the checkout's own destination turns out to *be*
+one of those versions, reconciliation `ingest_file`s it and the ordinary CAS-to-CAS
 delta proceeds. It runs only above `delta_min_size`, only when no CAS donor
 exists, and only when the file really is a named version.
 
@@ -354,12 +349,12 @@ is one group, and it goes to the network.
 
 Promoted groups flow through `on_content_progress` like fetched ones, so the
 node advertises partial possession of `R'` within one milestone interval —
-mirrors of the same space then delta from *each other*, and the origin uploads
+replicas of the same space then delta from *each other*, and the origin uploads
 the changed bytes roughly once (§6.3's O(N) swarm property, now for updates too).
 
 ### 3.5 Materialization: one path onto the filesystem
 
-`materialize_blob` is the only way an object becomes a file. The mirror pass
+`materialize_blob` is the only way an object becomes a file. Checkout reconciliation
 (§7.2), `synch adopt tree` of a space (§7.2), `synch adopt path`/`adopt_from` (§8) and the
 gateway's fetch-to-file all go through it, and all get the same guarantees: the target is old-or-new and never
 half, no staging residue is left on any path, and the object is never held in
@@ -373,7 +368,7 @@ file's name. Then:
   `FICLONE`. On btrfs, XFS or bcachefs that shares the payload's extents: O(1),
   no data moved, and no second copy of the object on the disk until one of the
   two is written to.
-- Where the ioctl cannot apply — the mirror is on a different filesystem from
+- Where the ioctl cannot apply — the checkout is on a different filesystem from
   the CAS, ext4, a platform without it — the fallback is `std::fs::copy`, itself
   a kernel-side `copy_file_range` on Linux with no bounce through user space.
 - Objects small enough to live in the index (§6.2) have no payload file and are
@@ -388,10 +383,10 @@ file's name. Then:
   rules skip, so a stranded one would sit beside the target unnoticed forever,
   full-size, on a path reached exactly when the disk is already in trouble.
 
-`MirrorReport::reflinked` counts the files that cost no data movement.
+`CheckoutReport::reflinked` counts the files that cost no data movement.
 
-**Currency: a stat, not a hash.** A mirror pass decides "already current?"
-the way the scanner decides "unchanged?" for the node's own spaces: a file the
+**Currency: a stat, not a hash.** Checkout reconciliation decides "already current?"
+the way the scanner decides "unchanged?" for filesystem sources: a file the
 pass wrote or hashed itself is believed by its record — the content root,
 length, stored mtime, and platform identity, believed past the scanner's racy
 window — and only a path no record vouches for is hashed. A quiet pass costs
@@ -402,8 +397,8 @@ peer-chosen data, so a file is never believed for *matching the entry* — only
 for matching the record of what this process itself wrote or hashed.
 
 The record is in memory, per process, and the price is paid on restart: the
-first pass of every mirror hashes the whole tree once, and that pass doubles
-as the mirror's only scrub — whatever has drifted or rotted is found and
+first reconciliation of every checkout hashes the whole tree once, and that
+pass doubles as the checkout's only scrub — whatever has drifted or rotted is found and
 rewritten there. Between restarts, what a stat that never moved hides stays
 hidden: a same-size rewrite that restores length, mtime, and identity, and
 bytes that rot at rest beneath the record — including a CAS payload already
@@ -412,11 +407,11 @@ rotted before a pass wrote from it. Both are the filesystem-integrity domain
 file is recorded and a recorded file is believed, so the pass converges by
 construction rather than by guard.
 
-**The trade-off, stated plainly.** A mirror on a *different filesystem from the
-CAS* keeps the whole network win — the delta happens in the CAS, before the
-mirror is involved at all — but pays a full local copy of the object on every
+**The trade-off, stated plainly.** A checkout on a *different filesystem from
+the CAS* keeps the whole network win — the delta happens in the CAS, before the
+checkout is involved at all — but pays a full local copy of the object on every
 update, because `FICLONE` cannot cross filesystems. An earlier design avoided
-that by patching the mirror's existing file in a clone of *itself*, keeping the
+that by patching the checkout's existing file in a clone of *itself*, keeping the
 groups a donor had proved it already held. That path is deliberately gone:
 
 - **One path.** Two ways to write a file meant two sets of atomicity, residue
@@ -427,12 +422,12 @@ groups a donor had proved it already held. That path is deliberately gone:
   before a network fetch and acted on after it. Nothing stopped the file
   changing in between, and the pass would have kept groups that were no longer
   there.
-- **Extent sharing where it counts.** When the mirror *does* share a filesystem
+- **Extent sharing where it counts.** When the checkout *does* share a filesystem
   with the CAS — the ordinary single-disk deployment — the clone is O(1) and the
-  mirrored file and the CAS object are the same extents, which is strictly
+  checkout file and the CAS object are the same extents, which is strictly
   better than patching a private copy.
 
-Put the mirror on the CAS's filesystem and the whole update, network and disk,
+Put the checkout on the CAS's filesystem and the whole update, network and disk,
 costs the size of the change.
 
 ## 4. Policy and configuration
@@ -460,7 +455,7 @@ costs the size of the change.
   and the object address is *plain* `blake3(file)` — checkable by any BLAKE3
   tool, servable by bao, deduplicated across peers (§6.1). Changing the
   address scheme for one workload class is not worth breaking that; and the
-  workloads mirrors carry at scale (images, databases, media, logs) mutate in
+  workloads replicas carry at scale (images, databases, media, logs) mutate in
   place or append, which fixed offsets serve well. An rsync-style rolling-hash
   recovery layer over the existing addresses is possible future work; it fits
   *behind* `GetProof` without any further wire change.
@@ -484,7 +479,7 @@ costs the size of the change.
 | An entry **under**states a root's size | Refused before anything is written. Nothing is resized on the strength of an unproved length — the payload and outboard only ever grow until a commit settles the size — so a claim short enough to contradict groups already in the bitmap is rejected, and the bytes, the bitmap and the row are exactly as they were. |
 | A size claim racing a write that completes the object | The claim loses. Whether a claimed size may stand is decided inside the same transaction as the bitmap read-union-write, so the two writers serialize: the honest one either finds the claim and replaces it, or lands first and has the claim refused against the size its final group now attests to. Before that the decision was made on a snapshot taken before the work, and the second committer overwrote the first's size — leaving the row `complete` under a length no byte on the disk supported: unreadable, refusing every honest writer for good, and pinned against the collector by the entry that named it. |
 | Donor's tree disagrees under a matched span | Span refused and left to the network; the spans around it are unaffected. |
-| Donor's **payload** rotted, its outboard intact | Not detected, and by design. Promotion compares tree chaining values, never bytes — re-reading the donor is the scrubbing §2.1 refuses — so the rotted run is copied into the new object and its bitmap bit set. The new object then fails its own `read_range` there, and serving it fails at `encode_ranges_validated` rather than sending bad bytes, so the damage does not propagate to peers. It does propagate *locally*, into every derived object promotion touches. This is the accepted cost of trusting the filesystem at rest; the answer to it is a checksumming filesystem, and the mirror's non-convergence guard (§3.5) is what surfaces it to an operator. |
+| Donor's **payload** rotted, its outboard intact | Not detected, and by design. Promotion compares tree chaining values, never bytes — re-reading the donor is the scrubbing §2.1 refuses — so the rotted run is copied into the new object and its bitmap bit set. The new object then fails its own `read_range` there, and serving it fails at `encode_ranges_validated` rather than sending bad bytes, so the damage does not propagate to peers. It does propagate *locally*, into every derived object promotion touches. This is the accepted cost of trusting the filesystem at rest; the answer to it is a checksumming filesystem, and the checkout's non-convergence guard (§3.5) is what surfaces it to an operator. |
 | Donor object collected mid-promotion | The payload and outboard handles are opened once and held for the run, so an unlinked inode stays readable to the end; a donor already gone before the open simply supplies nothing. |
 | Crash mid-promotion | Bitmap has only committed groups; next pass resumes. |
 | Two writers filling one root at once | Bitmap commits are read-union-write inside one transaction, so neither loses the other's groups; promoted bytes are correct by construction, so overlapping writes are idempotent. |
@@ -494,18 +489,18 @@ costs the size of the change.
 ## 7. Cost model (worked example)
 
 100 GB VM image, 1 GB modified in place across 64 spans, previous version in the
-CAS and mirrored on the same filesystem:
+CAS and checkout on the same filesystem:
 
 | | today | with delta |
 | --- | --- | --- |
 | proof rounds | — | ~381 KB + 64 spans × ~65 KB ≈ 4.6 MB |
 | network payload | 100 GB | ~1 GB (+ slice path hashes) |
 | CAS write | 100 GB payload + 400 MB outboard | ~1 GB + 390 MB of tree; the other 99 GB is shared extents |
-| mirror write | 100 GB staging copy | reflink of the finished object: O(1) |
+| checkout write | 100 GB staging copy | reflink of the finished object: O(1) |
 | time to first ad of `R'` | after ≥ first milestone of a 100 GB fetch | one milestone after promotion — seconds |
 
 On a filesystem without reflink the CAS write becomes ~100 GB of local copy and
-the mirror write another 100 GB; the network column is unchanged.
+the checkout write another 100 GB; the network column is unchanged.
 
 Append-only case (log grows 100 MB on 50 GB): round 1 proves every old
 complete span equal; only tail spans reach round 2; network cost ≈ the
@@ -516,7 +511,7 @@ appended bytes.
 1. `synch-core`: `GetProof`/`ProofEnd` messages on the existing `sync/blob/1`
    `BlobMessage`, proof-window bound; chaining-value helpers (`group_cv`,
    `join_cvs`, `join_root`) in `hash.rs`.
-2. `synch-store`: `encode_proof` (positional outboard reads, mirror of
+2. `synch-store`: `encode_proof` (positional outboard reads, counterpart of
    `encode_slice_inner`), `write_proof` (verify, then sparse `.obao` commits)
    returning `Proven`, `subtree_cvs` (the donor-side comparison), and
    `promote(donor, proven)` with the §3.4 compare-then-clone;
@@ -526,7 +521,7 @@ appended bytes.
    two-round descent in front of `fetch_groups`, with round two restricted to
    comparable-and-unequal spans; `FetchReport::promoted` and `reused`.
 5. `synch-engine`: `materialize_blob`, the one write path (§3.5), and the
-   mirror's re-ingest recovery (§3.2).
+   checkout re-ingest recovery (§3.2).
 6. Tests: store-level round trips (equal spans across unequal sizes, tail
    groups, tampered proofs, rotted donor trees, a proof spent on the wrong
    object or at the wrong length, an overstated size, an understated one that
@@ -535,7 +530,7 @@ appended bytes.
    writes, a two-node `tests/two_nodes.rs` case asserting what a one-group edit
    to a 64-group object costs on the wire, the leaf round's restriction to spans
    a donor can speak to, the proof window ceiling's arithmetic, a staging file
-   unlinked on a commit that cannot finish, and mirror passes asserting reuse, an
+   unlinked on a commit that cannot finish, and checkout reconciliations asserting reuse, an
    appended file, donor recovery by re-ingest, the atomicity invariant under a
    torn materialization, and non-convergence on a rotted payload being reported
    rather than rewritten.

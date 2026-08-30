@@ -218,7 +218,7 @@ enum SampleData {
     {
       var run = ActivityRun(
         id: UUID(uuidString: "00000000-0000-0000-0000-00000000a001")!,
-        title: "Sync mirrors", commandLine: "synch replica sync",
+        title: "Sync replicas", commandLine: "synch replica sync",
         startedAt: day(0))
       run.output = RunOutput(frames: [
         .line("notes -> /Users/me/Checkouts/notes: 3 written, 1 unchanged"),

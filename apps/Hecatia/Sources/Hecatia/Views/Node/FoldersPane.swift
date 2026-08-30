@@ -6,7 +6,7 @@ struct SpacesPane: View {
   @Binding var confirmation: ConfirmationRequest?
   @State private var adding = false
   @State private var configuring: Space?
-  @State private var filling: Space?
+  @State private var adopting: Space?
   @State private var selection: Space.ID?
 
   /// The window opens with nothing selected and no report under the table. A
@@ -24,7 +24,7 @@ struct SpacesPane: View {
     ScrollView {
       VStack(alignment: .leading, spacing: Theme.Space.section) {
         SettingsSection(
-          footer: "Spaces this Mac indexes and publishes. The name is shared across every device.",
+          footer: "Filesystem and API sources this Mac publishes. The space name is shared across every device.",
           warnings: (node.parseWarnings[.spaces] ?? []) + (node.parseWarnings[.replication] ?? [])
         ) {
           BorderedTable {
@@ -37,7 +37,7 @@ struct SpacesPane: View {
             TableActionButton(symbol: "minus", name: "Stop Sharing…") { requestRemove() }
               .disabled(selected?.isSource != true || !node.advancedUnlocked)
             Spacer()
-            Button("Adopt From the Cluster…") { filling = selected }
+            Button("Adopt From the Cluster…") { adopting = selected }
               .disabled(selected?.hasFilesystemSource != true)
           }
           // Directly under the bar it unlocks, rather than at the foot of the
@@ -64,7 +64,7 @@ struct SpacesPane: View {
       ReplicationSheet(
         space: space, heldBytes: node.replicaStatus[space.id]?.heldBytes ?? 0)
     }
-    .sheet(item: $filling) { space in AdoptTreeSheet(space: space) }
+    .sheet(item: $adopting) { space in AdoptTreeSheet(space: space) }
   }
 
   /// Name, path, replication — and only the path grows.
@@ -99,7 +99,7 @@ struct SpacesPane: View {
         // readable and copyable some other way.
         .help(space.pathLabel)
         .textSelection(.enabled)
-      // A detached space has no directory, so there is nothing to reveal and
+      // A API source has no directory, so there is nothing to reveal and
       // the button is not drawn rather than drawn dead.
       if let localPath = space.localPath {
         Button {

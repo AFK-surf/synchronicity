@@ -88,10 +88,10 @@ struct NodeInner {
     /// each may be asked about again (§6.3).
     ///
     /// Discovery walks every dialable peer, and it is entered whenever no local
-    /// ad covers a root — so a root nobody holds is re-planned by every mirror
+    /// ad covers a root — so a root nobody holds is re-planned by every checkout
     /// pass and re-dials the whole cluster, forever. An origin publishing `f:`
     /// records whose content hashes name nothing therefore starves the victim's
-    /// mirror of the passes that would have done real work, and `trust rm` does
+    /// counterpart of the passes that would have done real work, and `trust rm` does
     /// not clear it because what has already been published is retained for
     /// `root_retention`. The entries expire, so a root that later becomes
     /// available is picked up.
@@ -132,7 +132,7 @@ struct NodeInner {
     /// and `daemon status` have to be able to name.
     dns_resolver: std::sync::Mutex<crate::membership::ResolverSlot>,
     /// Rung when the unified tree may have changed — an accepted head flipped
-    /// complete, a local publish landed, a mirror was added — so the standing
+    /// complete, a local publish landed, a checkout was added — so standing
     /// checkout loop materializes it without waiting out its interval (§7.2).
     checkout_wake: Arc<tokio::sync::Notify>,
     replica_wake: Arc<tokio::sync::Notify>,
@@ -158,7 +158,7 @@ struct NodeInner {
     /// membership domain.
     ///
     /// In memory and nowhere else: a stored table of live connections is a
-    /// lie the moment the process dies, and `synch cloud status` is asking
+    /// lie the moment the process dies, and `synch control-plane status` is asking
     /// what this daemon is doing now.
     cloud: std::sync::Mutex<
         std::collections::HashMap<crate::cloud::CloudKey, crate::cloud::CloudDomainStatus>,
@@ -318,7 +318,7 @@ impl Node {
     /// head in either slot — and nothing removes those: `rebuild_views`
     /// iterates the complete slots, so an origin with neither is never visited.
     /// The unified tree reads `entries` regardless of heads, so every path
-    /// would stay duplicated under both names, in every mirror, permanently.
+    /// would stay duplicated under both names, in every checkout, permanently.
     ///
     /// Blobs stay: they are content-addressed, and the next scan republishes
     /// them under the new name. `head_history` stays too, so heads signed under
@@ -578,7 +578,7 @@ impl Node {
                     .collect();
                 if !path_spaces.is_empty() {
                     return Err(EngineError::invalid(format!(
-                        "cloud CAS requires API sources; path-backed space(s): {}",
+                        "cloud CAS requires API sources; filesystem source(s): {}",
                         path_spaces.join(", ")
                     )));
                 }
@@ -684,7 +684,7 @@ impl Node {
         let dns_wake = Arc::new(tokio::sync::Notify::new());
         config.net.on_unknown_key = Some(dns_wake.clone());
         // Every head that flips to complete — dialed out or pushed in — rings
-        // the mirror bell. One syncer does both: it is handed to the endpoint
+        // the checkout bell. One syncer does both: it is handed to the endpoint
         // as the head sink the serve side reconciles through, and it is the
         // same object this node's own rounds dial with.
         let checkout_wake = Arc::new(tokio::sync::Notify::new());
@@ -1368,21 +1368,21 @@ impl Node {
         self.inner.dns_wake.clone()
     }
 
-    /// The bell that wakes the standing mirror loop (§7.2).
+    /// The bell that wakes standing checkout reconciliation (§7.2).
     pub(crate) fn checkout_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.checkout_wake.clone()
     }
 
     /// The bell a replication sweep waits on (`docs/REPLICATION.md` §3.4).
     ///
-    /// Its own rather than shared with the mirrors': the two react to the same
+    /// Its own rather than shared with checkouts: the two react to the same
     /// events but at different costs, and a checkout pass over an unchanged tree
     /// must not drag a sweep of four million entries along with it.
     pub(crate) fn replica_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.replica_wake.clone()
     }
 
-    /// Which replicated space leads the next fetch batch (`docs/REPLICATION.md`
+    /// Which replica leads the next fetch batch (`docs/REPLICATION.md`
     /// §3.3). In memory only: fairness across a restart is not worth a write.
     pub(crate) fn replica_rotation(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.inner.replica_rotation.clone()
@@ -1394,7 +1394,7 @@ impl Node {
     }
 
     /// Serializes one materialization pass against every other on this node:
-    /// a checkout pass (§7.2) and a `synch adopt tree` of a space (fill.rs) alike.
+    /// a checkout pass (§7.2) and a `synch adopt tree` of a space (adopt_tree.rs) alike.
     pub(crate) async fn lock_materialization(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.checkout_lock.lock().await
     }
@@ -1676,8 +1676,8 @@ impl Node {
     ///
     /// - **In memory, per process.** Nothing durable ever calls a file good,
     ///   so there is no stale verdict to clear. The price is paid on restart:
-    ///   every mirror's first pass hashes the whole tree once, and that pass
-    ///   doubles as the mirror's only scrub.
+    ///   every checkout's first pass hashes the whole tree once, and that pass
+    ///   doubles as the checkout's only scrub.
     /// - **A stat that never moved hides what lies beneath it.** A same-size
     ///   rewrite that restores length, mtime, and identity — and bytes that
     ///   rot at rest behind an unmoved stat, including a CAS payload already
@@ -1694,7 +1694,7 @@ impl Node {
     }
 
     /// Forgets what was believed about `target` — called when the file leaves
-    /// the mirror, when the file is gone or the wrong length, and when a
+    /// the checkout, when the file is gone or the wrong length, and when a
     /// fresh write or hash re-anchors the belief.
     pub(crate) fn forget_checkout_write(&self, target: &Path) {
         self.checkout_writes().remove(target);
@@ -1828,7 +1828,7 @@ pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// Resolves a stored space or mirror root for comparison against a freshly
+/// Resolves a stored source or checkout root for comparison against a freshly
 /// canonicalized path.
 ///
 /// Both registration paths canonicalize before storing, but a stored root can
@@ -2416,7 +2416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cloud_node_refuses_an_existing_path_backed_space() {
+    async fn a_cloud_node_refuses_an_existing_filesystem_source() {
         let data = tempfile::tempdir().unwrap();
         let checkout = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
@@ -2438,7 +2438,7 @@ mod tests {
             cache_bytes: Some(512 * 1024 * 1024),
         });
         let error = Node::open(config).await.unwrap_err();
-        assert!(error.to_string().contains("path-backed space"), "{error}");
+        assert!(error.to_string().contains("filesystem source"), "{error}");
     }
 
     #[tokio::test]

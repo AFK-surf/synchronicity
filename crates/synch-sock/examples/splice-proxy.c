@@ -1,10 +1,10 @@
 /* splice-proxy — tcp-proxy.c's job, with the bytes never entering the program.
  *
  *   synch socket build examples/splice-proxy.c -o splice-proxy.o
- *   synch socket add code/git.sock
+ *   synch socket declare code/git.sock
  *   synch socket arm code/git.sock        # inspect and copy the printed root
  *   synch socket arm code/git.sock --review <token>
- *   synch connect nas:code/git.sock --listen 127.0.0.1:9418
+ *   synch socket connect nas:code/git.sock --listen 127.0.0.1:9418
  *
  * `sy_splice` moves bytes from one endpoint's receive side straight into
  * another's send side. A program that only forwards has no reason to copy them

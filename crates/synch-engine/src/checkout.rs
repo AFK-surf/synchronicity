@@ -608,7 +608,7 @@ fn plan_pass(
 ///
 /// Counted in bytes rather than groups, and clamped to the object, so the tail
 /// group of a 100-byte file does not report 16 KiB. Shared with `synch adopt tree`
-/// (fill.rs), which reports the same reused-versus-fetched pair.
+/// (adopt_tree.rs), which reports the same reused-versus-fetched pair.
 pub(crate) fn bytes_of(groups: &ChunkRanges, size: u64) -> u64 {
     groups
         .ranges
@@ -949,7 +949,7 @@ fn fold(path: &str) -> String {
 /// The §7.2 first-claimant-wins rule — two published paths that fold onto one
 /// local name are not both materializable, and without the claim one would be
 /// silently written over the other. One implementation, shared by the checkout
-/// and the fill, because it is a policy rule that must not be able to differ
+/// and tree adoption, because it is a policy rule that must not be able to differ
 /// between them. `Err` carries the skip reason for the caller's report.
 pub(crate) fn claim_folded_name(
     claimed: &mut HashMap<String, String>,

@@ -1258,7 +1258,7 @@ enum UIProbe {
 
   /// Writes a file into the shared directory behind the app's back.
   ///
-  /// `HECATIA_PROBE_SHARE` names the folder the selected space indexes. The
+  /// `HECATIA_PROBE_SHARE` names the folder the selected filesystem source publishes. The
   /// daemon's watcher publishes it; nothing tells the app. Until the listing
   /// watch existed the table was a snapshot of whenever it was last navigated.
   static func externalChange(_ model: FilesModel, _ node: NodeStore? = nil) async {

@@ -106,7 +106,7 @@ neither implementation keeps independent metadata.
 
 The node constructs exactly one `Arc<dyn CasBackend>` and supplies that same
 object to the engine, peer `BlobProtocol`, gateway/control write paths, scanner,
-mirror materializer, and maintenance loop. Network receive paths therefore
+checkout materializer, and maintenance loop. Network receive paths therefore
 commit through the configured backend rather than accidentally writing the
 local scratch codec directly. No component selects behavior by asking which
 provider is configured.
@@ -114,7 +114,7 @@ provider is configured.
 Two consequences of that cut, named up front:
 
 - **`blob_path` is no longer a public API.** The former CAS payload-path API
-  escaped the store crate and was reflinked into mirror targets
+  escaped the store crate and was reflinked into checkout targets
   (`Adoption::clone_from` via `fetcher.rs`). That call site is now
   `backend.materialize(root, target)`: the local backend reflinks where the
   filesystem allows, the cloud backend downloads through its cache. Nothing
@@ -202,7 +202,7 @@ pub trait CasBackend: Send + Sync + 'static {
     /// durable row bit. No-op apart from validation on LocalFs.
     async fn finalize(&self, root: Hash, size: u64) -> Result<()>;
 
-    /// Write the object's bytes to a local file (mirror / `synch get`
+    /// Write the object's bytes to a local file (checkout / `synch get`
     /// materialization), atomically replacing the target. LocalFs reflinks
     /// where possible; Cloud downloads through its cache.
     async fn materialize(&self, root: Hash, size: u64,
@@ -692,7 +692,7 @@ without default features and with only Tokio, the reqwest
 service features. That preserves the workspace's process-wide `aws-lc-rs` TLS
 choice and avoids pulling in a second rustls provider. Hashing between awaits
 is bounded or offloaded. Sync flows that reach the CAS (scanner ingest and
-mirror materialization) restructure so their CAS steps are awaited by the
+checkout materialization) restructure so their CAS steps are awaited by the
 async orchestration that already wraps them. The standing rule "no
 `Store::conn` inside a transaction" gains a sibling: no backend await while
 holding a connection. LocalFs retains its short row-delete/unlink critical
@@ -727,7 +727,7 @@ replicas: 1, strategy: Recreate
 ```
 
 **Backend migration.** `synch cas migrate --to s3|gcs|azblob` first refuses a
-node with path-backed spaces: detaching a checkout is an explicit metadata and
+node with filesystem sources: converting one to an API source is an explicit
 publication decision, not a storage-side effect. The command owns the same
 cross-platform lifecycle lock a daemon takes before opening its Store or iroh
 endpoint, so a daemon cannot start and acknowledge a source-only write

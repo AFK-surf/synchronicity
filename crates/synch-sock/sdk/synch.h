@@ -2,7 +2,7 @@
  *
  * A socket is a file in a node's published tree whose content is an eBPF ELF
  * object. The node that published it runs it, once per incoming stream, for a
- * peer that connects with `synch connect <origin>:<space>/<path>`. See
+ * peer that connects with `synch socket connect <origin>:<space>/<path>`. See
  * `docs/SOCKETS.md`.
  *
  * `synch socket build prog.c -o prog.o` compiles against this header with the
@@ -210,7 +210,7 @@ extern sy_u64 sy_now_ms(void);
 extern sy_u64 sy_monotonic_ns(void);
 extern sy_s64 sy_getrandom(void *out, sy_u64 out_len);
 extern sy_s64 sy_version(char *out, sy_u64 out_len);
-/* Reads a key set by `synch socket add --config k=v`. Deliberately not an
+/* Reads a key set by `synch socket declare --config k=v`. Deliberately not an
  * environment read: this program is reachable by every member of the cluster,
  * and on a serverless node the daemon's environment holds cloud credentials. */
 extern sy_s64 sy_config_get(const char *key, sy_u64 key_len, char *out,

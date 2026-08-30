@@ -35,7 +35,7 @@ pub struct EntryRow {
     /// The origin's advisory unix mode (§4.2), when it published one.
     ///
     /// `None` where the origin's platform has no mode to report, and on rows
-    /// materialized before the column existed — a mirror reproduces what it is
+    /// materialized before the column existed — a checkout reproduces what it is
     /// given and leaves the rest alone.
     pub unix_mode: Option<u32>,
     /// The object root, for files.
@@ -157,7 +157,7 @@ pub(crate) const DEFAULT_REPLICA_RELEASE_FLOOR: i64 = 1;
 /// Thirty days rather than the seven `root_retention` uses, because these are
 /// different clocks measuring different things: `root_retention` bounds how
 /// long a read cache keeps what nobody references, while this is the entire
-/// recovery story for an accidental deletion under the `tree` policy. The one
+/// recovery story for an accidental deletion under `current` retention. The one
 /// an operator regrets is the short one.
 pub const DEFAULT_REPLICA_GRACE_SECS: i64 = 30 * 24 * 3600;
 
@@ -237,7 +237,7 @@ pub struct LocalFile {
     pub scanned_at: i64,
 }
 
-/// A peer we have seen, for ranking and `synch peers` (§6.4, §9.2).
+/// A peer we have seen, for ranking and `synch peer ls` (§6.4, §9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSeen {
     /// The peer's device key.
@@ -583,12 +583,12 @@ impl Store {
     /// change rather than to the size of the trie. Runs in one transaction so
     /// the derived views never show a half-applied head.
     /// Rebuilds `entries` and `blob_providers` for one origin from scratch
-    /// (`synch doctor --rebuild`).
+    /// (`synch repair rebuild-views`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
         // One transaction, because the intermediate state is destructive. The
         // Letting the two deletes autocommit and computing the diff outside
         // any transaction leaves `entries` observably empty for the whole
-        // rebuild — and a mirror pass reading `unified_listing` in that window
+        // rebuild — and checkout reconciliation reading `unified_listing` in that window
         // builds an empty `known` set and its sweep unlinks the user's files.
         self.transaction(|txn| {
             txn.delete_origin_entries(origin)?;
@@ -598,7 +598,7 @@ impl Store {
             // reset only those two was not a rebuild of everything the diff
             // writes. A delegated binding whose record has since left the trie
             // survived the pass that exists to remove precisely that — which
-            // made `doctor --rebuild` unable to repair the one table where a
+            // made `repair rebuild-views` unable to repair the one table where a
             // stale row grants trust.
             txn.delete_origin_delegations(origin)?;
             txn.materialize_diff(origin, Hash::EMPTY, root)
@@ -1042,7 +1042,7 @@ impl Txn<'_> {
     ///
     /// This is the half of a head flip that the derived views see, and it
     /// commits with the flip: a crash can never leave `entries` — what the
-    /// unified tree, mirrors, and `synch-s3` serve from — missing a promoted
+    /// unified tree, checkouts, and `synch-s3` serve from — missing a promoted
     /// head's delta.
     pub fn materialize_diff(
         &self,
@@ -1135,7 +1135,7 @@ fn replica_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplicaRow> {
     })
 }
 
-/// The replicated spaces a materialization is running against
+/// The replicas a materialization is running against
 /// (`docs/REPLICATION.md` §3.4).
 ///
 /// Read once per promotion rather than once per changed leaf. A diff can name
@@ -1225,11 +1225,11 @@ fn current_content(
     }
 }
 
-/// Stages a want for a root a replicated space has just been shown, and calls
+/// Stages a want for a root a replica has just been shown, and calls
 /// off any release scheduled against it.
 ///
 /// Content that comes back is content that stays: the same root reappears when
-/// another origin publishes the same bytes, when a `take` adopts them, or when
+/// another origin publishes the same bytes, when `adopt path` selects them, or when
 /// a file is restored from a copy, and in each case the release was decided
 /// against a tree that has since changed its mind.
 fn content_wants(
@@ -1364,7 +1364,7 @@ fn apply_change(
             (None, _) => None,
             // `Added` means the key was not under the old root, and `entries`
             // is derived from the trie, so there is no row to supersede. Worth
-            // the special case: a first sync of a replicated space is millions
+            // the special case: a first sync of a replica is millions
             // of `Added` leaves and this is a query on each of them.
             (Some(_), ChangeKind::Added) => None,
             (Some(_), _) => current_content(tx, origin, &space, &path)?,
@@ -1386,7 +1386,7 @@ fn apply_change(
                 // A record from a future schema is refused rather than
                 // half-read. postcard ignores trailing bytes, so a v2 entry
                 // with a field appended decodes as a v1 entry with that field
-                // missing — silently, and into the table the mirrors write
+                // missing — silently, and into the table checkouts write
                 // from. `Decode` is an origin fault, so the origin that
                 // published it is contained and the rest of the round is
                 // unaffected.
@@ -1537,7 +1537,7 @@ fn delete_delegation_in(
 /// The row is the leaf, verbatim. Every column here is what the origin
 /// published and what every other node holding this trie also materializes:
 /// two nodes with the same trie must produce the same `entries`, and
-/// `doctor --rebuild` must produce what the original materialization did, or
+/// `repair rebuild-views` must produce what the original materialization did, or
 /// version selection stops being a function of the data (§8). A peer's
 /// `mtime_ns` is judged where it is *used* — [`VersionSet::select`] orders
 /// under the reader's own clock — not where it is stored.
@@ -1606,7 +1606,7 @@ mod tests {
     use super::*;
     use crate::testutil::{origin_named, store};
 
-    /// The advisory mode is metadata a mirror materializes (§7.2), so it must
+    /// The advisory mode is metadata a checkout materializes (§7.2), so it must
     /// survive the trip through this view, and the delete path must too.
     #[test]
     fn entries_carry_the_advisory_unix_mode() {
@@ -1937,7 +1937,7 @@ mod tests {
         // the rebuild is asked to derive state from a root that predates
         // nothing else. `bindings` is the third table `materialize_diff`
         // writes, so a rebuild that reset only `entries` and `blob_providers`
-        // left the granted trust standing, and `doctor --rebuild` could not
+        // left the granted trust standing, and `repair rebuild-views` could not
         // repair the one table where a stale row grants something.
         let without = trie
             .remove(with, &synch_core::delegation_key(&subject))
@@ -2057,7 +2057,7 @@ mod tests {
     }
 
     /// A listing must not stop short of a path that sorts high: what the
-    /// mirror's unlink sweep reads is this listing, so a path missing from it
+    /// checkout's unlink sweep reads is this listing, so a path missing from it
     /// is a file the sweep would remove.
     #[test]
     fn a_prefix_listing_reaches_every_path_under_it() {

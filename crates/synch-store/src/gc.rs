@@ -113,7 +113,7 @@ impl Store {
     /// `last_access` is written on ingest and on every download milestone, not
     /// on reads: a streaming read would otherwise cost one row update per
     /// chunk — each taking the single write connection and appending a WAL
-    /// frame, so gateway range reads and mirror materialization would serialize
+    /// frame, so gateway range reads and checkout materialization would serialize
     /// against publishes and GC — and an object nothing references is by
     /// construction not being read through the tree. `read_range` therefore
     /// does not touch the row: doing so would cost exactly that and quietly

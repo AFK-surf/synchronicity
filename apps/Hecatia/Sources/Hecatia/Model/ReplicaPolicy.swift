@@ -1,11 +1,11 @@
 import Foundation
 
-/// What a replicating space holds. The daemon's grammar, round-tripped exactly.
+/// What a replica holds. The daemon's grammar, round-tripped exactly.
 ///
 /// Distinct from ``VersionPolicy``, which picks *one* version for a read. This
 /// picks how much history a node keeps on disk, and the two are not
-/// interchangeable — `tree` is not `newest`, because a tree replica holds every
-/// version the current tree names, from every origin.
+/// interchangeable — `current` is not `newest`, because current retention
+/// holds every version the visible tree names, from every origin.
 enum ReplicaPolicy: String, CaseIterable, Hashable, Sendable {
   /// Hold what the tree names, and release a root once it stops naming it.
   case current

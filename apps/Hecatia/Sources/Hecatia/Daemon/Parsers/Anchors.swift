@@ -33,8 +33,8 @@ enum Anchor {
   /// head from path exactly — including when the id itself contains spaces,
   /// which the daemon permits and a whitespace split would mangle.
   ///
-  /// Only for rows whose path is the **last** field, which is `mirror ls`.
-  /// `space ls` used this and was wrong from the day a third column landed
+  /// Only for rows whose path is the **last** field.
+  /// A generic whitespace split was wrong from the day a third column landed
   /// after the path: everything from the first `/` to end of line includes it.
   /// Use ``columns(_:)`` for anything with a field after the path.
   static func splitAtFirstPath(_ line: String) -> (head: String, path: String)? {

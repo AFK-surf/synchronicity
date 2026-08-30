@@ -366,23 +366,23 @@ impl Node {
     ) -> Result<CompletedUpload> {
         let chosen = choose_parts(wanted, available)?;
         let dir = self.store().upload_dir(upload);
-        let detached = {
+        let api_source = {
             let (node, space) = (self.clone(), space.to_string());
             crate::blocking::offload(move || node.is_api_source(&space)).await?
         };
         let remote_parts = self.cas_backend().remote_upload_parts();
-        if remote_parts && !detached {
+        if remote_parts && !api_source {
             return Err(EngineError::invalid(
-                "a cloud-CAS node cannot complete into a path-backed space",
+                "a cloud-CAS node cannot complete into a filesystem source",
             ));
         }
-        // A detached completion assembles into a staging file the daemon owns.
-        // A path-backed one assembles into the space itself, and opens that
+        // An API-source completion assembles into a staging file the daemon owns.
+        // A filesystem-source completion assembles into the source itself and opens that
         // write through `open_adoption` below — which resolves the target, takes
         // the gates, and carries them to the commit, so an upload open for days
         // is judged by the rules in force when it lands rather than the ones it
         // started under.
-        let target = if detached {
+        let target = if api_source {
             dir.join(format!(
                 "assembled.{}{}",
                 nonce(),
@@ -426,7 +426,7 @@ impl Node {
                 // then (or re-checks the guard, where there are no directory
                 // handles), so the assembly streaming in between cannot be
                 // redirected outside the space.
-                let mut adoption = if detached {
+                let mut adoption = if api_source {
                     Adoption::at(&assembled_target)?
                 } else {
                     node.open_adoption(&space_owned, &path_owned)?
@@ -440,7 +440,7 @@ impl Node {
                 Ok((root, written))
             })
             .await?;
-            if detached {
+            if api_source {
                 let committed = self
                     .commit_api_file(space, path, &target, synch_core::now_ns())
                     .await;
@@ -955,7 +955,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cloud_parts_are_durable_before_rows_and_complete_detached() {
+    async fn cloud_parts_are_durable_before_rows_and_complete_an_api_source() {
         let data = tempfile::tempdir().unwrap();
         Node::init(data.path(), None).unwrap();
         let mut config = crate::config::NodeConfig::loopback(data.path());

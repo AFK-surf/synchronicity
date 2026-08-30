@@ -10,7 +10,7 @@ struct FilesSidebar: View {
   let model: FilesModel
   @Binding var addingSpace: Bool
   @State private var confirmation: ConfirmationRequest?
-  @State private var filling: Space?
+  @State private var adopting: Space?
 
   var body: some View {
     // An `NSOutlineView`, not a SwiftUI `List`. See ``FolderListView`` for
@@ -30,9 +30,9 @@ struct FilesSidebar: View {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: checkout.localPath)
       },
       onStopSharing: requestStopSharing,
-      onFill: { filling = $0 })
+      onAdopt: { adopting = $0 })
     .confirmedAction($confirmation)
-    .sheet(item: $filling) { space in AdoptTreeSheet(space: space) }
+    .sheet(item: $adopting) { space in AdoptTreeSheet(space: space) }
     .safeAreaInset(edge: .bottom) { SidebarConnectionFooter() }
     .task(id: node.connection) {
       guard node.connection.isConnected else { return }
@@ -50,14 +50,10 @@ struct FilesSidebar: View {
     return policy.label
   }
 
-  /// What `space rm` does to *this* folder.
+  /// What `source rm` does to *this* folder.
   ///
-  /// It used to say "the files stay on disk" and stop there, which is only the
-  /// whole story for a plain published folder. On a replicating one the daemon
-  /// stops the replication too, and what that replication holds stays held
-  /// unless `--release` is sent — so the sentence promised less than happens
-  /// and more than is freed. On a detached one there are no files to reassure
-  /// anybody about.
+  /// Removing a source does not alter an independent replica role. A filesystem
+  /// source also leaves its directory untouched.
   private func stopSharingConsequence(_ space: Space) -> String {
     "This Mac stops publishing \(space.localPath ?? space.id). Its replica role, if any, is unchanged. The source files stay on disk."
   }

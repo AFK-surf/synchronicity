@@ -226,12 +226,12 @@ enum Listings {
     }
   }
 
-  // MARK: - cloud status  ·  "cloud: {state}" then "{:<32} {:<10} {endpoint}{error}"
+  // MARK: - control-plane status  ·  "control-plane: {state}" then "{:<32} {:<10} {endpoint}{error}"
 
   static func cloud(_ output: RunOutput) -> CloudState {
     var state = CloudState()
     for line in output.lines {
-      if let value = Anchor.after("cloud: ", in: line) {
+      if let value = Anchor.after("control-plane: ", in: line) {
         state.enabled = value.hasPrefix("enabled")
         continue
       }

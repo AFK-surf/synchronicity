@@ -78,7 +78,7 @@ here and no output drifts from what `synch` prints.
 | `synch_versions` | `Run(Status)` |
 | `synch_history` | `Run(Log)` |
 | `synch_compare` | `Run(Compare)`, structured — the daemon already emits JSON |
-| `synch_peers` | `Run(Peers)` |
+| `synch_peer_list` | `Run(PeerLs)` |
 | `synch_doctor` | `Run(Doctor)` |
 | `synch_socket_list` | `Run(SocketLs)` |
 | `synch_socket_ps` | `Run(SocketPs)` |
@@ -86,7 +86,7 @@ here and no output drifts from what `synch` prints.
 | `synch_socket_sdk` | `Run(SocketSdk)` |
 | `synch_socket_build` | none — the compiler is in this process |
 | `synch_socket_review` | `Run(SocketArm)` with no token: inspects only |
-| `synch_connect` | `OpenSocket` |
+| `synch_socket_connect` | `OpenSocket` |
 
 ### Write tier — `--allow-write`
 
@@ -98,11 +98,11 @@ here and no output drifts from what `synch` prints.
 | `synch_adopt_tree` | `Run(AdoptTree)` — `dry_run` defaults to true here |
 | `synch_pin` | `Run(PinAdd)` / `Run(PinRm)` |
 | `synch_source_scan` | `Run(SourceScan)` |
-| `synch_sync` | `Run(SyncNow)` |
-| `synch_socket_add` | `Run(SocketAdd)` |
+| `synch_peer_sync` | `Run(PeerSync)` |
+| `synch_socket_declare` | `Run(SocketDeclare)` |
 | `synch_socket_arm` | `Run(SocketArm)` with a review token |
 | `synch_socket_disarm` | `Run(SocketDisarm)` |
-| `synch_socket_remove` | `Run(SocketRm)` |
+| `synch_socket_undeclare` | `Run(SocketUndeclare)` |
 | `synch_socket_kill` | `Run(SocketKill)` |
 
 The split is by whether a tool changes state, not by how alarming it sounds. The
@@ -126,7 +126,7 @@ Two placements are worth stating because they are not obvious:
 The whole socket lifecycle is reachable over the protocol without a single
 filesystem write outside a space: `synch_socket_build` takes C source and
 returns the object base64-encoded, `synch_write` puts it in a space,
-`synch_socket_add` declares it, `synch_source_scan` republishes it as a socket, and
+`synch_socket_declare` declares it, `synch_source_scan` republishes it as a socket, and
 `synch_socket_review` then `synch_socket_arm` approve it.
 
 ### `--space`
@@ -136,7 +136,7 @@ space outside it is refused before it reaches the daemon; a resource URI outside
 it is answered as though it did not exist, because a resource this server does
 not serve should not be distinguishable from one that is not there.
 
-The filter applies to `synch_connect` too. A socket on a peer is still addressed
+The filter applies to `synch_socket_connect` too. A socket on a peer is still addressed
 by space, and letting one through would make the filter a local-only fiction.
 
 A tool whose space argument is optional does not inherit the wildcard: an
@@ -145,7 +145,7 @@ exists to prevent. So under `--space`, `synch_socket_list` fills in the confined
 space when there is exactly one and asks which when there are several.
 
 Three tools take no space at all and act on everything the node holds:
-`synch_source_scan`, `synch_sync`, and `synch_socket_ps` when it names no socket. There
+`synch_source_scan`, `synch_peer_sync`, and `synch_socket_ps` when it names no socket. There
 is nothing in them to narrow, so under `--space` they are refused rather than
 allowed to reach past the confinement. Without `--space` they behave as before.
 
@@ -209,8 +209,9 @@ which keeps one message per line true under concurrency.
 `notifications/cancelled` stops a request and sends nothing further for it, which
 is what the spec requires.
 
-**Progress is forwarded.** The daemon already reports what `scan`, `sync` and
-`fill` are doing; a client that sends a `progressToken` gets those frames as
+**Progress is forwarded.** The daemon already reports what source scans, peer
+exchanges, replica reconciliation, and tree adoption are doing; a client that
+sends a `progressToken` gets those frames as
 `notifications/progress`.
 
 **Shutdown is on stdin closing** — the primary signal, and the only portable
@@ -226,7 +227,7 @@ silence for work the server had already started.
 | One `resources/read` | — | 1 MiB, then refused with `synch_read` named |
 | Rendered command output | — | 1 MiB, and truncation is announced |
 | One listing page | 200 | 1000 |
-| One `synch_connect` | 30 s | 300 s |
+| One `synch_socket_connect` | 30 s | 300 s |
 | One input line | — | 16 MiB, then the stream is not MCP |
 
 ## 7. stdout carries protocol and nothing else

@@ -39,7 +39,7 @@ impl Node {
     /// Picks the version a policy selects for a path (§8).
     ///
     /// The single entry point every reading surface goes through — `cat`,
-    /// `get`, mirrors, the S3 gateway — so that they cannot disagree about what
+    /// `get`, checkouts, the S3 gateway — so that they cannot disagree about what
     /// a policy means.
     pub fn resolve(&self, space: &str, path: &str, policy: &VersionPolicy) -> Result<EntryRow> {
         let set = self.versions(space, path)?;

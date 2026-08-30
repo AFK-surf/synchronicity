@@ -17,14 +17,14 @@ prints what the program says it needs and asks you to approve it:
 
 ```sh
 cp echo.o ~/synchronicity/code/echo.sock
-synch socket add code/echo.sock
+synch socket declare code/echo.sock
 synch socket arm code/echo.sock
 ```
 
 And call it from another node in the cluster:
 
 ```sh
-synch connect nas:code/echo.sock
+synch socket connect nas:code/echo.sock
 ```
 
 | | what it is for | what to read it for |

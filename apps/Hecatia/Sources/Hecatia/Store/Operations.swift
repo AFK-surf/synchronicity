@@ -7,11 +7,9 @@ import Foundation
 /// missing placement is a failing test rather than a review question.
 ///
 /// The count is checked against `control.proto` itself by
-/// `Scripts/audit-coverage.sh`, not against a number written here. It used to
-/// be a literal, and it said 55 for three daemon releases while `space set`,
-/// `space sync` and `fill` had no home — the test that existed to catch exactly
-/// that counted this array against a number in a comment, so the two agreed
-/// with each other and neither agreed with the daemon.
+/// `Scripts/audit-coverage.sh`, not against a number written here. A literal
+/// count once let new daemon operations ship with no home because the array
+/// and its comment agreed with each other instead of with the daemon.
 ///
 /// What is deliberately **not** here: `init`, `daemon run`, `daemon start`,
 /// `cas migrate` and `socket build`. All five are dispatched by the CLI before
@@ -47,7 +45,7 @@ enum Operations {
     // these and the daemon bridges it to a QUIC stream. Listed so the registry
     // keeps counting the daemon rather than counting itself; see the `socket`
     // block in `run` for why none of the surface exists yet.
-    .init("rpc.openSocket", "—", "synch connect <origin>:<space>/<path>", surface: .notSurfaced,
+    .init("rpc.openSocket", "—", "synch socket connect <origin>:<space>/<path>", surface: .notSurfaced,
           omission: "A bidirectional byte pipe carrying somebody else's protocol; this app has no terminal, no listener and nothing to pipe it to."),
   ]
 
@@ -73,7 +71,7 @@ enum Operations {
     .init("domain.set", "Use a Membership Zone…", "synch domain set <domain>", gate: .consequence, surface: .node, dirties: [.domains, .members, .status]),
     .init("domain.clear", "Stop Using the Zone…", "synch domain clear", gate: .typed, surface: .node, dirties: [.domains, .members, .status]),
     .init("domain.refresh", "Check Now", "synch domain refresh", surface: .node, dirties: [.domains, .members]),
-    .init("peers", "Network", "synch peer ls", surface: .node, provides: [.peers]),
+    .init("peer.ls", "Network", "synch peer ls", surface: .node, provides: [.peers]),
     // Independent local roles. Namespace discovery itself uses ListSpaces.
     .init("source.ls", "—", "synch source ls [<id>]", surface: .notSurfaced,
           omission: "The typed ListSpaces call supplies the same role records without parsing text."),
@@ -102,7 +100,7 @@ enum Operations {
     // The omission note that used to sit here claimed `Control.Read` was
     // equivalent. It is not: `ReadRequest` has no root field, so it can only
     // ever select a *current* version, and a superseded one — the thing you
-    // want back after a bad `take`, and everything an `archive` replica holds —
+    // want back after an unwanted adoption, and everything a `forever` replica holds —
     // was unreachable by any route.
     .init("cat", "Quick Look an Old Version", "synch cat --root <hex>", surface: .files),
     .init("get", "Download an Old Version…", "synch get --root <hex>", surface: .files),
@@ -116,16 +114,16 @@ enum Operations {
     .init("pin.add", "Keep Offline", "synch pin add <target>", gate: .consequence, surface: .files, dirties: [.pins]),
     .init("pin.rm", "Stop Keeping Offline", "synch pin rm <target>", gate: .confirm, surface: .files, dirties: [.pins]),
     // Upkeep
-    .init("sync", "Sync Now", "synch peer sync", surface: .ambient, // `.listing` too: `SyncNow` pulls a peer's entries into this node's store, so
+    .init("peer.sync", "Sync Now", "synch peer sync", surface: .ambient, // `.listing` too: peer sync pulls a peer's entries into this node's store, so
     // it changes what the browser is showing and used not to refresh it.
     dirties: [.peers, .status, .listing]),
     .init("recover", "Resume Publishing…", "synch recover", gate: .conditional, surface: .node, dirties: [.status]),
     .init("doctor", "Run Diagnostics", "synch doctor", surface: .node, dirties: []),
     .init("repair.rebuildViews", "Rebuild Derived Views", "synch repair rebuild-views", gate: .typed, surface: .node, dirties: [.status, .spaces, .listing]),
     // Remote access
-    .init("cloud.status", "Remote access", "synch control-plane status", surface: .node, provides: [.cloud]),
-    .init("cloud.enable", "Allow remote browsing", "synch control-plane enable", gate: .confirm, surface: .node, dirties: [.cloud]),
-    .init("cloud.disable", "Stop remote browsing", "synch control-plane disable", gate: .confirm, surface: .node, dirties: [.cloud]),
+    .init("control-plane.status", "Remote access", "synch control-plane status", surface: .node, provides: [.cloud]),
+    .init("control-plane.enable", "Allow remote browsing", "synch control-plane enable", gate: .confirm, surface: .node, dirties: [.cloud]),
+    .init("control-plane.disable", "Stop remote browsing", "synch control-plane disable", gate: .confirm, surface: .node, dirties: [.cloud]),
     // Sockets (oneof 47…55), none of them surfaced.
     //
     // v3 publishes a socket as an entry of its own kind, arms it against a
@@ -133,9 +131,9 @@ enum Operations {
     // whole surface — an object to review, an armed/disarmed state, a list of
     // running invocations, a log — and this app has not one piece of it. They
     // are listed anyway, because the registry is the count the daemon is
-    // checked against: leaving an operation out is not neutrality, it is how
-    // `space set`, `space sync` and `fill` stayed invisible for three
-    // releases. `surface: .notSurfaced` is the same admission `ls` makes at
+    // checked against: leaving an operation out is not neutrality. A new
+    // operation once stayed invisible for three releases.
+    // `surface: .notSurfaced` is the same admission `ls` makes at
     // the top of this section, and each row says what building it would take.
     //
     // None declares `dirties`. A row nothing can invoke has no table to
@@ -143,13 +141,13 @@ enum Operations {
     // `CoverageTests.everyMutationInvalidatesSomething` exempts `.notSurfaced`
     // for exactly that reason, and the exemption ends the moment one gets a
     // button.
-    .init("socket.add", "—", "synch socket declare <space>/<path>", surface: .notSurfaced,
+    .init("socket.declare", "—", "synch socket declare <space>/<path>", surface: .notSurfaced,
           omission: "Publishes an eBPF object as a runnable entry; nothing in this app builds, inspects or reviews one."),
     .init("socket.arm", "—", "synch socket arm <space>/<path>", surface: .notSurfaced,
           omission: "Approves one review token to execute, which is a review decision — a button without the review it approves is the wrong half of the feature."),
     .init("socket.disarm", "—", "synch socket disarm <space>/<path>", surface: .notSurfaced,
           omission: "Stops a socket serving, and there is no armed state shown anywhere for a person to want stopped."),
-    .init("socket.rm", "—", "synch socket undeclare <space>/<path>", surface: .notSurfaced,
+    .init("socket.undeclare", "—", "synch socket undeclare <space>/<path>", surface: .notSurfaced,
           omission: "Withdraws the socket entry; the browser can name a socket row now but offers it only `rpc.delete`, which is a different question from retiring a published program."),
     .init("socket.ls", "—", "synch socket ls [<space>]", surface: .notSurfaced,
           omission: "The sockets of a space, with no pane to list them in and no Topic for them to fill."),

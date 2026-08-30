@@ -34,7 +34,7 @@ struct FolderListView: NSViewRepresentable {
   /// `synch adopt tree` — pull the cluster's content into this folder's own
   /// directory. Offered here because this is where someone is when they have
   /// just added a folder that other devices already have files in.
-  let onFill: (Space) -> Void
+  let onAdopt: (Space) -> Void
 
   func makeNSView(context: Context) -> NSScrollView {
     let outline = FolderNSOutlineView()
@@ -262,8 +262,8 @@ struct FolderListView: NSViewRepresentable {
       NSPasteboard.general.setString(path, forType: .string)
     }
 
-    @objc private func fillClicked() {
-      if case .space(let space)? = clickedRow()?.kind { view.onFill(space) }
+    @objc private func adoptClicked() {
+      if case .space(let space)? = clickedRow()?.kind { view.onAdopt(space) }
     }
 
     @objc private func stopSharingClicked() {
@@ -292,7 +292,7 @@ extension FolderListView.Coordinator: NSMenuDelegate {
         menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealClicked), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(
-          withTitle: "Adopt From the Cluster\u{2026}", action: #selector(fillClicked),
+          withTitle: "Adopt From the Cluster\u{2026}", action: #selector(adoptClicked),
           keyEquivalent: "")
         menu.addItem(withTitle: "Copy Path", action: #selector(copyPathClicked), keyEquivalent: "")
       }
@@ -350,13 +350,13 @@ private struct FolderListPreview: View {
       onAddFolder: {},
       onRevealCheckout: { _ in },
       onStopSharing: { _ in },
-      onFill: { _ in })
+      onAdopt: { _ in })
   }
 }
 
 #Preview("Spaces") {
-  // Four spaces and a checkout. One of the spaces is detached — it holds the
-  // content and indexes no directory — so it is the row drawn with a box
+  // Four spaces and a checkout. One is an API source with no directory, so it
+  // is the row drawn with a box
   // instead of a folder, and the checkout is the row that carries a second line.
   FolderListPreview(store: NodeStore.preview())
     .frame(width: 230, height: 420)

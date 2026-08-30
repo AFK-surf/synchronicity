@@ -2,9 +2,9 @@
  *
  *   synch socket build examples/compact-frames.c -o compact-frames.o
  *   cp compact-frames.o ~/synchronicity/code/compact-frames.sock
- *   synch socket add code/compact-frames.sock
+ *   synch socket declare code/compact-frames.sock
  *   synch socket arm code/compact-frames.sock
- *   synch connect nas:code/compact-frames.sock
+ *   synch socket connect nas:code/compact-frames.sock
  *
  * Synchronicity normally uses guarded 16 KiB local-call frames. This program's
  * compiler setting and locals fit in 512 bytes, so it asks for smaller frames

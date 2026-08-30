@@ -2,9 +2,9 @@
  *
  *   synch socket build examples/echo.c -o echo.o
  *   cp echo.o ~/synchronicity/code/echo.sock
- *   synch socket add code/echo.sock
+ *   synch socket declare code/echo.sock
  *   synch socket arm code/echo.sock
- *   synch connect nas:code/echo.sock
+ *   synch socket connect nas:code/echo.sock
  *
  * Everything a socket must have and nothing it need not: a declaration hook
  * the operator reads at arm time, one event loop, and an end that lets the

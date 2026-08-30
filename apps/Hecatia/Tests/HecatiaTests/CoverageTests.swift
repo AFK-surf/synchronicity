@@ -8,10 +8,10 @@ import Testing
 /// subcommands `Run` carries (proto field numbers 1…55 with 9 reserved).
 ///
 /// These numbers are the app's side of the count only. Asserting them here is
-/// what *failed* last time: `space set`, `space sync` and `fill` shipped in the
-/// daemon and this test stayed green, because it compared the registry against
-/// a literal that was written from the registry. The check that can actually
-/// fail lives in `Scripts/audit-coverage.sh`, which counts the oneof in
+/// what failed before: new daemon operations shipped while this test stayed
+/// green, because it compared the registry against a literal written from the
+/// registry. The check that can actually fail lives in
+/// `Scripts/audit-coverage.sh`, which counts the oneof in
 /// `control.proto` — a file `make check-proto` keeps identical to the
 /// daemon's. Keep both: this one localizes a miscount to a test name, that one
 /// is the one that notices.
@@ -44,7 +44,7 @@ struct CoverageTests {
     // add a parser and no capability. `cat` and `get` used to be here on the
     // same reasoning, and the reasoning was wrong — `ReadRequest` carries no
     // content root, so it can only select the *current* version of a path,
-    // and everything a superseded version or an `archive` replica holds needs
+    // and everything a superseded version or a `forever` replica holds needs
     // `--root` — which is why they are surfaced now.
     //
     // The nine `socket` subcommands and `rpc.openSocket` are a second kind of
@@ -56,8 +56,8 @@ struct CoverageTests {
     // was dropped, not replaced.
     let omitted = Operations.all.filter { $0.surface == .notSurfaced }.map(\.id).sorted()
     #expect(omitted == [
-      "ls", "rpc.openSocket", "socket.add", "socket.arm", "socket.disarm",
-      "socket.kill", "socket.log", "socket.ls", "socket.ps", "socket.rm",
+      "ls", "rpc.openSocket", "socket.arm", "socket.declare", "socket.disarm",
+      "socket.kill", "socket.log", "socket.ls", "socket.ps", "socket.undeclare",
       "socket.sdk",
     ])
   }
@@ -67,7 +67,7 @@ struct CoverageTests {
   @Test func readsInvalidateNothing() {
     let readOnly: Set<String> = [
       "id", "daemon.status", "key.ls", "trust.ls", "delegate.ls", "domain.ls",
-      "peers", "source.ls", "replica.ls", "pin.ls", "cloud.status", "doctor",
+      "peer.ls", "source.ls", "replica.ls", "pin.ls", "control-plane.status", "doctor",
       "status", "log", "compare", "rpc.list", "rpc.resolve", "rpc.read",
       "rpc.getConfig", "rpc.listSpaces", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
     ]
@@ -84,14 +84,14 @@ struct CoverageTests {
     // impossible to introduce by forgetting.
     let readOnly: Set<String> = [
       "id", "daemon.status", "key.ls", "trust.ls", "delegate.ls", "domain.ls",
-      "peers", "source.ls", "replica.ls", "pin.ls", "cloud.status", "doctor",
+      "peer.ls", "source.ls", "replica.ls", "pin.ls", "control-plane.status", "doctor",
       "status", "log", "compare", "rpc.list", "rpc.resolve", "rpc.read",
       "rpc.getConfig", "rpc.listSpaces", "rpc.listUploads", "rpc.listParts", "ls", "cat", "get",
     ]
     // `.notSurfaced` is exempt, and it is honest rather than convenient to
     // exempt it: nothing can invoke those, so what they would invalidate is a
     // guess, and a guess written as a fact is the exact failure this test
-    // exists to prevent. `socket add` and `socket rm` really do change a
+    // exists to prevent. Socket declaration changes really do change a
     // listing — but the day either gets a button is the day that can be
     // written down from a refresh someone watched happen, and the exemption
     // ends there.
@@ -122,7 +122,7 @@ struct CoverageTests {
       "rpc.list", "rpc.resolve", "rpc.read", "rpc.put", "rpc.delete",
       "rpc.listSpaces", "source.ls", "source.add", "status", "adopt.path", "log", "compare",
       "pin.add", "pin.rm", "source.scan",
-      // `fill` names a folder and writes into it. `cat` and `get` name one
+      // Tree adoption names a folder and writes into it. `cat` and `get` name one
       // object by its content root, which is a version of a file — the only
       // route to one no path selects any more.
       "adopt.tree", "cat", "get",

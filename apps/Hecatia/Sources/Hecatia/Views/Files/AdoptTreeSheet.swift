@@ -3,8 +3,8 @@ import SwiftUI
 /// `synch adopt tree` — adopt the cluster's content into a filesystem source.
 ///
 /// The operation someone reaches for after adding an existing shared space to
-/// a new Mac. It is not a download and it is not a mirror: it writes into the
-/// space this node already indexes, additively. It never removes anything,
+/// a new Mac. It is not a foreground download or a replica checkout: it writes into the
+/// filesystem source this node already publishes, additively. It never removes anything,
 /// leaves bytes that already match alone, reports differing ones instead of
 /// overwriting them, honours `.syncignore`, and stamps the published mtime so
 /// it does not mint a version that looks newer than what it copied.

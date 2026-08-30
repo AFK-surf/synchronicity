@@ -16,7 +16,7 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        AdoptCommand, CasBackendArg, CasCommand, Cli, CloudCommand, Command, DaemonCommand,
+        AdoptCommand, CasBackendArg, CasCommand, Cli, Command, ControlPlaneCommand, DaemonCommand,
         DelegateCommand, DomainCommand, KeyCommand, PeerCommand, PinCommand, RepairCommand,
         ReplicaCommand, SocketCommand, SourceCommand, TrustCommand,
     },
@@ -324,13 +324,13 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
         let checked = source_store.clone();
         let path_spaces = tokio::task::spawn_blocking(move || {
             let _scope = synch_core::BlockingScope::enter();
-            path_backed_space_ids(&checked)
+            filesystem_source_ids(&checked)
         })
         .await
         .context("the space inventory task did not complete")??;
         if !path_spaces.is_empty() {
             anyhow::bail!(
-                "cloud CAS migration requires API sources; path-backed space(s): {}",
+                "cloud CAS migration requires API sources; filesystem source(s): {}",
                 path_spaces.join(", ")
             );
         }
@@ -399,7 +399,7 @@ async fn migrate_cas(cli: &Cli, data_dir: &Path, target: CasBackendArg) -> Resul
     Ok(())
 }
 
-fn path_backed_space_ids(
+fn filesystem_source_ids(
     store: &synch_store::Store,
 ) -> std::result::Result<Vec<String>, synch_store::StoreError> {
     Ok(store
@@ -767,8 +767,8 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Peer { command } => match command {
-            PeerCommand::Ls => Cmd::Peers(pb::Peers {}),
-            PeerCommand::Sync => Cmd::SyncNow(pb::SyncNow {}),
+            PeerCommand::Ls => Cmd::PeerLs(pb::PeerLs {}),
+            PeerCommand::Sync => Cmd::PeerSync(pb::PeerSync {}),
         },
 
         Command::Source { command } => match command {
@@ -862,7 +862,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 max_streams,
                 auto,
                 note,
-            } => Cmd::SocketAdd(pb::SocketAdd {
+            } => Cmd::SocketDeclare(pb::SocketDeclare {
                 target: target.clone(),
                 config: config.clone(),
                 max_streams: max_streams.unwrap_or(0),
@@ -876,7 +876,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             SocketCommand::Disarm { target } => Cmd::SocketDisarm(pb::SocketDisarm {
                 target: target.clone(),
             }),
-            SocketCommand::Undeclare { target } => Cmd::SocketRm(pb::SocketRm {
+            SocketCommand::Undeclare { target } => Cmd::SocketUndeclare(pb::SocketUndeclare {
                 target: target.clone(),
             }),
             SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
@@ -973,9 +973,9 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             command: RepairCommand::RebuildViews,
         } => Cmd::RepairRebuildViews(pb::RepairRebuildViews {}),
         Command::ControlPlane { command } => match command {
-            CloudCommand::Enable => Cmd::CloudEnable(pb::CloudEnable {}),
-            CloudCommand::Disable => Cmd::CloudDisable(pb::CloudDisable {}),
-            CloudCommand::Status => Cmd::CloudStatus(pb::CloudStatus {}),
+            ControlPlaneCommand::Enable => Cmd::ControlPlaneEnable(pb::ControlPlaneEnable {}),
+            ControlPlaneCommand::Disable => Cmd::ControlPlaneDisable(pb::ControlPlaneDisable {}),
+            ControlPlaneCommand::Status => Cmd::ControlPlaneStatus(pb::ControlPlaneStatus {}),
         },
     })
 }
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_migration_preflight_names_path_backed_spaces() {
+    fn cloud_migration_preflight_names_filesystem_sources() {
         let data = tempfile::tempdir().unwrap();
         let store = synch_store::Store::open(data.path()).unwrap();
         store
@@ -1144,7 +1144,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            path_backed_space_ids(&store).unwrap(),
+            filesystem_source_ids(&store).unwrap(),
             vec!["checkout".to_string()]
         );
     }

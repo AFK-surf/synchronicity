@@ -117,7 +117,7 @@ CP_SESSION_SECRET=…the primary's, byte for byte…
 
 The apex then publishes one `v=synccp1 url=` record per endpoint at
 `_synchronicity-cp.<base>`, and every daemon opens a standing tunnel to each
-(`synch cloud status` lists one line per endpoint). At most 8 endpoints:
+(`synch control-plane status` lists one line per endpoint). At most 8 endpoints:
 every one costs every daemon in every network a WebSocket, and both ends
 refuse a longer list — the control plane at boot, the daemon at discovery.
 

@@ -67,11 +67,11 @@ impl Node {
     /// Does not arm it: what the file contains at declaration time may not be
     /// what the operator meant to approve, and `synch socket arm` is where the
     /// approval happens after the declaration is printed.
-    pub fn socket_add(&self, row: &SocketRow) -> Result<()> {
+    pub fn socket_declare(&self, row: &SocketRow) -> Result<()> {
         let _authorization = self.socket_authorization_write();
         let Some(space) = self.store().source(&row.space)? else {
             return Err(EngineError::invalid(format!(
-                "`{}` is not a space this node indexes",
+                "`{}` is not a filesystem source",
                 row.space
             )));
         };
@@ -194,7 +194,7 @@ impl Node {
     ///
     /// The next scan republishes the path as an ordinary file, because the kind
     /// comes from the declaration and there is no longer one.
-    pub fn socket_rm(&self, space: &str, path: &str) -> Result<bool> {
+    pub fn socket_undeclare(&self, space: &str, path: &str) -> Result<bool> {
         let _authorization = self.socket_authorization_write();
         let out = self.store().remove_socket(space, path)?;
         if out {
@@ -969,9 +969,9 @@ fn evaluate_put_condition(
 ///
 /// A re-composition of what the control-service `Put` handler does, gate for
 /// gate: bytes stream into an [`Adoption`](crate::Adoption) beside the target
-/// — or the daemon's scratch, for a API source — and a commit is the
+/// — or the daemon's scratch, for an API source — and a commit is the
 /// adoption's rename plus the ordinary publish path (`scan_publish_push` for
-/// a path-backed space, `commit_api_file` plus a flush for a detached
+/// a filesystem source, `commit_api_file` plus a flush for an API-source
 /// one). Dropping it uncommitted drops the adoption, whose own `Drop` removes
 /// the staging file.
 struct TreeWriter {
@@ -1045,12 +1045,12 @@ impl SocketWriter for TreeWriter {
         let _guard = node.tree_write_lock().lock().await;
         let check = self.node.clone();
         let (space, path, modes) = (self.space.clone(), self.path.clone(), self.modes);
-        let (condition, detached) = crate::blocking::offload(move || {
+        let (condition, api_source) = crate::blocking::offload(move || {
             check.ensure_publishable()?;
-            let detached = check.is_api_source(&space)?;
+            let api_source = check.is_api_source(&space)?;
             Ok((
                 evaluate_put_condition(&check, &space, &path, modes, expected),
-                detached,
+                api_source,
             ))
         })
         .await
@@ -1063,7 +1063,7 @@ impl SocketWriter for TreeWriter {
         // From here down the staging is consumed: should any step below
         // fail, a retry must not quietly re-stage zero bytes.
         self.staging_lost = true;
-        let (root, size) = if detached {
+        let (root, size) = if api_source {
             let scratch = crate::blocking::offload(move || adoption.commit())
                 .await
                 .map_err(write_refusal)?;
@@ -1211,7 +1211,7 @@ pub(crate) fn default_limits() -> Limits {
 /// site: async-ebpf exists on Linux, macOS and OpenBSD on x86-64 and arm64 and
 /// nowhere else, and the engine has to build everywhere. What a node without
 /// it loses is serving — declaring, publishing, replicating and materializing
-/// socket entries all work, and so does `synch connect`, because the
+/// socket entries all work, and so does `synch socket connect`, because the
 /// connecting side executes nothing.
 #[cfg(all(
     any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
@@ -1646,7 +1646,7 @@ impl Node {
     ///
     /// With it, the declaration follows the file: the new root is armed with
     /// whatever the new program declares. That is correct for a path you are
-    /// the only writer of and wrong for any path an S3 key, a fill or a take
+    /// the only writer of and wrong for any path a read-write S3 key or adoption
     /// can reach, which is why `synch doctor` lists every `--auto` socket.
     pub(crate) fn follow_socket_content(&self, space: &str, path: &str, root: &Hash) -> Result<()> {
         let Some(state) = self.store().socket(space, path)? else {
@@ -1749,7 +1749,7 @@ impl Node {
     ///
     /// One QUIC connection per call rather than a reused session: a socket
     /// stream's lifetime is the caller's, and sharing a connection between two
-    /// unrelated `synch connect` invocations would let one close the other's.
+    /// unrelated `synch socket connect` invocations would let one close the other's.
     pub async fn connect_socket(
         &self,
         origin: &OriginId,

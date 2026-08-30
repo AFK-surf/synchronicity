@@ -133,7 +133,7 @@ impl Client {
         Ok(self.inner.open_socket(requests).await?.into_inner())
     }
 
-    /// Opens a streamed write into one of this node's own spaces (§7.1, §9.4).
+    /// Opens a streamed write into one of this node's sources (§7.1, §9.4).
     ///
     /// Returns once the daemon has taken its gates — publishability, a
     /// resolvable target — so a refusal arrives here, before a byte of the

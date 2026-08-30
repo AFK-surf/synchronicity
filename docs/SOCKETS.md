@@ -110,7 +110,7 @@ keeping `m:space/<id>` an exact key rather than a prefix, and it is decisive.
 
 The kind of an entry is what *this* origin says about *its own* copy — like
 `unix_mode`, and unlike content. It comes from a local declaration (`synch
-socket add`, §3), never from a peer. So:
+socket declare`, §3), never from a peer. So:
 
 - `synch adopt path nas:code/git.sock` fetches the ELF bytes and writes them into the
   local space. The next scan publishes them as `EntryKind::File`, because this
@@ -139,14 +139,14 @@ here and never a dispatch one.
 ## 3. Arming: how code gets into a node's own tree
 
 "Only its own tree" is a strong rule, but a node's own tree is not a closed
-system. Several existing commands write bytes into a space directory that the
+system. Several existing commands write bytes into a filesystem-source directory that the
 scanner then publishes as this node's own view. Enumerating them is the whole
 threat model:
 
 - your editor, which is the intended path;
 - `synch adopt path`, which adopts a peer's bytes;
 - `synch adopt tree --replace`, which does the same in bulk;
-- an S3 gateway `PUT`, which writes into a space directory over the network.
+- an S3 gateway `PUT`, which writes into a filesystem-source directory over the network.
 
 Every one of these is an existing, sanctioned way to change what this node
 publishes. So publication is not, and must not be, the gate. Two locally-held
@@ -163,7 +163,7 @@ gates stand between a published socket entry and an invocation:
 
 `synch socket declare --auto` follows the file: it re-arms on every content change
 and skips the second gate forever. It is correct for a path you are the only
-writer of and wrong for any path an S3 key, a fill or a take can reach. `synch
+writer of and wrong for any path a read-write S3 key or adoption can reach. `synch
 socket ls` marks every `--auto` socket, because that list is the honest answer
 to "what can execute here?", and `synch socket declare` says what `--auto` costs at
 the moment it is asked for.

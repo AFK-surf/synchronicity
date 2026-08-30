@@ -1,9 +1,9 @@
 /* whoami — what the node knows about the caller, and where it learned it.
  *
  *   synch socket build examples/whoami.c -o whoami.o
- *   synch socket add ops/whoami.sock
+ *   synch socket declare ops/whoami.sock
  *   synch socket arm ops/whoami.sock
- *   synch connect nas:ops/whoami.sock --meta tag=laptop
+ *   synch socket connect nas:ops/whoami.sock --meta tag=laptop
  *
  * Useful as it stands — it is the fastest way to find out whether a delegation
  * is doing what you think — and it is here to make one distinction concrete.

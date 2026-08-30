@@ -624,7 +624,7 @@ pub fn doctor(node: &Node) -> Lines {
         report.trie.nodes, report.trie.values, report.blobs.0, report.blobs.1
     ));
 
-    // Replication belongs in the examination rather than only in `space ls`,
+    // Replication belongs in the examination rather than only in `replica ls`,
     // because the two lines that matter here are ones nobody thinks to look
     // for: content no provider will serve, and releases that have stopped
     // running. Both mean a replica is not doing what it was asked to.

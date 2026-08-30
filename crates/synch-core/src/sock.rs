@@ -98,7 +98,7 @@ pub enum RefuseCode {
 }
 
 impl RefuseCode {
-    /// A short, stable machine-readable name, for logs and `synch connect`.
+    /// A short, stable machine-readable name, for logs and `synch socket connect`.
     pub fn as_str(self) -> &'static str {
         match self {
             RefuseCode::NoSuchPath => "no-such-path",
@@ -153,7 +153,7 @@ pub enum SockStatus {
 }
 
 impl SockStatus {
-    /// The process exit code `synch connect` reports for this status.
+    /// The process exit code `synch socket connect` reports for this status.
     ///
     /// A clean return is the program's own value, truncated to a byte the way
     /// every other exit status is. Everything else is a distinct code above the

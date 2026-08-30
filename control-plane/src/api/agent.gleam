@@ -220,7 +220,7 @@ pub type Answer {
   Replicating(spaces: List(ReplicaSpace))
 }
 
-/// One replicated space, as the node reports it (`docs/REPLICATION.md` §8).
+/// One replica, as the node reports it (`docs/REPLICATION.md` §8).
 ///
 /// The counts are the node's own and are carried through unfolded. `wanted`
 /// includes `unreachable`, because that is what the node means by it: objects
@@ -234,7 +234,7 @@ pub type Answer {
 pub type ReplicaSpace {
   ReplicaSpace(
     space: String,
-    /// `tree` or `archive`.
+    /// `current` or `forever`.
     policy: String,
     grace_secs: Int,
     /// The ceiling on held bytes, or 0 for none.

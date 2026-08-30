@@ -354,7 +354,7 @@ fn wire_case(seed: u64) {
                 "seed {seed}: node {i} holds a head for {origin} it cannot serve"
             );
             // The derived view agrees with the head — what the unified tree,
-            // mirrors and the gateway read (one key per head, so seq is leaf count).
+            // checkouts and the gateway read (one key per head, so seq is leaf count).
             assert_eq!(
                 holder
                     .store

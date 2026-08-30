@@ -120,7 +120,7 @@ pub fn join_root(left: &Cv, right: &Cv) -> Hash {
 /// Hashes everything a reader yields, in bounded pieces.
 ///
 /// The whole-slice [`Hash::new`] is fine for a record; this is for content — a
-/// mirror asking whether a multi-gigabyte object on disk matches the tree
+/// checkout asking whether a multi-gigabyte object on disk matches the tree
 /// (§7.2) must never answer by reading one into memory.
 pub fn hash_reader(mut reader: impl std::io::Read) -> std::io::Result<Hash> {
     let mut hasher = blake3::Hasher::new();

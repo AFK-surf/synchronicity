@@ -175,7 +175,7 @@ pub enum PinHolder {
     Operator,
     /// A source's current published tree promises these bytes.
     Source(String),
-    /// A replicated space holds this for as long as its policy says.
+    /// A replica holds this for as long as its policy says.
     Replica(String),
     /// A spelling this build does not know, kept verbatim.
     ///
@@ -841,7 +841,7 @@ impl Store {
     /// Folds newly verified groups into an object's row, atomically (§10).
     ///
     /// Two writers of one root is the ordinary case rather than an exotic one:
-    /// a mirror pass, a `synch cat` and the gateway's range read all resolve to
+    /// checkout reconciliation, a `synch cat` and the gateway's range read all resolve to
     /// the same content, and a promotion commits a whole span in a single step.
     /// Reading the bitmap, unioning, and writing it back as three separate
     /// statements loses one of two interleaved writers' progress every time —
@@ -1111,7 +1111,7 @@ impl Store {
                 // is the point: a root no entry names is still re-fetchable
                 // from any provider that has it, and `blob_providers` survives
                 // independently of `entries`. Dropping such a claim silently
-                // would lose exactly the objects an `archive` replica is bought
+                // would lose exactly the objects a `forever` replica is bought
                 // to keep, since nothing else names a superseded version.
                 tx.execute(
                     "INSERT INTO content_want (root, holder, size, prev, first_wanted)
@@ -1408,8 +1408,8 @@ impl Store {
         Ok(dropped > 0)
     }
 
-    /// Drops every claim one holder has, for `space rm --release` and
-    /// `--no-replicate --release`. Returns how many went.
+    /// Drops every claim one holder has, including a replica removal that
+    /// releases its durable holds. Returns how many went.
     pub fn unpin_all(&self, holder: &PinHolder) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM pins WHERE holder = ?1",

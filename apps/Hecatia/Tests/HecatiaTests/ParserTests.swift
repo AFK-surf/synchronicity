@@ -371,11 +371,11 @@ struct ParserTests {
     #expect(merged.versions[0].attestors == ["nas", "laptop"])
   }
 
-  // MARK: - cloud status
+  // MARK: - control-plane status
 
   @Test func cloudStatusReadsTheProgressChannelToo() {
     let output = RunOutput(frames: [
-      .line("cloud: enabled"),
+      .line("control-plane: enabled"),
       // The only status in this family whose empty state is a progress frame
       // rather than a line. Reading only `lines` loses it entirely.
       .progress("(no attach attempts yet)"),
@@ -387,7 +387,7 @@ struct ParserTests {
 
   @Test func cloudEndpointErrorIsSeparated() {
     let output = RunOutput(frames: [
-      .line("cloud: enabled"),
+      .line("control-plane: enabled"),
       .line("cluster.example.com              detached   https://cp.example  last error: connection refused"),
     ])
     let state = Listings.cloud(output)

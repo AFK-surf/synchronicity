@@ -302,7 +302,7 @@ synch adopt tree media --replace                           # replace local files
 `synch replica sync` is the other half of the same wish and a different thing:
 replication holds the *bytes* of every version in the store and materializes
 nothing, while adoption writes *files*, one selected version per path, into a
-source. On a replicated space the two compose: retained objects need no network
+source. When the same namespace is also a replica, the two compose: retained objects need no network
 read during adoption.
 
 Tree adoption scans, publishes, and pushes successful changes before returning.
@@ -332,8 +332,8 @@ synch pin ls
 synch pin rm media/talks/keynote.mp4
 ```
 
-Hold a whole space instead of naming objects one at a time. A replicated space
-is one this node keeps every version of — every origin's version of every path,
+Hold a whole namespace instead of naming objects one at a time. A replica keeps
+every version — every origin's version of every path,
 not the one a policy selects — fetched as it appears and held for as long as
 its retention says. A replica may optionally materialize one newest checkout.
 

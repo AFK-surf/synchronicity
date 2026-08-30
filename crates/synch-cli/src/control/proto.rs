@@ -47,7 +47,7 @@ pub use pb::{
 /// opaque token that also binds the authorization revision and init result.
 ///
 /// v4 adds `ListSpaces` for the MCP bridge (`crate::mcp`), which needs the
-/// space list as data rather than as the line `space ls` prints. A call
+/// space list as data rather than as the line `source ls` or `replica ls` prints. A call
 /// addition, so it takes a bump for the reason above. It also changes what
 /// `List` means by `limit` — entries rather than paths scanned — which is a
 /// change to an existing request and takes one on its own.

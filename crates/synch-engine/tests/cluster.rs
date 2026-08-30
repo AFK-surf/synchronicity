@@ -114,7 +114,7 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detached_take_promotes_to_cloud_before_publishing_its_own_reference() {
+async fn api_source_adoption_promotes_to_cloud_before_publishing_its_own_reference() {
     let _blocking = synch_core::BlockingScope::enter();
     let source = spawn("source").await;
     let adopter = spawn_with("adopter", |config| {
@@ -196,7 +196,7 @@ async fn three_nodes_converge_and_fetch_verified_content() {
     let vps = spawn("vps").await;
     introduce(&[&nas, &laptop, &vps]);
 
-    // The NAS indexes a space with a mix of small and large files.
+    // The NAS publishes a filesystem source with a mix of small and large files.
     let keynote = big_payload(200_000);
     nas.node
         .add_filesystem_source("media", nas.space.path())
@@ -662,7 +662,7 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
         .unwrap()
         .expect("our copy was here");
     // The path is reported under the *stored* space root, canonicalized at
-    // `space add` time — on macOS `/var/…` is a symlink to `/private/var/…`,
+    // `source add` time — on macOS `/var/…` is a symlink to `/private/var/…`,
     // so the raw tempdir path would not compare equal.
     let canonical_space = laptop.space.path().canonicalize().unwrap();
     assert_eq!(removed, canonical_space.join("notes.txt"));

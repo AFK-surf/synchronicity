@@ -4,7 +4,7 @@
 //! The daemon holds the one endpoint, the one database writer, and the one
 //! lifecycle. It serves the control socket concurrently with the engine's
 //! standing work — the anti-entropy scheduler, the scanner, the filesystem
-//! watcher, the batching publisher, the mirror loop, and the maintenance/GC
+//! watcher, the batching publisher, checkout reconciliation, and the maintenance/GC
 //! pass.
 
 use std::{
@@ -438,7 +438,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     }
 
     // A restored SQLite replica may trail an acknowledged publish whose bytes
-    // already reached the cloud CAS. Peers retain the signed head; recover it
+    // already reached the cloud CAS. PeerLs retain the signed head; recover it
     // before scanner or publisher tasks can mint a competing successor.
     match node.readopt_self_on_startup().await {
         Ok(true) => tracing::info!("re-adopted a newer own-origin head from a peer"),
@@ -479,7 +479,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let checkouts = spawn_loop("checkouts", &node, &stop_tx, |node, shutdown| async move {
         node.run_checkouts(shutdown).await
     });
-    // The standing replication loop: reconciles what the replicated spaces
+    // The standing replication loop: reconciles what the replicas
     // should hold against what they do, and fetches the difference
     // (`docs/REPLICATION.md` §3.4). A node replicating nothing sweeps an empty
     // list and sleeps.

@@ -1,6 +1,6 @@
 [package]
 name = "synch-engine"
-description = "The embeddable synchronicity node: scanner, publisher, anti-entropy, fetcher, mirrors"
+description = "The embeddable synchronicity node: sources, publisher, anti-entropy, fetcher, replicas, checkouts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

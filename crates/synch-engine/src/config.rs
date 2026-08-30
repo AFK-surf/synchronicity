@@ -54,7 +54,7 @@ pub struct NodeConfig {
     /// How many providers a single range fetch is split across (§6.4).
     pub fetch_fanout: usize,
     /// The backstop interval between replication sweeps (`docs/REPLICATION.md`
-    /// §5, default 300 s with ±50 % jitter). Like the mirror interval, passes
+    /// §5, default 300 s with ±50 % jitter). Like the checkout interval, passes
     /// normally run because the unified tree changed and rang the bell.
     pub replica_interval: Duration,
     /// How many other origins must advertise a complete copy before a replica

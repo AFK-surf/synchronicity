@@ -59,7 +59,7 @@ struct SettingsSection<Content: View>: View {
 #Preview("Spaces") {
   SettingsSection(
     "Shared Spaces",
-    footer: "Spaces this Mac indexes and publishes. The name is shared across every device."
+    footer: "Filesystem and API sources this Mac publishes. The space name is shared across every device."
   ) {
     VStack(alignment: .leading, spacing: Theme.Space.xs) {
       DetailRow(label: "Spaces", value: "notes, archive, photos")
@@ -97,7 +97,7 @@ struct SettingsSection<Content: View>: View {
   // on it: `Theme.measure` caps the line length, never the number of lines.
   SettingsSection(
     "Shared Spaces",
-    footer: "Spaces this Mac indexes and publishes. The name is shared across every device."
+    footer: "Filesystem and API sources this Mac publishes. The space name is shared across every device."
   ) {
     DetailRow(label: "Spaces", value: "notes")
   }

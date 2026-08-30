@@ -2,23 +2,25 @@
 name: synch
 description: >-
   Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon,
-  index local directories as spaces, join a control-plane-managed membership
-  zone, delegate space-restricted access, read the unified tree, resolve
-  divergent paths, build and serve Synchronicity sockets, mirror, fill, pin,
-  rotate keys, and recover a lost origin — and drive the control plane's own
-  HTTP API with an org-scoped API key or a network-scoped join key, to enroll
-  devices, manage networks and keys, and browse a cluster's files without a
-  browser. Use whenever a task involves `synch`, `synch-s3`, a Synchronicity
-  socket, a synchronicity cluster, a node's data directory, or the
-  control-plane API.
+  publish filesystem or API sources, retain replicas, materialize replica
+  checkouts, join a control-plane-managed membership zone, delegate
+  space-restricted access, read the unified tree, adopt selected content,
+  build and serve Synchronicity sockets, pin, rotate keys, and recover a lost
+  origin — and drive the control plane's own HTTP API with an org-scoped API
+  key or a network-scoped join key, to enroll devices, manage networks and
+  keys, and browse a cluster's files without a browser. Use whenever a task
+  involves `synch`, `synch-s3`, a Synchronicity socket, a synchronicity
+  cluster, a node's data directory, or the control-plane API.
 ---
 
 # synch
 
 `synch` is one binary that is both a node daemon and the client that talks to
-it. A node publishes **its own view** of the files it indexes, signed; peers
-replicate each other's views; what you read is the **union** of everybody's
-views, with the conflicts left visible instead of resolved behind your back.
+it. A source publishes **its own view**, signed; trusted peers exchange those
+views as metadata; what you read is the **union** of everybody's views, with
+the conflicts left visible instead of resolved behind your back. Content is
+fetched by a read, retained by an explicit replica or pin, or held because
+this node publishes it. Merely seeing a peer's tree does not copy its bytes.
 
 This guide assumes the cluster's membership zone is **managed by a
 synchronicity control plane**: devices are enrolled on the network's page in
@@ -42,8 +44,17 @@ Two rules explain most of the surface:
    ```
 
 2. **Nobody writes anybody else's view.** A publish always says "*this* origin
-   asserts this content for this path". Adopting a peer's bytes is an explicit
-   `synch take`, and it publishes *your* assertion of them.
+   asserts this content for this path". Adopting selected peer content is an
+   explicit `synch adopt path` or `synch adopt tree`, and publishes *your*
+   assertion after a filesystem-source scan.
+
+3. **Published live content is durable locally.** A node cannot publish a file
+   or socket from its own source unless its CAS holds the complete object. The
+   source owns a durable hold for every live root it publishes. If a read
+   proves such a payload missing or corrupt, the node withdraws its false
+   availability claim and automatically fetches and verifies another copy
+   from an advertising peer. This repair is reactive; there is no periodic
+   full-byte scrub.
 
 ## Getting a binary
 
@@ -95,8 +106,8 @@ install.
 ```sh
 synch init --domain cluster.acme.example.com  # the zone the network's page names
 synch daemon start                      # background; returns when the socket is ready
-synch space add media /srv/media        # index a local directory
-synch scan                              # hash it and publish a signed root
+synch source add media /srv/media       # publish a local directory
+synch source scan media                 # hash it and publish a signed root
 synch ls media                          # read it back
 synch id                                # who this node is, and where it listens
 ```
@@ -120,7 +131,8 @@ this node itself, and the only one a join key can make. Until it is done,
 the daemon exposes only its reduced control service and waits: the zone does
 not name this key yet, so the node has no name to publish under.
 
-`scan` reports what it did and what it published:
+`source scan` reports what it did and what it published. With no space it
+scans every filesystem source:
 
 ```
 scanned media: hashed 2 · unchanged 0 · deleted 0
@@ -136,9 +148,10 @@ filesystem watcher. Run it when you want the publish *now*.
 An **origin** is one publisher, named by the zone:
 `nas@cluster.acme.example.com` — the device's label, at its network's zone.
 An origin the zone does not name — a delegate is the common case — appears
-as its device key, `key:qmpmjtrw…`. A **space** is an id mapped to a local
-directory on the node that indexes it; the same space id on several nodes is
-the same part of the tree.
+as its device key, `key:qmpmjtrw…`. A **space** is a namespace in the shared
+tree. A node may publish it as a source, retain it as a replica, do both, or do
+neither. A filesystem source maps the namespace to a local directory; an API
+source has no directory.
 
 Almost every read takes a **reference**:
 
@@ -150,11 +163,9 @@ Almost every read takes a **reference**:
 | `nas@cluster.acme.example.com:media/notes.txt` | that origin's version, pinned |
 | `key:qmpmjtrw…:media` | the same, for a key-identified origin |
 
-`synch take` is the one command that *requires* the origin-prefixed form:
-
-```
-synch: take needs an explicit <origin>:<space>/<path>
-```
+An origin prefix is a shorthand for `--select origin=<origin-id>`. Commands
+that accept a selection also accept `--select newest` (the default) and
+`--select strict`.
 
 ## Reading
 
@@ -167,8 +178,8 @@ synch status media                   # every path in the space, versions and all
 synch status                         # everything this node can see
 synch cat media/notes.txt
 synch cat media/talks/keynote.mp4 --range 0..1048576
-synch cat media/notes.txt --from nas@cluster.acme.example.com
-synch cat media/notes.txt --strict   # refuse a divergent path, list its versions
+synch cat media/notes.txt --select origin=nas@cluster.acme.example.com
+synch cat media/notes.txt --select strict # refuse divergence, list versions
 synch get media/notes.txt -o notes.txt
 synch log media/notes.txt            # per-origin publish history
 synch compare media --to nas@cluster.acme.example.com          # name-status diff, no bytes fetched
@@ -202,8 +213,8 @@ an explicit policy:
 
 - **`newest`** (the default) — greatest `(mtime, content root, origin)`. It is
   a total order over data every node has, so every node picks the same one.
-- **`origin=<id>`** — that origin's version. `--from <origin>` and the
-  `<origin>:` prefix are the same thing at the command line.
+- **`origin=<id>`** — that origin's version. An `<origin>:` prefix is the same
+  selection at the command line.
 - **`strict`** — refuse and list, exit 1:
 
   ```
@@ -220,11 +231,13 @@ deliberately.
 
 ```sh
 synch status media/notes.txt                       # see the versions
-synch take nas@cluster.acme.example.com:media/notes.txt # adopt one as ours
+synch adopt path media/notes.txt \
+  --select origin=nas@cluster.acme.example.com     # adopt one as ours
 ```
 
-`take` writes the bytes into the local space directory and publishes your own
-assertion of them, which is what collapses the count:
+`adopt path` requires a filesystem source for the space. It writes the bytes
+into that source and publishes your own assertion before answering, which is
+what collapses the count:
 
 ```
 adopted into /srv/media/notes.txt
@@ -245,8 +258,9 @@ media/notes.txt  2 version(s)  ⑂2
     b3222554c775e5f0   file               13  seq 4      key:zqgii4mspx
 ```
 
-`synch take <origin>:media/notes.txt` on that tombstone removes the local copy
-and publishes your own. Once every publisher has, the path leaves the tree.
+`synch adopt path media/notes.txt --select origin=<origin-id>` on that
+tombstone removes the local copy and publishes your own. Once every publisher
+has, the path leaves the tree.
 
 ## Synchronicity sockets
 
@@ -258,7 +272,7 @@ verified peer identity, never code. This is the rule to keep in mind:
 > A node executes only eBPF that is present in its own published tree.
 
 That makes the two sides deliberately asymmetric. `synch socket ...` builds,
-declares, approves and operates programs belonging to this node. `synch
+declares, approves and operates programs belonging to this node. `synch socket
 connect ...` is only a byte pump to a socket belonging to a named origin and
 needs no eBPF runtime on the caller.
 
@@ -268,8 +282,8 @@ The normal path from C source to a runnable socket is:
 
 ```sh
 synch socket build git.c -o code/git.sock       # C to eBPF; no daemon needed
-synch socket add code/git.sock                  # declare this local path a socket
-synch scan                                      # publish it as kind=Socket
+synch socket declare code/git.sock              # declare the local path
+synch source scan code                          # publish it as kind=Socket
 synch socket arm code/git.sock                  # inspect root and declarations
 synch socket arm code/git.sock --review <token> # approve exactly that inspection
 synch socket ls -l                              # verify armed root and policy
@@ -282,11 +296,11 @@ compatible `clang` and `llc` executables from `PATH` at `-O2`, and `-D
 NAME[=VALUE]` supplies compile-time definitions. Windows builds need this
 `--clang` route to build, but can connect normally.
 
-The object must already be below a directory registered with `synch space
-add`. Declaration and arming are separate local gates:
+The object must already be below a filesystem source registered with `synch
+source add`. Declaration and arming are separate local gates:
 
-- `synch socket add <space>/<path>` makes the next scan publish the entry as a
-  socket. Add `--config k=v` for values read through `sy_config_get`,
+- `synch socket declare <space>/<path>` makes the next source scan publish the
+  entry as a socket. Add `--config k=v` for values read through `sy_config_get`,
   `--max-streams N` for a local concurrency ceiling, or `--note TEXT` for an
   operator note.
 - The first `socket arm` runs the object's `synchronicity.init` hook and prints
@@ -298,10 +312,10 @@ add`. Declaration and arming are separate local gates:
   leaves the new root published but not runnable until it is reviewed and
   armed. In-flight invocations keep the root they started with.
 
-`synch socket add --auto` deliberately skips that fresh review by re-arming on
-every content change. Use it only when the path has a single trusted writer.
-It is unsafe for a path an S3 key, `synch fill`, or `synch take` can write,
-because each can replace bytes that this node then publishes as its own.
+`synch socket declare --auto` deliberately skips that fresh review by re-arming
+on every content change. Use it only when the path has a single trusted
+writer. It is unsafe for a path a read-write S3 key or adoption can write,
+because either can replace bytes that this node then publishes as its own.
 
 Serving sockets requires Linux, macOS or OpenBSD on x86-64 or arm64, where the
 async-ebpf runtime is available. Connecting works on every platform supported
@@ -313,11 +327,11 @@ Connections always require an origin-qualified reference; there is no
 `newest`, `strict`, or other version-selection policy for execution:
 
 ```sh
-synch connect nas@cluster.acme.example.com:code/git.sock
-synch connect nas@cluster.acme.example.com:code/git.sock --meta repo=docs
-synch connect nas@cluster.acme.example.com:code/git.sock \
+synch socket connect nas@cluster.acme.example.com:code/git.sock
+synch socket connect nas@cluster.acme.example.com:code/git.sock --meta repo=docs
+synch socket connect nas@cluster.acme.example.com:code/git.sock \
   --listen 127.0.0.1:9418
-synch connect nas@cluster.acme.example.com:code/git.sock \
+synch socket connect nas@cluster.acme.example.com:code/git.sock \
   --listen 127.0.0.1:9418 --once
 ```
 
@@ -334,11 +348,12 @@ and requires its current root to be armed. Publication alone is never execute
 permission. A program's undeclared outbound connections are also denied even
 after it is armed. Reading the tree needs no declaration and is not denied.
 
-Adopting a peer's socket with `synch take`, `fill`, a mirror or S3 copies its
-bytes as an ordinary file. Socket-ness is a local assertion created only by
-`synch socket add`, and executability is a separate local approval. If one
-origin publishes a socket and another publishes a regular file with identical
-bytes, they are divergent versions rather than one unanimous version.
+Adopting a peer's socket, materializing it in a replica checkout, or writing it
+through S3 copies its bytes as an ordinary file. Socket-ness is a local
+assertion created only by `synch socket declare`, and executability is a
+separate local approval. If one origin publishes a socket and another
+publishes a regular file with identical bytes, they are divergent versions
+rather than one unanimous version.
 
 ### Operate and troubleshoot sockets
 
@@ -348,7 +363,7 @@ synch socket ps [<space>/<path>]    # live invocations, ids, peers and counters
 synch socket log <space>/<path>     # recent sy_log output
 synch socket kill <invocation>      # end one invocation
 synch socket disarm <space>/<path>  # keep publishing it; refuse new runs
-synch socket rm <space>/<path>      # undeclare; next scan publishes a file
+synch socket undeclare <space>/<path> # next source scan publishes a file
 ```
 
 The common refusals say which gate failed: `NoSuchPath` means that origin does
@@ -358,7 +373,7 @@ member or delegate, `SpaceNotDelegated` that the socket falls outside the
 caller's grant, `Busy` that its concurrency cap is full, and `ProgramInvalid`
 that the object could not load or link. Repeated program faults automatically
 disarm that socket; inspect `socket log` and `socket ls -l`, fix or rebuild the
-object, scan it, and review and arm the new root.
+object, source-scan it, and review and arm the new root.
 
 ## Membership
 
@@ -461,52 +476,79 @@ published at seq 8 — every reachable peer within one push
 
 ## Materializing and keeping bytes
 
-A **mirror** continuously writes one space into a directory under a policy of
-its own. It is named by the directory it writes into.
+A node has independent **source**, **replica**, and **checkout** roles. With no
+replica, peer metadata is still exchanged and foreground reads fetch on
+demand, but peer content is only cache data and may be collected.
+
+A source publishes this node's assertions:
 
 ```sh
-synch mirror add media /mnt/media                              # newest
-synch mirror add media /mnt/nas --policy origin=nas@cluster.acme.example.com
-synch mirror add media /mnt/safe --policy strict               # skip divergent paths
-synch mirror ls
-synch mirror sync                                              # bring all up to date now
-synch mirror rm /mnt/safe
+synch source add media /srv/media    # watched filesystem publisher
+synch source add uploads --api       # writes arrive through typed APIs
+synch source ls [media]
+synch source scan [media]            # filesystem sources only
+synch source rm media                # unpublish this origin's entries
 ```
 
-```
-/mnt/media  written 0 · current 2 · retouched 0 · removed 0 · skipped 0
-```
+A filesystem source is the only role adoption can write into. An API source
+has no directory or scanner; it is for APIs such as a read-write S3 bucket.
+Removing a source publishes removals before deleting the role. It does not
+remove a replica of the same namespace.
 
-A **fill** is the one-shot form, and it writes into the space's *own* directory
-— the one `synch space add` named, which this node indexes and publishes from.
-So it only ever adds: a missing path is written, a path whose bytes already
-match is left alone, a path whose bytes differ is reported rather than
-overwritten, and nothing is ever removed. `--force` replaces the ones that
-differ and names each of them.
+A replica durably acquires every visible origin's content for one space and
+publishes no entries of its own:
 
 ```sh
-synch fill media                                               # newest
-synch fill media/talks                                         # one directory of it
-synch fill media --from nas@cluster.acme.example.com           # that origin's versions
-synch fill media --strict                                      # report divergent paths
-synch fill media --dry-run                                     # decide, write nothing
-synch fill media --force                                       # replace what differs
+synch replica add media                         # current roots
+synch replica add archive --retention forever  # every root observed while active
+synch replica add media --grace 30d --budget 8796093022208
+synch replica set media --checkout /srv/media-view
+synch replica ls [media]
+synch replica sync [media]
+synch replica rm media
+synch replica rm media --pin-held
 ```
 
-```
-filled 3 · current 41 · differing 1 · skipped 0
-differing media/notes.txt (local content differs; --force replaces it)
-the next scan publishes what was filled as this node's own view
+`current` releases roots that leave the current tree after the grace period.
+`forever` retains every root observed while the replica is active. A budget is
+an admission ceiling: it stops new acquisitions and never evicts held data.
+Removing a replica releases its holds; `--pin-held` converts them to explicit
+operator pins first.
+
+A replica may own one optional checkout. It materializes the unified `newest`
+view only; it does not publish a local tree and does not fetch independently of
+the replica. Acquisition first establishes the durable hold, then checkout
+reconciliation writes content already held. Moving or disabling a checkout
+leaves its existing files in place:
+
+```sh
+synch replica add media --checkout /srv/media-view
+synch replica set media --checkout /srv/new-view
+synch replica set media --no-checkout
 ```
 
-A fill does not publish: the files land where the scanner will find them, and
-they carry the mtime and mode the origin published, so the next scan republishes
-the version that was filled rather than a newer one.
+Adoption writes selected content into a filesystem source. One path publishes
+before the command answers. Tree adoption is additive by default, never
+removes files, and is published by the next source scan; `--replace` permits
+replacement of differing files.
 
-A node in key-loss recovery refuses to fill — a scan would refuse there too, so
-everything filled would sit unannounced. Run `synch recover` first, then fill,
-then scan. `synch take` refuses there for the same reason, before it touches
-the file rather than after.
+```sh
+synch adopt path media/notes.txt --select origin=nas@cluster.acme.example.com
+synch adopt tree media                              # newest
+synch adopt tree media/talks --select strict
+synch adopt tree media --select origin=nas@cluster.acme.example.com
+synch adopt tree media --dry-run
+synch adopt tree media --replace
+synch source scan media
+```
+
+A node in key-loss recovery refuses adoption because it cannot safely publish
+the result. Run `synch recover` first.
+
+Durable source and replica holds are repair intent. If a local read or cloud
+backend response proves a held payload missing or invalid, the node withdraws
+the false complete claim, queues a repair, fetches and verifies the object from
+an advertising peer, and restores the hold. Cache-only content is not healed.
 
 A **pin** keeps content regardless of retention. It names an object root, or a
 path — in which case the reading policy supplies the root. Pinning content this
@@ -514,10 +556,10 @@ node has never read fetches it first.
 
 ```sh
 synch pin add media/talks/keynote.mp4
-synch pin add nas@cluster.acme.example.com:media/notes.txt
+synch pin add media/notes.txt --select origin=nas@cluster.acme.example.com
 synch pin add 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 synch pin ls
-synch pin rm media/talks/keynote.mp4     # or the hex root
+synch pin rm media/talks/keynote.mp4     # or use the hex root
 ```
 
 `pin ls` names the root, the size, and the path that currently selects it —
@@ -532,18 +574,19 @@ synch daemon run                # owns the node: control socket + every standing
 synch daemon start              # launch it in the background; wait for the socket
 synch daemon status             # one screen
 synch daemon stop               # ask it to shut down (Ctrl-C does the same)
-synch peers                     # live peers, addresses, last sync, rtt
-synch sync                      # one anti-entropy exchange with every dialable peer, now
+synch peer ls                   # live peers, addresses, last exchange, lag
+synch peer sync                 # one metadata exchange with every dialable peer, now
 synch doctor                    # the full examination
-synch doctor --rebuild          # rebuild derived views from the authoritative trie
+synch repair rebuild-views      # rebuild derived views from the authoritative trie
 ```
 
 `daemon start` runs the same daemon in the background, appends its stdout and
 stderr to `<data-dir>/daemon.log`, and exits once the control socket accepts a
 connection. Use `daemon run` when a service manager should own the foreground
 process. `daemon run` prints where it is and what socket it bound, then keeps the
-anti-entropy scheduler, scanner, watcher, publisher, mirror loop, DNS refresh,
-maintenance/GC and the control-plane tunnel running:
+anti-entropy scheduler, source scanners and watchers, publisher, replica and
+checkout reconciliation, DNS refresh, maintenance/GC and the control-plane
+tunnel running:
 
 ```
 origin key:qmpmjtrw… on qmpmjtrw… via 127.0.0.1:47001
@@ -557,8 +600,8 @@ membership binding, the read scope, each origin's head and whether it is
 servable, unreconciled pre-recovery history, origins held without a live
 binding, equivocation, and storage counts.
 
-`sync` names each peer and what the exchange moved, including the ones it could
-not reach:
+`peer sync` names each peer and what the exchange moved, including the ones it
+could not reach:
 
 ```
 key:9qs54nyt… (fbadbd0811)  unreachable: endpoint: No addressing information available
@@ -641,15 +684,15 @@ by construction, and whether anything is browsable is decided by the org admin
 on the far end.
 
 ```sh
-synch cloud status      # per domain: record found, attached, last error
-synch cloud disable     # the only local act: opt out
-synch cloud enable      # undo it
+synch control-plane status  # per domain: record found, attached, last error
+synch control-plane disable # the only local act: opt out
+synch control-plane enable  # undo it
 ```
 
 With no domain configured it says so rather than pretending:
 
 ```
-cloud attach enabled: serving the control plane's requests for (no local spaces)
+control-plane tunnel enabled: serving requests for (no local sources or replicas)
 note: no membership domains are configured, so there is no zone to discover a
 control plane from; `synch domain set <domain>` first (add `--delegate` if this
 node is not meant to be named by that zone)
@@ -768,8 +811,9 @@ new key (both publish, the old one `retiring`), `synch key activate` on the
 device, then `POST …/<old>/retire`. A second `POST …/keys` while a window is
 open is refused with `rotation_open` rather than opening a second one.
 
-The browse surface is the same read-only tunnel `synch cloud status` reports
-from the node's side, and it stays gated on the org's per-network switch:
+The browse surface is the same read-only tunnel `synch control-plane status`
+reports from the node's side, and it stays gated on the org's per-network
+switch:
 
 | Method | Path | Role | What |
 | --- | --- | --- | --- |
@@ -944,8 +988,9 @@ Notes that bite:
 - The network flags take effect **where the endpoint is bound**, which is
   `synch daemon run` (directly or through `daemon start`). Passing them to a
   client command changes nothing.
-- `--strict` conflicts with `--from` on `cat` and `get` — one refuses to
-  choose, the other chooses.
+- `cat`, `get`, `adopt`, and path-based pins use one `--select` grammar:
+  `newest`, `strict`, or `origin=<origin-id>`. An origin-qualified reference
+  supplies the same origin selection and must not conflict with `--select`.
 
 ## Exit codes and error shapes
 
@@ -957,10 +1002,10 @@ Failures worth recognizing:
 | Message | Means |
 | --- | --- |
 | `no daemon is running for <dir>: nothing is listening on <sock>` | start `synch daemon start`, or use `synch daemon run` under a supervisor |
-| `no space <id>: not a local space, and no origin publishes one` | the space id is wrong, or nothing has published it yet |
+| `no space <id>: not a local source, and no origin publishes one` | the space id is wrong, or nothing has published it yet |
 | `not found: <space>/<path>` | no version of that path in the unified tree |
-| `<path> has N versions and the policy is strict` | divergence, under `--strict`; the versions follow |
-| `take needs an explicit <origin>:<space>/<path>` | `take` never guesses whose version to adopt |
+| `<path> has N versions and the policy is strict` | divergence under `--select strict`; the versions follow |
+| `no filesystem source <id>` | adoption needs a local directory to write |
 | `key-identified origins cannot rotate` | rotation needs a zone-issued name |
 | `<key> is the active key: run `synch key activate <new-key>` first` | retire the predecessor, not the incumbent |
 
@@ -991,22 +1036,27 @@ database and binds no endpoint — so `synch daemon run` must be live on the sam
 data directory for any `synch-s3` command to work.
 
 ```sh
-synch-s3 bucket add media media                             # newest
-synch-s3 bucket add nas-media nas@cluster.acme.example.com:media  # shorthand for an origin pin
-synch-s3 bucket add safe-media media --policy strict
-synch-s3 key add AKIAEXAMPLE <secret>
+synch-s3 bucket add media media --read-only                 # newest
+synch-s3 bucket add nas-media media --read-only \
+  --select origin=nas@cluster.acme.example.com
+synch-s3 bucket add safe-media media --read-only --select strict
+synch-s3 bucket add uploads uploads --read-write            # needs a local source
+synch-s3 access-key add AKIAEXAMPLE                         # prompts for the secret
+synch-s3 access-key add ROBOT --secret-file /run/secrets/synch-s3
+printf '%s' "$S3_SECRET" | synch-s3 access-key add CI --secret-stdin
 synch-s3 serve --listen 127.0.0.1:9000
 synch-s3 serve --anonymous                                   # loopback only
 ```
 
-A bucket is a space plus a version policy. ETags are the selected version's
-BLAKE3 root in hex, quoted. A `strict` bucket answers a divergent key with
-`409 Conflict` naming the versions. `PUT` and `DELETE` publish *this node's*
-view — the same thing writing or removing the file in the space directory does
-— so a bucket pinned to a foreign origin accepts writes but keeps reading that
-origin's versions, and the gateway warns about that shape. Multipart upload is
-supported, which is what makes the gateway writable from Mountpoint for
-Amazon S3.
+A bucket is explicitly read-only or read-write. A read-only bucket may select
+`newest`, `strict`, or one origin; a read-write bucket is fixed to this node's
+own view and requires a local source for its space. It rejects mutations early
+if that role is absent. ETags are the selected version's BLAKE3 root in hex,
+quoted. A strict bucket answers a divergent key with `409 Conflict` naming the
+versions. `PUT` and `DELETE` through a read-write bucket publish this node's
+view. Multipart upload is supported, which is what makes the gateway writable
+from Mountpoint for Amazon S3. Secrets are never positional: read one from the
+terminal prompt, a file, or standard input.
 
 ## Where to look next
 

@@ -101,8 +101,8 @@ struct RemoteAccessPane: View {
       isDestructive: !on,
       perform: {
         node.enqueue {
-          let operation = Operations.require(on ? "cloud.enable" : "cloud.disable")
-          await node.run(operation, on ? Cmd.cloudEnable : Cmd.cloudDisable)
+          let operation = Operations.require(on ? "control-plane.enable" : "control-plane.disable")
+          await node.run(operation, on ? Cmd.controlPlaneEnable : Cmd.controlPlaneDisable)
         }
       }
     )

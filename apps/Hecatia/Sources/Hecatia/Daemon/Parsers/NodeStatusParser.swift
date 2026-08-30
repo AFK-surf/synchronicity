@@ -70,7 +70,7 @@ enum NodeStatusReader {
     return status
   }
 
-  /// `spaces: {n} ({a, b, c}) · mirrors: {m}` — read from inside the
+  /// `sources: {n} · replicas: {m}` — read from inside the
   /// parentheses, which bound the list even when an id contains a space.
   private static func spaceNames(in line: String) -> [String] {
     guard let open = line.firstIndex(of: "("), let close = line.lastIndex(of: ")"), open < close

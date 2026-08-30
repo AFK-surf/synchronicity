@@ -12,7 +12,7 @@ final class SidebarCell: NSTableCellView {
   private let title = NSTextField(labelWithString: "")
   private let subtitle = NSTextField(labelWithString: "")
 
-  /// A second line under the name, for a mirror's space and read policy.
+  /// A second line under the name, for a replica's retention and checkout.
   var detail: String? {
     didSet {
       subtitle.stringValue = detail ?? ""
@@ -50,7 +50,7 @@ final class SidebarCell: NSTableCellView {
     imageView = symbol
 
     // The title is centred on the row when it is alone and rides above the
-    // detail line when there is one, so a folder row and a mirror row share a
+    // detail line when there is one, so a source row and a replica row share a
     // baseline instead of the folder sitting high.
     titleCentre = title.centerYAnchor.constraint(equalTo: centerYAnchor)
     titleTop = title.topAnchor.constraint(equalTo: topAnchor, constant: Theme.Space.tiny)
@@ -153,13 +153,13 @@ private struct SidebarCellPreview: NSViewRepresentable {
 }
 
 #Preview("A folder with no local copy") {
-  // A detached space indexes nothing on this Mac, so it is not drawn as a
+  // An API source has no directory on this Mac, so it is not drawn as a
   // folder pointing at a folder that does not exist.
   SidebarCellPreview(text: "media", symbol: "shippingbox", tint: .controlAccentColor)
     .frame(width: 230, height: 24)
 }
 
-#Preview("A mirror, with its policy") {
+#Preview("A replica, with its policy") {
   // The detail line is what moves the title off the row's centre.
   SidebarCellPreview(text: "notes", symbol: "arrow.down.doc", detail: "notes \u{00b7} Newest")
     .frame(width: 230, height: 40)

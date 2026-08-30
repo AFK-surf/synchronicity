@@ -1,6 +1,6 @@
 //! Holding a whole copy of a space (`docs/REPLICATION.md`).
 //!
-//! A replicated space is one this node holds *every* version of — every
+//! A replica is one this node holds *every* version of — every
 //! origin's version of every path, not the one a policy would select — fetched
 //! as it appears and pinned for as long as its policy says. It materializes
 //! nothing onto the filesystem and publishes nothing; the checkout half of a
@@ -111,7 +111,7 @@ impl ViewState {
         matches!(self, ViewState::Complete)
     }
 
-    /// The reason, for `space ls` and `doctor`.
+    /// The reason, for `replica ls` and `doctor`.
     pub fn reason(&self) -> Option<&str> {
         match self {
             ViewState::Complete => None,
@@ -120,7 +120,7 @@ impl ViewState {
     }
 }
 
-/// Everything `space ls <id>` reports about one replicated space.
+/// Everything `replica ls <id>` reports about one replica.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaStatus {
     /// The space.
@@ -258,7 +258,7 @@ impl Node {
         Ok(())
     }
 
-    /// Reconciles every replicated space — or one — against the unified tree.
+    /// Reconciles every replica — or one — against the unified tree.
     ///
     /// Staging is safe from a listing: the worst a spurious want costs is a
     /// fetch of something already held, which the fetch loop resolves in one
@@ -372,7 +372,7 @@ impl Node {
         let limit = self.config().replica_concurrency.max(1);
         // Candidates are drawn per holder and then ranked together. One global
         // queue ordered by age would let a space with a large old backlog
-        // starve every other replicated space outright, and would leave the
+        // starve every other replica outright, and would leave the
         // `(holder, first_wanted)` index unusable — a global `ORDER BY` over a
         // holder-leading index is a scan and a temp sort of the whole queue,
         // on the one write connection, on every pass.
@@ -604,7 +604,7 @@ impl Node {
         .await
     }
 
-    /// What `space ls <id>` reports.
+    /// What `replica ls <id>` reports.
     pub fn replica_status(&self, id: &str) -> Result<ReplicaStatus> {
         let Some(space) = self.store().replica(id)? else {
             return Err(EngineError::not_found(format!("no replica {id}")));
@@ -618,7 +618,7 @@ impl Node {
             next_release: self.store().next_release(&holder)?,
             view: self.view_state()?,
             // Only meaningful where the policy releases at all. Under
-            // `archive` nothing is ever let go, so "too few peers advertise
+            // Under `forever` nothing is ever let go, so "too few peers advertise
             // these to let them go" would imply a release that peers could
             // unblock — and none is waiting on them.
             held_back: match space.retention.releases() {
@@ -771,7 +771,7 @@ impl Node {
         }
     }
 
-    /// Every origin's claim on a space, for `space ls <id>`.
+    /// Every origin's claim on a space, for `replica ls <id>`.
     pub(crate) fn replica_claims_on(
         &self,
         space: &str,

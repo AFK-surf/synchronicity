@@ -2,9 +2,9 @@
  *
  *   synch socket build examples/ssh-shell.c -o ssh-shell.o
  *   cp ssh-shell.o ~/synchronicity/code/ssh.sock
- *   synch socket add code/ssh.sock
+ *   synch socket declare code/ssh.sock
  *   synch socket arm code/ssh.sock       # shows the exact /bin/bash declaration
- *   ssh -o 'ProxyCommand=synch connect %h:code/ssh.sock' nas
+ *   ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
  *
  * The SSH adapter turns the inbound stream into a control fd and channel fds;
  * the process declaration is what lets this program put a PTY-backed bash

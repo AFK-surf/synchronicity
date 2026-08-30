@@ -7,12 +7,6 @@ acceptance rule, or binding checks — those are implemented exactly as specifie
 
 Sections refer to `DESIGN.md`.
 
-> **Role-refactor note.** Sections that discuss the former combined `space`
-> row, mirror policies, or `--from` record the pre-refactor implementation and
-> are retained only as design history. The current source/replica/checkout and
-> uniform `--select` contract is in [ROLE-CLI-REFACTOR.md](ROLE-CLI-REFACTOR.md)
-> and [REPLICATION.md](REPLICATION.md).
-
 ## Deferred, with the module boundary in place
 
 ### §7.1 — ignore rules
@@ -107,7 +101,7 @@ assertions. Three things that phrase does not pin down:
   of the order for every path forever. The clamp is applied by the comparator
   from a clock the caller passes in and is never stored: the row a node
   materializes is the trie leaf verbatim, so two nodes holding one trie hold one
-  `entries`, and `doctor --rebuild` reproduces what the original materialization
+  `entries`, and `repair rebuild-views` reproduces what the original materialization
   produced.
 
 The order is otherwise computed over `entries` alone: mtime, content root, and
@@ -127,30 +121,19 @@ origin's view and has nothing to mark.
 indented line per version — content root, kind, size, seq, attestors — newest
 first, which is the order selection runs in.
 
-### §8, §9.2 — an origin-pinned reference and `--from` are the same thing
+### §8, §9.2 — selection has one grammar
 
-§7.2 gives `cat`/`get` both an `<origin>:` prefix and a `--from <origin>` flag.
-They express the same policy, so naming both is a contradiction rather than a
-preference and is refused with a message saying so. `--strict` on an
-origin-pinned reference is refused too: a pin already names one version, so
-strict has nothing to refuse. `--from` and `--strict` together are refused by
-the argument parser before a connection is made.
+Commands that select one version accept `--select newest`, `--select strict`,
+or `--select origin=<id>`. An origin-qualified reference supplies that same
+origin selection. Combining it with a conflicting `--select` value is refused
+before a connection is made.
 
-### §7.2 — when a path leaves a mirror
+### §7.2 — when a path leaves a checkout
 
-§7.2 says a mirror keeps a directory in sync with the policy-selected version
-of every path. The removal side has two halves, and only one of them is
-visible in a listing:
-
-- **The selected version is a tombstone.** The mirror follows the assertion it
-  selected, so the file goes. Under `newest` a deletion newer than the content
-  removes it; under `origin=<id>` only that origin's deletion does.
-- **The path has left the unified tree.** When every entry for a path is gone —
-  every publisher's tombstone expired (§4.2), or an operator ran `synch doctor
-  --rebuild` against a trie that no longer carries it — there is nothing left
-  to select, and nothing in the listing to notice. So each pass ends by walking
-  the mirror directory and removing files whose path the tree no longer carries
-  at all. Directories are left in place.
+A replica checkout follows the unified `newest` view. When the view no longer
+contains a live entry for a path, reconciliation removes the checkout file.
+Each pass also walks the checkout and removes files whose paths have left the
+tree entirely. Directories are left in place.
 
   Untrusting an origin is *not* one of those cases. Removal cuts a node off
   from future participation — connections refused, new heads ignored — and
@@ -160,18 +143,13 @@ visible in a listing:
   lists the origin under "origins held without a live binding", with how many
   entries it still carries.
 
-Two related choices: an `origin=` pin that selects nothing (that origin
-publishes no version of the path) removes the file too, since the path is not
-in the pinned view; and a path a `strict` mirror skipped is left exactly as it
-is — skipping is a refusal to act, not a decision to delete.
+### §7.2 — the metadata a checkout file carries
 
-### §7.2 — the metadata a mirrored file carries
-
-A mirrored file is the published file, which is more than its bytes: it carries
+A checkout file represents the selected published file, which is more than its bytes: it carries
 the mtime its origin observed and the permission bits of the advisory
-`unix_mode` §4.2 records. Without that a mirror is a directory of `0644` files
+`unix_mode` §4.2 records. Without that a checkout is a directory of `0644` files
 all modified the moment the copy ran — every executable stripped of its `+x`,
-every incremental `rsync` out of the mirror copying everything, every
+every incremental `rsync` out of the checkout copying everything, every
 "newest first" listing sorted by fetch order.
 
 Four choices worth naming:
@@ -181,15 +159,15 @@ Four choices worth naming:
   dropped it on the way in, so no reader could see it. Schema step 8 adds the
   column; rows materialized before it read as "no mode published", which means
   *leave the file's mode alone* rather than *reset it*, and refresh as their
-  origins republish or all at once under `synch doctor --rebuild`.
+  origins republish or all at once under `synch repair rebuild-views`.
 - **Only the permission bits.** setuid, setgid and the sticky bit are masked
-  off. A mirror writes bytes a peer chose under a name that peer chose, and the
+  off. A checkout writes bytes a peer chose under a name that peer chose, and the
   daemon may be running as root; reproducing a setuid bit would turn "publish a
   file" into "plant a setuid binary in someone else's tree". §4.2 already calls
   the mode advisory, so declining the three bits that grant authority costs
   nothing materialization promised.
 - **Times before mode, with owner-write borrowed.** Setting a file's times
-  needs a writable descriptor. Applying the mode first would leave a mirror
+  needs a writable descriptor. Applying the mode first would leave a checkout
   unable to re-stamp exactly the files whose mode it had got right — `0444` is
   an ordinary mode for published media — so the stamp goes on first, with the
   write bit lent for the duration and put back either way.
@@ -204,8 +182,8 @@ Four choices worth naming:
 Symlinks are the exception: a link's own timestamps cannot be set without
 `utimensat(AT_SYMLINK_NOFOLLOW)`, which `std` does not expose, and following
 the link to stamp it would stamp whatever it points at — possibly outside the
-mirror, which is what the escape guard exists to prevent. A link's target is
-its version (§8), and that is what the mirror reproduces.
+checkout, which is what the escape guard exists to prevent. A link's target is
+its version (§8), and that is what the checkout reproduces.
 
 ### §7.1 — reconciling `local_files` on open
 
@@ -333,7 +311,7 @@ two versions that share `None` there; without the extra component the order
 would break their tie on the *origin*, which §8 reserves for choosing which
 attestor is named, never which version wins.
 
-Mirrors materialize a symlink as a real symbolic link on unix. Windows has
+Checkouts materialize a symlink as a real symbolic link on unix. Windows has
 symlinks but creating one needs Developer Mode or
 `SeCreateSymbolicLinkPrivilege`, which a background daemon can neither assume
 nor usefully acquire, so there the path is **skipped and reported** — the same
@@ -432,22 +410,20 @@ out of their own bindings table.
 
 ### §8 — adopting a deletion
 
-`synch adopt path` of a tombstone version removes the local copy and lets the *next
-scan* publish our own tombstone — the same path a deletion made with `rm`
-takes, rather than a second way of minting one. `take` already flushes before
-it answers (§7.1), so the tombstone is published by the time the command
-returns and the seq it prints is real.
+`synch adopt path` of a tombstone version removes the local copy and publishes
+our own tombstone through the same source-scan path as a local deletion. The
+command flushes before it answers (§7.1), so the seq it prints is real.
 
 Three details:
 
-- **Nothing here is an error.** Taking a deletion of a path we never had
+- **Nothing here is an error.** Adopting a deletion of a path we never had
   reports that it is already absent: the assertion being adopted is "this is
-  gone", and it already is. The command still runs a scan, and says plainly
+  gone", and it already is. The command still runs a source scan, and says plainly
   when there was nothing for it to publish.
 - **The space guard is the same one content adoption takes.** A path outside a
-  configured space is refused, because outside one nothing would publish the
+  configured filesystem source is refused, because outside one nothing would publish the
   adoption and the removal would be a filesystem side effect with no assertion
-  behind it. A directory is refused too — `take` adopts a path's version, and a
+  behind it. A directory is refused too — `adopt path` adopts one version, and a
   directory is not one.
 - **A symlink is removed as the link it is**, not followed to what it points
   at.
@@ -509,11 +485,11 @@ names the way out: a rotatable name comes from a membership zone, so
 
 ### §7.1 — spaces added while the daemon runs
 
-The watcher registers every configured space root with `notify` and
-re-registers on every debounced pass, plus immediately when `space add` or
-`space rm` rings its bell. A watcher whose set was fixed at startup would leave
-a newly added space covered only by the hourly rescan, and would keep waking
-for a directory nobody indexes any more. Failing to watch a root stays
+The watcher registers every filesystem-source root with `notify` and
+re-registers on every debounced pass, plus immediately when `source add` or
+`source rm` rings its bell. A watcher whose set was fixed at startup would leave
+a newly added source covered only by the hourly rescan, and would keep waking
+for a directory nobody publishes any more. Failing to watch a root stays
 non-fatal, exactly as at startup: the periodic scan is the guarantee, and the
 watcher is a latency optimization.
 
@@ -581,12 +557,12 @@ The chain to date:
 | 0 | empty | 1 | the original schema, as it first shipped |
 | 1 | 1 | 2 | `observed_heads`, for key-loss recovery (§3.4) |
 | 2 | 2 | 3 | drop the dead `want` table |
-| 3 | 3 | 4 | reshape `mirrors` for the unified tree (§7.2) |
+| 3 | 3 | 4 | reshape filesystem-projection configuration (§7.2) |
 | 4 | 4 | 5 | reshape the `synch-s3` bucket map (§9.4) |
 | 5 | 5 | 6 | `entries.symlink_target`, for §8 version identity |
 | 6 | 6 | 7 | `observed_heads.claimed_by`, for §3.4 attribution |
 | 7 | 7 | 8 | move the gateway's config rows under the `s3.` namespace (§9.4) |
-| 8 | 8 | 9 | `entries.unix_mode`, so a mirror can reproduce it (§7.2) |
+| 8 | 8 | 9 | `entries.unix_mode`, so a checkout can reproduce it (§7.2) |
 
 Steps 0–2 reproduce the history that shipped before the chain existed: a
 database stamped 1, 2, or 3 by an older build lands on exactly the version the

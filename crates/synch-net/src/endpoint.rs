@@ -25,7 +25,7 @@ use crate::{
 ///
 /// Generous enough for hole-punching and a relay fallback; bounded so a dead
 /// address costs seconds, not the 30–60 s QUIC would spend retrying, which a
-/// stale binding would otherwise charge to `sync`, `take` and every head push,
+/// stale binding would otherwise charge to peer exchange, adoption and every head push,
 /// silently.
 pub(crate) const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -147,7 +147,7 @@ pub struct NetOptions {
     /// limiting and the resolving belong to whoever is listening.
     pub on_unknown_key: Option<Arc<tokio::sync::Notify>>,
     /// Notified when a head flips to complete (§5.2): the unified tree just
-    /// changed, and anything materializing it — mirrors — should look again.
+    /// changed, and any checkout materializing it should look again.
     /// The endpoint only rings the bell.
     pub heads: Option<Arc<dyn crate::HeadSink>>,
 }
@@ -277,8 +277,8 @@ pub struct Net {
     /// A QUIC session is not a request: opening one costs a handshake, a
     /// hole-punch or a relay round trip, and — until it idles out on both
     /// sides — a slot in each endpoint's connection table. Dialing per request
-    /// made a mirror pass or a large fetch open one session *per file*, which
-    /// is what turned `mirror sync` over a big tree into thousands of
+    /// made checkout reconciliation or a large fetch open one session *per file*, which
+    /// is what turned checkout reconciliation over a big tree into thousands of
     /// handshakes: the provider filled with paths idling out, and the fetching
     /// endpoint drowned in its own churn. Streams are what a request costs
     /// here; the session is held open and shared.
@@ -496,7 +496,7 @@ impl Net {
     ///
     /// Not session-reusing, unlike the other two. A socket connection carries
     /// long-lived streams whose lifetime is the caller's business, and handing
-    /// two unrelated `synch connect` invocations the same QUIC connection would
+    /// two unrelated `synch socket connect` invocations the same QUIC connection would
     /// make one of them able to close the other's.
     pub async fn connect_sock(
         &self,

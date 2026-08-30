@@ -138,9 +138,6 @@ message Command {
   // 9 was `trust rebind`: a hand-made name is the only thing it could
   // re-point, and there are none (DESIGN.md 3.2).
   reserved 9, 17 to 19, 24, 27 to 30, 36, 44 to 46;
-  reserved "space_add", "space_ls", "space_rm", "space_set", "space_sync",
-           "mirror_add", "mirror_rm", "mirror_ls", "mirror_sync", "scan",
-           "take", "fill";
   oneof kind {
     // `synch id`
     Id id = 1;
@@ -170,8 +167,8 @@ message Command {
     DomainLs domain_ls = 14;
     // `synch domain refresh`
     DomainRefresh domain_refresh = 15;
-    // `synch peers`
-    Peers peers = 16;
+    // `synch peer ls`
+    PeerLs peer_ls = 16;
     // `synch ls [<origin>:]<space>[/<dir>]`
     Ls ls = 20;
     // `synch status [<space>[/<path>]]`
@@ -194,28 +191,28 @@ message Command {
     Recover recover = 34;
     // `synch doctor`
     Doctor doctor = 35;
-    // `synch sync`
-    SyncNow sync_now = 37;
-    // `synch cloud enable`
-    CloudEnable cloud_enable = 38;
-    // `synch cloud disable`
-    CloudDisable cloud_disable = 39;
-    // `synch cloud status`
-    CloudStatus cloud_status = 40;
+    // `synch peer sync`
+    PeerSync peer_sync = 37;
+    // `synch control-plane enable`
+    ControlPlaneEnable control_plane_enable = 38;
+    // `synch control-plane disable`
+    ControlPlaneDisable control_plane_disable = 39;
+    // `synch control-plane status`
+    ControlPlaneStatus control_plane_status = 40;
     // `synch delegate add <key> --space <id> [--until <dur>] [--note <text>]`
     DelegateAdd delegate_add = 41;
     // `synch delegate rm <key>`
     DelegateRm delegate_rm = 42;
     // `synch delegate ls`
     DelegateLs delegate_ls = 43;
-    // `synch socket add <space>/<path> ...`
-    SocketAdd socket_add = 47;
+    // `synch socket declare <space>/<path> ...`
+    SocketDeclare socket_declare = 47;
     // `synch socket arm <space>/<path>`
     SocketArm socket_arm = 48;
     // `synch socket disarm <space>/<path>`
     SocketDisarm socket_disarm = 49;
-    // `synch socket rm <space>/<path>`
-    SocketRm socket_rm = 50;
+    // `synch socket undeclare <space>/<path>`
+    SocketUndeclare socket_undeclare = 50;
     // `synch socket ls [<space>]`
     SocketLs socket_ls = 51;
     // `synch socket sdk`
@@ -248,7 +245,7 @@ message Frame {
     string line = 1;
     // A piece of a byte payload (`cat`, `get`).
     bytes chunk = 2;
-    // A progress report the CLI renders and discards (`scan`, `mirror sync`).
+    // A progress report the CLI renders and discards (`source scan`, `replica sync`).
     string progress = 3;
   }
 }
@@ -339,7 +336,7 @@ message DomainLs {}
 
 message DomainRefresh {}
 
-message Peers {}
+message PeerLs {}
 
 message SourceAdd {
   string space = 1;
@@ -480,21 +477,21 @@ message Recover {
 message Doctor { reserved 1; }
 message RepairRebuildViews {}
 
-// Reopens the tunnel after `cloud disable`.
+// Reopens the tunnel after `control-plane disable`.
 //
 // The tunnel is on by default — no command is needed to open it — and serves
 // whatever the control plane requests, for every space this node holds. There
 // is no space list to state: which spaces a dashboard may browse is the
 // control plane's decision, made by the org admin's browsing toggle and the
 // RBAC around it.
-message CloudEnable {}
+message ControlPlaneEnable {}
 
 // Stops answering the control plane and drops any open tunnel.
-message CloudDisable {}
+message ControlPlaneDisable {}
 
 // Per membership domain: whether a record was found, whether the tunnel is
 // attached, and the last error if there was one.
-message CloudStatus {}
+message ControlPlaneStatus {}
 
 // One push-pull exchange with every dialable peer, now.
 //
@@ -502,7 +499,7 @@ message CloudStatus {}
 // this is the operator saying "I am watching, do one now" — after a publish
 // they want a peer to see, or in a script that would otherwise poll `status`
 // until the interval elapses.
-message SyncNow {}
+message PeerSync {}
 
 // ---- the structured surface (§9.4) ------------------------------------------
 
@@ -844,7 +841,7 @@ message PartInfo {
 
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
-message SocketAdd {
+message SocketDeclare {
   // `<space>/<path>`.
   string target = 1;
   // `k=v` pairs the program reads through `sy_config_get`.
@@ -853,7 +850,7 @@ message SocketAdd {
   // A concurrency cap; zero means the daemon's default.
   uint32 max_streams = 5;
   // Re-arm on every content change. Correct for a path you are the only
-  // writer of, wrong for any path an S3 key, a fill or a take can reach.
+  // writer of, wrong for any path an S3 key or adoption can reach.
   bool auto = 6;
   // A free-form operator note.
   string note = 7;
@@ -869,7 +866,7 @@ message SocketDisarm {
   string target = 1;
 }
 
-message SocketRm {
+message SocketUndeclare {
   string target = 1;
 }
 

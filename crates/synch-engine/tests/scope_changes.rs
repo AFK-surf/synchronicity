@@ -187,7 +187,7 @@ async fn rounds(syncer: &Syncer, client: &synch_net::MptClient, label: &str, rou
 /// space that was just opened up has not changed. The delegate fetches the new
 /// root under the wider scope, so the record *is* in its trie — but the
 /// promotion diff prunes at the shared node hash, and `entries` never learns
-/// about it. Nothing reports a problem. `doctor --rebuild` is the only repair.
+/// about it. Nothing reports a problem. `repair rebuild-views` is the repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_widened_delegation_materializes_the_space_it_just_gained() {
     let _blocking = synch_core::BlockingScope::enter();
@@ -242,10 +242,10 @@ async fn a_widened_delegation_materializes_the_space_it_just_gained() {
         .unwrap();
     assert!(in_trie.is_some(), "the record reached the trie");
 
-    // ...but the derived view — what the unified tree, mirrors and the S3
+    // ...but the derived view — what the unified tree, checkouts and the S3
     // gateway read — is short, and nothing says so. Read before the repair
     // below, which is what makes this a materialization bug and not a fetch
-    // one: `doctor --rebuild` puts the record in `entries`, and nothing in the
+    // one: `repair rebuild-views` puts the record in `entries`, and nothing in the
     // protocol ever runs it.
     let (photos, finance) = (
         delegate.entries(&issuer.origin, "photos"),
@@ -274,7 +274,7 @@ async fn a_widened_delegation_materializes_the_space_it_just_gained() {
 /// pruning over it, and the *old* root has no node there — it was never
 /// fetched under the narrow scope. `MptError::MissingNode` is classified as an
 /// origin fault, so the head is retired and put in the refusal memo, and the
-/// origin is left behind on every round from then on. `doctor --rebuild`
+/// origin is left behind on every round from then on. `repair rebuild-views`
 /// cannot repair it either: the trie under the stuck complete head is itself
 /// short of the new scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -315,7 +315,7 @@ async fn a_widened_delegation_with_a_changed_space_still_promotes() {
             .rematerialize(&issuer.origin, h.root)
             .map(|n| n.to_string())
             .unwrap_or_else(|e| format!("ERROR {e}"));
-        println!("doctor --rebuild at the stuck head: {repair}");
+        println!("repair rebuild-views at the stuck head: {repair}");
     }
     assert_eq!(head.map(|h| h.seq), Some(2), "the head must promote");
     assert_eq!(

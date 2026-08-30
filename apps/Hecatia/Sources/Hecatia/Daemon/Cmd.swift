@@ -91,7 +91,7 @@ enum Cmd {
   }
   static var domainClear: Command { make { $0.domainClear = .init() } }
   static var domainRefresh: Command { make { $0.domainRefresh = .init() } }
-  static var peers: Command { make { $0.peers = .init() } }
+  static var peerList: Command { make { $0.peerLs = .init() } }
 
   // Sources
   static func sourceAdd(id: String, path: String?, api: Bool = false) -> Command {
@@ -157,8 +157,8 @@ enum Cmd {
   //
   // `Control.Read` answers a `<space>/<path>` at whatever version the policy
   // selects, which is the current one. It has no root field, so a superseded
-  // version — the one you want back after a bad `take`, and everything an
-  // `archive` replica is holding — cannot be asked for through it at all.
+  // version — the one you want back after an unwanted adoption, and everything a
+  // `forever` replica is holding — cannot be asked for through it at all.
   // These two can. Both stream the bytes back as `Frame.chunk`, so both need
   // `ControlClient.runCollectingChunks`.
 
@@ -217,7 +217,7 @@ enum Cmd {
   }
 
   // Upkeep
-  static var syncNow: Command { make { $0.syncNow = .init() } }
+  static var peerSync: Command { make { $0.peerSync = .init() } }
   static func recover(wait: String?, gap: UInt64?) -> Command {
     make {
       $0.recover = .with {
@@ -230,9 +230,9 @@ enum Cmd {
   static var rebuildViews: Command { make { $0.repairRebuildViews = .init() } }
 
   // Remote access
-  static var cloudStatus: Command { make { $0.cloudStatus = .init() } }
-  static var cloudEnable: Command { make { $0.cloudEnable = .init() } }
-  static var cloudDisable: Command { make { $0.cloudDisable = .init() } }
+  static var controlPlaneStatus: Command { make { $0.controlPlaneStatus = .init() } }
+  static var controlPlaneEnable: Command { make { $0.controlPlaneEnable = .init() } }
+  static var controlPlaneDisable: Command { make { $0.controlPlaneDisable = .init() } }
 
   /// `[<origin>:]<space>/<path>` — the daemon's reference grammar. The origin
   /// goes before the first colon, and a colon after the first `/` is part of

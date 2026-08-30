@@ -1281,7 +1281,7 @@ async fn delete_object_removes_the_file_and_tombstones_the_key() {
         "204 carries no body"
     );
 
-    // Gone from the space directory, the listing, and a reader.
+    // Gone from the filesystem-source directory, the listing, and a reader.
     assert!(!harness.space_path.join("notes.txt").exists());
     let response = http
         .get(harness.url("/my-media/notes.txt"))

@@ -367,7 +367,7 @@ pub enum Command {
         /// A byte range, as `START..END`, `START..`, or `..END`.
         #[arg(long)]
         range: Option<String>,
-        /// Version selection: newest, strict, or origin=<origin-id>.
+        /// Version selection: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
         /// Read an object by its content root, with no path involved — what
@@ -385,7 +385,7 @@ pub enum Command {
         /// itself when `--root` names the object.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Version selection: newest, strict, or origin=<origin-id>.
+        /// Version selection: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
         /// Fetch an object by its content root, with no path involved.
@@ -457,9 +457,9 @@ pub enum Command {
     /// The read-only tunnel to the control plane the zone names, on by
     /// default.
     ControlPlane {
-        /// The cloud subcommand.
+        /// The control-plane subcommand.
         #[command(subcommand)]
-        command: CloudCommand,
+        command: ControlPlaneCommand,
     },
     /// Inspect or migrate the node's content-addressed storage backend.
     Cas {
@@ -524,7 +524,7 @@ pub enum CasCommand {
 /// attach is read from the same DNSSEC-validated zone that names the
 /// membership.
 #[derive(Debug, Subcommand)]
-pub enum CloudCommand {
+pub enum ControlPlaneCommand {
     /// Reopen the tunnel after `control-plane disable`. It is on by default, so this
     /// is only ever an undo.
     Enable,
@@ -560,7 +560,7 @@ pub enum AdoptCommand {
     Path {
         /// `[<origin>:]<space>/<path>`.
         reference: String,
-        /// Version selection: newest, strict, or origin=<origin-id>.
+        /// Version selection: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
     },
@@ -568,7 +568,7 @@ pub enum AdoptCommand {
     Tree {
         /// `[<origin>:]<space>[/<dir>]`.
         reference: String,
-        /// Version selection: newest, strict, or origin=<origin-id>.
+        /// Version selection: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
         /// Replace differing files. Adoption is additive by default.
@@ -897,7 +897,7 @@ pub enum SocketCommand {
     /// is no libc.
     ///
     /// This does not publish anything. The object it writes becomes a socket
-    /// when it is in a space and `synch socket add` and `synch socket arm`
+    /// when it is in a source and `synch socket declare` and `synch socket arm`
     /// have been run over it.
     Build {
         /// The C source to compile.
@@ -928,7 +928,7 @@ pub enum PinCommand {
         /// A hex object root, or `<space>/<path>` — whose selected version's
         /// content root is the one pinned (§8).
         target: String,
-        /// Version selection for a path: newest, strict, or origin=<origin-id>.
+        /// Version selection for a path: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
     },
@@ -936,7 +936,7 @@ pub enum PinCommand {
     Rm {
         /// A hex object root, or `<space>/<path>`.
         target: String,
-        /// Version selection for a path: newest, strict, or origin=<origin-id>.
+        /// Version selection for a path: newest, strict, or `origin=<origin-id>`.
         #[arg(long, value_name = "POLICY")]
         select: Option<String>,
     },
@@ -1092,8 +1092,8 @@ mod tests {
         );
 
         // --offline refuses every network flag rather than quietly ignoring
-        // it, the DHT sub-knobs need --dht, cat/get refuse --from with
-        // --strict, and cloud enable takes no --space.
+        // it, the DHT sub-knobs need --dht, and control-plane enable takes no
+        // --space.
         for args in [
             "synch daemon run --offline --dht",
             "synch daemon run --offline --dht-bootstrap boot.example:6881",
@@ -1102,9 +1102,7 @@ mod tests {
             "synch daemon run --offline --discovery https://d.example.com",
             "synch daemon run --dht-bootstrap boot.example:6881",
             "synch daemon run --dht-publish-addrs",
-            "synch cat media/a.txt --from nas@x --strict",
-            "synch get media/a.txt --from nas@x --strict",
-            "synch cloud enable --space media",
+            "synch control-plane enable --space media",
         ] {
             assert!(
                 Cli::try_parse_from(args.split_whitespace()).is_err(),

@@ -11,7 +11,7 @@
  *
  * Call it with the filename in the connection metadata:
  *
- *   synch connect nas:code/drop.sock --meta name=report.pdf < report.pdf
+ *   synch socket connect nas:code/drop.sock --meta name=report.pdf < report.pdf
  */
 
 #include <synch.h>

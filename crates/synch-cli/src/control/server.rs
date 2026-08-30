@@ -718,7 +718,7 @@ impl Control for ControlService {
     /// Receives a streamed write and publishes it (§7.1, §9.4).
     ///
     /// The recovery gate is taken before a byte is written, for the reason
-    /// `scan` takes it before hashing: a node that cannot publish would
+    /// `source scan` takes it before hashing: a node that cannot publish would
     /// otherwise accept the upload, write it into the space, and lose it
     /// (§3.4). Taking it before the response opens is what lets the refusal
     /// reach a client that has not started streaming yet.
@@ -1789,7 +1789,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 )
                 .await?;
             }
-            // Peers learn the re-signed head at the next round anyway; pushing
+            // PeerLs learn the re-signed head at the next round anyway; pushing
             // makes the switch visible immediately where reachable.
             if let Err(e) = node.push_head(&activation.head).await {
                 tracing::debug!(error = %e, "could not push the re-signed head");
@@ -2209,7 +2209,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             refresh_domains(node, out, None, true).await?
         }
 
-        Command::Peers(pb::Peers {}) => {
+        Command::PeerLs(pb::PeerLs {}) => {
             let now = now_ns();
             let seen = read(node, |n| Ok(n.store().peers_seen()?)).await?;
             if seen.is_empty() {
@@ -2637,8 +2637,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ));
             }
             // A tombstone is an assertion like any other, and §8 makes it
-            // adoptable the same way: take the deletion, and let the next scan
-            // publish our own.
+            // adoptable the same way: adopt the deletion, then publish our own.
             if theirs.kind == synch_core::EntryKind::Tombstone {
                 let (space, path) = (reference.space.clone(), reference.path.clone());
                 match read(node, move |n| Ok(n.adopt_deletion(&space, &path)?)).await? {
@@ -2654,7 +2653,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     }
                 }
             } else {
-                // Streamed into the space directly out of the CAS: `take` of a
+                // Streamed into the source directly out of the CAS: adoption of a
                 // multi-gigabyte file costs a chunk of memory, not a copy of
                 // the object (§9.4).
                 let path = node
@@ -2662,8 +2661,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     .await?;
                 out.line(format!("adopted into {}", path.display())).await?;
             }
-            // `take` publishes before it answers, for the same reason
-            // `scan` does: the seq it prints has to be a real one (§7.1).
+            // Path adoption publishes before it answers, for the same reason
+            // `source scan` does: the seq it prints has to be a real one (§7.1).
             match node.scan_publish_push().await? {
                 Some(head) => out.line(format!("published seq {}", head.seq)).await?,
                 None => {
@@ -2735,43 +2734,40 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // for: one typo should be reported as the same mistake whichever
             // command met it.
             //
-            // A space nobody publishes and a space nobody indexes fail for
+            // A space nobody publishes and a space with no filesystem source fail for
             // different reasons, and the second is the one adoption is picky
             // about: it writes into the filesystem source directory, so an
-            // unindexed namespace has nowhere to put anything. `fill_space`
+            // unconfigured namespace has nowhere to put anything. `adopt_tree`
             // says so; this is the other half, so a typo'd id does not report
             // "no local space" when the real answer is "no such space at all".
             ensure_known_space(node, &reference.space).await?;
-            // The policy's origin, not the reference's: `--from nsa` and
+            // The policy's origin, not the reference's: `--select origin=nsa` and
             // `nsa:media` are the same typo, and only one of them was being
-            // checked. A fill of an origin nobody has heard of selects nothing
+            // checked. Adoption from an origin nobody has heard of selects nothing
             // for every path, and `Absent` is silent by design — so the typo
-            // reported as a complete, clean fill of nothing.
+            // reported as a complete, clean adoption of nothing.
             if let VersionPolicy::Origin(origin) = &policy {
                 ensure_known_origin(node, origin).await?;
             }
-            let options = synch_engine::FillOptions {
-                force: replace,
-                dry_run,
-            };
+            let options = synch_engine::AdoptTreeOptions { replace, dry_run };
             let report = node
-                .fill_space(&reference.space, &reference.dir_prefix(), &policy, options)
+                .adopt_tree(&reference.space, &reference.dir_prefix(), &policy, options)
                 .await?;
             let mut summary = format!(
                 "{} {} · current {} · differing {} · skipped {}",
                 if report.dry_run {
-                    "would fill"
+                    "would adopt"
                 } else {
-                    "filled"
+                    "adopted"
                 },
-                report.filled,
+                report.adopted,
                 report.current,
                 report.differing.len(),
                 report.skipped.len()
             );
             // Counted apart from `differing` rather than folded into it: under
-            // `--force` nothing can be differing, so a folded count of 3 would
-            // read as three paths `--force` is about to fix, when they are three
+            // `--replace` nothing can be differing, so a folded count of 3 would
+            // read as three paths `--replace` is about to fix, when they are three
             // it deliberately did not touch.
             if !report.appeared.is_empty() {
                 summary.push_str(&format!(" · appeared {}", report.appeared.len()));
@@ -2799,10 +2795,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             // Every per-path line here goes to stdout, unlike the per-path
-            // lines of `scan` and `mirror sync`. Those report how a pass went,
+            // lines of `source scan` and `replica sync`. Those report how a pass went,
             // path by path; these are the paths the operator has to decide
             // about — under `--dry-run` the list *is* the command's answer, and
-            // under `--strict` the skipped paths are the entire reason the
+            // under `--select strict` the skipped paths are the entire reason the
             // command was run. Splitting one decision list across two streams
             // so that `synch adopt tree media --select strict > plan` wrote the count and
             // dropped the paths would be the worst of both.
@@ -2820,18 +2816,18 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             for path in &report.differing {
                 out.line(format!(
-                    "differing {}/{path} (local content differs; --force replaces it)",
+                    "differing {}/{path} (local content differs; --replace replaces it)",
                     reference.space
                 ))
                 .await?;
             }
             // Kept apart from `differing` because the advice is the opposite:
-            // these are paths that are no longer what the fill was shown, so
-            // `--force` — which answers for the file it was pointed at —
+            // these are paths that are no longer what the adoption plan was shown, so
+            // `--replace` — which answers for the file it was pointed at —
             // neither caused this nor resolves it.
             for path in &report.appeared {
                 out.line(format!(
-                    "appeared {}/{path} (not the file this fill was shown; left alone)",
+                    "appeared {}/{path} (not the file this adoption planned; left alone)",
                     reference.space
                 ))
                 .await?;
@@ -2841,15 +2837,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     .await?;
             }
             // Written, but not wholly: kept out of the skipped count so that
-            // `filled` and `skipped` never describe the same path.
+            // `adopted` and `skipped` never describe the same path.
             for (path, reason) in &report.warnings {
-                out.line(format!("filled {}/{path}, but {reason}", reference.space))
+                out.line(format!("adopted {}/{path}, but {reason}", reference.space))
                     .await?;
             }
             // A prefix that names nothing is almost always a typo, and it
             // reports exactly what an already-full directory reports. `status`
             // refuses to let a named path that matches nothing pass as silence;
-            // a fill that writes nothing because of a typo is the same trap.
+            // an adoption that writes nothing because of a typo is the same trap.
             if !reference.is_space_root() && report.considered == 0 {
                 out.line(format!(
                     "note: no path in {} starts with {}",
@@ -2858,7 +2854,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ))
                 .await?;
             }
-            if report.filled > 0 && !report.dry_run {
+            if report.adopted > 0 && !report.dry_run {
                 match node.scan_publish_push().await? {
                     Some(head) => out.line(format!("published seq {}", head.seq)).await?,
                     None => out.line("adopted content was already published").await?,
@@ -2976,7 +2972,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         // ---- sockets (`docs/SOCKETS.md`) ----------------------------------
-        Command::SocketAdd(pb::SocketAdd {
+        Command::SocketDeclare(pb::SocketDeclare {
             target,
             config,
             max_streams,
@@ -3001,7 +2997,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             };
             let node = node.clone();
             let declared = row.clone();
-            read(&node, move |n| Ok(n.socket_add(&declared)?)).await?;
+            read(&node, move |n| Ok(n.socket_declare(&declared)?)).await?;
             out.line(format!("declared {space}/{path}")).await?;
             if !synch_sock::SUPPORTED {
                 out.line(
@@ -3021,7 +3017,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     "warning: --auto re-arms on every content change — tree-write grants \
                      included, so whatever the bytes become may publish under the prefixes \
                      they declare. Correct for a path you are the only writer of; wrong for \
-                     any path an S3 key, a fill or a take can reach."
+                     any path an S3 key or adoption can reach."
                         .to_string(),
                 )
                 .await?;
@@ -3101,11 +3097,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             .await?;
         }
 
-        Command::SocketRm(pb::SocketRm { target }) => {
+        Command::SocketUndeclare(pb::SocketUndeclare { target }) => {
             let (space, path) = split_socket_target(&target)?;
             let node = node.clone();
             let (s, p) = (space.clone(), path.clone());
-            if !read(&node, move |n| Ok(n.socket_rm(&s, &p)?)).await? {
+            if !read(&node, move |n| Ok(n.socket_undeclare(&s, &p)?)).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("{space}/{path} is not a declared socket"),
@@ -3295,7 +3291,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::CloudEnable(pb::CloudEnable {}) => {
+        Command::ControlPlaneEnable(pb::ControlPlaneEnable {}) => {
             // One trip for the write and both reads, like every other handler
             // here: `config` and `spaces` go through `Store::conn`, which
             // aborts the process outright when it is touched from a runtime
@@ -3311,9 +3307,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             })
             .await?;
             out.line(format!(
-                "cloud attach enabled: serving the control plane's requests for {}",
+                "control-plane tunnel enabled: serving requests for {}",
                 if spaces.is_empty() {
-                    "(no local spaces)".to_string()
+                    "(no local sources or replicas)".to_string()
                 } else {
                     spaces
                         .iter()
@@ -3336,19 +3332,19 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             for domain in domains {
                 out.line(format!(
-                    "{domain}: discovering _synchronicity-cp at its apex (`synch cloud status`)"
+                    "{domain}: discovering _synchronicity-cp at its apex (`synch control-plane status`)"
                 ))
                 .await?;
             }
         }
 
-        Command::CloudDisable(pb::CloudDisable {}) => {
+        Command::ControlPlaneDisable(pb::ControlPlaneDisable {}) => {
             read(node, |n| Ok(n.disable_cloud()?)).await?;
-            out.line("cloud attach disabled; any open tunnel is dropped")
+            out.line("control-plane tunnel disabled; any open tunnel is dropped")
                 .await?;
         }
 
-        Command::CloudStatus(pb::CloudStatus {}) => {
+        Command::ControlPlaneStatus(pb::ControlPlaneStatus {}) => {
             // `cloud_status` below is in-memory; only the opt-out flag is a
             // store read, and it is the one that has to go over (§10).
             let settings = read(node, |n| Ok(n.cloud_settings()?)).await?;
@@ -3357,7 +3353,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             } else {
                 "enabled"
             };
-            out.line(format!("cloud: {state}")).await?;
+            out.line(format!("control-plane: {state}")).await?;
             let status = node.cloud_status();
             if status.is_empty() {
                 out.progress("(no attach attempts yet)").await?;
@@ -3385,7 +3381,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::SyncNow(pb::SyncNow {}) => {
+        Command::PeerSync(pb::PeerSync {}) => {
             let peers = read(node, |n| Ok(n.dialable_peers()?)).await?;
             if peers.is_empty() {
                 out.line("no dialable peers: nothing to sync with").await?;
@@ -3583,7 +3579,7 @@ async fn receive(
         target.display().to_string()
     };
 
-    // Path-backed writes enter through the scanner; API-source writes already
+    // Filesystem-source writes enter through the scanner; API-source writes already
     // staged their CAS-direct `f:`/`b:` pair above. `scan_publish_push` skips
     // API sources but flushes the shared batch in either case.
     node.scan_publish_push().await?;
@@ -3943,49 +3939,20 @@ fn parse_reference(text: &str) -> Result<EntryRef, ControlError> {
         .map_err(|e: synch_engine::EngineError| ControlError::from(e))
 }
 
-/// Builds the version policy a read runs under, from the reference and the
-/// flags (§8).
+/// Builds the version policy a read runs under (§8).
 ///
-/// An origin-pinned reference *is* an origin policy, and `--from` is the same
-/// thing spelled as a flag, so naming both is a contradiction rather than a
-/// preference and is refused.
-fn policy_for(
-    reference: &EntryRef,
-    from: Option<&str>,
-    strict: bool,
-) -> Result<VersionPolicy, ControlError> {
-    if let Some(origin) = &reference.origin {
-        if from.is_some() {
-            return Err(ControlError::invalid(
-                "the reference already pins an origin; drop --from or the <origin>: prefix",
-            ));
-        }
-        if strict {
-            return Err(ControlError::invalid(
-                "an origin-pinned reference already names one version; --strict has nothing to refuse",
-            ));
-        }
-        return Ok(VersionPolicy::Origin(origin.clone()));
-    }
-    match (from, strict) {
-        (Some(_), true) => Err(ControlError::invalid(
-            "--from and --strict are two answers to the same question; use one",
-        )),
-        (Some(origin), false) => Ok(VersionPolicy::Origin(parse_origin(origin)?)),
-        (None, true) => Ok(VersionPolicy::Strict),
-        (None, false) => Ok(VersionPolicy::Newest),
-    }
-}
-
+/// An origin-qualified reference is shorthand for the corresponding
+/// `--select origin=<id>`. Supplying the same selection twice is harmless;
+/// supplying two different selections is a contradiction.
 fn policy_for_select(
     reference: &EntryRef,
     select: Option<&str>,
 ) -> Result<VersionPolicy, ControlError> {
-    let (from, strict) = match select.unwrap_or("newest") {
-        "newest" => (None, false),
-        "strict" => (None, true),
+    let requested = match select.unwrap_or("newest") {
+        "newest" => VersionPolicy::Newest,
+        "strict" => VersionPolicy::Strict,
         value if value.starts_with("origin=") && value.len() > "origin=".len() => {
-            (Some(&value["origin=".len()..]), false)
+            VersionPolicy::Origin(parse_origin(&value["origin=".len()..])?)
         }
         value => {
             return Err(ControlError::invalid(format!(
@@ -3993,7 +3960,15 @@ fn policy_for_select(
             )))
         }
     };
-    policy_for(reference, from, strict)
+    let Some(origin) = &reference.origin else {
+        return Ok(requested);
+    };
+    if select.is_none() || requested == VersionPolicy::Origin(origin.clone()) {
+        return Ok(VersionPolicy::Origin(origin.clone()));
+    }
+    Err(ControlError::invalid(format!(
+        "the reference selects {origin}; remove its origin prefix or use --select origin={origin}"
+    )))
 }
 /// How long a delegation lasts when `--until` is not given.
 ///
@@ -4046,7 +4021,7 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
     }
 }
 
-/// Applies the replication half of `space add` and `space set`.
+/// Applies a replica-role configuration update.
 ///
 /// Shared because the two commands mean the same thing by the same flags, and
 /// because the reply is the part worth getting right: an operator turning this

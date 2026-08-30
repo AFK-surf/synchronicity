@@ -6,7 +6,7 @@ import Foundation
 /// The rest of the browser reads a `<space>/<path>` through `Control.Read`.
 /// That request carries no root, so it can only ever answer with the version
 /// the policy selects for a path that still exists. An object no current entry
-/// names — which is most of what an `archive` replica holds — is unreachable
+/// names — which is most of what a `forever` replica holds — is unreachable
 /// through it by construction.
 ///
 /// Both `cat` and `get` take a root and stream the bytes back on the `Run`

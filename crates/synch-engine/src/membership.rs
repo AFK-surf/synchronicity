@@ -1039,7 +1039,7 @@ impl Node {
     }
 
     /// Rebuilds `entries` and `blob_providers` from the authoritative trie
-    /// (`synch doctor --rebuild`, §10).
+    /// (`synch repair rebuild-views`, §10).
     ///
     /// Per origin, and one origin's failure does not stop the others. Each
     /// `rematerialize` is its own transaction, so a failure rolls back and is

@@ -159,7 +159,7 @@ struct DiagnosticsPane: View {
   private var unrecoverable: some View {
     SettingsSection(
       "Operations That Cannot Be Undone",
-      footer: "Rebuilding re-materialises every record of every device from the authoritative trie, and this Mac answers no reads while it runs. Stopping the background service ends sharing, mirrors and remote browsing — this app cannot start it again over the same socket."
+      footer: "Rebuilding re-materialises every record of every device from the authoritative trie, and this Mac answers no reads while it runs. Stopping the background service ends publishing, replication, checkouts, and remote browsing — this app cannot start it again over the same socket."
     ) {
       VStack(alignment: .leading, spacing: Theme.Space.m) {
         HStack(spacing: Theme.Space.s) {
@@ -184,7 +184,7 @@ struct DiagnosticsPane: View {
       verb: "Rebuild",
       gate: .typed,
       typedPhrase: "rebuild",
-      commandLine: "synch doctor --rebuild",
+      commandLine: "synch repair rebuild-views",
       perform: { node.enqueue { await node.runDoctor(rebuild: true) } }
     )
   }
@@ -192,7 +192,7 @@ struct DiagnosticsPane: View {
   private func requestStop() {
     confirmation = ConfirmationRequest(
       title: "Stop the background service?",
-      consequence: "Sharing, mirrors and remote browsing stop immediately. This app loses its connection, and nothing on that socket can start the service again — you will need a terminal.",
+      consequence: "Publishing, replication, checkouts, and remote browsing stop immediately. This app loses its connection, and nothing on that socket can start the service again — you will need a terminal.",
       verb: "Stop",
       gate: .typed,
       typedPhrase: "stop",

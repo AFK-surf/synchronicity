@@ -127,7 +127,7 @@ actor owning the gRPC transport and nothing else. Ordering comes from
 `NodeStore.enqueue`, a serial chain of Tasks, because the daemon takes a
 *global connection mutex* on every store read. `NodeStore`, `FilesModel` and
 `TransferQueue` are `@MainActor @Observable`; streamed frames hop back to the
-main actor and are buffered, flushed at most every 100ms, because `scan` emits a
+main actor and are buffered, flushed at most every 100ms, because source scans emit a
 progress frame per skipped file.
 
 **Success is "the response stream ended without a gRPC status" — never the

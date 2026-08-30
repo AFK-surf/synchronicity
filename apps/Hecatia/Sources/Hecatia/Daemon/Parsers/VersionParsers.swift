@@ -257,7 +257,7 @@ enum Versions {
   ///
   /// The placeholders are refused for the same reason. Where the daemon holds
   /// no name for a key it renders one in parentheses — `(untrusted)` in a
-  /// `peers` row, `(deleted)` for a tombstoned version — and a parenthesis is
+  /// `peer ls` row, `(deleted)` for a tombstoned version — and a parenthesis is
   /// not a character an origin can contain, so the shape is the test.
   static func isActionable(_ origin: String) -> Bool {
     guard !origin.isEmpty, !origin.hasPrefix("(") else { return false }

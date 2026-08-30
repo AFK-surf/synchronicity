@@ -911,7 +911,7 @@ final class FilesModel {
         commandLine: "synch pin add \(previousRoot)", deadline: .long, quiet: true)
     }
     let reference = Cmd.reference(origin: attestor, space: entry.space, path: entry.path)
-    // `take` declares `.listing` among its dirties, so `run` refreshes the
+    // `adopt path` declares `.listing` among its dirties, so `run` refreshes the
     // listing itself and the window reloads from that. Calling `reload()` here
     // as well was a second listing for one click — and the version refresh
     // that followed it looked the new row up in `rows`, which the other reload

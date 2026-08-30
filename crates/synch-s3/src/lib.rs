@@ -690,7 +690,7 @@ async fn list_objects(
         //
         // A socket is content-bearing and so is served like the file it is on
         // disk (`docs/SOCKETS.md` §2.2). Hiding it here would make the gateway
-        // the one surface that disagrees with `synch cat`, a mirror and a fill
+        // the one surface that disagrees with `synch cat`, a checkout and tree adoption
         // about a path that has a root and bytes — and it would hide it from
         // the operator without hiding it from anyone else, since every member
         // already reads those bytes out of the tree.
@@ -840,7 +840,7 @@ async fn put_object(
     check_headers(headers)?;
     bucket.require_writable()?;
     // The body streams over the socket into the daemon's ingest pipeline —
-    // space directory, hash, CAS, stage, publish (§7.1) — and comes back as the
+    // filesystem-source directory, hash, CAS, stage, publish (§7.1) — and comes back as the
     // published entry, so the ETag is the root the daemon computed rather than
     // one this process hashed from a copy it kept.
     let (body, fault) = payload(headers, body)?;

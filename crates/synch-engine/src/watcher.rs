@@ -17,7 +17,7 @@ use crate::{error::Result, node::Node};
 /// Whether an event could have changed what a scan would find.
 ///
 /// Reading is not changing, and the distinction is not a nicety here: a scan
-/// opens and reads every space directory and every file it has to hash, and
+/// opens and reads every filesystem-source directory and every file it has to hash, and
 /// inotify reports those opens, reads, and closes as events in their own
 /// right. Hinting on them makes the watcher chase its own tail — hint,
 /// rescan, read, hint — one full rescan of every space per debounce window,
@@ -168,7 +168,7 @@ impl Node {
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
-                // `space add` / `space rm` ring this so a new root is watched
+                // `source add` / `source rm` ring this so a new root is watched
                 // at once rather than at the next filesystem hint.
                 _ = spaces_changed.notified() => {
                     match spaces(self.clone()).await {
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn spaces_added_and_removed_while_running_are_re_registered() {
-        // A daemon runs for weeks; `space add` lands whenever an operator says
+        // A daemon runs for weeks; `source add` lands whenever an operator says
         // so. A watcher fixed at startup would leave the new root covered only
         // by the hourly rescan (§7.1).
         let (_d, node) = node().await;

@@ -89,7 +89,7 @@ const WRITE_AHEAD: usize = 32;
 /// How long requests already accepted have to finish once the input closes.
 ///
 /// Longer than any tool that answers from the daemon takes, and shorter than
-/// the ceiling on `synch_connect`: a client that closes its end while a socket
+/// the ceiling on `synch_socket_connect`: a client that closes its end while a socket
 /// invocation is still running gets a prompt exit rather than a five-minute
 /// wait for an answer it is no longer reading.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -581,8 +581,8 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 
 /// A request's progress channel, when the client opted into one.
 ///
-/// The daemon already reports what a long command is doing — `scan`, `sync`
-/// and `fill` all emit progress frames the CLI prints to stderr — so the only
+/// The daemon already reports what long source scans, peer exchanges, replica
+/// reconciliation, and tree adoption are doing, so the only
 /// thing missing was somewhere to put them. A client that sends a
 /// `progressToken` gets them; one that does not sends nothing and costs
 /// nothing.
@@ -944,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_that_needs_the_daemon_reports_it_as_something_to_fix() {
         let out = exchange(&[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"synch_peers","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"synch_peer_list","arguments":{}}}"#,
         ])
         .await;
         // A tool execution error, not a protocol error: the model is told what

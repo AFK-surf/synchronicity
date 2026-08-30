@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Devices this node has seen — `peers`.
+/// Devices this node has seen — `peer ls`.
 struct NetworkPane: View {
   @Environment(NodeStore.self) private var node
   @State private var sortOrder: [KeyPathComparator<PeerInfo>] = [
@@ -27,7 +27,7 @@ struct NetworkPane: View {
         } actions: {
           Button("Sync Now") {
             node.enqueue {
-              await node.run(Operations.require("sync"), Cmd.syncNow)
+              await node.run(Operations.require("peer.sync"), Cmd.peerSync)
             }
           }
           Button("Refresh") { Task { await node.refresh([.peers]) } }
