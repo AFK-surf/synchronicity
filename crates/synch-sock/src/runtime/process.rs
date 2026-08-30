@@ -625,19 +625,39 @@ mod tests {
             argv: vec!["sh".into(), "-c".into(), "printf %s \"$HOME\"".into()],
             allowed_signals: 0,
         };
-        let (mut master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        let (master, slave) = open_pty(80, 24, 0, 0).unwrap();
+        let mut reader = master.try_clone().unwrap();
         let mut child = spawn_pty(&capability, slave, "").unwrap();
         assert!(child.wait().unwrap().success());
 
+        // Read through a thread with a timeout rather than to EOF on this
+        // thread: once the last slave descriptor closes, Linux fails the
+        // master read with EIO but macOS may never report EOF at all, and
+        // a blocking read then hangs the suite until the CI job limit.
+        // The shell test below reads the same way, for the same reason.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 256];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let expected = home.as_os_str().as_bytes();
         let mut output = Vec::new();
-        let mut buffer = [0_u8; 256];
-        loop {
-            match master.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => output.extend_from_slice(&buffer[..n]),
+        while output.len() < expected.len() {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(chunk) => output.extend_from_slice(&chunk),
+                Err(_) => break,
             }
         }
-        assert_eq!(output, home.as_os_str().as_bytes());
+        assert_eq!(output, expected);
     }
 
     #[tokio::test]
