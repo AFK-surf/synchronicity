@@ -72,7 +72,7 @@ pub(crate) fn compile(
     // tree, which versions content like any other file's.)
     let ir = std::fs::read_to_string(&ir_path)
         .map_err(|e| CcError::Io(format!("cannot read {}: {e}", ir_path.display())))?;
-    std::fs::write(&ir_path, lower_mem_intrinsics(&ir, name)?)
+    std::fs::write(&ir_path, lower_mem_intrinsics(&ir))
         .map_err(|e| CcError::Io(format!("cannot write {}: {e}", ir_path.display())))?;
 
     let mut llc = Command::new("llc");

@@ -427,9 +427,9 @@ SY_MAYBE_UNUSED static sy_u64 sy_strlen(const char *s) {
 }
 /* Constant-time equality, for anything a token is checked against.
  * Returns 1 when the n bytes are equal and 0 otherwise — including when the
- * comparison could not be made at all (an unreadable pointer, or n above
- * 64 KiB). Never negative, so `if (sy_ct_eq(a, b, n))` fails closed; the
- * explicit `== 1` is still the clearer spelling. */
+ * comparison could not be made at all (an unreadable pointer). Never
+ * negative, so `if (sy_ct_eq(a, b, n))` fails closed; the explicit `== 1`
+ * is still the clearer spelling. */
 extern sy_s64 sy_ct_eq(const void *a, const void *b, sy_u64 n);
 /* First-class because content roots are BLAKE3: a program can check what it
  * read against what the tree said it would be. */

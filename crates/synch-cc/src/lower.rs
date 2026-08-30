@@ -24,15 +24,11 @@
 //!
 //! Calls llc *can* expand are left for it to turn into stores, so a small
 //! `= {0}` costs what it always cost; [`fits_llcs_budget`] draws that line.
-//! A constant length past what the host will copy is refused here, with the
-//! line that caused it, rather than compiled into a call that must fail.
-//! Everything else this pass does not positively recognize — a volatile
+//! Everything this pass does not positively recognize — a volatile
 //! intrinsic among them — it leaves untouched: the failure mode is llc's
 //! own diagnostic, never a miscompile.
 
 use std::fmt::Write as _;
-
-use crate::CcError;
 
 /// The intrinsic call prefixes clang emits, and the helper each forwards to.
 ///
@@ -48,14 +44,6 @@ const LOWERINGS: [(&str, Helper); 3] = [
 /// llc's inline-expansion budget: the BPF backend's `MaxStoresPerMemset`
 /// and `MaxStoresPerMemcpy`, 128 for as long as the backend has existed.
 const LLC_STORE_BUDGET: u64 = 128;
-
-/// The most the host will fill or copy in one helper call.
-///
-/// `synch-sock`'s `MAX_COPY`: the byte-copy helpers refuse a longer request
-/// with `SY_EINVAL` rather than shorten it. A constant length past this is
-/// a call that cannot succeed, so it is refused at compile time — silently
-/// unzeroed memory is the one outcome this pass may never produce.
-const HOST_COPY_LIMIT: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Helper {
@@ -108,9 +96,7 @@ fn module_names(ir: &str, symbol: &str) -> bool {
 }
 
 /// Rewrites the memory-intrinsic calls in one module of textual IR.
-///
-/// `name` is what diagnostics call the source, as everywhere in this crate.
-pub(crate) fn lower_mem_intrinsics(ir: &str, name: &str) -> Result<String, CcError> {
+pub(crate) fn lower_mem_intrinsics(ir: &str) -> String {
     let mut out = String::with_capacity(ir.len() + 256);
     // LLVM 14 and older spell `ptr` as `i8*`; one module never mixes them.
     let mut typed_pointers = false;
@@ -120,7 +106,7 @@ pub(crate) fn lower_mem_intrinsics(ir: &str, name: &str) -> Result<String, CcErr
     let mut fresh = 0usize;
 
     for line in ir.lines() {
-        match lower_line(line, name, &mut fresh)? {
+        match lower_line(line, &mut fresh) {
             Some(lowered) => {
                 typed_pointers |= lowered.typed_pointers;
                 if !helpers_called.contains(&lowered.helper) {
@@ -147,7 +133,7 @@ pub(crate) fn lower_mem_intrinsics(ir: &str, name: &str) -> Result<String, CcErr
             let _ = writeln!(out, "declare {p} @sy_memcpy({p}, {p}, i64)");
         }
     }
-    Ok(out)
+    out
 }
 
 struct Lowered {
@@ -156,52 +142,42 @@ struct Lowered {
     typed_pointers: bool,
 }
 
-/// Rewrites one line, keeps it byte-for-byte, or refuses the compile.
-fn lower_line(line: &str, name: &str, fresh: &mut usize) -> Result<Option<Lowered>, CcError> {
+/// Rewrites one line, or answers `None` to keep it byte-for-byte.
+fn lower_line(line: &str, fresh: &mut usize) -> Option<Lowered> {
     let body = line.trim_start();
     // The intrinsic's own `declare` stays: call sites within the budget
     // still use it, and an unreferenced declaration is nothing.
     if body.starts_with("declare ") {
-        return Ok(None);
+        return None;
     }
 
     // Printed IR holds one instruction per line, so at most one call.
-    let Some((at, helper)) = LOWERINGS
+    let (at, helper) = LOWERINGS
         .iter()
-        .find_map(|(prefix, helper)| Some((line.find(prefix)?, *helper)))
-    else {
-        return Ok(None);
-    };
-    let Some(name_end) = line[at..].find('(').map(|i| at + i) else {
-        return Ok(None);
-    };
+        .find_map(|(prefix, helper)| Some((line.find(prefix)?, *helper)))?;
+    let name_end = at + line[at..].find('(')?;
     let callee = &line[at..name_end];
     // The spellings clang emits for C all continue `p0…` (address space
     // zero, then the length type). What does not — `llvm.memset.inline`,
     // the element-atomic family — has different rules or arguments, cannot
     // come from this SDK's C, and stays llc's problem.
-    let Some(suffix) = callee
+    let suffix = callee
         .strip_prefix("@llvm.memset.")
         .or_else(|| callee.strip_prefix("@llvm.memcpy."))
-        .or_else(|| callee.strip_prefix("@llvm.memmove."))
-    else {
-        return Ok(None);
-    };
+        .or_else(|| callee.strip_prefix("@llvm.memmove."))?;
     if !suffix.starts_with("p0") {
-        return Ok(None);
+        return None;
     }
 
     // (dst, src|byte, len, volatile) — anything else is not the shape this
     // pass knows, and stays. So does a volatile intrinsic: the helpers make
     // no volatility promise, and declining is honester than dropping it.
-    let Some(arguments) = split_arguments(&line[name_end..]) else {
-        return Ok(None);
-    };
+    let arguments = split_arguments(&line[name_end..])?;
     let [dst, source_or_byte, len, volatile] = arguments.as_slice() else {
-        return Ok(None);
+        return None;
     };
     if !len.starts_with("i64 ") || last_token(volatile) != Some("false") {
-        return Ok(None);
+        return None;
     }
     if let Some(Ok(n)) = last_token(len).map(str::parse::<u64>) {
         let align = match helper {
@@ -209,18 +185,7 @@ fn lower_line(line: &str, name: &str, fresh: &mut usize) -> Result<Option<Lowere
             Helper::Memcpy => alignment(dst).min(alignment(source_or_byte)),
         };
         if fits_llcs_budget(n, align) {
-            return Ok(None); // llc will expand this one into stores
-        }
-        if n > HOST_COPY_LIMIT {
-            let what = match helper {
-                Helper::Memset => "fill",
-                Helper::Memcpy => "copy",
-            };
-            return Err(CcError::Diagnostics(format!(
-                "{name}: a {n}-byte {what} (from an initializer, assignment or \
-                 builtin the compiler turned into one operation) is more than \
-                 the host moves in one helper call (64 KiB); do it in pieces"
-            )));
+            return None; // llc will expand this one into stores
         }
     }
 
@@ -232,9 +197,7 @@ fn lower_line(line: &str, name: &str, fresh: &mut usize) -> Result<Option<Lowere
         Helper::Memset => {
             // `sy_memset` takes the fill byte as an i32. A constant widens
             // here; a value needs the instruction spelled out.
-            let Some(byte) = last_token(source_or_byte) else {
-                return Ok(None);
-            };
+            let byte = last_token(source_or_byte)?;
             let widened = match byte.parse::<i64>() {
                 Ok(value) => format!("{}", value as u8),
                 Err(_) => {
@@ -255,11 +218,11 @@ fn lower_line(line: &str, name: &str, fresh: &mut usize) -> Result<Option<Lowere
         }
     }
     *fresh += 1;
-    Ok(Some(Lowered {
+    Some(Lowered {
         text,
         helper,
         typed_pointers,
-    }))
+    })
 }
 
 /// Splits a parenthesized argument list at its top-level commas.
@@ -297,11 +260,7 @@ fn last_token(argument: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::CcError;
-
-    fn lower(ir: &str) -> String {
-        super::lower_mem_intrinsics(ir, "t.c").expect("this module lowers")
-    }
+    use super::lower_mem_intrinsics as lower;
 
     const BIG_MEMSET: &str = "  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(1336) %4, i8 0, i64 1328, i1 false)";
 
@@ -350,23 +309,6 @@ mod tests {
         assert!(
             lowered.contains("call ptr @sy_memset(ptr %1, i32 0, i64 %n)"),
             "{lowered}"
-        );
-    }
-
-    /// The host refuses a fill or copy past 64 KiB with `SY_EINVAL`, and the
-    /// rewritten call has nowhere to surface that: the honest outcome for a
-    /// constant length is a compile error naming the source, not an object
-    /// that leaves memory unzeroed at run time.
-    #[test]
-    fn a_constant_past_what_the_host_will_move_is_refused() {
-        let ir = "  call void @llvm.memset.p0.i64(ptr @g, i8 0, i64 100000, i1 false)";
-        let err = super::lower_mem_intrinsics(ir, "huge.c").expect_err("past MAX_COPY");
-        let CcError::Diagnostics(text) = &err else {
-            panic!("expected diagnostics, got {err:?}");
-        };
-        assert!(
-            text.contains("huge.c") && text.contains("100000") && text.contains("64 KiB"),
-            "{text}"
         );
     }
 

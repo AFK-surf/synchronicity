@@ -132,23 +132,6 @@ pub(crate) const MAX_GUEST_DURATION_MS: u64 = u32::MAX as u64;
 /// footprint a number that means something.
 pub const CURSOR_ENTRY_OVERHEAD: u64 = 32;
 
-/// The most bytes a single helper will copy in one call.
-///
-/// Not a security bound — the pointer cage already confines every access to the
-/// guest's own stack, so a larger request simply fails validation. It is here
-/// so that an absurd length argument is refused as an argument rather than
-/// walked.
-///
-/// Two ways of meeting it, and the difference is what a short answer means.
-/// The stream helpers — `sy_read`, `sy_write`, `sy_pread`, `sy_log` — clamp
-/// to it: a short count is the documented outcome of a stream call, the
-/// guest's next call continues where it left off, and a large request on a
-/// small stream is normal. The byte-copy helpers — `sy_memcpy`, `sy_memset`,
-/// `sy_getrandom`, the decoders — refuse an over-cap length with `SY_EINVAL`
-/// instead, because a short copy is not a short stream read; it is a silently
-/// different answer.
-pub(crate) const MAX_COPY: u64 = 64 * 1024;
-
 /// Consecutive faults, out of the last [`FAULT_WINDOW`] invocations, that
 /// auto-disarm a socket.
 ///
