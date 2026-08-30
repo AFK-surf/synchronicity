@@ -53,15 +53,14 @@ mod tests {
             ("SY_POLL_ERR", poll::ERR as i64),
             ("SY_POLL_RDHUP", poll::RDHUP as i64),
             ("SY_SELF", abi::SY_SELF),
-            ("SY_PEER_MEMBER", abi::peer_kind::MEMBER as i64),
-            ("SY_PEER_DELEGATE", abi::peer_kind::DELEGATE as i64),
-            ("SY_BASE64_STANDARD", abi::base64_kind::STANDARD as i64),
-            (
-                "SY_BASE64_STANDARD_NO_PAD",
-                abi::base64_kind::STANDARD_NO_PAD as i64,
-            ),
-            ("SY_BASE64_URL", abi::base64_kind::URL as i64),
-            ("SY_BASE64_URL_NO_PAD", abi::base64_kind::URL_NO_PAD as i64),
+            ("SY_BASE64_URL", abi::base64_flag::URL as i64),
+            ("SY_BASE64_NO_PAD", abi::base64_flag::NO_PAD as i64),
+            ("SY_JSON_NULL", abi::json_type::NULL),
+            ("SY_JSON_BOOL", abi::json_type::BOOL),
+            ("SY_JSON_NUMBER", abi::json_type::NUMBER),
+            ("SY_JSON_STRING", abi::json_type::STRING),
+            ("SY_JSON_ARRAY", abi::json_type::ARRAY),
+            ("SY_JSON_OBJECT", abi::json_type::OBJECT),
         ] {
             assert_eq!(
                 define(name),
@@ -71,97 +70,71 @@ mod tests {
         }
     }
 
-    /// `docs/SSH-SOCKETS.md` §14.1: the SDK header and the Rust constants
-    /// agree on every SSH method, event, result, field, lane and capability
-    /// number. Compiled only where the runtime is, because that is where the
-    /// Rust side of each number lives.
+    /// The SSH ABI is names, not numbers (`docs/SSH-SOCKETS.md` §14.1): the
+    /// event kinds and fields the runtime serves resolve through the string
+    /// maps, and the header must carry no numbered `SY_SSH_EVENT_*` /
+    /// `SY_SSH_FIELD_*` view of them for a stale build to disagree about.
+    /// Compiled only where the runtime is, because that is where the Rust
+    /// side of each name lives.
     #[test]
     #[cfg(all(
         any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    fn the_header_and_the_ssh_abi_agree() {
+    fn the_ssh_abi_is_named_not_numbered() {
         use crate::runtime::ssh;
-        for (name, value) in [
-            ("SY_SSH_AUTH_NONE", ssh::AUTH_NONE as i64),
-            ("SY_SSH_AUTH_PUBLICKEY", ssh::AUTH_PUBLICKEY as i64),
-            ("SY_SSH_AUTH_PASSWORD", ssh::AUTH_PASSWORD as i64),
-            ("SY_SSH_EVENT_AUTH_NONE", ssh::EVENT_AUTH_NONE as i64),
-            (
-                "SY_SSH_EVENT_AUTH_PASSWORD",
-                ssh::EVENT_AUTH_PASSWORD as i64,
-            ),
-            (
-                "SY_SSH_EVENT_AUTH_PUBLICKEY_OFFER",
-                ssh::EVENT_AUTH_PUBLICKEY_OFFER as i64,
-            ),
-            (
-                "SY_SSH_EVENT_AUTH_PUBLICKEY_VERIFIED",
-                ssh::EVENT_AUTH_PUBLICKEY_VERIFIED as i64,
-            ),
-            (
-                "SY_SSH_EVENT_AUTHENTICATED",
-                ssh::EVENT_AUTHENTICATED as i64,
-            ),
-            ("SY_SSH_EVENT_CHANNEL_OPEN", ssh::EVENT_CHANNEL_OPEN as i64),
-            (
-                "SY_SSH_EVENT_CHANNEL_REQUEST",
-                ssh::EVENT_CHANNEL_REQUEST as i64,
-            ),
-            (
-                "SY_SSH_EVENT_CHANNEL_EXTENDED_DATA",
-                ssh::EVENT_CHANNEL_EXTENDED_DATA as i64,
-            ),
-            ("SY_SSH_EVENT_WANT_REPLY", ssh::EVENT_WANT_REPLY as i64),
-            ("SY_SSH_FIELD_USERNAME", ssh::FIELD_USERNAME as i64),
-            ("SY_SSH_FIELD_SERVICE", ssh::FIELD_SERVICE as i64),
-            ("SY_SSH_FIELD_PASSWORD", ssh::FIELD_PASSWORD as i64),
-            (
-                "SY_SSH_FIELD_PUBLIC_KEY_ALGORITHM",
-                ssh::FIELD_PUBLIC_KEY_ALGORITHM as i64,
-            ),
-            (
-                "SY_SSH_FIELD_PUBLIC_KEY_BLOB",
-                ssh::FIELD_PUBLIC_KEY_BLOB as i64,
-            ),
-            (
-                "SY_SSH_FIELD_PUBLIC_KEY_SHA256",
-                ssh::FIELD_PUBLIC_KEY_SHA256 as i64,
-            ),
-            ("SY_SSH_FIELD_COMMAND", ssh::FIELD_COMMAND as i64),
-            ("SY_SSH_FIELD_SUBSYSTEM", ssh::FIELD_SUBSYSTEM as i64),
-            ("SY_SSH_FIELD_CHANNEL_TYPE", ssh::FIELD_CHANNEL_TYPE as i64),
-            (
-                "SY_SSH_FIELD_CHANNEL_OPEN_DATA",
-                ssh::FIELD_CHANNEL_OPEN_DATA as i64,
-            ),
-            ("SY_SSH_FIELD_REQUEST_TYPE", ssh::FIELD_REQUEST_TYPE as i64),
-            ("SY_SSH_FIELD_REQUEST_DATA", ssh::FIELD_REQUEST_DATA as i64),
-            (
-                "SY_SSH_FIELD_DESTINATION_HOST",
-                ssh::FIELD_DESTINATION_HOST as i64,
-            ),
-            (
-                "SY_SSH_FIELD_ORIGINATOR_HOST",
-                ssh::FIELD_ORIGINATOR_HOST as i64,
-            ),
-            ("SY_SSH_FIELD_SIGNAL", ssh::FIELD_SIGNAL as i64),
-            ("SY_SSH_FIELD_TERMINAL", ssh::FIELD_TERMINAL as i64),
-            ("SY_SSH_FIELD_ENV_NAME", ssh::FIELD_ENV_NAME as i64),
-            ("SY_SSH_FIELD_ENV_VALUE", ssh::FIELD_ENV_VALUE as i64),
-            (
-                "SY_PROCESS_MAX_ARGS",
-                synch_core::sock::MAX_PROCESS_ARGS as i64,
-            ),
-            (
-                "SY_PROCESS_ARG_MAX",
-                synch_core::sock::MAX_PROCESS_ARG_BYTES as i64,
-            ),
+        for name in [
+            "username",
+            "service",
+            "password",
+            "public_key_algorithm",
+            "public_key_blob",
+            "public_key_sha256",
+            "command",
+            "subsystem",
+            "channel_type",
+            "open_data",
+            "request_type",
+            "request_data",
+            "destination_host",
+            "originator_host",
+            "signal",
+            "terminal",
+            "env_name",
+            "env_value",
+            "auth_attempts",
+            "cert_flag",
+            "ca_public_key_blob",
+            "ca_public_key_sha256",
+            "cert_key_id",
+            "cert_serial",
+            "cert_type",
+            "cert_principals",
+            "cert_blob",
         ] {
-            assert_eq!(
-                define(name),
-                Some(value),
-                "the header and the SSH ABI disagree about {name}"
+            assert!(
+                ssh::field_id(name).is_some(),
+                "event field {name} has no id behind it"
+            );
+        }
+        for name in ["none", "publickey", "password"] {
+            assert!(
+                ssh::method_name_bit(name).is_some(),
+                "auth method {name} has no bit behind it"
+            );
+        }
+        for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
+            assert_ne!(ssh::kind_name(kind), "unknown", "event kind {kind}");
+        }
+        for stale in [
+            "SY_SSH_EVENT_",
+            "SY_SSH_FIELD_",
+            "SY_SSH_AUTH_",
+            "SY_SSH_OPEN_",
+        ] {
+            assert!(
+                !HEADER.contains(stale),
+                "the header reintroduces numbered SSH constants ({stale}*)"
             );
         }
     }

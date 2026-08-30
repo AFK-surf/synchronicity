@@ -20,7 +20,7 @@ mod harness;
 use std::sync::Arc;
 
 use harness::{compile, exchange, peer, Harness};
-use synch_core::{FaultKind, ProcessCapability, SockStatus};
+use synch_core::{FaultKind, FileTransferCapability, ProcessCapability, SockStatus};
 use synch_sock::{DuplexStream, EffectivePolicy, Limits, SocketId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -283,9 +283,21 @@ SY_ENTRY sy_s64 entry(void) {
   sy_write(SY_SELF, buf, sy_strlen(buf));
   sy_write(SY_SELF, SY_STR(" "));
 
-  sy_s64 kind = sy_peer_kind();
-  sy_write(SY_SELF, kind == SY_PEER_MEMBER ? "member" : "delegate",
-           kind == SY_PEER_MEMBER ? 6 : 8);
+  /* The identity is one JSON object; the kind is a name inside it, and the
+     JSON view of the origin must agree with the string helper's. */
+  sy_s64 info = sy_peer_info();
+  if (info < 0) return 8;
+  char kind[16];
+  if (sy_json_get_string(info, SY_STR("kind"), kind, sizeof kind) < 0) return 8;
+  char json_origin[256];
+  if (sy_json_get_string(info, SY_STR("origin"), json_origin,
+                         sizeof json_origin) < 0)
+    return 8;
+  sy_close(info);
+  if (sy_strlen(json_origin) != sy_strlen(buf) ||
+      sy_memcmp(json_origin, buf, sy_strlen(buf)) != 0)
+    return 9;
+  sy_write(SY_SELF, kind, sy_strlen(kind));
 
   if (sy_conn_meta(SY_STR("tag"), buf, sizeof buf) > 0) {
     sy_write(SY_SELF, SY_STR(" "));
@@ -1350,16 +1362,25 @@ const PROCESS_STATUS_CONTRACT: &str = r#"
 SY_ENTRY sy_s64 entry(void) {
   sy_s64 process = sy_process_spawn(1);
   if (process < 0) return 70;
-  struct sy_process_status status;
+  sy_s64 status;
   for (;;) {
-    sy_s64 result = sy_process_status(process, &status, sizeof status);
-    if (result == 1) break;
-    if (result != SY_EAGAIN) return 71;
+    status = sy_process_status(process);
+    if (status > 0) break;
+    if (status != SY_EAGAIN) return 71;
     struct sy_pollfd wait[1] = {{ process, SY_POLL_IN, 0 }};
     if (sy_poll(wait, 1, 1500) <= 0) return 72;
   }
-  if (!status.exited || status.signaled || status.exit_code != 0) return 73;
-  if (sy_process_status(process, &status, sizeof status) != 1) return 74;
+  sy_s64 exit_code = -1;
+  if (sy_json_get_bool(status, SY_STR("exited")) != 1) return 73;
+  if (sy_json_get_bool(status, SY_STR("signaled")) != 0) return 73;
+  if (sy_json_get_i64(status, SY_STR("exit_code"), &exit_code) < 0 ||
+      exit_code != 0)
+    return 73;
+  sy_close(status);
+  /* Terminal status is repeatable: each ask hands back a fresh handle. */
+  sy_s64 again = sy_process_status(process);
+  if (again <= 0) return 74;
+  sy_close(again);
   sy_close(process);
   return 0;
 }
@@ -1475,4 +1496,326 @@ async fn splice_may_be_a_programs_first_call_on_self() {
         SockStatus::Ok(0),
         "sy_splice(SY_SELF, ...) as a first call must not be SY_EBADF"
     );
+}
+
+/// The JSON value API, exercised from inside a guest: parse, navigate, read,
+/// build, mutate, serialize, and the copy semantics between handles.
+const JSON_ROUND_TRIP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  /* Parse and navigate. */
+  sy_s64 doc = sy_json_parse(SY_STR(
+      "{\"name\":\"git\",\"port\":9418,\"on\":true,\"tags\":[\"a\",\"b\"]}"));
+  if (doc < 0) return 10;
+  if (sy_json_type(doc) != SY_JSON_OBJECT) return 11;
+  if (sy_json_len(doc) != 4) return 12;
+
+  char name[16];
+  if (sy_json_get_string(doc, SY_STR("name"), name, sizeof name) != 3) return 13;
+  sy_s64 port = 0;
+  if (sy_json_get_i64(doc, SY_STR("port"), &port) < 0 || port != 9418) return 14;
+  if (sy_json_get_bool(doc, SY_STR("on")) != 1) return 15;
+  if (sy_json_get(doc, SY_STR("absent")) != SY_ENOENT) return 16;
+
+  sy_s64 tags = sy_json_get(doc, SY_STR("tags"));
+  if (tags < 0 || sy_json_type(tags) != SY_JSON_ARRAY) return 17;
+  if (sy_json_len(tags) != 2) return 18;
+  sy_s64 second = sy_json_array_get(tags, 1);
+  if (second < 0) return 19;
+  char tag[4];
+  if (sy_json_read_string(second, tag, sizeof tag) != 1 || tag[0] != 'b')
+    return 20;
+  if (sy_json_array_get(tags, 2) != SY_ENOENT) return 21;
+  sy_close(second);
+
+  /* Handles own copies: growing the extracted array must not touch the
+     document it came from. */
+  sy_s64 extra = sy_json_new_object();
+  if (extra < 0) return 22;
+  if (sy_json_set_string(extra, SY_STR("ignored")) != 0) return 23;
+  if (sy_json_type(extra) != SY_JSON_STRING) return 24;
+  if (sy_json_array_push(tags, extra) != 0) return 25;
+  if (sy_json_len(tags) != 3) return 26;
+  sy_close(extra);
+  sy_close(tags);
+  sy_s64 original = sy_json_get(doc, SY_STR("tags"));
+  if (sy_json_len(original) != 2) return 27;
+  sy_close(original);
+
+  /* Build a reply bottom-up and hand it back serialized. */
+  sy_s64 reply = sy_json_new_object();
+  sy_s64 value = sy_json_new_array();
+  if (reply < 0 || value < 0) return 28;
+  sy_s64 n = sy_json_new_object();
+  if (sy_json_set_i64(n, 7) != 0) return 29;
+  if (sy_json_array_push(value, n) != 0) return 30;
+  if (sy_json_set_bool(n, 1) != 0) return 31;
+  if (sy_json_array_push(value, n) != 0) return 32;
+  if (sy_json_set_null(n) != 0) return 33;
+  if (sy_json_array_push(value, n) != 0) return 34;
+  sy_close(n);
+  if (sy_json_set(reply, SY_STR("mixed"), value) != 0) return 35;
+  sy_close(value);
+  if (sy_json_remove(reply, SY_STR("absent")) != SY_ENOENT) return 36;
+
+  char out[128];
+  sy_s64 len = sy_json_stringify(reply, out, sizeof out);
+  if (len <= 0 || len >= (sy_s64)sizeof out) return 37;
+  sy_close(reply);
+  sy_close(doc);
+  sy_write_all(SY_SELF, out, (sy_u64)len, 5000);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn json_values_parse_navigate_build_and_serialize() {
+    let elf = compile(JSON_ROUND_TRIP, "json-round-trip.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(out, br#"{"mixed":[7,true,null]}"#);
+}
+
+/// The handle table holds 256 slots: with `SY_SELF` in slot zero, 255 JSON
+/// handles fit and the 256th is refused, and closing one frees a slot.
+const HANDLE_TABLE_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 handles[255];
+  for (int i = 0; i < 255; i++) {
+    handles[i] = sy_json_parse(SY_STR("null"));
+    if (handles[i] < 0) return 1000 + i;
+  }
+  if (sy_json_parse(SY_STR("null")) != SY_ELIMIT) return 1;
+  sy_close(handles[254]);
+  sy_s64 reused = sy_json_parse(SY_STR("null"));
+  if (reused < 0) return 2;
+  sy_close(reused);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn the_handle_table_holds_256_slots() {
+    let elf = compile(HANDLE_TABLE_CAP, "handle-table-cap.c");
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// Ring-bearing endpoints keep the pre-256 bound of 32, and a closed process
+/// handle gives no ring capacity back while its stdio endpoints stay open —
+/// only closing the endpoints does.
+const ENDPOINT_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 procs[16], mains[16], errs[16];
+  int n = 0;
+  for (; n < 16; n++) {
+    sy_s64 p = sy_process_spawn(1);
+    if (p == SY_ELIMIT) break;
+    if (p < 0) return 100 + n;
+    procs[n] = p;
+    mains[n] = sy_process_stdio(p, SY_STR("main"));
+    errs[n] = sy_process_stdio(p, SY_STR("stderr"));
+    if (mains[n] < 0 || errs[n] < 0) return 200 + n;
+  }
+  /* SY_SELF plus fifteen stdio pairs is 31 open endpoints; the sixteenth
+     spawn needs two more and fails whole. */
+  if (n != 15) return 1;
+  /* Closing only the process handle gives no ring capacity back. */
+  if (sy_close(procs[14]) != 0) return 2;
+  if (sy_process_spawn(1) != SY_ELIMIT) return 3;
+  /* Closing the stdio pair does. */
+  if (sy_close(mains[14]) != 0 || sy_close(errs[14]) != 0) return 4;
+  if (sy_process_spawn(1) < 0) return 5;
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn open_endpoints_are_capped_and_orphaned_stdio_still_counts() {
+    let elf = compile(ENDPOINT_CAP, "endpoint-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(ProcessCapability {
+        id: 1,
+        flags: 0x02,
+        executable: "/bin/sh".into(),
+        argv: vec!["sh".into(), "-c".into(), "true".into()],
+        allowed_signals: 0,
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// The sixteen-PTY-master bound, and a close giving the place back.
+const PTY_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  const char *spec_json = "{\"term\":\"xterm\",\"columns\":80,\"rows\":24}";
+  sy_s64 spec = sy_json_parse(spec_json, sy_strlen(spec_json));
+  if (spec < 0) return 1;
+  sy_s64 ptys[16];
+  for (int i = 0; i < 16; i++) {
+    ptys[i] = sy_pty_open(1, spec);
+    if (ptys[i] < 0) return 100 + i;
+  }
+  if (sy_pty_open(1, spec) != SY_ELIMIT) return 2;
+  if (sy_close(ptys[15]) != 0) return 3;
+  if (sy_pty_open(1, spec) < 0) return 4;
+  sy_close(spec);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn pty_masters_are_capped_per_invocation() {
+    let elf = compile(PTY_CAP, "pty-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.processes.push(ProcessCapability {
+        id: 1,
+        flags: 0x01,
+        executable: "/bin/sh".into(),
+        argv: vec!["sh".into()],
+        allowed_signals: 0,
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// The sixteen-file-transfer bound, and a close giving the place back.
+const SFTP_CAP: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 fds[16];
+  for (int i = 0; i < 16; i++) {
+    fds[i] = sy_sftp_open(1);
+    if (fds[i] < 0) return 100 + i;
+  }
+  if (sy_sftp_open(1) != SY_ELIMIT) return 1;
+  if (sy_close(fds[15]) != 0) return 2;
+  if (sy_sftp_open(1) < 0) return 3;
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn file_transfer_endpoints_are_capped_per_invocation() {
+    let elf = compile(SFTP_CAP, "sftp-cap.c");
+    let harness = Harness::new();
+    let mut policy = EffectivePolicy::default();
+    policy.file_transfers.push(FileTransferCapability {
+        id: 1,
+        protocol: 1,
+        access: 0x01 | 0x04,
+        scope: "files".into(),
+    });
+    let (status, out) = exchange(&harness, &elf, b"", policy, peer(None), vec![]).await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// `sy_stat` answers as JSON, with the kind a name and the root in hex.
+const STAT_JSON: &str = r#"
+#include <synch.h>
+
+SY_ENTRY sy_s64 entry(void) {
+  sy_s64 obj = sy_open(SY_STR("code/readme"));
+  if (obj < 0) return 10;
+  sy_s64 st = sy_stat(obj);
+  if (st < 0) return 11;
+
+  sy_s64 size = 0;
+  if (sy_json_get_i64(st, SY_STR("size"), &size) < 0) return 12;
+  char kind[16];
+  if (sy_json_get_string(st, SY_STR("kind"), kind, sizeof kind) != 4) return 13;
+  if (sy_memcmp(kind, "file", 4) != 0) return 14;
+  char root[65];
+  if (sy_json_get_string(st, SY_STR("root"), root, sizeof root) != 64)
+    return 15;
+  sy_close(st);
+  sy_close(obj);
+
+  char number[24];
+  sy_s64 digits = sy_utoa((sy_u64)size, number, sizeof number);
+  if (digits < 0) return 16;
+  sy_write_all(SY_SELF, number, (sy_u64)digits, 5000);
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn stat_answers_as_json_with_named_kind_and_hex_root() {
+    let elf = compile(STAT_JSON, "stat-json.c");
+    let harness = Harness::with_tree(&[("code/readme", "twelve bytes")]);
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::default(),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        SockStatus::Ok(0),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(out, b"12");
 }

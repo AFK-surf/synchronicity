@@ -24,16 +24,15 @@ use async_ebpf::{
 };
 use base64::Engine as _;
 
+use serde_json::{json, Value};
+
 use crate::{
-    abi::{
-        base64_kind, errno, poll, FILE_TRANSFER_CAPABILITY_SIZE, POLLFD_SIZE,
-        PROCESS_CAPABILITY_SIZE, PROCESS_STATUS_SIZE, PTY_SPEC_SIZE, SSH_EVENT_SIZE, STAT_SIZE,
-        SY_SELF,
-    },
+    abi::{errno, poll, POLLFD_SIZE, SY_SELF},
     limits::{CURSOR_ENTRY_OVERHEAD, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
         ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
         endpoint::{connect_task, Endpoint, EndpointRole, State},
+        json::{json_size, type_tag, JsonSlot},
     },
 };
 
@@ -59,11 +58,30 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_socket_path", h_socket_path),
     ("sy_peer_origin", h_peer_origin),
     ("sy_peer_device_key", h_peer_device_key),
-    ("sy_peer_kind", h_peer_kind),
+    ("sy_peer_info", h_peer_info),
     ("sy_peer_has_space", h_peer_has_space),
     ("sy_peer_addr", h_peer_addr),
     ("sy_conn_meta", h_conn_meta),
     ("sy_stream_index", h_stream_index),
+    // JSON values (docs/SOCKETS.md §7.7)
+    ("sy_json_parse", h_json_parse),
+    ("sy_json_stringify", h_json_stringify),
+    ("sy_json_new_object", h_json_new_object),
+    ("sy_json_new_array", h_json_new_array),
+    ("sy_json_type", h_json_type),
+    ("sy_json_len", h_json_len),
+    ("sy_json_get", h_json_get),
+    ("sy_json_array_get", h_json_array_get),
+    ("sy_json_read_string", h_json_read_string),
+    ("sy_json_read_i64", h_json_read_i64),
+    ("sy_json_read_bool", h_json_read_bool),
+    ("sy_json_set", h_json_set),
+    ("sy_json_remove", h_json_remove),
+    ("sy_json_array_push", h_json_array_push),
+    ("sy_json_set_string", h_json_set_string),
+    ("sy_json_set_i64", h_json_set_i64),
+    ("sy_json_set_bool", h_json_set_bool),
+    ("sy_json_set_null", h_json_set_null),
     // endpoint I/O
     ("sy_read", h_read),
     ("sy_write", h_write),
@@ -141,8 +159,6 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ),
     ("sy_declare_process", h_declare_process),
     ("sy_declare_file_transfer", h_declare_file_transfer),
-    // appended last: helper ids are table positions resolved by name, so this
-    // is additive and cannot collide with an existing id
     ("sy_ssh_exit_status_lost", h_ssh_exit_status_lost),
 ];
 
@@ -418,8 +434,22 @@ fn h_peer_device_key(
     out_exact(scope, ptr, 32, &key)
 }
 
-fn h_peer_kind(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
-    with(scope, |inner| inner.peer.kind())
+/// The caller's whole authenticated identity, as one JSON object.
+///
+/// `{"origin", "device_key" (hex), "kind" ("member" | "delegate"), "addr",
+/// "stream_index"}` — every field a fact the iroh handshake established, and
+/// `kind` a name rather than a number: the enum this replaces was the kind of
+/// thing a guest compiled against a stale header read wrong silently.
+fn h_peer_info(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let value = json!({
+        "origin": inner.peer.origin.canonical(),
+        "device_key": hex::encode(crate::device_key_bytes(&inner.peer.device_key)),
+        "kind": inner.peer.kind(),
+        "addr": inner.peer.addr,
+        "stream_index": inner.peer.stream_index,
+    });
+    ret(insert_json(&inner, value))
 }
 
 fn h_peer_has_space(
@@ -463,6 +493,420 @@ fn h_conn_meta(
 
 fn h_stream_index(scope: &HelperScope, _: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
     with(scope, |inner| inner.peer.stream_index)
+}
+
+// ---- JSON values ---------------------------------------------------------
+//
+// The structured half of the ABI (`docs/SOCKETS.md` §7.7), modeled on
+// zeroserve's JSON API: values live host-side, the guest holds handles, and
+// every handle owns its own value — navigation copies out, insertion copies
+// in, and no two handles ever alias. Handles come out of the same table as
+// endpoints and objects and are released with `sy_close`; their bytes are
+// charged against the same 1 MiB footprint. Pure data manipulation, so all of
+// it is valid in `synchronicity.init` too — the declaration helpers take JSON.
+
+/// The JSON value at `handle`, or `EBADF`.
+fn json_slot(inner: &Inner, handle: i64) -> Result<Rc<JsonSlot>, i64> {
+    match inner.slot(handle) {
+        Some(Slot2::Json(slot)) => Ok(slot),
+        _ => Err(errno::EBADF),
+    }
+}
+
+/// A copy of the JSON value at `handle`, for helpers that consume one.
+fn json_value(inner: &Inner, handle: i64) -> Result<Value, i64> {
+    json_slot(inner, handle).map(|slot| slot.value.borrow().clone())
+}
+
+/// Charges `value` and puts it in the table, returning its handle.
+fn insert_json(inner: &Rc<Inner>, value: Value) -> i64 {
+    let size = match json_size(&value) {
+        Ok(size) => size,
+        Err(error) => return error,
+    };
+    if inner.charge(size).is_err() {
+        return errno::ELIMIT;
+    }
+    match inner.insert(Slot::Json(Rc::new(JsonSlot::new(value, size)))) {
+        Ok(handle) => {
+            inner.publish_handles();
+            handle
+        }
+        Err(error) => {
+            inner.release(size);
+            error
+        }
+    }
+}
+
+/// Applies one mutation under the size and depth bounds, atomically.
+///
+/// The mutation runs on a copy, is re-measured, and replaces the slot's value
+/// only once the footprint accepts the difference — so a refused mutation
+/// leaves the value exactly as it was, rather than half-changed or
+/// over-budget.
+fn json_mutate(
+    inner: &Inner,
+    handle: i64,
+    mutate: impl FnOnce(&mut Value) -> Result<(), i64>,
+) -> i64 {
+    let slot = match json_slot(inner, handle) {
+        Ok(slot) => slot,
+        Err(error) => return error,
+    };
+    // Every copy is scrubbed on the way out, not only the slot's own drop:
+    // the candidate clone on a refused mutation, and the value a successful
+    // one replaces — `sy_json_remove(event, "password")` is exactly the call
+    // a hygienic guest makes, and it must not leave the un-scrubbed original
+    // on the freed heap (`docs/SSH-SOCKETS.md` §12.4).
+    let mut candidate = slot.value.borrow().clone();
+    let size = match mutate(&mut candidate).and_then(|()| json_size(&candidate)) {
+        Ok(size) => size,
+        Err(error) => {
+            crate::runtime::json::zeroize_strings(&mut candidate);
+            return error;
+        }
+    };
+    let charged = slot.charged.get();
+    if size > charged {
+        if inner.charge(size - charged).is_err() {
+            crate::runtime::json::zeroize_strings(&mut candidate);
+            return errno::ELIMIT;
+        }
+    } else {
+        inner.release(charged - size);
+    }
+    slot.charged.set(size);
+    let mut replaced = std::mem::replace(&mut *slot.value.borrow_mut(), candidate);
+    crate::runtime::json::zeroize_strings(&mut replaced);
+    0
+}
+
+fn h_json_parse(
+    scope: &HelperScope,
+    ptr: u64,
+    len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let data = guest!(bytes(scope, ptr, len));
+    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
+        return ret(errno::EINVAL);
+    };
+    let inner = with(scope, Rc::clone)?;
+    ret(insert_json(&inner, value))
+}
+
+fn h_json_stringify(
+    scope: &HelperScope,
+    handle: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let mut value = match with(scope, |inner| json_value(inner, handle as i64))? {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    let text = serde_json::to_string(&value);
+    // The clone and the serialized buffer are host-side copies of a value
+    // that may hold a credential; scrub them like the slot's drop does.
+    crate::runtime::json::zeroize_strings(&mut value);
+    let Ok(mut text) = text else {
+        return ret(errno::EINVAL);
+    };
+    let result = out_str(scope, out, out_len, &text);
+    // SAFETY: all-zero bytes are valid UTF-8.
+    unsafe { text.as_mut_vec() }.fill(0);
+    result
+}
+
+fn h_json_new_object(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    ret(insert_json(&inner, Value::Object(serde_json::Map::new())))
+}
+
+fn h_json_new_array(
+    scope: &HelperScope,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    ret(insert_json(&inner, Value::Array(Vec::new())))
+}
+
+fn h_json_type(
+    scope: &HelperScope,
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    match with(scope, |inner| json_slot(inner, handle as i64))? {
+        Ok(slot) => ret(type_tag(&slot.value.borrow())),
+        Err(error) => ret(error),
+    }
+}
+
+fn h_json_len(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    match with(scope, |inner| json_slot(inner, handle as i64))? {
+        Ok(slot) => match &*slot.value.borrow() {
+            Value::Array(items) => ret(items.len() as i64),
+            Value::Object(map) => ret(map.len() as i64),
+            Value::String(s) => ret(s.len() as i64),
+            _ => ret(errno::EINVAL),
+        },
+        Err(error) => ret(error),
+    }
+}
+
+fn h_json_get(
+    scope: &HelperScope,
+    handle: u64,
+    key_ptr: u64,
+    key_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let key = guest!(string(scope, key_ptr, key_len));
+    let inner = with(scope, Rc::clone)?;
+    let slot = match json_slot(&inner, handle as i64) {
+        Ok(slot) => slot,
+        Err(error) => return ret(error),
+    };
+    let member = match &*slot.value.borrow() {
+        Value::Object(map) => match map.get(&key) {
+            Some(member) => member.clone(),
+            None => return ret(errno::ENOENT),
+        },
+        _ => return ret(errno::EINVAL),
+    };
+    ret(insert_json(&inner, member))
+}
+
+fn h_json_array_get(
+    scope: &HelperScope,
+    handle: u64,
+    index: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let slot = match json_slot(&inner, handle as i64) {
+        Ok(slot) => slot,
+        Err(error) => return ret(error),
+    };
+    let item = match &*slot.value.borrow() {
+        Value::Array(items) => match usize::try_from(index).ok().and_then(|i| items.get(i)) {
+            Some(item) => item.clone(),
+            None => return ret(errno::ENOENT),
+        },
+        _ => return ret(errno::EINVAL),
+    };
+    ret(insert_json(&inner, item))
+}
+
+fn h_json_read_string(
+    scope: &HelperScope,
+    handle: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let text = match with(scope, |inner| json_slot(inner, handle as i64))? {
+        Ok(slot) => match &*slot.value.borrow() {
+            Value::String(s) => s.clone(),
+            _ => return ret(errno::EINVAL),
+        },
+        Err(error) => return ret(error),
+    };
+    out_str(scope, out, out_len, &text)
+}
+
+fn h_json_read_i64(
+    scope: &HelperScope,
+    handle: u64,
+    out: u64,
+    out_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if out_len < 8 {
+        return ret(errno::EINVAL);
+    }
+    let number = match with(scope, |inner| json_slot(inner, handle as i64))? {
+        Ok(slot) => match &*slot.value.borrow() {
+            // `as_i64` covers negatives and everything through i64::MAX;
+            // larger u64 values do not fit the out-parameter honestly.
+            Value::Number(n) => match n.as_i64() {
+                Some(value) => value,
+                None => return ret(errno::EINVAL),
+            },
+            _ => return ret(errno::EINVAL),
+        },
+        Err(error) => return ret(error),
+    };
+    out_exact(scope, out, out_len.min(8), &number.to_le_bytes())
+}
+
+fn h_json_read_bool(
+    scope: &HelperScope,
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    match with(scope, |inner| json_slot(inner, handle as i64))? {
+        Ok(slot) => match &*slot.value.borrow() {
+            Value::Bool(b) => ret(i64::from(*b)),
+            _ => ret(errno::EINVAL),
+        },
+        Err(error) => ret(error),
+    }
+}
+
+fn h_json_set(
+    scope: &HelperScope,
+    handle: u64,
+    key_ptr: u64,
+    key_len: u64,
+    value_handle: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let key = guest!(string(scope, key_ptr, key_len));
+    let inner = with(scope, Rc::clone)?;
+    let value = match json_value(&inner, value_handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    ret(json_mutate(&inner, handle as i64, |target| match target {
+        Value::Object(map) => {
+            map.insert(key, value);
+            Ok(())
+        }
+        _ => Err(errno::EINVAL),
+    }))
+}
+
+fn h_json_remove(
+    scope: &HelperScope,
+    handle: u64,
+    key_ptr: u64,
+    key_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let key = guest!(string(scope, key_ptr, key_len));
+    let inner = with(scope, Rc::clone)?;
+    ret(json_mutate(&inner, handle as i64, |target| match target {
+        Value::Object(map) => match map.remove(&key) {
+            Some(_) => Ok(()),
+            None => Err(errno::ENOENT),
+        },
+        _ => Err(errno::EINVAL),
+    }))
+}
+
+fn h_json_array_push(
+    scope: &HelperScope,
+    handle: u64,
+    value_handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let value = match json_value(&inner, value_handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    ret(json_mutate(&inner, handle as i64, |target| match target {
+        Value::Array(items) => {
+            items.push(value);
+            Ok(())
+        }
+        _ => Err(errno::EINVAL),
+    }))
+}
+
+fn h_json_set_string(
+    scope: &HelperScope,
+    handle: u64,
+    ptr: u64,
+    len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let text = guest!(string(scope, ptr, len));
+    let inner = with(scope, Rc::clone)?;
+    ret(json_mutate(&inner, handle as i64, |target| {
+        *target = Value::String(text);
+        Ok(())
+    }))
+}
+
+fn h_json_set_i64(
+    scope: &HelperScope,
+    handle: u64,
+    value: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    ret(json_mutate(&inner, handle as i64, |target| {
+        *target = json!(value as i64);
+        Ok(())
+    }))
+}
+
+fn h_json_set_bool(
+    scope: &HelperScope,
+    handle: u64,
+    value: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    if value > 1 {
+        return ret(errno::EINVAL);
+    }
+    let inner = with(scope, Rc::clone)?;
+    ret(json_mutate(&inner, handle as i64, |target| {
+        *target = Value::Bool(value == 1);
+        Ok(())
+    }))
+}
+
+fn h_json_set_null(
+    scope: &HelperScope,
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    ret(json_mutate(&inner, handle as i64, |target| {
+        *target = Value::Null;
+        Ok(())
+    }))
 }
 
 // ---- endpoint I/O --------------------------------------------------------
@@ -641,6 +1085,7 @@ fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
             ret(code)
         }
         Some(Slot2::Cursor(_)) => ret(0),
+        Some(Slot2::Json(_)) => ret(0),
         Some(Slot2::Process(process)) => ret(process.refresh().err().unwrap_or(0)),
         None => ret(errno::EBADF),
     }
@@ -763,17 +1208,41 @@ fn ssh_state(inner: &Inner) -> Result<std::sync::Arc<crate::runtime::ssh::SshSta
     }
 }
 
+/// The `["none" | "publickey" | "password", …]` array `sy_ssh_start` takes and
+/// `sy_ssh_auth_reply` optionally takes as `next_methods`, as method bits.
+fn method_bits(value: &Value) -> Result<u64, i64> {
+    let Value::Array(items) = value else {
+        return Err(errno::EINVAL);
+    };
+    let mut bits = 0;
+    for item in items {
+        let bit = item
+            .as_str()
+            .and_then(crate::runtime::ssh::method_name_bit)
+            .ok_or(errno::EINVAL)?;
+        bits |= bit;
+    }
+    Ok(bits)
+}
+
 fn h_ssh_start(
     scope: &HelperScope,
     stream: u64,
-    methods: u64,
+    methods_handle: u64,
     _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if stream as i64 != SY_SELF || methods == 0 || methods & !crate::runtime::ssh::AUTH_ALL != 0 {
+    if stream as i64 != SY_SELF {
         return ret(errno::EINVAL);
     }
+    let methods = match with(scope, |inner| {
+        json_value(inner, methods_handle as i64).and_then(|value| method_bits(&value))
+    })? {
+        Ok(bits) if bits != 0 => bits,
+        Ok(_) => return ret(errno::EINVAL),
+        Err(error) => return ret(error),
+    };
     with(scope, |inner| {
         if let Some(error) = mode_check(inner, false) {
             return error;
@@ -827,18 +1296,18 @@ pub(crate) fn peer_ip(addr: &str) -> &str {
     }
 }
 
-fn h_ssh_next(
-    scope: &HelperScope,
-    conn: u64,
-    out: u64,
-    out_len: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    if conn as i64 != SY_SELF || out_len < SSH_EVENT_SIZE {
+/// One event, as a fresh JSON handle.
+///
+/// Returns the handle (> 0), `SY_EAGAIN` while the queue is empty on a live
+/// connection, and `0` once it is empty after HUP: no further event will
+/// arrive. The event stays outstanding until it is answered — the JSON is a
+/// snapshot the guest closes whenever it likes.
+fn h_ssh_next(scope: &HelperScope, conn: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    if conn as i64 != SY_SELF {
         return ret(errno::EINVAL);
     }
-    let state = match with(scope, |inner| ssh_state(inner))? {
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
         Ok(state) => state,
         Err(error) => return ret(error),
     };
@@ -849,39 +1318,36 @@ fn h_ssh_next(
             errno::EAGAIN
         });
     };
-    let Ok(mut region) = scope.user_memory_mut(out, SSH_EVENT_SIZE) else {
-        return ret(errno::EINVAL);
+    let Some(value) = state.event_json(event.id) else {
+        return ret(errno::EAGAIN);
     };
-    region[0..8].copy_from_slice(&event.id.to_le_bytes());
-    region[8..16].copy_from_slice(&event.fd.to_le_bytes());
-    for (offset, value) in [
-        (16, event.kind),
-        (20, event.flags),
-        (24, event.data_len),
-        (28, event.aux_len),
-        (32, event.a),
-        (36, event.b),
-        (40, event.c),
-        (44, event.d),
-    ] {
-        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    let handle = insert_json(&inner, value);
+    if handle < 0 {
+        // No room for the handle: the event goes back to the head of the
+        // queue, so a retry after `sy_close` sees it again rather than a
+        // stranded outstanding event nothing points at.
+        state.requeue(event.id);
     }
-    ret(1)
+    ret(handle)
 }
 
 fn h_ssh_event_data(
     scope: &HelperScope,
     event_id: u64,
-    field: u64,
+    name_ptr: u64,
+    name_len: u64,
     out: u64,
     out_len: u64,
-    _: u64,
 ) -> Result<u64, ()> {
+    let name = guest!(string(scope, name_ptr, name_len));
+    let Some(field) = crate::runtime::ssh::field_id(&name) else {
+        return ret(errno::EINVAL);
+    };
     let state = match with(scope, |inner| ssh_state(inner))? {
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    let Some(mut value) = state.field(event_id, field as u32) else {
+    let Some(mut value) = state.field(event_id, field) else {
         return ret(errno::ENOENT);
     };
     let n = value.len().min(out_len as usize);
@@ -894,7 +1360,7 @@ fn h_ssh_event_data(
     let total = value.len() as i64;
     // The credential-zeroization rules (§12.4) cover this host-side copy of
     // the password too, not only the payload attached to the event.
-    if field as u32 == crate::runtime::ssh::FIELD_PASSWORD {
+    if field == crate::runtime::ssh::FIELD_PASSWORD {
         value.fill(0);
     }
     ret(total)
@@ -954,18 +1420,40 @@ pub(crate) fn auth_reply_result(kind: u32, result: u64) -> Result<u32, i64> {
     }
 }
 
+/// Answers an auth event with a JSON reply:
+/// `{"result": "accept" | "reject" | "partial" | "offer_accept",
+///   "next_methods": ["publickey", …]?}`.
+///
+/// `next_methods` is what a rejection or partial success leaves attemptable;
+/// absent means nothing further, which is the fail-closed reading.
 fn h_ssh_auth_reply(
     scope: &HelperScope,
     event_id: u64,
-    result: u64,
-    next_methods: u64,
+    reply_handle: u64,
+    _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if !(1..=4).contains(&result) || next_methods & !crate::runtime::ssh::AUTH_ALL != 0 {
-        return ret(errno::EINVAL);
-    }
-    let state = match with(scope, |inner| ssh_state(inner))? {
+    let inner = with(scope, Rc::clone)?;
+    let reply = match json_value(&inner, reply_handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    let result = match reply.get("result").and_then(Value::as_str) {
+        Some("accept") => 1,
+        Some("reject") => 2,
+        Some("partial") => 3,
+        Some("offer_accept") => 4,
+        _ => return ret(errno::EINVAL),
+    };
+    let next_methods = match reply.get("next_methods") {
+        None | Some(Value::Null) => 0,
+        Some(value) => match method_bits(value) {
+            Ok(bits) => bits,
+            Err(error) => return ret(error),
+        },
+    };
+    let state = match ssh_state(&inner) {
         Ok(state) => state,
         Err(error) => return ret(error),
     };
@@ -1182,16 +1670,16 @@ fn h_ssh_channel_accept(
 fn h_ssh_channel_reject(
     scope: &HelperScope,
     event_id: u64,
-    reason: u64,
-    _: u64,
+    reason_ptr: u64,
+    reason_len: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let reason = match reason {
-        1 => russh::ChannelOpenFailure::AdministrativelyProhibited,
-        2 => russh::ChannelOpenFailure::ConnectFailed,
-        3 => russh::ChannelOpenFailure::UnknownChannelType,
-        4 => russh::ChannelOpenFailure::ResourceShortage,
+    let reason = match guest!(string(scope, reason_ptr, reason_len)).as_str() {
+        "administratively_prohibited" => russh::ChannelOpenFailure::AdministrativelyProhibited,
+        "connect_failed" => russh::ChannelOpenFailure::ConnectFailed,
+        "unknown_channel_type" => russh::ChannelOpenFailure::UnknownChannelType,
+        "resource_shortage" => russh::ChannelOpenFailure::ResourceShortage,
         _ => return ret(errno::EINVAL),
     };
     let state = match with(scope, |inner| ssh_state(inner))? {
@@ -1335,6 +1823,9 @@ fn h_ssh_channel_lane(
         if inner.endpoint(handle).is_some() {
             return ret(handle);
         }
+    }
+    if state.lane_count(channel as i64) >= crate::limits::MAX_LANES_PER_CHANNEL {
+        return ret(errno::ELIMIT);
     }
     let lane_ring = inner.limits.ring_bytes.min(64 * 1024);
     let endpoint = Endpoint::new(
@@ -1513,48 +2004,45 @@ fn h_ssh_exit_status_lost(
     ret(state.lost_exit_deliveries() as i64)
 }
 
+/// A `pty-req`'s terminal parameters, as the JSON `sy_pty_open` takes back:
+/// `{"term", "columns", "rows", "pixel_width", "pixel_height",
+///   "modes": [{"opcode", "value"}, …]}`.
+///
+/// The mode opcodes stay numeric on purpose: they are SSH wire values
+/// (RFC 4254 §8), not an enum of this ABI's invention.
 fn h_ssh_pty_spec(
     scope: &HelperScope,
     event_id: u64,
-    out: u64,
-    out_len: u64,
+    _: u64,
+    _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if out_len < PTY_SPEC_SIZE {
-        return ret(errno::EINVAL);
-    }
-    let state = match with(scope, |inner| ssh_state(inner))? {
+    let inner = with(scope, Rc::clone)?;
+    let state = match ssh_state(&inner) {
         Ok(state) => state,
         Err(error) => return ret(error),
     };
     let Some(pty) = state.pty(event_id) else {
         return ret(errno::ESTATE);
     };
-    if pty.term.len() > 64 || pty.modes.len() > 64 {
+    if pty.term.len() > MAX_PTY_TERM_BYTES || pty.modes.len() > MAX_PTY_MODES {
         return ret(errno::ELIMIT);
     }
-    let Ok(mut region) = scope.user_memory_mut(out, PTY_SPEC_SIZE) else {
-        return ret(errno::EINVAL);
-    };
-    region.fill(0);
-    region[..pty.term.len()].copy_from_slice(pty.term.as_bytes());
-    for (offset, value) in [
-        (64, pty.term.len() as u32),
-        (68, pty.columns),
-        (72, pty.rows),
-        (76, pty.pixel_width),
-        (80, pty.pixel_height),
-        (84, pty.modes.len() as u32),
-    ] {
-        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-    for (index, (opcode, value)) in pty.modes.iter().enumerate() {
-        let offset = 88 + index * 8;
-        region[offset..offset + 4].copy_from_slice(&(*opcode as u32).to_le_bytes());
-        region[offset + 4..offset + 8].copy_from_slice(&value.to_le_bytes());
-    }
-    ret(0)
+    let modes: Vec<Value> = pty
+        .modes
+        .iter()
+        .map(|(opcode, value)| json!({"opcode": opcode, "value": value}))
+        .collect();
+    let value = json!({
+        "term": pty.term,
+        "columns": pty.columns,
+        "rows": pty.rows,
+        "pixel_width": pty.pixel_width,
+        "pixel_height": pty.pixel_height,
+        "modes": modes,
+    });
+    ret(insert_json(&inner, value))
 }
 
 // ---- declared process and PTY backing -----------------------------------
@@ -1569,55 +2057,102 @@ fn process_capability(inner: &Inner, id: u32) -> Result<synch_core::ProcessCapab
         .ok_or(errno::EPERM)
 }
 
-fn parse_pty_spec(
-    scope: &HelperScope,
-    ptr: u64,
-    len: u64,
-) -> Result<crate::runtime::ssh::PtyRequest, i64> {
-    if len != PTY_SPEC_SIZE {
+/// The most bytes a terminal name may carry, through either direction of the
+/// PTY spec JSON.
+const MAX_PTY_TERM_BYTES: usize = 64;
+
+/// The most `(opcode, value)` terminal modes one PTY spec may carry.
+const MAX_PTY_MODES: usize = 64;
+
+/// Reads the JSON `sy_ssh_pty_spec` writes — or one the guest built itself —
+/// back into a [`PtyRequest`](crate::runtime::ssh::PtyRequest).
+fn parse_pty_spec(value: &Value) -> Result<crate::runtime::ssh::PtyRequest, i64> {
+    let Value::Object(map) = value else {
         return Err(errno::EINVAL);
-    }
-    let raw = bytes(scope, ptr, len)?;
-    let term_len = le_u32(&raw, 64) as usize;
-    let mode_count = le_u32(&raw, 84) as usize;
-    if term_len > 64 || mode_count > 64 {
-        return Err(errno::EINVAL);
-    }
-    let term = String::from_utf8(raw[..term_len].to_vec()).map_err(|_| errno::EINVAL)?;
+    };
+    let number = |key: &str| -> Result<u32, i64> {
+        match map.get(key) {
+            None => Ok(0),
+            Some(value) => value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or(errno::EINVAL),
+        }
+    };
+    let term = match map.get("term") {
+        None => String::new(),
+        Some(Value::String(term)) => term.clone(),
+        Some(_) => return Err(errno::EINVAL),
+    };
     // Empty is legitimate: a client with no local terminal — `ssh -tt` from a
     // script or ProxyCommand — sends an empty name, and refusing it would
     // refuse the PTY. The child then simply gets no TERM variable.
-    if !term
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
+    if term.len() > MAX_PTY_TERM_BYTES
+        || !term
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+".contains(&byte))
     {
         return Err(errno::EINVAL);
     }
-    let mut modes = Vec::with_capacity(mode_count);
-    for index in 0..mode_count {
-        let offset = 88 + index * 8;
-        modes.push((le_u32(&raw, offset) as u8, le_u32(&raw, offset + 4)));
+    let mut modes = Vec::new();
+    match map.get("modes") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_PTY_MODES {
+                return Err(errno::EINVAL);
+            }
+            for item in items {
+                let opcode = item
+                    .get("opcode")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or(errno::EINVAL)?;
+                let value = item
+                    .get("value")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or(errno::EINVAL)?;
+                modes.push((opcode, value));
+            }
+        }
+        Some(_) => return Err(errno::EINVAL),
     }
     Ok(crate::runtime::ssh::PtyRequest {
         term,
-        columns: le_u32(&raw, 68),
-        rows: le_u32(&raw, 72),
-        pixel_width: le_u32(&raw, 76),
-        pixel_height: le_u32(&raw, 80),
+        columns: number("columns")?,
+        rows: number("rows")?,
+        pixel_width: number("pixel_width")?,
+        pixel_height: number("pixel_height")?,
         modes,
     })
+}
+
+/// How many live child-process handles the invocation holds.
+///
+/// The handle table alone must not bound OS children ([`crate::limits::MAX_LIVE_PROCESSES`]).
+fn live_processes(inner: &Inner) -> usize {
+    inner
+        .slots
+        .borrow()
+        .iter()
+        .flatten()
+        .filter(|slot| matches!(slot, Slot::Process(_)))
+        .count()
 }
 
 fn h_pty_open(
     scope: &HelperScope,
     capability_id: u64,
-    spec_ptr: u64,
-    spec_len: u64,
+    spec_handle: u64,
+    _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let spec = guest!(parse_pty_spec(scope, spec_ptr, spec_len));
     let inner = with(scope, Rc::clone)?;
+    let spec = match json_value(&inner, spec_handle as i64).and_then(|v| parse_pty_spec(&v)) {
+        Ok(spec) => spec,
+        Err(error) => return ret(error),
+    };
     if inner.init_mode {
         return ret(errno::EPERM);
     }
@@ -1625,6 +2160,9 @@ fn h_pty_open(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if inner.ptys.borrow().len() >= crate::limits::MAX_OPEN_PTYS {
+        return ret(errno::ELIMIT);
+    }
     let (master, slave) = match crate::runtime::process::open_pty(
         spec.columns,
         spec.rows,
@@ -1716,6 +2254,9 @@ fn h_process_spawn_pty(
         Ok(capability) if capability.flags & 0x01 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if live_processes(&inner) >= crate::limits::MAX_LIVE_PROCESSES {
+        return ret(errno::ELIMIT);
+    }
     let Some(pty) = inner.ptys.borrow().get(&(pty_handle as i64)).cloned() else {
         return ret(errno::EBADF);
     };
@@ -1775,6 +2316,9 @@ fn h_process_spawn(
         Ok(capability) if capability.flags & 0x02 != 0 => capability,
         Ok(_) | Err(_) => return ret(errno::EPERM),
     };
+    if live_processes(&inner) >= crate::limits::MAX_LIVE_PROCESSES {
+        return ret(errno::ELIMIT);
+    }
     let child_events = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
         Ok(events) => events,
         Err(_) => return ret(errno::ECONNRESET),
@@ -1853,17 +2397,18 @@ fn h_process_spawn(
 fn h_process_stdio(
     scope: &HelperScope,
     process: u64,
-    stream: u64,
-    _: u64,
+    stream_ptr: u64,
+    stream_len: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
+    let stream = guest!(string(scope, stream_ptr, stream_len));
     let Some(Slot2::Process(process)) = with(scope, |inner| inner.slot(process as i64))? else {
         return ret(errno::EBADF);
     };
-    match stream {
-        0 => ret(process.main),
-        1 => process.stderr.map_or_else(|| ret(errno::ENOENT), ret),
+    match stream.as_str() {
+        "main" => ret(process.main),
+        "stderr" => process.stderr.map_or_else(|| ret(errno::ENOENT), ret),
         _ => ret(errno::EINVAL),
     }
 }
@@ -1891,18 +2436,22 @@ fn h_pty_resize(
     }
 }
 
+/// Terminal status as a JSON handle: `{"exited": true, "exit_code",
+/// "signaled", "core_dumped", "signal"?}`.
+///
+/// `SY_EAGAIN` while the process is running; the status is repeatable — each
+/// call after exit hands back a fresh handle — until the process handle is
+/// closed.
 fn h_process_status(
     scope: &HelperScope,
     process: u64,
-    out: u64,
-    out_len: u64,
+    _: u64,
+    _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    if out_len < PROCESS_STATUS_SIZE {
-        return ret(errno::EINVAL);
-    }
-    let Some(Slot2::Process(process)) = with(scope, |inner| inner.slot(process as i64))? else {
+    let inner = with(scope, Rc::clone)?;
+    let Some(Slot2::Process(process)) = inner.slot(process as i64) else {
         return ret(errno::EBADF);
     };
     let status = match process.refresh() {
@@ -1912,25 +2461,16 @@ fn h_process_status(
     if !status.exited {
         return ret(errno::EAGAIN);
     }
-    let Ok(mut region) = scope.user_memory_mut(out, PROCESS_STATUS_SIZE) else {
-        return ret(errno::EINVAL);
-    };
-    region.fill(0);
-    for (offset, value) in [
-        (0, status.exited as u32),
-        (4, status.exit_code),
-        (8, status.signal.is_some() as u32),
-        (12, status.core_dumped as u32),
-    ] {
-        region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
+    let mut value = json!({
+        "exited": true,
+        "exit_code": status.exit_code,
+        "signaled": status.signal.is_some(),
+        "core_dumped": status.core_dumped,
+    });
     if let Some(signal) = status.signal {
-        let bytes = signal.as_bytes();
-        let n = bytes.len().min(32);
-        region[16..16 + n].copy_from_slice(&bytes[..n]);
-        region[48..52].copy_from_slice(&(n as u32).to_le_bytes());
+        value["signal"] = json!(signal);
     }
-    ret(1)
+    ret(insert_json(&inner, value))
 }
 
 fn h_process_signal(
@@ -1981,6 +2521,18 @@ fn h_sftp_open(
     };
     if capability.protocol != 1 || capability.access & 0x01 == 0 {
         return ret(errno::EPERM);
+    }
+    let open = inner
+        .slots
+        .borrow()
+        .iter()
+        .flatten()
+        .filter(|slot| {
+            matches!(slot, Slot::Endpoint(ep) if matches!(ep.role(), EndpointRole::FileTransfer))
+        })
+        .count();
+    if open >= crate::limits::MAX_OPEN_FILE_TRANSFERS {
+        return ret(errno::ELIMIT);
     }
     let endpoint = Endpoint::new(
         inner.limits.ring_bytes,
@@ -2168,6 +2720,9 @@ fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
             bits & (events | poll::ERR)
         }
         Some(Slot2::Cursor(_)) => poll::IN & events,
+        // Inert data: nothing about a JSON value will ever become ready, and
+        // reporting it would spin a poll loop that watches one by mistake.
+        Some(Slot2::Json(_)) => 0,
         Some(Slot2::Process(process)) => match process.refresh() {
             Ok(status) if status.exited => poll::IN & events,
             Ok(_) => 0,
@@ -2287,20 +2842,30 @@ fn h_open_root(scope: &HelperScope, ptr: u64, _: u64, _: u64, _: u64, _: u64) ->
     }
 }
 
-fn h_stat(scope: &HelperScope, handle: u64, ptr: u64, len: u64, _: u64, _: u64) -> Result<u64, ()> {
-    if len < STAT_SIZE {
-        return ret(errno::EINVAL);
-    }
-    let Some(Slot2::Object(obj)) = with(scope, |inner| inner.slot(handle as i64))? else {
+/// An object's metadata as a JSON handle: `{"size", "mtime_ns", "mode",
+/// "kind" ("file" | "dir" | "symlink" | "tombstone" | "socket"), "root"
+/// (the BLAKE3 content root, hex)}`.
+fn h_stat(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let Some(Slot2::Object(obj)) = inner.slot(handle as i64) else {
         return ret(errno::EBADF);
     };
-    let mut buf = [0u8; STAT_SIZE as usize];
-    buf[0..8].copy_from_slice(&obj.info.size.to_le_bytes());
-    buf[8..16].copy_from_slice(&obj.info.mtime_ns.to_le_bytes());
-    buf[16..20].copy_from_slice(&obj.info.mode.to_le_bytes());
-    buf[20..24].copy_from_slice(&obj.info.kind.to_le_bytes());
-    buf[24..56].copy_from_slice(obj.info.root.as_bytes());
-    out_exact(scope, ptr, STAT_SIZE, &buf)
+    let kind = match obj.info.kind {
+        0 => "file",
+        1 => "dir",
+        2 => "symlink",
+        3 => "tombstone",
+        4 => "socket",
+        _ => "unknown",
+    };
+    let value = json!({
+        "size": obj.info.size,
+        "mtime_ns": obj.info.mtime_ns,
+        "mode": obj.info.mode,
+        "kind": kind,
+        "root": obj.info.root.to_hex(),
+    });
+    ret(insert_json(&inner, value))
 }
 
 fn h_pread(
@@ -2703,13 +3268,18 @@ fn h_hmac_sha256(
     out_exact(scope, out, 32, tag.as_ref())
 }
 
-fn engine(kind: u64) -> Option<base64::engine::GeneralPurpose> {
+/// The base64 engine for a `SY_BASE64_*` flag set.
+///
+/// Two orthogonal booleans rather than a four-value enum: `SY_BASE64_URL`
+/// selects the URL-safe alphabet and `SY_BASE64_NO_PAD` drops the padding,
+/// alone or together. Anything else set is refused.
+fn engine(flags: u64) -> Option<base64::engine::GeneralPurpose> {
     use base64::engine::general_purpose::*;
-    match kind {
-        base64_kind::STANDARD => Some(STANDARD),
-        base64_kind::STANDARD_NO_PAD => Some(STANDARD_NO_PAD),
-        base64_kind::URL => Some(URL_SAFE),
-        base64_kind::URL_NO_PAD => Some(URL_SAFE_NO_PAD),
+    match flags {
+        0 => Some(STANDARD),
+        crate::abi::base64_flag::NO_PAD => Some(STANDARD_NO_PAD),
+        crate::abi::base64_flag::URL => Some(URL_SAFE),
+        crate::abi::base64_flag::URL_NO_PAD => Some(URL_SAFE_NO_PAD),
         _ => None,
     }
 }
@@ -2720,10 +3290,10 @@ fn h_base64_encode(
     len: u64,
     out: u64,
     out_len: u64,
-    kind: u64,
+    flags: u64,
 ) -> Result<u64, ()> {
     let data = guest!(bytes(scope, ptr, len));
-    let Some(engine) = engine(kind) else {
+    let Some(engine) = engine(flags) else {
         return ret(errno::EINVAL);
     };
     out_str(scope, out, out_len, &engine.encode(&data))
@@ -2733,11 +3303,11 @@ fn h_base64_decode_in_place(
     scope: &HelperScope,
     ptr: u64,
     len: u64,
-    kind: u64,
+    flags: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let Some(engine) = engine(kind) else {
+    let Some(engine) = engine(flags) else {
         return ret(errno::EINVAL);
     };
     // One registration, read and write through it. The cage refuses to write
@@ -2916,58 +3486,87 @@ fn h_declare_guarded_stack_frames(
     .and_then(ret)
 }
 
-fn le_u32(raw: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        raw[offset..offset + 4]
-            .try_into()
-            .expect("validated ABI field"),
-    )
+/// A nonzero program-local capability id out of a JSON object.
+fn capability_id_field(map: &serde_json::Map<String, Value>) -> Result<u32, i64> {
+    map.get("id")
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+        .filter(|id| *id != 0)
+        .ok_or(errno::EINVAL)
 }
 
-fn le_u64(raw: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        raw[offset..offset + 8]
-            .try_into()
-            .expect("validated ABI field"),
-    )
-}
-
-fn fixed_string(raw: &[u8], offset: usize, capacity: usize, len: u32) -> Result<String, i64> {
-    let len = len as usize;
-    if len > capacity {
-        return Err(errno::EINVAL);
+/// Named-flag bits out of a JSON string array: every name must be known.
+fn flag_bits(value: Option<&Value>, name_bit: impl Fn(&str) -> Option<u64>) -> Result<u64, i64> {
+    let items = match value {
+        None | Some(Value::Null) => return Ok(0),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(errno::EINVAL),
+    };
+    let mut bits = 0;
+    for item in items {
+        bits |= item.as_str().and_then(&name_bit).ok_or(errno::EINVAL)?;
     }
-    String::from_utf8(raw[offset..offset + len].to_vec()).map_err(|_| errno::EINVAL)
+    Ok(bits)
 }
 
+/// Declares one exact process capability from its JSON form:
+/// `{"id", "allow": ["pty" | "pipe", …], "executable", "argv": [...],
+///   "allowed_signals": ["HUP" | "INT" | "TERM", …]?}`.
 fn h_declare_process(
     scope: &HelperScope,
-    ptr: u64,
-    len: u64,
+    handle: u64,
+    _: u64,
     _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
     declaring!(scope);
-    if len != PROCESS_CAPABILITY_SIZE {
+    let inner = with(scope, Rc::clone)?;
+    let value = match json_value(&inner, handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    let Value::Object(map) = value else {
+        return ret(errno::EINVAL);
+    };
+    let id = match capability_id_field(&map) {
+        Ok(id) => id,
+        Err(error) => return ret(error),
+    };
+    let flags = match flag_bits(map.get("allow"), |name| match name {
+        "pty" => Some(0x01),
+        "pipe" => Some(0x02),
+        _ => None,
+    }) {
+        Ok(bits) => bits as u32,
+        Err(error) => return ret(error),
+    };
+    let allowed_signals = match flag_bits(map.get("allowed_signals"), |name| {
+        crate::runtime::process::signal_number(name).map(|(bit, _)| bit)
+    }) {
+        Ok(bits) => bits,
+        Err(error) => return ret(error),
+    };
+    let Some(executable) = map.get("executable").and_then(Value::as_str) else {
+        return ret(errno::EINVAL);
+    };
+    let argv: Vec<String> = match map.get("argv") {
+        Some(Value::Array(items)) => {
+            let mut argv = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(arg) => argv.push(arg.to_owned()),
+                    None => return ret(errno::EINVAL),
+                }
+            }
+            argv
+        }
+        _ => return ret(errno::EINVAL),
+    };
+    if argv.is_empty() || argv.len() > synch_core::sock::MAX_PROCESS_ARGS {
         return ret(errno::EINVAL);
     }
-    let raw = guest!(bytes(scope, ptr, len));
-    let executable = guest!(fixed_string(&raw, 8, 256, le_u32(&raw, 264)));
-    let argc = le_u32(&raw, 268) as usize;
-    if argc == 0 || argc > synch_core::sock::MAX_PROCESS_ARGS {
-        return ret(errno::EINVAL);
-    }
-    let mut argv = Vec::with_capacity(argc);
-    for index in 0..argc {
-        argv.push(guest!(fixed_string(
-            &raw,
-            272 + index * synch_core::sock::MAX_PROCESS_ARG_BYTES,
-            synch_core::sock::MAX_PROCESS_ARG_BYTES,
-            le_u32(&raw, 1296 + index * 4),
-        )));
-    }
-    let canonical = match std::fs::canonicalize(&executable) {
+    let canonical = match std::fs::canonicalize(executable) {
         Ok(path) => path,
         Err(_) => return ret(errno::ENOENT),
     };
@@ -2988,11 +3587,11 @@ fn h_declare_process(
         return ret(errno::EINVAL);
     };
     let capability = synch_core::ProcessCapability {
-        id: le_u32(&raw, 0),
-        flags: le_u32(&raw, 4),
+        id,
+        flags,
         executable,
         argv,
-        allowed_signals: le_u64(&raw, 1328),
+        allowed_signals,
     };
     with(scope, |inner| {
         let mut declaration = inner.declaration.borrow_mut();
@@ -3018,24 +3617,50 @@ fn h_declare_process(
     .and_then(ret)
 }
 
+/// Declares one scoped file-transfer capability from its JSON form:
+/// `{"id", "protocol": "sftp", "access": ["read", "recursive"?],
+///   "scope": "space/prefix"}`.
 fn h_declare_file_transfer(
     scope: &HelperScope,
-    ptr: u64,
-    len: u64,
+    handle: u64,
+    _: u64,
     _: u64,
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
     declaring!(scope);
-    if len != FILE_TRANSFER_CAPABILITY_SIZE {
+    let inner = with(scope, Rc::clone)?;
+    let value = match json_value(&inner, handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    let Value::Object(map) = value else {
         return ret(errno::EINVAL);
-    }
-    let raw = guest!(bytes(scope, ptr, len));
+    };
+    let id = match capability_id_field(&map) {
+        Ok(id) => id,
+        Err(error) => return ret(error),
+    };
+    let protocol = match map.get("protocol").and_then(Value::as_str) {
+        Some("sftp") => 0x01,
+        _ => return ret(errno::EINVAL),
+    };
+    let access = match flag_bits(map.get("access"), |name| match name {
+        "read" => Some(0x01),
+        "recursive" => Some(0x04),
+        _ => None,
+    }) {
+        Ok(bits) => bits as u32,
+        Err(error) => return ret(error),
+    };
+    let Some(transfer_scope) = map.get("scope").and_then(Value::as_str) else {
+        return ret(errno::EINVAL);
+    };
     let capability = synch_core::FileTransferCapability {
-        id: le_u32(&raw, 0),
-        protocol: le_u32(&raw, 4),
-        access: le_u32(&raw, 8),
-        scope: guest!(fixed_string(&raw, 12, 256, le_u32(&raw, 268))),
+        id,
+        protocol,
+        access,
+        scope: transfer_scope.to_owned(),
     };
     with(scope, |inner| {
         let mut declaration = inner.declaration.borrow_mut();

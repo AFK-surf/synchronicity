@@ -43,8 +43,14 @@ pub(crate) fn compile(
         // — `whoami.c`'s `field` did. Raising the inline cost threshold far
         // past any socket-sized function makes clang fold statics into their
         // callers, which is the same duplication tinycc does, minus the call.
+        // Cold call sites — an error path's `return finish(...)`, say — use
+        // their own threshold that the main one does not lift, and one
+        // surviving cold call puts the static right back in `.text`
+        // (`ssh-shell.c`'s `finish` did), so both get raised.
         "-mllvm",
         "-inline-threshold=2000000",
+        "-mllvm",
+        "-inline-cold-callsite-threshold=2000000",
         "-emit-llvm",
         "-S",
     ]);

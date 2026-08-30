@@ -22,6 +22,7 @@ use crate::{
     policy::{EffectivePolicy, PeerIdentity, SocketId},
     runtime::{
         endpoint::{reader_task, writer_task, Endpoint, EndpointRole, Readiness, State},
+        json::JsonSlot,
         map::SocketMaps,
         process::{ProcessSlot, PtySlot},
         ssh::SshState,
@@ -93,6 +94,7 @@ pub(crate) enum Slot {
     Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
+    Json(Rc<JsonSlot>),
 }
 
 impl Slot {
@@ -109,6 +111,9 @@ impl Slot {
             // A cursor is always ready: every answer it can give is already in
             // memory, so a program that polls one is told to go ahead.
             Slot::Cursor(_) => poll::IN,
+            // A JSON value is inert data: nothing about it will ever become
+            // ready, so it reports nothing and never keeps a poll waiting.
+            Slot::Json(_) => 0,
         }
     }
 }
@@ -343,6 +348,7 @@ impl Inner {
             Some(Slot::Process(process)) => Some(Slot2::Process(process.clone())),
             Some(Slot::Object(obj)) => Some(Slot2::Object(obj.clone())),
             Some(Slot::Cursor(cur)) => Some(Slot2::Cursor(cur.clone())),
+            Some(Slot::Json(json)) => Some(Slot2::Json(json.clone())),
             None => None,
         }
     }
@@ -435,6 +441,23 @@ impl Inner {
     /// lives.
     pub(crate) fn insert(&self, slot: Slot) -> Result<i64, i64> {
         let mut slots = self.slots.borrow_mut();
+        // Ring-bearing endpoints keep the pre-256 bound
+        // ([`crate::limits::MAX_OPEN_ENDPOINTS`]): the per-role budgets can
+        // be given back while their endpoints still hold rings, so the
+        // endpoints themselves are counted at the one place they all enter
+        // the table. The pristine slot-0 stream counts too — `select_raw`
+        // turns it into the caller's endpoint in place, never through here,
+        // and "`SY_SELF` included" must stay true either way.
+        if matches!(slot, Slot::Endpoint(_)) {
+            let open = slots
+                .iter()
+                .flatten()
+                .filter(|held| matches!(held, Slot::Endpoint(_) | Slot::Unselected(_)))
+                .count();
+            if open >= crate::limits::MAX_OPEN_ENDPOINTS {
+                return Err(errno::ELIMIT);
+            }
+        }
         if slots.is_empty() {
             // Only reachable off the served path — the arming run has no
             // endpoint table at all. Zero stays reserved there too, rather
@@ -530,6 +553,10 @@ impl Inner {
             Some(Slot::Cursor(cur)) => {
                 let held = cur.footprint();
                 self.release(held);
+                true
+            }
+            Some(Slot::Json(json)) => {
+                self.release(json.charged.get());
                 true
             }
             None => false,
@@ -705,6 +732,7 @@ pub(crate) enum Slot2 {
     Process(Rc<ProcessSlot>),
     Object(Rc<ObjectSlot>),
     Cursor(Rc<CursorSlot>),
+    Json(Rc<JsonSlot>),
 }
 
 /// Replaces anything a terminal should not be asked to render.

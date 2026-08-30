@@ -60,7 +60,7 @@ stopped working would fail the build rather than fail a reader.
    two endpoints without a buffer, and a short move leaves what did not fit
    where it already was.
 
-3. **Authorization is the handshake.** `sy_peer_origin`, `sy_peer_kind` and
+3. **Authorization is the handshake.** `sy_peer_origin`, `sy_peer_info` and
    `sy_peer_has_space` read an identity iroh authenticated before the program
    started. `sy_conn_meta` is the caller's own text and is none of those
    things — `whoami.c` prints the two under separate headings for a reason.

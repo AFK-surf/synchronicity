@@ -58,44 +58,45 @@ pub mod poll {
 pub const SY_SELF: i64 = 0;
 
 /// `struct sy_pollfd { sy_s64 handle; sy_u32 events; sy_u32 revents; }`.
+///
+/// The one guest-visible struct left in the ABI, and deliberately: `sy_poll`
+/// is the hot path, its array is one validated region however many handles it
+/// watches, and its three flat fields carry no enum worth a name. Everything
+/// structured — stat results, SSH events, PTY specs, process status, backing
+/// declarations — crosses the cage as a JSON handle instead (`sy_json_*`).
 pub(crate) const POLLFD_SIZE: u64 = 16;
 
-/// `struct sy_stat { sy_u64 size; sy_s64 mtime_ns; sy_u32 mode; sy_u32 kind; sy_u8 root[32]; }`.
-pub(crate) const STAT_SIZE: u64 = 56;
-
-/// `sizeof(struct sy_process_capability)` in the C SDK ABI.
-pub(crate) const PROCESS_CAPABILITY_SIZE: u64 = 1336;
-
-/// `sizeof(struct sy_file_transfer_capability)` in the C SDK ABI.
-pub(crate) const FILE_TRANSFER_CAPABILITY_SIZE: u64 = 272;
-
-/// `sizeof(struct sy_ssh_event)` in the C SDK ABI.
-pub(crate) const SSH_EVENT_SIZE: u64 = 48;
-
-/// `sizeof(struct sy_pty_spec)` in the C SDK ABI.
-pub(crate) const PTY_SPEC_SIZE: u64 = 600;
-
-/// `sizeof(struct sy_process_status)` in the C SDK ABI.
-pub(crate) const PROCESS_STATUS_SIZE: u64 = 52;
-
-/// What `sy_peer_kind` returns.
-pub mod peer_kind {
-    /// A rooted member: every space, by construction.
-    pub(crate) const MEMBER: u64 = 1;
-    /// A delegate: only the spaces its delegation names (§3.5).
-    pub(crate) const DELEGATE: u64 = 2;
+/// Flags for `sy_base64_encode` and `sy_base64_decode_in_place`.
+///
+/// Two orthogonal booleans rather than a four-value enum: the URL-safe
+/// alphabet and the padding are independent choices, combinable with `|`.
+pub mod base64_flag {
+    /// Use the URL-safe alphabet.
+    pub const URL: u64 = 0x1;
+    /// Omit (or refuse) `=` padding.
+    pub const NO_PAD: u64 = 0x2;
+    /// Both together, spelled out so the flag check can match exhaustively.
+    pub(crate) const URL_NO_PAD: u64 = URL | NO_PAD;
 }
 
-/// Base64 alphabets and padding, as `sy_base64_encode` takes them.
-pub mod base64_kind {
-    /// Standard alphabet, padded.
-    pub const STANDARD: u64 = 0;
-    /// Standard alphabet, unpadded.
-    pub const STANDARD_NO_PAD: u64 = 1;
-    /// URL-safe alphabet, padded.
-    pub const URL: u64 = 2;
-    /// URL-safe alphabet, unpadded.
-    pub(crate) const URL_NO_PAD: u64 = 3;
+/// What `sy_json_type` returns.
+///
+/// zeroserve's tags, verbatim: the JSON API is modeled on its, and a type tag
+/// is a discriminant a C program switches on, not a protocol value worth
+/// spelling out.
+pub mod json_type {
+    /// `null`.
+    pub const NULL: i64 = 0;
+    /// `true` or `false`.
+    pub const BOOL: i64 = 1;
+    /// A number.
+    pub const NUMBER: i64 = 2;
+    /// A string.
+    pub const STRING: i64 = 3;
+    /// An array.
+    pub const ARRAY: i64 = 4;
+    /// An object.
+    pub const OBJECT: i64 = 5;
 }
 
 /// The entrypoint section run once per incoming stream.

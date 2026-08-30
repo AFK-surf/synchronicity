@@ -5893,6 +5893,7 @@ dependencies = [
  "rand 0.8.7",
  "russh",
  "russh-sftp",
+ "serde_json",
  "synch-cc",
  "synch-core",
  "thiserror 2.0.20",

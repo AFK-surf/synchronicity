@@ -91,12 +91,17 @@ SY_ENTRY sy_s64 entry(void) {
   if (obj == SY_ENOENT) return refuse("no such file\n", 3);
   if (obj < 0) return refuse("cannot open\n", 4);
 
-  struct sy_stat st;
-  if (sy_stat(obj, &st, sizeof st) < 0) return refuse("cannot stat\n", 5);
+  /* Metadata is a JSON handle; `size` is the one field this program needs. */
+  sy_s64 st = sy_stat(obj);
+  if (st < 0) return refuse("cannot stat\n", 5);
+  sy_s64 size = 0;
+  sy_s64 got_size = sy_json_get_i64(st, SY_STR("size"), &size);
+  sy_close(st);
+  if (got_size < 0 || size < 0) return refuse("cannot stat\n", 5);
 
   char buf[2048];
   sy_u64 off = 0;
-  while (off < st.size) {
+  while (off < (sy_u64)size) {
     sy_s64 got = sy_pread(obj, buf, sizeof buf, off);
     if (got == SY_EAGAIN) {
       /* The bytes are not held locally yet. A cold read is an ordinary poll
@@ -113,5 +118,5 @@ SY_ENTRY sy_s64 entry(void) {
 
   sy_close(obj);
   sy_shutdown(SY_SELF);
-  return off == st.size ? 0 : 6;
+  return off == (sy_u64)size ? 0 : 6;
 }

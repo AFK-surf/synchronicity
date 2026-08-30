@@ -31,6 +31,7 @@ use crate::{
 pub(crate) const AUTH_NONE: u64 = 0x01;
 pub(crate) const AUTH_PUBLICKEY: u64 = 0x02;
 pub(crate) const AUTH_PASSWORD: u64 = 0x04;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const AUTH_ALL: u64 = AUTH_NONE | AUTH_PUBLICKEY | AUTH_PASSWORD;
 
 /// Bridges one SSH channel to its guest endpoint while keeping half-close and
@@ -340,6 +341,31 @@ impl SshState {
         let header = EventHeader::from(&event);
         store.outstanding.insert(event.id, event);
         Some(header)
+    }
+
+    /// Renders one outstanding event as the JSON `sy_ssh_next` hands over.
+    pub(crate) fn event_json(&self, id: u64) -> Option<serde_json::Value> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outstanding
+            .get(&id)
+            .map(render_event)
+    }
+
+    /// Puts an event `next` just took back at the head of the queue.
+    ///
+    /// For the one failure `sy_ssh_next` can hit after the pop — no room for
+    /// the event's JSON handle — so the event is offered again on the retry
+    /// rather than stranded outstanding with nothing pointing at it.
+    pub(crate) fn requeue(&self, id: u64) {
+        let mut store = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = store.outstanding.remove(&id) {
+            store.queued.push_front(event);
+        }
     }
 
     pub(crate) fn field(&self, id: u64, field: u32) -> Option<Vec<u8>> {
@@ -783,6 +809,16 @@ impl SshState {
         }
     }
 
+    /// How many lanes `fd` holds open, for the per-channel lane cap.
+    pub(crate) fn lane_count(&self, fd: i64) -> usize {
+        self.lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(parent, _)| *parent == fd)
+            .count()
+    }
+
     pub(crate) fn lane_handle(&self, fd: i64, data_type: u32) -> Option<i64> {
         self.lanes
             .lock()
@@ -859,42 +895,247 @@ impl SshState {
     }
 }
 
+/// What [`SshState::next`] hands the helper: enough to find the event again
+/// (`id`) and to reason about it in tests (`kind`). Everything else the guest
+/// learns comes from the event's JSON.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EventHeader {
     pub(crate) id: u64,
-    pub(crate) fd: i64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) data_len: u32,
-    pub(crate) aux_len: u32,
-    pub(crate) a: u32,
-    pub(crate) b: u32,
-    pub(crate) c: u32,
-    pub(crate) d: u32,
 }
 
 impl From<&Event> for EventHeader {
     fn from(event: &Event) -> Self {
-        let mut lengths = event.fields.values().map(Vec::len);
         Self {
             id: event.id,
-            fd: event.fd,
             kind: event.kind,
-            flags: event.flags,
-            data_len: lengths.next().unwrap_or(0) as u32,
-            aux_len: lengths.next().unwrap_or(0) as u32,
-            a: event.a,
-            b: event.b,
-            c: event.c,
-            d: event.d,
         }
     }
+}
+
+/// The `kind` string one event carries in its JSON.
+pub(crate) fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        EVENT_AUTH_NONE => "auth_none",
+        EVENT_AUTH_PASSWORD => "auth_password",
+        EVENT_AUTH_PUBLICKEY_OFFER => "auth_publickey_offer",
+        EVENT_AUTH_PUBLICKEY_VERIFIED => "auth_publickey_verified",
+        EVENT_AUTHENTICATED => "authenticated",
+        EVENT_AUTH_OPENSSH_CERT => "auth_openssh_cert",
+        EVENT_CHANNEL_OPEN => "channel_open",
+        EVENT_CHANNEL_REQUEST => "channel_request",
+        EVENT_CHANNEL_EXTENDED_DATA => "channel_extended_data",
+        _ => "unknown",
+    }
+}
+
+/// The raw field `sy_ssh_event_data` serves under one guest-visible name.
+///
+/// Every payload an event carries is reachable here, byte-for-byte as the
+/// wire delivered it — the JSON from `sy_ssh_next` is the decoded view, and
+/// the fields it leaves out (key and certificate blobs, channel open data,
+/// request payloads, a command that is not UTF-8) are exactly the ones a
+/// guest wants raw.
+pub(crate) fn field_id(name: &str) -> Option<u32> {
+    Some(match name {
+        "username" => FIELD_USERNAME,
+        "service" => FIELD_SERVICE,
+        "password" => FIELD_PASSWORD,
+        "public_key_algorithm" => FIELD_PUBLIC_KEY_ALGORITHM,
+        "public_key_blob" => FIELD_PUBLIC_KEY_BLOB,
+        "public_key_sha256" => FIELD_PUBLIC_KEY_SHA256,
+        "command" => FIELD_COMMAND,
+        "subsystem" => FIELD_SUBSYSTEM,
+        "channel_type" => FIELD_CHANNEL_TYPE,
+        "open_data" => FIELD_CHANNEL_OPEN_DATA,
+        "request_type" => FIELD_REQUEST_TYPE,
+        "request_data" => FIELD_REQUEST_DATA,
+        "destination_host" => FIELD_DESTINATION_HOST,
+        "originator_host" => FIELD_ORIGINATOR_HOST,
+        "signal" => FIELD_SIGNAL,
+        "terminal" => FIELD_TERMINAL,
+        "env_name" => FIELD_ENV_NAME,
+        "env_value" => FIELD_ENV_VALUE,
+        "auth_attempts" => FIELD_AUTH_ATTEMPTS,
+        "cert_flag" => FIELD_AUTH_CERT_FLAG,
+        "ca_public_key_blob" => FIELD_AUTH_CERT_CA_PUBLIC_KEY_BLOB,
+        "ca_public_key_sha256" => FIELD_AUTH_CERT_CA_SHA256,
+        "cert_key_id" => FIELD_AUTH_CERT_KEY_ID,
+        "cert_serial" => FIELD_AUTH_CERT_SERIAL,
+        "cert_type" => FIELD_AUTH_CERT_TYPE,
+        "cert_principals" => FIELD_AUTH_CERT_PRINCIPALS,
+        "cert_blob" => FIELD_AUTH_CERT_BLOB,
+        _ => return None,
+    })
+}
+
+/// The bit behind one auth method name, as `sy_ssh_start` and
+/// `sy_ssh_auth_reply` take them.
+pub(crate) fn method_name_bit(name: &str) -> Option<u64> {
+    Some(match name {
+        "none" => AUTH_NONE,
+        "publickey" => AUTH_PUBLICKEY,
+        "password" => AUTH_PASSWORD,
+        _ => return None,
+    })
+}
+
+/// Textual fields copied into the event JSON verbatim when they are UTF-8.
+///
+/// Most are strings by construction (russh hands them over as `&str`); a
+/// client-chosen `command` may not be, and is then reachable only through
+/// `sy_ssh_event_data`, raw.
+const JSON_TEXT_FIELDS: &[(u32, &str)] = &[
+    (FIELD_USERNAME, "username"),
+    (FIELD_SERVICE, "service"),
+    (FIELD_PASSWORD, "password"),
+    (FIELD_PUBLIC_KEY_ALGORITHM, "public_key_algorithm"),
+    (FIELD_CHANNEL_TYPE, "channel_type"),
+    (FIELD_REQUEST_TYPE, "request_type"),
+    (FIELD_DESTINATION_HOST, "destination_host"),
+    (FIELD_ORIGINATOR_HOST, "originator_host"),
+    (FIELD_SIGNAL, "signal"),
+    (FIELD_TERMINAL, "terminal"),
+    (FIELD_ENV_NAME, "env_name"),
+    (FIELD_ENV_VALUE, "env_value"),
+    (FIELD_SUBSYSTEM, "subsystem"),
+    (FIELD_COMMAND, "command"),
+];
+
+/// One event as `sy_ssh_next` hands it to the guest.
+///
+/// The decoded view: names instead of numbered kinds and fields, digests in
+/// hex, counters as numbers, certificate trust material as a sub-object. The
+/// binary payloads stay out of it and come raw through `sy_ssh_event_data`.
+fn render_event(event: &Event) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let mut out = Map::new();
+    out.insert("id".into(), json!(event.id));
+    out.insert("kind".into(), json!(kind_name(event.kind)));
+    if event.fd >= 0 {
+        out.insert("fd".into(), json!(event.fd));
+    }
+    for (field, name) in JSON_TEXT_FIELDS {
+        if let Some(text) = event
+            .fields
+            .get(field)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        {
+            out.insert((*name).into(), json!(text));
+        }
+    }
+    if let Some(digest) = event.fields.get(&FIELD_PUBLIC_KEY_SHA256) {
+        out.insert("public_key_sha256".into(), json!(hex::encode(digest)));
+    }
+    if let Some(bytes) = event.fields.get(&FIELD_AUTH_ATTEMPTS) {
+        if let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) {
+            out.insert("auth_attempts".into(), json!(u64::from_le_bytes(bytes)));
+        }
+    }
+    if event.fields.contains_key(&FIELD_AUTH_CERT_FLAG) {
+        out.insert("cert".into(), Value::Object(render_cert(event)));
+    }
+    match event.kind {
+        EVENT_CHANNEL_EXTENDED_DATA => {
+            out.insert("data_type".into(), json!(event.a));
+        }
+        EVENT_CHANNEL_OPEN => match event.fields.get(&FIELD_CHANNEL_TYPE).map(Vec::as_slice) {
+            Some(b"x11") => {
+                out.insert("originator_port".into(), json!(event.a));
+            }
+            Some(b"direct-tcpip" | b"forwarded-tcpip") => {
+                out.insert("port".into(), json!(event.a));
+                out.insert("originator_port".into(), json!(event.b));
+            }
+            _ => {}
+        },
+        EVENT_CHANNEL_REQUEST => {
+            out.insert(
+                "want_reply".into(),
+                json!(event.flags & EVENT_WANT_REPLY != 0),
+            );
+            match event.fields.get(&FIELD_REQUEST_TYPE).map(Vec::as_slice) {
+                Some(b"pty-req" | b"window-change") => {
+                    out.insert("columns".into(), json!(event.a));
+                    out.insert("rows".into(), json!(event.b));
+                    out.insert("pixel_width".into(), json!(event.c));
+                    out.insert("pixel_height".into(), json!(event.d));
+                }
+                Some(b"x11-req") => {
+                    out.insert("screen_number".into(), json!(event.a));
+                    out.insert("single_connection".into(), json!(event.b != 0));
+                }
+                Some(b"break") => {
+                    out.insert("break_ms".into(), json!(event.a));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    Value::Object(out)
+}
+
+/// The certificate sub-object of an auth event that carries one.
+fn render_cert(event: &Event) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::json;
+
+    let mut cert = serde_json::Map::new();
+    if let Some(digest) = event.fields.get(&FIELD_AUTH_CERT_CA_SHA256) {
+        cert.insert("ca_public_key_sha256".into(), json!(hex::encode(digest)));
+    }
+    if let Some(key_id) = event
+        .fields
+        .get(&FIELD_AUTH_CERT_KEY_ID)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    {
+        cert.insert("key_id".into(), json!(key_id));
+    }
+    if let Some(bytes) = event.fields.get(&FIELD_AUTH_CERT_SERIAL) {
+        if let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) {
+            cert.insert("serial".into(), json!(u64::from_le_bytes(bytes)));
+        }
+    }
+    if let Some(bytes) = event.fields.get(&FIELD_AUTH_CERT_TYPE) {
+        if let Ok(bytes) = <[u8; 4]>::try_from(bytes.as_slice()) {
+            cert.insert(
+                "type".into(),
+                match u32::from_le_bytes(bytes) {
+                    1 => json!("user"),
+                    2 => json!("host"),
+                    other => json!(other),
+                },
+            );
+        }
+    }
+    if let Some(mut bytes) = event
+        .fields
+        .get(&FIELD_AUTH_CERT_PRINCIPALS)
+        .map(Vec::as_slice)
+    {
+        let mut principals = Vec::new();
+        while bytes.len() >= 4 {
+            let len = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes")) as usize;
+            bytes = &bytes[4..];
+            if len > bytes.len() {
+                break;
+            }
+            if let Ok(principal) = std::str::from_utf8(&bytes[..len]) {
+                principals.push(json!(principal));
+            }
+            bytes = &bytes[len..];
+        }
+        cert.insert("principals".into(), json!(principals));
+    }
+    cert
 }
 
 /// The method name-list advertised to the client in `USERAUTH_FAILURE`.
 ///
 /// `none` is deliberately never in it: RFC 4252 §5.2 forbids listing `none`
-/// as a supported method. The `SY_SSH_AUTH_NONE` bit controls only whether a
+/// as a supported method. The `none` method bit controls only whether a
 /// `none` *attempt* may reach the guest and be accepted.
 fn advertised_methods(bits: u64) -> russh::MethodSet {
     let mut methods = russh::MethodSet::empty();

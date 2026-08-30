@@ -160,7 +160,7 @@ fn build_guest(template: &str, root: &Hash, name: &str) -> Vec<u8> {
 /// and `open_root` resolves any content in the store by hash alone, reporting
 /// `kind: 0` (`TreeHost::open_root`).
 struct KindAwareTree {
-    /// path -> (entry kind as SY_KIND_*, content)
+    /// path -> (entry kind as `ObjectInfo::kind`, content)
     files: std::collections::HashMap<String, (u32, Vec<u8>)>,
 }
 

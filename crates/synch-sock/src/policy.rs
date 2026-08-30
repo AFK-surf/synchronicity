@@ -78,11 +78,11 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
-    /// What `sy_peer_kind` returns: a rooted member, or a delegate.
-    pub fn kind(&self) -> u64 {
+    /// What `sy_peer_info` reports as `kind`: a rooted member, or a delegate.
+    pub fn kind(&self) -> &'static str {
         match self.spaces {
-            None => crate::abi::peer_kind::MEMBER,
-            Some(_) => crate::abi::peer_kind::DELEGATE,
+            None => "member",
+            Some(_) => "delegate",
         }
     }
 
@@ -324,14 +324,14 @@ mod tests {
             addr: String::new(),
             stream_index: 0,
         };
-        assert_eq!(member.kind(), crate::abi::peer_kind::MEMBER);
+        assert_eq!(member.kind(), "member");
         assert!(member.has_space("anything"));
 
         let delegate = PeerIdentity {
             spaces: Some(vec!["code".into()]),
             ..member
         };
-        assert_eq!(delegate.kind(), crate::abi::peer_kind::DELEGATE);
+        assert_eq!(delegate.kind(), "delegate");
         assert!(delegate.has_space("code"));
         assert!(!delegate.has_space("secrets"));
     }

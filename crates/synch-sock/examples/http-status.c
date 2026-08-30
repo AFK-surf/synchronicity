@@ -90,9 +90,16 @@ SY_ENTRY sy_s64 entry(void) {
   len = append(body, len, sizeof body, SY_STR("\npeer      "));
   sy_peer_origin(scratch, sizeof scratch);
   len = append(body, len, sizeof body, scratch, sy_strlen(scratch));
-  len = append(body, len, sizeof body,
-               sy_peer_kind() == SY_PEER_MEMBER ? " (member)" : " (delegate)",
-               sy_peer_kind() == SY_PEER_MEMBER ? 9 : 11);
+  /* The caller's kind is a name in the identity JSON, not a numbered enum. */
+  sy_s64 info = sy_peer_info();
+  char kind[16] = "unknown";
+  if (info >= 0) {
+    sy_json_get_string(info, SY_STR("kind"), kind, sizeof kind);
+    sy_close(info);
+  }
+  len = append(body, len, sizeof body, SY_STR(" ("));
+  len = append(body, len, sizeof body, kind, sy_strlen(kind));
+  len = append(body, len, sizeof body, SY_STR(")"));
 
   len = append(body, len, sizeof body, SY_STR("\nuptime-ms "));
   len = append_u64(body, len, sizeof body, sy_monotonic_ns() / 1000000);
