@@ -49,6 +49,12 @@ pub(crate) struct ObjectSlot {
     /// that asks for a different range gets a fresh read rather than the
     /// previous answer.
     pub(crate) want: Cell<(u64, u64)>,
+    /// The guest closed the handle. A fetch still in flight checks this when
+    /// it lands and gives its footprint charge back instead of parking an
+    /// answer nothing will ever collect (the handle index may even belong to
+    /// a new object by then — the task holds the old slot's `Rc`, not the
+    /// index).
+    pub(crate) closed: Cell<bool>,
     pub(crate) ready: Arc<Readiness>,
 }
 
@@ -661,6 +667,11 @@ impl Inner {
                     .map(|b| b.len() as u64)
                     .unwrap_or(0);
                 self.release(held);
+                // A read still in flight holds its own charge; the fetch task
+                // sees this flag when it lands and settles the whole charge
+                // itself, rather than parking bytes that would stay charged
+                // for the rest of the invocation.
+                obj.closed.set(true);
                 true
             }
             Some(Slot::Cursor(cur)) => {
@@ -843,6 +854,14 @@ impl Inner {
             // one can always accept more, a full buffer will drain, and a
             // dispatched commit has an answer on its way.
             Slot::Writer(writer) => writer.delivered.get(),
+            // A process handle is never quiet: a running child will exit —
+            // `watch_exit` bumps readiness when it does, so waiting on it is
+            // waiting, not finished — and an exited one has a status waiting
+            // to be collected. Before this arm existed the catch-all below
+            // read a *running* child's empty revents as "nothing can become
+            // ready", and a program that closed its streams and polled for
+            // its child's exit was told it was finished while the child ran.
+            Slot::Process(_) => false,
             // A cursor with an answer waiting is not quiet either.
             other => other.revents() == 0,
         })
