@@ -75,8 +75,113 @@ pub struct FakeTree {
     /// in the engine's tree): present in the listing (they are keys in
     /// `files`), but `open` refuses them and `entry_kind` refuses to
     /// classify them, so the SFTP backend skips them rather than fabricate
-    /// attributes.
+    /// attributes — and `put_open` refuses them the way the engine refuses
+    /// a declared socket path.
     pub refused: std::collections::HashSet<String>,
+    /// What tree writers committed, observable by tests — and the "live tree"
+    /// a conditional commit is evaluated against, mirroring the engine's
+    /// condition semantics over a flat map.
+    pub written: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    /// Paths tree writers deleted, in order.
+    pub deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    /// This many upcoming commits fail with `HostError::Io`, for exercising
+    /// the runtime's sticky-failure handling.
+    pub fail_commits: Arc<std::sync::Mutex<u32>>,
+}
+
+/// The [`FakeTree`] half of a `sy_put_*` writer: bytes accumulate in memory,
+/// and a commit lands them in the shared `written` map under the engine's
+/// condition semantics.
+pub struct FakeWriter {
+    path: String,
+    modes: u32,
+    staged: Vec<u8>,
+    written: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    fail_commits: Arc<std::sync::Mutex<u32>>,
+}
+
+#[async_trait::async_trait]
+impl synch_sock::SocketWriter for FakeWriter {
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), HostError> {
+        self.staged.extend_from_slice(&data);
+        Ok(())
+    }
+
+    async fn commit(
+        &mut self,
+        expected: synch_sock::PutCondition,
+    ) -> Result<synch_sock::PutReceipt, HostError> {
+        {
+            let mut failures = self.fail_commits.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(HostError::Io("injected commit failure".into()));
+            }
+        }
+        // The engine's `evaluate_put_condition`, over the flat map: the
+        // grant's modes gate what the commit does, and only then does a
+        // stated expectation get compared — same order, same error classes.
+        let mut written = self.written.lock().unwrap();
+        let live = written.contains_key(&self.path);
+        let create = self.modes & synch_core::TREE_WRITE_CREATE != 0;
+        let replace = self.modes & synch_core::TREE_WRITE_REPLACE != 0;
+        match expected {
+            synch_sock::PutCondition::Any => {
+                if live && !replace {
+                    return Err(HostError::Denied(
+                        "a live version exists and the grant cannot replace".into(),
+                    ));
+                }
+                if !live && !create {
+                    return Err(HostError::Denied(
+                        "no live version exists and the grant cannot create".into(),
+                    ));
+                }
+            }
+            synch_sock::PutCondition::Absent => {
+                if !create {
+                    return Err(HostError::Denied("the grant carries no create mode".into()));
+                }
+                if live {
+                    return Err(HostError::Conflict(
+                        "the path now has a live version".into(),
+                    ));
+                }
+            }
+            synch_sock::PutCondition::Root(root) => {
+                if !replace {
+                    return Err(HostError::Denied(
+                        "the grant carries no replace mode".into(),
+                    ));
+                }
+                let current = written.get(&self.path).map(|bytes| Hash::new(bytes));
+                if current != Some(root) {
+                    return Err(HostError::Conflict(
+                        "the path no longer has the expected version".into(),
+                    ));
+                }
+            }
+        }
+        let bytes = std::mem::take(&mut self.staged);
+        let receipt = synch_sock::PutReceipt {
+            root: Hash::new(&bytes),
+            size: bytes.len() as u64,
+        };
+        written.insert(self.path.clone(), bytes);
+        Ok(receipt)
+    }
+
+    async fn delete(&mut self) -> Result<(), HostError> {
+        // Re-taken as the engine re-takes it, so the fake cannot green-light
+        // a runtime that stopped checking.
+        if self.modes & synch_core::TREE_WRITE_DELETE == 0 {
+            return Err(HostError::Denied("the grant carries no delete mode".into()));
+        }
+        self.written.lock().unwrap().remove(&self.path);
+        self.deleted.lock().unwrap().push(self.path.clone());
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -167,6 +272,26 @@ impl SocketHost for FakeTree {
         let start = (offset as usize).min(bytes.len());
         let end = (start + len as usize).min(bytes.len());
         Ok(bytes[start..end].to_vec())
+    }
+
+    fn put_open(
+        &self,
+        path: &str,
+        modes: u32,
+    ) -> Result<Box<dyn synch_sock::SocketWriter>, HostError> {
+        // The engine's declared-socket refusal, over the same `refused` set
+        // the read side uses.
+        if self.refused.contains(path) {
+            return Err(HostError::Denied(format!("{path} is a declared socket")));
+        }
+        Ok(Box::new(FakeWriter {
+            path: path.to_string(),
+            modes,
+            staged: Vec::new(),
+            written: self.written.clone(),
+            deleted: self.deleted.clone(),
+            fail_commits: self.fail_commits.clone(),
+        }))
     }
 }
 

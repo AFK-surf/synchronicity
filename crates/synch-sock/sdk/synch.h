@@ -90,6 +90,8 @@ typedef unsigned char sy_u8;
 #define SY_ENOENT     -8  /* no such path, key or object                     */
 #define SY_EPIPE      -9  /* wrote after the peer's read side went away      */
 #define SY_ESTATE    -10  /* valid operation, wrong selected protocol state  */
+#define SY_ESTALE    -11  /* conditional commit lost: the tree moved         */
+#define SY_EIO       -12  /* staging or commit failed host-side (disk, CAS)  */
 
 /* ---- poll -------------------------------------------------------------- */
 
@@ -417,6 +419,48 @@ extern sy_s64 sy_pread(sy_s64 obj, void *buf, sy_u64 len, sy_u64 offset);
 extern sy_s64 sy_list_open(const char *prefix, sy_u64 prefix_len);
 extern sy_s64 sy_list_next(sy_s64 cursor, char *out, sy_u64 out_len);
 
+/* ---- writing the tree ---------------------------------------------------
+ *
+ * Requires an armed tree-write declaration (`sy_declare_tree_write`): the
+ * grant's prefix, modes and size bound are the operator's approval, and the
+ * helpers below are the only door to mutation. A committed write publishes
+ * this node's own new version of the path — an ordinary local publish, which
+ * wins `newest` selection like any local save — and a delete publishes this
+ * node's tombstone. A writer is opened, filled, committed (or deleted), and
+ * closed; `sy_close` on an uncommitted writer aborts it and nothing is
+ * published. See `docs/TREE-WRITES.md`. */
+
+/* Opens a writer on `space/path` under declared capability `id`. The path
+ * must sit inside the declared prefix by whole components, and a declared
+ * socket path is never writable. */
+extern sy_s64 sy_put_open(sy_u32 tree_write_capability, const char *path,
+                          sy_u64 path_len);
+/* Appends bytes to the writer's staging. A short count is backpressure,
+ * SY_EAGAIN a full buffer — poll the writer for SY_POLL_OUT. */
+extern sy_s64 sy_put_write(sy_s64 writer, const void *buf, sy_u64 len);
+/* Moves up to `max` bytes from an endpoint's rx ring into the writer,
+ * host-side — sy_splice with a writer destination. Same returns: a count,
+ * 0 at the source's clean EOF, SY_EAGAIN when nothing could move. */
+extern sy_s64 sy_put_splice(sy_s64 writer, sy_s64 from, sy_u64 max);
+/* Commits the staged bytes as this node's own new version of the path.
+ * First call dispatches and returns SY_EAGAIN; poll the writer for
+ * SY_POLL_IN, then repeat the call — it returns 0 and fills `root32` with
+ * the published content root. After success the writer is spent. A parked
+ * answer is collected only by the family that dispatched it: collecting a
+ * dispatched delete here (or a commit with sy_put_delete) is SY_ESTATE.
+ * A refusal (SY_EPERM, SY_ESTALE) leaves the writer retryable; a host-side
+ * failure (SY_EIO) is sticky — open a new writer. */
+extern sy_s64 sy_put_commit(sy_s64 writer, void *root32);
+/* The same, but only if this node's own live version of the path currently
+ * has content root `expected32`; all-zero expected means "no live version of
+ * ours" (create). SY_ESTALE if the tree moved: re-read and decide again. */
+extern sy_s64 sy_put_commit_if(sy_s64 writer, const void *expected32,
+                               void *root32);
+/* Publishes this node's tombstone for the path instead of bytes. Requires
+ * the `delete` mode and a writer with nothing staged. Idempotent: a path we
+ * already publish no live version of returns 0. */
+extern sy_s64 sy_put_delete(sy_s64 writer);
+
 /* ---- state that outlives an invocation ---------------------------------- */
 /* ttl_ms and the rate-limit window_ms are clamped to u32::MAX (about 49.7
  * days): a longer value is held at the clamp, which is indistinguishable
@@ -504,6 +548,13 @@ extern sy_s64 sy_declare_process(sy_s64 capability_json);
  * "access": ["read", "recursive"?], "scope" (exact normalized tree path of
  * at most 256 bytes)}. */
 extern sy_s64 sy_declare_file_transfer(sy_s64 capability_json);
+
+/* A tree-write capability is an object: {"id", "prefix" (a normalized tree
+ * path: a space, or space/dir), "allow": ["create" | "replace" | "delete"],
+ * "max_bytes"?}. `max_bytes` bounds one commit's staged bytes; absent means
+ * 16 MiB, and 0 means unbounded — printed loudly at the arm prompt, like
+ * egress port 0. */
+extern sy_s64 sy_declare_tree_write(sy_s64 capability_json);
 
 /* ---- what the compiler calls whether you write it or not ---------------- */
 

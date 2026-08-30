@@ -202,6 +202,29 @@ pub(crate) const MAX_OPEN_PTYS: usize = 16;
 /// from being a multiplier on host memory (`docs/SSH-SOCKETS.md` §9).
 pub(crate) const MAX_OPEN_FILE_TRANSFERS: usize = 16;
 
+/// The most tree writers one invocation may hold open
+/// (`docs/TREE-WRITES.md` §8).
+///
+/// A writer carries a [`WRITER_BUFFER_BYTES`] staging buffer and, engine-side,
+/// a staging file on the callee's disk. Bounded like the ring-bearing
+/// endpoints are — by its own count, not the footprint meter — so the 256-slot
+/// handle table cannot multiply either.
+pub(crate) const MAX_OPEN_WRITERS: usize = 4;
+
+/// Host bytes one tree writer buffers between the guest and the staging file.
+///
+/// A full buffer is backpressure — `sy_put_write` returns `SY_EAGAIN` and the
+/// writer polls `SY_POLL_OUT` when room appears — exactly as a full tx ring
+/// is.
+pub(crate) const WRITER_BUFFER_BYTES: usize = 256 * 1024;
+
+/// The most commits — deletes included — one invocation may dispatch.
+///
+/// A sanity bound on heads-per-stream rather than a quota: every commit is a
+/// published head, and a program with many files to publish per invocation is
+/// meant to batch them into fewer, larger objects.
+pub(crate) const MAX_PUT_COMMITS: u32 = 64;
+
 /// The most extended-data lanes one SSH channel may hold open.
 ///
 /// `data_type` is a guest-chosen `u32` and lanes are keyed per

@@ -160,6 +160,71 @@ pub trait SocketHost: Send + Sync + 'static {
             "entry kinds are not supported by this host".into(),
         ))
     }
+
+    /// Opens a writer that will publish `space/path` as this node's own new
+    /// version (`docs/TREE-WRITES.md` §6).
+    ///
+    /// The runtime has already checked the armed tree-write grant — the
+    /// prefix, the modes, the size bound — before this is reached; what the
+    /// engine's implementation re-takes are its own durable gates: the
+    /// declared-socket refusal, `.syncignore`, path normalization, recovery.
+    /// `modes` carries the grant's `TREE_WRITE_*` bits so the create/replace
+    /// condition can be evaluated at commit, against the tree as it is then.
+    ///
+    /// Synchronous for the reason `open` is — the checks are indexed reads of
+    /// local state — and the default fails: a host without write support
+    /// refuses rather than pretends.
+    fn put_open(&self, path: &str, modes: u32) -> Result<Box<dyn SocketWriter>, HostError> {
+        let _ = (path, modes);
+        Err(HostError::Unavailable(
+            "tree writes are not supported by this host".into(),
+        ))
+    }
+}
+
+/// One pending write into this node's own tree, behind a `sy_put_*` writer
+/// handle (`docs/TREE-WRITES.md` §5).
+///
+/// Driven sequentially by the writer's pump task: chunks in order, then one
+/// commit or delete. Dropping it without committing aborts the write — the
+/// engine's staging cleanup is its `Drop`.
+#[async_trait::async_trait]
+pub trait SocketWriter: Send + 'static {
+    /// Appends one chunk to the staged bytes.
+    async fn write(&mut self, data: Vec<u8>) -> Result<(), HostError>;
+
+    /// Publishes the staged bytes as this node's own new version of the path.
+    ///
+    /// The condition is evaluated at commit against this node's own live
+    /// entry, under the engine's tree-write lock; a lost condition is
+    /// [`HostError::Conflict`], and nothing is published.
+    async fn commit(&mut self, expected: PutCondition) -> Result<PutReceipt, HostError>;
+
+    /// Publishes this node's tombstone for the path instead of bytes.
+    ///
+    /// Idempotent like an S3 delete: a path this node already does not
+    /// publish live succeeds.
+    async fn delete(&mut self) -> Result<(), HostError>;
+}
+
+/// What a [`SocketWriter::commit`] requires of the path's current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutCondition {
+    /// Commit whatever is there: last write wins, like an S3 `PUT`.
+    Any,
+    /// This node must currently publish no live version of its own.
+    Absent,
+    /// This node's own live version must have exactly this content root.
+    Root(Hash),
+}
+
+/// What a successful commit published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutReceipt {
+    /// The BLAKE3 content root of the published version.
+    pub root: Hash,
+    /// Its size in bytes.
+    pub size: u64,
 }
 
 /// One bounded storage page returned by [`SocketHost::list_page`].
@@ -187,6 +252,16 @@ pub enum HostError {
     /// The bytes could not be produced.
     #[error("{0}")]
     Unavailable(String),
+    /// A write refused by the engine's own gates: a declared socket path, a
+    /// mode the grant does not carry, an ignored path, a node in recovery.
+    #[error("{0}")]
+    Denied(String),
+    /// A conditional commit lost: the tree moved underneath it.
+    #[error("{0}")]
+    Conflict(String),
+    /// Staging or committing failed host-side: disk, CAS, the store.
+    #[error("{0}")]
+    Io(String),
 }
 
 /// The semantic type of a tree entry exposed through [`SocketHost`].

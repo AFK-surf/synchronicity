@@ -47,6 +47,8 @@ mod tests {
             ("SY_ENOENT", errno::ENOENT),
             ("SY_EPIPE", errno::EPIPE),
             ("SY_ESTATE", errno::ESTATE),
+            ("SY_ESTALE", errno::ESTALE),
+            ("SY_EIO", errno::EIO),
             ("SY_POLL_IN", poll::IN as i64),
             ("SY_POLL_OUT", poll::OUT as i64),
             ("SY_POLL_HUP", poll::HUP as i64),

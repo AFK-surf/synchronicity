@@ -1071,7 +1071,7 @@ pub(crate) fn target_within(root: &Path, space_id: &str, path: &str) -> Result<P
 }
 
 /// Normalizes a write path and applies the host platform's relative-path rules.
-fn normalized_adoption_path(path: &str) -> Result<String> {
+pub(crate) fn normalized_adoption_path(path: &str) -> Result<String> {
     let normalized =
         synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
     // And the platform has to agree the result is purely relative before it

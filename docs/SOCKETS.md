@@ -569,8 +569,9 @@ four-alphabet enum.
 `sy_declare_name`, `sy_declare_egress(host, len, port)` (port `0` means any port
 on that host and is printed in red at the arm prompt), `sy_declare_max_streams`,
 `sy_declare_stack_frame_size(bytes)`,
-`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(json)` and
-`sy_declare_file_transfer(json)` (`docs/SSH-SOCKETS.md` §7). The two
+`sy_declare_guarded_stack_frames(enabled)`, `sy_declare_process(json)`,
+`sy_declare_file_transfer(json)` (`docs/SSH-SOCKETS.md` §7) and
+`sy_declare_tree_write(json)` (`docs/TREE-WRITES.md` §3). The two
 backing-service declarations take JSON handles —
 `{"id", "allow": ["pty" | "pipe"], "executable", "argv",
 "allowed_signals": ["HUP" | "INT" | "TERM"]}` and
@@ -580,6 +581,12 @@ family is valid inside `synchronicity.init`.
 
 There is no `sy_declare_tree_read`: reading the tree is not a declared
 capability (§7.6).
+
+`sy_declare_tree_write(json)` declares a prefix-scoped write grant —
+`{"id", "prefix", "allow": ["create" | "replace" | "delete"], "max_bytes"?}` —
+which is the one declaration family whose gate is a boundary rather than a
+prompt line: the `sy_put_*` helpers are the only door to mutation
+(`docs/TREE-WRITES.md` §3).
 
 `sy_declare_stack_frame_size` must match the compiler's eBPF stack-frame
 setting. It accepts a multiple of 16 from 16 bytes through 32 KiB; omitting it
@@ -661,6 +668,17 @@ get-read-close spelling of the common case.
 The JSON family is pure data manipulation, so it is the one part of the API
 valid in `synchronicity.init` as well as in the stream entrypoint: the
 declaration helpers take JSON.
+
+### 7.12 Writing the tree — declared, and a boundary
+
+`sy_put_open`, `sy_put_write`, `sy_put_splice`, `sy_put_commit`,
+`sy_put_commit_if` and `sy_put_delete` publish file versions and tombstones
+into this node's own trie, behind an armed `sy_declare_tree_write` grant
+(§7.9). A committed write is an ordinary local publish through the same
+ingest path an S3 `PUT` takes; a declared socket path is never writable. The
+whole design — why the write declaration is enforceable where the read one
+(§7.6) was decorative, the writer lifecycle, the commit conditions, and the
+bounds — is **[docs/TREE-WRITES.md](TREE-WRITES.md)**.
 
 ## 8. A whole socket, end to end
 
@@ -899,6 +917,11 @@ own.
 | `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
 | `Open` handshake | 120 s, 8 per connection | The shared accept path's per-stream timeout and per-connection in-flight cap, applied to the one phase of a socket stream that has no runtime of its own: a stream that never finishes its `Open` is not an invocation, and without a bound it would own a task and a buffer for as long as the peer keeps the connection. The bound ends the moment the `Open` is admitted — a socket that proxies is supposed to be long-lived, and its concurrency bound is the armed `max_streams`, not this. |
 | Declared sockets per space | 64 | A declaration is operator state; this is a sanity bound, not a quota. |
+| Tree-write declarations per program | 16 | Like the other per-family declaration caps (`docs/TREE-WRITES.md` §8). |
+| Open tree writers per invocation | 4 | Each holds a 256 KiB staging buffer and, engine-side, a staging file; counted as their own role, like endpoints, not charged to the footprint. Over: `sy_put_open` returns `SY_ELIMIT`. |
+| Tree-writer staging buffer | 256 KiB | Full is backpressure: `SY_EAGAIN`, poll `SY_POLL_OUT`. |
+| Bytes per tree-write commit | declared `max_bytes`, default 16 MiB | Enforced as bytes enter staging (`SY_ELIMIT`), never at commit. `0` = unbounded, printed loudly at arm. |
+| Tree-write commits per invocation | 64 | Deletes included. A sanity bound on heads-per-stream, not a quota; a program with many files to publish batches them into fewer, larger objects. |
 
 | What happens | Stream | And then |
 | --- | --- | --- |
@@ -956,11 +979,12 @@ own.
 
 ## 12. Non-goals, and what comes after
 
+An earlier revision's first non-goal — *writing to the tree from a program* —
+has since been designed and built: **[docs/TREE-WRITES.md](TREE-WRITES.md)**,
+the `sy_put_*` family behind an operator-armed tree-write declaration (§7.12).
+
 Not in this design:
 
-- **Writing to the tree from a program.** Publishing is the scanner's job and
-  stays that way. A remotely-triggered publish path is a much larger surface
-  than a remotely-triggered read one, and nothing here needs it.
 - **Listening sockets opened by a program.** Outbound TCP only. A program that
   could bind a port would be a service the operator never configured.
 - **UDP, QUIC or raw sockets as egress**, and no TLS termination inside the

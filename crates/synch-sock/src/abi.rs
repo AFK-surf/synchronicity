@@ -34,6 +34,10 @@ pub mod errno {
     pub(crate) const EPIPE: i64 = -9;
     /// The operation is invalid in the handle's selected protocol state.
     pub(crate) const ESTATE: i64 = -10;
+    /// A conditional commit lost: the tree moved underneath it.
+    pub(crate) const ESTALE: i64 = -11;
+    /// Staging or committing failed host-side: disk, CAS, the store.
+    pub(crate) const EIO: i64 = -12;
 }
 
 /// Readiness bits, for `sy_poll`'s `events` and `revents`.

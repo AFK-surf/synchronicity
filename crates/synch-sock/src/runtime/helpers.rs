@@ -30,7 +30,7 @@ use crate::{
     abi::{errno, poll, POLLFD_SIZE, SY_SELF},
     limits::{CURSOR_ENTRY_OVERHEAD, MAX_GUEST_DURATION_MS, MAX_LOG_LINE},
     runtime::{
-        ctx::{Ctx, CursorSlot, Inner, ObjectSlot, Slot, Slot2},
+        ctx::{Ctx, CursorSlot, Inner, ObjectSlot, PutCommand, Slot, Slot2, WriterSlot},
         endpoint::{connect_task, Endpoint, EndpointRole, State},
         json::{json_size, type_tag, JsonSlot},
     },
@@ -130,6 +130,13 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ("sy_pread", h_pread),
     ("sy_list_open", h_list_open),
     ("sy_list_next", h_list_next),
+    // writing the tree (docs/TREE-WRITES.md)
+    ("sy_put_open", h_put_open),
+    ("sy_put_write", h_put_write),
+    ("sy_put_splice", h_put_splice),
+    ("sy_put_commit", h_put_commit),
+    ("sy_put_commit_if", h_put_commit_if),
+    ("sy_put_delete", h_put_delete),
     // state
     ("sy_map_get", h_map_get),
     ("sy_map_set", h_map_set),
@@ -159,6 +166,7 @@ pub(crate) const HELPERS: &[(&str, Helper)] = &[
     ),
     ("sy_declare_process", h_declare_process),
     ("sy_declare_file_transfer", h_declare_file_transfer),
+    ("sy_declare_tree_write", h_declare_tree_write),
     ("sy_ssh_exit_status_lost", h_ssh_exit_status_lost),
 ];
 
@@ -1087,6 +1095,17 @@ fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
         Some(Slot2::Cursor(_)) => ret(0),
         Some(Slot2::Json(_)) => ret(0),
         Some(Slot2::Process(process)) => ret(process.refresh().err().unwrap_or(0)),
+        Some(Slot2::Writer(writer)) => {
+            let code = if writer.failed.get() != 0 {
+                writer.failed.get()
+            } else {
+                match &*writer.result.borrow() {
+                    Some(Err(e)) => *e,
+                    _ => 0,
+                }
+            };
+            ret(code)
+        }
         None => ret(errno::EBADF),
     }
 }
@@ -2723,6 +2742,7 @@ fn revents_for(inner: &Inner, handle: i64, events: u32) -> u32 {
         // Inert data: nothing about a JSON value will ever become ready, and
         // reporting it would spin a poll loop that watches one by mistake.
         Some(Slot2::Json(_)) => 0,
+        Some(Slot2::Writer(writer)) => writer.poll_revents(events),
         Some(Slot2::Process(process)) => match process.refresh() {
             Ok(status) if status.exited => poll::IN & events,
             Ok(_) => 0,
@@ -2802,6 +2822,9 @@ fn host_errno(e: &crate::HostError) -> i64 {
         crate::HostError::NotFound => errno::ENOENT,
         crate::HostError::NotReadable(_) => errno::EPERM,
         crate::HostError::Unavailable(_) => errno::ECONNRESET,
+        crate::HostError::Denied(_) => errno::EPERM,
+        crate::HostError::Conflict(_) => errno::ESTALE,
+        crate::HostError::Io(_) => errno::EIO,
     }
 }
 
@@ -3038,6 +3061,448 @@ fn h_list_next(
         cur.at.set(at + 1);
     }
     result
+}
+
+// ---- writing the tree (docs/TREE-WRITES.md) ------------------------------
+
+/// Drains a writer's staging buffer into the host and performs its one
+/// command, in order, off the guest's back.
+///
+/// The pump owns the [`SocketWriter`](crate::SocketWriter): a guest that
+/// closes the handle uncommitted makes this task exit, and dropping the host
+/// writer is what removes the staging behind it. An operation already
+/// dispatched still runs to completion — a commit is atomic engine-side —
+/// with its result discarded, exactly as an invocation killed mid-commit
+/// leaves the tree either committed or untouched, never half-written.
+async fn writer_pump(
+    inner: Rc<Inner>,
+    slot: Rc<WriterSlot>,
+    mut host_writer: Box<dyn crate::SocketWriter>,
+) {
+    loop {
+        if slot.closed.get() {
+            return;
+        }
+        let chunk: Vec<u8> = {
+            let mut buf = slot.buf.borrow_mut();
+            let n = buf.len().min(64 * 1024);
+            buf.drain(..n).collect()
+        };
+        if !chunk.is_empty() {
+            match host_writer.write(chunk).await {
+                Ok(()) => {
+                    // Room appeared; a guest parked on OUT can continue.
+                    slot.ready.bump();
+                    continue;
+                }
+                Err(e) => {
+                    slot.failed.set(host_errno(&e));
+                    slot.ready.bump();
+                    return;
+                }
+            }
+        }
+        if let Some(command) = slot.command.take() {
+            let outcome = match command {
+                PutCommand::Commit(condition) => host_writer
+                    .commit(condition)
+                    .await
+                    .map(|receipt| Some(receipt.root)),
+                PutCommand::Delete => host_writer.delete().await.map(|_| None),
+            };
+            slot.op_pending.set(false);
+            let parked = outcome.map_err(|e| host_errno(&e));
+            let succeeded = parked.is_ok();
+            // A refusal (`SY_ESTALE`, `SY_EPERM`) leaves the host's staging
+            // intact by contract — evaluated before anything is consumed —
+            // so the guest may repair and re-dispatch. Anything else (disk,
+            // CAS, a vanished space) may have consumed the staging on its
+            // way down, and a retry over unknown staging is how an empty
+            // file gets published under a valid receipt: sticky instead.
+            let retryable = matches!(parked, Err(code)
+                if code == errno::ESTALE || code == errno::EPERM);
+            if succeeded || retryable {
+                *slot.result.borrow_mut() = Some(parked);
+            } else if let Err(code) = parked {
+                slot.failed.set(code);
+            }
+            // A commit landing is progress in exactly the idle deadline's
+            // sense, and a refused one is the answer the guest was parked on.
+            inner.made_progress();
+            slot.ready.bump();
+            if succeeded || !retryable {
+                // Spent on success, broken on a sticky failure; either way
+                // nothing further will be asked of this writer.
+                return;
+            }
+            continue;
+        }
+        slot.work.notified().await;
+    }
+}
+
+/// Why a writer cannot take more bytes right now, or `None` if it can.
+///
+/// Sticky failure first — nothing recovers a broken staging — then the
+/// lifecycle states: a dispatched, parked, or delivered operation makes
+/// further writes a program bug, which is what `SY_ESTATE` is for.
+fn writer_not_accepting(writer: &WriterSlot) -> Option<i64> {
+    if writer.failed.get() != 0 {
+        return Some(writer.failed.get());
+    }
+    if writer.delivered.get()
+        || writer.op_pending.get()
+        || writer.command.get().is_some()
+        || writer.result.borrow().is_some()
+    {
+        return Some(errno::ESTATE);
+    }
+    None
+}
+
+fn h_put_open(
+    scope: &HelperScope,
+    capability_id: u64,
+    path_ptr: u64,
+    path_len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let raw = guest!(string(scope, path_ptr, path_len));
+    let inner = with(scope, Rc::clone)?;
+    if inner.init_mode {
+        return ret(errno::EPERM);
+    }
+    let Ok(path) = synch_core::normalize_path(&raw) else {
+        return ret(errno::EINVAL);
+    };
+    // A write names a file inside a space, never a space itself.
+    if !path
+        .split_once('/')
+        .is_some_and(|(space, rest)| !space.is_empty() && !rest.is_empty())
+    {
+        return ret(errno::EINVAL);
+    }
+    let Some(capability) = inner
+        .policy
+        .tree_writes
+        .iter()
+        .find(|capability| capability.id == capability_id as u32)
+        .cloned()
+    else {
+        return ret(errno::EPERM);
+    };
+    if !capability.covers(&path) {
+        tracing::warn!(
+            socket = %inner.socket.qualified(),
+            path,
+            prefix = capability.prefix,
+            "socket tree write refused: the path is outside the armed prefix"
+        );
+        return ret(errno::EPERM);
+    }
+    let writers = inner
+        .slots
+        .borrow()
+        .iter()
+        .flatten()
+        .filter(|slot| matches!(slot, Slot::Writer(_)))
+        .count();
+    if writers >= crate::limits::MAX_OPEN_WRITERS {
+        return ret(errno::ELIMIT);
+    }
+    // The engine's own gates — the declared-socket refusal, `.syncignore`,
+    // recovery — are re-taken behind this call; the grant above is the
+    // runtime's half of the check.
+    let host_writer = match inner.host.put_open(&path, capability.modes) {
+        Ok(writer) => writer,
+        Err(e) => {
+            tracing::warn!(
+                socket = %inner.socket.qualified(),
+                path,
+                "socket tree write refused: {e}"
+            );
+            return ret(host_errno(&e));
+        }
+    };
+    let slot = Rc::new(WriterSlot {
+        path,
+        capability,
+        buf: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        work: Rc::new(tokio::sync::Notify::new()),
+        command: std::cell::Cell::new(None),
+        dispatched: std::cell::Cell::new(None),
+        op_pending: std::cell::Cell::new(false),
+        result: std::cell::RefCell::new(None),
+        delivered: std::cell::Cell::new(false),
+        failed: std::cell::Cell::new(0),
+        accepted: std::cell::Cell::new(0),
+        closed: std::cell::Cell::new(false),
+        ready: inner.ready.clone(),
+    });
+    let handle = match inner.insert(Slot::Writer(slot.clone())) {
+        Ok(handle) => handle,
+        Err(error) => return ret(error),
+    };
+    inner.spawn(writer_pump(inner.clone(), slot, host_writer));
+    inner.publish_handles();
+    ret(handle)
+}
+
+fn h_put_write(
+    scope: &HelperScope,
+    handle: u64,
+    ptr: u64,
+    len: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let data = guest!(bytes(scope, ptr, len));
+    let inner = with(scope, Rc::clone)?;
+    let Some(Slot2::Writer(writer)) = inner.slot(handle as i64) else {
+        return ret(errno::EBADF);
+    };
+    if let Some(code) = writer_not_accepting(&writer) {
+        return ret(code);
+    }
+    // The declared per-commit bound is enforced as bytes enter staging, before
+    // the disk holds more than the grant allows — never at commit, when it
+    // already does.
+    let max = writer.capability.max_bytes;
+    if max > 0 && writer.accepted.get().saturating_add(len) > max {
+        return ret(errno::ELIMIT);
+    }
+    let room = writer.room();
+    if room == 0 {
+        return ret(errno::EAGAIN);
+    }
+    let n = data.len().min(room);
+    writer.buf.borrow_mut().extend(&data[..n]);
+    writer.accepted.set(writer.accepted.get() + n as u64);
+    writer.work.notify_one();
+    inner.made_progress();
+    ret(n as i64)
+}
+
+/// Moves bytes from an endpoint's rx ring into a writer's staging, host-side.
+///
+/// `sy_splice` with a writer destination, and for the same reason: a drop-box
+/// that never inspects the payload has no reason to lift it over the pointer
+/// cage. Same returns too — a count, `0` at the source's clean EOF,
+/// `SY_EAGAIN` when nothing could move — and the writer is checked before
+/// anything leaves the source.
+fn h_put_splice(
+    scope: &HelperScope,
+    handle: u64,
+    from: u64,
+    max: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    // Zero would have to mean both "moved nothing" and "the source ended";
+    // refused as the malformed argument it is, exactly as `sy_splice` does.
+    if max == 0 {
+        return ret(errno::EINVAL);
+    }
+    let inner = with(scope, Rc::clone)?;
+    let Some(Slot2::Writer(writer)) = inner.slot(handle as i64) else {
+        return ret(errno::EBADF);
+    };
+    if let Some(code) = writer_not_accepting(&writer) {
+        return ret(code);
+    }
+    let src = match inner.endpoint_for_io(from as i64) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return ret(error),
+    };
+    let avail = src.readable();
+    if avail == 0 {
+        // The same answer `sy_read` gives an empty ring: `0` at a clean EOF,
+        // the endpoint's errno, `SY_EAGAIN` while it may still fill. Checked
+        // before the grant bound, so a payload of exactly `max_bytes` ends at
+        // its clean EOF instead of tripping `SY_ELIMIT` with nothing left.
+        return ret(src.read(&mut []));
+    }
+    let mut room = writer
+        .room()
+        .min(usize::try_from(max).unwrap_or(usize::MAX));
+    let bound = writer.capability.max_bytes;
+    if bound > 0 {
+        let remaining = bound.saturating_sub(writer.accepted.get());
+        if remaining == 0 {
+            return ret(errno::ELIMIT);
+        }
+        room = room.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+    }
+    let n = avail.min(room);
+    if n == 0 {
+        return ret(errno::EAGAIN);
+    }
+    let mut moved = vec![0u8; n];
+    let took = src.read(&mut moved);
+    if took <= 0 {
+        return ret(took);
+    }
+    writer.buf.borrow_mut().extend(&moved[..took as usize]);
+    writer.accepted.set(writer.accepted.get() + took as u64);
+    writer.work.notify_one();
+    inner.made_progress();
+    // Counted as sy_splice counts its source: caller-facing bytes only.
+    if src.role().counts_stream_bytes() {
+        inner
+            .live
+            .bytes_in
+            .fetch_add(took as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    ret(took)
+}
+
+/// The shared body of the three dispatch helpers: deliver a parked answer, or
+/// validate and dispatch the command — `sy_pread`'s repeat-the-call shape.
+fn put_op(
+    scope: &HelperScope,
+    handle: u64,
+    command: PutCommand,
+    out_ptr: Option<u64>,
+) -> Result<u64, ()> {
+    let inner = with(scope, Rc::clone)?;
+    let Some(Slot2::Writer(writer)) = inner.slot(handle as i64) else {
+        return ret(errno::EBADF);
+    };
+    if writer.failed.get() != 0 {
+        return ret(writer.failed.get());
+    }
+    // An in-flight or parked answer belongs to the call that dispatched it:
+    // a commit collecting a delete's bare success would return 0 with the
+    // root buffer unwritten, and a delete collecting a commit would discard
+    // the receipt. The wrong collector is the lifecycle bug `SY_ESTATE`
+    // names, and the parked answer stays for the right one.
+    let kind = command.kind();
+    if writer
+        .dispatched
+        .get()
+        .is_some_and(|dispatched| dispatched != kind)
+    {
+        return ret(errno::ESTATE);
+    }
+    // A parked answer is what the repeated call collects, before anything new
+    // is dispatched.
+    let parked = writer.result.borrow_mut().take();
+    if let Some(outcome) = parked {
+        match outcome {
+            Ok(root) => {
+                if let (Some(ptr), Some(root)) = (out_ptr, root) {
+                    let Ok(mut region) = scope.user_memory_mut(ptr, 32) else {
+                        // Park it again: a corrected retry can still collect.
+                        *writer.result.borrow_mut() = Some(Ok(Some(root)));
+                        return ret(errno::EINVAL);
+                    };
+                    region.copy_from_slice(root.as_bytes());
+                }
+                writer.dispatched.set(None);
+                writer.delivered.set(true);
+                return ret(0);
+            }
+            // A failed operation is not the writer's end: a lost condition is
+            // retryable once the guest has read the tree again.
+            Err(code) => {
+                writer.dispatched.set(None);
+                return ret(code);
+            }
+        }
+    }
+    if writer.op_pending.get() || writer.command.get().is_some() {
+        return ret(errno::EAGAIN);
+    }
+    if writer.delivered.get() {
+        return ret(errno::ESTATE);
+    }
+    match command {
+        PutCommand::Delete => {
+            if writer.capability.modes & synch_core::TREE_WRITE_DELETE == 0 {
+                tracing::warn!(
+                    socket = %inner.socket.qualified(),
+                    path = writer.path,
+                    "socket tree delete refused: the armed grant carries no delete mode"
+                );
+                return ret(errno::EPERM);
+            }
+            // A delete publishes no bytes; a writer that staged some was
+            // going to commit them, and this call is a program bug.
+            if writer.accepted.get() != 0 {
+                return ret(errno::ESTATE);
+            }
+        }
+        PutCommand::Commit(_) => {
+            let writes = synch_core::TREE_WRITE_CREATE | synch_core::TREE_WRITE_REPLACE;
+            if writer.capability.modes & writes == 0 {
+                tracing::warn!(
+                    socket = %inner.socket.qualified(),
+                    path = writer.path,
+                    "socket tree commit refused: the armed grant is delete-only"
+                );
+                return ret(errno::EPERM);
+            }
+        }
+    }
+    if inner.put_commits.get() >= crate::limits::MAX_PUT_COMMITS {
+        return ret(errno::ELIMIT);
+    }
+    inner.put_commits.set(inner.put_commits.get() + 1);
+    writer.command.set(Some(command));
+    writer.dispatched.set(Some(kind));
+    writer.op_pending.set(true);
+    writer.work.notify_one();
+    ret(errno::EAGAIN)
+}
+
+fn h_put_commit(
+    scope: &HelperScope,
+    handle: u64,
+    out_ptr: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    put_op(
+        scope,
+        handle,
+        PutCommand::Commit(crate::PutCondition::Any),
+        Some(out_ptr),
+    )
+}
+
+fn h_put_commit_if(
+    scope: &HelperScope,
+    handle: u64,
+    expected_ptr: u64,
+    out_ptr: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let raw = guest!(bytes(scope, expected_ptr, 32));
+    // All-zero is a safe sentinel for "no live version of ours": it is not
+    // the BLAKE3 of anything, the empty input included.
+    let condition = if raw.iter().all(|byte| *byte == 0) {
+        crate::PutCondition::Absent
+    } else {
+        match synch_core::Hash::from_slice(&raw) {
+            Ok(root) => crate::PutCondition::Root(root),
+            Err(_) => return ret(errno::EINVAL),
+        }
+    };
+    put_op(scope, handle, PutCommand::Commit(condition), Some(out_ptr))
+}
+
+fn h_put_delete(
+    scope: &HelperScope,
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    put_op(scope, handle, PutCommand::Delete, None)
 }
 
 // ---- state ---------------------------------------------------------------
@@ -3679,6 +4144,81 @@ fn h_declare_file_transfer(
             Ok(()) => 0,
             Err(_) => {
                 declaration.file_transfers.pop();
+                errno::EINVAL
+            }
+        }
+    })
+    .and_then(ret)
+}
+
+/// Declares one prefix-scoped tree-write capability from its JSON form:
+/// `{"id", "prefix": "space/dir", "allow": ["create" | "replace" | "delete"],
+///   "max_bytes"?}` (`docs/TREE-WRITES.md` §3).
+fn h_declare_tree_write(
+    scope: &HelperScope,
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    declaring!(scope);
+    let inner = with(scope, Rc::clone)?;
+    let value = match json_value(&inner, handle as i64) {
+        Ok(value) => value,
+        Err(error) => return ret(error),
+    };
+    let Value::Object(map) = value else {
+        return ret(errno::EINVAL);
+    };
+    let id = match capability_id_field(&map) {
+        Ok(id) => id,
+        Err(error) => return ret(error),
+    };
+    let modes = match flag_bits(map.get("allow"), |name| match name {
+        "create" => Some(synch_core::TREE_WRITE_CREATE as u64),
+        "replace" => Some(synch_core::TREE_WRITE_REPLACE as u64),
+        "delete" => Some(synch_core::TREE_WRITE_DELETE as u64),
+        _ => None,
+    }) {
+        Ok(bits) => bits as u32,
+        Err(error) => return ret(error),
+    };
+    let Some(prefix) = map.get("prefix").and_then(Value::as_str) else {
+        return ret(errno::EINVAL);
+    };
+    // Absent means the modest default; `0` is the explicit "unbounded", which
+    // the arm prompt prints loudly.
+    let max_bytes = match map.get("max_bytes") {
+        None | Some(Value::Null) => synch_core::DEFAULT_TREE_WRITE_MAX_BYTES,
+        Some(value) => match value.as_u64() {
+            Some(bytes) => bytes,
+            None => return ret(errno::EINVAL),
+        },
+    };
+    let capability = synch_core::TreeWriteCapability {
+        id,
+        modes,
+        prefix: prefix.to_owned(),
+        max_bytes,
+    };
+    with(scope, |inner| {
+        let mut declaration = inner.declaration.borrow_mut();
+        if declaration.tree_writes.len() >= synch_core::MAX_DECLARED_TREE_WRITES {
+            return errno::ELIMIT;
+        }
+        if declaration
+            .tree_writes
+            .iter()
+            .any(|item| item.id == capability.id)
+        {
+            return errno::EINVAL;
+        }
+        declaration.tree_writes.push(capability);
+        match declaration.validate() {
+            Ok(()) => 0,
+            Err(_) => {
+                declaration.tree_writes.pop();
                 errno::EINVAL
             }
         }

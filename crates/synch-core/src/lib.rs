@@ -30,9 +30,10 @@ pub use record::{
 pub use sock::{
     display_text_is_safe, valid_ebpf_stack_frame_size, Declaration, FaultKind,
     FileTransferCapability, ProcessCapability, RefuseCode, SockClosed, SockOpen, SockOpened,
-    SockStatus, ALPN_SOCK, DEFAULT_EBPF_STACK_FRAME_SIZE, MAX_DECLARED_EGRESS,
-    MAX_DECLARED_FILE_TRANSFERS, MAX_DECLARED_PROCESSES, MAX_EBPF_STACK_FRAME_SIZE,
-    MAX_OPEN_FRAME_LEN,
+    SockStatus, TreeWriteCapability, ALPN_SOCK, DEFAULT_EBPF_STACK_FRAME_SIZE,
+    DEFAULT_TREE_WRITE_MAX_BYTES, MAX_DECLARED_EGRESS, MAX_DECLARED_FILE_TRANSFERS,
+    MAX_DECLARED_PROCESSES, MAX_DECLARED_TREE_WRITES, MAX_EBPF_STACK_FRAME_SIZE,
+    MAX_OPEN_FRAME_LEN, TREE_WRITE_CREATE, TREE_WRITE_DELETE, TREE_WRITE_REPLACE,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,
