@@ -194,6 +194,48 @@ pub trait SocketWriter: Send + 'static {
     /// Appends one chunk to the staged bytes.
     async fn write(&mut self, data: Vec<u8>) -> Result<(), HostError>;
 
+    /// Reads bytes from the staged payload. Protocol adapters use this for a
+    /// handle opened for both reading and writing, before the staged version
+    /// is committed.
+    async fn read_at(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {
+        let _ = (offset, len);
+        Err(HostError::Unavailable(
+            "random-access tree writes are not supported by this host".into(),
+        ))
+    }
+
+    /// Writes bytes at an arbitrary offset in the staged payload.
+    async fn write_at(&mut self, offset: u64, data: Vec<u8>) -> Result<(), HostError> {
+        let _ = (offset, data);
+        Err(HostError::Unavailable(
+            "random-access tree writes are not supported by this host".into(),
+        ))
+    }
+
+    /// Changes the staged payload's logical length, zero-filling growth.
+    async fn set_len(&mut self, len: u64) -> Result<(), HostError> {
+        let _ = len;
+        Err(HostError::Unavailable(
+            "resizing tree writes is not supported by this host".into(),
+        ))
+    }
+
+    /// Applies host-originated metadata to the staged payload.
+    ///
+    /// Protocol adapters use this to preserve attributes already present in
+    /// the tree (not to accept caller-supplied metadata). `None` leaves that
+    /// attribute under the host's normal stamping policy.
+    async fn set_metadata(
+        &mut self,
+        unix_mode: Option<u32>,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), HostError> {
+        let _ = (unix_mode, mtime_ns);
+        Err(HostError::Unavailable(
+            "staged metadata preservation is not supported by this host".into(),
+        ))
+    }
+
     /// Publishes the staged bytes as this node's own new version of the path.
     ///
     /// The condition is evaluated at commit against this node's own live
@@ -206,6 +248,21 @@ pub trait SocketWriter: Send + 'static {
     /// Idempotent like an S3 delete: a path this node already does not
     /// publish live succeeds.
     async fn delete(&mut self) -> Result<(), HostError>;
+
+    /// Publishes a tombstone only if the path still has the expected state.
+    ///
+    /// Hosts that do not implement conditional deletion retain support for
+    /// unconditional deletes, but fail closed for a condition they cannot
+    /// enforce. Protocol adapters use this to avoid deleting a version that
+    /// raced with a rename or remove operation.
+    async fn delete_if(&mut self, expected: PutCondition) -> Result<(), HostError> {
+        match expected {
+            PutCondition::Any => self.delete().await,
+            PutCondition::Absent | PutCondition::Root(_) => Err(HostError::Unavailable(
+                "conditional tree deletes are not supported by this host".into(),
+            )),
+        }
+    }
 }
 
 /// What a [`SocketWriter::commit`] requires of the path's current state.

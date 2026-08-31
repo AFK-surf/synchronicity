@@ -96,6 +96,7 @@ pub struct FakeWriter {
     path: String,
     modes: u32,
     staged: Vec<u8>,
+    base: Option<Vec<u8>>,
     written: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     deleted: Arc<std::sync::Mutex<Vec<String>>>,
     fail_commits: Arc<std::sync::Mutex<u32>>,
@@ -105,6 +106,41 @@ pub struct FakeWriter {
 impl synch_sock::SocketWriter for FakeWriter {
     async fn write(&mut self, data: Vec<u8>) -> Result<(), HostError> {
         self.staged.extend_from_slice(&data);
+        Ok(())
+    }
+
+    async fn read_at(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.staged.len());
+        let take = usize::try_from(len).unwrap_or(usize::MAX);
+        let end = start.saturating_add(take).min(self.staged.len());
+        Ok(self.staged[start..end].to_vec())
+    }
+
+    async fn write_at(&mut self, offset: u64, data: Vec<u8>) -> Result<(), HostError> {
+        let start = usize::try_from(offset)
+            .map_err(|_| HostError::Denied("write offset is too large".into()))?;
+        let end = start
+            .checked_add(data.len())
+            .ok_or_else(|| HostError::Denied("write range is too large".into()))?;
+        self.staged.resize(self.staged.len().max(end), 0);
+        self.staged[start..end].copy_from_slice(&data);
+        Ok(())
+    }
+
+    async fn set_len(&mut self, len: u64) -> Result<(), HostError> {
+        let len = usize::try_from(len)
+            .map_err(|_| HostError::Denied("staged length is too large".into()))?;
+        self.staged.resize(len, 0);
+        Ok(())
+    }
+
+    async fn set_metadata(
+        &mut self,
+        _unix_mode: Option<u32>,
+        _mtime_ns: Option<i64>,
+    ) -> Result<(), HostError> {
         Ok(())
     }
 
@@ -123,7 +159,15 @@ impl synch_sock::SocketWriter for FakeWriter {
         // grant's modes gate what the commit does, and only then does a
         // stated expectation get compared — same order, same error classes.
         let mut written = self.written.lock().unwrap();
-        let live = written.contains_key(&self.path);
+        let deleted = self.deleted.lock().unwrap();
+        let current = written.get(&self.path).or_else(|| {
+            if deleted.iter().any(|path| path == &self.path) {
+                None
+            } else {
+                self.base.as_ref()
+            }
+        });
+        let live = current.is_some();
         let create = self.modes & synch_core::TREE_WRITE_CREATE != 0;
         let replace = self.modes & synch_core::TREE_WRITE_REPLACE != 0;
         match expected {
@@ -155,8 +199,7 @@ impl synch_sock::SocketWriter for FakeWriter {
                         "the grant carries no replace mode".into(),
                     ));
                 }
-                let current = written.get(&self.path).map(|bytes| Hash::new(bytes));
-                if current != Some(root) {
+                if current.map(|bytes| Hash::new(bytes)) != Some(root) {
                     return Err(HostError::Conflict(
                         "the path no longer has the expected version".into(),
                     ));
@@ -169,16 +212,49 @@ impl synch_sock::SocketWriter for FakeWriter {
             size: bytes.len() as u64,
         };
         written.insert(self.path.clone(), bytes);
+        drop(deleted);
+        drop(written);
+        self.deleted
+            .lock()
+            .unwrap()
+            .retain(|path| path != &self.path);
         Ok(receipt)
     }
 
     async fn delete(&mut self) -> Result<(), HostError> {
+        self.delete_if(synch_sock::PutCondition::Any).await
+    }
+
+    async fn delete_if(&mut self, expected: synch_sock::PutCondition) -> Result<(), HostError> {
         // Re-taken as the engine re-takes it, so the fake cannot green-light
         // a runtime that stopped checking.
         if self.modes & synch_core::TREE_WRITE_DELETE == 0 {
             return Err(HostError::Denied("the grant carries no delete mode".into()));
         }
-        self.written.lock().unwrap().remove(&self.path);
+        let mut written = self.written.lock().unwrap();
+        let deleted = self.deleted.lock().unwrap();
+        let current = written.get(&self.path).or_else(|| {
+            if deleted.iter().any(|path| path == &self.path) {
+                None
+            } else {
+                self.base.as_ref()
+            }
+        });
+        let allowed = match expected {
+            synch_sock::PutCondition::Any => true,
+            synch_sock::PutCondition::Absent => current.is_none(),
+            synch_sock::PutCondition::Root(root) => {
+                current.is_some_and(|bytes| Hash::new(bytes) == root)
+            }
+        };
+        if !allowed {
+            return Err(HostError::Conflict(
+                "the path no longer has the expected version".into(),
+            ));
+        }
+        written.remove(&self.path);
+        drop(deleted);
+        drop(written);
         self.deleted.lock().unwrap().push(self.path.clone());
         Ok(())
     }
@@ -190,7 +266,21 @@ impl SocketHost for FakeTree {
         if self.refused.contains(path) {
             return Err(HostError::NotReadable("refused".into()));
         }
-        let bytes = self.files.get(path).ok_or(HostError::NotFound)?;
+        let written = self.written.lock().unwrap();
+        let bytes = if let Some(bytes) = written.get(path) {
+            bytes
+        } else {
+            if self
+                .deleted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|deleted| deleted == path)
+            {
+                return Err(HostError::NotFound);
+            }
+            self.files.get(path).ok_or(HostError::NotFound)?
+        };
         Ok(ObjectInfo {
             root: Hash::new(bytes),
             size: bytes.len() as u64,
@@ -201,9 +291,10 @@ impl SocketHost for FakeTree {
     }
 
     fn open_root(&self, root: &Hash) -> Result<ObjectInfo, HostError> {
-        let bytes = self
-            .files
+        let written = self.written.lock().unwrap();
+        let bytes = written
             .values()
+            .chain(self.files.values())
             .find(|b| Hash::new(b) == *root)
             .ok_or(HostError::NotFound)?;
         Ok(ObjectInfo {
@@ -221,14 +312,19 @@ impl SocketHost for FakeTree {
         start_after: Option<&str>,
         limit: usize,
     ) -> Result<synch_sock::ListPage, HostError> {
+        let written = self.written.lock().unwrap();
+        let deleted = self.deleted.lock().unwrap();
         let mut names: Vec<String> = self
             .files
             .keys()
+            .chain(written.keys())
+            .filter(|key| !deleted.iter().any(|deleted| deleted == *key))
             .filter(|k| k.starts_with(prefix))
             .filter(|k| start_after.is_none_or(|after| k.as_str() > after))
             .cloned()
             .collect();
         names.sort();
+        names.dedup();
         names.truncate(limit);
         let next = (names.len() == limit)
             .then(|| names.last().cloned())
@@ -252,10 +348,19 @@ impl SocketHost for FakeTree {
         if self.refused.contains(path) {
             return Err(HostError::NotReadable("refused".into()));
         }
-        if self.files.contains_key(path) {
+        let written = self.written.lock().unwrap();
+        let deleted = self.deleted.lock().unwrap();
+        let live = |key: &str| {
+            written.contains_key(key)
+                || (self.files.contains_key(key) && !deleted.iter().any(|deleted| deleted == key))
+        };
+        if live(path) {
             return Ok(synch_sock::HostEntryKind::File);
         }
-        if self.files.keys().any(|key| {
+        if self.files.keys().chain(written.keys()).any(|key| {
+            if !live(key) {
+                return false;
+            }
             key.len() > path.len() && key.starts_with(path) && key.as_bytes()[path.len()] == b'/'
         }) {
             return Ok(synch_sock::HostEntryKind::Directory);
@@ -264,9 +369,10 @@ impl SocketHost for FakeTree {
     }
 
     async fn pread(&self, root: Hash, offset: u64, len: u64) -> Result<Vec<u8>, HostError> {
-        let bytes = self
-            .files
+        let written = self.written.lock().unwrap();
+        let bytes = written
             .values()
+            .chain(self.files.values())
             .find(|b| Hash::new(b) == root)
             .ok_or(HostError::NotFound)?;
         let start = (offset as usize).min(bytes.len());
@@ -288,6 +394,7 @@ impl SocketHost for FakeTree {
             path: path.to_string(),
             modes,
             staged: Vec::new(),
+            base: self.files.get(path).cloned(),
             written: self.written.clone(),
             deleted: self.deleted.clone(),
             fail_commits: self.fail_commits.clone(),

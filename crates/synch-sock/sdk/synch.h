@@ -410,7 +410,9 @@ extern sy_s64 sy_process_signal(sy_s64 process, const char *name,
                                 sy_u64 name_len);
 
 /* Starts the scope-confined SFTP engine as an ordinary byte-stream endpoint.
- * The guest chooses which protocol channel carries those bytes. */
+ * The guest chooses which protocol channel carries those bytes. `write`
+ * access requires the same-id armed tree-write capability; file close commits
+ * the staged version, while closing the service aborts unclosed handles. */
 extern sy_s64 sy_sftp_open(sy_u32 file_transfer_capability);
 
 /* ---- poll: the only helper that suspends -------------------------------- */
@@ -542,8 +544,9 @@ extern sy_s64 sy_hex_decode_in_place(void *buf, sy_u64 len);
  * at most 128 bytes), "allowed_signals": ["HUP" | "INT" | "TERM", ...]?}.
  *
  * A file-transfer capability ("file_transfers") is an object: {"id",
- * "protocol": "sftp", "access": ["read", "recursive"?], "scope" (exact
- * normalized tree path of at most 256 bytes)}.
+ * "protocol": "sftp", "access": ["read" | "write", "recursive"?], "scope"
+ * (exact normalized tree path of at most 256 bytes)}. A writable service uses
+ * the tree-write capability with the same id for its mutation authority.
  *
  * A tree-write capability ("tree_writes") is an object: {"id", "prefix" (a
  * normalized tree path: a space, or space/dir), "allow": ["create" |

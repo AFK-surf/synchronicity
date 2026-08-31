@@ -1012,6 +1012,95 @@ async fn ssh_shell_serves_the_declared_bash_on_a_pty() {
     assert_eq!(outcome.status, SockStatus::Ok(0));
 }
 
+/// The same shipped program is a writable SFTP server, not merely an SSH
+/// transport that happens to recognize a subsystem name. Upload close commits
+/// through the declared tree writer, and remove publishes a tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_shell_serves_declared_read_write_sftp() {
+    use std::time::Duration;
+
+    let elf = build("ssh-shell.c");
+    let harness = Harness::with_tree(&[("files/hello.txt", "hello over sftp")]);
+    let declaration =
+        synch_sock::manifest::manifest_declaration(&elf).expect("the manifest parsed");
+    assert_eq!(declaration.file_transfers.len(), 1);
+    assert_eq!(declaration.file_transfers[0].access, 0x01 | 0x02 | 0x04);
+    assert_eq!(declaration.file_transfers[0].scope, "files");
+    assert_eq!(declaration.tree_writes.len(), 1);
+    assert_eq!(declaration.tree_writes[0].prefix, "files");
+    assert_eq!(declaration.tree_writes[0].modes, 0x01 | 0x02 | 0x04);
+
+    let policy = EffectivePolicy::granted(&declaration, vec![], None, 64);
+    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server_stream);
+    let invocation = harness.invocation(
+        &elf,
+        DuplexStream::new(server_reader, server_writer),
+        policy,
+        peer(None),
+        vec![],
+    );
+    let run = tokio::spawn(async move { harness.pool.run(invocation).await.unwrap() });
+
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        ShellClient,
+    )
+    .await
+    .expect("SSH handshake completed");
+    assert!(client
+        .authenticate_none("operator")
+        .await
+        .unwrap()
+        .success());
+    let channel = client
+        .channel_open_session()
+        .await
+        .expect("a session channel");
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .expect("the SFTP subsystem request was sent");
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .expect("the SFTP version exchange completed");
+
+    assert_eq!(sftp.read("hello.txt").await.unwrap(), b"hello over sftp");
+    let mut upload = sftp.create("upload.txt").await.expect("a writable file");
+    upload
+        .write_all(b"written through the shipped server")
+        .await
+        .expect("the upload bytes were accepted");
+    upload.close().await.expect("close committed the upload");
+    assert_eq!(
+        harness.tree.written.lock().unwrap().get("files/upload.txt"),
+        Some(&b"written through the shipped server".to_vec())
+    );
+
+    sftp.remove_file("upload.txt")
+        .await
+        .expect("remove published a tombstone");
+    assert!(harness
+        .tree
+        .deleted
+        .lock()
+        .unwrap()
+        .contains(&"files/upload.txt".to_string()));
+    sftp.close().await.expect("the SFTP session closed");
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await
+        .unwrap();
+    drop(client);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the invocation ended with the connection")
+        .unwrap();
+    assert_eq!(outcome.status, SockStatus::Ok(0));
+}
+
 /// The runtime loads an object somebody else's compiler wrote.
 ///
 /// Every other test here builds with the compiler in the binary, which would

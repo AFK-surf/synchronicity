@@ -2489,9 +2489,23 @@ fn h_sftp_open(
     else {
         return ret(errno::EPERM);
     };
-    if capability.protocol != 1 || capability.access & 0x01 == 0 {
+    if capability.protocol != 1 || capability.access & 0x03 == 0 {
         return ret(errno::EPERM);
     }
+    let write_capability = if capability.access & 0x02 != 0 {
+        let Some(write) = inner
+            .policy
+            .tree_writes
+            .iter()
+            .find(|write| write.id == capability.id)
+            .cloned()
+        else {
+            return ret(errno::EPERM);
+        };
+        Some(write)
+    } else {
+        None
+    };
     let open = inner
         .slots
         .borrow()
@@ -2529,6 +2543,9 @@ fn h_sftp_open(
         inner.host.clone(),
         capability.scope,
         capability.access,
+        write_capability,
+        inner.put_commits.clone(),
+        inner.put_writers.clone(),
     );
     inner.spawn(async move {
         russh_sftp::server::run(service, handler).await;
@@ -3150,14 +3167,15 @@ fn h_put_open(
         );
         return ret(errno::EPERM);
     }
-    let writers = inner
-        .slots
-        .borrow()
-        .iter()
-        .flatten()
-        .filter(|slot| matches!(slot, Slot::Writer(_)))
-        .count();
-    if writers >= crate::limits::MAX_OPEN_WRITERS {
+    if inner
+        .put_writers
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |count| (count < crate::limits::MAX_OPEN_WRITERS).then_some(count + 1),
+        )
+        .is_err()
+    {
         return ret(errno::ELIMIT);
     }
     // The engine's own gates — the declared-socket refusal, `.syncignore`,
@@ -3166,6 +3184,9 @@ fn h_put_open(
     let host_writer = match inner.host.put_open(&path, capability.modes) {
         Ok(writer) => writer,
         Err(e) => {
+            inner
+                .put_writers
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 socket = %inner.socket.qualified(),
                 path,
@@ -3188,6 +3209,8 @@ fn h_put_open(
         accepted: std::cell::Cell::new(0),
         closed: std::cell::Cell::new(false),
         ready: inner.ready.clone(),
+        writer_count: inner.put_writers.clone(),
+        counted: std::cell::Cell::new(true),
     });
     let handle = match inner.insert(Slot::Writer(slot.clone())) {
         Ok(handle) => handle,
@@ -3394,10 +3417,17 @@ fn put_op(
             }
         }
     }
-    if inner.put_commits.get() >= crate::limits::MAX_PUT_COMMITS {
+    if inner
+        .put_commits
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |count| (count < crate::limits::MAX_PUT_COMMITS).then_some(count + 1),
+        )
+        .is_err()
+    {
         return ret(errno::ELIMIT);
     }
-    inner.put_commits.set(inner.put_commits.get() + 1);
     writer.command.set(Some(command));
     writer.dispatched.set(Some(kind));
     writer.op_pending.set(true);

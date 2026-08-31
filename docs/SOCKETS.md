@@ -598,7 +598,8 @@ a bare host is any port on it, which inspection prints loudly),
 The capability members are arrays of JSON objects — `"processes"`:
 `{"id", "allow": ["pty" | "pipe"], "executable", "argv",
 "allowed_signals": ["HUP" | "INT" | "TERM"]}`; `"file_transfers"`:
-`{"id", "protocol": "sftp", "access": ["read", "recursive"], "scope"}`
+`{"id", "protocol": "sftp", "access": ["read" | "write", "recursive"?],
+"scope"}`
 (`docs/SSH-SOCKETS.md` §7); and `"tree_writes"`:
 `{"id", "prefix", "allow": ["create" | "replace" | "delete"], "max_bytes"?}`
 (`docs/TREE-WRITES.md` §3). Tree writes are the one capability family whose

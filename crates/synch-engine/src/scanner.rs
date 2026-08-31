@@ -766,7 +766,7 @@ impl Node {
             let reported = PathBuf::from(format!("{space_id}/{path}"));
             let (node, space, path) = (self.clone(), space_id.to_string(), path.to_string());
             crate::blocking::offload(move || {
-                node.stage_api_reference(&space, &path, range.root, range.size, now_ns())
+                node.stage_api_reference(&space, &path, range.root, range.size, now_ns(), None)
             })
             .await?;
             return Ok(reported);
@@ -898,6 +898,19 @@ impl Node {
         source: &Path,
         mtime_ns: i64,
     ) -> Result<(Hash, u64)> {
+        self.commit_api_file_with_metadata(space_id, path, source, mtime_ns, None)
+            .await
+    }
+
+    /// The socket-writer variant, carrying host-originated permission bits.
+    pub(crate) async fn commit_api_file_with_metadata(
+        &self,
+        space_id: &str,
+        path: &str,
+        source: &Path,
+        mtime_ns: i64,
+        unix_mode: Option<u32>,
+    ) -> Result<(Hash, u64)> {
         let (node, checked_space, checked_path, checked_source) = (
             self.clone(),
             space_id.to_string(),
@@ -937,7 +950,14 @@ impl Node {
         debug_assert_eq!(ingested.size, size);
         let (node, space) = (self.clone(), space_id.to_string());
         crate::blocking::offload(move || {
-            node.stage_api_reference(&space, &normalized, ingested.root, ingested.size, mtime_ns)?;
+            node.stage_api_reference(
+                &space,
+                &normalized,
+                ingested.root,
+                ingested.size,
+                mtime_ns,
+                unix_mode,
+            )?;
             Ok((ingested.root, ingested.size))
         })
         .await
@@ -951,6 +971,7 @@ impl Node {
         root: Hash,
         size: u64,
         mtime_ns: i64,
+        unix_mode: Option<u32>,
     ) -> Result<()> {
         let normalized = normalized_adoption_path(path)?;
         let previous = self
@@ -958,6 +979,7 @@ impl Node {
             .entry(self.origin(), space_id, &normalized)?
             .and_then(|entry| entry.content);
         let mut entry = FileEntry::file(size, mtime_ns, root, self.next_seq()?);
+        entry.unix_mode = unix_mode;
         entry.prev = previous.filter(|previous| *previous != root);
         let entry = synch_core::record::encode(&entry)?;
         let ad = self.store().local_ad(&root)?.ok_or_else(|| {
@@ -1394,18 +1416,84 @@ impl Adoption {
             .as_mut()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
         file.set_len(len)?;
+        self.written = len;
+        Ok(())
+    }
+
+    /// Reads one range from the staged payload without changing its logical
+    /// length.
+    pub(crate) fn read_at(&mut self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let len = usize::try_from(len)
+            .map_err(|_| EngineError::invalid("the staged read length is too large"))?;
+        let mut bytes = vec![0; len];
+        let count = file.read(&mut bytes)?;
+        bytes.truncate(count);
+        Ok(bytes)
+    }
+
+    /// Writes one range into the staged payload, growing it as necessary.
+    pub(crate) fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::io::{Seek, Write};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        self.written = self.written.max(offset.saturating_add(bytes.len() as u64));
         Ok(())
     }
 
     /// Appends one piece of the payload.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+        use std::io::{Seek, Write};
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        file.seek(std::io::SeekFrom::End(0))?;
         file.write_all(bytes)?;
-        self.written += bytes.len() as u64;
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Preserves metadata already supplied by the host on the staged inode.
+    pub(crate) fn set_metadata(
+        &mut self,
+        unix_mode: Option<u32>,
+        mtime_ns: Option<i64>,
+    ) -> Result<()> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        #[cfg(unix)]
+        if let Some(mode) = unix_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
+        if let Some(mtime_ns) = mtime_ns {
+            let modified = if mtime_ns >= 0 {
+                std::time::UNIX_EPOCH + std::time::Duration::from_nanos(mtime_ns as u64)
+            } else {
+                std::time::UNIX_EPOCH - std::time::Duration::from_nanos(mtime_ns.unsigned_abs())
+            };
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        }
         Ok(())
     }
 
@@ -2352,6 +2440,36 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::testkit::{node_with_space, published, reopen};
 
+    #[test]
+    fn empty_adoption_writes_do_not_extend_or_advance_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("empty");
+        let mut adoption = Adoption::open(target).unwrap();
+        adoption.write_at(100, &[]).unwrap();
+        adoption.write(&[]).unwrap();
+        assert_eq!(adoption.written(), 0);
+        let committed = adoption.commit().unwrap();
+        assert_eq!(std::fs::metadata(committed).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn adoption_applies_preserved_metadata_to_the_committed_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("preserved");
+        let mut adoption = Adoption::open(target).unwrap();
+        adoption.write(b"body").unwrap();
+        let stamp = 1_700_000_000_000_000_000i64;
+        adoption.set_metadata(Some(0o755), Some(stamp)).unwrap();
+        let committed = adoption.commit().unwrap();
+        let metadata = std::fs::metadata(committed).unwrap();
+        assert_eq!(mtime_nanos(&metadata), stamp);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
+        }
+    }
+
     #[tokio::test]
     async fn api_sources_publish_cas_direct_and_never_scan_a_checkout() {
         let (_data, node) = crate::testkit::node().await;
@@ -2370,7 +2488,7 @@ mod tests {
         let source = source_dir.path().join("incoming");
         std::fs::write(&source, b"API source payload").unwrap();
         let (root, size) = node
-            .commit_api_file("media", "nested/a.txt", &source, 42)
+            .commit_api_file_with_metadata("media", "nested/a.txt", &source, 42, Some(0o755))
             .await
             .unwrap();
         node.flush_staged().await.unwrap().unwrap();
@@ -2379,6 +2497,7 @@ mod tests {
         assert_eq!(entry.content, Some(root));
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime_ns, 42);
+        assert_eq!(entry.unix_mode, Some(0o755));
         assert_eq!(node.store().read_all(&root).unwrap(), b"API source payload");
         assert!(node
             .store()

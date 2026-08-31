@@ -32,11 +32,9 @@ nothing here needs it." Half of that has aged: things need it now.
   the state ends up outside the tree that this system exists to replicate,
   verify and version. The composition is exactly backwards: the fabric can move
   and keep the bytes; only the *accepting* of them is missing.
-- `docs/SSH-SOCKETS.md` §7.2 ships SFTP read-only, and says why: treating an
-  SFTP close as a tree commit would be an implicit mutation API. The blocker is
-  not SFTP; it is that no *explicit* mutation API exists to build on. This
-  design is that API, and upload support in the file-transfer engine becomes an
-  ordinary follow-up on the same declared capability.
+- `docs/SSH-SOCKETS.md` §7.2 layers writable SFTP on this explicit mutation
+  API: a file handle stages bytes, and close conditionally commits the version
+  it opened rather than turning protocol close into an unscoped mutation.
 
 The "larger surface" half of the sentence was right, and the design takes it
 seriously rather than around. What made writes larger than reads is that a read
@@ -460,12 +458,11 @@ All applied in the change that built this:
   names the `sy_put_*` family and §7.9 gains the `"tree_writes"` manifest
   member; the §10 tables gain the rows above; the breadth warning at
   `synch socket activate` names writes.
-- **`docs/SSH-SOCKETS.md` §7.2** — the "read-only in v1" rationale gains its
-  second half: upload support becomes a follow-up that commits through this
-  API's engine seam under a tree-write declaration, instead of inventing
-  close-as-commit.
+- **`docs/SSH-SOCKETS.md` §7.2** — SFTP uploads commit through this API's
+  engine seam under a same-id tree-write declaration; open handles stage
+  random-access writes and close conditionally publishes their version.
 - **`DESIGN.md` §12** — the membership-capability sentence extends: invoking a
-  socket may, where its manifest declares a tree-write prefix, cause the
+  activated socket may, where its manifest declares a tree-write prefix, cause the
   callee to publish new versions of its own view. Mitigations in place: the
   prefix and modes are data in the object the operator deployed, the version
   model scopes every write to the callee's own origin, and divergence remains
@@ -488,18 +485,20 @@ Not in this design:
   needing "both or neither" publishes a manifest last and treats it as the
   commit point — the tree's own idiom.
 - **Rename/copy helpers.** A rename is read + write + delete composed in the
-  program, under the modes it declared.
+  program, under the modes it declared. Host protocol adapters can condition
+  the delete on a content root so this composition never removes a source
+  version that raced with the copy.
 - **Writing other origins, other record kinds, or socket activations.**
   Structural, not policy (§2).
 
 Worth building next:
 
-- **SFTP upload** on the same declared capability, through the same seam —
-  unblocking `docs/SSH-SOCKETS.md` §7.2's deliberate deferral.
 - **Batched publishes** — a per-invocation option to stage commits into the
   publisher's ordinary quiesce batching instead of one head per commit,
   trading read-back immediacy for head economy; shared with the S3 gateway.
-- **Conditional delete** (`delete_if`), once a real program wants tombstone
-  CAS semantics.
+- **Guest-facing conditional delete.** The host writer contract has
+  `delete_if` for protocol adapters, but the `sy_put_*` ABI still exposes only
+  the unconditional delete operation until a program needs tombstone CAS
+  semantics directly.
 - **A commit metadata object** (JSON) if modes or content-type-style operator
   config ever earn their place — the JSON-handle convention leaves room.

@@ -1,18 +1,22 @@
-/* ssh-shell — a real `ssh nas` login, terminated by a socket.
+/* ssh-shell — a real SSH shell and read/write SFTP server, terminated by a
+ * socket.
  *
  *   synch socket build examples/ssh-shell.c -o ssh-shell.o
  *   cp ssh-shell.o ~/synchronicity/code/ssh.sock
- *   synch socket declare code/ssh.sock
- *   synch socket arm code/ssh.sock       # shows the exact /bin/bash declaration
+ *   synch socket activate code/ssh.sock  # shows the exact manifest capabilities
  *   ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
+ *   sftp -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
  *
  * The SSH adapter turns the inbound stream into a control fd and channel fds;
  * the process declaration is what lets this program put a PTY-backed bash
- * behind one of them (`docs/SSH-SOCKETS.md`). The three parts stay separate on
+ * behind one of them (`docs/SSH-SOCKETS.md`), or attach the declared SFTP
+ * service to it. The three shell parts stay separate on
  * purpose: accepting the `session` channel starts nothing, a successful
  * `pty-req` allocates a terminal but starts nothing, and only the `shell`
- * request spawns the one executable the operator approved at arm time. The
- * client's username and command bytes never choose what runs.
+ * request spawns the one executable the operator deployed. The
+ * client's username and command bytes never choose what runs. An exact
+ * `subsystem "sftp"` request instead exposes SFTP_SCOPE, with reads and
+ * atomic close-to-commit writes bounded by the declarations below.
  *
  * Every event arrives as a JSON handle: its `kind` is a name, its fields are
  * members, and the whole dispatch below is string comparison rather than
@@ -20,7 +24,7 @@
  * event itself stays outstanding until it is answered.
  *
  * Authorization is the outer handshake: whoever the cluster let reach this
- * socket gets the shell, so SSH `none` completes the inner exchange. Arm it
+ * socket gets the shell, so SSH `none` completes the inner exchange. Activate it
  * only where that is the intended policy — §15.2 of the design shows the
  * two-line `sy_peer_device_key` gate that narrows it to one machine, and §15.3
  * shows tree-backed `authorized_keys` when the inner identity should be an SSH
@@ -40,21 +44,31 @@
 #ifndef SHELL_ARGV0
 #define SHELL_ARGV0 "bash"
 #endif
+#ifndef SFTP_SCOPE
+#define SFTP_SCOPE "files"
+#endif
 
 #define SHELL_CAPABILITY 1
+#define SFTP_CAPABILITY 1
 
 /* The most one splice call moves, so one busy direction cannot keep the loop
    away from the control fd or the other direction. */
 #define CHUNK 32768
 
-/* The complete capability, embedded in the object as data: the exact
-   executable, argv, PTY permission, and the signals the guest may relay.
-   Literal concatenation splices the macros in at compile time. */
+/* The complete capabilities, embedded in the object as data: the exact
+   executable, argv, PTY permission, signals, and scoped SFTP access. `write`
+   opts the service into mutation; the same-id tree-write capability supplies
+   create/replace/delete authority and the default 16 MiB staging bound. */
 SY_MANIFEST("{\"manifest\":1,\"name\":\"ssh-shell\",\"max_streams\":4,"
             "\"processes\":[{\"id\":1,\"allow\":[\"pty\"],"
             "\"executable\":\"" SHELL_EXECUTABLE "\","
             "\"argv\":[\"" SHELL_ARGV0 "\"],"
-            "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}]}");
+            "\"allowed_signals\":[\"HUP\",\"INT\",\"TERM\"]}],"
+            "\"file_transfers\":[{\"id\":1,\"protocol\":\"sftp\","
+            "\"access\":[\"read\",\"write\",\"recursive\"],"
+            "\"scope\":\"" SFTP_SCOPE "\"}],"
+            "\"tree_writes\":[{\"id\":1,\"prefix\":\"" SFTP_SCOPE "\","
+            "\"allow\":[\"create\",\"replace\",\"delete\"]}]}");
 
 static int str_is(const char *value, const char *want) {
   sy_u64 len = sy_strlen(want);
@@ -68,10 +82,11 @@ static sy_s64 finish(sy_s64 event, sy_u64 id, sy_u32 granted) {
   return sy_ssh_event_done(id);
 }
 
-/* Everything one shell session is. -1 handles mean "not yet". */
+/* Everything one shell or SFTP session is. -1 handles mean "not yet". */
 struct session {
   sy_s64 channel;
   sy_s64 pty;
+  sy_s64 sftp;
   sy_s64 process;
   int input_done;       /* client EOF reached the shell as a hangup       */
   int output_done;      /* the PTY reached EOF: the shell is gone         */
@@ -109,7 +124,7 @@ static sy_s64 handle_request(sy_s64 event, sy_u64 id, struct session *s) {
   sy_json_get_string(event, SY_STR("request_type"), type, sizeof type);
 
   if (str_is(type, "pty-req")) {
-    if (s->pty >= 0) return finish(event, id, 0);
+    if (s->pty >= 0 || s->sftp >= 0) return finish(event, id, 0);
     sy_s64 spec = sy_ssh_pty_spec(id);
     if (spec < 0) return finish(event, id, 0);
     sy_s64 pty = sy_pty_open(SHELL_CAPABILITY, spec);
@@ -120,7 +135,8 @@ static sy_s64 handle_request(sy_s64 event, sy_u64 id, struct session *s) {
   }
 
   if (str_is(type, "shell")) {
-    if (s->pty < 0 || s->process >= 0) return finish(event, id, 0);
+    if (s->pty < 0 || s->sftp >= 0 || s->process >= 0)
+      return finish(event, id, 0);
     sy_s64 process = sy_process_spawn_pty(SHELL_CAPABILITY, s->pty);
     if (process < 0) return finish(event, id, 0);
     s->process = process;
@@ -148,38 +164,55 @@ static sy_s64 handle_request(sy_s64 event, sy_u64 id, struct session *s) {
     return finish(event, id, sent < 0 ? 0 : 1);
   }
 
-  /* exec, subsystem, env, forwarding: not this socket's policy. The refusal
-     costs nothing — none of those names could have started anything. */
+  if (str_is(type, "subsystem")) {
+    char subsystem[32] = {0};
+    sy_s64 len = sy_json_get_string(event, SY_STR("subsystem"), subsystem,
+                                    sizeof subsystem);
+    if (s->pty >= 0 || s->sftp >= 0 || s->process >= 0 || len < 0 ||
+        len >= (sy_s64)sizeof subsystem || !str_is(subsystem, "sftp"))
+      return finish(event, id, 0);
+    sy_s64 backend = sy_sftp_open(SFTP_CAPABILITY);
+    if (backend < 0) return finish(event, id, 0);
+    s->sftp = backend;
+    return finish(event, id, 1);
+  }
+
+  /* exec, other subsystems, env, forwarding: not this socket's policy. The
+     refusal costs nothing — none of those names could have started anything. */
   return finish(event, id, 0);
 }
 
-/* Both directions of the terminal, each allowed to end on its own. An error
-   ends its direction rather than the session: a PTY write half failing after
-   the shell exited must not race the exit status away, and a broken channel
-   surfaces through its own ERR in the poll loop. */
+/* Both directions of the selected backend, each allowed to end on its own. An
+   error ends its direction rather than the session: a PTY write half failing
+   after the shell exited must not race the exit status away, and a broken
+   channel surfaces through its own ERR in the poll loop. */
 static void move_terminal(struct session *s) {
+  sy_s64 backend = s->sftp >= 0 ? s->sftp : s->pty;
   if (!s->input_done) {
-    sy_s64 n = sy_splice(s->channel, s->pty, CHUNK);
+    sy_s64 n = sy_splice(s->channel, backend, CHUNK);
     if (n == 0 || (n < 0 && n != SY_EAGAIN)) {
-      /* Client EOF: no more keystrokes, and nothing else. A PTY has no write
+      /* Client EOF: no more keystrokes. A PTY has no write
          half to shut, and hanging the shell up here would kill commands the
          client already typed — `printf 'exit\n' | ssh` sends EOF right behind
          the keystrokes, and sshd lets the shell drain them and end itself.
          A client that vanishes entirely still can't leak the process: the
-         connection closing reaches close_session, which kills a live shell. */
+         connection closing reaches close_session, which kills a live shell.
+         SFTP is a byte-stream backend, so EOF is relayed to let it finish its
+         last request and drain its replies. */
+      if (s->sftp >= 0) sy_shutdown(s->sftp);
       s->input_done = 1;
     } else {
       s->upward_blocked =
-          sy_readable(s->channel) > 0 && sy_writable(s->pty) == 0;
+          sy_readable(s->channel) > 0 && sy_writable(backend) == 0;
     }
   }
   if (!s->output_done) {
-    sy_s64 n = sy_splice(s->pty, s->channel, CHUNK);
+    sy_s64 n = sy_splice(backend, s->channel, CHUNK);
     if (n == 0 || (n < 0 && n != SY_EAGAIN)) {
       s->output_done = 1;
     } else {
       s->downward_blocked =
-          sy_readable(s->pty) > 0 && sy_writable(s->channel) == 0;
+          sy_readable(backend) > 0 && sy_writable(s->channel) == 0;
     }
   }
 }
@@ -187,8 +220,9 @@ static void move_terminal(struct session *s) {
 static void close_session(struct session *s) {
   if (s->process >= 0) sy_close(s->process); /* kills and reaps a live shell */
   if (s->pty >= 0) sy_close(s->pty);
+  if (s->sftp >= 0) sy_close(s->sftp);
   if (s->channel >= 0) sy_close(s->channel);
-  s->process = s->pty = s->channel = -1;
+  s->process = s->sftp = s->pty = s->channel = -1;
   /* A clean slate, so the next `session` open on this connection starts a
      fresh shell instead of inheriting this one's finished lifecycle. */
   s->input_done = s->output_done = 0;
@@ -218,7 +252,7 @@ SY_ENTRY sy_s64 entry(void) {
   if (started < 0) return 1;
 
   struct session s = {0};
-  s.channel = s.pty = s.process = -1;
+  s.channel = s.pty = s.sftp = s.process = -1;
 
   for (;;) {
     /* fd zero, then whichever session fds still have something coming. */
@@ -226,23 +260,25 @@ SY_ENTRY sy_s64 entry(void) {
     sy_u64 nfds = 1;
     sy_u64 channel_at = 0;
 
-    if (s.channel >= 0 && s.pty >= 0) {
-      sy_u32 channel_events = 0, pty_events = 0;
+    sy_s64 backend = s.sftp >= 0 ? s.sftp : s.pty;
+    if (s.channel >= 0 && backend >= 0) {
+      sy_u32 channel_events = 0, backend_events = 0;
       /* As in splice-proxy.c: bytes waiting on a full destination wait for
          the room, not for more input that has nowhere to go. */
       if (!s.input_done) {
-        if (s.upward_blocked) pty_events |= SY_POLL_OUT;
+        if (s.upward_blocked) backend_events |= SY_POLL_OUT;
         else channel_events |= SY_POLL_IN;
       }
       if (!s.output_done) {
         if (s.downward_blocked) channel_events |= SY_POLL_OUT;
-        else pty_events |= SY_POLL_IN;
+        else backend_events |= SY_POLL_IN;
       }
       if (channel_events) {
         channel_at = nfds;
         fds[nfds++] = (struct sy_pollfd){s.channel, channel_events, 0};
       }
-      if (pty_events) fds[nfds++] = (struct sy_pollfd){s.pty, pty_events, 0};
+      if (backend_events)
+        fds[nfds++] = (struct sy_pollfd){backend, backend_events, 0};
     }
     if (s.process >= 0 && !s.have_status)
       fds[nfds++] = (struct sy_pollfd){s.process, SY_POLL_IN, 0};
@@ -277,7 +313,7 @@ SY_ENTRY sy_s64 entry(void) {
       }
     }
 
-    if (s.channel >= 0 && s.pty >= 0) move_terminal(&s);
+    if (s.channel >= 0 && (s.pty >= 0 || s.sftp >= 0)) move_terminal(&s);
 
     /* The channel failing is the client abandoning this session: no one is
        left to see an exit status, so reap it and keep serving — the
@@ -287,6 +323,13 @@ SY_ENTRY sy_s64 entry(void) {
       close_session(&s);
 
     if (s.process >= 0 && !s.have_status) collect_status(&s);
+
+    /* SFTP has no process status. Once its protocol engine reaches EOF, send
+       channel EOF after the final reply and release the session slot. */
+    if (s.sftp >= 0 && s.output_done) {
+      sy_shutdown(s.channel);
+      close_session(&s);
+    }
 
     /* Exit status goes out only after the terminal's last output: reporting
        first would race the goodbye off the screen. */
