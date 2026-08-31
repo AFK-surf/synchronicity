@@ -142,6 +142,37 @@ backend and is safe to retry after interruption. See
 [docs/SERVERLESS.md](docs/SERVERLESS.md) for the full durability, recovery,
 failure, and Kubernetes deployment contract.
 
+## Hosted replicas (the cloud data plane)
+
+`synch-dp` is the managed side of the same idea: one process hosting a fleet of
+serverless replica nodes, one per customer network, each joining that network as
+an ordinary zone-named device and replicating everything it publishes into
+object storage. A customer turns it on with one per-network switch in the
+control plane and needs no new protocol, no configuration and no upgrade — they
+gain a member that fetches eagerly and serves well.
+
+```sh
+export SYNCH_DP_CONTROL_URL=https://cp.example
+export SYNCH_DP_TOKEN=synchdp_…             # minted by `controlplane dataplane-key mint`
+export SYNCH_DP_BASE_DIR=/run/synch-dp      # ephemeral; nothing here survives a restart
+export SYNCH_DP_CAS_BACKEND=s3
+export SYNCH_DP_S3_BUCKET=synch-hosted
+export SYNCH_DP_S3_REGION=us-east-1
+synch-dp
+```
+
+It runs on pods with no durable disk, so it replicates each tenant's SQLite
+database to the bucket itself — Litestream's LTX format via the `celld-ltx`
+library, driven in-process rather than by a sidecar — and restores it on every
+reschedule. Everything durable about a tenant is keyed by network rather than
+by pod, so a rescheduled shard resumes the same identities with no zone change
+at all. Those streams carry device secret keys, so give the bucket encryption
+at rest and do not grant the `db/` prefix more widely than the `tenants/` one.
+
+[docs/CLOUD-DATAPLANE.md](docs/CLOUD-DATAPLANE.md) is the design: the
+control-plane API it polls, the tenancy and storage model, the failure matrix,
+and what hosting does and does not promise about privacy.
+
 Admit a peer. Trust is unilateral, so each side runs this for the other:
 
 ```sh
@@ -457,9 +488,12 @@ async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 | `synch-sock` | the socket runtime: the eBPF host APIs, the endpoint reactor, the program cache |
 | `synch-cc` | the embedded C-to-eBPF compiler, so writing a socket needs no toolchain |
 | `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
+| `synch-dp` | the `synch-dp` binary: the multi-tenant cloud data plane, one embedded replica node per hosted network |
 
 All logic lives in the library crates, so any Rust application can embed a full
-node by depending on `synch-engine`.
+node by depending on `synch-engine`. `synch-dp` is the largest such embedder in
+this repository, and a worked example of what embedding many nodes at once
+asks for.
 
 [docs/IMPLEMENTATION-NOTES.md](docs/IMPLEMENTATION-NOTES.md) records where this
 implementation differs from the design and why.

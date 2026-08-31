@@ -328,9 +328,44 @@ impl Drop for WriteLease<'_> {
 /// and nothing else, which is why there is no LRU here.
 const COMPLETE_ROOTS_MAX: usize = 4096;
 
+/// Who is responsible for moving WAL frames back into the database file.
+///
+/// The store has always assumed a replicating checkpointer might be running
+/// beside it — its 30-second `busy_timeout` exists for exactly that — but that
+/// checkpointer was assumed to be *another process* (Litestream), which SQLite
+/// coordinates with through the WAL index whether or not anyone declares it.
+/// A replicator inside this process needs the opposite: a promise that nothing
+/// else checkpoints, so it can ship frames before they are recycled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Checkpointing {
+    /// SQLite's own autocheckpoint, and any external process that runs one.
+    #[default]
+    Automatic,
+    /// The embedder's, exclusively: SQLite's autocheckpoint is disabled and
+    /// the embedder is expected to run its own on its own schedule.
+    ///
+    /// A WAL that nobody checkpoints grows without bound, so taking this on
+    /// means owning it — see `docs/CLOUD-DATAPLANE.md` §5.3, where shipping a
+    /// frame *before* it can be recycled is what makes the replica stream
+    /// complete.
+    Embedder,
+}
+
+/// Knobs that must be settled before the first statement runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreOptions {
+    /// Who checkpoints the WAL.
+    pub checkpointing: Checkpointing,
+}
+
 impl Store {
     /// Opens (creating if needed) the store rooted at `data_dir`.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Store> {
+        Store::open_with(data_dir, StoreOptions::default())
+    }
+
+    /// Opens the store with non-default [`StoreOptions`].
+    pub fn open_with(data_dir: impl AsRef<Path>, options: StoreOptions) -> Result<Store> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(data_dir.join(CAS_DIR))?;
@@ -349,18 +384,23 @@ impl Store {
             #[cfg(test)]
             write_window: Mutex::new(None),
         };
-        store.init()?;
+        store.init(options)?;
         // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
         harden_db_files(&store.data_dir);
         Ok(store)
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&self, options: StoreOptions) -> Result<()> {
         let mut conn = self.conn();
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if options.checkpointing == Checkpointing::Embedder {
+            // Zero disables it. Set before `migrate` runs, so not one frame of
+            // this store's life is recycled by anybody but the embedder.
+            conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        }
         // Litestream checkpoints in a second process. A trie GC transaction
         // can legitimately hold the write lock beyond SQLite's old five
         // second wait, so give replication and daemon writers room to queue
@@ -373,6 +413,11 @@ impl Store {
     /// The data directory.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// The database file.
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir.join(DB_FILE)
     }
 
     /// Selects remote durability semantics for this process.
@@ -1746,5 +1791,55 @@ mod tests {
         assert!(conn
             .query_row("SELECT COUNT(*) FROM third", [], |r| r.get::<_, i64>(0))
             .is_ok());
+    }
+
+    /// Handing checkpointing to the embedder means SQLite stops doing it: the
+    /// log grows until the embedder says otherwise, which is what lets a
+    /// replicator ship a frame before anything can recycle it
+    /// (`docs/CLOUD-DATAPLANE.md` §5.3).
+    #[test]
+    fn the_embedder_can_take_the_write_ahead_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_with(
+            dir.path(),
+            StoreOptions {
+                checkpointing: Checkpointing::Embedder,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .conn()
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+        );
+
+        // Enough writes that SQLite's own 1000-page threshold would have
+        // fired several times over had it still been in charge.
+        for n in 0..2000 {
+            store.set_config(&format!("probe.{n}"), "x").unwrap();
+        }
+        let wal = dir.path().join(format!("{DB_FILE}-wal"));
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the log should still hold the writes nobody moved"
+        );
+        assert_eq!(store.config("probe.1999").unwrap().as_deref(), Some("x"));
+    }
+
+    /// The default leaves SQLite in charge, so nothing about an ordinary
+    /// daemon changes.
+    #[test]
+    fn by_default_sqlite_still_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(
+            store
+                .conn()
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
     }
 }

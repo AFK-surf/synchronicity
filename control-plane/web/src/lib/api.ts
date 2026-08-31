@@ -96,6 +96,10 @@ export interface OrgDetail {
 export interface NetworkSummary {
   name: string
   device_count: number
+  // Whether an operator-run replica is hosted on this network
+  // (`docs/CLOUD-DATAPLANE.md` §2). The column behind it is an integer; the
+  // API answers a boolean, so this is a switch here too.
+  cloud_hosted: boolean
 }
 
 export interface DeviceKeyRow {
@@ -114,6 +118,7 @@ export interface NetworkDetail {
   soa_serial: number
   sig_expires_at: number
   last_published_at: number
+  cloud_hosted: boolean
   devices: DeviceKeyRow[]
 }
 
@@ -340,4 +345,41 @@ export function browseQuery(params: Record<string, string>): string {
   }
   const rendered = query.toString()
   return rendered === '' ? '' : `?${rendered}`
+}
+
+// -- cloud hosting ----------------------------------------------------------
+
+/// What a route that reshapes the zone answers with: the flat `ok` plus the
+/// serial the publish committed at, and the route's own payload nested under
+/// `result`. Every zone-shaping call replies in this envelope — adding a
+/// device does, and so does this switch — so the payload is never at the top
+/// level however small it is.
+export interface ZoneMutation<T> {
+  ok: boolean
+  soa_serial: number
+  result: T
+}
+
+/// The cloud-hosting switch's payload. `devices_removed` is what turning it
+/// off took out of the network in the same commit — 0 on the way in.
+export interface CloudHostingResult {
+  enabled: boolean
+  devices_removed: number
+}
+
+/// Turn managed replica hosting on or off for one network
+/// (`docs/CLOUD-DATAPLANE.md` §2). Admin-gated, like the browse switch, and a
+/// zone mutation in both directions: enabling republishes so the data plane's
+/// poll notices, and disabling removes the hosted device rows with the same
+/// commit that clears the flag.
+export function setCloudHosting(
+  slug: string,
+  network: string,
+  enabled: boolean,
+): Promise<ZoneMutation<CloudHostingResult>> {
+  return send(
+    'PUT',
+    `/api/orgs/${slug}/networks/${network}/cloud-hosting/enabled`,
+    { enabled },
+  )
 }

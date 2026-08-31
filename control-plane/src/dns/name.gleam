@@ -80,6 +80,34 @@ fn plain_bytes_ok(bytes: BitArray) -> Bool {
   }
 }
 
+/// Whether a device label is in the reserved `cloud-` namespace
+/// (docs/CLOUD-DATAPLANE.md §3.4): the hosting slots the cloud data plane's
+/// devices occupy, which only the data-plane principal may create.
+///
+/// It lives beside `valid_device_label` rather than in the API layer because
+/// it is the same kind of fact — a grammar over a label — and because both
+/// device-create paths and the data-plane API need it, and the one module all
+/// three can import without a cycle is this one.
+///
+/// **The whole prefix, not just `cloud-<digits>`.** An earlier version
+/// reserved only the digit form, on the reasoning that a namespace should
+/// take no more names than it can explain. That is the wrong trade for a
+/// namespace whose purpose is to keep one identity unambiguous: it left
+/// `cloud-1a`, `cloud-01` and `cloud-1-2` available as customer labels that
+/// read, to a human scanning a device list, exactly like the hosting slot
+/// beside them. Reserving the prefix costs a handful of names nobody has a
+/// strong claim to and buys a device list in which "starts with `cloud-`"
+/// means one thing.
+///
+/// This is a rule about **creation**. It deliberately does not decide which
+/// existing device the data plane owns — that is `devices.created_by`, and
+/// every path that acts on a device already present uses it, so widening this
+/// grammar can neither delete nor lock a customer out of a device they made
+/// before the namespace existed.
+pub fn reserved_device_label(label: String) -> Bool {
+  string.starts_with(label, "cloud-")
+}
+
 /// Presentation form, always absolute: ["a", "b"] is "a.b.".
 pub fn to_string(name: Name) -> String {
   case name {

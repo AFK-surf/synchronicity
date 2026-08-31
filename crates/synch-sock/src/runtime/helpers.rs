@@ -1348,8 +1348,12 @@ fn h_ssh_event_done(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
+    // Both outcomes are success: completing an event allocates nothing, so a
+    // connection that went away while the guest was answering leaves nothing
+    // to undo. The guest learns of the teardown from `POLL_HUP`, which is the
+    // mechanism for it — not from an error on a call it made correctly.
     match state.reply(event_id, crate::runtime::ssh::Decision::Done) {
-        Ok(()) => ret(0),
+        Ok(_) => ret(0),
         Err(()) => ret(errno::ESTATE),
     }
 }
@@ -1441,7 +1445,7 @@ fn h_ssh_auth_reply(
             next_methods,
         },
     ) {
-        Ok(()) => ret(0),
+        Ok(_) => ret(0),
         Err(()) => ret(errno::ESTATE),
     }
 }
@@ -1619,15 +1623,22 @@ fn h_ssh_channel_accept(
         endpoint,
         Box::new(writer),
     ));
-    if state
-        .reply(
+    // The one caller that must treat a teardown as a failure. The others
+    // answer and are done; this one has just built an endpoint for the answer
+    // to carry, and an answer nobody received means that endpoint will never
+    // be bridged to anything. Handing the guest a live fd onto a dead
+    // connection would leak it for the life of the invocation, so the
+    // allocation is undone and the guest is told — it asked for a channel and
+    // there is no channel.
+    if !matches!(
+        state.reply(
             event_id,
             crate::runtime::ssh::Decision::Channel { fd: handle, bridge },
-        )
-        .is_err()
-    {
-        // The reply failed, so no registration will consume the token; drop
-        // it so the next accept that reuses the fd starts from a clean slate.
+        ),
+        Ok(crate::runtime::ssh::Replied::Delivered)
+    ) {
+        // No registration will consume the token; drop it so the next accept
+        // that reuses the fd starts from a clean slate.
         state.forget_accept(handle);
         state.release_channel();
         inner.remove(handle);
@@ -1666,7 +1677,7 @@ fn h_ssh_channel_reject(
         event_id,
         crate::runtime::ssh::Decision::ChannelReject(reason),
     ) {
-        Ok(()) => ret(0),
+        Ok(_) => ret(0),
         Err(()) => ret(errno::ESTATE),
     }
 }
@@ -1873,7 +1884,7 @@ fn h_ssh_request_reply(
         event_id,
         crate::runtime::ssh::Decision::Request(result == 1),
     ) {
-        Ok(()) => ret(0),
+        Ok(_) => ret(0),
         Err(()) => ret(errno::ESTATE),
     }
 }

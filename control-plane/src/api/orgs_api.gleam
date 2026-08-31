@@ -171,6 +171,31 @@ pub fn delete_org(
                 [Text(org_id)],
               ),
             )
+            // Children before parents, and foreign keys are on: the
+            // metering heartbeat's row points at a network.
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "DELETE FROM network_hosting_status
+                 WHERE network_id IN (SELECT id FROM networks WHERE org_id = ?)",
+                [Text(org_id)],
+              ),
+            )
+            // Deleting an org that still hosts networks is an offboarding for
+            // each of them: the bytes in the bucket outlive every row here, so
+            // the instruction to collect them is written before the rows go.
+            // `DO NOTHING` leaves a clock that is already running alone.
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "INSERT INTO cloud_collect_queue
+                   (org_slug, network_name, disabled_at)
+                 SELECT ?1, n.name, ?2 FROM networks n
+                 WHERE n.org_id = ?3 AND n.cloud_hosted = 1
+                 ON CONFLICT (org_slug, network_name) DO NOTHING",
+                [Text(slug), VInt(now_unix()), Text(org_id)],
+              ),
+            )
             use _ <- result.try(
               sqlite.exec(conn, "DELETE FROM networks WHERE org_id = ?", [
                 Text(org_id),

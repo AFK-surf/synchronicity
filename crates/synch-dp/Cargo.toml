@@ -1,0 +1,50 @@
+[package]
+name = "synch-dp"
+description = "The cloud data plane: one embedded synchronicity replica node per hosted network, replicated to object storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The node itself, embedded as a library — this crate is one more embedder of
+# the engine, not a fork of the daemon (`docs/CLOUD-DATAPLANE.md` §4.1).
+synch-core.workspace = true
+synch-engine.workspace = true
+synch-net.workspace = true
+synch-store.workspace = true
+
+opendal.workspace = true
+# SQLite replication, off the shelf. A WAL shipper is a specialist's problem —
+# uncommitted spill, rollback rewinding the high-water mark, frame checksum
+# chains, snapshots ordered against checkpoints — and `celld-ltx` is a Rust
+# reimplementation of Litestream v0.5 that has solved it, so the data plane
+# configures it rather than reimplementing it (`docs/CLOUD-DATAPLANE.md` §5.3).
+# Pinned to a commit: it is unpublished, so there is no version to track.
+celld-ltx = { git = "https://github.com/denoland/celld", rev = "a52f9905425bc41134d817694bdc2c50bcc5e856" }
+
+# `json` for the metrics/stub surfaces; the workspace default keeps axum lean
+# for the gateway, which does not need it.
+axum = { workspace = true, features = ["json"] }
+blake3.workspace = true
+clap.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The simulated signed zone the end-to-end test resolves against, which is
+# how a hosted tenant is named without standing up a real control plane's
+# DNSSEC signer.
+synch-net = { workspace = true, features = ["sim"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

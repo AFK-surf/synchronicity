@@ -24,7 +24,10 @@ pub mod views;
 pub use bindings::{Binding, BindingSource, PublishScope};
 pub use cas::{PinHolder, PinRow};
 pub use clock::ClockStatus;
-pub use db::{DeviceKey, IdentityAdoption, KeyState, Store, Txn, CAS_DIR, DB_FILE};
+pub use db::{
+    Checkpointing, DeviceKey, IdentityAdoption, KeyState, Store, StoreOptions, Txn, CAS_DIR,
+    DB_FILE,
+};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot};

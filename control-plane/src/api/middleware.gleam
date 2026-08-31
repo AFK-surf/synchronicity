@@ -1,8 +1,9 @@
 //// Credential resolution for the product API: the session cookie and its
-//// CSRF double submit, and the bearer token an API key — org-scoped or
-//// network-scoped — is presented as.
+//// CSRF double submit, and the bearer token an API key — org-scoped,
+//// network-scoped, or the deployment-wide data-plane key — is presented as.
 
 import auth/api_key
+import auth/dataplane_key
 import auth/principal.{type Principal, Cookie, Principal}
 
 import auth/session.{type Session}
@@ -108,7 +109,16 @@ pub fn check_principal(
     Bearer(token) ->
       case api_key.authenticate(conn, token, now_unix()) {
         Ok(who) -> Ok(who)
-        Error(Nil) -> Error(bad_key())
+        // The two families are told apart by prefix before either touches the
+        // database — `synchdp_` does not start with `synch_` — so this is not
+        // a second lookup for a well-formed token of either kind. It costs one
+        // extra round trip only for a token that is going to be refused, which
+        // is the request we are least interested in making fast.
+        Error(Nil) ->
+          case dataplane_key.authenticate(conn, token, now_unix()) {
+            Ok(who) -> Ok(who)
+            Error(Nil) -> Error(bad_key())
+          }
       }
     Foreign -> Error(foreign_credential())
     Absent ->
@@ -209,6 +219,7 @@ pub fn require_user(who: Principal, next: fn() -> Response) -> Response {
     // A join key gets the refusal that names the one thing it *can* do,
     // rather than a list of things no key may.
     principal.JoinKey(..) -> join_key_refused()
+    principal.Dataplane(..) -> dataplane_refused()
   }
 }
 
@@ -220,5 +231,22 @@ pub fn join_key_refused() -> Response {
     "join_key_forbidden",
     "a join key may only add a device to the network it was minted for: "
       <> "POST /api/orgs/<org>/networks/<network>/devices",
+  )
+}
+
+/// The refusal every route outside `/dp/v1` gives a data-plane key.
+///
+/// Named rather than folded into `api_key_refused`, for the reason the join
+/// key's refusal is named: a credential should be told what it *is* for, and a
+/// message about managing accounts and other API keys would send whoever is
+/// reading the log looking for the wrong mistake. The one mistake this refusal
+/// covers is pointing the data plane's own key at the org API — which the
+/// design says can never work, and this is where it does not.
+pub fn dataplane_refused() -> Response {
+  error_json(
+    403,
+    "dataplane_forbidden",
+    "a data-plane key reaches the hosted-replica API and nothing else: "
+      <> "/dp/v1/networks and the routes below it",
   )
 }

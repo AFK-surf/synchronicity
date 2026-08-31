@@ -567,8 +567,11 @@ impl Node {
             .filter(|(key, _)| !key.ends_with(".cache_bytes") && !key.ends_with(".upload"))
             .cloned()
             .collect();
+        let store_options = synch_store::StoreOptions {
+            checkpointing: config.checkpointing,
+        };
         let opened = crate::blocking::offload(move || {
-            let store = Store::open(&data_dir)?;
+            let store = Store::open_with(&data_dir, store_options)?;
             if desired_backend != "local" {
                 let path_spaces: Vec<String> = store
                     .sources()?
@@ -715,12 +718,20 @@ impl Node {
         // fails at ALPN negotiation rather than after a handshake and a
         // refusal, and a build that cannot run a program never advertises that
         // it can (`docs/SOCKETS.md` §5.1).
+        // Zero workers is the same statement made by the host rather than by
+        // the build, and it is answered here rather than inside the pool so
+        // that declining costs nothing at all: no threads, and no SSH host key
+        // minted — generating one is a durable write, and a node that will
+        // never answer an SSH socket has no business having one
+        // (`config::NodeConfig`).
         let socket_workers = config.socket_workers;
         #[cfg(all(
             any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
-        let socket_pool = {
+        let socket_pool = if socket_workers == 0 {
+            None
+        } else {
             const SSH_HOST_KEY_CONFIG: &str = "ssh.host_key.ed25519";
             let key_store = store.clone();
             let host_key =
@@ -752,8 +763,11 @@ impl Node {
             any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
-        let socket_pool =
-            crate::sockets::SocketPool::start(socket_workers, crate::sockets::default_limits());
+        let socket_pool = if socket_workers == 0 {
+            None
+        } else {
+            crate::sockets::SocketPool::start(socket_workers, crate::sockets::default_limits())
+        };
         let dispatch = crate::sockets::SocketDispatch::new();
         if socket_pool.is_some() {
             config.net.sockets = Some(Arc::new(dispatch.clone()));
@@ -1902,7 +1916,7 @@ pub(crate) fn decode_addr(id: NodeId, bytes: &[u8]) -> Option<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::node;
+    use crate::testkit::{node, node_with};
 
     fn node_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -2515,6 +2529,35 @@ mod tests {
         std::fs::write(space.path().join("b.txt"), b"hello").unwrap();
         let (_, after) = node.scan_and_publish().unwrap();
         assert_eq!(after.unwrap().seq, before.seq + 1);
+        node.shutdown().await.unwrap();
+    }
+
+    /// Zero socket workers declines the capability rather than starving it:
+    /// no pool, and — the part a durable write makes visible — no SSH host key
+    /// minted for a node that will never answer an SSH socket. A multi-tenant
+    /// host pays both of these per tenant (`docs/CLOUD-DATAPLANE.md` §4.4).
+    #[tokio::test]
+    async fn declining_sockets_starts_no_pool_and_mints_no_host_key() {
+        let (_d, node) = node_with(|config| config.socket_workers = 0).await;
+        assert!(node.socket_workers().is_none());
+        assert_eq!(node.store().config("ssh.host_key.ed25519").unwrap(), None);
+        node.shutdown().await.unwrap();
+    }
+
+    /// And the default still serves them, so the switch is the host's alone.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[tokio::test]
+    async fn the_default_still_serves_sockets() {
+        let (_d, node) = node_with(|config| config.socket_workers = 1).await;
+        assert!(node.socket_workers().is_some());
+        assert!(node
+            .store()
+            .config("ssh.host_key.ed25519")
+            .unwrap()
+            .is_some());
         node.shutdown().await.unwrap();
     }
 

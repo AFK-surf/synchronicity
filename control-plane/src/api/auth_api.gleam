@@ -596,6 +596,9 @@ pub fn me(reads_ctx: Reads, who: Principal) -> Response {
     principal.Cookie(csrf) -> me_for(reads_ctx, who.user_id, csrf)
     principal.ApiKey(..) -> middleware.api_key_refused()
     principal.JoinKey(..) -> middleware.join_key_refused()
+    // The data plane's key has no account and no org at all, so there is even
+    // less here for it than for the other two.
+    principal.Dataplane(..) -> middleware.dataplane_refused()
   }
 }
 
