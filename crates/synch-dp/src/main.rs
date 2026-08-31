@@ -82,7 +82,7 @@ async fn run() -> synch_dp::Result<()> {
     // tenant (§7.1). Tenants that cannot resolve simply do not identify, which
     // the supervisor already treats as "wait", so a failure here is a warning
     // rather than a refusal to start.
-    let resolver = match build_resolver().await {
+    let resolver = match build_resolver(config.dns.clone()).await {
         Ok(resolver) => Some(resolver),
         Err(error) => {
             tracing::error!(%error, "no DNSSEC resolver; tenants will not identify");
@@ -111,8 +111,9 @@ async fn run() -> synch_dp::Result<()> {
 }
 
 /// Builds the shared DNSSEC resolver.
-async fn build_resolver() -> synch_dp::Result<Arc<synch_net::DnssecResolver>> {
-    let options = synch_net::ResolverOptions::default();
+async fn build_resolver(
+    options: synch_net::ResolverOptions,
+) -> synch_dp::Result<Arc<synch_net::DnssecResolver>> {
     let built = tokio::task::spawn_blocking(move || {
         let _scope = synch_core::BlockingScope::enter();
         synch_net::DnssecResolver::with_options(&options)

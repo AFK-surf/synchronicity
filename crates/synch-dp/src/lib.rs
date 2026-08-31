@@ -17,6 +17,7 @@ pub mod dbrepl;
 pub mod error;
 pub mod metrics;
 pub mod reconciler;
+pub mod rotation;
 pub mod spaces;
 pub mod store;
 pub mod tenant;

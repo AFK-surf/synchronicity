@@ -468,7 +468,7 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
       devices_api.revoke_key(auth, browse, who, slug, dev, key)
     }
 
-    // The data plane's three writes. They are here rather than in a table of
+    // The data plane's four writes. They are here rather than in a table of
     // their own because they are writes, and everything true of a write on
     // this service is true of them: the primary takes them, they publish the
     // zone where they shape it, and a replica answers `elsewhere`'s 409.
@@ -483,6 +483,13 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
     ["dp", "v1", "networks", org, net, "status"], Post -> {
       use who <- with_principal(req, auth.reads)
       dataplane_api.post_status(req, auth, who, org, net)
+    }
+    // Reporting a collection, not asking for one: the fleet has already
+    // deleted the tenant's prefixes when it calls this, and what it is
+    // writing here is the record that it did.
+    ["dp", "v1", "networks", org, net, "storage"], Delete -> {
+      use who <- with_principal(req, auth.reads)
+      dataplane_api.collect_storage(auth, who, org, net)
     }
 
     _, _ -> wisp.not_found()

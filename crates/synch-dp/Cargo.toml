@@ -22,7 +22,9 @@ opendal.workspace = true
 # AES-256-GCM over the database stream, which carries device secrets (§9).
 aws-lc-rs.workspace = true
 
-axum.workspace = true
+# `json` for the metrics/stub surfaces; the workspace default keeps axum lean
+# for the gateway, which does not need it.
+axum = { workspace = true, features = ["json"] }
 blake3.workspace = true
 clap.workspace = true
 hex.workspace = true
@@ -36,6 +38,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# The simulated signed zone the end-to-end test resolves against, which is
+# how a hosted tenant is named without standing up a real control plane's
+# DNSSEC signer.
+synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 
 [lints]

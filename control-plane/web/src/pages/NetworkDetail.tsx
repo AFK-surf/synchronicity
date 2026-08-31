@@ -9,6 +9,7 @@ import {
   type DeviceKeyRow,
   type DeviceRow,
   type NetworkDetail as Detail,
+  setCloudHosting,
   type NodeReplication,
   type ReplicaSpace,
   type Replication as ReplicationPayload,
@@ -32,6 +33,9 @@ export function NetworkDetail() {
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['network', slug, name] })
     queryClient.invalidateQueries({ queryKey: ['devices', slug] })
+    // The org's network list carries per-network facts of its own now
+    // (`cloud_hosted`), so it goes stale with this page.
+    queryClient.invalidateQueries({ queryKey: ['networks', slug] })
   }
 
   if (error) return <ErrorNote error={error} />
@@ -66,6 +70,13 @@ export function NetworkDetail() {
       <AddDevice slug={slug} network={name} onChange={refresh} />
       <DelegatedTrust slug={slug} network={name} />
       <ReplicationPanel slug={slug} network={name} />
+      <CloudHosting
+        slug={slug}
+        network={name}
+        enabled={data.cloud_hosted}
+        isAdmin={isAdmin}
+        onChange={refresh}
+      />
       <ConnectPanel domain={data.domain} />
     </div>
   )
@@ -496,6 +507,90 @@ function remaining(at: number): string {
   const hours = Math.floor(secs / 3600)
   if (hours > 0) return `${hours}h`
   return `${Math.max(1, Math.floor(secs / 60))}m`
+}
+
+/// The org's switch for managed replica hosting
+/// (`docs/CLOUD-DATAPLANE.md` §2).
+///
+/// Admin-gated the way the browse switch is, and off until an admin turns it
+/// on: hosting puts a service-operated node in the customer's network, which
+/// is an explicit grant or it is nothing. The state is shown to everyone
+/// regardless — whether an operator holds a copy of this network is a fact a
+/// member gets to read, and only an owner or admin gets to change.
+///
+/// Both directions publish the zone, so the reply is the zone-mutation
+/// envelope rather than a bare `enabled`, and turning it off removes the
+/// hosted device rows in that same commit — hence the full refresh, device
+/// table included.
+function CloudHosting({
+  slug,
+  network,
+  enabled,
+  isAdmin,
+  onChange,
+}: {
+  slug: string
+  network: string
+  enabled: boolean
+  isAdmin: boolean
+  onChange: () => void
+}) {
+  const set = useMutation({
+    mutationFn: (next: boolean) => setCloudHosting(slug, network, next),
+    onSuccess: onChange,
+  })
+  return (
+    <div className="rounded-lg border border-neutral-800 p-4">
+      <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-neutral-400">
+        Cloud hosting
+      </h2>
+      <p className="text-neutral-300">
+        Cloud hosting is {enabled ? 'on' : 'off'} for this network.
+      </p>
+      <p className="mt-1 text-sm text-neutral-500">
+        Off by default. When it is on, an operator-run replica joins this
+        network as an ordinary device (
+        <code className="text-neutral-300">cloud-1</code>) and durably keeps a
+        copy of everything published on this network. It is a member like any
+        other, and reads what any member reads. Turning it off removes that
+        device and starts a retention hold — 30 days by default — before the
+        stored copy is deleted.
+      </p>
+      {isAdmin ? (
+        <div className="mt-4">
+          {enabled ? (
+            <button
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Turn cloud hosting off for ${network}? The hosted device leaves the network on the next publish, and the stored copy is deleted after the retention hold.`,
+                  )
+                )
+                  set.mutate(false)
+              }}
+              disabled={set.isPending}
+              className="rounded-md border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800 disabled:opacity-50"
+            >
+              Turn off cloud hosting
+            </button>
+          ) : (
+            <button
+              onClick={() => set.mutate(true)}
+              disabled={set.isPending}
+              className="rounded-md bg-white px-3 py-2 text-sm font-medium text-neutral-950 disabled:opacity-50"
+            >
+              Enable cloud hosting
+            </button>
+          )}
+          <ErrorNote error={set.error} />
+        </div>
+      ) : (
+        <p className="mt-4 text-sm text-neutral-500">
+          You are a member of this org, so an owner or admin has to change it.
+        </p>
+      )}
+    </div>
+  )
 }
 
 function DeviceTable({

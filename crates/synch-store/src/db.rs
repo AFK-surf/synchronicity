@@ -1904,10 +1904,7 @@ mod tests {
         assert!(!report.busy, "{report:?}");
         assert_eq!(std::fs::metadata(store.wal_path()).unwrap().len(), 0);
         // The data survived the move into the database file.
-        assert_eq!(
-            store.config("probe.1999").unwrap().as_deref(),
-            Some("x")
-        );
+        assert_eq!(store.config("probe.1999").unwrap().as_deref(), Some("x"));
     }
 
     /// The default leaves SQLite in charge, so nothing about an ordinary

@@ -287,9 +287,9 @@ grant that did not move it would be a network nobody ever hosted.
 
 Disabling also stamps `cloud_disabled_at`, which starts the retention clock
 over the tenant's object storage — re-enabling within the hold is a cheap
-re-provision, and after it a scheduled job deletes the prefix. That date
-outlives the device rows the same transaction removes, which is why it lives on
-the network.
+re-provision, and after it the network shows up in the `collect` list below and
+the fleet deletes the prefix. That date outlives the device rows the same
+transaction removes, which is why it lives on the network.
 
 The two toggles stay independent and independently fail-closed. Hosting without
 browse replicates, and is observable only through the status heartbeat below;
@@ -344,6 +344,7 @@ ever answer for the other's token, in the middleware or in a log line.
 | `PUT`    | `/dp/v1/networks/:org/:net/device`            | `{"label": "cloud-1", "nk": "…"}` — idempotent registration |
 | `DELETE` | `/dp/v1/networks/:org/:net/device/keys/:nk`   | close a rotation (`?revoke=1` to withdraw outright) |
 | `POST`   | `/dp/v1/networks/:org/:net/status`            | the metering heartbeat |
+| `DELETE` | `/dp/v1/networks/:org/:net/storage`           | record that an offboarded tenant's storage has been collected |
 
 **Nothing else accepts this credential, and it accepts nothing else.** Both
 halves are one `case` arm rather than a maintained list: `api/common.check_org`
@@ -354,7 +355,7 @@ dataplane_only`. A dashboard user who could register hosted devices by hand
 would be a second, unaudited way into the reserved namespace.
 
 The `GET` is a read and a replica answers it, like the rest of the read half;
-the three writes are the primary's, like every write, and a write that reaches
+the four writes are the primary's, like every write, and a write that reaches
 a replica gets the ordinary `409 read-only-replica` naming where to take it.
 
 **The desired-state document** is what the whole design turns on:
@@ -366,7 +367,8 @@ a replica gets the ordinary `409 read-only-replica` naming where to take it.
       "domain": "prod.acme.synchronicity.example",
       "budget_bytes": 2199023255552,
       "retention": "current",
-      "device": { "label": "cloud-1", "nk": "…", "state": "active" } } ] }
+      "device": { "label": "cloud-1", "nk": "…", "state": "active" } } ],
+  "collect": [ { "org": "acme", "network": "old" } ] }
 ```
 
 `domain` is the membership domain verbatim, because the fleet must never
@@ -378,16 +380,39 @@ control-plane change and nothing else; today every network gets 2 TiB and
 is how a disk-less pod tells "a network I have never joined" from "a network
 whose identity I must recover".
 
-`generation` is the zone's SOA serial, and the response carries it as an
-`ETag`, so the steady-state poll is one `304` per interval. The serial is
-already bumped in the same transaction by everything that can change this
-document — a device registered or retired, a network deleted, the toggle
-flipped — so nothing has to remember to move a counter, which is the class of
-mistake that shows up as a fleet quietly serving last week's tenant set. It is
-deliberately *loose* rather than tight: it is deployment-wide, and the hourly
-re-sign moves it too, so the fleet occasionally refetches a small document it
-already had. The failure mode of a loose generation costs bytes; the failure
-mode of a tight one that missed a change is a network that never gets hosted.
+`collect` is the other list, and the one the fleet acts on with a delete rather
+than a provision: offboarded networks whose retention hold has run out. It is
+described on its own below.
+
+`generation` is the zone's SOA serial, and the response carries it — plus one
+more component, in a moment — as an `ETag`, so the steady-state poll is one
+`304` per interval. The serial is already bumped in the same transaction by
+everything that can change the `networks` half of this document — a device
+registered or retired, a network deleted, the toggle flipped — so nothing has
+to remember to move a counter, which is the class of mistake that shows up as a
+fleet quietly serving last week's tenant set. It is deliberately *loose* rather
+than tight: it is deployment-wide, and the hourly re-sign moves it too, so the
+fleet occasionally refetches a small document it already had. The failure mode
+of a loose generation costs bytes; the failure mode of a tight one that missed a
+change is a network that never gets hosted.
+
+The `collect` half cannot ride on the serial, though, and that is why the
+`ETag` is not simply the generation. A network becomes due for collection
+because a *clock* passed its stamp plus the hold: no transaction ran, no zone
+fact changed, and the serial sits exactly where it was. A tag built from the
+serial alone would answer `304` to every poll from then on and the fleet would
+never see the entry — not a late collection, a collection that never happens,
+which is the bug the list exists to fix. So the tag carries a second component:
+how many networks are due, and the sum of their `cloud_disabled_at` stamps.
+Both move under any change to the due set, including the one a count alone
+would miss — a network falling due in the same interval as another is collected,
+which leaves the count where it was and the set different.
+
+What that still leaves, and it is fine: a collection can be **up to one poll
+interval late**. The tag moves the moment the hold elapses, but nothing pushes;
+the fleet finds out when it next asks. A deletion that happens sixty seconds
+after it fell due is not a correctness problem, and it is said here rather than
+left as a silent hole.
 
 **Registration** creates the `devices`, `device_keys` and `network_devices`
 rows in one transaction with the zone republish — the same transaction shape
@@ -419,11 +444,66 @@ it survives the tenant being down. A heartbeat that has stopped moving *is* the
 alert. It is not audited: it arrives per tenant every few minutes, and a row
 per breath would bury every act a human took.
 
+### The retention hold, and collecting what it releases
+
+Turning hosting off drains the tenant and takes its device out of the zone in
+the same commit, but the bytes stay: thirty days, stated in
+docs/CLOUD-DATAPLANE.md §6 and held here as a module constant in
+`api/dataplane_api`, because the hold is policy and the fleet is mechanism. A
+service that holds the bucket credentials must not also hold an opinion about
+when a customer's data may go.
+
+Within the hold, re-enabling is a cheap re-provision: the stamp is cleared, the
+tenant database is restored from its replica stream, and the prefix is
+re-adopted rather than replicated afresh. After it, the network appears in
+`collect` — `cloud_hosted = 0`, a live `cloud_disabled_at`, and `now` past
+`cloud_disabled_at + 30 days` — and the fleet deletes `tenants/<org>/<net>/`
+and `db/<org>/<net>/`. The entry is just the two names, because those are what
+the prefixes are keyed by; handing over the stamp or the deadline would be
+giving the deleting service a second opinion about whether the hold had run.
+
+Then it says so:
+
+```
+DELETE /dp/v1/networks/:org/:net/storage
+{"ok": true, "network": "old", "collected": true}
+```
+
+Called **after** the bytes are gone, never before. It clears
+`cloud_disabled_at`, which is what takes the network out of `collect` — without
+it the list would repeat the same instruction on every poll for the rest of the
+deployment's life — and writes one `cloud-hosting.storage.collect` row carrying
+the stamp it just cleared and how long the hold actually ran, since the column
+that would answer that later is the one being erased.
+
+Two properties it is built around. It **refuses a network with `cloud_hosted =
+1`, `409 cloud-hosting-enabled`**: collecting a live tenant's storage is the
+catastrophic operation in this design, and while this service performs no
+deletion, it must never be able to *record* one — a row asserting that a
+running customer's bytes were collected is a claim somebody would have to
+disprove later. And it is **idempotent**: a network with no stamp is a `200`
+no-op with `"collected": false`, because the fleet deletes a great many objects
+and then calls this, and a pod that died between the last object and the call
+has no way to know which side of it it was on.
+
+It is not a zone mutation, unlike the toggle that starts the clock. The toggle
+republishes even when turning hosting *on* changes nothing in the zone, purely
+so the serial moves and the fleet's conditional poll notices — but that reason
+does not apply here, because the `collect` list has its own component in the
+`ETag` and moves the tag by itself. Republishing would be worse than
+unnecessary: nothing in the zone depends on `cloud_disabled_at` (the hosted
+devices went a month earlier, in the commit that stamped it), so it would
+re-sign and bump a deployment-wide serial — making *every* shard refetch —
+because one tenant's bucket was emptied. It would also put a housekeeping call
+behind the transparency gate, where it could be held back and leave the fleet
+asked to collect the same prefix on every poll until a human noticed.
+
 Audit actions this adds, all under the actor `dpkey:<id>` (its own namespace,
 because `key:<id>` is resolvable against `api_keys` and this one is not):
 `cloud-hosting.device.register`, `cloud-hosting.device.rotate`,
-`cloud-hosting.key.retire`, `cloud-hosting.key.revoke`. The mint itself is
-`dataplane.key.mint`, with no org, under `system:dataplane-key-mint`.
+`cloud-hosting.key.retire`, `cloud-hosting.key.revoke`,
+`cloud-hosting.storage.collect`. The mint itself is `dataplane.key.mint`, with
+no org, under `system:dataplane-key-mint`.
 
 **What this service does not do.** It runs no hosted replicas and stores no
 customer bytes; `crates/synch-dp` does that, against this API. And a hosted

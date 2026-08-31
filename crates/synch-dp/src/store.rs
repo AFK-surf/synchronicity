@@ -61,6 +61,15 @@ impl ObjectStore {
         Ok(Self { operator, seal })
     }
 
+    /// An in-memory store that seals, for tests that need the real envelope.
+    ///
+    /// Not `cfg(test)`: the crate's own integration tests are a separate
+    /// build and reach this the way any embedder would.
+    pub fn memory_sealed() -> Result<Self> {
+        let operator = opendal::Operator::from_config(opendal::services::MemoryConfig::default())?;
+        Self::new(operator, Some([7u8; 32]))
+    }
+
     /// An in-memory store, for tests.
     #[cfg(test)]
     pub fn memory() -> Result<Self> {

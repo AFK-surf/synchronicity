@@ -2553,7 +2553,11 @@ mod tests {
     async fn the_default_still_serves_sockets() {
         let (_d, node) = node_with(|config| config.socket_workers = 1).await;
         assert!(node.socket_workers().is_some());
-        assert!(node.store().config("ssh.host_key.ed25519").unwrap().is_some());
+        assert!(node
+            .store()
+            .config("ssh.host_key.ed25519")
+            .unwrap()
+            .is_some());
         node.shutdown().await.unwrap();
     }
 

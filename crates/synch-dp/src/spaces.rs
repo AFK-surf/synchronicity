@@ -61,7 +61,15 @@ pub async fn ensure_replicas(node: &Node, network: &HostedNetwork) -> Result<()>
                     node.add_replica(&space, policy, grace, share, None)?;
                     tracing::info!(%tenant, %space, "replicating a space");
                 }
-                Some(replica) if replica.retention != policy || share.is_some() => {
+                // Compared against what the replica *has*, not against
+                // whether a budget exists. An org moving to an unlimited plan
+                // sends `budget_bytes: 0`, which derives `None`; a guard that
+                // only fired when a budget was present would leave every
+                // replica pinned at its old ceiling for ever, admitting
+                // nothing and reporting `held_back` with no explanation. It
+                // also stops this writing a row for every space on every tick
+                // whenever any budget is set.
+                Some(replica) if replica.retention != policy || replica.budget != share => {
                     node.set_replica(&space, Some(policy), None, Some(share), None)?;
                 }
                 Some(_) => {}

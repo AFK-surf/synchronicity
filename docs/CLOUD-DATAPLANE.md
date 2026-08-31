@@ -3,10 +3,9 @@
 Status: **implemented** (v1) · 2026-08-31
 
 The service is `crates/synch-dp`, the control-plane half is under
-`control-plane/src` (migration v12, `/dp/v1`, the cloud-hosting toggle), and
-the engine changes §7.3 asks for are in. What is *not* yet built is named in
-§11: the retention-hold collector, the dashboard toggle in `web/`, and
-sharding beyond a single shard's rendezvous filter.
+`control-plane/src` (migration v12, `/dp/v1`, the cloud-hosting toggle and
+its dashboard switch), and the engine changes §7.3 asks for are in. §11 says
+what is built and what a v2 would add.
 
 This document designs the **cloud data plane**: a managed, multi-tenant
 hosting service that runs a fleet of synchronicity replica nodes — one per
@@ -177,13 +176,14 @@ CREATE TABLE dataplane_keys (
 
 ### 3.3 The data-plane API
 
-Four routes under `/dp/v1`, all requiring the data-plane principal.
+Five routes under `/dp/v1`, all requiring the data-plane principal.
 
 **`GET /dp/v1/networks`** — the desired-state document. Every network of
 every org with `cloud_hosted = 1`:
 
 ```json
 { "generation": 4183,
+  "collect": [ { "org": "beta", "network": "old" } ],
   "networks": [
     { "org": "acme", "network": "prod",
       "domain": "prod.acme.synchronicity.example",
@@ -202,9 +202,16 @@ every org with `cloud_hosted = 1`:
 - `device` is present once the data plane has registered a key (below), so
   a restarted, disk-less data plane can tell "network I have never joined"
   from "network whose identity I must recover" (§5.3).
-- `generation` is a monotonic counter bumped by any change to the set or
-  its fields; the response carries an `ETag` derived from it so the
-  steady-state poll is one 304 per interval.
+- `collect` names offboarded networks whose retention hold (§6) has run
+  out — the fleet's instruction to delete what it stored.
+- `generation` is the zone's serial, bumped by any change that shapes the
+  hosted set. The response's `ETag` is derived from it **and from the
+  collections now due**, which is not a refinement but a correctness fix: a
+  hold elapses because a clock passed, with no transaction and no zone
+  fact, so a tag built from the serial alone would answer 304 for ever and
+  the collection would never happen at all. The tag folds in both a count
+  and a sum of the due stamps, because a count alone is unchanged when one
+  network falls due in the same interval another is collected.
 
 **`PUT /dp/v1/networks/:org/:net/device`** — idempotent registration of the
 hosted device's key:
@@ -256,6 +263,13 @@ other two writes: disabling hosting deletes these devices in its own
 commit, so a key still findable belongs to a tenant still hosted or one
 mid-teardown, and refusing to withdraw a key because the switch already
 went off would close the door on exactly the cleanup this is for.
+
+**`DELETE /dp/v1/networks/:org/:net/storage`** — the data plane reporting
+that it has deleted an offboarded tenant's stored copy. Refused with 409
+while the network is still hosted, so the record can never say "collected"
+about storage that is still in use; idempotent, because the fleet retries
+after a partial failure. It clears `cloud_disabled_at`, which is what takes
+the network out of `collect`.
 
 **`POST /dp/v1/networks/:org/:net/status`** — the metering heartbeat, sent
 per tenant every few minutes:
@@ -412,9 +426,19 @@ that a source-less, checkout-less, socket-less member needs:
 | `run_checkouts` | no | nothing is materialized |
 | uploads sweeper | no | v1 has no write surface at all — no control socket, no gateway, no sockets — so no upload can ever exist to sweep or reopen |
 
-Plus, of the daemon's one-shot startup helpers, only
-`readopt_self_on_startup` and `scan_publish_push` per tenant
-(`reopen_interrupted_uploads` goes with the sweeper, for the same reason).
+Plus, of the daemon's one-shot startup helpers, `readopt_self_on_startup`
+and then `scan_publish_push` per tenant (`reopen_interrupted_uploads` goes
+with the sweeper, for the same reason). The order matters and the first is
+not optional: a restored database can be behind what peers already hold
+(§5.3), and a publisher started over that seq forks this origin's own head
+— so re-adoption runs *before* any loop does.
+
+Two of these take a resolver and so are spawned directly rather than
+through the common helper. `run_dns` is the one whose absence is silent
+and total: membership is a lease, `run_maintenance` expires bindings on
+schedule, and nothing else renews them — a tenant without it stops
+trusting every customer device a TTL and a grace after it opened, while
+still reporting itself healthy.
 
 **Sockets are refused, permanently.** The hosted node closes socket
 admission at open and never reopens it. A hosted replica stores and serves
@@ -445,9 +469,10 @@ and ensure a replica exists for each —
 node.add_replica(space, policy_from_control_plane, grace, budget_share, None)
 ```
 
-The enumeration is `store().known_spaces()` (every space any origin has
-published entries for), woken by the engine's existing
-`spaces_changed_signal()` rather than polled blind.
+The enumeration is `store().known_spaces()` — every space any origin has
+published entries for — run on the reconciler's tick. A space that appears
+between ticks waits one interval, which costs latency on a new space and
+nothing else.
 
 Replicas are added and **never automatically removed**. Removal is the
 wrong tool twice over: `remove_replica` without `--pin-held` releases the
@@ -601,22 +626,32 @@ db/<org>/<network>/
   restore. Within a generation, `snapshot + wal/*` replays to the
   current database; frame salts and checksums in the WAL segments are what
   make a torn or duplicated upload detectable on restore.
-- **Shipping**: the replicator holds its own read connection beside the
-  store's single writer (the store's 30 s `busy_timeout` exists precisely
-  because a replication checkpointer contends with it), reads new WAL
-  frames on a short interval (default 1 s, batched), uploads a segment,
-  and only then checkpoints. It owns checkpointing outright — engine
-  change **(d)**, §7.3 — so the writer can never truncate WAL frames that
-  have not been shipped. Acknowledged-but-unshipped writes are bounded by
-  the interval; as with Litestream, the replica can only be *behind* the
-  bucket's CAS state, never ahead, which is the direction §8.3 of
-  SERVERLESS already reasons about.
+- **Shipping**: on a short interval (default 1 s) the replicator walks the
+  frames appended since it last shipped, and uploads them as one segment.
+  It owns checkpointing outright — engine change **(d)**, §7.3 — so nothing
+  can recycle a frame it has not shipped. Two rules make the walk sound,
+  and neither is optional. It stops at the last frame that **committed** a
+  transaction, because SQLite spills a large transaction's pages into the
+  log before it commits and rolls back by rewinding its own high-water mark
+  while leaving those bytes for the next transaction to overwrite — so
+  shipping by file length ships frames that are about to be replaced and
+  then misses their replacements. And it **verifies each frame's checksum
+  against the running chain**, so a frame that does not continue what was
+  already shipped is caught; that can only mean the log was rewritten
+  behind us, and the sound response is to end the generation and snapshot
+  the database file, which is authoritative either way.
+  Acknowledged-but-unshipped writes are bounded by the interval; as with
+  Litestream, the replica can only be *behind* the bucket's CAS state,
+  never ahead, which is the direction §8.3 of SERVERLESS already reasons
+  about.
 - **Restore**: on provisioning, before any init — list generations, pick
   the newest with a contiguous, checksum-valid WAL, download and replay,
   then start a fresh generation. Only when nothing restorable exists does
   `Node::init` run, exactly like a serverless daemon's boot.
-- **Drain and shutdown**: final checkpoint, ship the tail, write a
-  generation close marker, stop. This is the last step of §4.6.
+- **Drain and shutdown**: ship the tail, then stop. There is deliberately
+  no close marker and no final checkpoint: a marker would be one more thing
+  whose absence could strand a good stream, and restore already reads a
+  generation by what it holds rather than by what it claims.
 - **Single writer**: correctness of the stream assumes one live replicator
   per tenant DB, which is the same assumption the node itself makes
   (`replicas: 1`, SERVERLESS §1) and is provided by shard ownership
@@ -688,9 +723,20 @@ at expiry) and stamps `cloud_disabled_at` → next poll omits the network →
 the tenant drains: loops stopped, `Node::shutdown`, state `Retired`, local
 dir deleted. The object-store prefix and DB replica enter the **retention
 hold** (default 30 days, control-plane policy): re-enabling within it is a
-cheap re-provision that restores the DB and re-adopts the prefix; after
-it, a scheduled job deletes `tenants/<org>/<net>/` and `db/<org>/<net>/`
-and the hold's audit row records who disabled and when it fell due.
+cheap re-provision that restores the DB and re-adopts the prefix.
+
+**Collect**: once the hold elapses the control plane lists the network in
+`collect`, and the fleet deletes `tenants/<org>/<net>/` and
+`db/<org>/<net>/` and reports it with §3.3's `DELETE …/storage`. The order
+is the whole of the safety: bytes first, record second, so a crash in
+between re-collects an already-empty prefix rather than leaving the
+control plane believing storage is gone while the bill continues. Two
+independent locks guard it, because this is the one operation in the
+design that destroys customer data — the control plane refuses to mark a
+still-hosted network collected, and the data plane refuses to collect a
+tenant its own shard is running. The hold is control-plane policy for the
+same reason the flag is: the service holding the bucket credentials should
+not also hold the opinion about when a customer's bytes may go.
 
 **Shard loss**: a shard pod dies — the *normal* event, since pods are
 ephemeral. Its tenants' desired state still lists them; the replacement
@@ -869,40 +915,44 @@ crates/synch-dp/
 
 ### What is built
 
-1. **Engine groundwork** — done. Change (a) `socket_workers: 0` skips the
-   socket runtime and the SSH host key entirely; change (c)
+1. **Engine groundwork.** Change (a) `socket_workers: 0` skips the socket
+   runtime and the SSH host key entirely; change (c)
    `synch_engine::LifecycleLock` (the daemon's own lock, moved into the
    engine so an embedder gets it and the two cannot drift); change (d)
    `Checkpointing::Embedder` plus `Store::checkpoint`, `db_path`, and
    `wal_path`.
-2. **Control plane** — done. Migration v12 (`cloud_hosted`,
-   `cloud_disabled_at`, `dataplane_keys`, `network_hosting_status`, the
-   `system-dataplane` user), the admin toggle with its audit events, the
-   four `/dp/v1` routes, the `Dataplane` principal that `check_org` refuses
-   outright, the reserved `cloud-*` label namespace, and
+2. **Control plane.** Migration v12 (`cloud_hosted`, `cloud_disabled_at`,
+   `dataplane_keys`, `network_hosting_status`, the `system-dataplane`
+   user), the admin toggle with its audit events and its dashboard switch,
+   the five `/dp/v1` routes, the `Dataplane` principal that `check_org`
+   refuses outright, the reserved `cloud-*` label namespace, and
    `controlplane dataplane-key mint`.
-3. **`synch-dp` v1** — done for a single shard: restore-or-init, register,
-   identify, replicate, converge, heartbeat, drain.
+3. **`synch-dp`.** Restore-or-init, register, identify, replicate,
+   converge, rotate, heartbeat, collect, drain.
+4. **Offboarding is closed.** Disabling drains the tenant and removes its
+   local directory; the control plane lists the network for collection
+   once its hold has elapsed, and the data plane deletes the CAS prefix and
+   the database stream, then reports it. Two locks guard the one operation
+   here that destroys customer data: the control plane refuses to mark a
+   still-hosted network collected, and the data plane refuses to collect a
+   tenant this shard is running.
+5. **Rotation is driven**, not merely possible: the tenant's own database
+   carries the deadline, so a rotation survives the pod that started it.
 
-### What is not
+### What a v2 would add
 
-- **The retention-hold collector** (§6): disabling drains the tenant and
-  removes the local directory, and the bucket prefix plus DB stream are
-  left for a scheduled job that does not exist yet. Until it does, an
-  offboarded tenant's storage is retained indefinitely rather than for the
-  stated 30 days — the safe direction, and a billing question.
-- **The dashboard toggle**: the API is there and `cloud_hosted` is exposed
-  on both network reads; `web/` has no switch yet.
-- **An end-to-end test across both halves** — a customer node publishes,
-  the hosted tenant converges, the customer's copy goes away, the bytes
-  survive in the tenant prefix. The pieces are unit-tested on each side
-  (the replicator round-trips a real SQLite database; the control plane's
-  own suite covers the routes), but nothing yet runs the two together.
-  This is the most valuable next test to write.
-- **Sharding beyond one shard**: the rendezvous filter is implemented and
-  tested, but no handover has been exercised against a live fleet.
-- **Rotation is not driven** (§6): the `DELETE …/device/keys/:nk` route
-  exists and the client can call it; nothing schedules a rotation yet.
+- **Redundant hosting** — a second slot (`cloud-2`) on a different shard.
+  The slot model (§3.4) and the shard filter are built for it; what is
+  missing is billing and a status API that assume one row per network.
+- **Delegate-scoped hosting** (§9): the hosted node admitted for named
+  spaces only, so the fleet never sees the rest. A different product tier,
+  not a fix.
+- **Cross-shard handover exercised against a live fleet.** The rendezvous
+  filter is implemented and unit-tested; no test moves a running tenant
+  between two processes.
+- **Restore fuzzing** over torn and forked streams. Restore is exercised on
+  every provisioning and in unit tests covering a gap and a generation
+  roll; it is not yet fuzzed.
 
 ---
 

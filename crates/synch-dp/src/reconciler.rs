@@ -25,6 +25,13 @@ pub struct Reconciler {
     /// Networks that failed to provision, and when to try again.
     parked: HashMap<String, std::time::Instant>,
     etag: Option<String>,
+    /// The last document this shard successfully acted on.
+    ///
+    /// In memory, and consulted before the bucket: a `304 Not Modified` means
+    /// "what you already have", and reading that back from object storage
+    /// turns a missing cache object into an authoritative empty set — which
+    /// would drain every tenant on the shard.
+    last: Option<Desired>,
     metrics: Arc<Metrics>,
 }
 
@@ -47,6 +54,7 @@ impl Reconciler {
             tenants: HashMap::new(),
             parked: HashMap::new(),
             etag: None,
+            last: None,
             metrics,
         }
     }
@@ -67,20 +75,48 @@ impl Reconciler {
             }
         }
         // Every tenant gets its drain, and they run concurrently: the pod's
-        // termination grace is one budget shared by all of them (§4.6).
+        // termination grace is one budget shared by all of them, and a shard
+        // holding hundreds of tenants cannot spend it one at a time — the
+        // ones at the back of a sequential queue would be SIGKILLed before
+        // shipping their tails, which is the loss the replicator exists to
+        // prevent (§4.6).
         let drains: Vec<_> = self
             .tenants
             .drain()
-            .map(|(_, tenant)| tenant.drain())
+            .map(|(_, tenant)| tokio::spawn(tenant.drain()))
             .collect();
-        futures_join_all(drains).await;
+        for handle in drains {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "a tenant drain did not finish");
+            }
+        }
     }
 
     /// One pass: poll, diff, converge, report.
     pub async fn tick(&mut self) -> Result<()> {
-        let desired = self.desired().await?;
+        let (desired, fresh) = self.desired().await?;
         self.metrics.observed_generation(desired.generation);
 
+        // An empty set while tenants are running is the shape of every way
+        // this can go wrong at once — a stale cache, a truncated answer, a
+        // misconfigured shard. A real offboarding empties the set one network
+        // at a time and is in no hurry, so refusing to act on a wholesale
+        // emptying costs a poll interval and buys back the case where this
+        // deletes a shard's worth of data directories.
+        if desired.networks.is_empty() && !self.tenants.is_empty() {
+            tracing::error!(
+                tenants = self.tenants.len(),
+                "refusing to act on an empty desired set while tenants are running"
+            );
+            self.metrics.reconcile_failed();
+            return Ok(());
+        }
+
+        let collectable: Vec<crate::control::Collectable> = desired
+            .collect
+            .into_iter()
+            .filter(|network| self.config.serves(&network.key()))
+            .collect();
         let mine: Vec<HostedNetwork> = desired
             .networks
             .into_iter()
@@ -118,7 +154,8 @@ impl Reconciler {
         for (key, network) in wanted {
             match self.tenants.get_mut(&key) {
                 Some(tenant) => {
-                    if let Err(error) = tenant.converge(&network).await {
+                    if let Err(error) = tenant.converge(&network, &self.config, &self.control).await
+                    {
                         tracing::warn!(tenant = %key, %error, "converging the tenant failed");
                     }
                 }
@@ -126,6 +163,20 @@ impl Reconciler {
             }
         }
 
+        // Collection is the one irreversible act here, so it runs only on a
+        // document the control plane answered *this pass*. The fail-static
+        // cache exists to keep tenants alive through an outage; letting it
+        // authorize a delete would invert exactly what it is for — a shard
+        // partitioned from the control plane could delete a prefix the org
+        // had since re-enabled, and never know.
+        if fresh {
+            self.collect(&collectable).await;
+        } else if !collectable.is_empty() {
+            tracing::info!(
+                due = collectable.len(),
+                "holding collections until the control plane answers again"
+            );
+        }
         self.report().await;
         self.metrics.tenants(self.tenants.len(), self.parked.len());
         Ok(())
@@ -164,6 +215,64 @@ impl Reconciler {
         }
     }
 
+    /// Deletes the stored copy of offboarded tenants whose hold has run (§6).
+    ///
+    /// The order is the whole of the safety here: the bytes go first and the
+    /// control plane is told second, so a crash in between leaves a network
+    /// that is *still* listed as collectable and gets deleted again — a
+    /// no-op on an empty prefix — rather than one the control plane believes
+    /// is gone while its storage bill continues.
+    ///
+    /// A tenant this shard is still running is never collected, whatever the
+    /// document says. The control plane refuses to mark a hosted network
+    /// collected too, so this is the second of two locks on the one operation
+    /// in this design that destroys customer data.
+    async fn collect(&mut self, collectable: &[crate::control::Collectable]) {
+        for network in collectable {
+            let key = network.key();
+            if self.tenants.contains_key(&key) {
+                tracing::error!(
+                    tenant = %key,
+                    "refusing to collect storage for a tenant this shard is running"
+                );
+                continue;
+            }
+            let cas = self.config.cas_root(&network.org, &network.network);
+            let db = self.config.db_prefix(&network.org, &network.network);
+            // `cas_root` is an OpenDAL root (a leading slash); as a key under
+            // this operator's own root it is the same path without it.
+            let cas_prefix = cas.trim_start_matches('/').to_string();
+            let db_prefix = format!("{db}/");
+            let deleted = async {
+                self.objects.remove_prefix(&cas_prefix).await?;
+                self.objects.remove_prefix(&db_prefix).await
+            }
+            .await;
+            match deleted {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .control
+                        .storage_collected(&network.org, &network.network)
+                        .await
+                    {
+                        // The bytes are gone; the record of it is not. Next
+                        // pass re-deletes nothing and re-reports.
+                        tracing::warn!(
+                            tenant = %key, %error,
+                            "deleted the tenant's storage but could not record it"
+                        );
+                        continue;
+                    }
+                    self.metrics.collected();
+                    tracing::info!(tenant = %key, "collected an offboarded tenant's storage");
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %key, %error, "could not delete tenant storage")
+                }
+            }
+        }
+    }
+
     /// Sends each tenant's heartbeat.
     async fn report(&mut self) {
         for (key, tenant) in &self.tenants {
@@ -195,11 +304,17 @@ impl Reconciler {
     /// control-plane outage would otherwise boot knowing nothing and host
     /// nothing. What this cannot cover is a *first* boot with neither: there
     /// is no known set to serve, and that cold start waits.
-    async fn desired(&mut self) -> Result<Desired> {
+    async fn desired(&mut self) -> Result<(Desired, bool)> {
         match self.control.poll(self.etag.as_deref()).await {
-            Ok(Poll::Unchanged) => self.cached().await,
+            // The control plane answered, and said "what you already have".
+            // That is a fresh answer about a document we are holding.
+            Ok(Poll::Unchanged) => match self.last.clone() {
+                Some(desired) => Ok((desired, true)),
+                None => self.cached().await.map(|desired| (desired, false)),
+            },
             Ok(Poll::Changed { desired, etag }) => {
                 self.etag = etag;
+                self.last = Some(desired.clone());
                 let key = self.config.desired_key();
                 match serde_json::to_vec(&desired) {
                     Ok(bytes) => {
@@ -209,12 +324,15 @@ impl Reconciler {
                     }
                     Err(error) => tracing::warn!(%error, "could not encode the desired state"),
                 }
-                Ok(desired)
+                Ok((desired, true))
             }
             Err(error) => {
                 tracing::warn!(%error, "control plane unreachable; holding the current set");
                 self.metrics.poll_failed();
-                self.cached().await
+                match self.last.clone() {
+                    Some(desired) => Ok((desired, false)),
+                    None => self.cached().await.map(|desired| (desired, false)),
+                }
             }
         }
     }
@@ -229,15 +347,9 @@ impl Reconciler {
             None => Ok(Desired {
                 generation: 0,
                 networks: Vec::new(),
+                collect: Vec::new(),
             }),
         }
-    }
-}
-
-/// Awaits every future, without pulling in a futures dependency for it.
-async fn futures_join_all<F: std::future::Future<Output = ()>>(futures: Vec<F>) {
-    for future in futures {
-        future.await;
     }
 }
 
@@ -253,6 +365,7 @@ mod tests {
         let config = test_config();
         let desired = Desired {
             generation: 7,
+            collect: Vec::new(),
             networks: vec![HostedNetwork {
                 org: "acme".into(),
                 network: "prod".into(),
@@ -312,6 +425,10 @@ mod tests {
             cache_bytes_total: 1024,
             max_tenants: 4,
             metrics_addr: None,
+            net: synch_net::NetOptions::default(),
+            dns: synch_net::ResolverOptions::default(),
+            rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,
+            retire_after: crate::rotation::DEFAULT_RETIRE_AFTER,
         }
     }
 }

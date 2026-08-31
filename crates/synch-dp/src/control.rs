@@ -79,6 +79,22 @@ pub struct HostedDevice {
     pub state: String,
 }
 
+/// A network whose retention hold has run out (§6).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Collectable {
+    /// The org's slug.
+    pub org: String,
+    /// The network's name within it.
+    pub network: String,
+}
+
+impl Collectable {
+    /// The key it is filed under, matching [`HostedNetwork::key`].
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.org, self.network)
+    }
+}
+
 /// The desired-state document.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Desired {
@@ -87,6 +103,13 @@ pub struct Desired {
     pub generation: u64,
     /// Every network with cloud hosting enabled.
     pub networks: Vec<HostedNetwork>,
+    /// Offboarded networks whose stored copy is now due for deletion.
+    ///
+    /// Defaulted rather than required, so a data plane still runs against a
+    /// control plane that predates collection — it hosts and replicates
+    /// correctly and simply collects nothing, which is the safe direction.
+    #[serde(default)]
+    pub collect: Vec<Collectable>,
 }
 
 /// What a poll produced.
@@ -189,6 +212,24 @@ impl ControlPlane {
         let response = self
             .http
             .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|error| DpError::Control(error.to_string()))?;
+        self.check(response).await.map(|_| ())
+    }
+
+    /// Records that this tenant's stored copy has been deleted (§6).
+    ///
+    /// Called only after the bytes are actually gone, so the control plane's
+    /// view never says "collected" about storage that still exists.
+    pub async fn storage_collected(&self, org: &str, network: &str) -> Result<()> {
+        let response = self
+            .http
+            .delete(format!(
+                "{}/dp/v1/networks/{org}/{network}/storage",
+                self.base
+            ))
             .bearer_auth(&self.token)
             .send()
             .await

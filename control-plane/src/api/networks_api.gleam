@@ -301,14 +301,23 @@ pub fn set_cloud_hosting(
         }
         zone_mutation(conn, ctx, who, change, fn() {
           let work = {
-            use _ <- result.try(
-              sqlite.exec(
-                conn,
-                "UPDATE networks SET cloud_hosted = ?, cloud_disabled_at = ?
-                 WHERE id = ?",
-                [VInt(flag), disabled_at, Text(network_id)],
-              ),
-            )
+            use _ <- result.try(sqlite.exec(
+              conn,
+              // `coalesce` on the way down, so a repeated disable does not
+              // restart the retention clock. A reconciler or a UI that
+              // re-sends `{enabled: false}` is ordinary, and each restamp
+              // would push the collection another 30 days out — storage
+              // retained, and billed, for ever. Enabling passes NULL, and
+              // `coalesce(NULL, NULL)` is NULL, so the clear still clears.
+              "UPDATE networks
+                    SET cloud_hosted = ?1,
+                        cloud_disabled_at = CASE
+                          WHEN ?2 IS NULL THEN NULL
+                          ELSE coalesce(cloud_disabled_at, ?2)
+                        END
+                  WHERE id = ?3",
+              [VInt(flag), disabled_at, Text(network_id)],
+            ))
             use removed <- result.try(case enabled {
               True -> Ok(0)
               False -> retire_hosted_devices(conn, network_id)

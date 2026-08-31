@@ -41,6 +41,23 @@
 //! half-uploaded segment costs the transactions inside it and nothing before
 //! them. That is the same bound as an unclean shutdown, which the node already
 //! survives (`docs/SERVERLESS.md` §8.3).
+//!
+//! # Why the shipper verifies rather than counts
+//!
+//! The obvious implementation — ship every whole frame the file has grown by
+//! — is wrong twice, and both ways are silent. SQLite spills a big
+//! transaction's pages into the log *before* it commits, and rolls back by
+//! rewinding its own high-water mark while leaving those bytes behind for the
+//! next transaction to overwrite. So a length-driven shipper both ships
+//! frames that never committed and then misses the frames that replace them,
+//! and the stream ends up describing a log that never existed.
+//!
+//! So the shipper walks frames instead: it stops at the last frame that
+//! *committed* a transaction, and it verifies every frame's checksum against
+//! the running chain SQLite maintains. A frame that does not continue the
+//! chain is proof the log was rewritten behind us, and the only sound
+//! response is to end the generation and take a fresh snapshot — the database
+//! file is authoritative whatever the log did.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -106,6 +123,23 @@ pub struct Replicator {
     salt: Option<[u8; 8]>,
     /// Page size, read from the log header, needed to find frame boundaries.
     page_size: Option<u64>,
+    /// The running frame checksum at `shipped`, and the log's byte order.
+    ///
+    /// SQLite chains every frame's checksum onto its predecessor's, so this
+    /// is what lets the next tick prove the frames it is about to ship
+    /// continue the ones already shipped — and notice when they do not,
+    /// which is how a rewritten log is caught (see the module docs).
+    chain: Option<Chain>,
+}
+
+/// The running checksum a WAL's frames chain through.
+#[derive(Debug, Clone, Copy)]
+struct Chain {
+    /// The two 32-bit halves of the running checksum.
+    state: (u32, u32),
+    /// Whether the log's checksums are computed over big-endian words. Taken
+    /// from the header magic, which is the only thing that says.
+    big_endian: bool,
 }
 
 impl Replicator {
@@ -129,6 +163,7 @@ impl Replicator {
             next_index: 0,
             salt: None,
             page_size: None,
+            chain: None,
         };
         replicator.roll_generation().await?;
         Ok(replicator)
@@ -152,6 +187,26 @@ impl Replicator {
     /// so the next generation's frames start at offset zero of a log whose
     /// header the first segment carries.
     async fn roll_generation(&mut self) -> Result<()> {
+        // Ship what the old generation still owes before the checkpoint
+        // destroys the only local record of it. A checkpoint folds unshipped
+        // frames into the database file and empties the log; if the snapshot
+        // upload then fails and the pod is replaced, those writes exist
+        // nowhere. Shipping first bounds the loss to what the stream already
+        // bounds it to.
+        //
+        // Only when there is a generation to owe it to: the first roll opens
+        // one, and `ship_pending` on an empty stream has nothing to say.
+        if !self.generation.is_empty() {
+            if let Err(error) = self.ship_once().await {
+                // Not fatal: the snapshot about to be taken supersedes the
+                // log either way. Recorded because it is the one moment the
+                // window widens.
+                tracing::warn!(
+                    prefix = %self.config.prefix, %error,
+                    "could not ship the outstanding log before rolling"
+                );
+            }
+        }
         let store = self.store.clone();
         // A reader can hold the log open; the checkpoint then reports busy
         // rather than failing, and the retry is the whole recovery.
@@ -199,65 +254,118 @@ impl Replicator {
         Ok(())
     }
 
-    /// Ships every complete frame appended since the last call.
+    /// Ships every *committed* frame appended since the last call.
     ///
     /// Returns how many bytes went up. Rolls a generation when the log has
-    /// grown past the configured ceiling.
+    /// grown past the configured ceiling, or when the log turns out to have
+    /// been rewritten under us.
+    ///
+    /// Two rules make this safe, and neither is optional:
+    ///
+    /// **Only through the last commit frame.** SQLite spills a large
+    /// transaction's pages into the log *before* it commits, and rolls back
+    /// by rewinding its own high-water mark while leaving those bytes in the
+    /// file — the next transaction then writes over them. Shipping by file
+    /// length would therefore ship frames that are about to be replaced, and
+    /// the stream would carry a version of the log that never existed.
+    ///
+    /// **Every frame is checked against the chain.** Each frame's checksum
+    /// covers its predecessor's, so a frame that does not continue the run
+    /// we shipped proves the log was rewritten behind us. There is no way to
+    /// patch that up, so it ends the generation: the next snapshot is taken
+    /// from the database file, which is authoritative either way.
     pub async fn tick(&mut self) -> Result<u64> {
-        let wal_path = self.store.wal_path();
+        let outcome = self.ship_once().await?;
+        if outcome.needs_roll {
+            self.roll_generation().await?;
+        }
+        Ok(outcome.bytes)
+    }
+
+    /// The frame walk, without ever rolling a generation.
+    ///
+    /// Split out because a roll ships the outstanding tail first, and a
+    /// shipper that could roll would recurse into the roll that called it.
+    async fn ship_once(&mut self) -> Result<Shipped> {
+        let wal_path = self.store().wal_path();
         let Some(len) = file_len(&wal_path).await? else {
             // No log at all: nothing has been written since the generation
             // opened. Not an error, and not a state to correct.
-            return Ok(0);
+            return Ok(Shipped::none());
         };
         if len < WAL_HEADER_LEN {
-            return Ok(0);
+            return Ok(Shipped::none());
         }
         let header = read_at(&wal_path, 0, WAL_HEADER_LEN as usize).await?;
-        let salt: [u8; 8] = header[16..24]
-            .try_into()
-            .expect("the WAL header is 32 bytes and 16..24 is inside it");
-        let page_size = u32::from_be_bytes(
-            header[8..12]
-                .try_into()
-                .expect("the WAL header is 32 bytes and 8..12 is inside it"),
-        ) as u64;
-        if page_size == 0 {
-            return Ok(0);
-        }
+        let Some(header) = WalHeader::parse(&header) else {
+            tracing::warn!(prefix = %self.config.prefix, "unrecognized write-ahead log header");
+            return Ok(Shipped::none());
+        };
 
         match self.salt {
             None => {
-                self.salt = Some(salt);
-                self.page_size = Some(page_size);
+                self.salt = Some(header.salt);
+                self.page_size = Some(header.page_size);
+                self.chain = Some(Chain {
+                    state: header.checksum,
+                    big_endian: header.big_endian,
+                });
             }
-            Some(known) if known != salt => {
-                // Somebody else checkpointed, or SQLite reset the log. Every
-                // frame after this point belongs to a log our segments do not
-                // describe, so the honest move is a new generation rather than
-                // shipping bytes that will not replay.
+            Some(known) if known != header.salt => {
+                // The log was reset. Since this process owns checkpointing
+                // that should not happen, and the honest response is a new
+                // generation rather than bytes that will not replay.
                 tracing::warn!(
                     prefix = %self.config.prefix,
                     "the write-ahead log was reset underneath the replicator; rolling"
                 );
-                return self.roll_generation().await.map(|()| 0);
+                return Ok(Shipped::roll());
             }
             Some(_) => {}
         }
 
-        let frame = WAL_FRAME_HEADER_LEN + page_size;
-        // Only whole frames: a partially written one is a frame SQLite has not
-        // committed to, and shipping it would put bytes in the stream that the
-        // next segment would then overlap.
-        let complete = WAL_HEADER_LEN + ((len - WAL_HEADER_LEN) / frame) * frame;
+        let frame = WAL_FRAME_HEADER_LEN + header.page_size;
+        let Some(mut chain) = self.chain else {
+            return Ok(Shipped::none());
+        };
+        // Walk from where we stopped, verifying as we go, and remember the
+        // end of the last frame that *committed* a transaction.
+        let mut offset = self.shipped.max(WAL_HEADER_LEN);
+        let mut committed = self.shipped;
+        let mut committed_chain = chain;
+        while offset + frame <= len {
+            let bytes = read_at(&wal_path, offset, frame as usize).await?;
+            let Some(next) = verify_frame(&bytes, header.salt, chain) else {
+                if offset < self.shipped {
+                    // A frame we already shipped no longer chains: the log
+                    // was rewritten behind us.
+                    tracing::warn!(
+                        prefix = %self.config.prefix,
+                        offset,
+                        "the write-ahead log was rewritten behind the replicator; rolling"
+                    );
+                    return Ok(Shipped::roll());
+                }
+                // An incomplete or uncommitted tail. Stop; it is not ours to
+                // ship yet, and the next tick will find it finished.
+                break;
+            };
+            chain = next.chain;
+            offset += frame;
+            if next.commit {
+                committed = offset;
+                committed_chain = next.chain;
+            }
+        }
+
+        if committed <= self.shipped {
+            return Ok(Shipped::none());
+        }
         // `shipped` is zero for a fresh generation, so the first segment
         // starts at zero and carries the log header — which is what makes the
         // assembled file a WAL rather than a pile of frames.
         let start = self.shipped;
-        if complete <= start {
-            return Ok(0);
-        }
-        let payload = read_at(&wal_path, start, (complete - start) as usize).await?;
+        let payload = read_at(&wal_path, start, (committed - start) as usize).await?;
         let shipped = payload.len() as u64;
         let key = format!(
             "{}/{}/wal/{:08}.{}.{}",
@@ -265,18 +373,175 @@ impl Replicator {
         );
         self.objects.put(&key, payload).await?;
         self.next_index += 1;
-        self.shipped = complete;
+        self.shipped = committed;
+        self.chain = Some(committed_chain);
 
-        if complete >= self.config.wal_roll_bytes {
-            self.roll_generation().await?;
-        }
-        Ok(shipped)
+        Ok(Shipped {
+            bytes: shipped,
+            needs_roll: committed >= self.config.wal_roll_bytes,
+        })
+    }
+
+    /// The store this replicator streams.
+    fn store(&self) -> &Arc<synch_store::Store> {
+        &self.store
     }
 
     /// Ships everything outstanding. The last thing a draining tenant does.
     pub async fn flush(&mut self) -> Result<()> {
         self.tick().await.map(|_| ())
     }
+}
+
+/// What one pass of the frame walk did.
+#[derive(Debug, Clone, Copy)]
+struct Shipped {
+    /// Bytes uploaded.
+    bytes: u64,
+    /// Whether the caller should now close this generation.
+    needs_roll: bool,
+}
+
+impl Shipped {
+    /// Nothing to do.
+    fn none() -> Self {
+        Self {
+            bytes: 0,
+            needs_roll: false,
+        }
+    }
+
+    /// Nothing shipped, and the generation must end.
+    fn roll() -> Self {
+        Self {
+            bytes: 0,
+            needs_roll: true,
+        }
+    }
+}
+
+/// The parts of a WAL header this module reads.
+///
+/// Layout (SQLite's file format, section 4.1): magic, format version, page
+/// size, checkpoint sequence, two salts, then the header's own checksum.
+#[derive(Debug, Clone, Copy)]
+struct WalHeader {
+    /// Bytes per page, which fixes the frame size.
+    page_size: u64,
+    /// The salt every frame in this log must carry.
+    salt: [u8; 8],
+    /// The checksum the first frame chains from.
+    checksum: (u32, u32),
+    /// Whether checksums are computed over big-endian words.
+    big_endian: bool,
+}
+
+impl WalHeader {
+    /// Parses a 32-byte header, or `None` if it is not a WAL this build
+    /// understands.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < WAL_HEADER_LEN as usize {
+            return None;
+        }
+        // The magic's low bit is the one thing that says which byte order the
+        // checksums are computed in; everything else in the file is big-endian.
+        let magic = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
+        let big_endian = match magic {
+            0x377f_0682 => false,
+            0x377f_0683 => true,
+            _ => return None,
+        };
+        let page_size = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as u64;
+        // A page size of 65536 is stored as 1, and anything else must be a
+        // power of two: a bogus one would make every frame boundary wrong.
+        let page_size = if page_size == 1 { 65_536 } else { page_size };
+        if page_size < 512 || !page_size.is_power_of_two() {
+            return None;
+        }
+        Some(Self {
+            page_size,
+            salt: bytes[16..24].try_into().ok()?,
+            checksum: (
+                u32::from_be_bytes(bytes[24..28].try_into().ok()?),
+                u32::from_be_bytes(bytes[28..32].try_into().ok()?),
+            ),
+            big_endian,
+        })
+    }
+}
+
+/// What verifying one frame established.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    /// The running checksum after it.
+    chain: Chain,
+    /// Whether it is a commit frame — the last frame of a transaction, and
+    /// the only kind it is safe to stop shipping on.
+    commit: bool,
+}
+
+/// Checks one frame against the salt and the running checksum.
+///
+/// Returns `None` when the frame is not part of this log or does not continue
+/// the chain, which are the two ways a frame can be "not ours to ship".
+fn verify_frame(bytes: &[u8], salt: [u8; 8], chain: Chain) -> Option<Frame> {
+    if bytes.len() < WAL_FRAME_HEADER_LEN as usize {
+        return None;
+    }
+    // A frame written under a different salt belongs to an older log that
+    // happened to occupy this offset.
+    if bytes[8..16] != salt[..] {
+        return None;
+    }
+    let claimed = (
+        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+    );
+    // The checksum covers the frame header's first eight bytes (page number
+    // and post-commit database size) and then the whole page.
+    let mut state = checksum(chain.state, &bytes[0..8], chain.big_endian);
+    state = checksum(
+        state,
+        &bytes[WAL_FRAME_HEADER_LEN as usize..],
+        chain.big_endian,
+    );
+    if state != claimed {
+        return None;
+    }
+    // A non-zero database size marks the frame that commits the transaction.
+    let commit = u32::from_be_bytes(bytes[4..8].try_into().ok()?) != 0;
+    Some(Frame {
+        chain: Chain {
+            state,
+            big_endian: chain.big_endian,
+        },
+        commit,
+    })
+}
+
+/// SQLite's WAL checksum, continued from `state` over `bytes`.
+///
+/// Two interleaved running sums over 32-bit words, which is the algorithm the
+/// file format defines; it is not a general-purpose checksum and is not
+/// interchangeable with one.
+fn checksum(state: (u32, u32), bytes: &[u8], big_endian: bool) -> (u32, u32) {
+    let (mut s0, mut s1) = state;
+    for pair in bytes.chunks_exact(8) {
+        let (a, b) = if big_endian {
+            (
+                u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]),
+                u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]),
+            )
+        } else {
+            (
+                u32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]),
+                u32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]),
+            )
+        };
+        s0 = s0.wrapping_add(a).wrapping_add(s1);
+        s1 = s1.wrapping_add(b).wrapping_add(s0);
+    }
+    (s0, s1)
 }
 
 /// How many times a generation roll retries a busy checkpoint.
@@ -633,6 +898,101 @@ mod tests {
         let (wal, skipped) = assemble_wal(&objects, "db/x/y", "g1").await.unwrap();
         assert_eq!(wal, vec![1, 2, 3, 4]);
         assert_eq!(skipped, 1);
+    }
+
+    /// The rule that keeps an uncommitted spill out of the stream: shipping
+    /// stops at the last commit frame, so a partially written transaction is
+    /// never uploaded and the bytes it will be replaced by are still ours to
+    /// read next tick.
+    #[tokio::test]
+    async fn shipping_stops_at_the_last_commit() {
+        let source = tempfile::tempdir().unwrap();
+        let objects = ObjectStore::memory().unwrap();
+        let store = open_store(source.path());
+        let mut replicator = Replicator::start(
+            objects.clone(),
+            ReplicatorConfig::new("db/acme/prod"),
+            store.clone(),
+        )
+        .await
+        .unwrap();
+
+        {
+            let store = store.clone();
+            synch_core::offload(move || store.set_config("probe", "committed"))
+                .await
+                .unwrap();
+        }
+        let shipped = replicator.tick().await.unwrap();
+        assert!(shipped > 0);
+        // Every byte shipped ends on a frame boundary at a commit, so the
+        // WAL file's length is greater than or equal to what went up — never
+        // the other way round.
+        let wal_len = std::fs::metadata(store.wal_path()).unwrap().len();
+        assert!(
+            replicator.shipped_bytes() <= wal_len,
+            "shipped {} beyond a log of {wal_len}",
+            replicator.shipped_bytes()
+        );
+    }
+
+    /// The checksum chain is what catches a log rewritten behind us. Feeding
+    /// a frame that does not continue the chain must not verify.
+    #[test]
+    fn a_frame_that_does_not_continue_the_chain_is_refused() {
+        let salt = [1u8; 8];
+        let chain = Chain {
+            state: (0, 0),
+            big_endian: false,
+        };
+        // A frame carrying the right salt but a checksum that chains from
+        // nothing: the shape of a frame written over an older one.
+        let mut frame = vec![0u8; (WAL_FRAME_HEADER_LEN + 512) as usize];
+        frame[8..16].copy_from_slice(&salt);
+        frame[16..20].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        assert!(verify_frame(&frame, salt, chain).is_none());
+
+        // And a frame from another log entirely is refused on the salt
+        // before its checksum is even considered.
+        assert!(verify_frame(&frame, [2u8; 8], chain).is_none());
+    }
+
+    /// The checksum is SQLite's, not a general-purpose one — two interleaved
+    /// running sums, order-dependent, and it must chain rather than restart.
+    #[test]
+    fn the_checksum_chains() {
+        let first = checksum((0, 0), &[1u8; 16], false);
+        let chained = checksum(first, &[1u8; 16], false);
+        let restarted = checksum((0, 0), &[1u8; 16], false);
+        assert_ne!(
+            chained, restarted,
+            "the second block must depend on the first"
+        );
+        // Byte order is a property of the log, and changes the answer — on
+        // bytes that are not the same read either way.
+        let asymmetric = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_ne!(
+            checksum((0, 0), &asymmetric, true),
+            checksum((0, 0), &asymmetric, false)
+        );
+    }
+
+    /// A header that is not a WAL is refused rather than guessed at: a wrong
+    /// page size makes every frame boundary wrong.
+    #[test]
+    fn an_unrecognized_header_is_refused() {
+        assert!(WalHeader::parse(&[0u8; 32]).is_none());
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
+        header[8..12].copy_from_slice(&777u32.to_be_bytes());
+        assert!(
+            WalHeader::parse(&header).is_none(),
+            "a page size that is not a power of two is not a WAL"
+        );
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        let parsed = WalHeader::parse(&header).expect("a valid header");
+        assert_eq!(parsed.page_size, 4096);
+        assert!(!parsed.big_endian);
     }
 
     #[test]

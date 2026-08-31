@@ -18,6 +18,7 @@ pub struct Metrics {
     poll_failures: AtomicU64,
     reconcile_failures: AtomicU64,
     generation: AtomicU64,
+    collected: AtomicU64,
     per_tenant: Mutex<BTreeMap<String, Status>>,
 }
 
@@ -42,6 +43,11 @@ impl Metrics {
     /// Records the generation of the last desired document acted on.
     pub fn observed_generation(&self, generation: u64) {
         self.generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// Records one offboarded tenant's storage deleted (§6).
+    pub fn collected(&self) {
+        self.collected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records what one tenant holds.
@@ -83,6 +89,15 @@ impl Metrics {
         out.push_str(&format!(
             "synch_dp_desired_generation {}\n",
             self.generation.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP synch_dp_storage_collected Offboarded tenants whose storage was deleted.\n",
+        );
+        out.push_str("# TYPE synch_dp_storage_collected counter\n");
+        out.push_str(&format!(
+            "synch_dp_storage_collected {}\n",
+            self.collected.load(Ordering::Relaxed)
         ));
 
         let per_tenant = match self.per_tenant.lock() {

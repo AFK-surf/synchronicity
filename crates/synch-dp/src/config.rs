@@ -50,6 +50,23 @@ pub struct DpConfig {
     pub max_tenants: u64,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
+    /// How each tenant's endpoint is bound.
+    ///
+    /// The default is an ephemeral port on every interface, which is what a
+    /// pod wants. A deployment pins relay URLs or discovery here; a test
+    /// makes it loopback so a tenant talks only to the node beside it.
+    pub net: synch_net::NetOptions,
+    /// How every tenant resolves its membership zone.
+    ///
+    /// The daemon exposes this as `--doh` / `--dnssec-anchor`; a fleet needs
+    /// it for the same reasons, and additionally because *identity settles at
+    /// open* — a tenant whose node cannot resolve its zone never learns its
+    /// own name, whatever resolver is installed afterwards.
+    pub dns: synch_net::ResolverOptions,
+    /// How old the hosted device key may get before it is rotated (§6).
+    pub rotate_after: Duration,
+    /// How long the old key stays published after the new one signs.
+    pub retire_after: Duration,
 }
 
 /// The object store both the CAS and the database streams live in.
@@ -128,6 +145,35 @@ impl ObjectConfig {
 }
 
 impl DpConfig {
+    /// A configuration for a test or an embedder driving the pieces directly.
+    ///
+    /// Memory-backed storage, one shard, everything else at its default. The
+    /// caller adjusts what it cares about — `net` for a loopback endpoint,
+    /// `rotate_after` to make a rotation due.
+    pub fn for_test(base_dir: impl Into<PathBuf>, control_url: &str) -> Self {
+        Self {
+            control_url: control_url.trim_end_matches('/').to_string(),
+            token: "synchdp_test".into(),
+            base_dir: base_dir.into(),
+            shard: 0,
+            shards: 1,
+            shard_name: "dp-test".into(),
+            poll_interval: Duration::from_secs(60),
+            objects: ObjectConfig {
+                service: "memory".into(),
+                options: HashMap::new(),
+            },
+            db_key: None,
+            cache_bytes_total: 64 * 1024 * 1024,
+            max_tenants: 4,
+            metrics_addr: None,
+            net: synch_net::NetOptions::default(),
+            dns: synch_net::ResolverOptions::default(),
+            rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,
+            retire_after: crate::rotation::DEFAULT_RETIRE_AFTER,
+        }
+    }
+
     /// Reads the environment.
     pub fn from_env() -> Result<Self> {
         let control_url = require("SYNCH_DP_CONTROL_URL")?
@@ -194,6 +240,25 @@ impl DpConfig {
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
             max_tenants: parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1),
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
+            net: synch_net::NetOptions::default(),
+            dns: synch_net::ResolverOptions {
+                doh_url: std::env::var("SYNCH_DP_DOH").ok(),
+                trust_anchor: std::env::var("SYNCH_DP_DNSSEC_ANCHOR")
+                    .ok()
+                    .map(PathBuf::from),
+                ..synch_net::ResolverOptions::default()
+            },
+            // Settable so a test can exercise a rotation without waiting a
+            // quarter of a year for one; not documented as an operator knob,
+            // because the defaults are the policy (`rotation`).
+            rotate_after: Duration::from_secs(parse::<u64>(
+                "SYNCH_DP_ROTATE_AFTER_SECS",
+                crate::rotation::DEFAULT_ROTATE_AFTER.as_secs(),
+            )?),
+            retire_after: Duration::from_secs(parse::<u64>(
+                "SYNCH_DP_RETIRE_AFTER_SECS",
+                crate::rotation::DEFAULT_RETIRE_AFTER.as_secs(),
+            )?),
         })
     }
 
@@ -323,6 +388,10 @@ mod tests {
             cache_bytes_total: 1024,
             max_tenants: 4,
             metrics_addr: None,
+            net: synch_net::NetOptions::default(),
+            dns: synch_net::ResolverOptions::default(),
+            rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,
+            retire_after: crate::rotation::DEFAULT_RETIRE_AFTER,
         }
     }
 

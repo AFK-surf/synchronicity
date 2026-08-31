@@ -3173,6 +3173,188 @@ pub fn the_desired_document_is_conditional_test() {
   assert again.status == 304
 }
 
+// ---- the retention hold ------------------------------------------------------
+
+/// A network that was hosted and has since been switched off — the state the
+/// retention hold runs over, and the only state the `collect` list is about.
+fn offboarded(h: Harness, slug: String, network: String) -> Nil {
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/" <> slug <> "/networks",
+      json.object([#("name", json.string(network))]),
+    ).status
+  assert host_network(h, slug, network, True) == 200
+  assert host_network(h, slug, network, False) == 200
+  Nil
+}
+
+/// Backdates the retention stamp, which is the only way a test reaches the far
+/// side of a thirty-day hold: the API takes a *decision* and stamps the clock
+/// itself, and there is deliberately no way to ask it for a date in the past.
+fn age_hold(h: Harness, network: String, seconds: Int) -> Nil {
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE networks SET cloud_disabled_at = ? WHERE name = ?",
+      [sqlite.Int(now_unix() - seconds), sqlite.Text(network)],
+    )
+  sqlite.close(conn)
+}
+
+/// The desired-state document, as the fleet reads it.
+fn dp_document(h: Harness, token: String) -> String {
+  simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+}
+
+/// The document under an `If-None-Match`, which is how the fleet actually
+/// polls it.
+fn dp_poll(h: Harness, token: String, tag: String) -> wisp.Response {
+  call(
+    h,
+    keyed(token, Get, "/dp/v1/networks")
+      |> simulate.header("if-none-match", tag),
+  )
+}
+
+fn soa_serial(h: Harness) -> Int {
+  let conn = read_db(h)
+  let assert Ok(meta) = model.read_meta(conn)
+  sqlite.close(conn)
+  meta.soa_serial
+}
+
+fn collect_rows(h: Harness) -> List(List(sqlite.Value)) {
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(conn, "SELECT count(*) FROM audit_log WHERE action = ?", [
+      sqlite.Text("cloud-hosting.storage.collect"),
+    ])
+  sqlite.close(conn)
+  rows
+}
+
+/// The hold is a hold. An offboarded network's storage is not offered for
+/// collection until thirty days have run, and then it is — which is the whole
+/// of the promise §6 makes and the thing that was missing.
+pub fn storage_is_collectable_only_after_the_retention_hold_test() {
+  let h = harness()
+  org_named(h, "acme")
+  offboarded(h, "acme", "prod")
+  let token = mint_dataplane(h, "fleet")
+
+  // Switched off a moment ago. It has already left `networks` — that is the
+  // teardown — and it has not joined `collect`, so the name appears nowhere in
+  // the document at all, which makes its absence checkable as one claim.
+  assert !string.contains(dp_document(h, token), "prod")
+
+  // Twenty-nine days is still inside the hold, and that is the point of
+  // having one: re-enabling here is a cheap re-provision, and the bytes have
+  // to still be there for it.
+  age_hold(h, "prod", 29 * 86_400)
+  assert !string.contains(dp_document(h, token), "prod")
+
+  // Thirty-one days is not.
+  age_hold(h, "prod", 31 * 86_400)
+  let due = dp_document(h, token)
+  assert string.contains(
+    due,
+    "\"collect\":[{\"org\":\"acme\",\"network\":\"prod\"}]",
+  )
+}
+
+/// The hole a serial-only generation would leave, and the reason the `ETag`
+/// carries the due set too.
+///
+/// A hold elapses because a *clock* passed, not because anything committed:
+/// no zone fact changes, so the SOA serial sits exactly where it was. A fleet
+/// polling with `If-None-Match` against a tag built from the serial alone
+/// would be handed 304s for ever and never learn that a tenant's storage fell
+/// due — the collection would not be late, it would never happen.
+pub fn a_hold_falling_due_moves_the_etag_test() {
+  let h = harness()
+  org_named(h, "acme")
+  offboarded(h, "acme", "prod")
+  let token = mint_dataplane(h, "fleet")
+
+  let first = call(h, keyed(token, Get, "/dp/v1/networks"))
+  assert first.status == 200
+  let assert Ok(tag) = list.key_find(first.headers, "etag")
+  // Nothing has changed, so the steady-state poll is the cheap 304 it is meant
+  // to be. That is the behaviour the rest of this test has to survive.
+  assert dp_poll(h, token, tag).status == 304
+
+  let serial = soa_serial(h)
+  age_hold(h, "prod", 31 * 86_400)
+  // The evidence that this is a real hole and not a hypothetical one: the
+  // serial — the document's `generation` — is untouched by a hold elapsing.
+  assert soa_serial(h) == serial
+
+  let after = dp_poll(h, token, tag)
+  assert after.status == 200
+  assert string.contains(simulate.read_body(after), "prod")
+}
+
+/// The other half of the loop: the data plane reports the deletion, and the
+/// network stops being offered. Without this the list would repeat the same
+/// instruction on every poll for the rest of the deployment's life.
+pub fn collecting_storage_clears_the_network_from_the_list_test() {
+  let h = harness()
+  org_named(h, "acme")
+  offboarded(h, "acme", "prod")
+  age_hold(h, "prod", 31 * 86_400)
+  let token = mint_dataplane(h, "fleet")
+  assert string.contains(dp_document(h, token), "prod")
+
+  let done = call(h, keyed(token, Delete, "/dp/v1/networks/acme/prod/storage"))
+  assert done.status == 200
+  assert string.contains(simulate.read_body(done), "\"collected\":true")
+
+  assert !string.contains(dp_document(h, token), "prod")
+
+  // The retry a partially-failed collection makes — the pod died between the
+  // last object and the call, and has no way to know which — is a 200 no-op
+  // rather than a 404, and does not write a second page of history.
+  let again = call(h, keyed(token, Delete, "/dp/v1/networks/acme/prod/storage"))
+  assert again.status == 200
+  assert string.contains(simulate.read_body(again), "\"collected\":false")
+
+  assert collect_rows(h) == [[sqlite.Int(1)]]
+}
+
+/// Collecting a live tenant's storage is the catastrophic operation in this
+/// design, so the API must not be able to *say* it happened — whatever the
+/// fleet believes it did.
+pub fn collecting_a_hosted_networks_storage_is_refused_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+
+  let refused =
+    call(h, keyed(token, Delete, "/dp/v1/networks/acme/prod/storage"))
+  assert refused.status == 409
+  assert string.contains(simulate.read_body(refused), "cloud-hosting-enabled")
+  // Nothing recorded: the refusal is about the audit row as much as the write,
+  // since a row claiming a hosted tenant's bytes were collected is a claim
+  // somebody would have to disprove later.
+  assert collect_rows(h) == [[sqlite.Int(0)]]
+
+  // And the route is the fleet's, like the rest of `/dp/v1`: a signed-in
+  // admin of the very org that owns the network cannot record a collection.
+  assert call(h, authed(h, Delete, "/dp/v1/networks/acme/prod/storage")).status
+    == 403
+}
+
 /// An expired data-plane key is refused like any other credential.
 pub fn expired_dataplane_key_is_refused_test() {
   let h = harness()
@@ -3184,4 +3366,71 @@ pub fn expired_dataplane_key_is_refused_test() {
     ])
   sqlite.close(conn)
   assert call(h, keyed(token, Get, "/dp/v1/networks")).status == 401
+}
+
+/// Disabling twice must not restart the retention clock: a reconciler that
+/// re-sends the same state is ordinary, and each restamp would push the
+/// collection another hold out — storage retained, and billed, for ever.
+pub fn disabling_twice_does_not_restart_the_retention_clock_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  assert host_network(h, "acme", "prod", False) == 200
+
+  // Backdate the stamp, then disable again as a retrying caller would.
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let long_ago = now_unix() - 1_000_000
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE networks SET cloud_disabled_at = ? WHERE name = ?",
+      [
+        sqlite.Int(long_ago),
+        sqlite.Text("prod"),
+      ],
+    )
+  sqlite.close(conn)
+  assert host_network(h, "acme", "prod", False) == 200
+
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(conn, "SELECT cloud_disabled_at FROM networks WHERE name = ?", [
+      sqlite.Text("prod"),
+    ])
+  sqlite.close(conn)
+  assert rows == [[sqlite.Int(long_ago)]]
+}
+
+/// And re-enabling clears it, so a network that comes back is not carrying a
+/// deadline from its last life.
+pub fn re_enabling_clears_the_retention_clock_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  assert host_network(h, "acme", "prod", False) == 200
+  assert host_network(h, "acme", "prod", True) == 200
+
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(
+      conn,
+      "SELECT count(*) FROM networks WHERE name = ? AND cloud_disabled_at IS NULL",
+      [sqlite.Text("prod")],
+    )
+  sqlite.close(conn)
+  assert rows == [[sqlite.Int(1)]]
 }
