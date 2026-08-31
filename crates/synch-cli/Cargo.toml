@@ -27,6 +27,9 @@ hyper-util.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 prost.workspace = true
+# `synch fetch` downloads over HTTP(S) in the CLI process; the daemon speaks
+# to peers only and never holds an HTTP client (`crate::fetch`).
+reqwest.workspace = true
 serde.workspace = true
 # JSON-RPC has to be parsed, not just written, so the hand-formatted writer in
 # `synch_core::json` stays where it is rather than being stretched to cover it.

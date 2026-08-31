@@ -392,6 +392,21 @@ pub enum Command {
         #[arg(long, value_name = "HEX", conflicts_with = "select")]
         root: Option<String>,
     },
+    /// Fetch an http(s) URL into the tree.
+    ///
+    /// The download streams through this process into the daemon and is
+    /// published as this node's own version of the destination path, exactly
+    /// as a write through the API would be. Redirects are followed, and
+    /// nothing is published unless the whole body arrives: a download that
+    /// fails partway leaves the tree untouched.
+    Fetch {
+        /// The http:// or https:// URL to download.
+        url: String,
+        /// Where the file lands: `<space>/<path>`, or a directory as
+        /// `<space>/<dir>/` — the trailing slash keeps the file name the URL
+        /// carries.
+        destination: String,
+    },
     /// Adopt content into this node's published source.
     Adopt {
         /// The adoption subcommand.
@@ -1073,6 +1088,23 @@ mod tests {
                 command: DaemonCommand::Start
             }
         ));
+    }
+
+    #[test]
+    fn fetch_takes_a_url_and_a_destination() {
+        let cli = Cli::parse_from([
+            "synch",
+            "fetch",
+            "https://example.com/1.txt",
+            "workspace/documents/",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Fetch { url, destination }
+                if url == "https://example.com/1.txt" && destination == "workspace/documents/"
+        ));
+        // Both arguments are required.
+        assert!(Cli::try_parse_from(["synch", "fetch", "https://example.com/1.txt"]).is_err());
     }
 
     #[test]

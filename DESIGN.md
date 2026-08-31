@@ -1464,6 +1464,10 @@ synch cat|get --root <hex>                   read an object by content root, no 
                                              involved — how a superseded version is read
 synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
            [--select <policy>]
+synch fetch <url> <space>/<path>             stream an http(s) URL into the tree as
+                                             this node's own version, redirects
+                                             followed; a destination ending in `/`
+                                             keeps the URL's file name
 synch adopt path [<origin>:]<space>/<path>   adopt one version as my own
            [--select <policy>]
 synch adopt tree <space>[/<dir>]             additive bulk adoption into a source

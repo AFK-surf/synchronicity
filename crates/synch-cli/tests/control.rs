@@ -1447,6 +1447,178 @@ async fn an_api_source_put_publishes_from_the_cas_without_a_checkout() {
     daemon.shutdown().await;
 }
 
+/// A canned loopback HTTP/1.1 server for `synch fetch`: each connection is
+/// answered from the route table with pre-built response bytes and closed.
+async fn http_server(
+    routes: Vec<(&'static str, Vec<u8>)>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let routes: std::collections::HashMap<&'static str, Vec<u8>> = routes.into_iter().collect();
+    let served = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let answer = routes.get(path).cloned().unwrap_or_else(|| {
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_vec()
+                });
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, served)
+}
+
+fn ok_response(body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn redirect_response(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// `synch fetch` streams a URL into the tree through the same write the S3
+/// gateway uses, follows redirects, and completes a directory destination
+/// with the file name the *final* URL carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_streams_a_url_into_the_tree() {
+    let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+
+    // Larger than one control chunk, so the payload crosses the coalescing
+    // path rather than fitting a single message.
+    let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+    let (addr, served) = http_server(vec![
+        ("/1.txt", ok_response(b"hello from the web\n")),
+        ("/moved.bin", redirect_response("/real/system.img")),
+        ("/real/system.img", ok_response(&payload)),
+    ])
+    .await;
+
+    // A directory destination keeps the URL's file name.
+    let written = synch_cli::fetch::fetch(
+        data_dir,
+        &format!("http://{addr}/1.txt"),
+        "media/documents/",
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.entry.path, "documents/1.txt");
+    assert_eq!(
+        read(data_dir, cat("media/documents/1.txt", None, None)).await,
+        b"hello from the web\n"
+    );
+
+    // A redirect is followed, and the entry is named after where it landed.
+    let written = synch_cli::fetch::fetch(
+        data_dir,
+        &format!("http://{addr}/moved.bin"),
+        "media/images/",
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.entry.path, "images/system.img");
+    assert_eq!(written.entry.size, payload.len() as u64);
+    assert_eq!(
+        read(data_dir, cat("media/images/system.img", None, None)).await,
+        payload
+    );
+
+    // An explicit file destination is taken as written, whatever the URL.
+    let written = synch_cli::fetch::fetch(
+        data_dir,
+        &format!("http://{addr}/1.txt"),
+        "media/copies/renamed.txt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.entry.path, "copies/renamed.txt");
+
+    served.abort();
+    daemon.shutdown().await;
+}
+
+/// A fetch that cannot complete publishes nothing: a non-success status is
+/// refused before the write opens, and a body that stops short of its
+/// declared length aborts the write, so a truncated download is never
+/// published as this node's own assertion (§9.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_fetch_publishes_nothing() {
+    let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+
+    let mut truncated =
+        b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_vec();
+    truncated.extend_from_slice(&[7u8; 10]);
+    let (addr, served) = http_server(vec![("/gone.bin", truncated)]).await;
+
+    let error = synch_cli::fetch::fetch(
+        data_dir,
+        &format!("http://{addr}/missing.txt"),
+        "media/documents/",
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("404"), "{error:#}");
+
+    let error = synch_cli::fetch::fetch(data_dir, &format!("http://{addr}/gone.bin"), "media/")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("nothing was published"),
+        "{error:#}"
+    );
+    assert_eq!(
+        resolve(data_dir, resolve_req("media", "gone.bin"))
+            .await
+            .unwrap_err(),
+        ErrorCode::NotFound
+    );
+
+    // A scheme fetch does not speak, and a malformed destination, both fail
+    // before any connection is made.
+    for (url, destination) in [
+        ("ftp://example.com/x", "media/"),
+        ("not a url", "media/"),
+        (&format!("http://{addr}/gone.bin"), "media"),
+    ] {
+        assert!(
+            synch_cli::fetch::fetch(data_dir, url, destination)
+                .await
+                .is_err(),
+            "{url} -> {destination}"
+        );
+    }
+
+    served.abort();
+    daemon.shutdown().await;
+}
+
 /// Gateway config lives in the daemon: appended a record at a time, fenced
 /// to `s3.*` so one config row cannot reach another (§9.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5737,6 +5737,7 @@ dependencies = [
  "libc",
  "prost",
  "protox",
+ "reqwest",
  "serde",
  "serde_json",
  "synch-cc",

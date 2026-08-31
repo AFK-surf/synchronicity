@@ -2242,7 +2242,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SourceAdd(pb::SourceAdd { space, path, api }) => {
-            if api == !path.is_empty() {
+            if api != path.is_empty() {
                 return Err(ControlError::invalid(
                     "source add requires exactly one of a filesystem path or API mode",
                 ));
