@@ -43,8 +43,24 @@ struct Cp {
     statuses: Vec<synch_dp::control::Status>,
     /// Networks this control plane says are due for collection.
     collect: Vec<synch_dp::control::Collectable>,
-    /// Networks whose storage the data plane has reported deleted.
-    collected: Vec<String>,
+    /// Networks whose storage the data plane has reported deleted, each with
+    /// whether the bytes were *already* gone when the report arrived.
+    ///
+    /// The second half is the whole assertion: the order is the safety, and a
+    /// test that only counted reports would pass an implementation that told
+    /// the control plane first and deleted afterwards — the one ordering that
+    /// leaves a customer billed for storage the control plane believes is
+    /// gone.
+    collected: Vec<(String, bool)>,
+    /// The bucket, and the exact keys that must already be gone when a
+    /// collection is reported.
+    ///
+    /// Named keys rather than a prefix listing: `ObjectStore::list` is
+    /// delimited, so a key one level down shows up only as a synthesized
+    /// directory the helper filters out — a "the prefix is empty" check built
+    /// on it would answer `true` before anything was deleted, and the
+    /// assertion would pass for every implementation.
+    witness: Option<(synch_dp::store::ObjectStore, Vec<String>)>,
     /// Whether hosting has been turned off, so the document lists no networks.
     offboarded: bool,
 }
@@ -109,8 +125,24 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
             axum::routing::delete(
                 |State(state): State<Shared>,
                  Path((org, network)): Path<(String, String)>| async move {
+                    // Taken out of the lock before any await, so the guard is
+                    // not held across one.
+                    let witness = state.lock().expect("the stub's lock").witness.clone();
+                    let mut emptied = true;
+                    if let Some((bucket, keys)) = witness {
+                        for key in keys {
+                            if bucket
+                                .get_if_present(&key)
+                                .await
+                                .expect("reading the bucket")
+                                .is_some()
+                            {
+                                emptied = false;
+                            }
+                        }
+                    }
                     let mut cp = state.lock().expect("the stub's lock");
-                    cp.collected.push(format!("{org}/{network}"));
+                    cp.collected.push((format!("{org}/{network}"), emptied));
                     cp.collect.clear();
                     Json(serde_json::json!({"ok": true}))
                 },
@@ -503,22 +535,30 @@ async fn an_offboarded_tenants_storage_is_collected_and_reported() {
         .expect("an in-memory operator");
     let bucket = synch_dp::store::ObjectStore::new(operator.clone());
 
-    // The tenant's two prefixes, and a neighbour that shares their leading
-    // bytes. Prefix deletion is the one operation here that destroys customer
-    // data, and `tenants/acme/prod` is a prefix of `tenants/acme/production`.
+    // The tenant's two prefixes, and a neighbouring network whose *name*
+    // starts the same way. `cas_root` ends in a slash and `collect` appends
+    // one to `db_prefix`, so `acme/production` is already out of reach — this
+    // pins that, since a sweep built from the bare names would take a second
+    // customer's bytes with the first's, and prefix deletion is the one
+    // operation here that destroys customer data.
     let cas = config.cas_root(ORG, NETWORK);
     let cas_key = format!("{}blobs/one", cas.trim_start_matches('/'));
     let db_key = format!("{}/ltx/0000", config.db_prefix(ORG, NETWORK));
-    let neighbour = format!(
+    let cas_neighbour = format!(
         "{}blobs/one",
         config.cas_root(ORG, "production").trim_start_matches('/')
     );
-    for key in [&cas_key, &db_key, &neighbour] {
+    let db_neighbour = format!("{}/ltx/0000", config.db_prefix(ORG, "production"));
+    for key in [&cas_key, &db_key, &cas_neighbour, &db_neighbour] {
         bucket
             .put(key, b"bytes".to_vec())
             .await
             .expect("seeding the bucket");
     }
+    cp_state.lock().expect("the stub's lock").witness = Some((
+        synch_dp::store::ObjectStore::new(operator.clone()),
+        vec![cas_key.clone(), db_key.clone()],
+    ));
 
     let mut reconciler = synch_dp::reconciler::Reconciler::new(
         config.clone(),
@@ -546,20 +586,24 @@ async fn an_offboarded_tenants_storage_is_collected_and_reported() {
             .is_none(),
         "and so should its database stream"
     );
-    assert!(
-        bucket
-            .get_if_present(&neighbour)
-            .await
-            .expect("reading the bucket")
-            .is_some(),
-        "a network whose name merely starts the same way must be untouched"
-    );
+    for neighbour in [&cas_neighbour, &db_neighbour] {
+        assert!(
+            bucket
+                .get_if_present(neighbour)
+                .await
+                .expect("reading the bucket")
+                .is_some(),
+            "a network whose name merely starts the same way must be untouched"
+        );
+    }
 
-    // The record of it, second.
+    // The record of it, second — and the stub looked at the bucket when the
+    // report arrived, so "second" is asserted rather than assumed.
     assert_eq!(
         cp_state.lock().expect("the stub's lock").collected,
-        vec![format!("{ORG}/{NETWORK}")],
-        "the control plane should be told exactly once, after the delete"
+        vec![(format!("{ORG}/{NETWORK}"), true)],
+        "the control plane should be told exactly once, and only after the \
+         bytes are actually gone"
     );
 
     cp_server.abort();

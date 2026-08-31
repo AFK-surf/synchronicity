@@ -3208,15 +3208,121 @@ fn retire_slot_key(
 }
 
 /// The stored state of a key, by its z32 — the fact the route is about.
+///
+/// Newest row wins, because `nk_z32` is not unique: the uniqueness the schema
+/// enforces is a *partial* index over `nk_bytes` where `state != 'revoked'`,
+/// so any number of revoked rows may share a key with one live one. That is
+/// not a corner — re-registering a revoked key is the documented recovery path
+/// after a data-plane disk loss, and `rotate_slot` inserts a second row rather
+/// than reviving the first.
 fn key_state(h: Harness, key: String) -> String {
   let conn = read_db(h)
   let looked =
-    sqlite.query(conn, "SELECT state FROM device_keys WHERE nk_z32 = ?", [
-      sqlite.Text(key),
-    ])
+    sqlite.query(
+      conn,
+      "SELECT state FROM device_keys WHERE nk_z32 = ?
+       ORDER BY added_at DESC, rowid DESC LIMIT 1",
+      [sqlite.Text(key)],
+    )
   sqlite.close(conn)
   let assert Ok([[sqlite.Text(state)]]) = looked
   state
+}
+
+/// Whether the *signed* zone carries this key for a network.
+///
+/// Deliberately not `published_nks`, which recomputes the zone input from the
+/// `devices`/`device_keys` rows these tests are already asserting on directly
+/// — beside a `key_state` check it restates it, and a handler that wrote the
+/// row and forgot to publish would pass both. This reads the presigned RRset
+/// a resolver would actually be served, so "the commit is the publish" is
+/// asserted rather than assumed.
+fn served(h: Harness, network: String, key: String) -> Bool {
+  let conn = read_db(h)
+  let found =
+    sqlite.query(
+      conn,
+      "SELECT count(*) FROM presigned_rrsets
+       WHERE name = ? AND instr(rrset_wire, ?) > 0",
+      [
+        sqlite.Text("_synchronicity." <> network <> ".acme.sync.test."),
+        sqlite.Blob(<<key:utf8>>),
+      ],
+    )
+  sqlite.close(conn)
+  let assert Ok([[sqlite.Int(count)]]) = found
+  count > 0
+}
+
+/// Plants a device row directly, owned by a human rather than by the fleet.
+///
+/// The API will not create one: a customer is refused the `cloud-` prefix, and
+/// the data plane's own registrations are stamped `system-dataplane`. So the
+/// only way to build the row that isolates `find_slot_key`'s ownership clause
+/// — a device that *reads* like a hosting slot but is not one — is to write it
+/// the way a legacy row or an operator's `INSERT` would have.
+fn plant_device(
+  h: Harness,
+  network: String,
+  label: String,
+  key: String,
+) -> Nil {
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok([[sqlite.Text(org_id)]]) =
+    sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [
+      sqlite.Text("acme"),
+    ])
+  let assert Ok([[sqlite.Text(network_id)]]) =
+    sqlite.query(conn, "SELECT id FROM networks WHERE name = ? AND org_id = ?", [
+      sqlite.Text(network),
+      sqlite.Text(org_id),
+    ])
+  let assert Ok([[sqlite.Text(user_id)]]) =
+    sqlite.query(conn, "SELECT id FROM users WHERE id != ? LIMIT 1", [
+      sqlite.Text("system-dataplane"),
+    ])
+  let device_id = id.new()
+  let assert Ok(bytes) = model.validate_nk(key)
+  let assert Ok(_) =
+    sqlite.exec(conn, "INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?, ?)", [
+      sqlite.Text(device_id),
+      sqlite.Text(org_id),
+      sqlite.Text(label),
+      sqlite.Null,
+      sqlite.Null,
+      sqlite.Text(user_id),
+      sqlite.Int(now_unix()),
+    ])
+  let assert Ok(_) =
+    sqlite.exec(conn, "INSERT INTO device_keys VALUES (?, ?, ?, ?, ?, ?, ?)", [
+      sqlite.Text(id.new()),
+      sqlite.Text(device_id),
+      sqlite.Text(key),
+      sqlite.Blob(bytes),
+      sqlite.Text("active"),
+      sqlite.Int(now_unix()),
+      sqlite.Null,
+    ])
+  let assert Ok(_) =
+    sqlite.exec(conn, "INSERT INTO network_devices VALUES (?, ?, ?)", [
+      sqlite.Text(network_id),
+      sqlite.Text(device_id),
+      sqlite.Int(now_unix()),
+    ])
+  sqlite.close(conn)
+  Nil
+}
+
+/// How many audit rows a given action has written.
+fn audit_count(h: Harness, action: String) -> Int {
+  let conn = read_db(h)
+  let counted =
+    sqlite.query(conn, "SELECT count(*) FROM audit_log WHERE action = ?", [
+      sqlite.Text(action),
+    ])
+  sqlite.close(conn)
+  let assert Ok([[sqlite.Int(count)]]) = counted
+  count
 }
 
 /// A slot's only live key may be withdrawn, but not merely stood down.
@@ -3241,15 +3347,17 @@ pub fn retiring_the_last_active_key_is_refused_unless_revoking_test() {
   let token = mint_dataplane(h, "fleet")
   let key = nk()
   assert register_slot(h, token, "cloud-1", key) == 200
-  assert list.contains(published_nks(h), key)
+  assert served(h, "prod", key)
+  let before = soa_serial(h)
 
   let refused = retire_slot_key(h, token, "prod", key, False)
   assert refused.status == 409
   assert string.contains(simulate.read_body(refused), "last-active-key")
-  // Refused, not half-applied: the tenant is still able to present it, and
-  // the zone still names it.
+  // Refused, not half-applied: the tenant is still able to present it, the
+  // signed zone still names it, and nothing was published.
   assert key_state(h, key) == "active"
-  assert list.contains(published_nks(h), key)
+  assert served(h, "prod", key)
+  assert soa_serial(h) == before
 
   // The same key, withdrawn outright, is allowed — and leaves the zone in the
   // same commit, which is what a revocation is for.
@@ -3257,7 +3365,8 @@ pub fn retiring_the_last_active_key_is_refused_unless_revoking_test() {
   assert withdrawn.status == 200
   assert string.contains(simulate.read_body(withdrawn), "revoked")
   assert key_state(h, key) == "revoked"
-  assert !list.contains(published_nks(h), key)
+  assert !served(h, "prod", key)
+  assert soa_serial(h) > before
 
   // And it is gone from the route's view too: `find_slot_key` skips revoked
   // keys, so a retrying reconciler gets a 404 rather than a second audit row.
@@ -3292,24 +3401,32 @@ pub fn closing_a_rotation_window_retires_only_the_old_key_test() {
   // breaking at the moment of the swap.
   assert key_state(h, old) == "retiring"
   assert key_state(h, new) == "active"
-  assert list.contains(published_nks(h), old)
-  assert list.contains(published_nks(h), new)
+  assert served(h, "prod", old)
+  assert served(h, "prod", new)
 
   // The new key is now the sole active one, so standing it down is refused —
   // the rule holds mid-rotation, which is when it matters most.
   assert retire_slot_key(h, token, "prod", new, False).status == 409
 
-  // The old one is already `retiring`, so a plain close is accepted and
-  // idempotent; the fleet re-sends it on every rotation pass.
-  assert retire_slot_key(h, token, "prod", old, False).status == 200
+  // The old one is already `retiring`, so a plain close is accepted — and
+  // publishes nothing. A reconciler re-sends this on every rotation pass, and
+  // the serial it would otherwise bump is the desired document's
+  // `generation`: a republish per pass would turn every shard's 304 into a
+  // full document and re-sign the zone for a row that did not change.
+  let settled = soa_serial(h)
+  let repeated = retire_slot_key(h, token, "prod", old, False)
+  assert repeated.status == 200
   assert key_state(h, old) == "retiring"
+  assert soa_serial(h) == settled
+  assert audit_count(h, "cloud-hosting.key.retire") == 0
 
   // Withdrawing it closes the window: one record under the label again, so the
-  // next rotation has room.
+  // next rotation has room. That one *does* publish.
   assert retire_slot_key(h, token, "prod", old, True).status == 200
   assert key_state(h, old) == "revoked"
-  assert !list.contains(published_nks(h), old)
-  assert list.contains(published_nks(h), new)
+  assert !served(h, "prod", old)
+  assert served(h, "prod", new)
+  assert soa_serial(h) > settled
   // And the replacement key is untouched by any of it.
   assert key_state(h, new) == "active"
 }
@@ -3368,12 +3485,27 @@ pub fn key_retirement_is_confined_to_hosting_slots_test() {
         ),
     ).status
 
-  // Not a `cloud-*` label, and not created by the data plane: unreachable,
-  // and it reads as "no such live key" rather than as a permission error,
-  // because the credential has no business knowing the device exists.
+  // A device that reads exactly like a hosting slot but that the data plane
+  // did not create. It has to be planted directly, because the API refuses a
+  // customer the `cloud-` prefix outright — which is the point: without the
+  // `created_by` clause, a `cloud-*` row that predates the reserved namespace
+  // (or one an operator inserted) would be retirable by this credential, and
+  // the label test alone cannot tell the two apart.
+  let squatter = nk()
+  plant_device(h, "prod", "cloud-9", squatter)
+
+  // Not a `cloud-*` label: unreachable, and it reads as "no such live key"
+  // rather than as a permission error, because the credential has no business
+  // knowing the device exists.
   assert retire_slot_key(h, token, "prod", customer, True).status == 404
   assert key_state(h, customer) == "active"
-  assert list.contains(published_nks(h), customer)
+  assert served(h, "prod", customer)
+
+  // Named like a slot, in the right network, and still unreachable — this one
+  // isolates `find_slot_key`'s `created_by` clause, which nothing else here
+  // would fail without.
+  assert retire_slot_key(h, token, "prod", squatter, True).status == 404
+  assert key_state(h, squatter) == "active"
 
   // A hosting slot, but of a different network than the path names.
   assert retire_slot_key(h, token, "prod", hosted, True).status == 404
@@ -3417,6 +3549,27 @@ pub fn the_dp_api_is_closed_without_a_credential_test() {
   // attacker learns nothing about which credentials exist.
   assert call(h, keyed("synchdp_nonsense", Get, "/dp/v1/networks")).status
     == 401
+
+  // And the half that a missing credential cannot reach. `require_dataplane`
+  // is the *only* authorization these routes have — `hosted_network` takes the
+  // org straight from the path without asking who is calling — so a handler
+  // that lost the guard would let an admin of one org revoke another org's
+  // hosted key, or plant a `cloud-*` device in it, by spelling the path. An
+  // unauthenticated request dies in the shared session check long before any
+  // handler, and would stay green through exactly that regression.
+  let org_key = mint(h, "acme", "ci", "admin")
+  let refused = fn(method, path) {
+    #(
+      call(h, keyed(org_key, method, path)).status,
+      call(h, authed(h, method, path)).status,
+    )
+  }
+  assert refused(Get, "/dp/v1/networks") == #(403, 403)
+  assert refused(Put, "/dp/v1/networks/acme/prod/device") == #(403, 403)
+  assert refused(Delete, "/dp/v1/networks/acme/prod/device/keys/" <> nk())
+    == #(403, 403)
+  assert refused(Post, "/dp/v1/networks/acme/prod/status") == #(403, 403)
+  assert refused(Delete, "/dp/v1/networks/acme/prod/storage") == #(403, 403)
 }
 
 /// The steady-state poll is a 304, which is what makes a 60-second fleet-wide

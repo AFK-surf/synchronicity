@@ -415,6 +415,12 @@ field — the SSH wire-format blob — and compares it byte for byte with the
 canonical blob on the event, so a match means the exact verified key. It
 returns `1` for a match, `0` after a complete scan with no match,
 `SY_EAGAIN` when object bytes are not resident, or another negative error.
+It also returns `0`, without reading anything, once the connection has been
+torn down: there is no key left to compare against, and no decision left to
+carry, so the answer is the one that grants nothing. A guest that logs "not
+in `authorized_keys`" should therefore say so only for a connection it can
+still see, exactly as it should for every other event answer after a
+teardown.
 On `SY_EAGAIN` the host starts one bounded read of the whole object — the
 size limit below is what makes reading it whole safe — charged against the
 invocation's ordinary host-byte footprint, and the object becomes pollable;

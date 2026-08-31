@@ -242,7 +242,12 @@ struct ChannelBinding {
 pub(crate) enum Outstanding {
     /// The event is live, and this is its kind.
     Kind(u32),
-    /// Gone with the connection. The guest did nothing wrong.
+    /// Not here, and the connection has gone — so we cannot tell whether the
+    /// guest held this id legitimately or made it up, and it no longer
+    /// matters: `close` empties `outstanding` wholesale, and no answer given
+    /// now can reach a peer either way. Read it as *cannot tell*, not as
+    /// *did nothing wrong*; treating it as a fault is what would turn an
+    /// ordinary teardown into a guest error.
     Abandoned,
     /// No such event on a live connection: the guest's mistake.
     Unknown,
