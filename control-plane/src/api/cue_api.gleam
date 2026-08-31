@@ -13,8 +13,13 @@
 ////
 //// Idempotent by `cue_workspace_id` (unique in `cue_workspace_orgs`): a
 //// repeat, a concurrent duplicate, or a retry converges on the one org. The
-//// create path publishes the zone (a network is zone data); the reuse path
-//// only backfills the owner's identity/membership and never republishes.
+//// create path publishes the zone (a network is zone data); the ordinary reuse
+//// path only backfills the owner's identity/membership and never republishes.
+//// A duplicate that raced the create path rechecks after acquiring the writer
+//// transaction and may perform one no-op republish rather than return a false
+//// conflict.
+//// The paired remote/local retry lifecycle is modeled in the Cue repository at
+//// `tla/cue_synchronicity/WorkspaceProvisioning.tla`.
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
@@ -133,20 +138,32 @@ fn create(
   let who = principal.Principal("cue:provisioning", principal.Cookie(""))
 
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
-    let org_id = id.new()
-    let network_id = id.new()
+    // The fast-path lookup happens before the transaction. Recheck after the
+    // SQLite writer lock is held: another request may have committed the one
+    // mapping while this request waited to enter `zone_mutation`.
+    case find_workspace_org(conn, cue_workspace_id) {
+      Error(response) -> Error(response)
+      Ok(Some(#(org_id, network_id))) -> {
+        use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
+        Ok(provisioned(org_id, network_id, sync_user_id, False))
+      }
+      Ok(None) -> {
+        let org_id = id.new()
+        let network_id = id.new()
 
-    use _ <- result.try(insert_org(conn, org_id, ws_name))
-    use _ <- result.try(insert_network(conn, network_id, org_id))
-    use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
-    use _ <- result.try(insert_mapping(
-      conn,
-      cue_workspace_id,
-      org_id,
-      network_id,
-    ))
+        use _ <- result.try(insert_org(conn, org_id, ws_name))
+        use _ <- result.try(insert_network(conn, network_id, org_id))
+        use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
+        use _ <- result.try(insert_mapping(
+          conn,
+          cue_workspace_id,
+          org_id,
+          network_id,
+        ))
 
-    Ok(provisioned(org_id, network_id, sync_user_id, True))
+        Ok(provisioned(org_id, network_id, sync_user_id, True))
+      }
+    }
   })
 }
 
@@ -451,9 +468,11 @@ fn provisioned(
 /// Joins a device (its public node key `nk`) to the Workspace's assigned
 /// network. The network is resolved server-side from the workspace mapping; the
 /// caller never names it. Idempotent by the device key: because a live `nk` is
-/// globally unique to one device, a repeat returns that same device (ensuring
-/// its membership of this network), never a duplicate. A new `nk` creates the
-/// device + key + membership and republishes the zone.
+/// globally unique to one device, a repeat inside the owning org returns that
+/// same device (ensuring its membership of this network), never a duplicate.
+/// Reuse from another org is rejected: `devices.org_id` is the ownership
+/// boundary used by every dashboard mutation. A new `nk` creates the device +
+/// key + membership and republishes the zone.
 pub fn enroll_device(
   req: Request,
   ctx: AuthContext,
@@ -551,8 +570,16 @@ fn enroll(
 ) -> Response {
   case existing_device_for_nk(conn, nk_bytes) {
     Error(response) -> response
-    Ok(Some(device_id)) ->
-      ensure_member(conn, ctx, org_id, network_id, device_id)
+    Ok(Some(#(device_id, device_org_id))) ->
+      case device_org_id == org_id {
+        True -> ensure_member(conn, ctx, org_id, network_id, device_id)
+        False ->
+          error_json(
+            409,
+            "device_org_conflict",
+            "this node key belongs to a device in another org",
+          )
+      }
     Ok(None) ->
       create_device(
         conn,
@@ -569,9 +596,9 @@ fn enroll(
 }
 
 /// The device already exists (its `nk` is live). Guarantee it is a member of
-/// this network and return it. An existing membership is a pure repeat and
-/// never touches the zone; a new membership (the same device joining a second
-/// Workspace's network) adds zone content and republishes.
+/// this network and return it. `enroll` has already verified that the device
+/// and network share an org. An existing membership is a pure repeat and never
+/// touches the zone; a new membership adds zone content and republishes.
 fn ensure_member(
   conn: Connection,
   ctx: AuthContext,
@@ -632,15 +659,17 @@ fn create_device(
 fn existing_device_for_nk(
   conn: Connection,
   nk_bytes: BitArray,
-) -> Result(Option(String), Response) {
+) -> Result(Option(#(String, String)), Response) {
   case
     sqlite.query(
       conn,
-      "SELECT device_id FROM device_keys WHERE nk_bytes = ? AND state != 'revoked'",
+      "SELECT d.id, d.org_id
+       FROM device_keys k JOIN devices d ON d.id = k.device_id
+       WHERE k.nk_bytes = ? AND k.state != 'revoked'",
       [Blob(nk_bytes)],
     )
   {
-    Ok([[Text(device_id)]]) -> Ok(Some(device_id))
+    Ok([[Text(device_id), Text(org_id)]]) -> Ok(Some(#(device_id, org_id)))
     Ok([]) -> Ok(None)
     Ok(_) -> Error(db_error())
     Error(_) -> Error(db_error())

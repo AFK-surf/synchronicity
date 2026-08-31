@@ -19,6 +19,7 @@ import store/sqlite
 import util/id
 import wisp
 import wisp/simulate
+import zone/publish
 
 const secret = "cue-provisioning-shared-secret-0123456789"
 
@@ -35,11 +36,15 @@ type Env {
 }
 
 fn setup() -> Env {
-  setup_full(Some(cue_cfg()), fn(_conn) { Nil })
+  setup_full(
+    Some(cue_cfg()),
+    fn(_conn) { Nil },
+    fn(_conn, _now, _actor, _change) { Ok(1) },
+  )
 }
 
 fn setup_seeded(seed: fn(sqlite.Connection) -> Nil) -> Env {
-  setup_full(Some(cue_cfg()), seed)
+  setup_full(Some(cue_cfg()), seed, fn(_conn, _now, _actor, _change) { Ok(1) })
 }
 
 /// A migrated database carrying the shared hub org + its OIDC provider (every
@@ -48,6 +53,8 @@ fn setup_seeded(seed: fn(sqlite.Connection) -> Nil) -> Env {
 fn setup_full(
   cue: Option(config.CueProvisioning),
   seed: fn(sqlite.Connection) -> Nil,
+  publish_in_tx: fn(sqlite.Connection, Int, String, publish.Change) ->
+    Result(Int, publish.PublishError),
 ) -> Env {
   let db_path = tmp_db()
   let assert Ok(conn) = db.open_primary(db_path)
@@ -79,7 +86,7 @@ fn setup_full(
       None,
       // The network write publishes the zone; stub the publish (returns a
       // serial) so the create path exercises the whole transaction.
-      fn(_conn, _now, _actor, _change) { Ok(1) },
+      publish_in_tx,
       fn() { Nil },
       cue,
     )
@@ -137,6 +144,19 @@ fn count(env: Env, sql: String, params: List(sqlite.Value)) -> Int {
   let assert Ok([[sqlite.Int(n)]]) = sqlite.query(conn, sql, params)
   sqlite.close(conn)
   n
+}
+
+fn workspace_mapping(env: Env, workspace_id: String) -> #(String, String) {
+  let assert Ok(conn) = db.open_read(env.db_path)
+  let assert Ok([[sqlite.Text(org_id), sqlite.Text(network_id)]]) =
+    sqlite.query(
+      conn,
+      "SELECT org_id, network_id FROM cue_workspace_orgs
+       WHERE cue_workspace_id = ?",
+      [sqlite.Text(workspace_id)],
+    )
+  sqlite.close(conn)
+  #(org_id, network_id)
 }
 
 pub fn create_provisions_org_network_identity_membership_test() {
@@ -261,7 +281,10 @@ pub fn absent_secret_is_unauthenticated_test() {
 }
 
 pub fn disabled_provisioning_is_unavailable_test() {
-  let env = setup_full(None, fn(_conn) { Nil })
+  let env =
+    setup_full(None, fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) {
+      Ok(1)
+    })
   let resp =
     put(env, "wsp_g", Some(secret), body("G", "usr_grace", "g@cue.test"))
   assert resp.status == 503
@@ -276,6 +299,7 @@ pub fn unknown_hub_provider_is_unavailable_test() {
     setup_full(
       Some(config.CueProvisioning(secret, "no-such-provider")),
       fn(_conn) { Nil },
+      fn(_conn, _now, _actor, _change) { Ok(1) },
     )
   let resp =
     put(env, "wsp_h", Some(secret), body("H", "usr_ivan", "i@cue.test"))
@@ -410,6 +434,96 @@ pub fn enroll_device_is_idempotent_by_nk_test() {
 
   assert count(env, "SELECT count(*) FROM devices", []) == 1
   assert count(env, "SELECT count(*) FROM device_keys", []) == 1
+  assert count(env, "SELECT count(*) FROM network_devices", []) == 1
+}
+
+pub fn concurrent_provisioning_reuses_the_winning_mapping_test() {
+  let publish_entered = process.new_subject()
+  let responses = process.new_subject()
+
+  let env =
+    setup_full(
+      Some(cue_cfg()),
+      fn(_conn) { Nil },
+      fn(_conn, _now, _actor, _change) {
+        // A subject can only be received by the process that created it. Each
+        // publisher therefore makes its own gate and hands the sending half to
+        // the test process.
+        let release = process.new_subject()
+        process.send(publish_entered, release)
+        let assert Ok(Nil) = process.receive(release, 5000)
+        Ok(1)
+      },
+    )
+  let payload = body("Concurrent", "usr_race", "race@cue.test")
+
+  process.spawn_unlinked(fn() {
+    process.send(responses, put(env, "wsp_race", Some(secret), payload))
+  })
+  let assert Ok(first_release) = process.receive(publish_entered, 1000)
+
+  // The second request observes the still-uncommitted mapping as absent, then
+  // waits for the first writer. Releasing after it has reached that window
+  // reproduces the uniqueness race deterministically on the two-connection
+  // pool used by this fixture.
+  process.spawn_unlinked(fn() {
+    process.send(responses, put(env, "wsp_race", Some(secret), payload))
+  })
+  process.sleep(100)
+  process.send(first_release, Nil)
+
+  // After the repair, the losing request rechecks inside `zone_mutation` and
+  // reaches the publisher too. Before the repair it fails at the mapping's
+  // unique constraint, so there is no second gate to release.
+  case process.receive(publish_entered, 500) {
+    Ok(second_release) -> process.send(second_release, Nil)
+    Error(Nil) -> Nil
+  }
+
+  let assert Ok(first) = process.receive(responses, 5000)
+  let assert Ok(second) = process.receive(responses, 5000)
+  assert first.status == 200
+  assert second.status == 200
+  let #(org_id, network_id) = workspace_mapping(env, "wsp_race")
+  let first_body = simulate.read_body(first)
+  let second_body = simulate.read_body(second)
+  assert string.contains(first_body, "\"org_id\":\"" <> org_id <> "\"")
+  assert string.contains(first_body, "\"network_id\":\"" <> network_id <> "\"")
+  assert string.contains(second_body, "\"org_id\":\"" <> org_id <> "\"")
+  assert string.contains(second_body, "\"network_id\":\"" <> network_id <> "\"")
+  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM networks", []) == 1
+}
+
+pub fn existing_device_key_cannot_cross_workspace_orgs_test() {
+  let env = setup()
+  let subject = "usr_cross_org"
+  let email = "cross-org@cue.test"
+  let a = put(env, "wsp_org_a", Some(secret), body("A", subject, email))
+  let b = put(env, "wsp_org_b", Some(secret), body("B", subject, email))
+  assert a.status == 200
+  assert b.status == 200
+  let nk = fixtures.nk()
+
+  let first =
+    post_device(
+      env,
+      "wsp_org_a",
+      Some(secret),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert first.status == 200
+
+  let second =
+    post_device(
+      env,
+      "wsp_org_b",
+      Some(secret),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert second.status == 409
+  assert string.contains(simulate.read_body(second), "device_org_conflict")
+  assert count(env, "SELECT count(*) FROM devices", []) == 1
   assert count(env, "SELECT count(*) FROM network_devices", []) == 1
 }
 
