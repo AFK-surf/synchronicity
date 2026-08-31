@@ -8,7 +8,7 @@
 //! numbers the modules here cite.
 //!
 //! The service is an *embedder* of [`synch_engine`], not a fork of the daemon:
-//! one tenant is one [`Node`](synch_engine::Node), whole, with its own data
+//! one tenant is one [`synch_engine::Node`], whole, with its own data
 //! directory, database, device key, endpoint and CAS prefix (§4.1).
 
 pub mod config;

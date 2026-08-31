@@ -1,6 +1,6 @@
 //! One hosted network's whole life (`docs/CLOUD-DATAPLANE.md` §4.3, §4.4).
 //!
-//! A tenant is one full [`Node`](synch_engine::Node): its own data directory,
+//! A tenant is one full [`Node`]: its own data directory,
 //! database, device key, endpoint and CAS prefix. Everything here is per
 //! tenant, and nothing here is shared with another one except the process it
 //! runs in — which is the isolation story §9 states, honestly, as ownership

@@ -5,7 +5,7 @@
 //! half of this rule ("run exactly one daemon for a data directory/identity");
 //! this is the half the code can enforce.
 //!
-//! [`Node::open`](crate::Node::open) deliberately does **not** take the lock
+//! [`Node::open`](crate::node::Node::open) deliberately does **not** take the lock
 //! itself. The lock covers a *lifecycle* — a daemon run, an offline CAS
 //! migration — which is longer than any one `Node`, and a host that owns
 //! several of them (`docs/CLOUD-DATAPLANE.md` §4.1) wants to say so once per
@@ -25,7 +25,7 @@ const LIFECYCLE_FILE: &str = "lifecycle.lock";
 
 /// Process-held exclusive ownership of a data directory's mutable lifecycle.
 ///
-/// Acquire before opening the [`Store`](synch_store::Store) or any endpoint,
+/// Acquire before opening the [`synch_store::Store`] or any endpoint,
 /// and hold for as long as the work lasts — the lock releases on drop, and on
 /// process death, which is what makes it safe against a crash that never ran
 /// any cleanup.
