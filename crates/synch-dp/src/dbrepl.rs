@@ -526,7 +526,10 @@ fn verify_frame(bytes: &[u8], salt: [u8; 8], chain: Chain) -> Option<Frame> {
 /// interchangeable with one.
 fn checksum(state: (u32, u32), bytes: &[u8], big_endian: bool) -> (u32, u32) {
     let (mut s0, mut s1) = state;
-    for pair in bytes.chunks_exact(8) {
+    // Whole 8-byte pairs only; a trailing partial word cannot be part of a
+    // checksummed region, since both the frame header slice and a page are
+    // multiples of eight.
+    for pair in bytes.as_chunks::<8>().0 {
         let (a, b) = if big_endian {
             (
                 u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]),
