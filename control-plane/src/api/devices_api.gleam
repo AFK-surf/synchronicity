@@ -90,18 +90,24 @@ pub fn create_device(
   }
   use #(label, nk, relay, addr) <- body_decoder(req, decoder)
   case
+    // The reserved hosting-slot namespace, refused here for the reason
+    // `networks_api.join_device` refuses it: a device created in the org and
+    // assigned later would reach the zone under a `cloud-<n>` label just the
+    // same, so closing only the one-call join route would have closed nothing.
+    name.reserved_device_label(label),
     name.valid_device_label(label),
     model.validate_nk(nk),
     build.valid_hint(relay) && build.valid_hint(addr)
   {
-    False, _, _ -> refused(build.InvalidLabel(label))
-    _, Error(Nil), _ -> refused(build.InvalidNk(nk))
+    True, _, _, _ -> common.reserved_label(label)
+    _, False, _, _ -> refused(build.InvalidLabel(label))
+    _, _, Error(Nil), _ -> refused(build.InvalidNk(nk))
     // Refused here as well as at publish. A membership record is
     // whitespace-separated key=value pairs, so a hint carrying whitespace
     // is extra fields rather than one value — and a second apex= makes the
     // client refuse the whole record.
-    _, _, False -> refused(bad_hint(relay, addr))
-    True, Ok(nk_bytes), True ->
+    _, _, _, False -> refused(bad_hint(relay, addr))
+    False, True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Member)
         zone_mutation(conn, ctx, who, publish.Widening, fn() {

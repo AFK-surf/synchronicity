@@ -4,6 +4,7 @@ import api/browse_api
 import api/reads
 import api/router
 import api/skill
+import auth/dataplane_key
 import auth/google
 import auth/session
 import dns/name as dns_name
@@ -2884,4 +2885,303 @@ pub fn deleting_a_network_takes_its_join_keys_test() {
   let listed =
     simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
   assert !string.contains(listed, "rack-1")
+}
+
+// ---- the cloud data plane ---------------------------------------------------
+
+/// Mints a data-plane key the way the operator CLI does, straight against the
+/// table: there is deliberately no HTTP route that mints one, so a test cannot
+/// go through the API to get it either.
+fn mint_dataplane(h: Harness, name: String) -> String {
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(#(token, _prefix)) =
+    dataplane_key.create(conn, id.new(), name, None, now_unix())
+  sqlite.close(conn)
+  token
+}
+
+/// Turns hosting on for a network, as an org admin.
+fn host_network(h: Harness, slug: String, network: String, on: Bool) -> Int {
+  call_json(
+    h,
+    Put,
+    "/api/orgs/" <> slug <> "/networks/" <> network <> "/cloud-hosting/enabled",
+    json.object([#("enabled", json.bool(on))]),
+  ).status
+}
+
+/// The gate the whole credential rests on: a data-plane key sees every org's
+/// hosted networks, and *only* through `/dp/v1`. Against the org API it is
+/// refused outright rather than being treated as a member of anything — so a
+/// leaked one cannot read a file, a roster, or another credential.
+pub fn dataplane_key_reaches_only_the_dp_api_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint_dataplane(h, "fleet")
+
+  // The one surface it has.
+  assert call(h, keyed(token, Get, "/dp/v1/networks")).status == 200
+
+  // And nothing else, including an org that exists and one that does not.
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 403
+  assert call(h, keyed(token, Get, "/api/orgs/nope")).status == 403
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks")).status == 403
+  assert call(h, keyed(token, Get, "/api/orgs/acme/api-keys")).status == 403
+  assert call(h, keyed(token, Get, "/api/me")).status == 403
+
+  // The converse: an org key is not a data-plane key, however privileged.
+  let org_token = mint(h, "acme", "ci", "admin")
+  assert call(h, keyed(org_token, Get, "/dp/v1/networks")).status == 403
+  // Nor is a session, which is a person and not a fleet.
+  assert call(h, authed(h, Get, "/dp/v1/networks")).status == 403
+}
+
+/// Hosting is off until an org admin turns it on, and the document the fleet
+/// polls is what carries that decision.
+pub fn hosting_is_off_until_an_admin_enables_it_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let token = mint_dataplane(h, "fleet")
+
+  // Default off: the network exists and the fleet is not told to host it.
+  let before = simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+  assert !string.contains(before, "prod")
+
+  assert host_network(h, "acme", "prod", True) == 200
+  let after = simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+  assert string.contains(after, "prod")
+  // The membership domain, verbatim what the node is configured with.
+  assert string.contains(after, "prod.acme.sync.test")
+
+  // And off again removes it, which is what starts a teardown.
+  assert host_network(h, "acme", "prod", False) == 200
+  let disabled =
+    simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+  assert !string.contains(disabled, "prod.acme.sync.test")
+}
+
+/// Registration is idempotent and publishes: the zone names the key on the
+/// commit, which is what closes the window a restarted pod waits in.
+pub fn registering_a_hosted_device_publishes_and_is_idempotent_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  let key = nk()
+  let body =
+    json.object([#("label", json.string("cloud-1")), #("nk", json.string(key))])
+
+  let registered =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(body),
+    )
+  assert registered.status == 200
+
+  // The zone carries it now — no second step, and no TTL to wait out.
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(conn, "SELECT count(*) FROM presigned_rrsets WHERE name = ?", [
+      sqlite.Text("_synchronicity.prod.acme.sync.test."),
+    ])
+  sqlite.close(conn)
+  // Present at all is the claim: the membership name is signed and served
+  // the moment the registration commits, which is what the reconciler's
+  // next open depends on. How many rows that is (the RRset and its RRSIG)
+  // is the signer's business, not this test's.
+  assert rows != [[sqlite.Int(0)]]
+
+  // The same key again is a no-op, because a reconciler re-registers on every
+  // provisioning and must not churn the zone by doing so.
+  let again =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(body),
+    )
+  assert again.status == 200
+
+  // And the document now reports the device, which is how a disk-less pod
+  // tells "never joined" from "identity to recover".
+  let listed = simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+  assert string.contains(listed, "cloud-1")
+  assert string.contains(listed, key)
+}
+
+/// The reserved namespace, in both directions: customers cannot mint a device
+/// that impersonates the fleet, and the fleet cannot register anything else.
+pub fn the_cloud_label_namespace_is_reserved_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+
+  // A customer cannot take a slot label.
+  let taken =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      json.object([
+        #("label", json.string("cloud-1")),
+        #("nk", json.string(nk())),
+      ]),
+    )
+  assert taken.status == 409
+  assert string.contains(simulate.read_body(taken), "reserved-label")
+
+  // A label that merely looks like one is not reserved: the rule is
+  // `cloud-<digits>`, and a customer's `cloud-nine` is their own business.
+  assert call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      json.object([
+        #("label", json.string("cloud-nine")),
+        #("nk", json.string(nk())),
+      ]),
+    ).status
+    == 200
+
+  // And the fleet cannot register outside it.
+  let token = mint_dataplane(h, "fleet")
+  let refused =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("nas")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    )
+  assert refused.status == 400
+}
+
+/// A network nobody enabled is not registrable, however good the credential —
+/// the toggle is the gate, not just a listing filter.
+pub fn registering_into_an_unhosted_network_is_refused_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let token = mint_dataplane(h, "fleet")
+  let refused =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    )
+  assert refused.status != 200
+}
+
+/// Disabling takes the hosted device out of the zone in the same commit, so a
+/// customer who turns hosting off stops publishing the fleet's key at once.
+pub fn disabling_hosting_removes_the_hosted_device_from_the_zone_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  let assert 200 =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    ).status
+
+  assert host_network(h, "acme", "prod", False) == 200
+
+  let conn = read_db(h)
+  let assert Ok(devices) =
+    sqlite.query(conn, "SELECT count(*) FROM devices WHERE label = ?", [
+      sqlite.Text("cloud-1"),
+    ])
+  let assert Ok(stamped) =
+    sqlite.query(
+      conn,
+      "SELECT count(*) FROM networks WHERE name = ? AND cloud_disabled_at IS NOT NULL",
+      [sqlite.Text("prod")],
+    )
+  sqlite.close(conn)
+  // Gone, not merely unpublished: the retention hold is over storage, and the
+  // device row is what the zone is built from.
+  assert devices == [[sqlite.Int(0)]]
+  // And the clock the retention hold runs on has started.
+  assert stamped == [[sqlite.Int(1)]]
+}
+
+/// The steady-state poll is a 304, which is what makes a 60-second fleet-wide
+/// cadence cheap.
+pub fn the_desired_document_is_conditional_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint_dataplane(h, "fleet")
+  let first = call(h, keyed(token, Get, "/dp/v1/networks"))
+  assert first.status == 200
+  let assert Ok(tag) = list.key_find(first.headers, "etag")
+
+  let again =
+    call(
+      h,
+      keyed(token, Get, "/dp/v1/networks")
+        |> simulate.header("if-none-match", tag),
+    )
+  assert again.status == 304
+}
+
+/// An expired data-plane key is refused like any other credential.
+pub fn expired_dataplane_key_is_refused_test() {
+  let h = harness()
+  let token = mint_dataplane(h, "fleet")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE dataplane_keys SET expires_at = ?", [
+      sqlite.Int(now_unix() - 1),
+    ])
+  sqlite.close(conn)
+  assert call(h, keyed(token, Get, "/dp/v1/networks")).status == 401
 }

@@ -88,6 +88,16 @@ pub fn require_org(
 /// whole family in the one function every org-scoped route goes through is
 /// what makes that scope real: the join endpoint admits a join key by checking
 /// the network itself, and nothing else in the service can.
+///
+/// **Neither does a data-plane key**, and here the stakes are the other way
+/// round. That credential names *no* org on purpose — its job is to be told
+/// which networks of every org have hosting on — so there is nothing for the
+/// `ApiKey` arm's "the org this key names, and nothing else" comparison to
+/// compare against, and any arm that tried would be inventing a scope. The
+/// explicit refusal is what makes docs/CLOUD-DATAPLANE.md §3.2's promise
+/// structural: a leaked data-plane key cannot touch the org API at all,
+/// because every org-scoped route in the service resolves its caller through
+/// this function and this function names the variant and turns it away.
 pub fn check_org(
   conn: Connection,
   slug: String,
@@ -97,6 +107,7 @@ pub fn check_org(
   case who.credential {
     principal.Cookie(_) -> member_org(conn, slug, who.user_id, minimum)
     principal.JoinKey(_, _, _) -> Error(middleware.join_key_refused())
+    principal.Dataplane(_) -> Error(middleware.dataplane_refused())
     principal.ApiKey(_, key_org_id, role_text) ->
       case
         sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)])
@@ -440,6 +451,12 @@ fn credential_fields(
     principal.Cookie(_) -> []
     principal.ApiKey(key_id, _, _) | principal.JoinKey(key_id, _, _) ->
       describe_key(conn, key_id)
+    // A different table, so a different lookup — `describe_key` would find
+    // nothing in `api_keys` and say nothing, which reads as "the key was
+    // revoked" rather than "this was never an org key". There is no minter to
+    // name: these are minted at the operator CLI, where the actor is the
+    // machine somebody had a shell on.
+    principal.Dataplane(key_id) -> describe_dataplane_key(conn, key_id)
   }
 }
 
@@ -463,6 +480,46 @@ fn describe_key(conn: Connection, key_id: String) -> List(#(String, Json)) {
     // still names the key, and a lookup is not worth failing a mutation for.
     _ -> []
   }
+}
+
+fn describe_dataplane_key(
+  conn: Connection,
+  key_id: String,
+) -> List(#(String, Json)) {
+  case
+    sqlite.query(conn, "SELECT name FROM dataplane_keys WHERE id = ?", [
+      Text(key_id),
+    ])
+  {
+    Ok([[Text(name)]]) -> [#("key_name", json.string(name))]
+    // A miss is ordinary rather than impossible, for `describe_key`'s reasons:
+    // the row can go between the request authenticating and this write, and the
+    // query itself can fail. Say nothing rather than guess.
+    _ -> []
+  }
+}
+
+/// The reserved device-label namespace, refused in one voice.
+///
+/// `cloud-<n>` labels belong to the cloud data plane's hosting slots
+/// (docs/CLOUD-DATAPLANE.md §3.4): only the data-plane principal may create
+/// one, and every customer-facing path that takes a label refuses them here.
+/// 409 rather than 400 because the label is *well formed* — it is a perfectly
+/// good device label that this deployment has already spoken for, which is a
+/// conflict, not a malformed request.
+///
+/// Public and shared so the two device-create paths refuse it identically; a
+/// namespace enforced in two wordings is a namespace a client has to test for
+/// twice.
+pub fn reserved_label(label: String) -> Response {
+  error_json(
+    409,
+    "reserved-label",
+    "device label '"
+      <> label
+      <> "' is reserved: 'cloud-<n>' names a cloud-hosted replica's hosting "
+      <> "slot, which only the hosting service may create",
+  )
 }
 
 /// Decodes a JSON request body, or answers 400.

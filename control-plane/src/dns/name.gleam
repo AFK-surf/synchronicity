@@ -80,6 +80,35 @@ fn plain_bytes_ok(bytes: BitArray) -> Bool {
   }
 }
 
+/// Whether a device label is in the reserved `cloud-<n>` namespace
+/// (docs/CLOUD-DATAPLANE.md §3.4): the hosting slots the cloud data plane's
+/// devices occupy, which only the data-plane principal may create.
+///
+/// It lives beside `valid_device_label` rather than in the API layer because
+/// it is the same kind of fact — a grammar over a label — and because both
+/// device-create paths and the data-plane API need it, and the one module all
+/// three can import without a cycle is this one.
+///
+/// The suffix is the *slot*, not the shard, so it must be digits and nothing
+/// else: `cloud-1` is one durable identity that any pod may currently be
+/// serving. `cloud-`, `cloud-1a` and `cloud-1-2` are ordinary customer labels
+/// and stay available, because a namespace that swallowed more than it can
+/// explain is a namespace that takes names off people for no reason.
+pub fn reserved_device_label(label: String) -> Bool {
+  case string.split_once(label, "-") {
+    Ok(#("cloud", slot)) -> slot != "" && digits_ok(<<slot:utf8>>)
+    _ -> False
+  }
+}
+
+fn digits_ok(bytes: BitArray) -> Bool {
+  case bytes {
+    <<>> -> True
+    <<b:int-size(8), rest:bits>> -> b >= 48 && b <= 57 && digits_ok(rest)
+    _ -> False
+  }
+}
+
 /// Presentation form, always absolute: ["a", "b"] is "a.b.".
 pub fn to_string(name: Name) -> String {
   case name {

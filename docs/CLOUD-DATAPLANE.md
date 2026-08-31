@@ -1,6 +1,12 @@
 # Cloud data plane — multi-tenant hosted replicas
 
-Status: design proposal v1 · 2026-08-31
+Status: **implemented** (v1) · 2026-08-31
+
+The service is `crates/synch-dp`, the control-plane half is under
+`control-plane/src` (migration v12, `/dp/v1`, the cloud-hosting toggle), and
+the engine changes §7.3 asks for are in. What is *not* yet built is named in
+§11: the retention-hold collector, the dashboard toggle in `web/`, and
+sharding beyond a single shard's rendezvous filter.
 
 This document designs the **cloud data plane**: a managed, multi-tenant
 hosting service that runs a fleet of synchronicity replica nodes — one per
@@ -233,15 +239,23 @@ seeds one system user (`system-dataplane`, no email, no sessions possible)
 that these rows reference, so no human's id is impersonated and the audit
 trail names the service.
 
-**`DELETE /dp/v1/networks/:org/:net/device/keys/:nk`** — completes a
-rotation by retiring the named key (`state='retiring'`, then the ordinary
-retirement), or revokes it outright with `?revoke=1` when the data plane
-has reason to distrust it. Confined to keys of `cloud-*` devices in that
-network; refuses the last `active` key unless revoking, so the route
-cannot orphan a healthy tenant. Without this route a rotation could be
-opened (the `PUT` above) but never closed — the zone would carry two keys
-per label forever, which the zone validation caps but the design should
-never lean on.
+**`DELETE /dp/v1/networks/:org/:net/device/keys/:nk`** — withdraws a key
+this service registered, in the two steps the rotation window has: plain
+moves `active → retiring` (the key still publishes, so peers that have not
+re-resolved keep working), and `?revoke=1` withdraws it outright once the
+window has run. A rotation is therefore `PUT` a new key, `DELETE` the old,
+and `DELETE …?revoke=1` a TTL later; a key the service has reason to
+distrust skips to the last step. Confined to keys of `cloud-*` devices in
+that network, and it refuses the last `active` key unless revoking, so the
+route cannot orphan a healthy tenant. Without it a rotation could be
+opened and never closed — the zone would carry two keys per label forever,
+which the zone validation caps but the design should never lean on.
+
+The `cloud_hosted` flag is deliberately *not* required here, unlike the
+other two writes: disabling hosting deletes these devices in its own
+commit, so a key still findable belongs to a tenant still hosted or one
+mid-teardown, and refusing to withdraw a key because the switch already
+went off would close the door on exactly the cleanup this is for.
 
 **`POST /dp/v1/networks/:org/:net/status`** — the metering heartbeat, sent
 per tenant every few minutes:
@@ -660,11 +674,13 @@ must admit the new member before it can fetch), which the 300 s data TTL
 keeps in minutes.
 
 **Rotate**: the hosted device rotates keys with the standard window
-(DESIGN §3.4), driven by the data plane on its own schedule (and forced by
-the operator on suspicion): generate, `PUT` the new key (two keys under
-one label), `swap_active_endpoint`, then retire the old key with §3.3's
-`DELETE …/device/keys/:nk` once customer bindings have had a TTL to move.
-No customer involvement; that is what the rotation design bought.
+(DESIGN §3.4): generate, `PUT` the new key (two keys under one label),
+`swap_active_endpoint`, `DELETE` the old one to mark it retiring, and
+`DELETE …?revoke=1` a TTL later once customer bindings have moved. No
+customer involvement; that is what the rotation design bought. The routes
+are built and the client can call them; what does not exist yet is
+anything that *schedules* a rotation, so today this is an operator action
+rather than a standing one.
 
 **Disable**: flag off → the control plane deletes the network's `cloud-*`
 devices in the same commit (zone shrinks; customer nodes drop the binding
@@ -839,38 +855,54 @@ None of the engine's replication, storage, or membership code changes.
 
 ```
 crates/synch-dp/
-  src/main.rs          # config from env, runtime, shard identity
+  src/main.rs          # config from env, runtime, signals, metrics server
+  src/config.rs        # the environment, the shard filter, the slot
   src/control.rs       # /dp/v1 client: poll (ETag), register, heartbeat
   src/reconciler.rs    # desired-state diff, fail-static cache, shard filter
   src/tenant.rs        # per-network lifecycle: provision, identify,
                        #   loop set, supervise, drain, retire
   src/spaces.rs        # space-driven replica ensure (§4.5 — never removes)
   src/dbrepl.rs        # in-process WAL-shipping DB replicator (§5.3)
+  src/store.rs         # the service's bucket client, and the sealed envelope
   src/metrics.rs
 ```
 
-### Phases
+### What is built
 
-1. **Engine groundwork**: change (a) `socket_workers: 0`; change (c)
-   engine-side lifecycle lock; change (d) embedder-owned WAL
-   checkpointing, which phase 3's replicator needs. All small, all
-   independently shippable.
-2. **Control plane**: migration v12 (`cloud_hosted`, `cloud_disabled_at`,
-   `dataplane_keys`, system user, reserved-label check in `join_device`),
-   the toggle route + audit events, `/dp/v1` routes and the `Dataplane`
-   principal, `controlplane dataplane-key mint`. The e2e harness grows one
-   scenario: enable → poll → register → zone names the key.
-3. **`synch-dp` v1**: single shard, provision/identify/replicate/drain
-   against a real control plane and a Memory/S3-compatible store; the
-   integration test is the engine's cluster testkit plus the control-plane
-   e2e stack — a customer node publishes, the hosted tenant converges, the
-   customer node deletes its copy, the bytes survive in the tenant prefix,
-   the rebuilt-DB path re-adopts them.
-4. **Operations**: replicator hardening (restore fuzzing over torn and
-   forked streams), retention-hold deletion job, dashboards, the status
-   heartbeat and its control-plane table, runbook (`control-plane/ops/`).
-5. **Scale-out**: shard filter + rendezvous handover, then the
-   dedicated-shard and redundant-hosting tiers as configuration.
+1. **Engine groundwork** — done. Change (a) `socket_workers: 0` skips the
+   socket runtime and the SSH host key entirely; change (c)
+   `synch_engine::LifecycleLock` (the daemon's own lock, moved into the
+   engine so an embedder gets it and the two cannot drift); change (d)
+   `Checkpointing::Embedder` plus `Store::checkpoint`, `db_path`, and
+   `wal_path`.
+2. **Control plane** — done. Migration v12 (`cloud_hosted`,
+   `cloud_disabled_at`, `dataplane_keys`, `network_hosting_status`, the
+   `system-dataplane` user), the admin toggle with its audit events, the
+   four `/dp/v1` routes, the `Dataplane` principal that `check_org` refuses
+   outright, the reserved `cloud-*` label namespace, and
+   `controlplane dataplane-key mint`.
+3. **`synch-dp` v1** — done for a single shard: restore-or-init, register,
+   identify, replicate, converge, heartbeat, drain.
+
+### What is not
+
+- **The retention-hold collector** (§6): disabling drains the tenant and
+  removes the local directory, and the bucket prefix plus DB stream are
+  left for a scheduled job that does not exist yet. Until it does, an
+  offboarded tenant's storage is retained indefinitely rather than for the
+  stated 30 days — the safe direction, and a billing question.
+- **The dashboard toggle**: the API is there and `cloud_hosted` is exposed
+  on both network reads; `web/` has no switch yet.
+- **An end-to-end test across both halves** — a customer node publishes,
+  the hosted tenant converges, the customer's copy goes away, the bytes
+  survive in the tenant prefix. The pieces are unit-tested on each side
+  (the replicator round-trips a real SQLite database; the control plane's
+  own suite covers the routes), but nothing yet runs the two together.
+  This is the most valuable next test to write.
+- **Sharding beyond one shard**: the rendezvous filter is implemented and
+  tested, but no handover has been exercised against a live fleet.
+- **Rotation is not driven** (§6): the `DELETE …/device/keys/:nk` route
+  exists and the client can call it; nothing schedules a rotation yet.
 
 ---
 

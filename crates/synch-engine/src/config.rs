@@ -22,12 +22,26 @@ pub struct NodeConfig {
     ///
     /// Dedicated OS threads, because async-ebpf's `Program` is neither `Send`
     /// nor `Sync` — a guest suspends inside a signal handler — so an
-    /// invocation is placed on a worker and stays there. Zero is rounded up to
-    /// one by the pool: a pool that exists and can run nothing would surface as
-    /// a hang rather than an error.
+    /// invocation is placed on a worker and stays there.
+    ///
+    /// **Zero declines the capability outright**: no pool, no SSH host key
+    /// minted, and — because the socket ALPN is mounted only where a pool
+    /// exists — nothing advertised for a peer to dial. That is a different
+    /// statement from "run sockets with no worker to run them on", which is
+    /// why zero is not rounded up to one: a host that means to serve sockets
+    /// and asks for none would get a hang, while a host that means not to
+    /// serve them at all had no way to say so. An embedder hosting many nodes
+    /// in one process pays this per node (`docs/CLOUD-DATAPLANE.md` §4.4).
     pub socket_workers: usize,
     /// OpenDAL cloud CAS settings. `None` selects the local filesystem CAS.
     pub cloud: Option<synch_store::cloud::CloudConfig>,
+    /// Who checkpoints this node's write-ahead log.
+    ///
+    /// The default leaves it to SQLite. An embedder replicating the database
+    /// itself takes it over, so that no frame is recycled before it has been
+    /// shipped (`docs/CLOUD-DATAPLANE.md` §5.3) — and then owes the WAL a
+    /// checkpoint, because nothing else will run one.
+    pub checkpointing: synch_store::Checkpointing,
     /// How the endpoint is bound.
     pub net: NetOptions,
     /// The base anti-entropy round interval (§5.3, default 30 s with ±50 %
@@ -140,6 +154,7 @@ impl NodeConfig {
                 .map(|n| n.get().min(4))
                 .unwrap_or(1),
             cloud: None,
+            checkpointing: synch_store::Checkpointing::default(),
             net: NetOptions::default(),
             aae_interval: Duration::from_secs(30),
             checkout_interval: Duration::from_secs(60),

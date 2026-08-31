@@ -1,0 +1,42 @@
+[package]
+name = "synch-dp"
+description = "The cloud data plane: one embedded synchronicity replica node per hosted network, replicated to object storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The node itself, embedded as a library — this crate is one more embedder of
+# the engine, not a fork of the daemon (`docs/CLOUD-DATAPLANE.md` §4.1).
+synch-core.workspace = true
+synch-engine.workspace = true
+synch-net.workspace = true
+synch-store.workspace = true
+
+# The DB replica stream rides the same object-store client as the CAS, so a
+# deployment configures one set of credentials (§5.3).
+opendal.workspace = true
+# AES-256-GCM over the database stream, which carries device secrets (§9).
+aws-lc-rs.workspace = true
+
+axum.workspace = true
+blake3.workspace = true
+clap.workspace = true
+hex.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -30,40 +30,13 @@ pub(crate) const SOCKET_FILE: &str = "control.sock";
 /// The token file inside the data directory.
 pub(crate) const TOKEN_FILE: &str = "control.token";
 
-/// Stable inode used to exclude daemon startup and offline CAS migration.
-const LIFECYCLE_FILE: &str = "lifecycle.lock";
-
 /// Process-held exclusive ownership of a data directory's mutable lifecycle.
-#[derive(Debug)]
-pub(crate) struct LifecycleLock(std::fs::File);
-
-impl LifecycleLock {
-    /// Acquires the lock before opening the Store or any network endpoint.
-    pub(crate) fn acquire(data_dir: &Path) -> io::Result<Self> {
-        use fs2::FileExt;
-        harden_data_dir(data_dir)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(data_dir.join(LIFECYCLE_FILE))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.try_lock_exclusive()
-            .map_err(|_| already_running_error(data_dir))?;
-        Ok(Self(file))
-    }
-}
-
-impl Drop for LifecycleLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
+///
+/// The implementation moved into the engine, where an embedder can reach it
+/// (`synch_engine::lifecycle`); the daemon is one such embedder and must take
+/// the same lock on the same file, so it uses that one rather than keeping a
+/// second definition that could drift apart from it.
+pub(crate) use synch_engine::LifecycleLock;
 
 /// The authority every control channel claims.
 ///

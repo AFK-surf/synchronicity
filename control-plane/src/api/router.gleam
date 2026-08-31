@@ -19,6 +19,18 @@
 //// `middleware.require_user`, and the one join route, which asks
 //// `api/common.check_join_target` instead.
 ////
+//// **A fourth reaches `/dp/v1` and only `/dp/v1`** — the cloud data plane's
+//// key (docs/CLOUD-DATAPLANE.md §3.2). It is resolved by the same
+//// `with_principal`, because there must be exactly one place a bearer token
+//// becomes a principal, and it is then kept apart by two refusals rather than
+//// by a second router: `api/common.check_org` turns it away, so no org-scoped
+//// route can be reached with it, and `api/dataplane_api` admits nothing else,
+//// so no other credential can be reached *through* it. The `/dp/v1` prefix
+//// sits under the same reads/writes split as everything else — the
+//// desired-state GET is a read of litestream-fed state and a replica serves
+//// it; the registration, the retirement and the heartbeat are writes and are
+//// the primary's.
+////
 //// Naming convention in api/: endpoint modules carry the `_api` suffix
 //// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
 //// (router, middleware, common, static — static serves files, not an API;
@@ -27,6 +39,7 @@
 import api/api_keys_api
 import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
+import api/dataplane_api
 import api/devices_api
 import api/middleware
 import api/networks_api
@@ -128,7 +141,13 @@ pub fn handle(req: Request, ctx: Context) -> Response {
         ReadOnly(_, primary_url), Get -> auth_api.methods(None, primary_url)
         _, _ -> wisp.not_found()
       }
-    ["auth", ..] | ["api", ..] ->
+    // `/dp/v1` joins the same two tables rather than getting a mount of its
+    // own: it has the same reads-on-a-replica, writes-on-the-primary property
+    // as everything else, and a second dispatch would be a second place for
+    // that property to be got wrong. A write reaching a replica therefore gets
+    // `elsewhere`'s 409 naming the primary, which is the answer a reconciler
+    // behind a load balancer can act on.
+    ["auth", ..] | ["api", ..] | ["dp", ..] ->
       // Reads first, whichever surface this is: the two mount the same
       // handlers over the same tables, so a route that appears in both is
       // written once and cannot drift between them.
@@ -311,6 +330,15 @@ fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
         devices_api.list_devices(reads, who, slug)
       })
 
+    // The data plane's desired-state document. A read like any other, so a
+    // replica answers it — which is what lets the fleet's every-60s poll be
+    // load-balanced away from the node that takes the writes.
+    ["dp", "v1", "networks"], Get ->
+      Some({
+        use who <- with_principal(req, reads)
+        dataplane_api.desired_state(req, reads, who)
+      })
+
     _, _ -> None
   }
 }
@@ -407,6 +435,13 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
       use who <- with_principal(req, auth.reads)
       browse_api.set_enabled(req, auth, browse, who, slug, net)
     }
+    // The hosting switch, beside the browse switch it is modelled on. The two
+    // are independent and independently fail-closed: hosting replicates,
+    // browsing observes, and neither implies the other.
+    ["api", "orgs", slug, "networks", net, "cloud-hosting", "enabled"], Put -> {
+      use who <- with_principal(req, auth.reads)
+      networks_api.set_cloud_hosting(req, auth, who, slug, net)
+    }
 
     ["api", "orgs", slug, "devices"], Post -> {
       use who <- with_principal(req, auth.reads)
@@ -431,6 +466,23 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
     ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
       use who <- with_principal(req, auth.reads)
       devices_api.revoke_key(auth, browse, who, slug, dev, key)
+    }
+
+    // The data plane's three writes. They are here rather than in a table of
+    // their own because they are writes, and everything true of a write on
+    // this service is true of them: the primary takes them, they publish the
+    // zone where they shape it, and a replica answers `elsewhere`'s 409.
+    ["dp", "v1", "networks", org, net, "device"], Put -> {
+      use who <- with_principal(req, auth.reads)
+      dataplane_api.register_device(req, auth, who, org, net)
+    }
+    ["dp", "v1", "networks", org, net, "device", "keys", nk], Delete -> {
+      use who <- with_principal(req, auth.reads)
+      dataplane_api.retire_key(req, auth, who, org, net, nk)
+    }
+    ["dp", "v1", "networks", org, net, "status"], Post -> {
+      use who <- with_principal(req, auth.reads)
+      dataplane_api.post_status(req, auth, who, org, net)
     }
 
     _, _ -> wisp.not_found()

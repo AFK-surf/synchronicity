@@ -4741,6 +4741,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -5777,12 +5779,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "synch-dp"
+version = "0.1.7"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "blake3",
+ "clap",
+ "hex",
+ "opendal",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "synch-core",
+ "synch-engine",
+ "synch-net",
+ "synch-store",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "synch-engine"
 version = "0.1.7"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
  "directories",
+ "fs2",
  "futures-util",
  "hex",
  "iroh",

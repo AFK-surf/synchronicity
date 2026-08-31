@@ -14,9 +14,10 @@ import auth/principal.{type Principal}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
+import gleam/list
 import gleam/result
 import gleam/string
-import store/sqlite.{Blob, Int as VInt, Text}
+import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
 import util/id
 import wisp.{type Request, type Response}
 import zone/build
@@ -29,7 +30,7 @@ pub fn list_networks(reads: Reads, who: Principal, slug: String) -> Response {
     let rows =
       sqlite.query(
         conn,
-        "SELECT n.name, count(nd.device_id)
+        "SELECT n.name, count(nd.device_id), n.cloud_hosted
          FROM networks n LEFT JOIN network_devices nd ON nd.network_id = n.id
          WHERE n.org_id = ? GROUP BY n.id ORDER BY n.name",
         [Text(org_id)],
@@ -38,6 +39,10 @@ pub fn list_networks(reads: Reads, who: Principal, slug: String) -> Response {
       json.object([
         #("name", json.string(text_at(row, 0))),
         #("device_count", json.int(common.int_at(row, 1))),
+        // The stored column is an integer, as `browse_enabled` is; the API
+        // answers a boolean, because a switch is a switch and every reader of
+        // this list would otherwise write the same `!== 0` for itself.
+        #("cloud_hosted", json.bool(common.int_at(row, 2) != 0)),
       ])
     })
   })
@@ -99,6 +104,18 @@ pub fn network_detail(
       Error(Nil) -> error_json(404, "not_found", "no such network")
       Ok(network_id) -> {
         let meta = model.read_meta(conn)
+        // Its own statement rather than a column on the device join: that
+        // query returns one row per device key, and a per-network fact
+        // repeated down a device list is a fact somebody will read off the
+        // wrong row when the list is empty.
+        let hosting =
+          sqlite.query(conn, "SELECT cloud_hosted FROM networks WHERE id = ?", [
+            Text(network_id),
+          ])
+        let cloud_hosted = case hosting {
+          Ok([[VInt(flag)]]) -> flag != 0
+          _ -> False
+        }
         let devices =
           sqlite.query(
             conn,
@@ -132,6 +149,7 @@ pub fn network_detail(
                 #("soa_serial", json.int(zone_meta.soa_serial)),
                 #("sig_expires_at", json.int(expires)),
                 #("last_published_at", json.int(signed_at)),
+                #("cloud_hosted", json.bool(cloud_hosted)),
                 #(
                   "devices",
                   json.array(device_rows, fn(row) {
@@ -220,6 +238,162 @@ pub fn delete_network(
   }
 }
 
+// -- cloud hosting ----------------------------------------------------------
+
+/// `PUT /api/orgs/:slug/networks/:net/cloud-hosting/enabled` — the org's
+/// switch for managed replica hosting (docs/CLOUD-DATAPLANE.md §2, §3.1).
+///
+/// Admin-gated and audited, the shape `browse_api.set_enabled` set for the
+/// browse switch, and off until an org admin turns it on: hosting means a
+/// service-operated node joins the customer's network and holds a replica of
+/// everything on it, which is an explicit grant or it is nothing. The two
+/// toggles stay independent and independently fail-closed — hosting without
+/// browse replicates but is observable only through the status heartbeat.
+///
+/// **Unlike the browse switch, this one is a `zone_mutation`**, and both
+/// directions are, for two reasons that pull the same way:
+///
+///   * Turning it *off* deletes the network's `cloud-<n>` devices, which is a
+///     zone change and must be the *same* commit — the flag and the membership
+///     record it caused have to stop being true together, or the zone goes on
+///     naming a hosted key the org has just withdrawn consent for.
+///   * Turning it *on* changes nothing in the zone, but it does change the
+///     data plane's desired-state document — and that document's `generation`
+///     is the zone serial (`api/dataplane_api`), so a toggle that did not
+///     publish would be a network the fleet's `If-None-Match` poll never
+///     notices. Making the grant itself `Widening` also puts it behind the
+///     transparency gate, which is honest: the very next thing that happens is
+///     a device registration that widens the zone for real, and being refused
+///     now rather than a minute later names the ceremony step that is missing.
+///
+/// `cloud_disabled_at` starts the retention clock over the tenant's object
+/// storage, so it is stamped on the way out and cleared on the way back in:
+/// re-enabling within the hold is a cheap re-provision, and the date is what a
+/// scheduled deletion job later reads. It outlives the device rows this same
+/// transaction removes, which is the point of putting it on the network.
+pub fn set_cloud_hosting(
+  req: Request,
+  ctx: AuthContext,
+  who: Principal,
+  slug: String,
+  network: String,
+) -> Response {
+  let decoder = {
+    use enabled <- decode.field("enabled", decode.bool)
+    decode.success(enabled)
+  }
+  use enabled <- body_decoder(req, decoder)
+  with_db(ctx, fn(conn) {
+    use org_id, _ <- require_org(conn, slug, who, Admin)
+    case find_network(conn, org_id, network) {
+      Error(Nil) -> error_json(404, "not_found", "no such network")
+      Ok(network_id) -> {
+        // The four things that differ between the two directions, decided
+        // once: what the zone is told to expect, the stored flag, when the
+        // retention clock starts, and what the trail calls it.
+        let #(change, flag, action) = case enabled {
+          True -> #(publish.Widening, 1, "cloud-hosting.enable")
+          False -> #(publish.Narrowing, 0, "cloud-hosting.disable")
+        }
+        let disabled_at = case enabled {
+          True -> Null
+          False -> VInt(now_unix())
+        }
+        zone_mutation(conn, ctx, who, change, fn() {
+          let work = {
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "UPDATE networks SET cloud_hosted = ?, cloud_disabled_at = ?
+                 WHERE id = ?",
+                [VInt(flag), disabled_at, Text(network_id)],
+              ),
+            )
+            use removed <- result.try(case enabled {
+              True -> Ok(0)
+              False -> retire_hosted_devices(conn, network_id)
+            })
+            use _ <- result.try(
+              audit(conn, who, org_id, action, [
+                #("network", json.string(network)),
+                #("devices_removed", json.int(removed)),
+              ]),
+            )
+            Ok(removed)
+          }
+          case work {
+            Ok(removed) ->
+              Ok(
+                json.object([
+                  #("enabled", json.bool(enabled)),
+                  #("devices_removed", json.int(removed)),
+                ]),
+              )
+            Error(e) -> Error(constraint_response(e))
+          }
+        })
+      }
+    }
+  })
+}
+
+/// Removes the network's hosted devices, in the transaction that switched
+/// hosting off. Answers how many devices went.
+///
+/// **The rows go rather than the keys being revoked.** A revoked key leaves a
+/// device in the network holding nothing, which the dashboard would draw as a
+/// broken member forever; and re-enabling later is a fresh provision with a
+/// fresh key, so there is no identity here worth keeping. What is kept is
+/// `cloud_disabled_at` on the network, which is the only fact that has to
+/// outlive them.
+///
+/// The candidate set is narrowed in SQL and *decided* in Gleam. GLOB cannot
+/// say "digits and nothing else", so `cloud-1a` — an ordinary customer label
+/// that predates this namespace and stays legal — would match a
+/// `'cloud-*'` pattern, and a toggle that deleted somebody's device because it
+/// happened to be named after a cloud is not a toggle anyone can be asked to
+/// flip. `name.reserved_device_label` is the same predicate that refuses these
+/// labels at creation, so what this deletes is exactly what the data plane can
+/// have created.
+fn retire_hosted_devices(
+  conn: Connection,
+  network_id: String,
+) -> Result(Int, sqlite.Error) {
+  use rows <- result.try(
+    sqlite.query(
+      conn,
+      "SELECT d.id, d.label FROM network_devices nd
+       JOIN devices d ON d.id = nd.device_id
+       WHERE nd.network_id = ? AND d.label GLOB 'cloud-*'",
+      [Text(network_id)],
+    ),
+  )
+  let hosted =
+    rows
+    |> list.filter(fn(row) { name.reserved_device_label(text_at(row, 1)) })
+    |> list.map(fn(row) { text_at(row, 0) })
+  use _ <- result.try(
+    list.try_fold(hosted, Nil, fn(_, device_id) {
+      // The same three deletes, in the same order, that `devices_api` uses to
+      // remove a device: assignments, then keys, then the row the two
+      // reference.
+      use _ <- result.try(
+        sqlite.exec(conn, "DELETE FROM network_devices WHERE device_id = ?", [
+          Text(device_id),
+        ]),
+      )
+      use _ <- result.try(
+        sqlite.exec(conn, "DELETE FROM device_keys WHERE device_id = ?", [
+          Text(device_id),
+        ]),
+      )
+      sqlite.exec(conn, "DELETE FROM devices WHERE id = ?", [Text(device_id)])
+      |> result.replace(Nil)
+    }),
+  )
+  Ok(list.length(hosted))
+}
+
 // -- assignment -------------------------------------------------------------
 
 /// `POST /api/orgs/:slug/networks/:net/devices` — a node joins a network.
@@ -258,14 +432,21 @@ pub fn join_device(
   }
   use #(label, nk, relay, addr) <- body_decoder(req, decoder)
   case
+    // First, and ahead of the grammar: `cloud-<n>` is a *valid* device label
+    // that this deployment has spoken for (docs/CLOUD-DATAPLANE.md §3.4), so
+    // refusing it as malformed would be a lie. Only the data-plane principal
+    // creates one, through `api/dataplane_api`, which is the reason a customer
+    // holding a join key cannot displace or impersonate a hosted replica.
+    name.reserved_device_label(label),
     name.valid_device_label(label),
     model.validate_nk(nk),
     build.valid_hint(relay) && build.valid_hint(addr)
   {
-    False, _, _ -> refused(build.InvalidLabel(label))
-    _, Error(Nil), _ -> refused(build.InvalidNk(nk))
-    _, _, False -> refused(bad_hint(relay, addr))
-    True, Ok(nk_bytes), True ->
+    True, _, _, _ -> common.reserved_label(label)
+    _, False, _, _ -> refused(build.InvalidLabel(label))
+    _, _, Error(Nil), _ -> refused(build.InvalidNk(nk))
+    _, _, _, False -> refused(bad_hint(relay, addr))
+    False, True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
         case common.check_join_target(conn, slug, network, who) {
           Error(refusal) -> refusal

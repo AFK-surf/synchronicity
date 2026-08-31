@@ -62,8 +62,103 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12]
 }
+
+/// V12: the cloud data plane (docs/CLOUD-DATAPLANE.md §3).
+///
+/// Four additions, and each one exists because the hosted-replica service is
+/// a *caller* of this control plane rather than a part of it.
+///
+/// **`networks.cloud_hosted`** copies V9's shape and its rationale verbatim:
+/// off for every network that already exists and for every one created after,
+/// because hosting is the org's call alone. Like `browse_enabled` it is
+/// deliberately **not** a zone fact — the zone carries the *consequence* (the
+/// hosted device's TXT record), while the flag itself is enforced at the
+/// data-plane API, where a change takes effect within one poll interval
+/// instead of a TTL later, and where it never reaches public DNS.
+/// `cloud_disabled_at` is stamped when the switch goes off and cleared when
+/// it comes back on; it starts the retention clock over the tenant's object
+/// storage, which is a decision an operator makes later and therefore a date
+/// that has to survive the devices the same commit deletes.
+///
+/// **`dataplane_keys`** is a fourth credential kind, and pointedly *not* a row
+/// in `api_keys`. An `api_keys` row names one org (`org_id NOT NULL`) and the
+/// role CHECK stops at `admin`; the data plane's whole job is to enumerate
+/// every org's hosted networks, so bending that table would break the one-org
+/// invariant `api/common.check_org` and every handler downstream lean on.
+/// Everything about *being* a credential is copied from V10 — the SHA-256 of
+/// the token and never the token, the display `prefix` that lets a list name a
+/// leaked token without holding enough to be one, the optional expiry — and
+/// everything about *scope* is absent, because the scope is "the `/dp/v1`
+/// surface" and that is a fact about routing, not about a row. There is no
+/// `created_by`: these are minted from the operator CLI
+/// (`controlplane dataplane-key mint`), where there is no signed-in person to
+/// name, and no HTTP route mints or lists them — the credential that can see
+/// every org is never reachable *through* the API it authorizes.
+///
+/// **`network_hosting_status`** is one row per network, last write wins: the
+/// metering heartbeat a hosted tenant sends every few minutes. The browse
+/// tunnel's replication answer is deliberately unstored (a held-object count
+/// is stale the moment a fetch lands), but billing needs a number that
+/// survives the tenant being *down* — a stale heartbeat is itself the alert —
+/// so this one is kept. `slot` is the hosting slot the row is about, which is
+/// the suffix of the `cloud-<n>` device label and never the shard: slots are
+/// durable identities, shards are interchangeable pods, and `shard` is
+/// operational metadata that changes under a tenant without anything else
+/// moving.
+///
+/// **The system user.** `devices.created_by` is `NOT NULL REFERENCES
+/// users(id)` and a data-plane key is not a person, so the hosted device rows
+/// need a user to point at. Seeding one here means no human's id is
+/// impersonated and the audit trail names the service.
+///
+/// Its `email` is `system-dataplane`, which is **not an email address**: it
+/// carries no `@`. That is the whole of why the row can never log in, and it
+/// is enforced by every sign-in path rather than by a flag somebody could
+/// forget to check. `auth/magic.request` refuses an address without an `@`
+/// before it mints anything, so no magic link can ever be addressed here.
+/// Google and GitHub assert only addresses they have verified, and a verified
+/// address contains an `@`, so `auth/identity`'s trusted auto-link can never
+/// match this row. A custom OIDC issuer *could* mint any email claim it likes,
+/// including this one — and is refused anyway, because OIDC never auto-links:
+/// it finds the existing row, sees `email_trusted = False`, and answers
+/// `NeedsExplicitLink`, which needs a live session on this account that
+/// nothing can ever create. A sentinel column would have been one more thing
+/// for a future sign-in path to consult; an unaddressable address is refused
+/// by the paths that already exist.
+///
+/// `created_at` is 0 rather than a clock reading: the row is schema, not
+/// history, and a migration that produces byte-identical databases on every
+/// replay is worth more than a timestamp nobody will read.
+const v12 = "
+ALTER TABLE networks ADD COLUMN cloud_hosted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE networks ADD COLUMN cloud_disabled_at INTEGER;
+
+CREATE TABLE dataplane_keys (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+  prefix       TEXT NOT NULL,
+  token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER
+);
+
+CREATE TABLE network_hosting_status (
+  network_id   TEXT PRIMARY KEY REFERENCES networks(id),
+  slot         INTEGER NOT NULL,
+  held_roots   INTEGER NOT NULL,
+  held_bytes   INTEGER NOT NULL,
+  wanted       INTEGER NOT NULL,
+  last_sync_ns INTEGER NOT NULL,
+  shard        TEXT NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+INSERT INTO users (id, email, name, created_at)
+  VALUES ('system-dataplane', 'system-dataplane', 'cloud data plane', 0);
+"
 
 /// V11: the browser every OAuth flow was started from.
 ///

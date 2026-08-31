@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 aws-lc-rs.workspace = true
 directories.workspace = true
+fs2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 iroh.workspace = true

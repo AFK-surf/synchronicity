@@ -119,6 +119,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   of the database is. There is no deployment-level switch — the org admin's
   per-network toggle is the whole of the gate, and it is off until they turn
   it on.
+- **Cloud hosting** is a second, independent per-network switch: with it on,
+  an operator-run fleet joins the network as one more ordinary device
+  (`cloud-1`) and durably replicates everything published on it. This service
+  is the authority and the API; the fleet is cattle that polls it. See
+  [The cloud data plane](#the-cloud-data-plane) below and
+  [docs/CLOUD-DATAPLANE.md](../docs/CLOUD-DATAPLANE.md).
 
 ## API keys
 
@@ -238,6 +244,192 @@ whose without a second lookup, and goes on saying it after the key is revoked
 and its row is gone. Reads are not recorded, browse reads included: that is a
 deliberate choice about logging ordinary use, and it means the trail says what
 a key *did*, never what it saw.
+
+## The cloud data plane
+
+Hosted replicas (docs/CLOUD-DATAPLANE.md). An org admin turns hosting on for
+one network; within a poll interval a device labelled `cloud-1` appears in it,
+in the device list and as one more `v=sync1 id=cloud-1 nk=…` record in the
+zone, and an operator-run fleet holds a replica of every space on that network
+in provider object storage. Customer nodes admit it the way they admit any
+member — no new protocol, no configuration, no upgrade — because that is all
+it is: the daemon's replicate mode, operated as a service.
+
+**Why this adds no new trust.** This service already signs the membership zone;
+it can already, today, put any device key into any network it serves. An org
+running its networks here has already extended exactly the authority hosting
+exercises. The toggle *narrows* that authority to an explicit, auditable,
+org-controlled grant. It does not widen anything, which is the same argument
+the browse toggle makes and the reason both flags live in this database rather
+than in the zone: enforcement takes effect at the next call, not a TTL later,
+and never reaches public DNS.
+
+### The org's switch
+
+```
+PUT /api/orgs/:slug/networks/:net/cloud-hosting/enabled
+{"enabled": true}
+```
+
+Admin-gated, off by default, audited as `cloud-hosting.enable` /
+`cloud-hosting.disable`, and exposed as `cloud_hosted` on
+`GET /api/orgs/:slug/networks` and `GET /api/orgs/:slug/networks/:net` — the
+browse switch's shape throughout, because it is the same kind of decision.
+
+Two ways it is not the browse switch. It is a **zone mutation**, so the answer
+carries a `soa_serial` like every other zone-shaping call: turning hosting
+*off* deletes the network's `cloud-*` devices in the same commit, so the flag
+and the membership record it caused stop being true together — the zone must
+never go on naming a hosted key the org has just withdrawn consent for. And
+turning it *on* publishes too, even though nothing in the zone changes, because
+the serial is what the fleet's `If-None-Match` poll is watching (below); a
+grant that did not move it would be a network nobody ever hosted.
+
+Disabling also stamps `cloud_disabled_at`, which starts the retention clock
+over the tenant's object storage — re-enabling within the hold is a cheap
+re-provision, and after it a scheduled job deletes the prefix. That date
+outlives the device rows the same transaction removes, which is why it lives on
+the network.
+
+The two toggles stay independent and independently fail-closed. Hosting without
+browse replicates, and is observable only through the status heartbeat below;
+with browse on, the hosted node shows up in the ordinary replication panel like
+any attached daemon, because it *is* one — "is the cloud replica keeping up" is
+a question the dashboard already knows how to ask, with no new UI.
+
+### The reserved label namespace
+
+Device labels matching `cloud-<digits>` belong to hosting slots and nobody
+else's. Every customer-facing path that takes a label — `POST
+…/networks/:net/devices` and `POST …/devices`, the two the dashboard and the
+join key use — answers `409 reserved-label`, and the data-plane API is the only
+place one can be created. That confinement is what bounds a leaked data-plane
+key: it can enumerate hosted networks and forge heartbeats, and its one write
+cannot displace or impersonate a customer's device.
+
+The suffix is the **slot**, not the shard. v1 hosts every network once, in slot
+1, so the device is always `cloud-1` whichever pod happens to be running it; a
+tenant moving between shards is no zone change at all. Redundant hosting, later,
+is a second slot — `cloud-1` and `cloud-2` as two ordinary devices, because two
+replicas of one network is already something the protocol does.
+
+### `/dp/v1`, and the credential that reaches it
+
+The fleet is a program, so it holds a credential — but not an API key. Every
+row in `api_keys` names one org, and `api/common.check_org` treats "a
+credential names one org" as load-bearing; the data plane's whole question is
+"which networks, of *every* org, have hosting on", which no org-scoped
+credential can be allowed to ask. So it is a fourth kind, in its own table,
+resolved to its own principal:
+
+```sh
+controlplane dataplane-key mint dp-1 --expires-in 31536000
+```
+
+Printed once, the same posture as `seed-admin`, and **no HTTP route mints,
+renames or lists these keys** — the credential that can see every org is never
+reachable through the API it authorizes, or one leak buys a replacement that
+outlives the revocation. `--expires-in` is optional here, unlike on a join key:
+the fleet holds this for as long as the fleet runs, and an expiry nobody
+arranged to renew would stop every hosted tenant converging at an hour nobody
+chose.
+
+Sent as `Authorization: Bearer synchdp_…`. The distinct prefix is not
+decoration: `synchdp_` does not start with `synch_`, so neither resolver can
+ever answer for the other's token, in the middleware or in a log line.
+
+| Method   | Path                                          | What |
+| -------- | --------------------------------------------- | ---- |
+| `GET`    | `/dp/v1/networks`                             | the desired-state document: every hosted network of every org |
+| `PUT`    | `/dp/v1/networks/:org/:net/device`            | `{"label": "cloud-1", "nk": "…"}` — idempotent registration |
+| `DELETE` | `/dp/v1/networks/:org/:net/device/keys/:nk`   | close a rotation (`?revoke=1` to withdraw outright) |
+| `POST`   | `/dp/v1/networks/:org/:net/status`            | the metering heartbeat |
+
+**Nothing else accepts this credential, and it accepts nothing else.** Both
+halves are one `case` arm rather than a maintained list: `api/common.check_org`
+names the variant and refuses it, so every org-scoped route in the service is
+closed to a data-plane key by construction; `api/dataplane_api` admits only
+that variant, so a session cookie or an admin key aimed at `/dp/v1` gets `403
+dataplane_only`. A dashboard user who could register hosted devices by hand
+would be a second, unaudited way into the reserved namespace.
+
+The `GET` is a read and a replica answers it, like the rest of the read half;
+the three writes are the primary's, like every write, and a write that reaches
+a replica gets the ordinary `409 read-only-replica` naming where to take it.
+
+**The desired-state document** is what the whole design turns on:
+
+```json
+{ "generation": 4183,
+  "networks": [
+    { "org": "acme", "network": "prod",
+      "domain": "prod.acme.synchronicity.example",
+      "budget_bytes": 2199023255552,
+      "retention": "current",
+      "device": { "label": "cloud-1", "nk": "…", "state": "active" } } ] }
+```
+
+`domain` is the membership domain verbatim, because the fleet must never
+assemble a name itself. `budget_bytes` and `retention` are **policy, decided
+here** — the data plane is mechanism only — and they travel in the document
+rather than in the fleet's configuration precisely so that a plan change is a
+control-plane change and nothing else; today every network gets 2 TiB and
+`current` retention. `device` is `null` until a key has been registered, which
+is how a disk-less pod tells "a network I have never joined" from "a network
+whose identity I must recover".
+
+`generation` is the zone's SOA serial, and the response carries it as an
+`ETag`, so the steady-state poll is one `304` per interval. The serial is
+already bumped in the same transaction by everything that can change this
+document — a device registered or retired, a network deleted, the toggle
+flipped — so nothing has to remember to move a counter, which is the class of
+mistake that shows up as a fleet quietly serving last week's tenant set. It is
+deliberately *loose* rather than tight: it is deployment-wide, and the hourly
+re-sign moves it too, so the fleet occasionally refetches a small document it
+already had. The failure mode of a loose generation costs bytes; the failure
+mode of a tight one that missed a change is a network that never gets hosted.
+
+**Registration** creates the `devices`, `device_keys` and `network_devices`
+rows in one transaction with the zone republish — the same transaction shape
+`join_device` uses, so **the commit is the publish** and the zone names the key
+immediately, which turns the fleet's wait for identification from a propagation
+window into a DoH-cache-sized one. Re-`PUT` with the same `(label, nk)` is a
+`200` that writes nothing and publishes nothing (`result.changed` says so),
+which matters: a republish per poll would churn the very serial the `ETag` is
+built from. The same label with a *new* key opens the standard two-key rotation
+window when the old key is live, and replaces outright when the old key is
+already revoked — the recovery path after a lost tenant database. `created_by`
+on those rows is `system-dataplane`, a user seeded by migration v12 whose
+"email" carries no `@` and which therefore no sign-in path can ever reach: no
+human's id is impersonated, and the audit trail names the service.
+
+The `DELETE` is what *closes* a rotation, and it exists because without it one
+could be opened and never closed — the zone would carry two keys per label
+forever, which the zone build caps but no design should lean on. Plain, it
+moves the key to `retiring`; with `?revoke=1` it goes straight to `revoked`. It
+refuses the last `active` key unless revoking, so the route cannot orphan a
+healthy tenant, and it is confined to `cloud-*` devices of the named network,
+so it cannot reach a customer's key however the path is spelled.
+
+The **heartbeat** is stored, one row per network, last write wins — unlike the
+browse tunnel's replication answer, which is deliberately unstored. The
+difference is what each is for: the tunnel's answer is a live view and is
+worthless stale, while this is the billing record and its whole value is that
+it survives the tenant being down. A heartbeat that has stopped moving *is* the
+alert. It is not audited: it arrives per tenant every few minutes, and a row
+per breath would bury every act a human took.
+
+Audit actions this adds, all under the actor `dpkey:<id>` (its own namespace,
+because `key:<id>` is resolvable against `api_keys` and this one is not):
+`cloud-hosting.device.register`, `cloud-hosting.device.rotate`,
+`cloud-hosting.key.retire`, `cloud-hosting.key.revoke`. The mint itself is
+`dataplane.key.mint`, with no org, under `system:dataplane-key-mint`.
+
+**What this service does not do.** It runs no hosted replicas and stores no
+customer bytes; `crates/synch-dp` does that, against this API. And a hosted
+replica holds customer plaintext, as any replica does — that is stated in the
+product, not discovered in the fine print, and it is why enabling hosting is an
+explicit org-admin act.
 
 ## `GET /SKILL.md`
 

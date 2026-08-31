@@ -16,6 +16,12 @@
 ////                         and clients never treat a retire as authorization.
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
+////   dataplane-key mint <name> [--expires-in <secs>]
+////                         mint the cloud data plane's credential and print
+////                         the token once. Deliberately a subcommand and not
+////                         a route: this is the one key that can see every
+////                         org, so it is never mintable through the API it
+////                         authorizes (docs/CLOUD-DATAPLANE.md §3.2).
 ////   migrate-check         replay the migration chain against a scratch DB
 
 import api/agent
@@ -24,6 +30,7 @@ import api/browse_api
 import api/edge
 import api/reads
 import api/router
+import auth/dataplane_key
 import auth/github
 import auth/google
 import auth/magic
@@ -37,6 +44,7 @@ import email/mailer
 import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/json
 import gleam/list
 import gleam/option
 import gleam/otp/static_supervisor as sup
@@ -57,6 +65,7 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
+import util/id
 import wisp/wisp_mist
 import zone/model
 import zone/publish
@@ -86,10 +95,16 @@ pub fn main() {
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
+    // `key_name` rather than `name`: this module imports `dns/name`, and a
+    // binding of that name would shadow the module for the rest of the clause.
+    ["dataplane-key", "mint", key_name] ->
+      run_or_die(fn() { dataplane_key_mint(key_name, "") })
+    ["dataplane-key", "mint", key_name, "--expires-in", seconds] ->
+      run_or_die(fn() { dataplane_key_mint(key_name, seconds) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | dataplane-key mint <name> [--expires-in <secs>] | migrate-check",
       )
       halt(2)
     }
@@ -762,6 +777,89 @@ fn seed_admin(email: String) -> Result(Nil, String) {
     <> token,
   )
   sqlite.close(conn)
+  Ok(Nil)
+}
+
+/// Mints the cloud data plane's credential and prints the token, once.
+///
+/// The same posture as `seed-admin`: an operator with a shell on the primary
+/// gets a secret out of the database that no HTTP request could have asked
+/// for. Here it is not a convenience but the design (docs/CLOUD-DATAPLANE.md
+/// §3.2) — this key can enumerate every org's hosted networks, so putting a
+/// mint route behind it would mean one leak buys a replacement that outlives
+/// the revocation. There is no list route either, for the same reason, and
+/// none of that is a gap somebody should later fill in.
+///
+/// `--expires-in` is seconds from now, and its absence means no expiry, which
+/// matches how `api_keys` spells the same choice. A duration rather than a
+/// date so nothing depends on the operator's clock agreeing with the
+/// service's. Unlike a join key it is *not* required: the fleet holds this key
+/// for as long as the fleet runs, and an expiry nobody arranged to renew would
+/// stop every hosted tenant converging at an hour nobody chose.
+fn dataplane_key_mint(
+  key_name: String,
+  expires_in: String,
+) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  let now = now_unix()
+  // Parsed before the database is opened: a typo in the flag should not cost
+  // an open connection and a csqlite process nobody closes.
+  use expires_at <- result.try(case expires_in {
+    "" -> Ok(option.None)
+    seconds ->
+      case int.parse(seconds) {
+        Ok(secs) if secs > 0 -> Ok(option.Some(now + secs))
+        _ -> Error("--expires-in takes a positive number of seconds")
+      }
+  })
+  use conn <- result.try(open_primary_db(cfg))
+  let key_id = id.new()
+  use #(token, prefix) <- result.try(
+    dataplane_key.create(conn, key_id, key_name, expires_at, now)
+    |> result.map_error(fn(e) { "minting the key: " <> string.inspect(e) }),
+  )
+  // The mint goes in the trail, with `org_id` NULL because this credential
+  // belongs to the deployment rather than to an org. It is written straight to
+  // the table rather than through `api/common.audit`, which takes a
+  // `Principal` — and the actor here is not a request, it is whoever had a
+  // shell.
+  use _ <- result.try(
+    sqlite.exec(
+      conn,
+      "INSERT INTO audit_log (at, actor, org_id, action, detail)
+       VALUES (?, 'system:dataplane-key-mint', NULL, 'dataplane.key.mint', ?)",
+      [
+        sqlite.Int(now),
+        sqlite.Text(
+          json.to_string(
+            json.object([
+              #("id", json.string(key_id)),
+              #("name", json.string(key_name)),
+              #("prefix", json.string(prefix)),
+              #("expires_at", json.nullable(expires_at, json.int)),
+            ]),
+          ),
+        ),
+      ],
+    )
+    |> result.map_error(fn(e) { "recording the mint: " <> string.inspect(e) }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "data-plane key "
+    <> key_id
+    <> " ("
+    <> key_name
+    <> ") minted"
+    <> case expires_at {
+      option.Some(at) -> ", expires at " <> int.to_string(at)
+      option.None -> ", no expiry"
+    }
+    <> "\n; this is the only time the token exists outside your hands:\n"
+    <> token
+    <> "\n; give it to the data plane as SYNCH_DP_TOKEN; it is sent as\n"
+    <> "; Authorization: Bearer <token> and reaches /dp/v1 and nothing else.",
+  )
   Ok(Nil)
 }
 

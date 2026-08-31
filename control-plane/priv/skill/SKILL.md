@@ -830,6 +830,33 @@ switch:
 Space and path are query parameters and never path segments — a file path may
 contain anything, separators included.
 
+**Cloud hosting** is a second, independent per-network switch, and the same
+shape:
+
+| Method | Path | Role | What |
+| --- | --- | --- | --- |
+| `PUT` | `…/networks/<net>/cloud-hosting/enabled` | admin | `{"enabled": true}` |
+
+With it on, an operator-run fleet joins the network as an ordinary device
+labelled `cloud-1` and durably replicates everything published on it; the
+network listing and detail carry `cloud_hosted` so you can read the switch
+without flipping it. It is a zone-shaping call, so it answers with a
+`soa_serial` like the rest: turning it *off* removes the hosted device in the
+same commit, which is what stops the zone naming a key the org has just
+withdrawn consent for.
+
+Hosting and browsing are independent and independently fail-closed. Hosting
+without browsing replicates but is invisible to the dashboard; with both on,
+the hosted node answers the replication question like any attached daemon and
+shows up in the panel as `cloud-1`.
+
+Labels matching `cloud-<digits>` are **reserved** for those hosting slots:
+every route above that takes a label answers `409 reserved-label` for one, and
+only the hosting service itself can create one. Its API — `/dp/v1` — takes a
+different credential entirely and no org key, join key or session reaches it;
+it is documented in the control plane's own README, not here, because nothing
+driving a node has any business calling it.
+
 Downloads are capped at four open at once **per credential**: a key gets its
 own budget rather than spending the budget of whoever minted it, and the
 fifth concurrent stream is a `429` naming the limit.
@@ -932,6 +959,7 @@ method is a route that does not exist, so it is a 404 like any other.
 | `409` | `conflict` | the change collides with a record that exists; the message names the invariant |
 | `409` | `rotation_open` / `not_retiring` | a second rotation window while one is open; retiring a key that is not the retiring one |
 | `409` | `browse-disabled` | the org has not turned browsing on for this network |
+| `409` | `reserved-label` | the label is `cloud-<n>`, which names a cloud-hosting slot and only the hosting service may create |
 | `409` | `duplicate_label`, `ambiguous_nk`, `bad_glue`, … | the zone the change would produce is refused — the 400 vocabulary, caught later |
 | `409` | `read-only-replica` | this node holds a read-only copy; the `primary` field names where writes go |
 | `409` | `no_rekor_record` | the transparency gate is holding the zone key back — an operator ceremony, not your request |
