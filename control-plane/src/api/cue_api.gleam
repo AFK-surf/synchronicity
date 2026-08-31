@@ -24,14 +24,16 @@ import api/common.{
 import api/middleware.{Bearer, error_json, now_unix, presented}
 import auth/principal
 import config.{type CueProvisioning}
+import dns/name
 import gleam/dynamic/decode
 import gleam/json.{type Json}
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import store/sqlite.{type Connection, Done, Int as VInt, Text}
+import store/sqlite.{type Connection, Blob, Done, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
+import zone/model
 import zone/publish
 
 type Owner {
@@ -440,6 +442,341 @@ fn provisioned(
     #("org_id", json.string(org_id)),
     #("network_id", json.string(network_id)),
     #("sync_user_id", json.string(sync_user_id)),
+    #("created", json.bool(created)),
+  ])
+}
+
+/// `POST /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/devices`.
+///
+/// Joins a device (its public node key `nk`) to the Workspace's assigned
+/// network. The network is resolved server-side from the workspace mapping; the
+/// caller never names it. Idempotent by the device key: because a live `nk` is
+/// globally unique to one device, a repeat returns that same device (ensuring
+/// its membership of this network), never a duplicate. A new `nk` creates the
+/// device + key + membership and republishes the zone.
+pub fn enroll_device(
+  req: Request,
+  ctx: AuthContext,
+  cue_workspace_id: String,
+) -> Response {
+  case ctx.cue_provisioning {
+    None ->
+      error_json(
+        503,
+        "provisioning_not_configured",
+        "cue provisioning is not enabled on this control plane",
+      )
+    Some(cfg) -> {
+      use <- authorized(req, cfg)
+      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      let owner_decoder = {
+        use subject <- decode.field("subject", decode.string)
+        use email <- decode.field("email", decode.string)
+        use name <- decode.optional_field(
+          "name",
+          None,
+          decode.optional(decode.string),
+        )
+        decode.success(Owner(subject, email, name))
+      }
+      let decoder = {
+        use nk <- decode.field("nk", decode.string)
+        use label <- decode.field("label", decode.string)
+        use owner <- decode.field("owner", owner_decoder)
+        decode.success(#(nk, label, owner))
+      }
+      use #(nk, label, owner) <- body_decoder(req, decoder)
+      use <- valid_id(owner.subject, "invalid_subject")
+      case valid_email(owner.email) {
+        False ->
+          error_json(400, "invalid_email", "owner email is not a valid address")
+        True ->
+          case name.valid_device_label(label), model.validate_nk(nk) {
+            False, _ ->
+              error_json(
+                400,
+                "invalid_label",
+                "device label must be a DNS label of 1..63 [a-z0-9-]",
+              )
+            _, Error(Nil) ->
+              error_json(
+                400,
+                "invalid_nk",
+                "nk must be a 52-char z-base-32 encoding of a 32-byte key",
+              )
+            True, Ok(nk_bytes) ->
+              with_db(ctx, fn(conn) {
+                case hub_provider_exists(conn, cfg) {
+                  Error(response) -> response
+                  Ok(Nil) ->
+                    case find_workspace_org(conn, cue_workspace_id) {
+                      Error(response) -> response
+                      Ok(None) ->
+                        error_json(
+                          404,
+                          "workspace_not_provisioned",
+                          "this workspace has no synchronicity org yet",
+                        )
+                      Ok(Some(#(org_id, network_id))) ->
+                        enroll(
+                          conn,
+                          ctx,
+                          cfg,
+                          org_id,
+                          network_id,
+                          owner,
+                          label,
+                          nk,
+                          nk_bytes,
+                        )
+                    }
+                }
+              })
+          }
+      }
+    }
+  }
+}
+
+fn enroll(
+  conn: Connection,
+  ctx: AuthContext,
+  cfg: CueProvisioning,
+  org_id: String,
+  network_id: String,
+  owner: Owner,
+  label: String,
+  nk: String,
+  nk_bytes: BitArray,
+) -> Response {
+  case existing_device_for_nk(conn, nk_bytes) {
+    Error(response) -> response
+    Ok(Some(device_id)) ->
+      ensure_member(conn, ctx, org_id, network_id, device_id)
+    Ok(None) ->
+      create_device(
+        conn,
+        ctx,
+        cfg,
+        org_id,
+        network_id,
+        owner,
+        label,
+        nk,
+        nk_bytes,
+      )
+  }
+}
+
+/// The device already exists (its `nk` is live). Guarantee it is a member of
+/// this network and return it. An existing membership is a pure repeat and
+/// never touches the zone; a new membership (the same device joining a second
+/// Workspace's network) adds zone content and republishes.
+fn ensure_member(
+  conn: Connection,
+  ctx: AuthContext,
+  org_id: String,
+  network_id: String,
+  device_id: String,
+) -> Response {
+  case is_member(conn, network_id, device_id) {
+    Error(response) -> response
+    Ok(True) ->
+      case build_domain(conn, org_id, network_id) {
+        Error(response) -> response
+        Ok(domain) ->
+          ok_json(
+            json.object([
+              #("result", enrolled(device_id, network_id, domain, False)),
+            ]),
+          )
+      }
+    Ok(False) -> {
+      let who = principal.Principal("cue:provisioning", principal.Cookie(""))
+      zone_mutation(conn, ctx, who, publish.Widening, fn() {
+        use _ <- result.try(insert_network_device(conn, network_id, device_id))
+        use domain <- result.try(build_domain(conn, org_id, network_id))
+        Ok(enrolled(device_id, network_id, domain, False))
+      })
+    }
+  }
+}
+
+/// A new device key: mint the device + key + network membership and publish the
+/// zone. `created_by` must be a real user, so the owner's identity is ensured
+/// first (it exists from provisioning; a miss creates it, or 409s on an email
+/// already owned by a different, unlinked user).
+fn create_device(
+  conn: Connection,
+  ctx: AuthContext,
+  cfg: CueProvisioning,
+  org_id: String,
+  network_id: String,
+  owner: Owner,
+  label: String,
+  nk: String,
+  nk_bytes: BitArray,
+) -> Response {
+  let who = principal.Principal("cue:provisioning", principal.Cookie(""))
+  zone_mutation(conn, ctx, who, publish.Widening, fn() {
+    use user_id <- result.try(ensure_identity(conn, cfg, owner))
+    let device_id = id.new()
+    use _ <- result.try(insert_device(conn, device_id, org_id, label, user_id))
+    use _ <- result.try(insert_device_key(conn, device_id, nk, nk_bytes))
+    use _ <- result.try(insert_network_device(conn, network_id, device_id))
+    use domain <- result.try(build_domain(conn, org_id, network_id))
+    Ok(enrolled(device_id, network_id, domain, True))
+  })
+}
+
+fn existing_device_for_nk(
+  conn: Connection,
+  nk_bytes: BitArray,
+) -> Result(Option(String), Response) {
+  case
+    sqlite.query(
+      conn,
+      "SELECT device_id FROM device_keys WHERE nk_bytes = ? AND state != 'revoked'",
+      [Blob(nk_bytes)],
+    )
+  {
+    Ok([[Text(device_id)]]) -> Ok(Some(device_id))
+    Ok([]) -> Ok(None)
+    Ok(_) -> Error(db_error())
+    Error(_) -> Error(db_error())
+  }
+}
+
+fn is_member(
+  conn: Connection,
+  network_id: String,
+  device_id: String,
+) -> Result(Bool, Response) {
+  case
+    sqlite.query(
+      conn,
+      "SELECT 1 FROM network_devices WHERE network_id = ? AND device_id = ?",
+      [Text(network_id), Text(device_id)],
+    )
+  {
+    Ok([_, ..]) -> Ok(True)
+    Ok([]) -> Ok(False)
+    Error(_) -> Error(db_error())
+  }
+}
+
+fn insert_device(
+  conn: Connection,
+  device_id: String,
+  org_id: String,
+  label: String,
+  created_by: String,
+) -> Result(Nil, Response) {
+  case
+    sqlite.exec(conn, "INSERT INTO devices VALUES (?, ?, ?, NULL, NULL, ?, ?)", [
+      Text(device_id),
+      Text(org_id),
+      Text(label),
+      Text(created_by),
+      VInt(now_unix()),
+    ])
+  {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(constraint_response(e))
+  }
+}
+
+fn insert_device_key(
+  conn: Connection,
+  device_id: String,
+  nk: String,
+  nk_bytes: BitArray,
+) -> Result(Nil, Response) {
+  case
+    sqlite.exec(
+      conn,
+      "INSERT INTO device_keys VALUES (?, ?, ?, ?, 'active', ?, NULL)",
+      [
+        Text(id.new()),
+        Text(device_id),
+        Text(nk),
+        Blob(nk_bytes),
+        VInt(now_unix()),
+      ],
+    )
+  {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(constraint_response(e))
+  }
+}
+
+fn insert_network_device(
+  conn: Connection,
+  network_id: String,
+  device_id: String,
+) -> Result(Nil, Response) {
+  case
+    sqlite.exec(conn, "INSERT INTO network_devices VALUES (?, ?, ?)", [
+      Text(network_id),
+      Text(device_id),
+      VInt(now_unix()),
+    ])
+  {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(constraint_response(e))
+  }
+}
+
+/// `<network>.<org-slug>.<apex>` — the daemon's `DomainSet` target.
+fn build_domain(
+  conn: Connection,
+  org_id: String,
+  network_id: String,
+) -> Result(String, Response) {
+  use slug <- result.try(
+    scalar_text(conn, "SELECT slug FROM orgs WHERE id = ?", [Text(org_id)]),
+  )
+  use net_name <- result.try(
+    scalar_text(conn, "SELECT name FROM networks WHERE id = ?", [
+      Text(network_id),
+    ]),
+  )
+  case model.read_meta(conn) {
+    Ok(meta) ->
+      Ok(
+        net_name
+        <> "."
+        <> slug
+        <> "."
+        <> string.drop_end(name.to_string(meta.apex), 1),
+      )
+    Error(_) -> Error(db_error())
+  }
+}
+
+fn scalar_text(
+  conn: Connection,
+  sql: String,
+  params: List(sqlite.Value),
+) -> Result(String, Response) {
+  case sqlite.query(conn, sql, params) {
+    Ok([[Text(value)]]) -> Ok(value)
+    Ok(_) -> Error(db_error())
+    Error(_) -> Error(db_error())
+  }
+}
+
+fn enrolled(
+  device_id: String,
+  network_id: String,
+  domain: String,
+  created: Bool,
+) -> Json {
+  json.object([
+    #("device_id", json.string(device_id)),
+    #("network_id", json.string(network_id)),
+    #("network", json.string("default")),
+    #("domain", json.string(domain)),
     #("created", json.bool(created)),
   ])
 }

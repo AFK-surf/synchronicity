@@ -455,6 +455,17 @@ fn internal_routes(req: Request, auth: AuthContext) -> Response {
     ["internal", "v1", "integrations", "cue", "workspaces", cue_workspace_id],
       Put
     -> cue_api.provision_workspace(req, auth, cue_workspace_id)
+    [
+      "internal",
+      "v1",
+      "integrations",
+      "cue",
+      "workspaces",
+      cue_workspace_id,
+      "devices",
+    ],
+      Post
+    -> cue_api.enroll_device(req, auth, cue_workspace_id)
     _, _ -> wisp.not_found()
   }
 }

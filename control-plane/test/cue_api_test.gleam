@@ -9,7 +9,7 @@ import config
 import email/mailer
 import fixtures.{tmp_db}
 import gleam/erlang/process
-import gleam/http.{Put}
+import gleam/http.{Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -52,6 +52,9 @@ fn setup_full(
   let db_path = tmp_db()
   let assert Ok(conn) = db.open_primary(db_path)
   let assert Ok(_) = migrate.migrate(conn)
+  // The zone identity (zone_meta + a CSK), so the create/enroll paths can build
+  // a device domain from the apex. The publish itself stays stubbed below.
+  let _ = fixtures.zone_boot(conn)
   let assert Ok(_) =
     sqlite.exec(conn, "INSERT INTO orgs VALUES (?, 'hub', 'Hub', 0)", [
       sqlite.Text(hub_org),
@@ -289,4 +292,168 @@ pub fn invalid_email_is_rejected_test() {
     put(env, "wsp_j", Some(secret), body("J", "usr_judy", "not-an-email"))
   assert resp.status == 400
   assert string.contains(simulate.read_body(resp), "invalid_email")
+}
+
+// --- Device enrollment -----------------------------------------------------
+
+fn device_body(
+  nk: String,
+  label: String,
+  subject: String,
+  email: String,
+) -> json.Json {
+  json.object([
+    #("nk", json.string(nk)),
+    #("label", json.string(label)),
+    #(
+      "owner",
+      json.object([
+        #("subject", json.string(subject)),
+        #("email", json.string(email)),
+        #("name", json.string("Owner")),
+      ]),
+    ),
+  ])
+}
+
+fn post_device(
+  env: Env,
+  workspace_id: String,
+  token: Option(String),
+  payload: json.Json,
+) -> wisp.Response {
+  let base =
+    simulate.request(
+      Post,
+      "/internal/v1/integrations/cue/workspaces/" <> workspace_id <> "/devices",
+    )
+    |> simulate.json_body(payload)
+  let req = case token {
+    Some(t) -> simulate.header(base, "authorization", "Bearer " <> t)
+    None -> base
+  }
+  router.handle(req, env.ctx)
+}
+
+/// Provisions a workspace and returns its owner subject/email, ready to enroll.
+fn provisioned_workspace(env: Env, workspace_id: String) -> #(String, String) {
+  let subject = "usr_" <> id.new()
+  let email = id.new() <> "@cue.test"
+  let resp = put(env, workspace_id, Some(secret), body("WS", subject, email))
+  assert resp.status == 200
+  #(subject, email)
+}
+
+pub fn enroll_device_creates_device_key_membership_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_dev")
+  let nk = fixtures.nk()
+
+  let resp =
+    post_device(
+      env,
+      "wsp_dev",
+      Some(secret),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert resp.status == 200
+  let out = simulate.read_body(resp)
+  assert string.contains(out, "\"created\":true")
+  assert string.contains(out, "\"device_id\"")
+  // The domain is <network>.<org-slug>.<apex>; the apex is the booted zone.
+  assert string.contains(out, "default.cue-")
+  assert string.contains(out, ".sync.test")
+
+  // One device, one active key, one membership of the workspace's network.
+  assert count(env, "SELECT count(*) FROM devices", []) == 1
+  assert count(
+      env,
+      "SELECT count(*) FROM device_keys WHERE state = 'active'",
+      [],
+    )
+    == 1
+  assert count(
+      env,
+      "SELECT count(*) FROM network_devices nd
+       JOIN cue_workspace_orgs w ON w.network_id = nd.network_id
+       WHERE w.cue_workspace_id = ?",
+      [sqlite.Text("wsp_dev")],
+    )
+    == 1
+}
+
+pub fn enroll_device_is_idempotent_by_nk_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_idem")
+  let nk = fixtures.nk()
+
+  let first =
+    post_device(
+      env,
+      "wsp_idem",
+      Some(secret),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert first.status == 200
+  assert string.contains(simulate.read_body(first), "\"created\":true")
+
+  // A repeat with the same nk (a retry) converges on the one device.
+  let second =
+    post_device(
+      env,
+      "wsp_idem",
+      Some(secret),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert second.status == 200
+  assert string.contains(simulate.read_body(second), "\"created\":false")
+
+  assert count(env, "SELECT count(*) FROM devices", []) == 1
+  assert count(env, "SELECT count(*) FROM device_keys", []) == 1
+  assert count(env, "SELECT count(*) FROM network_devices", []) == 1
+}
+
+pub fn enroll_unprovisioned_workspace_is_not_found_test() {
+  let env = setup()
+  let nk = fixtures.nk()
+  let resp =
+    post_device(
+      env,
+      "wsp_absent",
+      Some(secret),
+      device_body(nk, "laptop", "usr_k", "k@cue.test"),
+    )
+  assert resp.status == 404
+  assert string.contains(simulate.read_body(resp), "workspace_not_provisioned")
+  assert count(env, "SELECT count(*) FROM devices", []) == 0
+}
+
+pub fn enroll_device_wrong_secret_is_unauthenticated_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_authz")
+  let nk = fixtures.nk()
+  let resp =
+    post_device(
+      env,
+      "wsp_authz",
+      Some("not-the-secret"),
+      device_body(nk, "laptop", subject, email),
+    )
+  assert resp.status == 401
+  assert count(env, "SELECT count(*) FROM devices", []) == 0
+}
+
+pub fn enroll_invalid_nk_is_rejected_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_badnk")
+  let resp =
+    post_device(
+      env,
+      "wsp_badnk",
+      Some(secret),
+      device_body("not-a-valid-key", "laptop", subject, email),
+    )
+  assert resp.status == 400
+  assert string.contains(simulate.read_body(resp), "invalid_nk")
+  assert count(env, "SELECT count(*) FROM devices", []) == 0
 }
