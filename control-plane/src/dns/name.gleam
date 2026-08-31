@@ -80,7 +80,7 @@ fn plain_bytes_ok(bytes: BitArray) -> Bool {
   }
 }
 
-/// Whether a device label is in the reserved `cloud-<n>` namespace
+/// Whether a device label is in the reserved `cloud-` namespace
 /// (docs/CLOUD-DATAPLANE.md §3.4): the hosting slots the cloud data plane's
 /// devices occupy, which only the data-plane principal may create.
 ///
@@ -89,24 +89,23 @@ fn plain_bytes_ok(bytes: BitArray) -> Bool {
 /// device-create paths and the data-plane API need it, and the one module all
 /// three can import without a cycle is this one.
 ///
-/// The suffix is the *slot*, not the shard, so it must be digits and nothing
-/// else: `cloud-1` is one durable identity that any pod may currently be
-/// serving. `cloud-`, `cloud-1a` and `cloud-1-2` are ordinary customer labels
-/// and stay available, because a namespace that swallowed more than it can
-/// explain is a namespace that takes names off people for no reason.
+/// **The whole prefix, not just `cloud-<digits>`.** An earlier version
+/// reserved only the digit form, on the reasoning that a namespace should
+/// take no more names than it can explain. That is the wrong trade for a
+/// namespace whose purpose is to keep one identity unambiguous: it left
+/// `cloud-1a`, `cloud-01` and `cloud-1-2` available as customer labels that
+/// read, to a human scanning a device list, exactly like the hosting slot
+/// beside them. Reserving the prefix costs a handful of names nobody has a
+/// strong claim to and buys a device list in which "starts with `cloud-`"
+/// means one thing.
+///
+/// This is a rule about **creation**. It deliberately does not decide which
+/// existing device the data plane owns — that is `devices.created_by`, and
+/// every path that acts on a device already present uses it, so widening this
+/// grammar can neither delete nor lock a customer out of a device they made
+/// before the namespace existed.
 pub fn reserved_device_label(label: String) -> Bool {
-  case string.split_once(label, "-") {
-    Ok(#("cloud", slot)) -> slot != "" && digits_ok(<<slot:utf8>>)
-    _ -> False
-  }
-}
-
-fn digits_ok(bytes: BitArray) -> Bool {
-  case bytes {
-    <<>> -> True
-    <<b:int-size(8), rest:bits>> -> b >= 48 && b <= 57 && digits_ok(rest)
-    _ -> False
-  }
+  string.starts_with(label, "cloud-")
 }
 
 /// Presentation form, always absolute: ["a", "b"] is "a.b.".

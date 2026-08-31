@@ -3,8 +3,8 @@
 
 import api/auth_api.{type AuthContext}
 import api/middleware.{error_json, now_unix}
+import auth/dataplane_key
 import auth/principal.{type Principal}
-import dns/name
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
@@ -502,9 +502,12 @@ fn describe_dataplane_key(
 
 /// The reserved device-label namespace, refused in one voice.
 ///
-/// `cloud-<n>` labels belong to the cloud data plane's hosting slots
+/// Labels beginning `cloud-` belong to the cloud data plane's hosting slots
 /// (docs/CLOUD-DATAPLANE.md §3.4): only the data-plane principal may create
 /// one, and every customer-facing path that takes a label refuses them here.
+/// The whole prefix is reserved, not only the `cloud-<n>` form the fleet
+/// actually uses — a lookalike sitting beside a real slot in a device list is
+/// the ambiguity this namespace exists to prevent.
 /// 409 rather than 400 because the label is *well formed* — it is a perfectly
 /// good device label that this deployment has already spoken for, which is a
 /// conflict, not a malformed request.
@@ -518,8 +521,8 @@ pub fn reserved_label(label: String) -> Response {
     "reserved-label",
     "device label '"
       <> label
-      <> "' is reserved: 'cloud-<n>' names a cloud-hosted replica's hosting "
-      <> "slot, which only the hosting service may create",
+      <> "' is reserved: labels beginning 'cloud-' name a cloud-hosted "
+      <> "replica's hosting slot, which only the hosting service may create",
   )
 }
 
@@ -573,14 +576,22 @@ pub fn find_device(
 /// `find_device`, refusing a device in the reserved hosting-slot namespace.
 ///
 /// Every customer-facing route that acts on an *existing* device goes through
-/// this rather than `find_device`. Guarding creation alone guarded nothing:
-/// the label is reserved because a `cloud-<n>` device is an operator-run
-/// replica's identity, and a customer who can add a key to it, retire its key
-/// or delete it can seize or destroy that identity just as thoroughly as one
-/// who could have created it. The fleet reaches these rows through `/dp/v1`,
-/// which is the only surface that may.
+/// this rather than `find_device`. Guarding creation alone guarded nothing: a
+/// hosting slot's device is an operator-run replica's identity, and a customer
+/// who can add a key to it, retire its key or delete it can seize or destroy
+/// that identity just as thoroughly as one who could have created it. The
+/// fleet reaches these rows through `/dp/v1`, which is the only surface that
+/// may.
 ///
-/// A reserved device answers 409 rather than 404: it exists, the caller can
+/// **Ownership decides, not the label.** `devices.created_by` is
+/// `system-dataplane` for exactly the devices the data plane made. Matching on
+/// the reserved prefix instead would be both too wide and beside the point:
+/// too wide because a customer device named `cloud-backup` from before the
+/// namespace existed is still theirs to manage, and beside the point because
+/// what must be protected is the identity a pod is signing with, which is a
+/// fact about who created the row rather than about how it reads.
+///
+/// A hosted device answers 409 rather than 404: it exists, the caller can
 /// already see it in the device list, and pretending otherwise would be a lie
 /// that helps nobody.
 pub fn find_customer_device(
@@ -588,13 +599,20 @@ pub fn find_customer_device(
   org_id: String,
   device_id: String,
 ) -> Result(String, Response) {
-  case find_device(conn, org_id, device_id) {
-    Error(Nil) -> Error(error_json(404, "not_found", "no such device"))
-    Ok(label) ->
-      case name.reserved_device_label(label) {
+  let looked =
+    sqlite.query(
+      conn,
+      "SELECT label, created_by FROM devices WHERE id = ? AND org_id = ?",
+      [Text(device_id), Text(org_id)],
+    )
+  case looked {
+    Error(_) -> Error(db_error())
+    Ok([[Text(label), Text(created_by)]]) ->
+      case created_by == dataplane_key.system_user_id {
         True -> Error(reserved_label(label))
         False -> Ok(label)
       }
+    Ok(_) -> Error(error_json(404, "not_found", "no such device"))
   }
 }
 

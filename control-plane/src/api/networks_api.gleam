@@ -10,6 +10,7 @@ import api/common.{
 }
 import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
+import auth/dataplane_key
 import auth/principal.{type Principal}
 import dns/name
 import gleam/dynamic/decode
@@ -434,14 +435,17 @@ fn is_hosted(
 /// `cloud_collect_queue` row, which is the only fact that has to outlive
 /// them.
 ///
-/// The candidate set is narrowed in SQL and *decided* in Gleam. GLOB cannot
-/// say "digits and nothing else", so `cloud-1a` — an ordinary customer label
-/// that predates this namespace and stays legal — would match a
-/// `'cloud-*'` pattern, and a toggle that deleted somebody's device because it
-/// happened to be named after a cloud is not a toggle anyone can be asked to
-/// flip. `name.reserved_device_label` is the same predicate that refuses these
-/// labels at creation, so what this deletes is exactly what the data plane can
-/// have created.
+/// **What this deletes is decided by ownership, never by the label.**
+/// `devices.created_by` is `system-dataplane` for exactly the devices the
+/// data plane made, so that is the test. The label is not: the reserved
+/// namespace is a rule about what may be *created* from now on, and a
+/// customer device named `cloud-backup` that predates it is still theirs. A
+/// toggle that deleted somebody's device because it happened to be named
+/// after a cloud is not a toggle anyone can be asked to flip.
+///
+/// The `GLOB` stays as a narrowing — every device this can delete does carry
+/// the prefix, because `dataplane_api.register_device` refuses to create one
+/// that does not — but it is the ownership column that decides.
 fn retire_hosted_devices(
   conn: Connection,
   network_id: String,
@@ -451,14 +455,12 @@ fn retire_hosted_devices(
       conn,
       "SELECT d.id, d.label FROM network_devices nd
        JOIN devices d ON d.id = nd.device_id
-       WHERE nd.network_id = ? AND d.label GLOB 'cloud-*'",
-      [Text(network_id)],
+       WHERE nd.network_id = ? AND d.label GLOB 'cloud-*'
+         AND d.created_by = ?",
+      [Text(network_id), Text(dataplane_key.system_user_id)],
     ),
   )
-  let hosted =
-    rows
-    |> list.filter(fn(row) { name.reserved_device_label(text_at(row, 1)) })
-    |> list.map(fn(row) { text_at(row, 0) })
+  let hosted = list.map(rows, fn(row) { text_at(row, 0) })
   use _ <- result.try(
     list.try_fold(hosted, Nil, fn(_, device_id) {
       // The same three deletes, in the same order, that `devices_api` uses to

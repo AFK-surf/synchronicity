@@ -29,6 +29,7 @@ import api/common.{
 }
 import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
+import auth/dataplane_key
 import auth/principal.{type Principal}
 import dns/name
 import gleam/dynamic/decode
@@ -196,20 +197,18 @@ fn document(
        JOIN networks n ON n.id = nd.network_id
        WHERE n.cloud_hosted = 1 AND k.state = 'active'
          AND d.label GLOB 'cloud-*'
+         AND d.created_by = ?
        ORDER BY nd.network_id, d.label",
-      [],
+      [Text(dataplane_key.system_user_id)],
     )
   let due = collectable(conn, due_before)
   case networks, devices, due {
     Ok(network_rows), Ok(device_rows), Ok(due_rows) -> {
-      // GLOB cannot say "digits and nothing else", so the pattern above is a
-      // narrowing and this is the decision — the same predicate that refuses
-      // these labels at creation. A customer device called `cloud-nine` is not
-      // a hosting slot and must never be reported as one.
-      let hosted =
-        list.filter(device_rows, fn(row) {
-          name.reserved_device_label(text_at(row, 1))
-        })
+      // Already narrowed to devices this service created (`created_by`), which
+      // is the only thing that makes a row a hosting slot. A customer device
+      // called `cloud-backup` is not one and must never be reported as one —
+      // and the label alone could not tell them apart.
+      let hosted = device_rows
       // The apex without its trailing dot, which is what `domain` is built
       // from: the data plane hands the result straight to `Node::set_domain`
       // and never assembles a name itself.
@@ -417,7 +416,7 @@ pub fn register_device(
       error_json(
         400,
         "slot-label",
-        "a hosted device's label is its hosting slot: 'cloud-<n>', digits only",
+        "a hosted device's label is its hosting slot and must begin 'cloud-'",
       )
     _, Error(Nil) -> refused(build.InvalidNk(nk))
     True, Ok(nk_bytes) ->
@@ -806,18 +805,14 @@ fn find_slot_key(
        JOIN devices d ON d.id = nd.device_id
        JOIN device_keys k ON k.device_id = d.id
        WHERE nd.network_id = ? AND k.nk_z32 = ? AND k.state != 'revoked'
-         AND d.label GLOB 'cloud-*'",
-      [Text(network_id), Text(nk)],
+         AND d.label GLOB 'cloud-*'
+         AND d.created_by = ?",
+      [Text(network_id), Text(nk), Text(dataplane_key.system_user_id)],
     )
   case looked {
     Error(_) -> Error(db_error())
-    Ok(rows) ->
-      case
-        list.find(rows, fn(row) { name.reserved_device_label(text_at(row, 1)) })
-      {
-        Ok(row) -> Ok(#(text_at(row, 0), text_at(row, 2), text_at(row, 3)))
-        Error(Nil) -> Error(error_json(404, "not_found", "no such live key"))
-      }
+    Ok([row, ..]) -> Ok(#(text_at(row, 0), text_at(row, 2), text_at(row, 3)))
+    Ok([]) -> Error(error_json(404, "not_found", "no such live key"))
   }
 }
 

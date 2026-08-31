@@ -3052,14 +3052,30 @@ pub fn the_cloud_label_namespace_is_reserved_test() {
   assert taken.status == 409
   assert string.contains(simulate.read_body(taken), "reserved-label")
 
-  // A label that merely looks like one is not reserved: the rule is
-  // `cloud-<digits>`, and a customer's `cloud-nine` is their own business.
-  assert call_json(
+  // The whole prefix, not just the digit form. `cloud-nine` reads like a
+  // hosting slot in a device list, and a namespace whose point is to make
+  // one identity unambiguous cannot leave lookalikes on the table.
+  let lookalike =
+    call_json(
       h,
       Post,
       "/api/orgs/acme/networks/prod/devices",
       json.object([
         #("label", json.string("cloud-nine")),
+        #("nk", json.string(nk())),
+      ]),
+    )
+  assert lookalike.status == 409
+  assert string.contains(simulate.read_body(lookalike), "reserved-label")
+
+  // But `cloud` and `clouds-1` are ordinary labels: the rule is the prefix
+  // `cloud-`, not the word.
+  assert call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      json.object([
+        #("label", json.string("clouds-1")),
         #("nk", json.string(nk())),
       ]),
     ).status
@@ -3334,6 +3350,90 @@ pub fn collecting_storage_clears_the_network_from_the_list_test() {
   assert string.contains(simulate.read_body(again), "\"collected\":false")
 
   assert collect_rows(h) == [[sqlite.Int(1)]]
+}
+
+/// Reserving the prefix is a rule about *creation*; what a customer may touch
+/// is decided by ownership.
+///
+/// The two must not be the same test. A device named `cloud-backup` that
+/// predates the namespace is still the customer's — they can manage it and
+/// delete it — while the fleet's own device is untouchable no matter what it
+/// is called. Conflating them would either lock a customer out of their own
+/// row or, worse, have "disable hosting" delete it.
+pub fn ownership_not_the_label_decides_what_a_customer_may_touch_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+
+  // A device from before the namespace existed, inserted directly because the
+  // API now refuses to create one — which is exactly the situation under test.
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok([[sqlite.Text(org_id)]]) =
+    sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [
+      sqlite.Text("acme"),
+    ])
+  let assert Ok([[sqlite.Text(user_id)]]) =
+    sqlite.query(conn, "SELECT id FROM users WHERE id != ? LIMIT 1", [
+      sqlite.Text("system-dataplane"),
+    ])
+  let assert Ok(_) =
+    sqlite.exec(conn, "INSERT INTO devices VALUES (?, ?, ?, ?, ?, ?, ?)", [
+      sqlite.Text("legacy-device"),
+      sqlite.Text(org_id),
+      sqlite.Text("cloud-backup"),
+      sqlite.Null,
+      sqlite.Null,
+      sqlite.Text(user_id),
+      sqlite.Int(0),
+    ])
+  sqlite.close(conn)
+
+  // Theirs: the reserved prefix does not take it away from them.
+  let removed =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/devices/legacy-device",
+      json.object([#("confirm", json.string("cloud-backup"))]),
+    )
+  assert removed.status == 200
+
+  // The fleet's, by contrast, is refused — and it is refused because the data
+  // plane created it, not because of how it reads.
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  assert call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    ).status
+    == 200
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(hosted_id)]]) =
+    sqlite.query(conn, "SELECT id FROM devices WHERE label = ?", [
+      sqlite.Text("cloud-1"),
+    ])
+  sqlite.close(conn)
+  let refused =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/devices/" <> hosted_id,
+      json.object([#("confirm", json.string("cloud-1"))]),
+    )
+  assert refused.status == 409
+  assert string.contains(simulate.read_body(refused), "reserved-label")
 }
 
 /// The hold is enforced on the *write*, not only in the list.

@@ -236,8 +236,8 @@ empty — an ephemeral pod has no stable address to publish, the hosted node
 initiates its own fetches, and inbound reaches it through iroh discovery
 and relays like any NAT-bound peer.
 
-Constraints inherited from the schema and enforced here: `label` must match
-`cloud-[0-9]+` (the reserved namespace, §3.4), one live `nk` binds one
+Constraints inherited from the schema and enforced here: `label` must begin
+`cloud-` (the reserved namespace, §3.4), one live `nk` binds one
 device globally (`device_keys_live_nk`), at most two records per label (the
 rotation window, `zone/build.gleam` validation).
 
@@ -287,9 +287,27 @@ the tunnel; the stored row is for invoices and alerts.
 
 ### 3.4 The reserved label namespace
 
-Device labels matching `cloud-[0-9]+` are reserved: `join_device` and the
+Device labels beginning `cloud-` are reserved: `join_device` and the
 dashboard refuse them for customers (409 `reserved-label`), and only the
-data-plane principal may create them. The suffix is the **hosting slot**,
+data-plane principal may create them. The **whole prefix** is reserved,
+not only the `cloud-<n>` form the fleet actually uses. Reserving just the
+digit form would leave `cloud-1a`, `cloud-01` and `cloud-nine` available
+as customer labels that read, to a human scanning a device list, exactly
+like the hosting slot beside them — and a namespace whose purpose is to
+make one identity unambiguous cannot leave its own lookalikes on the
+table. The cost is a handful of names nobody has a strong claim to.
+
+**Reservation is a rule about creation; ownership decides everything
+else.** `devices.created_by` is `system-dataplane` for precisely the
+devices this service made, and that column — never the label — is what
+`retire_hosted_devices`, the desired document's `device` field, the
+key-retirement route and the customer-facing device guard all test. The
+two must not be the same predicate: a device named `cloud-backup` that
+predates the namespace is still the customer's to manage and delete, and
+deciding by label would either lock them out of their own row or, when
+they disabled hosting, delete it.
+
+The suffix is the **hosting slot**,
 *not* the shard: v1 hosts every network once, in slot 1, so the device is
 always `cloud-1`, whichever shard happens to run it. A slot is a durable
 identity and shards are interchangeable pods — the same distinction that

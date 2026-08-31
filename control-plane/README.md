@@ -299,8 +299,9 @@ a question the dashboard already knows how to ask, with no new UI.
 
 ### The reserved label namespace
 
-Device labels matching `cloud-<digits>` belong to hosting slots and nobody
-else's. Every customer-facing path that takes a label — `POST
+Device labels beginning `cloud-` belong to hosting slots and nobody else's —
+the whole prefix, so that nothing in a device list can be mistaken for the
+slot beside it. Every customer-facing path that takes a label — `POST
 …/networks/:net/devices` and `POST …/devices`, the two the dashboard and the
 join key use — answers `409 reserved-label`, and the data-plane API is the only
 place one can be created. That confinement is what bounds a leaked data-plane
