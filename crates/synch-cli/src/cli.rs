@@ -399,6 +399,11 @@ pub enum Command {
     /// as a write through the API would be. Redirects are followed, and
     /// nothing is published unless the whole body arrives: a download that
     /// fails partway leaves the tree untouched.
+    ///
+    /// The write replaces whatever the destination path held, and with a
+    /// directory destination the final URL — after redirects — chooses the
+    /// file name. Name the file yourself when the server is not one you
+    /// trust to pick names in that directory.
     Fetch {
         /// The http:// or https:// URL to download.
         url: String,

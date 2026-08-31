@@ -1572,9 +1572,13 @@ async fn a_failed_fetch_publishes_nothing() {
     let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
     let data_dir = dir.path();
 
+    // The body stops 600 000 bytes short of its declared length, after enough
+    // has arrived that a full control chunk was already streamed into the
+    // daemon's staging file — the abort must throw *staged* bytes away, not
+    // just an empty write.
     let mut truncated =
-        b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_vec();
-    truncated.extend_from_slice(&[7u8; 10]);
+        b"HTTP/1.1 200 OK\r\ncontent-length: 900000\r\nconnection: close\r\n\r\n".to_vec();
+    truncated.extend_from_slice(&[7u8; 300_000]);
     let (addr, served) = http_server(vec![("/gone.bin", truncated)]).await;
 
     let error = synch_cli::fetch::fetch(
@@ -1589,8 +1593,10 @@ async fn a_failed_fetch_publishes_nothing() {
     let error = synch_cli::fetch::fetch(data_dir, &format!("http://{addr}/gone.bin"), "media/")
         .await
         .unwrap_err();
+    // The error carries the daemon's own account of the abort, with the one
+    // full chunk it had staged and threw away.
     assert!(
-        format!("{error:#}").contains("nothing was published"),
+        format!("{error:#}").contains("abandoned after 262144 byte(s)"),
         "{error:#}"
     );
     assert_eq!(
@@ -1601,17 +1607,20 @@ async fn a_failed_fetch_publishes_nothing() {
     );
 
     // A scheme fetch does not speak, and a malformed destination, both fail
-    // before any connection is made.
-    for (url, destination) in [
-        ("ftp://example.com/x", "media/"),
-        ("not a url", "media/"),
-        (&format!("http://{addr}/gone.bin"), "media"),
+    // before any connection is made — each with its own reason.
+    let gone = format!("http://{addr}/gone.bin");
+    for (url, destination, says) in [
+        ("ftp://example.com/x", "media/", "http:// or https://"),
+        ("not a url", "media/", "is not a URL"),
+        (gone.as_str(), "media", "is not a destination"),
+        (gone.as_str(), "nas@cluster.example:media/f", "own version"),
     ] {
+        let error = synch_cli::fetch::fetch(data_dir, url, destination)
+            .await
+            .unwrap_err();
         assert!(
-            synch_cli::fetch::fetch(data_dir, url, destination)
-                .await
-                .is_err(),
-            "{url} -> {destination}"
+            format!("{error:#}").contains(says),
+            "{url} -> {destination}: {error:#}"
         );
     }
 

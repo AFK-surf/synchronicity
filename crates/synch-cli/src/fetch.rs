@@ -15,9 +15,14 @@ use anyhow::{Context, Result};
 
 use crate::control::{proto::CHUNK_SIZE, Client, Written};
 
-/// How long establishing the HTTP connection may take. The transfer itself
-/// has no deadline: a large file over a slow link is not a fault.
+/// How long establishing the HTTP connection may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the server may go silent *between* bytes. Not a transfer
+/// deadline — a large file over a slow link is not a fault, but a server
+/// that stops sending without closing would otherwise hang this command,
+/// and the daemon's open write with it, forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs `synch fetch <url> <destination>`.
 pub async fn run(data_dir: &Path, url: &str, destination: &str) -> Result<()> {
@@ -46,6 +51,7 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
     // speaks HTTP (`synch_net::dns`).
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         .context("building the HTTP client")?;
     let mut response = http
@@ -54,7 +60,10 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
         .await
         .with_context(|| format!("fetching {url}"))?;
     let status = response.status();
-    if !status.is_success() {
+    // 206 is refused even though it is a success: no Range was asked for, so
+    // a partial answer is a broken server, and publishing a fragment as the
+    // whole object is exactly the wrong outcome.
+    if !status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT {
         anyhow::bail!("{} answered {status}", response.url());
     }
     // The file name comes off the URL the response actually came from, so a
@@ -71,7 +80,7 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
     // coalesced into protocol-sized chunks exactly as the S3 gateway does,
     // so the message size is a property of the protocol rather than of the
     // server's write pattern.
-    let mut pending: Vec<u8> = Vec::new();
+    let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
     loop {
         match response.chunk().await {
             Ok(Some(piece)) => {
@@ -81,7 +90,11 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
                     pending.extend_from_slice(&rest[..take]);
                     rest = &rest[take..];
                     if pending.len() == CHUNK_SIZE {
-                        put.chunk(std::mem::take(&mut pending)).await?;
+                        // `replace` rather than `take`, so the buffer keeps
+                        // its capacity instead of regrowing from zero for
+                        // every chunk of a large download.
+                        let full = std::mem::replace(&mut pending, Vec::with_capacity(CHUNK_SIZE));
+                        put.chunk(full).await?;
                     }
                 }
             }
@@ -89,13 +102,12 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
             // A body that stopped early — a dropped connection, a length the
             // server never honored — aborts the write: a truncated download
             // must never be published as this node's own assertion (§9.4).
+            // The abort's answer is the daemon's own account of what it threw
+            // away, so it travels in the error rather than being discarded.
             Err(e) => {
-                let failed = format!(
-                    "the download from {} failed; nothing was published",
-                    response.url()
-                );
-                let _ = put.abort(format!("the download failed: {e}")).await;
-                return Err(anyhow::Error::from(e).context(failed));
+                let failed = format!("the download from {} failed", response.url());
+                let aborted = put.abort(format!("the download failed: {e}")).await;
+                return Err(anyhow::Error::from(e).context(aborted).context(failed));
             }
         }
     }
@@ -126,6 +138,14 @@ impl Destination {
         };
         if space.is_empty() {
             anyhow::bail!("`{text}` names no space; use <space>/<path>");
+        }
+        // Every reference-taking read accepts `<origin>:`, so say why this
+        // one cannot rather than failing on a space that does not exist.
+        if space.contains(':') {
+            anyhow::bail!(
+                "`{text}` names an origin, and a fetch publishes this node's own version; \
+                 use <space>/<path>"
+            );
         }
         Ok(Destination {
             space: space.to_string(),
@@ -175,6 +195,11 @@ fn percent_decode(text: &str) -> Option<String> {
         match bytes[i] {
             b'%' => {
                 let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+                // Checked directly: `from_str_radix` alone would also accept
+                // a sign, letting `%+5` decode.
+                if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
                 out.push(u8::from_str_radix(hex, 16).ok()?);
                 i += 3;
             }
@@ -239,8 +264,10 @@ mod tests {
             // A decoded separator would not stay one path component.
             "https://example.com/a%2Fb",
             "https://example.com/%2e%2e",
-            // An escape that is not two hex digits.
+            // Escapes that are not two hex digits — including a sign, which
+            // a bare `from_str_radix` would have accepted.
             "https://example.com/bad%zzname",
+            "https://example.com/bad%+5x",
         ] {
             let e = entry_path("workspace/documents/", url).unwrap_err();
             assert!(
@@ -255,5 +282,8 @@ mod tests {
         for bad in ["workspace", "", "/path"] {
             assert!(Destination::parse(bad).is_err(), "{bad}");
         }
+        // An origin prefix is refused with its reason, not as a missing space.
+        let e = Destination::parse("nas@cluster.example:media/f").unwrap_err();
+        assert!(e.to_string().contains("own version"), "{e:#}");
     }
 }
