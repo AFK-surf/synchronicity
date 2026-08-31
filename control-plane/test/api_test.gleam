@@ -3143,7 +3143,7 @@ pub fn disabling_hosting_removes_the_hosted_device_from_the_zone_test() {
   let assert Ok(stamped) =
     sqlite.query(
       conn,
-      "SELECT count(*) FROM networks WHERE name = ? AND cloud_disabled_at IS NOT NULL",
+      "SELECT count(*) FROM cloud_collect_queue WHERE network_name = ?",
       [sqlite.Text("prod")],
     )
   sqlite.close(conn)
@@ -3198,7 +3198,7 @@ fn age_hold(h: Harness, network: String, seconds: Int) -> Nil {
   let assert Ok(_) =
     sqlite.exec(
       conn,
-      "UPDATE networks SET cloud_disabled_at = ? WHERE name = ?",
+      "UPDATE cloud_collect_queue SET disabled_at = ? WHERE network_name = ?",
       [sqlite.Int(now_unix() - seconds), sqlite.Text(network)],
     )
   sqlite.close(conn)
@@ -3390,7 +3390,7 @@ pub fn disabling_twice_does_not_restart_the_retention_clock_test() {
   let assert Ok(_) =
     sqlite.exec(
       conn,
-      "UPDATE networks SET cloud_disabled_at = ? WHERE name = ?",
+      "UPDATE cloud_collect_queue SET disabled_at = ? WHERE network_name = ?",
       [
         sqlite.Int(long_ago),
         sqlite.Text("prod"),
@@ -3401,9 +3401,11 @@ pub fn disabling_twice_does_not_restart_the_retention_clock_test() {
 
   let conn = read_db(h)
   let assert Ok(rows) =
-    sqlite.query(conn, "SELECT cloud_disabled_at FROM networks WHERE name = ?", [
-      sqlite.Text("prod"),
-    ])
+    sqlite.query(
+      conn,
+      "SELECT disabled_at FROM cloud_collect_queue WHERE network_name = ?",
+      [sqlite.Text("prod")],
+    )
   sqlite.close(conn)
   assert rows == [[sqlite.Int(long_ago)]]
 }
@@ -3424,13 +3426,16 @@ pub fn re_enabling_clears_the_retention_clock_test() {
   assert host_network(h, "acme", "prod", False) == 200
   assert host_network(h, "acme", "prod", True) == 200
 
+  // Re-enabling removes the queue row outright rather than nulling a column:
+  // the instruction to delete this tenant's bytes must not survive the
+  // decision to keep hosting them.
   let conn = read_db(h)
   let assert Ok(rows) =
     sqlite.query(
       conn,
-      "SELECT count(*) FROM networks WHERE name = ? AND cloud_disabled_at IS NULL",
+      "SELECT count(*) FROM cloud_collect_queue WHERE network_name = ?",
       [sqlite.Text("prod")],
     )
   sqlite.close(conn)
-  assert rows == [[sqlite.Int(1)]]
+  assert rows == [[sqlite.Int(0)]]
 }

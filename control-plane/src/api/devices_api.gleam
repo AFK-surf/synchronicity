@@ -6,8 +6,8 @@ import api/agent
 import api/auth_api.{type AuthContext, with_db}
 import api/browse_api.{type Browse}
 import api/common.{
-  Admin, Member, audit, body_decoder, constraint_response, db_error, find_device,
-  require_org, text_at, zone_mutation,
+  Admin, Member, audit, body_decoder, constraint_response, db_error,
+  find_customer_device, require_org, text_at, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
@@ -174,8 +174,8 @@ pub fn patch_device(
     True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Member)
-        case find_device(conn, org_id, device_id) {
-          Error(Nil) -> error_json(404, "not_found", "no such device")
+        case find_customer_device(conn, org_id, device_id) {
+          Error(refusal) -> refusal
           Ok(_) ->
             zone_mutation(conn, ctx, who, publish.Widening, fn() {
               let update =
@@ -212,8 +212,8 @@ pub fn delete_device(
 ) -> Response {
   with_db(ctx, fn(conn) {
     use org_id, _ <- require_org(conn, slug, who, Admin)
-    case find_device(conn, org_id, device_id) {
-      Error(Nil) -> error_json(404, "not_found", "no such device")
+    case find_customer_device(conn, org_id, device_id) {
+      Error(refusal) -> refusal
       Ok(label) ->
         zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           let work = {
@@ -268,8 +268,8 @@ pub fn add_key(
     Ok(nk_bytes) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Member)
-        case find_device(conn, org_id, device_id) {
-          Error(Nil) -> error_json(404, "not_found", "no such device")
+        case find_customer_device(conn, org_id, device_id) {
+          Error(refusal) -> refusal
           Ok(_) -> {
             let live_keys =
               sqlite.query(
@@ -386,8 +386,8 @@ fn key_state_change(
   }
   with_db(ctx, fn(conn) {
     use org_id, _ <- require_org(conn, slug, who, minimum)
-    case find_device(conn, org_id, device_id) {
-      Error(Nil) -> error_json(404, "not_found", "no such device")
+    case find_customer_device(conn, org_id, device_id) {
+      Error(refusal) -> refusal
       Ok(_) ->
         zone_mutation(conn, ctx, who, publish.Narrowing, fn() {
           let update =

@@ -77,10 +77,21 @@ fn migrations() -> List(String) {
 /// hosted device's TXT record), while the flag itself is enforced at the
 /// data-plane API, where a change takes effect within one poll interval
 /// instead of a TTL later, and where it never reaches public DNS.
-/// `cloud_disabled_at` is stamped when the switch goes off and cleared when
-/// it comes back on; it starts the retention clock over the tenant's object
-/// storage, which is a decision an operator makes later and therefore a date
-/// that has to survive the devices the same commit deletes.
+///
+/// **`cloud_collect_queue`** is the retention clock over an offboarded
+/// tenant's object storage: one row per network whose hosting was switched
+/// off, holding the moment it went. It is keyed by *slug and name* rather
+/// than by `network_id`, and carries **no foreign key**, for the same reason
+/// the audit trail carries none — it has to outlive the thing it describes.
+/// The bytes in the bucket are named `tenants/<org>/<network>/`, and they do
+/// not stop existing because the row that pointed at them was deleted; a
+/// clock kept on the network would be destroyed by the ordinary delete
+/// button, and the fleet would then hold that customer's data for ever with
+/// nothing left to say it should not. Enabling hosting removes the row (a
+/// re-provision inside the hold is cheap and deliberate), collecting removes
+/// it, and a second disable does not replace it — `ON CONFLICT DO NOTHING`,
+/// so a reconciler that re-sends `{enabled: false}` cannot push the deletion
+/// another 30 days out.
 ///
 /// **`dataplane_keys`** is a fourth credential kind, and pointedly *not* a row
 /// in `api_keys`. An `api_keys` row names one org (`org_id NOT NULL`) and the
@@ -133,7 +144,16 @@ fn migrations() -> List(String) {
 /// replay is worth more than a timestamp nobody will read.
 const v12 = "
 ALTER TABLE networks ADD COLUMN cloud_hosted INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE networks ADD COLUMN cloud_disabled_at INTEGER;
+CREATE INDEX networks_cloud_hosted ON networks (cloud_hosted)
+  WHERE cloud_hosted = 1;
+
+CREATE TABLE cloud_collect_queue (
+  org_slug     TEXT NOT NULL,
+  network_name TEXT NOT NULL,
+  disabled_at  INTEGER NOT NULL,
+  PRIMARY KEY (org_slug, network_name)
+);
+CREATE INDEX cloud_collect_queue_due ON cloud_collect_queue (disabled_at);
 
 CREATE TABLE dataplane_keys (
   id           TEXT PRIMARY KEY,
@@ -146,7 +166,7 @@ CREATE TABLE dataplane_keys (
 );
 
 CREATE TABLE network_hosting_status (
-  network_id   TEXT PRIMARY KEY REFERENCES networks(id),
+  network_id   TEXT PRIMARY KEY REFERENCES networks(id) ON DELETE CASCADE,
   slot         INTEGER NOT NULL,
   held_roots   INTEGER NOT NULL,
   held_bytes   INTEGER NOT NULL,

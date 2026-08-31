@@ -4,6 +4,7 @@
 import api/auth_api.{type AuthContext}
 import api/middleware.{error_json, now_unix}
 import auth/principal.{type Principal}
+import dns/name
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
@@ -566,6 +567,34 @@ pub fn find_device(
   {
     Ok([[Text(label)]]) -> Ok(label)
     _ -> Error(Nil)
+  }
+}
+
+/// `find_device`, refusing a device in the reserved hosting-slot namespace.
+///
+/// Every customer-facing route that acts on an *existing* device goes through
+/// this rather than `find_device`. Guarding creation alone guarded nothing:
+/// the label is reserved because a `cloud-<n>` device is an operator-run
+/// replica's identity, and a customer who can add a key to it, retire its key
+/// or delete it can seize or destroy that identity just as thoroughly as one
+/// who could have created it. The fleet reaches these rows through `/dp/v1`,
+/// which is the only surface that may.
+///
+/// A reserved device answers 409 rather than 404: it exists, the caller can
+/// already see it in the device list, and pretending otherwise would be a lie
+/// that helps nobody.
+pub fn find_customer_device(
+  conn: Connection,
+  org_id: String,
+  device_id: String,
+) -> Result(String, Response) {
+  case find_device(conn, org_id, device_id) {
+    Error(Nil) -> Error(error_json(404, "not_found", "no such device"))
+    Ok(label) ->
+      case name.reserved_device_label(label) {
+        True -> Error(reserved_label(label))
+        False -> Ok(label)
+      }
   }
 }
 

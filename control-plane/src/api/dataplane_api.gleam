@@ -271,11 +271,15 @@ fn collectable(
 ) -> Result(List(List(sqlite.Value)), sqlite.Error) {
   sqlite.query(
     conn,
-    "SELECT o.slug, n.name
-     FROM networks n JOIN orgs o ON o.id = n.org_id
-     WHERE n.cloud_hosted = 0 AND n.cloud_disabled_at IS NOT NULL
-       AND n.cloud_disabled_at <= ?
-     ORDER BY o.slug, n.name",
+    "SELECT q.org_slug, q.network_name
+     FROM cloud_collect_queue q
+     WHERE q.disabled_at <= ?
+       AND NOT EXISTS (
+         SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
+         WHERE o.slug = q.org_slug AND n.name = q.network_name
+           AND n.cloud_hosted = 1
+       )
+     ORDER BY q.org_slug, q.network_name",
     [VInt(due_before)],
   )
 }
@@ -295,9 +299,14 @@ fn collection_mark(
   let counted =
     sqlite.query(
       conn,
-      "SELECT count(*), coalesce(sum(cloud_disabled_at), 0) FROM networks
-       WHERE cloud_hosted = 0 AND cloud_disabled_at IS NOT NULL
-         AND cloud_disabled_at <= ?",
+      "SELECT count(*), coalesce(sum(q.disabled_at), 0)
+       FROM cloud_collect_queue q
+       WHERE q.disabled_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
+           WHERE o.slug = q.org_slug AND n.name = q.network_name
+             AND n.cloud_hosted = 1
+         )",
       [VInt(due_before)],
     )
   case counted {
@@ -835,13 +844,24 @@ fn sole_active(conn: Connection, device_id: String) -> Bool {
 
 /// What a `DELETE …/storage` finds of the retention hold.
 type Hold {
-  /// Stamped and still standing: the offboarding this call is reporting the
-  /// end of.
-  Held(disabled_at: Int)
-  /// No stamp. Either this network was never offboarded, or a previous call
-  /// already cleared it — which are the same thing to this route, and the
-  /// reason it can be retried.
+  /// Stamped, and the hold has run out: the offboarding this call is
+  /// reporting the end of, and the only state in which it may proceed.
+  Due(disabled_at: Int)
+  /// Stamped, and still running. The customer's window to change their mind
+  /// (§6), and the reason this route re-checks it rather than trusting the
+  /// caller: the `collect` list already withholds a network that is not due,
+  /// but a list is a hint and this is the write that destroys the bytes. A
+  /// replayed instruction, a fleet bug, or a leaked `synchdp_` token must not
+  /// be able to collect inside the hold, so the authority that owns the clock
+  /// checks it here too.
+  Running(disabled_at: Int)
+  /// No queue row. Either this network was never offboarded, or a previous
+  /// call already cleared it — which are the same thing to this route, and
+  /// the reason it can be retried.
   Collected
+  /// Hosting is on right now, so the storage is live and must not be touched
+  /// whatever the queue says.
+  Hosted
 }
 
 /// `DELETE /dp/v1/networks/:org/:net/storage` — the data plane reporting that
@@ -900,68 +920,122 @@ pub fn collect_storage(
 ) -> Response {
   use <- require_dataplane(who)
   with_db(ctx, fn(conn) {
-    case hosted_network(conn, slug, network) {
+    // Deliberately NOT `hosted_network`: the whole point of the queue is that
+    // it outlives the network row, so a network deleted while offboarded has
+    // bytes to collect and nothing left in `networks` to look them up by. The
+    // hosting check that used to come from that lookup is folded into
+    // `read_hold` instead, where it reads the live flag by slug and name.
+    case read_hold(conn, slug, network) {
       Error(refusal) -> refusal
-      Ok(#(_, _, True)) ->
+      Ok(Hosted) ->
         error_json(
           409,
           "cloud-hosting-enabled",
           "cloud hosting is enabled for this network: its storage is live and "
             <> "cannot be recorded as collected",
         )
-      Ok(#(org_id, network_id, False)) ->
-        case read_hold(conn, network_id) {
-          Error(refusal) -> refusal
-          Ok(Collected) -> collected(network, False)
-          Ok(Held(disabled_at)) -> {
-            let done =
-              transaction(conn, fn() {
-                let cleared =
-                  sqlite.exec(
-                    conn,
-                    "UPDATE networks SET cloud_disabled_at = NULL WHERE id = ?",
-                    [Text(network_id)],
-                  )
-                case cleared {
-                  Error(e) -> Error(constraint_response(e))
-                  Ok(_) ->
-                    // The stamp is about to stop existing, so the row that
-                    // would answer "how long was this held, and from when"
-                    // carries both — the same denormalisation `common.audit`
-                    // makes for a credential that is about to be revoked.
-                    audit(conn, who, org_id, "cloud-hosting.storage.collect", [
-                      #("network", json.string(network)),
-                      #("disabled_at", json.int(disabled_at)),
-                      #("held_seconds", json.int(now_unix() - disabled_at)),
-                    ])
-                    |> result.replace(Nil)
-                    |> result.map_error(fn(_) { db_error() })
-                }
-              })
-            case done {
-              Ok(Nil) -> collected(network, True)
-              Error(refusal) -> refusal
+      Ok(Collected) -> collected(network, False)
+      Ok(Running(disabled_at)) ->
+        error_json(
+          409,
+          "retention-hold",
+          "this network's retention hold has not elapsed: it was offboarded "
+            <> int.to_string(now_unix() - disabled_at)
+            <> "s ago and is held for "
+            <> int.to_string(retention_hold_seconds)
+            <> "s",
+        )
+      Ok(Due(disabled_at)) -> {
+        let done =
+          transaction(conn, fn() {
+            let cleared =
+              sqlite.exec(
+                conn,
+                "DELETE FROM cloud_collect_queue
+                  WHERE org_slug = ? AND network_name = ?",
+                [Text(slug), Text(network)],
+              )
+            case cleared {
+              Error(e) -> Error(constraint_response(e))
+              Ok(_) ->
+                // The queue row is about to stop existing, so the row that
+                // would answer "how long was this held, and from when"
+                // carries both — the same denormalisation `common.audit`
+                // makes for a credential that is about to be revoked. The org
+                // is named by slug because it, too, may already be gone.
+                audit(
+                  conn,
+                  who,
+                  org_slug_for_audit(conn, slug),
+                  action_collect,
+                  [
+                    #("org", json.string(slug)),
+                    #("network", json.string(network)),
+                    #("disabled_at", json.int(disabled_at)),
+                    #("held_seconds", json.int(now_unix() - disabled_at)),
+                  ],
+                )
+                |> result.replace(Nil)
+                |> result.map_error(fn(_) { db_error() })
             }
-          }
+          })
+        case done {
+          Ok(Nil) -> collected(network, True)
+          Error(refusal) -> refusal
         }
+      }
     }
   })
 }
 
-/// Whether this network's retention clock is still running.
+/// What the audit row records as the org.
 ///
-/// Read inside the same connection the update runs on, and only after
-/// `hosted_network` has established the network exists, so an empty result
-/// here is a storage fault rather than a 404 — the `db_error` says so.
-fn read_hold(conn: Connection, network_id: String) -> Result(Hold, Response) {
-  case
-    sqlite.query(conn, "SELECT cloud_disabled_at FROM networks WHERE id = ?", [
-      Text(network_id),
-    ])
-  {
-    Ok([[VInt(disabled_at)]]) -> Ok(Held(disabled_at))
-    Ok([[Null]]) -> Ok(Collected)
-    _ -> Error(db_error())
+/// The org's id when it still exists, and its slug when it does not — a
+/// collection can land after the org was deleted, and `audit.org_id` carries
+/// no foreign key precisely so history survives that.
+fn org_slug_for_audit(conn: Connection, slug: String) -> String {
+  case sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)]) {
+    Ok([[Text(org_id)]]) -> org_id
+    _ -> slug
+  }
+}
+
+const action_collect = "cloud-hosting.storage.collect"
+
+/// Whether this network's retention clock is still running, read by slug and
+/// name so a network whose row is gone can still be answered.
+///
+/// The live hosting flag is consulted in the same read: a network re-enabled
+/// inside its hold — or a *different* network that has since taken the same
+/// slug and name — is hosted, and its storage is live.
+fn read_hold(
+  conn: Connection,
+  slug: String,
+  network: String,
+) -> Result(Hold, Response) {
+  let hosted =
+    sqlite.query(
+      conn,
+      "SELECT count(*) FROM networks n JOIN orgs o ON o.id = n.org_id
+       WHERE o.slug = ? AND n.name = ? AND n.cloud_hosted = 1",
+      [Text(slug), Text(network)],
+    )
+  let queued =
+    sqlite.query(
+      conn,
+      "SELECT disabled_at FROM cloud_collect_queue
+       WHERE org_slug = ? AND network_name = ?",
+      [Text(slug), Text(network)],
+    )
+  case hosted, queued {
+    Ok([[VInt(n)]]), _ if n > 0 -> Ok(Hosted)
+    Ok(_), Ok([[VInt(disabled_at)]]) ->
+      case now_unix() - disabled_at >= retention_hold_seconds {
+        True -> Ok(Due(disabled_at))
+        False -> Ok(Running(disabled_at))
+      }
+    Ok(_), Ok([]) -> Ok(Collected)
+    _, _ -> Error(db_error())
   }
 }
 

@@ -17,7 +17,7 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
+import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
 import zone/build
@@ -219,6 +219,38 @@ pub fn delete_network(
                     [Text(network_id)],
                   ),
                 )
+                // The metering heartbeat's row is a child of the network and
+                // foreign keys are on, so it leaves before its parent — the
+                // same order every other child here follows. Without this the
+                // delete fails with an unmapped constraint error, and any
+                // network the fleet has ever heartbeated for becomes
+                // permanently undeletable.
+                use _ <- result.try(
+                  sqlite.exec(
+                    conn,
+                    "DELETE FROM network_hosting_status WHERE network_id = ?",
+                    [Text(network_id)],
+                  ),
+                )
+                // Deleting a hosted network is an offboarding: the bytes in
+                // the bucket outlive the row, so the instruction to collect
+                // them has to as well. `DO NOTHING` because a network deleted
+                // *during* its hold already has a clock running and must not
+                // have it restarted.
+                use hosted <- result.try(is_hosted(conn, network_id))
+                use _ <- result.try(case hosted {
+                  False -> Ok(Nil)
+                  True ->
+                    sqlite.exec(
+                      conn,
+                      "INSERT INTO cloud_collect_queue
+                         (org_slug, network_name, disabled_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT (org_slug, network_name) DO NOTHING",
+                      [Text(slug), Text(network), VInt(now_unix())],
+                    )
+                    |> result.replace(Nil)
+                })
                 use _ <- result.try(
                   sqlite.exec(conn, "DELETE FROM networks WHERE id = ?", [
                     Text(network_id),
@@ -266,11 +298,14 @@ pub fn delete_network(
 ///     a device registration that widens the zone for real, and being refused
 ///     now rather than a minute later names the ceremony step that is missing.
 ///
-/// `cloud_disabled_at` starts the retention clock over the tenant's object
-/// storage, so it is stamped on the way out and cleared on the way back in:
-/// re-enabling within the hold is a cheap re-provision, and the date is what a
-/// scheduled deletion job later reads. It outlives the device rows this same
-/// transaction removes, which is the point of putting it on the network.
+/// A `cloud_collect_queue` row starts the retention clock over the tenant's
+/// object storage, so one is written on the way out and removed on the way
+/// back in: re-enabling within the hold is a cheap re-provision, and the date
+/// is what the fleet's `collect` list later reads. It is keyed by slug and
+/// name and carries no foreign key, because it has to outlive not only the
+/// device rows this same transaction removes but the *network itself* — the
+/// bytes in the bucket do not stop existing because somebody deleted the row
+/// that pointed at them (`store/migrate` V12).
 pub fn set_cloud_hosting(
   req: Request,
   ctx: AuthContext,
@@ -288,36 +323,58 @@ pub fn set_cloud_hosting(
     case find_network(conn, org_id, network) {
       Error(Nil) -> error_json(404, "not_found", "no such network")
       Ok(network_id) -> {
-        // The four things that differ between the two directions, decided
-        // once: what the zone is told to expect, the stored flag, when the
-        // retention clock starts, and what the trail calls it.
+        // The three things that differ between the two directions, decided
+        // once: what the zone is told to expect, the stored flag, and what
+        // the trail calls it.
         let #(change, flag, action) = case enabled {
           True -> #(publish.Widening, 1, "cloud-hosting.enable")
           False -> #(publish.Narrowing, 0, "cloud-hosting.disable")
         }
-        let disabled_at = case enabled {
-          True -> Null
-          False -> VInt(now_unix())
-        }
         zone_mutation(conn, ctx, who, change, fn() {
           let work = {
-            use _ <- result.try(sqlite.exec(
-              conn,
-              // `coalesce` on the way down, so a repeated disable does not
-              // restart the retention clock. A reconciler or a UI that
-              // re-sends `{enabled: false}` is ordinary, and each restamp
-              // would push the collection another 30 days out — storage
-              // retained, and billed, for ever. Enabling passes NULL, and
-              // `coalesce(NULL, NULL)` is NULL, so the clear still clears.
-              "UPDATE networks
-                    SET cloud_hosted = ?1,
-                        cloud_disabled_at = CASE
-                          WHEN ?2 IS NULL THEN NULL
-                          ELSE coalesce(cloud_disabled_at, ?2)
-                        END
-                  WHERE id = ?3",
-              [VInt(flag), disabled_at, Text(network_id)],
-            ))
+            // Read before the write: whether this network was *actually*
+            // hosted a moment ago is what decides whether there is anything
+            // to collect. Disabling a network that was already off must not
+            // start a clock — a dashboard syncing its initial state, or an
+            // IaC provider writing `cloud_hosted = false` explicitly, would
+            // otherwise queue a deletion instruction for a prefix that never
+            // existed.
+            use was_hosted <- result.try(is_hosted(conn, network_id))
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "UPDATE networks SET cloud_hosted = ?1 WHERE id = ?2",
+                [VInt(flag), Text(network_id)],
+              ),
+            )
+            use _ <- result.try(case enabled, was_hosted {
+              // Back on inside the hold: the tenant is re-provisioned rather
+              // than collected, so the instruction to delete its bytes goes.
+              True, _ ->
+                sqlite.exec(
+                  conn,
+                  "DELETE FROM cloud_collect_queue
+                    WHERE org_slug = ? AND network_name = ?",
+                  [Text(slug), Text(network)],
+                )
+                |> result.replace(Nil)
+              // `DO NOTHING`, so a repeated disable does not restart the
+              // retention clock. A reconciler or a UI that re-sends
+              // `{enabled: false}` is ordinary, and each restamp would push
+              // the collection another 30 days out — storage retained, and
+              // billed, for ever.
+              False, True ->
+                sqlite.exec(
+                  conn,
+                  "INSERT INTO cloud_collect_queue
+                     (org_slug, network_name, disabled_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT (org_slug, network_name) DO NOTHING",
+                  [Text(slug), Text(network), VInt(now_unix())],
+                )
+                |> result.replace(Nil)
+              False, False -> Ok(Nil)
+            })
             use removed <- result.try(case enabled {
               True -> Ok(0)
               False -> retire_hosted_devices(conn, network_id)
@@ -346,15 +403,36 @@ pub fn set_cloud_hosting(
   })
 }
 
+/// Whether hosting is switched on for this network, read inside the
+/// transaction that is about to switch it.
+///
+/// A missing row cannot happen — `find_network` established it a moment ago
+/// on this same connection — and answering `False` for one is the safe way to
+/// be wrong: it queues no deletion.
+fn is_hosted(
+  conn: Connection,
+  network_id: String,
+) -> Result(Bool, sqlite.Error) {
+  use rows <- result.try(
+    sqlite.query(conn, "SELECT cloud_hosted FROM networks WHERE id = ?", [
+      Text(network_id),
+    ]),
+  )
+  case rows {
+    [[VInt(1)]] -> Ok(True)
+    _ -> Ok(False)
+  }
+}
+
 /// Removes the network's hosted devices, in the transaction that switched
 /// hosting off. Answers how many devices went.
 ///
 /// **The rows go rather than the keys being revoked.** A revoked key leaves a
 /// device in the network holding nothing, which the dashboard would draw as a
 /// broken member forever; and re-enabling later is a fresh provision with a
-/// fresh key, so there is no identity here worth keeping. What is kept is
-/// `cloud_disabled_at` on the network, which is the only fact that has to
-/// outlive them.
+/// fresh key, so there is no identity here worth keeping. What is kept is the
+/// `cloud_collect_queue` row, which is the only fact that has to outlive
+/// them.
 ///
 /// The candidate set is narrowed in SQL and *decided* in Gleam. GLOB cannot
 /// say "digits and nothing else", so `cloud-1a` — an ordinary customer label
