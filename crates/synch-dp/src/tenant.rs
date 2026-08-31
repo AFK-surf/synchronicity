@@ -22,9 +22,10 @@ use crate::spaces;
 
 /// Where a tenant is in its life.
 ///
-/// Cached, never authoritative: a fresh pod re-derives every one of these from
-/// the desired document, the control plane's `device` field and what the
-/// bucket holds (§4.2).
+/// Cached, never authoritative: a fresh pod re-derives every one of these
+/// from the desired document and what the bucket holds (§4.2). The control
+/// plane's `device` field is read too, on every converge — not to decide
+/// state, but to notice a slot whose registration has been displaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Restoring or initializing.
@@ -57,6 +58,16 @@ impl State {
 /// The daemon's own cadence, and for the daemon's own reason: the answer
 /// changes when a DoH cache expires, not when we ask harder.
 const IDENTITY_POLL: Duration = Duration::from_secs(30);
+
+/// How many times a draining tenant tries its final ship.
+///
+/// The pod's termination grace is 30 s and shared with every other tenant, so
+/// this is bounded deliberately: enough to ride out a provider blip, not
+/// enough to be the reason a drain gets SIGKILLed.
+const FINAL_SHIP_ATTEMPTS: u32 = 3;
+
+/// Backoff between those attempts, multiplied by the attempt number.
+const FINAL_SHIP_BACKOFF: Duration = Duration::from_millis(250);
 
 /// A running tenant.
 #[derive(Debug)]
@@ -92,6 +103,7 @@ impl Tenant {
         control: &ControlPlane,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
         network: HostedNetwork,
+        metrics: Arc<crate::metrics::Metrics>,
     ) -> Result<Self> {
         let dir = config.tenant_dir(&network.org, &network.network);
         // Before anything opens the directory: two tenants configured onto one
@@ -204,7 +216,7 @@ impl Tenant {
             replication_task: None,
             dir,
         };
-        tenant.open(config, resolver).await?;
+        tenant.open(config, resolver, metrics).await?;
         Ok(tenant)
     }
 
@@ -213,6 +225,7 @@ impl Tenant {
         &mut self,
         config: &DpConfig,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
+        metrics: Arc<crate::metrics::Metrics>,
     ) -> Result<()> {
         let node_config = self.node_config(config)?;
         self.state = State::Identifying;
@@ -240,7 +253,7 @@ impl Tenant {
         // before propagating. Without that, a failed open leaks an endpoint
         // and its tasks, and the retry 30 seconds later rewrites the database
         // file underneath them.
-        match self.start(node.clone(), config, resolver).await {
+        match self.start(node.clone(), config, resolver, metrics).await {
             Ok(()) => {
                 self.state = State::Running;
                 tracing::info!(tenant = %self.network.key(), "tenant is replicating");
@@ -264,6 +277,7 @@ impl Tenant {
         node: Node,
         config: &DpConfig,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
+        metrics: Arc<crate::metrics::Metrics>,
     ) -> Result<()> {
         // Before any publisher runs. A restored database can be behind what
         // peers already hold (§5.3), and publishing over that seq forks this
@@ -279,7 +293,7 @@ impl Tenant {
         .await?;
 
         self.spawn_loops(&node, resolver);
-        self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL);
+        self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL, metrics);
         self.node = Some(node.clone());
 
         // Publishes this node's own trie once, now that re-adoption has
@@ -394,7 +408,12 @@ impl Tenant {
     /// anything that shared it behind a lock would make this task's future
     /// unspawnable. Sole ownership also means the final ship cannot race a
     /// tick: the same task does both, in order.
-    fn spawn_replication(&mut self, mut replicator: Replicator, interval: Duration) {
+    fn spawn_replication(
+        &mut self,
+        mut replicator: Replicator,
+        interval: Duration,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
         let (finish, mut finished) = tokio::sync::oneshot::channel();
         self.replication_finish = Some(finish);
         let tenant = self.network.key();
@@ -404,10 +423,14 @@ impl Tenant {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        if let Err(error) = replicator.tick().await {
-                            // Retried on the next tick. A stream that stays
-                            // stalled is what the operator alerts on (§10) —
-                            // it is not something this loop can fix.
+                        let shipped = replicator.tick().await;
+                        // Every attempt, so `synch_dp_replication_failures`
+                        // shows a stream that is stuck *now*. Retried on the
+                        // next tick; a run that keeps climbing is the
+                        // operator's alert (§10), not something this loop can
+                        // fix.
+                        metrics.replication_attempt(&tenant, shipped.is_ok());
+                        if let Err(error) = shipped {
                             tracing::warn!(
                                 %tenant, %error,
                                 "shipping database frames failed"
@@ -419,11 +442,31 @@ impl Tenant {
                     _ = &mut finished => break,
                 }
             }
-            if let Err(error) = replicator.flush().await {
-                // Worth shouting about: this is the window in which
-                // acknowledged writes are lost, and it is supposed to be
-                // empty.
-                tracing::error!(%tenant, %error, "failed to ship the final database writes");
+            // The tail ship, retried. This is the window in which
+            // acknowledged writes are lost, and a single attempt threw the
+            // tenant's last second of writes away on one transient 503 — the
+            // library's own retry budget is ~30 s, and a rolling restart is
+            // exactly when a provider is most likely to blip. The attempts
+            // are bounded because a drain cannot block a pod's termination
+            // grace for ever.
+            let mut shipped = Err(DpError::Engine("not attempted".into()));
+            for attempt in 1..=FINAL_SHIP_ATTEMPTS {
+                shipped = replicator.flush().await;
+                match &shipped {
+                    Ok(()) => break,
+                    Err(error) => tracing::warn!(
+                        %tenant, %error, attempt,
+                        "the final database ship failed; retrying"
+                    ),
+                }
+                tokio::time::sleep(FINAL_SHIP_BACKOFF * attempt).await;
+            }
+            if let Err(error) = shipped {
+                tracing::error!(
+                    %tenant, %error, attempts = FINAL_SHIP_ATTEMPTS,
+                    "failed to ship the final database writes; \
+                     acknowledged writes have been lost"
+                );
             }
             // Releases the long-running read lock the replication library
             // holds on the database.
@@ -433,14 +476,38 @@ impl Tenant {
         }));
     }
 
+    /// Whether any standing loop has stopped while the tenant is running.
+    ///
+    /// The engine's loops return only when their shutdown future fires, so
+    /// while the tenant is `Running` a finished handle means one panicked —
+    /// and a tenant that has quietly stopped publishing, or stopped renewing
+    /// its membership lease, looks identical to a healthy one from outside.
+    /// The reconciler asks this every pass and re-provisions the tenant that
+    /// answers yes, which is the "restarts *that* tenant, never the process"
+    /// of §4.4 — previously asserted by a comment and implemented by nothing.
+    ///
+    /// The replication ticker counts too: it is the one loop whose silence
+    /// costs durability rather than freshness.
+    pub fn has_failed_loop(&self) -> bool {
+        if self.state != State::Running {
+            return false;
+        }
+        self.loops.iter().any(|handle| handle.is_finished())
+            || self
+                .replication_task
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+    }
+
     /// Spawns one standing loop.
     ///
     /// The engine's loops return nothing and stop only when their shutdown
     /// future fires, so the failure this guards against is a *panic*: it
     /// leaves the tenant quietly not doing part of its job — a dead publisher
-    /// never advertises again. The join handle carries that, and the
-    /// supervisor restarts *that tenant*, never the process: one tenant's
-    /// panic must not be another tenant's outage (§4.4).
+    /// never advertises again. The join handle carries that, and
+    /// [`has_failed_loop`](Self::has_failed_loop) is what the supervisor asks
+    /// so it can restart *that tenant*, never the process: one tenant's panic
+    /// must not be another tenant's outage (§4.4).
     fn spawn_loop<F, Fut>(&mut self, name: &'static str, node: &Node, run: F)
     where
         F: FnOnce(Node, BoxShutdown) -> Fut + Send + 'static,
@@ -470,6 +537,7 @@ impl Tenant {
         let Some(node) = self.node.clone() else {
             return Ok(());
         };
+        self.check_registration(&node, network).await;
         spaces::ensure_replicas(&node, network).await?;
         // A rotation failure is not a replication failure: the tenant keeps
         // holding and serving everything it held a moment ago, and the next
@@ -483,6 +551,59 @@ impl Tenant {
             }
         }
         Ok(())
+    }
+
+    /// Compares the key the control plane says this slot holds against the
+    /// one this node is actually signing with.
+    ///
+    /// The control plane computes this field carefully — only the `active`
+    /// key is reported, and a fully revoked device reports none — and until
+    /// now nothing read it, so the shard could never notice that its
+    /// registration had been displaced. That is not hypothetical: the
+    /// `cloud-<n>` label was reachable from customer-facing device routes,
+    /// and a member who added their own key to the slot would leave this node
+    /// serving under a key the zone no longer names while it went on
+    /// reporting itself healthy.
+    ///
+    /// Reported rather than acted on. Re-registering would be a fight with
+    /// whoever changed it, and initializing a new identity on a mismatch
+    /// would turn one bad answer into a replaced node. An operator wants to
+    /// know; the loud log and the reconcile-failure counter are how.
+    async fn check_registration(&self, node: &Node, network: &HostedNetwork) {
+        let held = match node.device_keys() {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::warn!(tenant = %network.key(), %error, "could not read this node's keys");
+                return;
+            }
+        };
+        let active = held
+            .iter()
+            .find(|key| key.state == synch_store::KeyState::Active)
+            .map(|key| key.node_id.to_z32());
+        match (&network.device, &active) {
+            // The ordinary case, and the only quiet one.
+            (Some(device), Some(active)) if &device.nk == active => {}
+            (Some(device), Some(active)) => tracing::error!(
+                tenant = %network.key(),
+                control_plane = %device.nk,
+                held = %active,
+                state = %device.state,
+                "this slot's registered key is not the key this node signs with: \
+                 the registration has been displaced"
+            ),
+            (None, Some(_)) => tracing::error!(
+                tenant = %network.key(),
+                "the control plane holds no live key for this slot; \
+                 this node is serving under a key the zone does not name"
+            ),
+            (Some(device), None) => tracing::error!(
+                tenant = %network.key(),
+                control_plane = %device.nk,
+                "this node holds no active key while the control plane names one"
+            ),
+            (None, None) => {}
+        }
     }
 
     /// What this tenant holds, for the metering heartbeat (§3.3).

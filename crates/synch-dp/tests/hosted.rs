@@ -24,6 +24,11 @@ use synch_engine::{Node, NodeConfig};
 use synch_net::sim::SimZone;
 use synch_net::{DnssecResolver, RekorPolicy, ResolverOptions};
 
+/// A fact the tenant learns only after it is up, so the restore assertion
+/// cannot pass on `Node::init`'s output alone.
+const PROBE_KEY: &str = "hosted.probe";
+const PROBE_VALUE: &str = "written-while-running";
+
 const APEX: &str = "prod.acme.example";
 const ORG: &str = "acme";
 const NETWORK: &str = "prod";
@@ -232,9 +237,15 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     // `provision` restores nothing, finds the directory already initialized
     // (the crash-between-init-and-register path), registers the key it holds,
     // and opens.
-    let mut tenant = Tenant::provision(&config, &control, Some(resolver.clone()), network.clone())
-        .await
-        .expect("the tenant provisions");
+    let mut tenant = Tenant::provision(
+        &config,
+        &control,
+        Some(resolver.clone()),
+        network.clone(),
+        std::sync::Arc::new(synch_dp::metrics::Metrics::default()),
+    )
+    .await
+    .expect("the tenant provisions");
     assert_eq!(
         cp_state.lock().unwrap().registered.as_deref(),
         Some(tenant_key.to_z32().as_str()),
@@ -353,6 +364,18 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     assert_eq!(&read[..], b"the only copy");
 
     // ---- the database replica stream is real ---------------------------
+    // A marker written *after* provisioning, so the restore below proves the
+    // replicator shipped something the tenant learned while it was running.
+    // Asserting only on the device key would pass vacuously: `Node::init`
+    // wrote that before the replicator existed, so the very first snapshot
+    // carries it whether or not a single tick ever worked.
+    {
+        let node = hosted.clone();
+        synch_core::offload(move || node.store().set_config(PROBE_KEY, PROBE_VALUE))
+            .await
+            .expect("writing the probe");
+    }
+
     // Drain first: the tail ship is the last thing a draining tenant does
     // (§4.6), so this asserts on the stream the tenant would actually leave
     // behind rather than on whatever a tick happened to have sent by now.
@@ -391,6 +414,21 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     assert_eq!(
         restored_key, tenant_key,
         "a restored tenant is the same device, not a new one"
+    );
+    let restored_probe = {
+        let dir = restored.path().to_path_buf();
+        synch_core::offload(move || {
+            let store = synch_store::Store::open(&dir)?;
+            store.config(PROBE_KEY)
+        })
+        .await
+        .expect("reading the restored probe")
+    };
+    assert_eq!(
+        restored_probe.as_deref(),
+        Some(PROBE_VALUE),
+        "the stream must carry what the tenant learned while it was running, \
+         not just the state `Node::init` left behind"
     );
 
     hosted_teardown(cp_server, zone_server);

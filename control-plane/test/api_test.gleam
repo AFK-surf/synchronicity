@@ -3226,6 +3226,17 @@ fn soa_serial(h: Harness) -> Int {
   meta.soa_serial
 }
 
+/// How many networks are queued for collection — the instruction itself,
+/// as distinct from `collect_rows`, which counts the history of collections
+/// that already happened.
+fn queued_rows(h: Harness) -> List(List(sqlite.Value)) {
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(conn, "SELECT count(*) FROM cloud_collect_queue", [])
+  sqlite.close(conn)
+  rows
+}
+
 fn collect_rows(h: Harness) -> List(List(sqlite.Value)) {
   let conn = read_db(h)
   let assert Ok(rows) =
@@ -3322,6 +3333,158 @@ pub fn collecting_storage_clears_the_network_from_the_list_test() {
   assert string.contains(simulate.read_body(again), "\"collected\":false")
 
   assert collect_rows(h) == [[sqlite.Int(1)]]
+}
+
+/// The hold is enforced on the *write*, not only in the list.
+///
+/// The `collect` list withholding a network is a hint; this is the call that
+/// destroys the bytes. A replayed instruction, a fleet bug, or a leaked
+/// `synchdp_` token must not be able to collect inside the customer's window
+/// to change their mind — the authority that owns the clock checks it here.
+pub fn collecting_inside_the_retention_hold_is_refused_test() {
+  let h = harness()
+  org_named(h, "acme")
+  offboarded(h, "acme", "prod")
+  let token = mint_dataplane(h, "fleet")
+
+  // One second in: the list correctly offers nothing...
+  assert !string.contains(dp_document(h, token), "prod")
+  // ...and the write refuses too, which is the half that was missing.
+  let early = call(h, keyed(token, Delete, "/dp/v1/networks/acme/prod/storage"))
+  assert early.status == 409
+  assert string.contains(simulate.read_body(early), "retention-hold")
+  // The clock is untouched, so the collection still happens on time.
+  assert queued_rows(h) == [[sqlite.Int(1)]]
+
+  age_hold(h, "prod", 31 * 86_400)
+  assert call(h, keyed(token, Delete, "/dp/v1/networks/acme/prod/storage")).status
+    == 200
+}
+
+/// Deleting a network does not delete the instruction to collect its bytes.
+///
+/// The clock used to live on the network row, so the ordinary delete button
+/// took it — and the fleet then held that customer's storage for ever, which
+/// is the exact bug the collect list exists to fix. The queue outlives the
+/// row because the bytes do.
+pub fn deleting_a_hosted_network_still_queues_its_storage_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+
+  // A heartbeat first: its row is a child of the network, and an un-cascaded
+  // foreign key used to make every hosted network permanently undeletable.
+  let token = mint_dataplane(h, "fleet")
+  assert call_json(
+      h,
+      Put,
+      "/api/orgs/acme/networks/prod/cloud-hosting/enabled",
+      json.object([#("enabled", json.bool(True))]),
+    ).status
+    == 200
+
+  let deleted =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/networks/prod",
+      json.object([#("confirm", json.string("prod"))]),
+    )
+  assert deleted.status == 200
+
+  // The network is gone and the instruction is not.
+  assert queued_rows(h) == [[sqlite.Int(1)]]
+  age_hold(h, "prod", 31 * 86_400)
+  assert string.contains(dp_document(h, token), "prod")
+}
+
+/// Disabling hosting on a network that never had it starts no clock.
+///
+/// Otherwise a dashboard syncing its initial state, or an IaC provider
+/// writing `cloud_hosted = false` explicitly, has the fleet delete prefixes
+/// thirty days later for a network that was never hosted.
+pub fn disabling_a_never_hosted_network_queues_nothing_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", False) == 200
+  assert queued_rows(h) == [[sqlite.Int(0)]]
+}
+
+/// The reserved namespace is guarded on every route that touches an existing
+/// device, not only on creation.
+///
+/// Guarding creation alone guarded nothing: a member who can add a key to the
+/// hosted device seizes the identity an operator-run pod holds the customer's
+/// replica under, and an admin who can delete it destroys that identity —
+/// both just as thoroughly as one who could have created the label.
+pub fn a_customer_cannot_touch_the_hosted_slots_device_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+
+  let token = mint_dataplane(h, "fleet")
+  let registered =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    )
+  assert registered.status == 200
+
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(device_id)]]) =
+    sqlite.query(conn, "SELECT id FROM devices WHERE label = ?", [
+      sqlite.Text("cloud-1"),
+    ])
+  sqlite.close(conn)
+
+  // Adding a key to it: the takeover.
+  let seized =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/devices/" <> device_id <> "/keys",
+      json.object([#("nk", json.string(nk()))]),
+    )
+  assert seized.status == 409
+  assert string.contains(simulate.read_body(seized), "reserved-label")
+
+  // Deleting it: the destruction.
+  let removed =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/devices/" <> device_id,
+      json.object([#("confirm", json.string("cloud-1"))]),
+    )
+  assert removed.status == 409
+  assert string.contains(simulate.read_body(removed), "reserved-label")
 }
 
 /// Collecting a live tenant's storage is the catastrophic operation in this

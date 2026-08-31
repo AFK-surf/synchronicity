@@ -20,6 +20,17 @@ pub struct Metrics {
     generation: AtomicU64,
     collected: AtomicU64,
     per_tenant: Mutex<BTreeMap<String, Status>>,
+    /// Per tenant: how many consecutive ship attempts have failed.
+    ///
+    /// The one number that makes a stalled replica stream visible. Without it
+    /// a tenant whose uploads are all failing — a bucket policy that grants
+    /// `ListBucket` but denies `PutObject` on `db/` is enough — goes on
+    /// reporting `running`, heartbeating healthy held-byte counts, and
+    /// logging one warning a second that nothing alerts on, until a
+    /// reschedule finds an empty stream and mints a fresh identity over the
+    /// network. §10 promised an operator could alert on this; this is what
+    /// they alert on.
+    replication_failures: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
@@ -54,6 +65,32 @@ impl Metrics {
     pub fn tenant_status(&self, key: &str, status: &Status) {
         if let Ok(mut per_tenant) = self.per_tenant.lock() {
             per_tenant.insert(key.to_string(), status.clone());
+        }
+    }
+
+    /// Records the outcome of one tenant's ship attempt.
+    ///
+    /// A success resets the run to zero rather than counting, because the
+    /// question an operator asks is "is this stream stuck *now*", not "has it
+    /// ever failed".
+    pub fn replication_attempt(&self, key: &str, ok: bool) {
+        if let Ok(mut failures) = self.replication_failures.lock() {
+            let run = failures.entry(key.to_string()).or_insert(0);
+            *run = if ok { 0 } else { run.saturating_add(1) };
+        }
+    }
+
+    /// Forgets a tenant this shard no longer runs.
+    ///
+    /// Called on every drain. Without it a pod that has rebalanced a few
+    /// times keeps exporting `held_bytes` for tenants whose bucket prefix has
+    /// since been deleted, and both maps grow for the life of the process.
+    pub fn forget_tenant(&self, key: &str) {
+        if let Ok(mut per_tenant) = self.per_tenant.lock() {
+            per_tenant.remove(key);
+        }
+        if let Ok(mut failures) = self.replication_failures.lock() {
+            failures.remove(key);
         }
     }
 
@@ -99,6 +136,21 @@ impl Metrics {
             "synch_dp_storage_collected {}\n",
             self.collected.load(Ordering::Relaxed)
         ));
+
+        let failures = match self.replication_failures.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        out.push_str(
+            "# HELP synch_dp_replication_failures Consecutive failed ship attempts for a tenant.\n",
+        );
+        out.push_str("# TYPE synch_dp_replication_failures gauge\n");
+        for (key, run) in &failures {
+            let (org, network) = split_key(key);
+            out.push_str(&format!(
+                "synch_dp_replication_failures{{org=\"{org}\",network=\"{network}\"}} {run}\n"
+            ));
+        }
 
         let per_tenant = match self.per_tenant.lock() {
             Ok(guard) => guard.clone(),

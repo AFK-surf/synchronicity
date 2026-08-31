@@ -199,14 +199,26 @@ impl Replicator {
         // the data directory needs the connection actually gone, not merely
         // asked to go.
         if let Some(worker) = self.worker.take() {
-            if tokio::task::spawn_blocking(move || worker.join())
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    tenant = %self.tenant,
+            // Two failures, and they are different things: the blocking task
+            // itself failing, and the *thread* having panicked. Testing only
+            // the first — as this did — reports a panicked replica thread as
+            // a clean close, which is the one outcome a caller must not be
+            // told, since it means the tail was never shipped.
+            match tokio::task::spawn_blocking(move || worker.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        tenant = %self.tenant,
+                        "the replication thread panicked; its database was not closed cleanly"
+                    );
+                    return Err(DpError::Engine(
+                        "the replication thread panicked".to_string(),
+                    ));
+                }
+                Err(error) => tracing::warn!(
+                    tenant = %self.tenant, %error,
                     "could not wait for the replication thread to finish"
-                );
+                ),
             }
         }
         tracing::debug!(tenant = %self.tenant, "closed the tenant's replicated database");

@@ -880,7 +880,7 @@ None of the engine's replication, storage, or membership code changes.
 | **rolling shard-count change** | **two pods may own one tenant for a reconcile interval and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: change `SYNCH_DP_SHARDS` as a stop-then-start, never a rolling update (§5.3, §7.2)** |
 | pod killed without grace | up to one replication interval of DB writes unshipped; replica behind, never ahead | restore + re-sync closes the gap, §5.3 |
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
-| budget exhausted | admission stops; `held_back` visible in panel and heartbeat; nothing evicted | org raises plan; acquisition resumes |
+| budget exhausted | admission stops; the engine's own `held_back` shows in the replication panel; nothing evicted. The metering heartbeat does **not** carry it — `wanted` climbing against a flat `held_bytes` is what an operator reads instead | org raises plan; acquisition resumes |
 | disk pressure on shard | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
 
 ---
@@ -942,9 +942,22 @@ None of the engine's replication, storage, or membership code changes.
 
 ## 10. Observability and metering
 
-- Prometheus per shard, labelled `{org, network}`: tenant state, held
-  roots/bytes, wants outstanding, budget headroom, acquisition and release
-  rates, identify latency, loop restarts, poll generation age.
+- Prometheus per shard. What is actually exported today, rather than a
+  wish list: `synch_dp_tenants_running` / `_parked`,
+  `synch_dp_poll_failures`, `synch_dp_reconcile_failures`,
+  `synch_dp_desired_generation`, `synch_dp_storage_collected`, and — per
+  tenant, labelled `{org, network}` — `synch_dp_held_bytes`,
+  `synch_dp_held_roots`, `synch_dp_wanted` and
+  `synch_dp_replication_failures`.
+- **`synch_dp_replication_failures` is the one to alert on**, and it is
+  here because an earlier draft promised an operator could alert on a
+  stalled stream while exporting nothing that showed one. It counts a
+  tenant's *consecutive* failed ship attempts and resets on success, so it
+  answers "is this stream stuck now". A bucket policy granting
+  `ListBucket` but denying `PutObject` on `db/` is enough to make a tenant
+  fail every ship while reporting `running` and heartbeating healthy
+  held-byte counts, until a reschedule finds an empty stream. Anything
+  above zero for more than a few scrapes is that.
 - The **stored heartbeat** (§3.3) is the billing record: held bytes per
   network, written by the tenant that holds them, timestamped, surviving
   the tenant being down (a stale heartbeat *is* the alert).

@@ -24,6 +24,8 @@ pub struct Reconciler {
     tenants: HashMap<String, Tenant>,
     /// Networks that failed to provision, and when to try again.
     parked: HashMap<String, std::time::Instant>,
+    /// Consecutive fresh polls that have answered "nothing on this shard".
+    empty_answers: u32,
     etag: Option<String>,
     /// The last document this shard successfully acted on.
     ///
@@ -34,6 +36,15 @@ pub struct Reconciler {
     last: Option<Desired>,
     metrics: Arc<Metrics>,
 }
+
+/// How many consecutive fresh polls must agree before a shard tears itself
+/// down.
+///
+/// Three, at the poll interval, so a transient truncation or a
+/// half-configured shard costs minutes rather than a shard's worth of data
+/// directories — and a genuine offboarding of the last network still
+/// completes without an operator.
+const EMPTY_SET_CONFIRMATIONS: u32 = 3;
 
 impl Reconciler {
     /// Builds a reconciler. The resolver is shared by every tenant: it holds
@@ -53,6 +64,7 @@ impl Reconciler {
             resolver,
             tenants: HashMap::new(),
             parked: HashMap::new(),
+            empty_answers: 0,
             etag: None,
             last: None,
             metrics,
@@ -97,35 +109,79 @@ impl Reconciler {
         let (desired, fresh) = self.desired().await?;
         self.metrics.observed_generation(desired.generation);
 
-        // An empty set while tenants are running is the shape of every way
-        // this can go wrong at once — a stale cache, a truncated answer, a
-        // misconfigured shard. A real offboarding empties the set one network
-        // at a time and is in no hurry, so refusing to act on a wholesale
-        // emptying costs a poll interval and buys back the case where this
-        // deletes a shard's worth of data directories.
-        if desired.networks.is_empty() && !self.tenants.is_empty() {
-            tracing::error!(
-                tenants = self.tenants.len(),
-                "refusing to act on an empty desired set while tenants are running"
-            );
-            self.metrics.reconcile_failed();
-            return Ok(());
-        }
-
+        // Names first, before anything derives a path or a delete prefix from
+        // them. A refused entry is dropped rather than fatal: one malformed
+        // network must not stop a shard serving every other one.
         let collectable: Vec<crate::control::Collectable> = desired
             .collect
             .into_iter()
+            .filter(|network| {
+                network.names_are_safe() || {
+                    tracing::error!(
+                        org = %network.org, network = %network.network,
+                        "refusing a collect entry whose names are not safe to build a prefix from"
+                    );
+                    false
+                }
+            })
             .filter(|network| self.config.serves(&network.key()))
             .collect();
         let mine: Vec<HostedNetwork> = desired
             .networks
             .into_iter()
+            .filter(|network| {
+                network.names_are_safe() || {
+                    tracing::error!(
+                        org = %network.org, network = %network.network,
+                        "refusing a hosted network whose names are not safe to build a path from"
+                    );
+                    false
+                }
+            })
             .filter(|network| self.config.serves(&network.key()))
             .collect();
         let wanted: HashMap<String, HostedNetwork> = mine
             .into_iter()
             .map(|network| (network.key(), network))
             .collect();
+
+        // An empty set while tenants are running is the shape of every way
+        // this can go wrong at once — a stale cache, a truncated answer, a
+        // misconfigured shard — so it is not acted on until several
+        // consecutive *fresh* answers have agreed.
+        //
+        // Two things about the shape of this guard were wrong before and are
+        // worth naming. It is asked of the set this shard actually serves,
+        // not the fleet-wide one: a document that still lists networks but
+        // none of *this* shard's is the same wholesale emptying and used to
+        // walk straight past. And it *expires*: an earlier version returned
+        // early for ever, so a deployment whose last hosted network was
+        // legitimately offboarded held that tenant, its directory and its
+        // bucket prefix indefinitely — never draining it, never heartbeating,
+        // and never running the collection sweep, which is the exact bug §6
+        // exists to fix. Refusing costs a few poll intervals; refusing
+        // permanently costs the customer their offboarding.
+        if wanted.is_empty() && !self.tenants.is_empty() {
+            if fresh {
+                self.empty_answers = self.empty_answers.saturating_add(1);
+            }
+            if self.empty_answers < EMPTY_SET_CONFIRMATIONS {
+                tracing::error!(
+                    tenants = self.tenants.len(),
+                    confirmations = self.empty_answers,
+                    needed = EMPTY_SET_CONFIRMATIONS,
+                    "an empty desired set while tenants are running; waiting for it to be confirmed"
+                );
+                self.metrics.reconcile_failed();
+                return Ok(());
+            }
+            tracing::warn!(
+                tenants = self.tenants.len(),
+                "an empty desired set confirmed; draining every tenant on this shard"
+            );
+        } else {
+            self.empty_answers = 0;
+        }
 
         // Retire what is no longer wanted. Reaching here at all means a
         // *successful* poll said so — an unreachable control plane leaves the
@@ -149,6 +205,36 @@ impl Reconciler {
                 }
             }
             self.parked.remove(&key);
+            self.metrics.forget_tenant(&key);
+        }
+
+        // Parked entries for networks nobody wants any more. A network that
+        // never provisioned successfully is by definition not in `tenants`,
+        // so the loop above never reaches it: without this, one org disabling
+        // hosting on a network this shard could never open leaves an entry
+        // that outlives the process and keeps `synch_dp_tenants_parked` over-
+        // reporting for ever.
+        self.parked.retain(|key, _| wanted.contains_key(key));
+
+        // A tenant whose standing loops have died is re-provisioned rather
+        // than converged. It looks healthy from every angle that matters
+        // externally — the node is open, the heartbeat still reports held
+        // bytes — while it has silently stopped publishing, or stopped
+        // renewing the membership lease that is the tenant boundary itself.
+        // Draining and re-provisioning is the whole of the restart, and it is
+        // per tenant: one panicking loop must not be another tenant's outage.
+        let failed: Vec<String> = self
+            .tenants
+            .iter()
+            .filter(|(_, tenant)| tenant.has_failed_loop())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in failed {
+            if let Some(tenant) = self.tenants.remove(&key) {
+                tracing::error!(tenant = %key, "a standing loop stopped; restarting the tenant");
+                self.metrics.reconcile_failed();
+                tenant.drain().await;
+            }
         }
 
         for (key, network) in wanted {
@@ -189,7 +275,15 @@ impl Reconciler {
                 return;
             }
         }
-        match Tenant::provision(&self.config, &self.control, self.resolver.clone(), network).await {
+        match Tenant::provision(
+            &self.config,
+            &self.control,
+            self.resolver.clone(),
+            network,
+            self.metrics.clone(),
+        )
+        .await
+        {
             Ok(tenant) => {
                 self.parked.remove(&key);
                 self.tenants.insert(key, tenant);
@@ -398,6 +492,108 @@ mod tests {
         );
         let cached = reconciler.cached().await.unwrap();
         assert!(cached.networks.is_empty());
+    }
+
+    /// The fail-static promise, exercised through the real entry point
+    /// rather than by calling the cache directly: an unreachable control
+    /// plane leaves the desired set exactly as it was, and says so.
+    #[tokio::test]
+    async fn an_unreachable_control_plane_holds_the_last_known_set() {
+        let objects = ObjectStore::memory().unwrap();
+        let config = test_config();
+        let cached = Desired {
+            generation: 7,
+            collect: Vec::new(),
+            networks: vec![HostedNetwork {
+                org: "acme".into(),
+                network: "prod".into(),
+                domain: "acme.example".into(),
+                budget_bytes: 0,
+                retention: "current".into(),
+                device: None,
+            }],
+        };
+        objects
+            .put(&config.desired_key(), serde_json::to_vec(&cached).unwrap())
+            .await
+            .unwrap();
+
+        let mut reconciler = Reconciler::new(
+            config,
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            objects,
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let (desired, fresh) = reconciler.desired().await.unwrap();
+        assert_eq!(desired, cached, "the cached set is what a failed poll sees");
+        assert!(
+            !fresh,
+            "and it is never fresh, so it can never authorize a collection"
+        );
+    }
+
+    /// A wholesale emptying is not acted on until several *fresh* answers
+    /// agree — and then it is. Both halves matter: refusing once protects a
+    /// shard from a truncated answer, refusing for ever would strand the last
+    /// offboarded tenant's storage, which is the bug §6 exists to fix.
+    #[tokio::test]
+    async fn an_empty_set_is_confirmed_before_it_is_acted_on() {
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        // Nothing running: an empty set is unremarkable and never counts.
+        for _ in 0..EMPTY_SET_CONFIRMATIONS + 2 {
+            reconciler.tick().await.unwrap();
+        }
+        assert_eq!(
+            reconciler.empty_answers, 0,
+            "an empty set with no tenants is not a wholesale emptying"
+        );
+    }
+
+    /// Names that would escape the base directory, or collapse two tenants
+    /// onto one prefix, are dropped before anything builds a path out of
+    /// them — and the rest of the document is still served.
+    #[test]
+    fn names_that_could_escape_a_prefix_are_refused() {
+        let safe = HostedNetwork {
+            org: "acme".into(),
+            network: "prod".into(),
+            domain: "acme.example".into(),
+            budget_bytes: 0,
+            retention: "current".into(),
+            device: None,
+        };
+        assert!(safe.names_are_safe());
+        for (org, network) in [
+            ("acme", "prod/../staging"),
+            ("..", "prod"),
+            ("/etc", "prod"),
+            ("acme", ""),
+            ("ACME", "prod"),
+            ("-acme", "prod"),
+        ] {
+            let unsafe_network = HostedNetwork {
+                org: org.into(),
+                network: network.into(),
+                ..safe.clone()
+            };
+            assert!(
+                !unsafe_network.names_are_safe(),
+                "{org}/{network} should be refused"
+            );
+        }
+        // The collect list is the one that names bytes a sweep deletes.
+        assert!(!crate::control::Collectable {
+            org: "acme".into(),
+            network: "..".into(),
+        }
+        .names_are_safe());
     }
 
     fn test_config() -> DpConfig {

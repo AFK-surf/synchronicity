@@ -49,6 +49,38 @@ impl HostedNetwork {
         format!("{}/{}", self.org, self.network)
     }
 
+    /// Whether this network's names are safe to build paths and prefixes out
+    /// of.
+    ///
+    /// These two strings become a data directory (`Path::join`), a CAS root,
+    /// and the prefix a `remove_prefix` sweep deletes — the two destructive
+    /// operations in the service. The control plane validates both as DNS
+    /// labels at creation, so this is a second lock rather than the only one;
+    /// it exists because this module's contract is that a response is data
+    /// this service acts on rather than trusts, and a `..` or a `/` arriving
+    /// here would collapse two tenants onto one directory and one stream, or
+    /// escape the base directory outright.
+    pub fn names_are_safe(&self) -> bool {
+        safe_name(&self.org) && safe_name(&self.network)
+    }
+}
+
+/// Whether one path component from the control plane can be trusted.
+///
+/// Deliberately stricter than "no slashes": the same DNS-label grammar the
+/// control plane enforces, so anything surprising is refused rather than
+/// reasoned about.
+fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+impl HostedNetwork {
     /// The retention policy this network asks for.
     ///
     /// An unknown value is treated as `current` rather than refused: the
@@ -92,6 +124,14 @@ impl Collectable {
     /// The key it is filed under, matching [`HostedNetwork::key`].
     pub fn key(&self) -> String {
         format!("{}/{}", self.org, self.network)
+    }
+
+    /// Whether these names are safe to delete a prefix by.
+    ///
+    /// The stakes here are the highest in the service: this pair names the
+    /// bytes a sweep removes. See [`HostedNetwork::names_are_safe`].
+    pub fn names_are_safe(&self) -> bool {
+        safe_name(&self.org) && safe_name(&self.network)
     }
 }
 
@@ -261,7 +301,11 @@ impl ControlPlane {
             return Ok(response);
         }
         let body = response.text().await.unwrap_or_default();
-        Err(DpError::Control(format!("{status}: {}", body.trim())))
+        let detail = format!("{status}: {}", body.trim());
+        match status {
+            reqwest::StatusCode::NOT_FOUND => Err(DpError::ControlNotFound(detail)),
+            _ => Err(DpError::Control(detail)),
+        }
     }
 }
 

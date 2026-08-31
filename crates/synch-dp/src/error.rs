@@ -18,6 +18,15 @@ pub enum DpError {
     /// The control plane refused, or could not be reached.
     #[error("control plane: {0}")]
     Control(String),
+    /// The control plane answered 404 for something this service named.
+    ///
+    /// Its own variant because absence is frequently the *desired* end state
+    /// rather than a failure — a key this service is asking to retire, and
+    /// which the control plane says does not exist, is a key that is retired.
+    /// Collapsing that into `Control` is what turns one lost local write into
+    /// a rotation that can never finish.
+    #[error("control plane: not found: {0}")]
+    ControlNotFound(String),
     /// The store or the node refused.
     #[error("node: {0}")]
     Engine(String),
@@ -35,6 +44,11 @@ impl DpError {
     /// Wraps a store failure.
     pub fn store(error: impl std::fmt::Display) -> Self {
         DpError::Engine(error.to_string())
+    }
+
+    /// Whether this is the control plane saying "no such thing".
+    pub fn is_control_not_found(&self) -> bool {
+        matches!(self, DpError::ControlNotFound(_))
     }
 }
 

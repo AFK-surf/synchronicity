@@ -94,6 +94,10 @@ pub async fn tick(
     config: &DpConfig,
     now_ns: i64,
 ) -> Result<Outcome> {
+    // Before either: repair a rotation that activated and then lost its
+    // deadline. Nothing downstream would ever notice it — see
+    // `adopt_orphan_retirement`.
+    adopt_orphan_retirement(node, network, config, now_ns).await?;
     if complete_if_due(node, control, network, now_ns).await? {
         return Ok(Outcome::Completed);
     }
@@ -101,6 +105,73 @@ pub async fn tick(
         return Ok(Outcome::Started);
     }
     Ok(Outcome::Idle)
+}
+
+/// Gives a deadline to a retirement that has one owed and none recorded.
+///
+/// `start_if_due` activates the new key and *then* writes the deadline, and
+/// those are two commits. A pod that dies in between — or one whose
+/// `set_config` fails — leaves the node holding a key in
+/// [`Retiring`](synch_store::KeyState::Retiring) with nothing scheduled to
+/// finish it, and neither half of `tick` can see it: `complete_if_due` finds
+/// no deadline and returns, `start_if_due` finds a freshly created active key
+/// and returns. The rotation is stuck open for ever, and a quarter later the
+/// next one is refused because the label already holds two live keys.
+///
+/// Writing the deadline the moment a retiring key is found with none closes
+/// that. It cannot fire spuriously: only `activate_key` produces a `Retiring`
+/// key, so the state it repairs is one an interrupted rotation really did
+/// create, and the retirement it schedules is the one that was already owed.
+///
+/// The order is deliberately *not* fixed by writing the deadline before
+/// activating instead. That trades this hole for a worse one: a deadline
+/// recorded against a key that is still `Active` would have `complete_if_due`
+/// retire the key the node is signing with.
+async fn adopt_orphan_retirement(
+    node: &Node,
+    network: &HostedNetwork,
+    config: &DpConfig,
+    now_ns: i64,
+) -> Result<bool> {
+    let recorded = {
+        let node = node.clone();
+        synch_core::offload(move || {
+            let due = node
+                .store()
+                .config(RETIRE_DUE_KEY)?
+                .filter(|v| !v.is_empty());
+            Ok::<_, synch_store::StoreError>(due)
+        })
+        .await?
+    };
+    if recorded.is_some() {
+        return Ok(false);
+    }
+    let Some(orphan) = node
+        .device_keys()?
+        .into_iter()
+        .find(|key| key.state == synch_store::KeyState::Retiring)
+    else {
+        return Ok(false);
+    };
+    let retiring = orphan.node_id.to_z32();
+    let due = now_ns.saturating_add(config.retire_after.as_nanos() as i64);
+    tracing::warn!(
+        tenant = %network.key(),
+        key = %retiring,
+        "found a retiring key with no deadline; a rotation was interrupted \
+         after activation — scheduling its retirement now"
+    );
+    {
+        let node = node.clone();
+        let retiring = retiring.clone();
+        synch_core::offload(move || {
+            node.store().set_config(RETIRE_DUE_KEY, &due.to_string())?;
+            node.store().set_config(RETIRING_KEY, &retiring)
+        })
+        .await?;
+    }
+    Ok(true)
 }
 
 /// Finishes a rotation whose overlap window has run.
@@ -149,9 +220,24 @@ async fn complete_if_due(
     if let Some(key) = held.iter().find(|key| key.node_id.to_z32() == retiring) {
         node.retire_key(&key.node_id).await?;
     }
-    control
+    // A 404 here is the desired end state, not a failure. The three steps are
+    // not one transaction, so a completion that revoked the key and then lost
+    // the local write comes back through here with the control plane already
+    // holding nothing under that `nk` — and treating "it is already gone" as
+    // an error is what would leave `clear_pending` forever unreachable and
+    // the tenant unable to rotate again.
+    match control
         .retire_key(&network.org, &network.network, &retiring, true)
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(error) if error.is_control_not_found() => tracing::info!(
+            tenant = %network.key(),
+            key = %retiring,
+            "the control plane already holds no live key here; finishing the rotation"
+        ),
+        Err(error) => return Err(error),
+    }
     clear_pending(node).await?;
     tracing::info!(
         tenant = %network.key(),
