@@ -17,9 +17,9 @@ can embed a full node the same way") is exactly the promise this design
 cashes. The control plane (the Gleam service under `control-plane/`) remains
 the authority and the API; the data plane is cattle that polls it.
 
-Section references (§) are to DESIGN.md unless prefixed. `SERVERLESS §` is
-docs/SERVERLESS.md, `REPLICATION` is docs/REPLICATION.md, `CP README` is
-control-plane/README.md.
+Section references (§) are to this document unless prefixed. `DESIGN §` is
+DESIGN.md, `SERVERLESS §` is docs/SERVERLESS.md, `REPLICATION` is
+docs/REPLICATION.md, `CP README` is control-plane/README.md.
 
 ---
 
@@ -81,10 +81,15 @@ The tenant contract, end to end:
    `_synchronicity.<network>.<org>.<base>`. Customer nodes admit it at their
    next zone refresh, exactly as they admit any new member.
 3. The hosted node replicates every space on the network with a cloud CAS
-   behind it. It shows up in the existing replication panel (CP README §
-   cloud browse: the "what does each node replicate" question is asked of
-   every attached daemon, and the hosted node attaches like any daemon), so
-   the org can watch coverage converge without any new UI.
+   behind it. Once the org has cloud **browse** enabled, it also shows up
+   in the existing replication panel (CP README § cloud browse: the "what
+   does each node replicate" question is asked of every attached daemon,
+   and the hosted node attaches like any daemon), so the org can watch
+   coverage converge without any new UI. The two toggles stay independent
+   and independently fail-closed: hosting without browse replicates but is
+   observable only through the status heartbeat (§3.3); the attach
+   endpoint refuses a browse-disabled network's tunnel today (`browse-
+   disabled`), hosted device or not, and this design does not change that.
 4. Disabling the toggle removes the device from the network. The zone
    shrinks at the next publish, customer nodes drop the binding when it
    expires, the data plane drains and retires the tenant, and after a
@@ -166,7 +171,7 @@ CREATE TABLE dataplane_keys (
 
 ### 3.3 The data-plane API
 
-Three routes under `/dp/v1`, all requiring the data-plane principal.
+Four routes under `/dp/v1`, all requiring the data-plane principal.
 
 **`GET /dp/v1/networks`** — the desired-state document. Every network of
 every org with `cloud_hosted = 1`:
@@ -206,10 +211,17 @@ Creates the `devices`, `device_keys` (`state='active'`), and
 `network_devices` rows in one `zone_mutation` transaction — the same
 transaction shape as `join_device`, so **the commit is the publish** and the
 zone names the key immediately. Re-`PUT` with the same `(label, nk)` is a
-200 no-op. `PUT` with the same label and a *new* key opens the standard §3.4
-rotation window (two keys under one label) when the old key is `active`, and
-replaces outright when the old key is already `revoked` — which is the
-recovery path after a data-plane disk loss (§6).
+200 no-op. `PUT` with the same label and a *new* key opens the standard
+rotation window (DESIGN §3.4: two keys under one label) when the old key is
+`active`, and replaces outright when the old key is already `revoked` —
+which is the recovery path after a data-plane disk loss (§6). A rotation is
+*completed* by the fourth route below; nothing completes it implicitly.
+
+The body may additionally carry the zone's optional `relay` and `addr`
+dialing hints (the fields `join_device` already takes); v1 leaves them
+empty — an ephemeral pod has no stable address to publish, the hosted node
+initiates its own fetches, and inbound reaches it through iroh discovery
+and relays like any NAT-bound peer.
 
 Constraints inherited from the schema and enforced here: `label` must match
 `cloud-[0-9]+` (the reserved namespace, §3.4), one live `nk` binds one
@@ -220,6 +232,16 @@ rotation window, `zone/build.gleam` validation).
 seeds one system user (`system-dataplane`, no email, no sessions possible)
 that these rows reference, so no human's id is impersonated and the audit
 trail names the service.
+
+**`DELETE /dp/v1/networks/:org/:net/device/keys/:nk`** — completes a
+rotation by retiring the named key (`state='retiring'`, then the ordinary
+retirement), or revokes it outright with `?revoke=1` when the data plane
+has reason to distrust it. Confined to keys of `cloud-*` devices in that
+network; refuses the last `active` key unless revoking, so the route
+cannot orphan a healthy tenant. Without this route a rotation could be
+opened (the `PUT` above) but never closed — the zone would carry two keys
+per label forever, which the zone validation caps but the design should
+never lean on.
 
 **`POST /dp/v1/networks/:org/:net/status`** — the metering heartbeat, sent
 per tenant every few minutes:
@@ -239,11 +261,16 @@ the tunnel; the stored row is for invoices and alerts.
 
 Device labels matching `cloud-[0-9]+` are reserved: `join_device` and the
 dashboard refuse them for customers (409 `reserved-label`), and only the
-data-plane principal may create them. The suffix is the **shard ordinal**
-(§7), so a network hosted redundantly by two shards carries `cloud-1` and
-`cloud-2` as two ordinary devices — which is all hosting redundancy has to
-be, because two replicas of one network is already a thing the protocol
-does.
+data-plane principal may create them. The suffix is the **hosting slot**,
+*not* the shard: v1 hosts every network once, in slot 1, so the device is
+always `cloud-1`, whichever shard happens to run it. A slot is a durable
+identity and shards are interchangeable pods — the same distinction that
+keys the DB replica stream by network rather than by shard (§5.3), and it
+is what lets a tenant move between shards (§7.2) with no zone change at
+all. Redundant hosting, later, is a second slot: `cloud-1` and `cloud-2`
+as two ordinary devices, because two replicas of one network is already a
+thing the protocol does. Which shard currently serves a slot is
+operational metadata, carried in the status heartbeat, never in the zone.
 
 ---
 
@@ -261,8 +288,8 @@ CAS root. There is no sub-node or virtual-node concept in the engine and
 this design does not invent one: the endpoint is bound under the device
 secret (`Net::bind`), the protocol handlers close over that node's store,
 and the device key *is* the cluster identity — multiplexing an endpoint
-would mean multiplexing an identity, which §3.1 spent its whole design
-budget keeping singular. Multiple `Node`s in one process is the supported,
+would mean multiplexing an identity, which DESIGN §3.1 spent its whole
+design budget keeping singular. Multiple `Node`s in one process is the supported,
 tested configuration (the engine's own cluster tests run exactly this way).
 
 What every tenant costs, and what is shared, is accounted in §7.
@@ -274,11 +301,16 @@ the engine's own standing loops (interval + jitter, work is idempotent,
 missing a tick costs latency not correctness):
 
 1. **Poll** `GET /dp/v1/networks` (default every 60 s, `If-None-Match`).
-   On success, persist the document to `<base>/desired.json` before acting
-   on it — the data plane **fails static**: if the control plane is
-   unreachable for an hour, the current tenant set keeps replicating; no
+   On success, persist the shard-filtered document to
+   `dp/<shard>/desired.json` **in the bucket** (local disk is ephemeral,
+   §5.3) before acting on it — the data plane **fails static**: if the
+   control plane is unreachable for an hour, the current tenant set keeps
+   replicating, and a pod rescheduled while the control plane is down
+   boots from the bucket copy and resumes hosting the last-known set; no
    tenant is ever torn down because the API was down (teardown requires a
-   *successful* poll that omits the network).
+   *successful* poll that omits the network). What fail-static cannot
+   cover is a *first* boot with no bucket copy and no control plane —
+   there is no known set to serve; that cold start waits.
 2. **Diff** desired against running, filtered to this shard (§7):
    - *new network* → provision (§4.3);
    - *running and desired* → converge policy: budget or retention changed →
@@ -289,7 +321,9 @@ missing a tick costs latency not correctness):
 3. **Report**: per-tenant status POSTs (§3.3), Prometheus metrics labelled
    by org/network, one log line per state transition.
 
-Tenant states, persisted per tenant in `<tenant-dir>/state`:
+Tenant states, cached per tenant in `<tenant-dir>/state` — a convenience,
+not a record: every state is re-derivable on a fresh pod from the desired
+document, the control plane's `device` field, and what the bucket holds:
 
 ```
 Provisioning → Identifying → Running → Draining → Retired
@@ -307,7 +341,8 @@ For a network entering the desired set:
    generates a fresh device key into the tenant's SQLite and leaves the
    origin unset — named identity comes from the zone, as it must.
 2. Read the public key back and `PUT /dp/v1/networks/:org/:net/device`
-   with `{label: "cloud-<shard>", nk}`. The commit publishes the zone.
+   with `{label: "cloud-1", nk}` (the slot label, §3.4). The commit
+   publishes the zone.
    (After a restore this is the idempotent 200 no-op; after a fresh init
    on a network whose old key is unrecoverable, it is the key-replacement
    path.)
@@ -333,7 +368,7 @@ NodeConfig {
     }),
     net: NetOptions { bind_addr: None, .. },   // ephemeral port per tenant
     socket_workers: 0,                   // §4.4 — engine change (a)
-    name: format!("cloud-{shard}"),      // never the host's hostname
+    name: "cloud-1".into(),              // the slot label; never the hostname
     replica_release_floor: 1,            // never release the last copy
     ..NodeConfig::new(tenant_dir)
 }
@@ -358,23 +393,26 @@ that a source-less, checkout-less, socket-less member needs:
 | `run_replicas` | yes | acquisition, grace releases, material claims |
 | `run_publisher` | yes | publishes this node's own trie: blob ads, `m:self`, replica claims — cheap when idle |
 | `run_dns` | yes | membership *is* the tenant boundary; a lapsed zone partitions the tenant |
-| `run_cloud` | yes | the browse/replication tunnel — this is what puts the hosted node in the org's replication panel for free |
-| uploads sweeper | yes | gateway/API uploads may target the hosted node |
+| `run_cloud` | yes | the browse/replication tunnel — this is what puts the hosted node in the org's replication panel (§2, once browse is enabled) |
 | `run_scanner`, `run_watcher` | no | no filesystem sources exist (cloud CAS refuses them anyway) |
 | `run_checkouts` | no | nothing is materialized |
+| uploads sweeper | no | v1 has no write surface at all — no control socket, no gateway, no sockets — so no upload can ever exist to sweep or reopen |
 
-Plus the daemon's one-shot startup helpers per tenant:
-`reopen_interrupted_uploads`, `readopt_self_on_startup`,
-`scan_publish_push`.
+Plus, of the daemon's one-shot startup helpers, only
+`readopt_self_on_startup` and `scan_publish_push` per tenant
+(`reopen_interrupted_uploads` goes with the sweeper, for the same reason).
 
 **Sockets are refused, permanently.** The hosted node closes socket
 admission at open and never reopens it. A hosted replica stores and serves
 bytes; executing customer socket code is compute hosting, a different
 product with a different isolation story. This wants one small engine
-change — **(a)** `socket_workers: 0` skips starting the `SocketPool`
-entirely (today `Node::open` starts it eagerly; N tenants × default 4 is
-the process's largest thread bill for a capability this service must not
-have).
+change — **(a)** `socket_workers: 0` makes `Node::open` skip the socket
+runtime outright: no `SocketPool` (today `start_with_ssh_host_key` returns
+`Some` unconditionally), no eager SSH host-key generation, and — because
+the socket ALPN and dispatcher are mounted only when the pool exists — no
+advertised socket capability for a peer to dial. Today's eager start costs
+N tenants × default 4 OS threads for a capability this service must not
+have.
 
 Supervision copies the daemon's discipline: one broadcast shutdown channel
 per tenant, every loop's `JoinError` inspected, and a loop that died by
@@ -393,10 +431,19 @@ and ensure a replica exists for each —
 node.add_replica(space, policy_from_control_plane, grace, budget_share, None)
 ```
 
-— and remove replicas for spaces that have left the view entirely (no
-origin publishes them and grace has elapsed), with `--pin-held` semantics
-*not* used: the standing policy leaves with the space, holds release
-through the ordinary grace machinery.
+The enumeration is `store().known_spaces()` (every space any origin has
+published entries for), woken by the engine's existing
+`spaces_changed_signal()` rather than polled blind.
+
+Replicas are added and **never automatically removed**. Removal is the
+wrong tool twice over: `remove_replica` without `--pin-held` releases the
+replica's holds *immediately*, bypassing grace — so auto-removing on "the
+space left the view" would let a transient view glitch, or a customer
+briefly unpublishing, instantly drop the hosted copy the service exists to
+keep. And it buys nothing: a replica of a space with no current entries
+holds no roots and costs nothing, while the retention policy already
+shrinks what leaves the tree through the grace machinery. Standing
+replica policies leave only with the tenant, at teardown.
 
 Decisions, with reasons:
 
@@ -414,11 +461,15 @@ Decisions, with reasons:
   root it cannot see another material holder for — the service must not be
   the actor that turns "leaves the current tree" into "ceases to exist"
   when it holds the last copy.
-- **Budget is the org's `budget_bytes`, split across the tenant's
-  replicas.** The budget is an admission ceiling (REPLICATION), so hitting
-  it stops new acquisition and surfaces in the status heartbeat and the
-  replication panel (`held_back`) rather than evicting anything — exactly
-  the failure mode a paid quota should have.
+- **Budget is the org's `budget_bytes`, enforced as a moving per-replica
+  ceiling.** The engine's budget is a per-replica admission ceiling
+  (REPLICATION) and no org-level ceiling exists, so the tenant loop
+  re-derives each replica's budget on every tick: the org budget minus
+  bytes the tenant's *other* replicas hold. Approximate — concurrent
+  admissions can briefly overshoot by one acquisition per space — but
+  convergent, and enforcement inherits the right failure mode: hitting it
+  stops new acquisition and surfaces in the status heartbeat and the
+  replication panel (`held_back`) rather than evicting anything.
 - **Delegations are honored, not created.** The hosted node is a full
   member and replicates delegation records like any peer, admitting the
   org's delegates on the org's say-so. It never issues delegations of its
@@ -451,8 +502,10 @@ Every tenant's `CloudConfig` names the same bucket with a distinct OpenDAL
 tenants/<org>/<network>/        ← OpenDAL root for this tenant
   cas/<hh>/<hex>                ← payload   (append-only, SERVERLESS §6.5)
   cas/<hh>/<hex>.obao           ← outboard
-  uploads/<id>/<n>              ← multipart staging, swept
+  uploads/<id>/<n>              ← multipart staging (unused in v1: no write
+                                   surface exists, §4.4)
 db/<org>/<network>/             ← tenant DB replica stream (§5.3)
+dp/<shard>/desired.json         ← fail-static desired-state cache (§4.2)
 ```
 
 The CAS layer supports the alternative — many nodes on one shared root,
@@ -530,9 +583,8 @@ db/<org>/<network>/
   <generation>/wal/<index>         ← WAL segments, shipped in order
 ```
 
-- **Generation**: a random id minted whenever the replicator starts from a
-  database it did not restore itself (first init, or restore from an older
-  generation). Within a generation, `snapshot + wal/*` replays to the
+- **Generation**: a random id minted at first init and again on every
+  restore. Within a generation, `snapshot + wal/*` replays to the
   current database; frame salts and checksums in the WAL segments are what
   make a torn or duplicated upload detectable on restore.
 - **Shipping**: the replicator holds its own read connection beside the
@@ -582,7 +634,11 @@ So a lost tenant DB with a live customer network costs: one key
 replacement (a new key registered under the same label via §3.3's PUT —
 the old key is revoked control-plane-side, the zone republishes, customers
 re-bind), one metadata re-sync, and a `require_pair` pass over held
-roots. What it does *not* cost is re-uploading terabytes.
+roots. What it does *not* cost is re-uploading — or even re-fetching —
+terabytes: the engine's fetch path consults the durable backend *before*
+falling back to peers (`fetch_groups_from` opens with
+`ensure_ranges`, whose miss path is `adopt_remote_if_present`), so a
+rebuilt node re-adopts the bucket's objects in place.
 
 The case the replicator actually protects is the one the service exists
 for:
@@ -603,11 +659,12 @@ replicated byte is dominated by customer nodes' zone-refresh TTL (they
 must admit the new member before it can fetch), which the 300 s data TTL
 keeps in minutes.
 
-**Rotate**: the hosted device rotates keys with the standard §3.4 window,
-driven by the data plane on its own schedule (and forced by the operator on
-suspicion): generate, `PUT` the new key (two keys under one label),
-`swap_active_endpoint`, then retire the old key control-plane-side. No
-customer involvement; that is what the rotation design bought.
+**Rotate**: the hosted device rotates keys with the standard window
+(DESIGN §3.4), driven by the data plane on its own schedule (and forced by
+the operator on suspicion): generate, `PUT` the new key (two keys under
+one label), `swap_active_endpoint`, then retire the old key with §3.3's
+`DELETE …/device/keys/:nk` once customer bindings have had a TTL to move.
+No customer involvement; that is what the rotation design bought.
 
 **Disable**: flag off → the control plane deletes the network's `cloud-*`
 devices in the same commit (zone shrinks; customer nodes drop the binding
@@ -657,16 +714,22 @@ Shards are declared, not discovered: `SYNCH_DP_SHARD=2`
 `SYNCH_DP_SHARDS=4`. Each shard runs the same reconciler over the same
 desired-state document, filtered by **rendezvous hashing on the network
 id** — no assignment state in the control plane, no coordination between
-shards, and a shard-count change moves ~1/n of tenants. A tenant's bucket
-prefix is keyed by network, not by shard, so a moved tenant keeps its CAS
-untouched; its DB moves by replica-stream restore, or failing that by the
-§5.3 rebuild. During a handover the network may briefly carry two hosted
-devices (`cloud-2` draining, `cloud-3` provisioning) — which is just two
-replicas, a state the protocol is indifferent to.
+shards, and a shard-count change moves ~1/n of tenants. Everything durable
+about a tenant is keyed by network, never by shard — the CAS prefix, the
+DB stream, the `cloud-1` device identity (§3.4) — so a handover is: the
+losing shard's next reconcile drains the tenant (shipping the DB tail),
+the gaining shard restores that stream and resumes the *same* identity; no
+zone change, no key change, no customer-visible event. The race — a
+rolling shard-count change where both pods briefly run the tenant — is one
+identity written by two processes, which is exactly the §5.3 generation
+fork: two generations, restore picks one, divergence repairs by key
+replacement. Rare, bounded by one reconcile interval, and recoverable
+rather than corrupting.
 
-Redundant hosting (two shards deliberately hosting every network) is the
-same mechanism run without the filter's exclusivity, and is future work
-only because billing and the status API assume one row per network today.
+Redundant hosting is a second *slot* (`cloud-2`, its own key, DB stream,
+and CAS claims over the same tenant prefix), assigned to a different shard
+by hashing on (network, slot) — future work only because billing and the
+status API assume one row per network today.
 
 ### 7.3 Engine changes required
 
@@ -717,9 +780,9 @@ None of the engine's replication, storage, or membership code changes.
   provider-side encryption at rest, access logging on the bucket, and the
   fact that enabling hosting is an explicit org-admin act. A
   partial-privacy future exists in the protocol already — delegate-scoped
-  hosting, where the hosted node is admitted as a §3.5 delegate for named
-  spaces only and scoped replication (§5.5) redacts the rest down to the
-  filenames — and is deliberately future work: it trades "replicate
+  hosting, where the hosted node is admitted as a delegate (DESIGN §3.5)
+  for named spaces only and scoped replication (DESIGN §5.5) redacts the
+  rest down to the filenames — and is deliberately future work: it trades "replicate
   everything" for "replicate exactly this", a different product tier.
 - **Blast radius of a compromised data-plane host**: every hosted
   network's content and device secrets on that shard — but no customer
@@ -759,11 +822,12 @@ None of the engine's replication, storage, or membership code changes.
 - The **stored heartbeat** (§3.3) is the billing record: held bytes per
   network, written by the tenant that holds them, timestamped, surviving
   the tenant being down (a stale heartbeat *is* the alert).
-- The **live view** is the existing replication panel over the browse
-  tunnel — the hosted node answers the same §8.1 question every daemon
-  answers, labelled with its `cloud-<shard>` identity, so "is the cloud
-  replica keeping up" is a question the dashboard already knows how to ask
-  and render, with zero new UI.
+- The **live view**, for orgs with browse enabled (§2), is the existing
+  replication panel over the browse tunnel — the hosted node answers the
+  same what-do-you-replicate question every attached daemon answers (CP
+  README), labelled with its `cloud-1` identity, so "is the cloud replica
+  keeping up" is a question the dashboard already knows how to ask and
+  render, with zero new UI.
 - `synch-dp status` (local admin socket, read-only): per-tenant state
   table, the parked-in-`Identifying` list, last poll generation.
 
@@ -780,7 +844,7 @@ crates/synch-dp/
   src/reconciler.rs    # desired-state diff, fail-static cache, shard filter
   src/tenant.rs        # per-network lifecycle: provision, identify,
                        #   loop set, supervise, drain, retire
-  src/spaces.rs        # view-driven replica ensure/remove (§4.5)
+  src/spaces.rs        # space-driven replica ensure (§4.5 — never removes)
   src/dbrepl.rs        # in-process WAL-shipping DB replicator (§5.3)
   src/metrics.rs
 ```
@@ -788,7 +852,9 @@ crates/synch-dp/
 ### Phases
 
 1. **Engine groundwork**: change (a) `socket_workers: 0`; change (c)
-   engine-side lifecycle lock. Both small, both independently shippable.
+   engine-side lifecycle lock; change (d) embedder-owned WAL
+   checkpointing, which phase 3's replicator needs. All small, all
+   independently shippable.
 2. **Control plane**: migration v12 (`cloud_hosted`, `cloud_disabled_at`,
    `dataplane_keys`, system user, reserved-label check in `join_device`),
    the toggle route + audit events, `/dp/v1` routes and the `Dataplane`
@@ -801,8 +867,8 @@ crates/synch-dp/
    customer node deletes its copy, the bytes survive in the tenant prefix,
    the rebuilt-DB path re-adopts them.
 4. **Operations**: replicator hardening (restore fuzzing over torn and
-   forked streams), retention-hold deletion job,
-   dashboards, the status heartbeat, runbook (`control-plane/ops/`).
+   forked streams), retention-hold deletion job, dashboards, the status
+   heartbeat and its control-plane table, runbook (`control-plane/ops/`).
 5. **Scale-out**: shard filter + rendezvous handover, then the
    dedicated-shard and redundant-hosting tiers as configuration.
 
@@ -812,10 +878,14 @@ crates/synch-dp/
 
 - **Storage residue within a tenancy.** Final `cas/` objects are
   append-only for the life of the tenant; a churn-heavy network pays for
-  history until roots age out of grace and the prefix is eventually
-  compacted only by offboarding. This is SERVERLESS's stated cost,
-  inherited knowingly — the retention hold and per-tenant metering make it
-  a billed cost rather than a hidden one.
+  history until roots age out of grace, and the prefix is eventually
+  compacted only by offboarding. The release floor (§4.5) sharpens this:
+  a root no other member still holds is *never* released, whatever the
+  grace says — under `current` retention the hosted prefix converges to
+  the current tree **plus every last copy**, which is the promise, priced.
+  This is SERVERLESS's stated cost, inherited knowingly — the retention
+  hold and per-tenant metering make it a billed cost rather than a hidden
+  one.
 - **No cross-tenant dedup.** Two orgs storing the same bytes pay twice.
   Chosen in §5.1; the confidentiality and offboarding wins are worth more
   than the duplicate gigabytes.
