@@ -67,6 +67,7 @@ fn harness_sized(pool_size: Int) -> Harness {
         publish.publish_in_tx(conn, csk, now, actor, change)
       },
       fn() { Nil },
+      None,
     )
   let agents = process.new_name("cp_agents_test_" <> id.new())
   let assert Ok(_) = agent.start(agents)

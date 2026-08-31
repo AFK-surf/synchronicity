@@ -2,7 +2,7 @@ import config
 import controlplane
 import dns/name
 import envoy
-import gleam/option.{None}
+import gleam/option.{None, Some}
 
 fn primary_env() -> Nil {
   envoy.set("CP_ROLE", "primary")
@@ -25,6 +25,16 @@ fn primary_env() -> Nil {
   envoy.unset("CP_GOOGLE_CLIENT_SECRET")
   envoy.unset("CP_GITHUB_CLIENT_ID")
   envoy.unset("CP_GITHUB_CLIENT_SECRET")
+  envoy.unset("CP_CUE_PROVISIONING_ENABLED")
+  envoy.unset("CP_CUE_PROVISIONING_SECRET")
+  envoy.unset("CP_CUE_OIDC_PROVIDER_ID")
+  envoy.unset("CP_CUE_TARGET_ORG_ID")
+}
+
+fn cue_enabled() -> Nil {
+  envoy.set("CP_CUE_PROVISIONING_ENABLED", "true")
+  envoy.set("CP_CUE_PROVISIONING_SECRET", "0123456789abcdef0123456789abcdef")
+  envoy.set("CP_CUE_OIDC_PROVIDER_ID", "oidcp-cue")
 }
 
 pub fn listen_defaults_to_all_interfaces_test() {
@@ -135,4 +145,54 @@ pub fn a_ceremony_names_the_configured_apex_test() {
   envoy.unset("CP_DNS_MODE")
   envoy.unset("CP_DNS_PROVIDER")
   envoy.unset("CP_SIGNING_ZONE")
+}
+
+pub fn cue_provisioning_is_off_by_default_test() {
+  primary_env()
+  let assert Ok(cfg) = config.load()
+  assert cfg.cue_provisioning == None
+}
+
+pub fn cue_provisioning_loads_when_enabled_test() {
+  primary_env()
+  cue_enabled()
+  let assert Ok(cfg) = config.load()
+  assert cfg.cue_provisioning
+    == Some(config.CueProvisioning(
+      "0123456789abcdef0123456789abcdef",
+      "oidcp-cue",
+    ))
+}
+
+pub fn cue_provisioning_requires_a_secret_test() {
+  primary_env()
+  cue_enabled()
+  envoy.unset("CP_CUE_PROVISIONING_SECRET")
+  let assert Error(message) = config.load()
+  assert message == "CP_CUE_PROVISIONING_SECRET is required"
+}
+
+pub fn cue_provisioning_rejects_a_short_secret_test() {
+  primary_env()
+  cue_enabled()
+  envoy.set("CP_CUE_PROVISIONING_SECRET", "too-short")
+  let assert Error(message) = config.load()
+  assert message == "CP_CUE_PROVISIONING_SECRET must be at least 32 characters"
+}
+
+pub fn cue_provisioning_requires_a_provider_test() {
+  primary_env()
+  cue_enabled()
+  envoy.unset("CP_CUE_OIDC_PROVIDER_ID")
+  let assert Error(message) = config.load()
+  assert message == "CP_CUE_OIDC_PROVIDER_ID is required"
+}
+
+pub fn cue_provisioning_rejects_a_bad_enabled_flag_test() {
+  primary_env()
+  cue_enabled()
+  envoy.set("CP_CUE_PROVISIONING_ENABLED", "maybe")
+  let assert Error(message) = config.load()
+  assert message
+    == "CP_CUE_PROVISIONING_ENABLED must be true or false, got maybe"
 }

@@ -11,6 +11,7 @@ import auth/oauth.{type Provider}
 import auth/oidc
 import auth/principal.{type Principal}
 import auth/session
+import config.{type CueProvisioning}
 import email/mailer.{type Mailer}
 import gleam/dynamic/decode
 import gleam/json
@@ -46,6 +47,10 @@ pub type AuthContext {
     /// is publication), the reconciler poke in external mode. Never inside
     /// the transaction: provider calls must not hold the write lock.
     published: fn() -> Nil,
+    /// Cue's S2S provisioning configuration, or `None` when the integration
+    /// is off. Only the primary carries a writable AuthContext, which is also
+    /// the only node that may provision.
+    cue_provisioning: Option(CueProvisioning),
   )
 }
 
