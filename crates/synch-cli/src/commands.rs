@@ -232,6 +232,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Socket {
             command: SocketCommand::Inspect { file },
         } => inspect_socket(file),
+        // Not a `Run` command: the download happens in this process — the
+        // daemon speaks to peers, not to web servers — and streams into the
+        // tree through the same typed write the S3 gateway uses (§9.4).
+        Command::Fetch { url, destination } => crate::fetch::run(&data_dir, url, destination).await,
         // Not a `Run` command either: it owns this process's stdin and stdout
         // for its lifetime and answers a protocol of its own, translating each
         // request into the control calls below (`crate::mcp`).
@@ -787,6 +791,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             unreachable!("handled before dispatch")
         }
         Command::Mcp { .. } => unreachable!("handled before dispatch"),
+        Command::Fetch { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),

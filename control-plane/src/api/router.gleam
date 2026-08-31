@@ -39,6 +39,7 @@
 import api/api_keys_api
 import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
+import api/cue_api
 import api/dataplane_api
 import api/devices_api
 import api/middleware
@@ -158,6 +159,15 @@ pub fn handle(req: Request, ctx: Context) -> Response {
             Writable(auth) -> write_routes(req, auth, ctx.browse)
             ReadOnly(_, primary_url) -> elsewhere(req, primary_url)
           }
+      }
+    // The server-to-server integration surface. Not part of the dashboard
+    // API, unreachable by a session or an API key, and — like every write —
+    // primary-only: a replica names the primary, the same refusal it gives
+    // any other mutation it cannot take.
+    ["internal", ..] ->
+      case ctx.api {
+        Writable(auth) -> internal_routes(req, auth)
+        ReadOnly(_, primary_url) -> elsewhere(req, primary_url)
       }
     // The dashboard ships with the API, on either surface: a node that
     // answers the reads serves the pages that make them.
@@ -492,6 +502,29 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
       dataplane_api.collect_storage(auth, who, org, net)
     }
 
+    _, _ -> wisp.not_found()
+  }
+}
+
+/// The server-to-server routes. Each verifies its own shared-secret bearer
+/// rather than going through `with_principal`: the caller is Cue's backend,
+/// not a person or an API key, so there is no `Principal` to resolve.
+fn internal_routes(req: Request, auth: AuthContext) -> Response {
+  case wisp.path_segments(req), req.method {
+    ["internal", "v1", "integrations", "cue", "workspaces", cue_workspace_id],
+      Put
+    -> cue_api.provision_workspace(req, auth, cue_workspace_id)
+    [
+      "internal",
+      "v1",
+      "integrations",
+      "cue",
+      "workspaces",
+      cue_workspace_id,
+      "devices",
+    ],
+      Post
+    -> cue_api.enroll_device(req, auth, cue_workspace_id)
     _, _ -> wisp.not_found()
   }
 }

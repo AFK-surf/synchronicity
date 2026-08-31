@@ -272,17 +272,19 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
       "ALTER TABLE oauth_states DROP COLUMN binding_token_hash",
       [],
     )
+  // Newest first, the reverse of the order the migrations created them.
   let assert Ok(_) = sqlite.exec(conn, "DROP INDEX networks_cloud_hosted", [])
   let assert Ok(_) =
     sqlite.exec(conn, "ALTER TABLE networks DROP COLUMN cloud_hosted", [])
   let assert Ok(_) = sqlite.exec(conn, "DROP TABLE cloud_collect_queue", [])
   let assert Ok(_) = sqlite.exec(conn, "DROP TABLE dataplane_keys", [])
   let assert Ok(_) = sqlite.exec(conn, "DROP TABLE network_hosting_status", [])
-  // The system user v12 inserts comes off too: re-running the insert over a
+  // The system user V13 inserts comes off too: re-running the insert over a
   // row that is already there is a primary-key violation, which is the same
   // shape of problem as re-adding a column.
   let assert Ok(_) =
     sqlite.exec(conn, "DELETE FROM users WHERE id = 'system-dataplane'", [])
+  let assert Ok(_) = sqlite.exec(conn, "DROP TABLE cue_workspace_orgs", [])
   let assert Ok(v) = migrate.migrate(conn)
   assert v == migrate.build_version()
 
