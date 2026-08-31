@@ -56,10 +56,11 @@ pub struct DpConfig {
     pub net: synch_net::NetOptions,
     /// How every tenant resolves its membership zone.
     ///
-    /// The daemon exposes this as `--doh` / `--dnssec-anchor`; a fleet needs
-    /// it for the same reasons, and additionally because *identity settles at
-    /// open* — a tenant whose node cannot resolve its zone never learns its
-    /// own name, whatever resolver is installed afterwards.
+    /// The daemon exposes this as `--doh` / `--dnssec-anchor` / `--rekor`; a
+    /// fleet needs it for the same reasons, and additionally because
+    /// *identity settles at open* — a tenant whose node cannot resolve its
+    /// zone never learns its own name, whatever resolver is installed
+    /// afterwards.
     pub dns: synch_net::ResolverOptions,
     /// How old the hosted device key may get before it is rotated (§6).
     pub rotate_after: Duration,
@@ -85,6 +86,12 @@ impl ObjectConfig {
 
     /// Builds an operator rooted at `root` — one tenant's CAS prefix.
     pub fn operator_rooted(&self, root: &str) -> Result<opendal::Operator> {
+        // OpenDAL's default features are disabled so dependencies cannot pick
+        // a TLS provider for this process. That also disables its pre-main
+        // HTTP transport registration, so every shipped constructor must
+        // install the enabled reqwest transport explicitly before S3/GCS/Azure
+        // is first used. `CloudStore::open` does the same for ordinary nodes.
+        opendal::install_default();
         let mut options = self.options.clone();
         options.insert("root".to_string(), root.to_string());
         let operator = match self.service.as_str() {
@@ -216,6 +223,7 @@ impl DpConfig {
                 trust_anchor: std::env::var("SYNCH_DP_DNSSEC_ANCHOR")
                     .ok()
                     .map(PathBuf::from),
+                rekor: Some(parse_rekor()?),
                 ..synch_net::ResolverOptions::default()
             },
             // Settable so a test can exercise a rotation without waiting a
@@ -395,6 +403,22 @@ fn parse<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
             .parse()
             .map_err(|_| DpError::Config(format!("{key} is not a number: {value}"))),
         Err(_) => Ok(default),
+    }
+}
+
+/// Reads the zone-key transparency policy.
+///
+/// `require` remains the default. `off` exists for private deployments whose
+/// DNSSEC root is deliberately not published to the public transparency log,
+/// matching the ordinary daemon's explicit `--rekor off` escape hatch.
+fn parse_rekor() -> Result<synch_net::RekorPolicy> {
+    match std::env::var("SYNCH_DP_REKOR") {
+        Err(_) => Ok(synch_net::RekorPolicy::Require),
+        Ok(value) if value.eq_ignore_ascii_case("require") => Ok(synch_net::RekorPolicy::Require),
+        Ok(value) if value.eq_ignore_ascii_case("off") => Ok(synch_net::RekorPolicy::Off),
+        Ok(value) => Err(DpError::Config(format!(
+            "SYNCH_DP_REKOR must be `require` or `off`, got `{value}`"
+        ))),
     }
 }
 

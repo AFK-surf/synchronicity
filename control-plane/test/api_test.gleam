@@ -3325,6 +3325,39 @@ pub fn a_hold_falling_due_moves_the_etag_test() {
   assert string.contains(simulate.read_body(after), "prod")
 }
 
+/// An entity tag identifies the collection set, not an aggregate of it.
+///
+/// Queue rows deliberately outlive their network and org rows, so the set is
+/// keyed by the stored names themselves. Two one-row sets with the same
+/// timestamp have the same count and timestamp sum; a lossy mark would return
+/// 304 after this replacement and strand the newly named prefix.
+pub fn distinct_collection_sets_cannot_share_an_etag_test() {
+  let h = harness()
+  org_named(h, "acme")
+  offboarded(h, "acme", "prod")
+  age_hold(h, "prod", 31 * 86_400)
+  let token = mint_dataplane(h, "fleet")
+
+  let first = call(h, keyed(token, Get, "/dp/v1/networks"))
+  assert first.status == 200
+  let assert Ok(tag) = list.key_find(first.headers, "etag")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE cloud_collect_queue SET network_name = 'archive'
+       WHERE org_slug = 'acme' AND network_name = 'prod'",
+      [],
+    )
+  sqlite.close(conn)
+
+  let after = dp_poll(h, token, tag)
+  assert after.status == 200
+  let body = simulate.read_body(after)
+  assert string.contains(body, "archive")
+  assert !string.contains(body, "\"network\":\"prod\"")
+}
+
 /// The other half of the loop: the data plane reports the deletion, and the
 /// network stops being offered. Without this the list would repeat the same
 /// instruction on every poll for the rest of the deployment's life.

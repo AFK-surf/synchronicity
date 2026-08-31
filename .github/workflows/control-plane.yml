@@ -196,3 +196,45 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev bind9-dnsutils
       - run: cd control-plane && make -C csqlite && gleam deps download
       - run: cd control-plane && ./e2e/run.sh
+
+  cloud-dataplane-e2e:
+    name: cloud data plane e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: control-plane/.tool-versions
+          version-type: strict
+          rebar3-version: "3.27.0"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - run: cd control-plane && make -C csqlite && gleam deps download && gleam export erlang-shipment
+      - run: cargo build --release -p synch-cli -p synch-dp
+      - name: Start the production-compatible S3 service
+        run: |
+          docker run -d --name synch-dp-minio --network host \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data
+          for attempt in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint=/bin/sh quay.io/minio/mc -c '
+            mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+            mc mb --ignore-existing local/synch-dp-e2e
+            mc anonymous set public local/synch-dp-e2e
+          '
+      - name: Run real control-plane, customer, and data-plane processes
+        run: cd control-plane && ./e2e/cloud-dataplane.sh
+        env:
+          SYNCH_E2E_SKIP_BUILD: "1"
+          SYNCH_E2E_S3_ENDPOINT: http://127.0.0.1:9000
+          SYNCH_E2E_S3_LIST_URL: http://127.0.0.1:9000/synch-dp-e2e
+          SYNCH_E2E_S3_BUCKET: synch-dp-e2e
+          SYNCH_E2E_S3_REGION: us-east-1
+          SYNCH_E2E_S3_ACCESS_KEY_ID: minioadmin
+          SYNCH_E2E_S3_SECRET_ACCESS_KEY: minioadmin

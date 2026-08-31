@@ -457,7 +457,12 @@ impl Node {
         now: i64,
     ) -> Result<DomainRefresh> {
         let (set, ttl) = resolver.resolve_members(domain).await?;
-        self.apply_member_set(&set, ttl, now)
+        // Resolution is asynchronous, but applying its answer is a SQLite
+        // transaction. The daemon drives this method from a Tokio worker, so
+        // doing that work inline blocks the runtime (and deliberately aborts
+        // debug binaries under the §10 invariant).
+        let node = self.clone();
+        crate::blocking::offload(move || node.apply_member_set(&set, ttl, now)).await
     }
 
     /// Applies an already-validated member set to the bindings table.

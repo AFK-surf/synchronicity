@@ -147,8 +147,8 @@ async fn adopt_orphan_retirement(
     if recorded.is_some() {
         return Ok(false);
     }
-    let Some(orphan) = node
-        .device_keys()?
+    let Some(orphan) = device_keys(node)
+        .await?
         .into_iter()
         .find(|key| key.state == synch_store::KeyState::Retiring)
     else {
@@ -216,7 +216,7 @@ async fn complete_if_due(
     // business and cannot be undone by anybody else; withdrawing the record
     // is the control plane's, and doing it first would leave a window where
     // the zone denies a key this node is still serving under.
-    let held = node.device_keys()?;
+    let held = device_keys(node).await?;
     if let Some(key) = held.iter().find(|key| key.node_id.to_z32() == retiring) {
         node.retire_key(&key.node_id).await?;
     }
@@ -255,8 +255,8 @@ async fn start_if_due(
     config: &DpConfig,
     now_ns: i64,
 ) -> Result<bool> {
-    let active = node
-        .device_keys()?
+    let active = device_keys(node)
+        .await?
         .into_iter()
         .find(|key| key.state == synch_store::KeyState::Active);
     let Some(active) = active else {
@@ -272,8 +272,8 @@ async fn start_if_due(
     // time it is called, so a control plane that is down for an hour would
     // otherwise leave sixty orphaned device secrets in the tenant's database,
     // every one of them riding the replica stream.
-    let staged = node
-        .device_keys()?
+    let staged = device_keys(node)
+        .await?
         .into_iter()
         .find(|key| key.state == synch_store::KeyState::Staged);
     let new_key_id = match staged {
@@ -284,7 +284,12 @@ async fn start_if_due(
             );
             key.node_id
         }
-        None => node.rotate_key()?.new_key,
+        None => {
+            let node = node.clone();
+            synch_core::offload(move || node.rotate_key())
+                .await?
+                .new_key
+        }
     };
     let new_key = new_key_id.to_z32();
     control
@@ -332,6 +337,12 @@ async fn clear_pending(node: &Node) -> Result<()> {
     })
     .await?;
     Ok(())
+}
+
+/// Reads the node's keyring without parking an async runtime worker on SQLite.
+async fn device_keys(node: &Node) -> Result<Vec<synch_store::DeviceKey>> {
+    let node = node.clone();
+    Ok(synch_core::offload(move || node.device_keys()).await?)
 }
 
 #[cfg(test)]
