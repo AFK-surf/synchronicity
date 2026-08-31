@@ -3,10 +3,11 @@
 #
 # Real processes only: the Gleam control plane, `synch` customer daemon and
 # `synch-dp` service. MinIO supplies the same S3 API production uses. The test
-# publishes a file, waits for the hosted tenant to report it durable, removes
-# the customer copy, destroys the data-plane working directory, and proves a
-# fresh data-plane process restores the same hosted identity and held bytes.
-set -euo pipefail
+# publishes files from two customer nodes, waits for the hosted tenant to
+# report both durable, removes both customer copies, and destroys the data-plane
+# working directory. A fresh data-plane process must restore the same identity
+# and serve both files to a third customer node that starts only afterwards.
+set -Eeuo pipefail
 cd "$(dirname "$0")/../.."
 
 require() {
@@ -31,7 +32,8 @@ DP_BIN="$ROOT/target/release/synch-dp"
 CP_SHIPMENT="$ROOT/control-plane/build/erlang-shipment/entrypoint.sh"
 CP_BIN=(/bin/sh "$CP_SHIPMENT" run)
 WORKDIR=$(mktemp -d)
-mkdir -p "$WORKDIR/cp-db" "$WORKDIR/customer" "$WORKDIR/source" "$WORKDIR/dp"
+mkdir -p "$WORKDIR/cp-db" "$WORKDIR/node-1" "$WORKDIR/node-2" \
+  "$WORKDIR/node-3" "$WORKDIR/source-1" "$WORKDIR/source-2" "$WORKDIR/dp"
 
 port() {
   python3 - <<'PY'
@@ -45,12 +47,16 @@ PY
 
 CP_HTTP_PORT=$(port)
 CP_DNS_PORT=$(port)
-CUSTOMER_PORT=$(port)
+NODE1_PORT=$(port)
+NODE2_PORT=$(port)
+NODE3_PORT=$(port)
 DP_METRICS_PORT=$(port)
 CP_URL="http://127.0.0.1:$CP_HTTP_PORT"
 DOMAIN=prod.acme.sync.test
 CP_LOG="$WORKDIR/control-plane.log"
-CUSTOMER_LOG="$WORKDIR/customer.log"
+NODE1_LOG="$WORKDIR/node-1.log"
+NODE2_LOG="$WORKDIR/node-2.log"
+NODE3_LOG="$WORKDIR/node-3.log"
 DP_LOG="$WORKDIR/data-plane.log"
 PIDS=()
 
@@ -70,6 +76,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'status=$?; echo "FAIL: command at line $LINENO exited $status" >&2' ERR
 
 wait_for() {
   local what=$1
@@ -82,7 +89,8 @@ wait_for() {
     sleep 0.25
   done
   echo "FAIL: timed out waiting for $what" >&2
-  tail -100 "$CP_LOG" "$CUSTOMER_LOG" "$DP_LOG" 2>/dev/null || true
+  tail -100 "$CP_LOG" "$NODE1_LOG" "$NODE2_LOG" "$NODE3_LOG" "$DP_LOG" \
+    2>/dev/null || true
   return 1
 }
 
@@ -115,13 +123,24 @@ curl -fsS -b "$WORKDIR/cookies" "$CP_URL/api/me" > "$WORKDIR/me.json"
 CSRF=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf"])' \
   < "$WORKDIR/me.json")
 
-"$SYNCH_BIN" --data-dir "$WORKDIR/customer" init --domain "$DOMAIN" \
-  > "$WORKDIR/customer-init.out"
-CUSTOMER_KEY=$(awk '/^device key:/ { print $3 }' "$WORKDIR/customer-init.out")
-curl -fsS -b "$WORKDIR/cookies" -H "x-csrf: $CSRF" \
-  -H 'content-type: application/json' \
-  -d "{\"label\":\"e2e-customer\",\"nk\":\"$CUSTOMER_KEY\",\"addr\":\"127.0.0.1:$CUSTOMER_PORT\"}" \
-  "$CP_URL/api/orgs/acme/networks/prod/devices" > "$WORKDIR/join.json"
+init_and_join() {
+  local label=$1 dir=$2 port=$3
+  local init_out="$WORKDIR/$label-init.out"
+  "$SYNCH_BIN" --data-dir "$dir" init --domain "$DOMAIN" > "$init_out"
+  local key
+  key=$(awk '/^device key:/ { print $3 }' "$init_out")
+  curl -fsS -b "$WORKDIR/cookies" -H "x-csrf: $CSRF" \
+    -H 'content-type: application/json' \
+    -d "{\"label\":\"$label\",\"nk\":\"$key\",\"addr\":\"127.0.0.1:$port\"}" \
+    "$CP_URL/api/orgs/acme/networks/prod/devices" > "$WORKDIR/$label-join.json"
+}
+
+# node-3 is enrolled now so cloud-1 learns its production membership and
+# direct-address hint, but its daemon does not start until both publishers and
+# the first cloud volume are gone.
+init_and_join node-1 "$WORKDIR/node-1" "$NODE1_PORT"
+init_and_join node-2 "$WORKDIR/node-2" "$NODE2_PORT"
+init_and_join node-3 "$WORKDIR/node-3" "$NODE3_PORT"
 curl -fsS -b "$WORKDIR/cookies" -H "x-csrf: $CSRF" \
   -H 'content-type: application/json' -X PUT -d '{"enabled":true}' \
   "$CP_URL/api/orgs/acme/networks/prod/cloud-hosting/enabled" \
@@ -130,16 +149,35 @@ curl -fsS -b "$WORKDIR/cookies" -H "x-csrf: $CSRF" \
 "${CP_BIN[@]}" dataplane-key mint e2e-fleet > "$WORKDIR/dp-key.out"
 DP_TOKEN=$(grep '^synchdp_' "$WORKDIR/dp-key.out")
 
-printf 'the only customer copy\n' > "$WORKDIR/source/report.txt"
-setsid "$SYNCH_BIN" --data-dir "$WORKDIR/customer" \
-  --bind "127.0.0.1:$CUSTOMER_PORT" --offline \
-  --doh "$CP_URL/dns-query" --dnssec-anchor "$WORKDIR/anchor.key" \
-  --rekor off --no-tuf daemon run > "$CUSTOMER_LOG" 2>&1 &
-CUSTOMER_PID=$!
-PIDS+=("$CUSTOMER_PID")
-wait_for "the customer daemon" 240 grep -q '^control socket:' "$CUSTOMER_LOG"
-"$SYNCH_BIN" --data-dir "$WORKDIR/customer" source add media "$WORKDIR/source"
-"$SYNCH_BIN" --data-dir "$WORKDIR/customer" source scan media
+printf 'written only by node-1\n' > "$WORKDIR/source-1/from-node-1.txt"
+printf 'written only by node-2\n' > "$WORKDIR/source-2/from-node-2.txt"
+EXPECTED_BYTES=$(wc -c < "$WORKDIR/source-1/from-node-1.txt")
+EXPECTED_BYTES=$((EXPECTED_BYTES + $(wc -c < "$WORKDIR/source-2/from-node-2.txt")))
+
+start_customer() {
+  local dir=$1 port=$2 log=$3
+  setsid "$SYNCH_BIN" --data-dir "$dir" \
+    --bind "127.0.0.1:$port" --offline \
+    --doh "$CP_URL/dns-query" --dnssec-anchor "$WORKDIR/anchor.key" \
+    --rekor off --no-tuf daemon run > "$log" 2>&1 &
+  CUSTOMER_PID=$!
+  PIDS+=("$CUSTOMER_PID")
+}
+
+start_customer "$WORKDIR/node-1" "$NODE1_PORT" "$NODE1_LOG"
+NODE1_PID=$CUSTOMER_PID
+start_customer "$WORKDIR/node-2" "$NODE2_PORT" "$NODE2_LOG"
+NODE2_PID=$CUSTOMER_PID
+wait_for "node-1" 240 grep -q '^control socket:' "$NODE1_LOG"
+wait_for "node-2" 240 grep -q '^control socket:' "$NODE2_LOG"
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-1" source add media "$WORKDIR/source-1"
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-1" source scan media
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-2" source add media "$WORKDIR/source-2"
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-2" source scan media
+
+# Keep node-3 genuinely empty: it is enrolled but has not opened its endpoint,
+# exchanged metadata, or fetched either payload.
+[[ ! -e "$WORKDIR/node-3/cas" ]]
 
 start_dp() {
   local base=$1 log=$2
@@ -178,17 +216,22 @@ wait_for "the hosted tenant" 360 metric_has 'synch_dp_tenants_running 1'
 FIRST_KEY=$(hosted_key)
 
 # `held_bytes` is populated only after Cloud::finalize has received the S3
-# acknowledgements for both payload and Bao outboard. This is the durability
-# claim, observed through the production metrics surface.
-wait_for "the hosted S3 copy" 480 metric_has \
-  'synch_dp_held_bytes{org="acme",network="prod"} 23'
+# acknowledgements for every payload and Bao outboard. Requiring two roots and
+# their exact combined size proves cloud-1 replicated both publishers.
+wait_for "both hosted S3 copies" 600 metric_has \
+  "synch_dp_held_bytes{org=\"acme\",network=\"prod\"} $EXPECTED_BYTES"
+metric_has 'synch_dp_held_roots{org="acme",network="prod"} 2'
 
-# Remove the publisher and its whole working copy. From here on the bucket is
-# the only copy of the bytes and database stream this test can use.
-"$SYNCH_BIN" --data-dir "$WORKDIR/customer" daemon stop
-wait "$CUSTOMER_PID"
-mv "$WORKDIR/customer" "$WORKDIR/customer-lost"
-mv "$WORKDIR/source" "$WORKDIR/source-lost"
+# Remove both publishers and their whole working copies. The only remaining
+# payloads are now in MinIO under cloud-1's durable claims.
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-1" daemon stop
+"$SYNCH_BIN" --data-dir "$WORKDIR/node-2" daemon stop
+wait "$NODE1_PID"
+wait "$NODE2_PID"
+mv "$WORKDIR/node-1" "$WORKDIR/node-1-lost"
+mv "$WORKDIR/node-2" "$WORKDIR/node-2-lost"
+mv "$WORKDIR/source-1" "$WORKDIR/source-1-lost"
+mv "$WORKDIR/source-2" "$WORKDIR/source-2-lost"
 
 kill -TERM "$DP_PID"
 wait "$DP_PID"
@@ -196,8 +239,8 @@ mv "$WORKDIR/dp" "$WORKDIR/dp-first-ephemeral-volume"
 mkdir -p "$WORKDIR/dp"
 : > "$DP_LOG"
 
-# A new process on a blank volume must restore the stream, keep the exact same
-# device identity, and still account for the held last copy.
+# A new cloud process on a blank volume must restore its identity, claims and
+# both payloads before the only surviving customer node is started.
 start_dp "$WORKDIR/dp" "$DP_LOG"
 wait_for "the restored hosted tenant" 360 metric_has 'synch_dp_tenants_running 1'
 SECOND_KEY=$(hosted_key)
@@ -205,21 +248,53 @@ SECOND_KEY=$(hosted_key)
   echo "FAIL: restored hosted identity changed ($FIRST_KEY -> $SECOND_KEY)" >&2
   exit 1
 }
-wait_for "the restored last copy" 240 metric_has \
-  'synch_dp_held_bytes{org="acme",network="prod"} 23'
+wait_for "both restored copies" 240 metric_has \
+  "synch_dp_held_bytes{org=\"acme\",network=\"prod\"} $EXPECTED_BYTES"
 
-# CI exposes this test-only bucket for listing, letting the harness also prove
-# that both production prefixes exist instead of inferring that solely from
-# the service's durable accounting.
+# node-3 starts only now. It has no source, replica, or cached payload. Its
+# first successful reads must therefore learn both publisher heads and fetch
+# both bodies from the restored cloud-1 node.
+start_customer "$WORKDIR/node-3" "$NODE3_PORT" "$NODE3_LOG"
+NODE3_PID=$CUSTOMER_PID
+wait_for "node-3" 240 grep -q '^control socket:' "$NODE3_LOG"
+
+node3_knows_both() {
+  "$SYNCH_BIN" --data-dir "$WORKDIR/node-3" ls media \
+    > "$WORKDIR/node-3-tree.out" 2>/dev/null || return 1
+  grep -q 'from-node-1.txt' "$WORKDIR/node-3-tree.out" &&
+    grep -q 'from-node-2.txt' "$WORKDIR/node-3-tree.out"
+}
+wait_for "node-3 to learn both publishers from cloud-1" 600 node3_knows_both
+
+node3_reads_both() {
+  "$SYNCH_BIN" --data-dir "$WORKDIR/node-3" cat media/from-node-1.txt \
+    > "$WORKDIR/node-3-read-1.txt" 2>/dev/null || return 1
+  "$SYNCH_BIN" --data-dir "$WORKDIR/node-3" cat media/from-node-2.txt \
+    > "$WORKDIR/node-3-read-2.txt" 2>/dev/null || return 1
+  cmp "$WORKDIR/source-1-lost/from-node-1.txt" "$WORKDIR/node-3-read-1.txt" &&
+    cmp "$WORKDIR/source-2-lost/from-node-2.txt" "$WORKDIR/node-3-read-2.txt"
+}
+wait_for "node-3 to read both files from cloud-1" 120 node3_reads_both
+
+# Teardown is not an assertion: depending on whether the control response or
+# process exit wins the race, `daemon stop` can report a closed socket. TERM the
+# process group directly after the byte comparisons have passed.
+kill -TERM -- "-$NODE3_PID" 2>/dev/null || kill -TERM "$NODE3_PID" 2>/dev/null || true
+wait "$NODE3_PID" || true
+
 if [[ -n "${SYNCH_E2E_S3_LIST_URL:-}" ]]; then
   curl -fsS "${SYNCH_E2E_S3_LIST_URL}?list-type=2&prefix=tenants/acme/prod/cas/" \
     > "$WORKDIR/cas-list.xml"
-  grep -q '<Key>tenants/acme/prod/cas/' "$WORKDIR/cas-list.xml"
+  CAS_KEYS=$(grep -o '<Key>tenants/acme/prod/cas/' "$WORKDIR/cas-list.xml" | wc -l)
+  [[ "$CAS_KEYS" -ge 4 ]] || {
+    echo "FAIL: expected two MinIO payload/outboard pairs, found $CAS_KEYS keys" >&2
+    exit 1
+  }
   curl -fsS "${SYNCH_E2E_S3_LIST_URL}?list-type=2&prefix=db/acme/prod/" \
     > "$WORKDIR/db-list.xml"
   grep -q '<Key>db/acme/prod/' "$WORKDIR/db-list.xml"
 fi
 
 kill -TERM "$DP_PID"
-wait "$DP_PID"
+wait "$DP_PID" || true
 echo "CLOUD-DATAPLANE-E2E-OK"
