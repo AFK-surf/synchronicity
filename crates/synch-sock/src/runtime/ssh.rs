@@ -233,6 +233,22 @@ struct ChannelBinding {
     guest_closed: Arc<Notify>,
 }
 
+/// What answering an event did.
+///
+/// A guest that answers correctly has done its job whether or not anyone was
+/// still listening, so both variants are success. They are distinguished
+/// because one caller — accepting a channel — allocates an fd for the answer
+/// to carry, and must undo that when the answer reaches nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replied {
+    /// Handed to the session task waiting for it.
+    Delivered,
+    /// The event was real and is now consumed, but the connection it belonged
+    /// to has gone: the peer disconnected between the event reaching the
+    /// guest and the guest answering it.
+    Abandoned,
+}
+
 /// One activated SSH connection as seen by fd zero.
 #[derive(Debug)]
 pub(crate) struct SshState {
@@ -398,21 +414,43 @@ impl SshState {
             .map(|event| event.kind)
     }
 
-    pub(crate) fn reply(&self, id: u64, decision: Decision) -> Result<(), ()> {
+    /// Answers an outstanding event.
+    ///
+    /// `Err` is reserved for the one case that is the guest's mistake: an id
+    /// that never named an outstanding event. A teardown is not that, and the
+    /// difference matters — see [`Replied`].
+    pub(crate) fn reply(&self, id: u64, decision: Decision) -> Result<Replied, ()> {
         let mut store = self
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut event) = store.outstanding.remove(&id) else {
-            return Err(());
+            drop(store);
+            // `close` empties `outstanding` wholesale, so after the peer has
+            // gone an id the guest legitimately holds is simply not here any
+            // more. That is indistinguishable *here* from a bogus id, and
+            // answering both the same way would be wrong: a guest cannot
+            // check and answer atomically, so every event answered near a
+            // disconnect would fail for something it could not have avoided.
+            // The connection's own state is what tells them apart.
+            return if self.is_closed() {
+                Ok(Replied::Abandoned)
+            } else {
+                Err(())
+            };
         };
         store.payload_bytes = store.payload_bytes.saturating_sub(event.payload_len());
         let response = event.response.take();
         drop(store);
         if let Some(response) = response {
-            response.send(decision).map_err(|_| ())?;
+            // The waiting session task can be gone before `close` has run —
+            // its future is dropped when the connection dies. Same teardown,
+            // same answer.
+            if response.send(decision).is_err() {
+                return Ok(Replied::Abandoned);
+            }
         }
-        Ok(())
+        Ok(Replied::Delivered)
     }
 
     fn cancel_event(&self, id: u64) {
@@ -2288,8 +2326,8 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        unknown_request_dimensions, AuthThrottle, Event, SshHandler, SshState, EVENT_AUTHENTICATED,
-        EVENT_AUTH_NONE, EVENT_AUTH_OPENSSH_CERT, EVENT_AUTH_PUBLICKEY_OFFER,
+        unknown_request_dimensions, AuthThrottle, Decision, Event, Replied, SshHandler, SshState,
+        EVENT_AUTHENTICATED, EVENT_AUTH_NONE, EVENT_AUTH_OPENSSH_CERT, EVENT_AUTH_PUBLICKEY_OFFER,
         EVENT_AUTH_PUBLICKEY_VERIFIED, FIELD_AUTH_ATTEMPTS, FIELD_AUTH_CERT_FLAG,
         MAX_AUTH_USERNAME_BYTES, MAX_EVENTS,
     };
@@ -2300,6 +2338,59 @@ mod tests {
         },
         runtime::endpoint::Readiness,
     };
+
+    /// Answering an event whose connection has since gone is not the guest's
+    /// error. This is the difference between a teardown and a bogus id, and
+    /// it has to be a difference: `close` empties the outstanding map, so
+    /// without it every event answered near a disconnect fails — which is
+    /// exactly the race that made
+    /// `partial_success_reaches_the_client_and_the_next_factor_completes`
+    /// flake, its guest exiting 84 from a `sy_ssh_event_done` it could not
+    /// have made succeed.
+    #[test]
+    fn answering_after_the_connection_closed_is_not_an_error() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let (tx, rx) = oneshot::channel();
+        state
+            .push(Event::auth(EVENT_AUTH_NONE, "test", tx))
+            .expect("the event is pushed");
+        let header = state.next().expect("the guest takes the event");
+
+        // The peer goes away with the event in the guest's hands.
+        state.close(0);
+        drop(rx);
+
+        assert_eq!(
+            state.reply(header.id, Decision::Done),
+            Ok(Replied::Abandoned),
+            "a teardown is not a failed reply"
+        );
+    }
+
+    /// And an id that never named an event still is an error, which is the
+    /// case the distinction exists to preserve.
+    #[test]
+    fn answering_an_unknown_event_is_still_an_error() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        assert_eq!(state.reply(4242, Decision::Done), Err(()));
+    }
+
+    /// A waiter that is gone before the connection is formally closed is the
+    /// same teardown, reached the other way.
+    #[test]
+    fn answering_a_departed_waiter_is_not_an_error() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let (tx, rx) = oneshot::channel();
+        state
+            .push(Event::auth(EVENT_AUTH_NONE, "test", tx))
+            .expect("the event is pushed");
+        let header = state.next().expect("the guest takes the event");
+        drop(rx);
+        assert_eq!(
+            state.reply(header.id, Decision::Done),
+            Ok(Replied::Abandoned)
+        );
+    }
 
     #[test]
     fn break_requests_expose_their_typed_duration() {
