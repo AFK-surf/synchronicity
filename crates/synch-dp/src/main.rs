@@ -63,17 +63,12 @@ async fn run() -> synch_dp::Result<()> {
         shard = config.shard,
         shards = config.shards,
         base_dir = %config.base_dir.display(),
-        sealed = config.db_key.is_some(),
         "cloud data plane starting"
     );
-    if config.db_key.is_none() {
-        tracing::warn!(
-            "database replica streams are unsealed: anyone who can read the bucket can read \
-             every hosted tenant's device secret key"
-        );
-    }
-
-    let objects = ObjectStore::new(config.objects.operator()?, config.db_key)?;
+    // Before anything provisions: a backend that cannot carry database
+    // streams is a shard that would lose every identity it creates (§5.3).
+    config.check_db_replication()?;
+    let objects = ObjectStore::new(config.objects.operator()?);
     let control = ControlPlane::new(&config.control_url, &config.token)?;
     let metrics = Arc::new(Metrics::default());
 

@@ -24,13 +24,6 @@ pub enum DpError {
     /// The configuration is unusable, and says why.
     #[error("configuration: {0}")]
     Config(String),
-    /// The database stream could not be sealed or opened.
-    ///
-    /// Deliberately says nothing about which: a decrypt failure is either a
-    /// wrong key or a tampered object, and telling them apart is exactly the
-    /// service an attacker would like.
-    #[error("database stream cryptography failed")]
-    Crypto,
 }
 
 impl DpError {

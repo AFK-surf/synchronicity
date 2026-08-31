@@ -520,9 +520,8 @@ Process shutdown (SIGTERM = SIGINT, as the daemon insists): broadcast to
 every tenant's loops, `join` them, then per tenant `Node::shutdown()` —
 its four-step order (close admission, drain socket streams, retire
 endpoints) already handles the no-sockets case as a cheap no-op — and
-finally a checkpoint-and-ship of that tenant's WAL tail by the in-process
-database replicator (§5.3), so the pod leaves nothing behind that the
-replica stream does not carry. The 30-second termination allowance from
+finally the tail ship by that tenant's replicator (§5.3), so the pod
+leaves nothing behind that the replica stream does not carry. The 30-second termination allowance from
 SERVERLESS scales: tenants shut down concurrently, and the deployment
 grants the pod the same 30 s it grants a serverless daemon. A pod killed
 without grace loses at most the replication interval (§5.3), the same
@@ -600,73 +599,104 @@ everything under `<base>` — every tenant's SQLite file, cache, and scratch
 is not one deployment option here; it is the only description of the
 system, and the data plane **manages the database replicas itself,
 in-process**. There is no Litestream sidecar, no operator-maintained
-replication config, and no volume to mount: `synch-dp` carries a
-WAL-shipping replicator (`dbrepl`, one standing task per tenant) that
-speaks the same OpenDAL operator the CAS already uses.
+replication config, and no volume to mount: `synch-dp` links the
+replication library in and drives one replica per tenant (`dbrepl`),
+against the same object store the CAS already uses.
 
 A sidecar was considered and rejected. The tenant set is dynamic — DBs
 appear and retire with every reconciler pass — and a config-file-plus-
 restart cycle per membership change is exactly the kind of process
 choreography an ephemeral pod is bad at. In-process replication follows a
 tenant's lifecycle for free (provision starts it, drain flushes and stops
-it), shares credentials and retry/timeout layers with the CAS client, and
-keeps the repository's one-self-contained-binary posture: SQLite is
+it), reads its credentials from the same environment the CAS client does,
+and keeps the repository's one-self-contained-binary posture: SQLite is
 already compiled in; its replication should not be the one function
 outsourced to a Go binary in the image.
 
-The replica stream follows the generation model Litestream proved:
+Shipping the stream is **not this repository's code**. `synch-dp` depends
+on [`celld-ltx`](https://github.com/denoland/celld/tree/main/crates/ltx), a
+Rust reimplementation of Litestream v0.5 writing the LTX format, pinned by
+git revision. `crates/synch-dp/src/dbrepl.rs` is the thin part: it points
+that library at a tenant's database and its prefix and drives it on an
+interval.
 
-```
-db/<org>/<network>/
-  <generation>/snapshot            ← compressed full copy at generation start
-  <generation>/wal/<index>         ← WAL segments, shipped in order
-```
+That division is deliberate, and the earlier draft of this document got it
+wrong by specifying a WAL shipper of our own. Shipping a write-ahead log
+is a specialist's problem wearing an easy problem's clothes. SQLite spills
+a large transaction's pages into the log *before* it commits, and rolls
+back by rewinding its own high-water mark while leaving those bytes for
+the next transaction to overwrite — so a shipper that goes by file length
+ships frames that are about to be replaced and then misses their
+replacements, silently, with the stream reporting healthy throughout.
+Getting it right means tracking commit boundaries, verifying SQLite's
+frame checksum chain to notice a log rewritten behind you, and ordering a
+snapshot against a checkpoint so a failed upload cannot strand writes.
+Litestream has learned those over years of production; inheriting them
+costs one dependency, and rediscovering them costs correctness we would
+only find out we lacked from a customer's lost database.
 
-- **Generation**: a random id minted at first init and again on every
-  restore. Within a generation, `snapshot + wal/*` replays to the
-  current database; frame salts and checksums in the WAL segments are what
-  make a torn or duplicated upload detectable on restore.
-- **Shipping**: on a short interval (default 1 s) the replicator walks the
-  frames appended since it last shipped, and uploads them as one segment.
-  It owns checkpointing outright — engine change **(d)**, §7.3 — so nothing
-  can recycle a frame it has not shipped. Two rules make the walk sound,
-  and neither is optional. It stops at the last frame that **committed** a
-  transaction, because SQLite spills a large transaction's pages into the
-  log before it commits and rolls back by rewinding its own high-water mark
-  while leaving those bytes for the next transaction to overwrite — so
-  shipping by file length ships frames that are about to be replaced and
-  then misses their replacements. And it **verifies each frame's checksum
-  against the running chain**, so a frame that does not continue what was
-  already shipped is caught; that can only mean the log was rewritten
-  behind us, and the sound response is to end the generation and snapshot
-  the database file, which is authoritative either way.
-  Acknowledged-but-unshipped writes are bounded by the interval; as with
-  Litestream, the replica can only be *behind* the bucket's CAS state,
-  never ahead, which is the direction §8.3 of SERVERLESS already reasons
-  about.
-- **Restore**: on provisioning, before any init — list generations, pick
-  the newest with a contiguous, checksum-valid WAL, download and replay,
-  then start a fresh generation. Only when nothing restorable exists does
-  `Node::init` run, exactly like a serverless daemon's boot.
-- **Drain and shutdown**: ship the tail, then stop. There is deliberately
-  no close marker and no final checkpoint: a marker would be one more thing
-  whose absence could strand a good stream, and restore already reads a
-  generation by what it holds rather than by what it claims.
+The stream lives under `db/<org>/<network>/`, in whatever layout the
+library writes — LTX files by compaction level, with its own snapshot and
+compaction policy. This design does not specify that layout and must not:
+it is the library's, and pinning our own description of it here is how a
+document starts lying after an upgrade.
+
+- **Shipping**: on a short interval (default 1 s) the replicator captures
+  what the database has committed into local LTX segments and uploads
+  them. It owns checkpointing outright — engine change **(d)**, §7.3 — so
+  nothing can recycle a frame it has not shipped. Acknowledged-but-
+  unshipped writes are bounded by the interval; as with Litestream, the
+  replica can only be *behind* the bucket's CAS state, never ahead, which
+  is the direction §8.3 of SERVERLESS already reasons about.
+- **A thread per tenant**: a replica owns a SQLite connection, so it is
+  `Send` but not `Sync`, and the library's `sync` holds `&self` across an
+  await — its future is therefore not `Send` and cannot be handed to
+  `tokio::spawn` at all. Each replicator owns one thread running a
+  current-thread runtime, and the type the tenant holds is a `Send + Sync`
+  handle onto it. This is not a workaround: the bound is telling the truth
+  about a connection that must not be touched from two threads. Two things
+  fall out of it that are worth having anyway — the blocking half of a
+  capture is real SQLite work and belongs off the async workers, and
+  commands are served one at a time, so a final ship can never interleave
+  with a tick.
+- **Restore**: on provisioning, before any init, at `TXID(0)` — meaning
+  "whatever is latest". A plan that comes back unsatisfiable at that TXID
+  can only mean the prefix holds no LTX files at all, so the library's
+  `TxNotAvailable` and `NoSnapshots` are read as *empty stream* and
+  nothing else; every other failure stays a failure and parks the tenant.
+  That distinction is load-bearing: "there is nothing here" initializes a
+  new identity, "I could not tell" must not.
+- **Never over an existing database**: a database already on disk is kept
+  rather than restored over. Partly the library's rule — a restore refuses
+  a path that exists — and mostly the right one, since the local copy is
+  by construction at least as new as a stream that is only ever written
+  *from* it. This is the crash-between-`init`-and-register path (§4.3),
+  and it is why the disk check is not redundant with the restore.
+- **Drain and shutdown**: ship the tail, then close. The close is what
+  releases the library's long-running read lock, and the drain waits for
+  the thread to actually end — a caller that closes in order to remove the
+  data directory needs the connection gone, not merely asked to go.
 - **Single writer**: correctness of the stream assumes one live replicator
   per tenant DB, which is the same assumption the node itself makes
   (`replicas: 1`, SERVERLESS §1) and is provided by shard ownership
-  (§7.2). A shard-handover race — two pods briefly believing they own a
-  tenant — writes two *different generations*, not interleaved garbage;
-  restore picks one, and the loser's divergence is repaired by the ordinary
-  key-replacement path below. The generation model turns split-brain from
-  corruption into a recoverable fork.
-- **Protection**: the DB stream contains the device secret, so
-  `db/<org>/<network>/` objects are additionally encrypted by the
-  replicator with a per-deployment key from the environment (KMS-backed
-  where available) before upload. Bucket read access alone then yields
-  content — which the CAS prefix already yields — but not identities. This
-  is the "protect it separately from the CAS prefix" rule of SERVERLESS,
-  discharged without needing a second bucket.
+  (§7.2). The backstop for a shard-handover race is
+  `check_database_behind_replica`, run before any sync: a database that
+  starts behind its own stream is refused rather than opened, so the
+  failure mode is a tenant that parks and says so, not one that reports
+  healthy while shipping nothing.
+- **S3 or nothing**: the library ships two clients — S3-compatible object
+  storage and a local directory — so a GCS or Azure deployment is refused
+  at startup rather than per tenant. That is a real narrowing of what the
+  CAS itself supports, and it is the honest one: a shard that cannot write
+  a database stream would mint device keys, get them named in customer
+  zones, and lose every one of them on its first reschedule.
+- **Protection**: not this layer's business, and an earlier draft was
+  wrong to make it so. The DB stream carries the device secret and does
+  want protecting, but the place to protect it is the bucket — SSE-KMS, a
+  customer-managed key, whatever the deployment already runs for
+  everything else it keeps there (§9). An envelope invented here would be
+  one more key to rotate, escrow and lose, buying nothing the storage
+  layer does not already do better.
 
 It is worth being precise about what the database is *for*, because it is
 less than it looks:
@@ -783,10 +813,11 @@ losing shard's next reconcile drains the tenant (shipping the DB tail),
 the gaining shard restores that stream and resumes the *same* identity; no
 zone change, no key change, no customer-visible event. The race — a
 rolling shard-count change where both pods briefly run the tenant — is one
-identity written by two processes, which is exactly the §5.3 generation
-fork: two generations, restore picks one, divergence repairs by key
-replacement. Rare, bounded by one reconcile interval, and recoverable
-rather than corrupting.
+identity written by two processes, and the §5.3 backstop is what catches
+it: the second replicator's behind-replica check refuses to open, so the
+tenant parks and says so instead of reporting healthy while shipping
+nothing. Rare, bounded by one reconcile interval, and recoverable rather
+than corrupting.
 
 Redundant hosting is a second *slot* (`cloud-2`, its own key, DB stream,
 and CAS claims over the same tenant prefix), assigned to a different shard
@@ -846,6 +877,17 @@ None of the engine's replication, storage, or membership code changes.
   for named spaces only and scoped replication (DESIGN §5.5) redacts the
   rest down to the filenames — and is deliberately future work: it trades "replicate
   everything" for "replicate exactly this", a different product tier.
+- **Device secrets live in the DB streams, and the bucket protects them.**
+  A tenant's database carries its device secret key, so `db/<org>/<network>/`
+  is the one prefix where read access yields identities rather than merely
+  content. Protecting it is the storage layer's job and is a deployment
+  requirement, not a code path: encryption at rest on the bucket (SSE-KMS
+  or a customer-managed key), and a bucket policy that does not grant this
+  prefix more widely than the CAS one. The service deliberately does not
+  wrap an envelope of its own around these objects — that would be one
+  more key to rotate, escrow and lose, buying nothing the provider does
+  not already do better, and its loss would strand every tenant's identity
+  at once.
 - **Blast radius of a compromised data-plane host**: every hosted
   network's content and device secrets on that shard — but no customer
   device keys, no zone keys, no control-plane credentials beyond the
@@ -908,8 +950,8 @@ crates/synch-dp/
   src/tenant.rs        # per-network lifecycle: provision, identify,
                        #   loop set, supervise, drain, retire
   src/spaces.rs        # space-driven replica ensure (§4.5 — never removes)
-  src/dbrepl.rs        # in-process WAL-shipping DB replicator (§5.3)
-  src/store.rs         # the service's bucket client, and the sealed envelope
+  src/dbrepl.rs        # per-tenant DB replica, driven over `celld-ltx` (§5.3)
+  src/store.rs         # the service's own bucket client (cache, offboarding)
   src/metrics.rs
 ```
 
@@ -919,8 +961,9 @@ crates/synch-dp/
    runtime and the SSH host key entirely; change (c)
    `synch_engine::LifecycleLock` (the daemon's own lock, moved into the
    engine so an embedder gets it and the two cannot drift); change (d)
-   `Checkpointing::Embedder` plus `Store::checkpoint`, `db_path`, and
-   `wal_path`.
+   `Checkpointing::Embedder` plus `Store::db_path` — the whole of what the
+   replication library needs, which is a database to point at and a
+   promise that nobody else checkpoints it.
 2. **Control plane.** Migration v12 (`cloud_hosted`, `cloud_disabled_at`,
    `dataplane_keys`, `network_hosting_status`, the `system-dataplane`
    user), the admin toggle with its audit events and its dashboard switch,
@@ -950,9 +993,10 @@ crates/synch-dp/
 - **Cross-shard handover exercised against a live fleet.** The rendezvous
   filter is implemented and unit-tested; no test moves a running tenant
   between two processes.
-- **Restore fuzzing** over torn and forked streams. Restore is exercised on
-  every provisioning and in unit tests covering a gap and a generation
-  roll; it is not yet fuzzed.
+- **Restore fuzzing** over torn and forked streams. Restore is exercised
+  on every provisioning, and a unit test round-trips a shipped stream back
+  into a database; the library carries its own tests for torn and
+  non-contiguous LTX chains, and this crate adds no fuzzing of its own.
 
 ---
 
@@ -971,14 +1015,16 @@ crates/synch-dp/
 - **No cross-tenant dedup.** Two orgs storing the same bytes pay twice.
   Chosen in §5.1; the confidentiality and offboarding wins are worth more
   than the duplicate gigabytes.
-- **The database replica is load-bearing, and now first-party.** The
-  last-copy case rests on the in-process replicator rather than a proven
-  external tool — engineering the data plane takes on knowingly, because
-  ephemeral pods and a dynamic tenant set left the sidecar shape without a
-  leg to stand on (§5.3). The mitigations are owed, not optional: the
-  generation model is Litestream's, restore is exercised on every pod
-  reschedule rather than only in disasters, and a stalled stream is an
-  incident, not a warning.
+- **The database replica is load-bearing, and now in-process.** The
+  last-copy case rests on replication this service drives itself rather
+  than on a sidecar an operator configures — a shape ephemeral pods and a
+  dynamic tenant set left without a leg to stand on (§5.3). What is *not*
+  taken on is the shipping algorithm: that is `celld-ltx`, pinned by
+  revision, and the cost moved rather than vanished — this fleet now owns
+  keeping that pin current and reading its changelog. The other
+  mitigations are owed too: restore is exercised on every pod reschedule
+  rather than only in disasters, and a stalled stream is an incident, not
+  a warning.
 - **One more standing fleet.** The data plane is a new operated service
   with real state. Everything in this design that could be a daemon
   feature was kept a daemon feature precisely so that a customer who

@@ -42,8 +42,6 @@ pub struct DpConfig {
     pub poll_interval: Duration,
     /// The object store: OpenDAL service and its options.
     pub objects: ObjectConfig,
-    /// The key sealing the database streams.
-    pub db_key: Option<[u8; 32]>,
     /// Total cache budget across all tenants on this pod.
     pub cache_bytes_total: u64,
     /// How many tenants this pod is sized for. Divides the cache budget.
@@ -163,7 +161,6 @@ impl DpConfig {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
-            db_key: None,
             cache_bytes_total: 64 * 1024 * 1024,
             max_tenants: 4,
             metrics_addr: None,
@@ -201,32 +198,6 @@ impl DpConfig {
         let mut options = HashMap::new();
         collect_options(&service, &mut options);
 
-        let db_key = match std::env::var("SYNCH_DP_DB_KEY") {
-            Ok(hex_key) => {
-                let bytes = hex::decode(hex_key.trim())
-                    .map_err(|_| DpError::Config("SYNCH_DP_DB_KEY must be hex".into()))?;
-                let key: [u8; 32] = bytes.try_into().map_err(|_| {
-                    DpError::Config("SYNCH_DP_DB_KEY must be 32 bytes (64 hex chars)".into())
-                })?;
-                Some(key)
-            }
-            // Refused rather than defaulted: the stream carries device secret
-            // keys, and a deployment that has not decided how to protect them
-            // should find out now and not after a bucket is readable (§9).
-            // `SYNCH_DP_DB_UNSEALED=1` is the explicit way to say "I know",
-            // which exists for tests and for a bucket that is already sealed
-            // by the provider under a key the operator controls.
-            Err(_) if truthy("SYNCH_DP_DB_UNSEALED") => None,
-            Err(_) => {
-                return Err(DpError::Config(
-                    "SYNCH_DP_DB_KEY is required: the database replica stream carries device \
-                     secret keys. Set a 32-byte hex key, or SYNCH_DP_DB_UNSEALED=1 to store \
-                     them unsealed deliberately."
-                        .into(),
-                ))
-            }
-        };
-
         Ok(Self {
             control_url,
             token,
@@ -236,7 +207,6 @@ impl DpConfig {
             shard_name,
             poll_interval,
             objects: ObjectConfig { service, options },
-            db_key,
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
             max_tenants: parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1),
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
@@ -308,6 +278,74 @@ impl DpConfig {
         format!("db/{org}/{network}")
     }
 
+    /// Refuses a deployment that cannot replicate tenant databases.
+    ///
+    /// Asked once at startup rather than discovered one tenant at a time. A
+    /// shard whose backend has no replication client would provision nodes,
+    /// mint their device keys, get them named in customer zones, and then
+    /// lose every one of them on its first reschedule — so the honest
+    /// failure is to refuse to start (§5.3).
+    pub fn check_db_replication(&self) -> Result<()> {
+        self.db_client("preflight", "preflight").map(|_| ())
+    }
+
+    /// The replication client for one tenant's database stream.
+    ///
+    /// `celld-ltx` brings its own storage client rather than OpenDAL, so this
+    /// is configured from the same environment as the CAS instead of sharing
+    /// its operator. Two clients, one bucket, separate prefixes — which is
+    /// what §5.1 already asks for.
+    ///
+    /// It also brings only two: S3-compatible object storage, and a local
+    /// directory. So a GCS or Azure deployment is refused here rather than
+    /// handed an S3 client pointed at a bucket that does not exist — the
+    /// database stream is the only durable copy of a tenant's identity
+    /// (§5.3), and a deployment that cannot write one must fail to start
+    /// rather than run and lose it.
+    pub fn db_client(&self, org: &str, network: &str) -> Result<crate::dbrepl::DbClient> {
+        let options = &self.objects.options;
+        let get = |key: &str| options.get(key).cloned().unwrap_or_default();
+        match self.objects.service.as_str() {
+            "s3" => Ok(crate::dbrepl::DbClient::Objects(Box::new(
+                celld_ltx::ObjectStoreClient::new(celld_ltx::ObjectStoreConfig {
+                    bucket: get("bucket"),
+                    path: self.db_prefix(org, network),
+                    region: get("region"),
+                    endpoint: get("endpoint"),
+                    access_key_id: get("access_key_id"),
+                    secret_access_key: get("secret_access_key"),
+                    // A custom endpoint is MinIO/R2/Backblaze in practice, and
+                    // all of them want path-style addressing; native AWS does
+                    // not.
+                    force_path_style: !get("endpoint").is_empty(),
+                    ..Default::default()
+                }),
+            ))),
+            // The CAS's `memory` service is for tests, and so is this: a
+            // directory beside the tenant data rather than inside the bucket.
+            // It is named for the CAS backend it accompanies, not for what it
+            // does — nothing durable is expected of either.
+            "memory" => Ok(crate::dbrepl::DbClient::Files(
+                celld_ltx::FileReplicaClient::new(
+                    self.db_stream_dir(org, network)
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            )),
+            other => Err(DpError::Config(format!(
+                "cloud hosting cannot replicate tenant databases to {other}: \
+                 the replication library supports S3-compatible storage only, \
+                 and a deployment without a database stream would lose every \
+                 tenant identity on the first reschedule"
+            ))),
+        }
+    }
+
+    /// Where a `memory`-backed deployment keeps its database streams.
+    pub fn db_stream_dir(&self, org: &str, network: &str) -> PathBuf {
+        self.base_dir.join("db").join(org).join(network)
+    }
+
     /// Where the fail-static desired-state cache lives (§4.2).
     pub fn desired_key(&self) -> String {
         format!("dp/{}/desired.json", self.shard)
@@ -360,13 +398,6 @@ fn parse<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
     }
 }
 
-fn truthy(key: &str) -> bool {
-    matches!(
-        std::env::var(key).unwrap_or_default().trim(),
-        "1" | "true" | "yes"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +415,6 @@ mod tests {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
-            db_key: None,
             cache_bytes_total: 1024,
             max_tenants: 4,
             metrics_addr: None,
@@ -392,6 +422,32 @@ mod tests {
             dns: synch_net::ResolverOptions::default(),
             rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,
             retire_after: crate::rotation::DEFAULT_RETIRE_AFTER,
+        }
+    }
+
+    /// The replication library speaks S3 and local files, and nothing else.
+    /// A backend it cannot write is a shard that would mint device keys, get
+    /// them named in customer zones, and lose them all on its first
+    /// reschedule — so it has to be refused before any of that (§5.3).
+    #[test]
+    fn a_backend_without_database_replication_refuses_to_start() {
+        let mut config = config(0, 1);
+        for service in ["s3", "memory"] {
+            config.objects.service = service.into();
+            assert!(
+                config.check_db_replication().is_ok(),
+                "{service} should be replicable"
+            );
+        }
+        for service in ["gcs", "azblob"] {
+            config.objects.service = service.into();
+            let error = config
+                .check_db_replication()
+                .expect_err("a backend with no replication client must be refused");
+            assert!(
+                error.to_string().contains(service),
+                "the refusal should name the backend: {error}"
+            );
         }
     }
 

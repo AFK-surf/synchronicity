@@ -15,11 +15,10 @@ use tokio::sync::broadcast;
 
 use crate::config::{slot_label, DpConfig, SLOT};
 use crate::control::{ControlPlane, HostedNetwork, Status};
-use crate::dbrepl::{self, Replicator, ReplicatorConfig};
+use crate::dbrepl::{self, Replicator};
 use crate::error::{DpError, Result};
 use crate::rotation;
 use crate::spaces;
-use crate::store::ObjectStore;
 
 /// Where a tenant is in its life.
 ///
@@ -71,7 +70,13 @@ pub struct Tenant {
     _lock: LifecycleLock,
     shutdown: broadcast::Sender<()>,
     loops: Vec<tokio::task::JoinHandle<()>>,
-    replicator: Option<Arc<tokio::sync::Mutex<Replicator>>>,
+    /// Tells the replication ticker to make its final ship and close.
+    ///
+    /// Separate from `shutdown` because the tail ship has to happen *after*
+    /// the node is closed, not alongside the loops (see [`Tenant::drain`]).
+    /// Dropping it says the same thing, so a tenant that is dropped rather
+    /// than drained still ends its ticker.
+    replication_finish: Option<tokio::sync::oneshot::Sender<()>>,
     replication_task: Option<tokio::task::JoinHandle<()>>,
     dir: PathBuf,
 }
@@ -84,7 +89,6 @@ impl Tenant {
     /// when the stream holds nothing (§4.3).
     pub async fn provision(
         config: &DpConfig,
-        objects: &ObjectStore,
         control: &ControlPlane,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
         network: HostedNetwork,
@@ -96,13 +100,28 @@ impl Tenant {
         let lock = LifecycleLock::acquire(&dir)
             .map_err(|error| DpError::io("locking the tenant data directory", error))?;
 
-        let db_prefix = config.db_prefix(&network.org, &network.network);
-        let restored = dbrepl::restore(objects, &db_prefix, &dir).await?;
-        if restored.is_none() && !initialized(&dir).await? {
-            // Nothing restorable and nothing on disk: a network never hosted,
-            // or one whose stream is gone. Either way this node needs an
-            // identity of its own, and the registration below is what gets it
-            // named.
+        // A database already on disk is never restored over. That is partly
+        // the library's rule — a restore refuses a path that exists, so asking
+        // is an error rather than a no-op — and mostly the right one: this
+        // copy is by construction at least as new as the stream, which is
+        // only ever written *from* it. The case where it is not, a directory
+        // left by some older owner, is caught in `Replicator::start`, which
+        // refuses to open a database behind its own stream rather than
+        // silently shipping nothing.
+        let restored = if dir.join(synch_store::DB_FILE).exists() {
+            tracing::info!(
+                tenant = %network.key(),
+                "a database is already on disk; keeping it rather than restoring"
+            );
+            false
+        } else {
+            dbrepl::restore(config.db_client(&network.org, &network.network)?, &dir).await?
+        };
+        if !restored && !initialized(&dir).await? {
+            // Nothing restorable and nothing settled on disk: a network never
+            // hosted, or one whose stream is gone. Either way this node needs
+            // an identity of its own, and the registration below is what gets
+            // it named.
             //
             // The disk check is not redundant with the restore. A pod that
             // died between `init` and the registration below leaves an
@@ -155,11 +174,11 @@ impl Tenant {
             _lock: lock,
             shutdown: broadcast::channel(1).0,
             loops: Vec::new(),
-            replicator: None,
+            replication_finish: None,
             replication_task: None,
             dir,
         };
-        tenant.open(config, objects, resolver).await?;
+        tenant.open(config, resolver).await?;
         Ok(tenant)
     }
 
@@ -167,7 +186,6 @@ impl Tenant {
     async fn open(
         &mut self,
         config: &DpConfig,
-        objects: &ObjectStore,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
     ) -> Result<()> {
         let node_config = self.node_config(config)?;
@@ -196,7 +214,7 @@ impl Tenant {
         // before propagating. Without that, a failed open leaks an endpoint
         // and its tasks, and the retry 30 seconds later rewrites the database
         // file underneath them.
-        match self.start(node.clone(), config, objects, resolver).await {
+        match self.start(node.clone(), config, resolver).await {
             Ok(()) => {
                 self.state = State::Running;
                 tracing::info!(tenant = %self.network.key(), "tenant is replicating");
@@ -219,7 +237,6 @@ impl Tenant {
         &mut self,
         node: Node,
         config: &DpConfig,
-        objects: &ObjectStore,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
     ) -> Result<()> {
         // Before any publisher runs. A restored database can be behind what
@@ -228,15 +245,15 @@ impl Tenant {
         // opens with the same call for the same reason.
         node.readopt_self_on_startup().await?;
 
-        let replicator_config =
-            ReplicatorConfig::new(config.db_prefix(&self.network.org, &self.network.network));
-        let interval = replicator_config.interval;
-        let replicator =
-            Replicator::start(objects.clone(), replicator_config, node.store().clone()).await?;
-        let replicator = Arc::new(tokio::sync::Mutex::new(replicator));
+        let replicator = Replicator::start(
+            &node.store().db_path(),
+            config.db_client(&self.network.org, &self.network.network)?,
+            self.network.key(),
+        )
+        .await?;
 
-        self.spawn_loops(&node, replicator.clone(), interval, resolver);
-        self.replicator = Some(replicator);
+        self.spawn_loops(&node, resolver);
+        self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL);
         self.node = Some(node.clone());
 
         // Publishes this node's own trie once, now that re-adoption has
@@ -280,19 +297,13 @@ impl Tenant {
         })
     }
 
-    /// Starts the loop set (§4.4) and the replication ticker.
+    /// Starts the loop set (§4.4).
     ///
     /// The set is the subset a source-less, checkout-less, socket-less member
     /// needs. `run_scanner`/`run_watcher` have no filesystem source to watch,
     /// `run_checkouts` has nothing to materialize, and the uploads sweeper has
     /// no write surface to sweep after — v1 exposes none.
-    fn spawn_loops(
-        &mut self,
-        node: &Node,
-        replicator: Arc<tokio::sync::Mutex<Replicator>>,
-        interval: Duration,
-        resolver: Option<Arc<synch_net::DnssecResolver>>,
-    ) {
+    fn spawn_loops(&mut self, node: &Node, resolver: Option<Arc<synch_net::DnssecResolver>>) {
         let tenant = self.network.key();
         self.spawn_loop("anti-entropy", node, |node, stop| async move {
             node.run_anti_entropy(stop).await
@@ -347,29 +358,51 @@ impl Tenant {
                 tracing::debug!(%tenant, loop_name = "cloud", "tenant loop stopped");
             }));
         }
+    }
 
-        // The replication ticker: ship WAL frames, forever.
-        let mut stop = self.shutdown.subscribe();
-        let tenant_name = tenant.clone();
+    /// Starts the replication ticker: ship what the database commits, forever.
+    ///
+    /// The ticker *owns* the replicator, and nothing else ever holds a
+    /// reference to it. That is not tidiness — the replication library's
+    /// replica owns a SQLite connection and so is `Send` but not `Sync`, and
+    /// anything that shared it behind a lock would make this task's future
+    /// unspawnable. Sole ownership also means the final ship cannot race a
+    /// tick: the same task does both, in order.
+    fn spawn_replication(&mut self, mut replicator: Replicator, interval: Duration) {
+        let (finish, mut finished) = tokio::sync::oneshot::channel();
+        self.replication_finish = Some(finish);
+        let tenant = self.network.key();
         self.replication_task = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let mut replicator = replicator.lock().await;
                         if let Err(error) = replicator.tick().await {
                             // Retried on the next tick. A stream that stays
                             // stalled is what the operator alerts on (§10) —
                             // it is not something this loop can fix.
                             tracing::warn!(
-                                tenant = %tenant_name, %error,
+                                %tenant, %error,
                                 "shipping database frames failed"
                             );
                         }
                     }
-                    _ = stop.recv() => return,
+                    // Either the drain asked, or the tenant was dropped
+                    // without draining. Both mean the same thing here.
+                    _ = &mut finished => break,
                 }
+            }
+            if let Err(error) = replicator.flush().await {
+                // Worth shouting about: this is the window in which
+                // acknowledged writes are lost, and it is supposed to be
+                // empty.
+                tracing::error!(%tenant, %error, "failed to ship the final database writes");
+            }
+            // Releases the long-running read lock the replication library
+            // holds on the database.
+            if let Err(error) = replicator.close().await {
+                tracing::warn!(%tenant, %error, "closing the replicated database failed");
             }
         }));
     }
@@ -460,20 +493,19 @@ impl Tenant {
                 tracing::warn!(%tenant, %error, "a tenant loop did not stop cleanly");
             }
         }
-        if let Some(task) = self.replication_task.take() {
-            let _ = task.await;
-        }
         if let Some(node) = self.node.take() {
             if let Err(error) = node.shutdown().await {
                 tracing::warn!(%tenant, %error, "tenant node shutdown reported an error");
             }
         }
-        if let Some(replicator) = self.replicator.take() {
-            let mut replicator = replicator.lock().await;
-            if let Err(error) = replicator.flush().await {
-                // Worth shouting about: this is the window in which
-                // acknowledged writes are lost, and it is supposed to be empty.
-                tracing::error!(%tenant, %error, "failed to ship the final database frames");
+        // Only now, with every writer stopped: the ticker's last act is the
+        // tail ship, and it has to carry the writes the shutdown above made.
+        if let Some(finish) = self.replication_finish.take() {
+            let _ = finish.send(());
+        }
+        if let Some(task) = self.replication_task.take() {
+            if let Err(error) = task.await {
+                tracing::error!(%tenant, %error, "the replication ticker did not stop cleanly");
             }
         }
         self.state = State::Retired;

@@ -158,15 +158,16 @@ export SYNCH_DP_BASE_DIR=/run/synch-dp      # ephemeral; nothing here survives a
 export SYNCH_DP_CAS_BACKEND=s3
 export SYNCH_DP_S3_BUCKET=synch-hosted
 export SYNCH_DP_S3_REGION=us-east-1
-export SYNCH_DP_DB_KEY=<64 hex chars>       # seals the database replica streams
 synch-dp
 ```
 
 It runs on pods with no durable disk, so it replicates each tenant's SQLite
-database to the bucket itself — a WAL-shipping replicator in-process, no
-Litestream sidecar — and restores it on every reschedule. Everything durable
-about a tenant is keyed by network rather than by pod, so a rescheduled shard
-resumes the same identities with no zone change at all.
+database to the bucket itself — Litestream's LTX format via the `celld-ltx`
+library, driven in-process rather than by a sidecar — and restores it on every
+reschedule. Everything durable about a tenant is keyed by network rather than
+by pod, so a rescheduled shard resumes the same identities with no zone change
+at all. Those streams carry device secret keys, so give the bucket encryption
+at rest and do not grant the `db/` prefix more widely than the `tenants/` one.
 
 [docs/CLOUD-DATAPLANE.md](docs/CLOUD-DATAPLANE.md) is the design: the
 control-plane API it polls, the tenancy and storage model, the failure matrix,

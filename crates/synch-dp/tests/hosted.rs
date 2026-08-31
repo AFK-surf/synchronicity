@@ -19,7 +19,6 @@ use axum::Json;
 use synch_core::OriginId;
 use synch_dp::config::{slot_label, DpConfig};
 use synch_dp::control::{ControlPlane, HostedDevice, HostedNetwork};
-use synch_dp::store::ObjectStore;
 use synch_dp::tenant::Tenant;
 use synch_engine::{Node, NodeConfig};
 use synch_net::sim::SimZone;
@@ -167,7 +166,6 @@ async fn until(what: &str, mut check: impl FnMut() -> bool) {
 async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     let _blocking = synch_core::BlockingScope::enter();
     let base = tempfile::tempdir().expect("a base dir");
-    let objects = ObjectStore::memory_sealed().expect("the object store");
     let cp_state: Shared = Arc::default();
     let (cp_url, cp_server) = control_plane(cp_state.clone()).await;
     let control = ControlPlane::new(&cp_url, "synchdp_test").expect("the client");
@@ -234,15 +232,9 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     // `provision` restores nothing, finds the directory already initialized
     // (the crash-between-init-and-register path), registers the key it holds,
     // and opens.
-    let mut tenant = Tenant::provision(
-        &config,
-        &objects,
-        &control,
-        Some(resolver.clone()),
-        network.clone(),
-    )
-    .await
-    .expect("the tenant provisions");
+    let mut tenant = Tenant::provision(&config, &control, Some(resolver.clone()), network.clone())
+        .await
+        .expect("the tenant provisions");
     assert_eq!(
         cp_state.lock().unwrap().registered.as_deref(),
         Some(tenant_key.to_z32().as_str()),
@@ -361,17 +353,64 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     assert_eq!(&read[..], b"the only copy");
 
     // ---- the database replica stream is real ---------------------------
-    let generations = objects
-        .list_dirs(&format!("db/{ORG}/{NETWORK}/"))
-        .await
-        .expect("listing the replica stream");
+    // Drain first: the tail ship is the last thing a draining tenant does
+    // (§4.6), so this asserts on the stream the tenant would actually leave
+    // behind rather than on whatever a tick happened to have sent by now.
+    tenant.drain().await;
+    let stream = config.db_stream_dir(ORG, NETWORK);
+    let files: Vec<_> = walk(&stream);
     assert!(
-        !generations.is_empty(),
-        "the tenant's database should be replicated to the bucket"
+        !files.is_empty(),
+        "the tenant's database should be replicated to {}",
+        stream.display()
     );
 
-    tenant.drain().await;
+    // And it restores to a database carrying what the tenant knew — the
+    // property the whole §5.3 contract rests on, not merely that bytes landed.
+    let restored = tempfile::tempdir().expect("a restore dir");
+    assert!(
+        synch_dp::dbrepl::restore(
+            config.db_client(ORG, NETWORK).expect("a db client"),
+            restored.path()
+        )
+        .await
+        .expect("restoring the tenant's stream"),
+        "the stream should hold a database"
+    );
+    let restored_key = {
+        let dir = restored.path().to_path_buf();
+        synch_core::offload(move || {
+            let store = synch_store::Store::open(&dir)?;
+            store.active_device_key()
+        })
+        .await
+        .expect("reading the restored key")
+        .expect("an active key")
+        .node_id
+    };
+    assert_eq!(
+        restored_key, tenant_key,
+        "a restored tenant is the same device, not a new one"
+    );
+
     hosted_teardown(cp_server, zone_server);
+}
+
+/// Every file under `dir`, recursively. Empty when it does not exist.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// Runs a future to completion on the current thread.

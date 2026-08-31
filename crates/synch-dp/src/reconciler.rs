@@ -189,15 +189,7 @@ impl Reconciler {
                 return;
             }
         }
-        match Tenant::provision(
-            &self.config,
-            &self.objects,
-            &self.control,
-            self.resolver.clone(),
-            network,
-        )
-        .await
-        {
+        match Tenant::provision(&self.config, &self.control, self.resolver.clone(), network).await {
             Ok(tenant) => {
                 self.parked.remove(&key);
                 self.tenants.insert(key, tenant);
@@ -421,7 +413,6 @@ mod tests {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
-            db_key: None,
             cache_bytes_total: 1024,
             max_tenants: 4,
             metrics_addr: None,

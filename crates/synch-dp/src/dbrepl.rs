@@ -1,820 +1,445 @@
-//! The in-process database replicator (`docs/CLOUD-DATAPLANE.md` §5.3).
+//! Replicating a tenant's database (`docs/CLOUD-DATAPLANE.md` §5.3).
 //!
 //! Every tenant's SQLite database lives on an ephemeral volume, so the copy
-//! that survives is the one in object storage. This module is what puts it
-//! there: a WAL-shipping replicator, one per tenant, over the same OpenDAL
-//! operator the CAS uses.
+//! that survives is the one in object storage. Putting it there is
+//! `celld-ltx`'s job, not this crate's: a Rust reimplementation of Litestream
+//! v0.5 writing the LTX format. This module is the thin part — pointing it at
+//! a tenant's database and prefix, and driving it on an interval.
 //!
-//! # The generation model
+//! # Why not write the shipper
 //!
-//! ```text
-//! db/<org>/<network>/
-//!   <generation>/snapshot                  a whole database file
-//!   <generation>/wal/<index>.<off>.<len>   WAL bytes appended since it
-//! ```
+//! Because it is a specialist's problem that looks like an easy one. SQLite
+//! spills a large transaction's pages into the write-ahead log *before* it
+//! commits, and rolls back by rewinding its own high-water mark while leaving
+//! those bytes for the next transaction to overwrite — so a shipper that goes
+//! by file length ships frames that are about to be replaced and then misses
+//! their replacements, silently, with the stream reporting healthy the whole
+//! time. Getting that right means tracking commit boundaries, verifying
+//! SQLite's frame checksum chain to notice a log rewritten behind you, and
+//! ordering a snapshot against a checkpoint so a failed upload cannot strand
+//! writes. Litestream has learned those; this service inherits them rather
+//! than rediscovering them.
 //!
-//! A *generation* is one database file plus the write-ahead log that grew on
-//! top of it. Restoring is therefore: take the snapshot, lay the log back
-//! beside it, and let SQLite recover — no bespoke replay, and no format of our
-//! own that could disagree with SQLite about what a committed transaction is.
+//! # Why a thread per tenant
 //!
-//! The reason a generation ever ends is that a WAL only makes sense on top of
-//! the database file it grew from. Checkpointing moves frames *into* that file
-//! and restarts the log, so the old log no longer describes anything: the
-//! moment we checkpoint, the old generation is closed and a new snapshot opens
-//! the next one. This is why the replicator owns checkpointing outright
-//! ([`synch_store::Checkpointing::Embedder`]) — a checkpoint it did not
-//! schedule would recycle frames it has not shipped, and the stream would have
-//! a hole in it that nothing could detect.
+//! A replica owns a SQLite connection, which is `Send` but not `Sync`, and the
+//! library's `sync` holds `&self` across an await — so its future is not
+//! `Send` and cannot be handed to `tokio::spawn` at all. Rather than bend that
+//! (there is no sound way to: the bound is telling the truth about a
+//! connection that must not be touched from two threads), each replicator owns
+//! one thread running a current-thread runtime, and this type is the
+//! `Send + Sync` handle onto it. Two things fall out of that and are worth
+//! having on their own: the blocking half of a capture is real SQLite work and
+//! belongs off the async workers regardless, and commands are served one at a
+//! time, so a final ship can never interleave with a tick.
 //!
-//! Generation ids sort chronologically (nanoseconds, zero-padded, then random
-//! bytes to break ties), so "the newest generation" is a lexicographic maximum
-//! over a listing — no index to keep consistent, and no metadata object whose
-//! absence would strand a perfectly good stream.
+//! # What this crate still owes it
 //!
-//! # What a torn stream costs
-//!
-//! Nothing that is not already survivable. Segments are named with the offset
-//! they start at, so restore assembles a *contiguous prefix* and stops at the
-//! first gap. A prefix of a WAL is a valid WAL: SQLite checksums every frame
-//! and replays up to the last commit frame it can verify, which means a
-//! half-uploaded segment costs the transactions inside it and nothing before
-//! them. That is the same bound as an unclean shutdown, which the node already
-//! survives (`docs/SERVERLESS.md` §8.3).
-//!
-//! # Why the shipper verifies rather than counts
-//!
-//! The obvious implementation — ship every whole frame the file has grown by
-//! — is wrong twice, and both ways are silent. SQLite spills a big
-//! transaction's pages into the log *before* it commits, and rolls back by
-//! rewinding its own high-water mark while leaving those bytes behind for the
-//! next transaction to overwrite. So a length-driven shipper both ships
-//! frames that never committed and then misses the frames that replace them,
-//! and the stream ends up describing a log that never existed.
-//!
-//! So the shipper walks frames instead: it stops at the last frame that
-//! *committed* a transaction, and it verifies every frame's checksum against
-//! the running chain SQLite maintains. A frame that does not continue the
-//! chain is proof the log was rewritten behind us, and the only sound
-//! response is to end the generation and take a fresh snapshot — the database
-//! file is authoritative whatever the log did.
+//! One thing: nothing else may checkpoint. `celld-ltx` disables autocheckpoint
+//! on its own connections and owns checkpointing from there, but
+//! `PRAGMA wal_autocheckpoint` is per-connection, so the *node's* writer would
+//! still recycle frames behind it. That is what
+//! [`Checkpointing::Embedder`](synch_store::Checkpointing::Embedder) is for,
+//! and it is the whole of engine change (d) in §7.3.
 
-use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
+use celld_ltx::{Db, Replica, ReplicaClient};
+use tokio::sync::{mpsc, oneshot};
+
 use crate::error::{DpError, Result};
-use crate::store::ObjectStore;
 
-/// The WAL header, which every generation's first segment must start with.
-const WAL_HEADER_LEN: u64 = 32;
-
-/// Bytes of frame header in front of each page in the log.
-const WAL_FRAME_HEADER_LEN: u64 = 24;
-
-/// How large the log may grow before the replicator rolls a generation.
+/// How often the replicator captures and ships.
 ///
-/// The tradeoff is restore time against snapshot cost: a bigger log means
-/// fewer whole-database uploads and a longer replay. 64 MiB of WAL replays in
-/// well under the time it takes to download the snapshot it sits on, so this
-/// is comfortably on the cheap side of the curve.
-const DEFAULT_WAL_ROLL_BYTES: u64 = 64 * 1024 * 1024;
+/// One second, which bounds what an ungraceful kill can lose — the same
+/// asynchrony Litestream accepts, and the number §5.3 quotes.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How often the replicator looks for new frames.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Settings for one tenant's replica stream.
-#[derive(Debug, Clone)]
-pub struct ReplicatorConfig {
-    /// Key prefix for this tenant's stream, e.g. `db/acme/prod`.
-    pub prefix: String,
-    /// How often to ship.
-    pub interval: Duration,
-    /// WAL size at which to roll a generation.
-    pub wal_roll_bytes: u64,
+/// Where a tenant's database stream is written.
+///
+/// The replication library ships exactly two clients — S3-compatible object
+/// storage and a local directory — and neither is a trait object, so this is
+/// where the deployment's choice becomes a concrete type. Dispatch happens
+/// once, at start and at restore; [`Replicator`] itself is not generic, so
+/// nothing downstream has to care which arm was taken.
+pub enum DbClient {
+    /// The bucket, beside the tenant CAS prefixes (§5.1).
+    ///
+    /// Boxed: it carries a whole S3 configuration and is ten times the size of
+    /// the other variant, which every value of this type would otherwise pay
+    /// for.
+    Objects(Box<celld_ltx::ObjectStoreClient>),
+    /// A local directory. Test deployments only — see `DpConfig::db_client`.
+    Files(celld_ltx::FileReplicaClient),
 }
 
-impl ReplicatorConfig {
-    /// The defaults, for a stream under `prefix`.
-    pub fn new(prefix: impl Into<String>) -> Self {
-        Self {
-            prefix: prefix.into(),
-            interval: DEFAULT_INTERVAL,
-            wal_roll_bytes: DEFAULT_WAL_ROLL_BYTES,
+impl std::fmt::Debug for DbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the config: it carries credentials.
+        match self {
+            DbClient::Objects(_) => f.write_str("DbClient::Objects"),
+            DbClient::Files(_) => f.write_str("DbClient::Files"),
         }
     }
+}
+
+/// What the owner asks the replica thread to do.
+///
+/// Each carries the channel its answer goes back on, so a caller that awaits
+/// one knows the work is done rather than merely queued.
+enum Command {
+    /// Capture what the database has committed, then ship it.
+    Sync(oneshot::Sender<Result<()>>),
+    /// Close the database, releasing its long-running read lock.
+    Close(oneshot::Sender<Result<()>>),
 }
 
 /// One tenant's replica stream.
-#[derive(Debug)]
+///
+/// A handle, not the replica: the replica lives on the thread this spawned.
 pub struct Replicator {
-    objects: ObjectStore,
-    config: ReplicatorConfig,
-    store: Arc<synch_store::Store>,
-    /// The generation being written, and how far into its log we have shipped.
-    generation: String,
-    shipped: u64,
-    /// The next segment index within the generation.
-    next_index: u64,
-    /// The log's salt when the generation opened. A change means SQLite reset
-    /// the log under us, which — since we own checkpointing — should not
-    /// happen; if it does, the generation is closed rather than corrupted.
-    salt: Option<[u8; 8]>,
-    /// Page size, read from the log header, needed to find frame boundaries.
-    page_size: Option<u64>,
-    /// The running frame checksum at `shipped`, and the log's byte order.
-    ///
-    /// SQLite chains every frame's checksum onto its predecessor's, so this
-    /// is what lets the next tick prove the frames it is about to ship
-    /// continue the ones already shipped — and notice when they do not,
-    /// which is how a rewritten log is caught (see the module docs).
-    chain: Option<Chain>,
+    tenant: String,
+    commands: mpsc::UnboundedSender<Command>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
-/// The running checksum a WAL's frames chain through.
-#[derive(Debug, Clone, Copy)]
-struct Chain {
-    /// The two 32-bit halves of the running checksum.
-    state: (u32, u32),
-    /// Whether the log's checksums are computed over big-endian words. Taken
-    /// from the header magic, which is the only thing that says.
-    big_endian: bool,
+impl std::fmt::Debug for Replicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replicator")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Replicator {
-    /// Opens a stream for a database that is already open in `store`.
+    /// Attaches to the database at `db_path` and replicates it through
+    /// `client`.
     ///
-    /// Takes the first snapshot before returning, so a caller that starts a
-    /// replicator has a complete copy in the bucket by the time it does — the
-    /// window where a tenant exists and is unreplicated closes here rather
-    /// than at the first tick.
+    /// Returns once the replica is open, so a failure to open is this call's
+    /// failure and not a warning from a thread nobody is watching.
+    ///
+    /// The behind-replica check runs here, before any sync. It is what makes a
+    /// hard recovery safe: restore an old snapshot, write to it, and without
+    /// this the fresh local database starts at a transaction id the remote is
+    /// already past, so the upload loop never runs and the new writes are
+    /// silently dropped.
     pub async fn start(
-        objects: ObjectStore,
-        config: ReplicatorConfig,
-        store: Arc<synch_store::Store>,
+        db_path: &Path,
+        client: DbClient,
+        tenant: impl Into<String>,
     ) -> Result<Self> {
-        let mut replicator = Self {
-            objects,
-            config,
-            store,
-            generation: String::new(),
-            shipped: 0,
-            next_index: 0,
-            salt: None,
-            page_size: None,
-            chain: None,
+        match client {
+            DbClient::Objects(client) => Self::start_with(db_path, *client, tenant).await,
+            DbClient::Files(client) => Self::start_with(db_path, client, tenant).await,
+        }
+    }
+
+    /// [`start`](Self::start) once the client's type is known.
+    async fn start_with<C>(db_path: &Path, client: C, tenant: impl Into<String>) -> Result<Self>
+    where
+        C: ReplicaClient + Send + 'static,
+    {
+        let tenant = tenant.into();
+        let db_path = db_path.to_path_buf();
+        let (commands, requests) = mpsc::unbounded_channel();
+        let (ready, opened) = oneshot::channel();
+        let worker = std::thread::Builder::new()
+            // Named for the tenant: a stuck thread in a stack dump has to say
+            // which of a shard's tenants it belongs to.
+            .name(format!("ltx-{tenant}"))
+            .spawn(move || serve(db_path, client, requests, ready))
+            .map_err(|error| DpError::io("spawning the replication thread", error))?;
+
+        let outcome = match opened.await {
+            Ok(outcome) => outcome,
+            // The thread ended without answering, which only a panic does.
+            Err(_) => Err(DpError::Engine(
+                "the replication thread stopped before it opened the database".into(),
+            )),
         };
-        replicator.roll_generation().await?;
-        Ok(replicator)
-    }
-
-    /// The generation currently being written.
-    pub fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    /// Bytes of log shipped in this generation.
-    pub fn shipped_bytes(&self) -> u64 {
-        self.shipped
-    }
-
-    /// Closes the current generation and opens a new one on a fresh snapshot.
-    ///
-    /// The checkpoint comes first and must reach [`CheckpointMode::Truncate`]:
-    /// it moves every frame into the database file, which is what makes the
-    /// file about to be uploaded a complete database, and it empties the log
-    /// so the next generation's frames start at offset zero of a log whose
-    /// header the first segment carries.
-    async fn roll_generation(&mut self) -> Result<()> {
-        // Ship what the old generation still owes before the checkpoint
-        // destroys the only local record of it. A checkpoint folds unshipped
-        // frames into the database file and empties the log; if the snapshot
-        // upload then fails and the pod is replaced, those writes exist
-        // nowhere. Shipping first bounds the loss to what the stream already
-        // bounds it to.
-        //
-        // Only when there is a generation to owe it to: the first roll opens
-        // one, and `ship_pending` on an empty stream has nothing to say.
-        if !self.generation.is_empty() {
-            if let Err(error) = self.ship_once().await {
-                // Not fatal: the snapshot about to be taken supersedes the
-                // log either way. Recorded because it is the one moment the
-                // window widens.
-                tracing::warn!(
-                    prefix = %self.config.prefix, %error,
-                    "could not ship the outstanding log before rolling"
-                );
+        match outcome {
+            Ok(()) => Ok(Self {
+                tenant,
+                commands,
+                worker: Some(worker),
+            }),
+            Err(error) => {
+                // Already finished — it answered by ending — so this join
+                // returns immediately rather than parking a runtime worker.
+                let _ = worker.join();
+                Err(error)
             }
         }
-        let store = self.store.clone();
-        // A reader can hold the log open; the checkpoint then reports busy
-        // rather than failing, and the retry is the whole recovery.
-        for attempt in 0..CHECKPOINT_ATTEMPTS {
-            let report = synch_core::offload({
-                let store = store.clone();
-                move || store.checkpoint(CheckpointMode::Truncate)
-            })
-            .await?;
-            if !report.busy {
-                break;
-            }
-            if attempt + 1 == CHECKPOINT_ATTEMPTS {
-                // Not fatal: the snapshot is still consistent (the database
-                // file is only ever mutated by a checkpoint, and we are the
-                // only checkpointer), it just carries fewer transactions and
-                // the log it starts from is not empty. Recorded because a
-                // permanently busy database is a bug worth seeing.
-                tracing::warn!(
-                    prefix = %self.config.prefix,
-                    "checkpoint stayed busy; snapshotting over a non-empty log"
-                );
-            }
-            tokio::time::sleep(CHECKPOINT_RETRY).await;
-        }
-
-        let generation = new_generation_id();
-        let db_path = self.store.db_path();
-        let snapshot = tokio::fs::read(&db_path)
-            .await
-            .map_err(|error| DpError::io("reading the database for a snapshot", error))?;
-        let key = format!("{}/{generation}/snapshot", self.config.prefix);
-        self.objects.put(&key, snapshot).await?;
-
-        tracing::info!(
-            prefix = %self.config.prefix,
-            generation = %generation,
-            "opened a database replica generation"
-        );
-        self.generation = generation;
-        self.shipped = 0;
-        self.next_index = 0;
-        self.salt = None;
-        self.page_size = None;
-        Ok(())
     }
 
-    /// Ships every *committed* frame appended since the last call.
-    ///
-    /// Returns how many bytes went up. Rolls a generation when the log has
-    /// grown past the configured ceiling, or when the log turns out to have
-    /// been rewritten under us.
-    ///
-    /// Two rules make this safe, and neither is optional:
-    ///
-    /// **Only through the last commit frame.** SQLite spills a large
-    /// transaction's pages into the log *before* it commits, and rolls back
-    /// by rewinding its own high-water mark while leaving those bytes in the
-    /// file — the next transaction then writes over them. Shipping by file
-    /// length would therefore ship frames that are about to be replaced, and
-    /// the stream would carry a version of the log that never existed.
-    ///
-    /// **Every frame is checked against the chain.** Each frame's checksum
-    /// covers its predecessor's, so a frame that does not continue the run
-    /// we shipped proves the log was rewritten behind us. There is no way to
-    /// patch that up, so it ends the generation: the next snapshot is taken
-    /// from the database file, which is authoritative either way.
-    pub async fn tick(&mut self) -> Result<u64> {
-        let outcome = self.ship_once().await?;
-        if outcome.needs_roll {
-            self.roll_generation().await?;
-        }
-        Ok(outcome.bytes)
-    }
-
-    /// The frame walk, without ever rolling a generation.
-    ///
-    /// Split out because a roll ships the outstanding tail first, and a
-    /// shipper that could roll would recurse into the roll that called it.
-    async fn ship_once(&mut self) -> Result<Shipped> {
-        let wal_path = self.store().wal_path();
-        let Some(len) = file_len(&wal_path).await? else {
-            // No log at all: nothing has been written since the generation
-            // opened. Not an error, and not a state to correct.
-            return Ok(Shipped::none());
-        };
-        if len < WAL_HEADER_LEN {
-            return Ok(Shipped::none());
-        }
-        let header = read_at(&wal_path, 0, WAL_HEADER_LEN as usize).await?;
-        let Some(header) = WalHeader::parse(&header) else {
-            tracing::warn!(prefix = %self.config.prefix, "unrecognized write-ahead log header");
-            return Ok(Shipped::none());
-        };
-
-        match self.salt {
-            None => {
-                self.salt = Some(header.salt);
-                self.page_size = Some(header.page_size);
-                self.chain = Some(Chain {
-                    state: header.checksum,
-                    big_endian: header.big_endian,
-                });
-            }
-            Some(known) if known != header.salt => {
-                // The log was reset. Since this process owns checkpointing
-                // that should not happen, and the honest response is a new
-                // generation rather than bytes that will not replay.
-                tracing::warn!(
-                    prefix = %self.config.prefix,
-                    "the write-ahead log was reset underneath the replicator; rolling"
-                );
-                return Ok(Shipped::roll());
-            }
-            Some(_) => {}
-        }
-
-        let frame = WAL_FRAME_HEADER_LEN + header.page_size;
-        let Some(mut chain) = self.chain else {
-            return Ok(Shipped::none());
-        };
-        // Walk from where we stopped, verifying as we go, and remember the
-        // end of the last frame that *committed* a transaction.
-        let mut offset = self.shipped.max(WAL_HEADER_LEN);
-        let mut committed = self.shipped;
-        let mut committed_chain = chain;
-        while offset + frame <= len {
-            let bytes = read_at(&wal_path, offset, frame as usize).await?;
-            let Some(next) = verify_frame(&bytes, header.salt, chain) else {
-                if offset < self.shipped {
-                    // A frame we already shipped no longer chains: the log
-                    // was rewritten behind us.
-                    tracing::warn!(
-                        prefix = %self.config.prefix,
-                        offset,
-                        "the write-ahead log was rewritten behind the replicator; rolling"
-                    );
-                    return Ok(Shipped::roll());
-                }
-                // An incomplete or uncommitted tail. Stop; it is not ours to
-                // ship yet, and the next tick will find it finished.
-                break;
-            };
-            chain = next.chain;
-            offset += frame;
-            if next.commit {
-                committed = offset;
-                committed_chain = next.chain;
-            }
-        }
-
-        if committed <= self.shipped {
-            return Ok(Shipped::none());
-        }
-        // `shipped` is zero for a fresh generation, so the first segment
-        // starts at zero and carries the log header — which is what makes the
-        // assembled file a WAL rather than a pile of frames.
-        let start = self.shipped;
-        let payload = read_at(&wal_path, start, (committed - start) as usize).await?;
-        let shipped = payload.len() as u64;
-        let key = format!(
-            "{}/{}/wal/{:08}.{}.{}",
-            self.config.prefix, self.generation, self.next_index, start, shipped
-        );
-        self.objects.put(&key, payload).await?;
-        self.next_index += 1;
-        self.shipped = committed;
-        self.chain = Some(committed_chain);
-
-        Ok(Shipped {
-            bytes: shipped,
-            needs_roll: committed >= self.config.wal_roll_bytes,
-        })
-    }
-
-    /// The store this replicator streams.
-    fn store(&self) -> &Arc<synch_store::Store> {
-        &self.store
+    /// Captures what the database has committed, then ships it.
+    pub async fn tick(&mut self) -> Result<()> {
+        self.request(Command::Sync).await
     }
 
     /// Ships everything outstanding. The last thing a draining tenant does.
     pub async fn flush(&mut self) -> Result<()> {
-        self.tick().await.map(|_| ())
-    }
-}
-
-/// What one pass of the frame walk did.
-#[derive(Debug, Clone, Copy)]
-struct Shipped {
-    /// Bytes uploaded.
-    bytes: u64,
-    /// Whether the caller should now close this generation.
-    needs_roll: bool,
-}
-
-impl Shipped {
-    /// Nothing to do.
-    fn none() -> Self {
-        Self {
-            bytes: 0,
-            needs_roll: false,
-        }
+        self.tick().await
     }
 
-    /// Nothing shipped, and the generation must end.
-    fn roll() -> Self {
-        Self {
-            bytes: 0,
-            needs_roll: true,
-        }
-    }
-}
-
-/// The parts of a WAL header this module reads.
-///
-/// Layout (SQLite's file format, section 4.1): magic, format version, page
-/// size, checkpoint sequence, two salts, then the header's own checksum.
-#[derive(Debug, Clone, Copy)]
-struct WalHeader {
-    /// Bytes per page, which fixes the frame size.
-    page_size: u64,
-    /// The salt every frame in this log must carry.
-    salt: [u8; 8],
-    /// The checksum the first frame chains from.
-    checksum: (u32, u32),
-    /// Whether checksums are computed over big-endian words.
-    big_endian: bool,
-}
-
-impl WalHeader {
-    /// Parses a 32-byte header, or `None` if it is not a WAL this build
-    /// understands.
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < WAL_HEADER_LEN as usize {
-            return None;
-        }
-        // The magic's low bit is the one thing that says which byte order the
-        // checksums are computed in; everything else in the file is big-endian.
-        let magic = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
-        let big_endian = match magic {
-            0x377f_0682 => false,
-            0x377f_0683 => true,
-            _ => return None,
-        };
-        let page_size = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as u64;
-        // A page size of 65536 is stored as 1, and anything else must be a
-        // power of two: a bogus one would make every frame boundary wrong.
-        let page_size = if page_size == 1 { 65_536 } else { page_size };
-        if page_size < 512 || !page_size.is_power_of_two() {
-            return None;
-        }
-        Some(Self {
-            page_size,
-            salt: bytes[16..24].try_into().ok()?,
-            checksum: (
-                u32::from_be_bytes(bytes[24..28].try_into().ok()?),
-                u32::from_be_bytes(bytes[28..32].try_into().ok()?),
-            ),
-            big_endian,
-        })
-    }
-}
-
-/// What verifying one frame established.
-#[derive(Debug, Clone, Copy)]
-struct Frame {
-    /// The running checksum after it.
-    chain: Chain,
-    /// Whether it is a commit frame — the last frame of a transaction, and
-    /// the only kind it is safe to stop shipping on.
-    commit: bool,
-}
-
-/// Checks one frame against the salt and the running checksum.
-///
-/// Returns `None` when the frame is not part of this log or does not continue
-/// the chain, which are the two ways a frame can be "not ours to ship".
-fn verify_frame(bytes: &[u8], salt: [u8; 8], chain: Chain) -> Option<Frame> {
-    if bytes.len() < WAL_FRAME_HEADER_LEN as usize {
-        return None;
-    }
-    // A frame written under a different salt belongs to an older log that
-    // happened to occupy this offset.
-    if bytes[8..16] != salt[..] {
-        return None;
-    }
-    let claimed = (
-        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
-        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
-    );
-    // The checksum covers the frame header's first eight bytes (page number
-    // and post-commit database size) and then the whole page.
-    let mut state = checksum(chain.state, &bytes[0..8], chain.big_endian);
-    state = checksum(
-        state,
-        &bytes[WAL_FRAME_HEADER_LEN as usize..],
-        chain.big_endian,
-    );
-    if state != claimed {
-        return None;
-    }
-    // A non-zero database size marks the frame that commits the transaction.
-    let commit = u32::from_be_bytes(bytes[4..8].try_into().ok()?) != 0;
-    Some(Frame {
-        chain: Chain {
-            state,
-            big_endian: chain.big_endian,
-        },
-        commit,
-    })
-}
-
-/// SQLite's WAL checksum, continued from `state` over `bytes`.
-///
-/// Two interleaved running sums over 32-bit words, which is the algorithm the
-/// file format defines; it is not a general-purpose checksum and is not
-/// interchangeable with one.
-fn checksum(state: (u32, u32), bytes: &[u8], big_endian: bool) -> (u32, u32) {
-    let (mut s0, mut s1) = state;
-    // Whole 8-byte pairs only; a trailing partial word cannot be part of a
-    // checksummed region, since both the frame header slice and a page are
-    // multiples of eight.
-    for pair in bytes.as_chunks::<8>().0 {
-        let (a, b) = if big_endian {
-            (
-                u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]),
-                u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]),
-            )
-        } else {
-            (
-                u32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]),
-                u32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]),
-            )
-        };
-        s0 = s0.wrapping_add(a).wrapping_add(s1);
-        s1 = s1.wrapping_add(b).wrapping_add(s0);
-    }
-    (s0, s1)
-}
-
-/// How many times a generation roll retries a busy checkpoint.
-const CHECKPOINT_ATTEMPTS: usize = 5;
-
-/// How long it waits between those attempts.
-const CHECKPOINT_RETRY: Duration = Duration::from_millis(200);
-
-use synch_store::CheckpointMode;
-
-/// Mints a generation id that sorts chronologically.
-///
-/// Nanoseconds zero-padded to twenty digits (which covers every timestamp a
-/// 64-bit nanosecond clock can produce), then random bytes so two generations
-/// opened in the same nanosecond — a restore racing the process that is being
-/// replaced — cannot collide.
-fn new_generation_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut random = [0u8; 8];
-    // Failure here would mean the system RNG is gone, which is not a condition
-    // this process can improve on; the timestamp alone still orders correctly.
-    let _ = aws_lc_rs::rand::fill(&mut random);
-    format!("{nanos:020}-{}", hex::encode(random))
-}
-
-/// A restored database, and where it came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestoreReport {
-    /// The generation it was assembled from.
-    pub generation: String,
-    /// Bytes of log laid back beside the snapshot.
-    pub wal_bytes: u64,
-    /// Segments that were on the far side of a gap, and so left out.
-    pub segments_skipped: usize,
-}
-
-/// Restores the newest usable generation into `data_dir`.
-///
-/// Returns `None` when the stream holds nothing restorable — a network never
-/// hosted before, or one whose stream has been deleted. That is the signal to
-/// initialize a fresh node, and it is deliberately distinguishable from an
-/// error: "there is nothing here" and "I could not tell" must not lead to the
-/// same action, because one of them silently replaces an identity.
-pub async fn restore(
-    objects: &ObjectStore,
-    prefix: &str,
-    data_dir: &Path,
-) -> Result<Option<RestoreReport>> {
-    let generations = objects.list_dirs(&format!("{prefix}/")).await?;
-    // Newest first: ids sort chronologically by construction.
-    let mut candidates: Vec<String> = generations;
-    candidates.sort();
-    candidates.reverse();
-
-    for generation in candidates {
-        let snapshot_key = format!("{prefix}/{generation}/snapshot");
-        let Some(snapshot) = objects.get_if_present(&snapshot_key).await? else {
-            // A generation whose snapshot never landed (the process died
-            // between opening it and uploading) describes nothing. Skip to the
-            // one before it, which is complete.
-            tracing::warn!(%generation, "replica generation has no snapshot; skipping it");
-            continue;
-        };
-
-        let (wal, segments_skipped) = assemble_wal(objects, prefix, &generation).await?;
-        std::fs::create_dir_all(data_dir)
-            .map_err(|error| DpError::io("creating the tenant data directory", error))?;
-        let db_path = data_dir.join(synch_store::DB_FILE);
-        let wal_bytes = wal.len() as u64;
-        tokio::fs::write(&db_path, &snapshot)
-            .await
-            .map_err(|error| DpError::io("writing the restored database", error))?;
-        let wal_path = wal_path_for(&db_path);
-        if wal.is_empty() {
-            // Leave no stale log beside a fresh snapshot.
-            let _ = tokio::fs::remove_file(&wal_path).await;
-        } else {
-            tokio::fs::write(&wal_path, &wal)
+    /// Closes the database cleanly and stops the thread.
+    pub async fn close(mut self) -> Result<()> {
+        let outcome = self.request(Command::Close).await;
+        // Before returning, not after: a caller that closes in order to remove
+        // the data directory needs the connection actually gone, not merely
+        // asked to go.
+        if let Some(worker) = self.worker.take() {
+            if tokio::task::spawn_blocking(move || worker.join())
                 .await
-                .map_err(|error| DpError::io("writing the restored write-ahead log", error))?;
+                .is_err()
+            {
+                tracing::warn!(
+                    tenant = %self.tenant,
+                    "could not wait for the replication thread to finish"
+                );
+            }
         }
-        // The -shm file is derived state SQLite rebuilds; a stale one from a
-        // previous life of this directory would describe the wrong log.
-        let _ = tokio::fs::remove_file(shm_path_for(&db_path)).await;
-
-        tracing::info!(
-            %generation,
-            wal_bytes,
-            segments_skipped,
-            "restored a tenant database from its replica stream"
-        );
-        return Ok(Some(RestoreReport {
-            generation,
-            wal_bytes,
-            segments_skipped,
-        }));
+        tracing::debug!(tenant = %self.tenant, "closed the tenant's replicated database");
+        outcome
     }
-    Ok(None)
+
+    /// Asks the thread for one thing and waits for its answer.
+    async fn request(&self, command: fn(oneshot::Sender<Result<()>>) -> Command) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(command(reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
 }
 
-/// Concatenates a generation's log segments into a contiguous prefix.
-///
-/// Segments are named `<index>.<offset>.<len>`, so the offset each one claims
-/// is checked against the length assembled so far. The first that does not
-/// continue the run ends the assembly: everything after it is unreachable,
-/// because a WAL with a hole in it is not a WAL.
-async fn assemble_wal(
-    objects: &ObjectStore,
-    prefix: &str,
-    generation: &str,
-) -> Result<(Vec<u8>, usize)> {
-    let mut segments: Vec<(u64, u64, u64, String)> = Vec::new();
-    for key in objects.list(&format!("{prefix}/{generation}/wal/")).await? {
-        let name = key.rsplit('/').next().unwrap_or_default();
-        let mut parts = name.split('.');
-        let (Some(index), Some(offset), Some(len)) = (parts.next(), parts.next(), parts.next())
-        else {
-            tracing::warn!(%key, "ignoring an unparseable replica segment name");
-            continue;
-        };
-        let (Ok(index), Ok(offset), Ok(len)) = (
-            index.parse::<u64>(),
-            offset.parse::<u64>(),
-            len.parse::<u64>(),
-        ) else {
-            tracing::warn!(%key, "ignoring an unparseable replica segment name");
-            continue;
-        };
-        segments.push((index, offset, len, key));
-    }
-    segments.sort_by_key(|(index, _, _, _)| *index);
-
-    let mut wal: Vec<u8> = Vec::new();
-    let mut skipped = 0usize;
-    let mut ended = false;
-    for (_, offset, len, key) in segments {
-        if ended {
-            skipped += 1;
-            continue;
-        }
-        if offset != wal.len() as u64 {
-            // The gap. Everything from here on is unusable, but what came
-            // before is a valid shorter log.
-            tracing::warn!(
-                %key,
-                expected = wal.len(),
-                found = offset,
-                "replica segment does not continue the log; truncating here"
+impl Drop for Replicator {
+    fn drop(&mut self) {
+        // Dropping the command sender ends the loop, and dropping the replica
+        // there closes the connection. Deliberately not joined: a drop cannot
+        // await, and blocking a runtime worker on a thread that is still
+        // uploading would be worse than letting it finish detached.
+        if self.worker.is_some() {
+            tracing::debug!(
+                tenant = %self.tenant,
+                "dropping a replicator that was not closed; its thread will end on its own"
             );
-            ended = true;
-            skipped += 1;
-            continue;
         }
-        let Some(bytes) = objects.get_if_present(&key).await? else {
-            tracing::warn!(%key, "replica segment vanished between listing and read");
-            ended = true;
-            skipped += 1;
-            continue;
-        };
-        if bytes.len() as u64 != len {
-            // A short object is a torn upload. SQLite would stop at the first
-            // frame that fails its checksum anyway; stopping here is the same
-            // outcome, reached deliberately.
-            tracing::warn!(%key, expected = len, found = bytes.len(), "replica segment is short");
-            ended = true;
-            skipped += 1;
-            continue;
-        }
-        wal.extend_from_slice(&bytes);
-    }
-    Ok((wal, skipped))
-}
-
-/// The log beside a database file.
-fn wal_path_for(db_path: &Path) -> PathBuf {
-    sidecar(db_path, "-wal")
-}
-
-/// The shared-memory index beside a database file.
-fn shm_path_for(db_path: &Path) -> PathBuf {
-    sidecar(db_path, "-shm")
-}
-
-fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
-    let mut name = db_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push_str(suffix);
-    db_path.with_file_name(name)
-}
-
-/// The length of a file, or `None` when it does not exist.
-async fn file_len(path: &Path) -> Result<Option<u64>> {
-    match tokio::fs::metadata(path).await {
-        Ok(meta) => Ok(Some(meta.len())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(DpError::io("reading the write-ahead log's size", error)),
     }
 }
 
-/// Reads exactly `len` bytes at `offset`.
-async fn read_at(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path)
+/// The replica thread: a runtime of its own, then commands until told to stop.
+fn serve<C: ReplicaClient>(
+    db_path: PathBuf,
+    client: C,
+    requests: mpsc::UnboundedReceiver<Command>,
+    ready: oneshot::Sender<Result<()>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(DpError::io("building the replication runtime", error)));
+            return;
+        }
+    };
+    runtime.block_on(replicate(db_path, client, requests, ready));
+}
+
+/// Opens the replica, reports whether that worked, then serves commands.
+async fn replicate<C: ReplicaClient>(
+    db_path: PathBuf,
+    client: C,
+    mut requests: mpsc::UnboundedReceiver<Command>,
+    ready: oneshot::Sender<Result<()>>,
+) {
+    let mut replica = match open(&db_path, client).await {
+        Ok(replica) => {
+            if ready.send(Ok(())).is_err() {
+                // Nobody is waiting for this replica any more, so there is
+                // nothing to serve; falling through would hold the read lock
+                // on a database the caller has given up on.
+                return;
+            }
+            replica
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    while let Some(command) = requests.recv().await {
+        match command {
+            Command::Sync(reply) => {
+                let _ = reply.send(sync(&mut replica).await);
+            }
+            Command::Close(reply) => {
+                let _ = reply.send(close(replica));
+                return;
+            }
+        }
+    }
+}
+
+/// Opens the database and its replica, and checks it is not behind the stream.
+async fn open<C: ReplicaClient>(db_path: &Path, client: C) -> Result<Replica<C>> {
+    let db = Db::open(db_path).map_err(engine)?;
+    let mut replica = Replica::new(db, client);
+    replica
+        .check_database_behind_replica()
         .await
-        .map_err(|error| DpError::io("opening the write-ahead log", error))?;
-    file.seek(io::SeekFrom::Start(offset))
-        .await
-        .map_err(|error| DpError::io("seeking the write-ahead log", error))?;
-    let mut buffer = vec![0u8; len];
-    file.read_exact(&mut buffer)
-        .await
-        .map_err(|error| DpError::io("reading the write-ahead log", error))?;
-    Ok(buffer)
+        .map_err(engine)?;
+    Ok(replica)
+}
+
+/// One capture and ship, in the library's own order.
+///
+/// The capture reads the write-ahead log into local LTX segments and is
+/// synchronous SQLite work — which is why this runs on a thread of its own —
+/// and the upload is ordinary async IO.
+async fn sync<C: ReplicaClient>(replica: &mut Replica<C>) -> Result<()> {
+    replica
+        .db_mut()
+        .expect("a replicator always owns its database")
+        .sync()
+        .map_err(engine)?;
+    match replica.sync().await {
+        Ok(()) => Ok(()),
+        Err(error) if is_waiting_for_data(&error) => Ok(()),
+        Err(error) => Err(engine(error)),
+    }
+}
+
+/// Closes the database, releasing the long-running read lock.
+fn close<C: ReplicaClient>(replica: Replica<C>) -> Result<()> {
+    match replica.into_db() {
+        Some(db) => db.close().map_err(engine),
+        None => Ok(()),
+    }
+}
+
+/// Restores a tenant's database into `data_dir`, if the stream holds one.
+///
+/// Returns `false` when there is nothing there — a network never hosted, or
+/// one whose stream is gone. That is the signal to initialize a fresh node,
+/// and it is deliberately distinguishable from an error: "there is nothing
+/// here" and "I could not tell" must not lead to the same action, because one
+/// of them silently replaces an identity.
+pub async fn restore(client: DbClient, data_dir: &Path) -> Result<bool> {
+    match client {
+        DbClient::Objects(client) => restore_with(*client, data_dir).await,
+        DbClient::Files(client) => restore_with(client, data_dir).await,
+    }
+}
+
+/// [`restore`] once the client's type is known.
+async fn restore_with<C: ReplicaClient>(client: C, data_dir: &Path) -> Result<bool> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| DpError::io("creating the tenant data directory", error))?;
+    let db_path = data_dir.join(synch_store::DB_FILE);
+    // The free function rather than `Replica::restore`: that one takes `&self`
+    // on a type holding a SQLite connection, so its future is not `Send` and
+    // could not be awaited from a spawned task.
+    match celld_ltx::restore(&client, &db_path, celld_ltx::TXID(0)).await {
+        Ok(stats) => {
+            tracing::info!(?stats, "restored a tenant database from its replica stream");
+            Ok(true)
+        }
+        Err(error) if is_empty_stream(&error) => Ok(false),
+        Err(error) => Err(engine(error)),
+    }
+}
+
+/// Whether a restore failed only because the stream holds nothing yet.
+///
+/// Restoring at [`TXID(0)`](celld_ltx::TXID) asks for "whatever is latest", and
+/// the only way that plan comes back unsatisfiable is that the prefix holds no
+/// LTX files at all — so these two variants mean an empty stream here and
+/// nothing else. Deliberately narrow: every other failure stays an error, so a
+/// tenant whose stream exists but cannot be read parks instead of quietly
+/// initializing a second identity over the top of the one already in the zone.
+fn is_empty_stream(error: &celld_ltx::Error) -> bool {
+    matches!(
+        error,
+        celld_ltx::Error::TxNotAvailable | celld_ltx::Error::NoSnapshots
+    )
+}
+
+/// Whether a sync failed only because the database has committed nothing yet.
+///
+/// A tenant that has just initialized has no transaction to ship. The library
+/// reports that as an error, and only as a message — treating it as one here
+/// would put a warning in the log every second until the first write lands.
+fn is_waiting_for_data(error: &celld_ltx::Error) -> bool {
+    matches!(error, celld_ltx::Error::Other(cause) if cause.to_string().contains("waiting for data"))
+}
+
+/// Every failure from the replication library reaches this crate the same way.
+fn engine(error: impl std::fmt::Display) -> DpError {
+    DpError::Engine(error.to_string())
+}
+
+/// The replica thread is gone, so nothing more can be shipped through it.
+fn stopped() -> DpError {
+    DpError::Engine("the replication thread has stopped".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celld_ltx::FileReplicaClient;
 
-    fn open_store(dir: &Path) -> Arc<synch_store::Store> {
-        Arc::new(
-            synch_store::Store::open_with(
-                dir,
-                synch_store::StoreOptions {
-                    checkpointing: synch_store::Checkpointing::Embedder,
-                },
-            )
+    /// Opens a store the way the service does: off the runtime's workers, and
+    /// with checkpointing left to the replicator.
+    async fn open_store(dir: &Path) -> std::sync::Arc<synch_store::Store> {
+        let dir = dir.to_path_buf();
+        std::sync::Arc::new(
+            synch_core::offload(move || {
+                synch_store::Store::open_with(
+                    &dir,
+                    synch_store::StoreOptions {
+                        checkpointing: synch_store::Checkpointing::Embedder,
+                    },
+                )
+            })
+            .await
             .unwrap(),
         )
     }
 
-    /// The property the whole module exists for: what the stream holds
-    /// restores to a database carrying the writes that were shipped.
-    #[tokio::test]
+    fn client(dir: &Path) -> DbClient {
+        DbClient::Files(FileReplicaClient::new(dir.to_string_lossy().to_string()))
+    }
+
+    /// The property this module exists for: what the stream holds restores to
+    /// a database carrying the writes that were shipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shipped_stream_restores_the_writes_it_carried() {
         let source = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::memory().unwrap();
-        let store = open_store(source.path());
-        let mut replicator = Replicator::start(
-            objects.clone(),
-            ReplicatorConfig::new("db/acme/prod"),
-            store.clone(),
-        )
-        .await
-        .unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator =
+            Replicator::start(&store.db_path(), client(remote.path()), "acme/prod")
+                .await
+                .unwrap();
 
-        // A write the snapshot cannot contain, since it happened after it.
         {
             let store = store.clone();
             synch_core::offload(move || store.set_config("dbrepl.probe", "shipped"))
                 .await
                 .unwrap();
         }
-        let shipped = replicator.tick().await.unwrap();
-        assert!(shipped > 0, "the write should have produced log frames");
+        replicator.flush().await.unwrap();
+        replicator.close().await.unwrap();
+        drop(store);
 
         let restored = tempfile::tempdir().unwrap();
-        let report = restore(&objects, "db/acme/prod", restored.path())
+        assert!(restore(client(remote.path()), restored.path())
             .await
-            .unwrap()
-            .expect("the stream holds a generation");
-        assert_eq!(report.generation, replicator.generation());
-        assert_eq!(report.segments_skipped, 0);
+            .unwrap());
 
-        let reopened = open_store(restored.path());
+        let reopened = open_store(restored.path()).await;
         let value = {
             let reopened = reopened.clone();
             synch_core::offload(move || reopened.config("dbrepl.probe"))
@@ -824,185 +449,30 @@ mod tests {
         assert_eq!(value.as_deref(), Some("shipped"));
     }
 
+    /// Ticking is what the service does forever, so a second tick with nothing
+    /// new to say must be quiet rather than an error the ticker logs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ticking_with_nothing_new_is_not_an_error() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator =
+            Replicator::start(&store.db_path(), client(remote.path()), "acme/prod")
+                .await
+                .unwrap();
+        replicator.tick().await.unwrap();
+        replicator.tick().await.unwrap();
+        replicator.close().await.unwrap();
+    }
+
     /// A stream nothing has been written to is not an error — it is the signal
     /// to initialize a new node, and must be distinguishable from a failure.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_empty_stream_restores_nothing() {
-        let objects = ObjectStore::memory().unwrap();
+        let remote = tempfile::tempdir().unwrap();
         let restored = tempfile::tempdir().unwrap();
-        let report = restore(&objects, "db/acme/prod", restored.path())
+        assert!(!restore(client(remote.path()), restored.path())
             .await
-            .unwrap();
-        assert!(report.is_none());
-    }
-
-    /// A generation roll must not lose the writes that preceded it: the new
-    /// snapshot has to carry everything the old generation's log did.
-    #[tokio::test]
-    async fn rolling_a_generation_carries_earlier_writes_into_the_snapshot() {
-        let source = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::memory().unwrap();
-        let store = open_store(source.path());
-        let mut replicator = Replicator::start(
-            objects.clone(),
-            ReplicatorConfig::new("db/acme/prod"),
-            store.clone(),
-        )
-        .await
-        .unwrap();
-        let first = replicator.generation().to_string();
-
-        {
-            let store = store.clone();
-            synch_core::offload(move || store.set_config("dbrepl.probe", "before-roll"))
-                .await
-                .unwrap();
-        }
-        replicator.tick().await.unwrap();
-        replicator.roll_generation().await.unwrap();
-        assert_ne!(
-            replicator.generation(),
-            first,
-            "the generation should change"
-        );
-
-        // Restore picks the newest generation, whose snapshot must already
-        // contain the write that was only in the previous generation's log.
-        let restored = tempfile::tempdir().unwrap();
-        let report = restore(&objects, "db/acme/prod", restored.path())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(report.generation, replicator.generation());
-        let reopened = open_store(restored.path());
-        let value = {
-            let reopened = reopened.clone();
-            synch_core::offload(move || reopened.config("dbrepl.probe"))
-                .await
-                .unwrap()
-        };
-        assert_eq!(value.as_deref(), Some("before-roll"));
-    }
-
-    /// A segment that never landed truncates the log rather than poisoning it.
-    #[tokio::test]
-    async fn a_gap_truncates_the_log_at_the_gap() {
-        let objects = ObjectStore::memory().unwrap();
-        // Segment 0 covers [0, 4); segment 2 claims to start at 8, which
-        // nothing reaches — so only the first survives assembly.
-        objects
-            .put("db/x/y/g1/wal/00000000.0.4", vec![1, 2, 3, 4])
-            .await
-            .unwrap();
-        objects
-            .put("db/x/y/g1/wal/00000002.8.4", vec![9, 9, 9, 9])
-            .await
-            .unwrap();
-        let (wal, skipped) = assemble_wal(&objects, "db/x/y", "g1").await.unwrap();
-        assert_eq!(wal, vec![1, 2, 3, 4]);
-        assert_eq!(skipped, 1);
-    }
-
-    /// The rule that keeps an uncommitted spill out of the stream: shipping
-    /// stops at the last commit frame, so a partially written transaction is
-    /// never uploaded and the bytes it will be replaced by are still ours to
-    /// read next tick.
-    #[tokio::test]
-    async fn shipping_stops_at_the_last_commit() {
-        let source = tempfile::tempdir().unwrap();
-        let objects = ObjectStore::memory().unwrap();
-        let store = open_store(source.path());
-        let mut replicator = Replicator::start(
-            objects.clone(),
-            ReplicatorConfig::new("db/acme/prod"),
-            store.clone(),
-        )
-        .await
-        .unwrap();
-
-        {
-            let store = store.clone();
-            synch_core::offload(move || store.set_config("probe", "committed"))
-                .await
-                .unwrap();
-        }
-        let shipped = replicator.tick().await.unwrap();
-        assert!(shipped > 0);
-        // Every byte shipped ends on a frame boundary at a commit, so the
-        // WAL file's length is greater than or equal to what went up — never
-        // the other way round.
-        let wal_len = std::fs::metadata(store.wal_path()).unwrap().len();
-        assert!(
-            replicator.shipped_bytes() <= wal_len,
-            "shipped {} beyond a log of {wal_len}",
-            replicator.shipped_bytes()
-        );
-    }
-
-    /// The checksum chain is what catches a log rewritten behind us. Feeding
-    /// a frame that does not continue the chain must not verify.
-    #[test]
-    fn a_frame_that_does_not_continue_the_chain_is_refused() {
-        let salt = [1u8; 8];
-        let chain = Chain {
-            state: (0, 0),
-            big_endian: false,
-        };
-        // A frame carrying the right salt but a checksum that chains from
-        // nothing: the shape of a frame written over an older one.
-        let mut frame = vec![0u8; (WAL_FRAME_HEADER_LEN + 512) as usize];
-        frame[8..16].copy_from_slice(&salt);
-        frame[16..20].copy_from_slice(&0xdead_beefu32.to_be_bytes());
-        assert!(verify_frame(&frame, salt, chain).is_none());
-
-        // And a frame from another log entirely is refused on the salt
-        // before its checksum is even considered.
-        assert!(verify_frame(&frame, [2u8; 8], chain).is_none());
-    }
-
-    /// The checksum is SQLite's, not a general-purpose one — two interleaved
-    /// running sums, order-dependent, and it must chain rather than restart.
-    #[test]
-    fn the_checksum_chains() {
-        let first = checksum((0, 0), &[1u8; 16], false);
-        let chained = checksum(first, &[1u8; 16], false);
-        let restarted = checksum((0, 0), &[1u8; 16], false);
-        assert_ne!(
-            chained, restarted,
-            "the second block must depend on the first"
-        );
-        // Byte order is a property of the log, and changes the answer — on
-        // bytes that are not the same read either way.
-        let asymmetric = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        assert_ne!(
-            checksum((0, 0), &asymmetric, true),
-            checksum((0, 0), &asymmetric, false)
-        );
-    }
-
-    /// A header that is not a WAL is refused rather than guessed at: a wrong
-    /// page size makes every frame boundary wrong.
-    #[test]
-    fn an_unrecognized_header_is_refused() {
-        assert!(WalHeader::parse(&[0u8; 32]).is_none());
-        let mut header = [0u8; 32];
-        header[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
-        header[8..12].copy_from_slice(&777u32.to_be_bytes());
-        assert!(
-            WalHeader::parse(&header).is_none(),
-            "a page size that is not a power of two is not a WAL"
-        );
-        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
-        let parsed = WalHeader::parse(&header).expect("a valid header");
-        assert_eq!(parsed.page_size, 4096);
-        assert!(!parsed.big_endian);
-    }
-
-    #[test]
-    fn generation_ids_sort_chronologically() {
-        let first = new_generation_id();
-        std::thread::sleep(Duration::from_millis(2));
-        let second = new_generation_id();
-        assert!(second > first, "{second} should sort after {first}");
+            .unwrap());
     }
 }

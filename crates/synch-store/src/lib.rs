@@ -25,8 +25,8 @@ pub use bindings::{Binding, BindingSource, PublishScope};
 pub use cas::{PinHolder, PinRow};
 pub use clock::ClockStatus;
 pub use db::{
-    CheckpointMode, CheckpointReport, Checkpointing, DeviceKey, IdentityAdoption, KeyState, Store,
-    StoreOptions, Txn, CAS_DIR, DB_FILE,
+    Checkpointing, DeviceKey, IdentityAdoption, KeyState, Store, StoreOptions, Txn, CAS_DIR,
+    DB_FILE,
 };
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};

@@ -341,56 +341,14 @@ pub enum Checkpointing {
     /// SQLite's own autocheckpoint, and any external process that runs one.
     #[default]
     Automatic,
-    /// The embedder's, exclusively: autocheckpoint is disabled and every
-    /// checkpoint is an explicit [`Store::checkpoint`] call.
+    /// The embedder's, exclusively: SQLite's autocheckpoint is disabled and
+    /// the embedder is expected to run its own on its own schedule.
     ///
     /// A WAL that nobody checkpoints grows without bound, so taking this on
     /// means owning it — see `docs/CLOUD-DATAPLANE.md` §5.3, where shipping a
     /// frame *before* it can be recycled is what makes the replica stream
     /// complete.
     Embedder,
-}
-
-/// How much a [`Store::checkpoint`] call insists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckpointMode {
-    /// Copy what can be copied without waiting for anybody. Never blocks a
-    /// writer, and may copy nothing at all.
-    Passive,
-    /// Copy everything, waiting for readers to finish first.
-    Full,
-    /// [`Full`](CheckpointMode::Full), then wait for readers so the *next*
-    /// writer restarts the WAL from its beginning.
-    Restart,
-    /// [`Restart`](CheckpointMode::Restart), then truncate the WAL to empty.
-    ///
-    /// This is the one a replicator wants at a generation boundary: the next
-    /// generation's frames then start at offset zero of a WAL whose header it
-    /// has, which is what lets the segments it ships be replayed as a WAL.
-    Truncate,
-}
-
-impl CheckpointMode {
-    fn as_sql(self) -> &'static str {
-        match self {
-            CheckpointMode::Passive => "PASSIVE",
-            CheckpointMode::Full => "FULL",
-            CheckpointMode::Restart => "RESTART",
-            CheckpointMode::Truncate => "TRUNCATE",
-        }
-    }
-}
-
-/// What one checkpoint moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointReport {
-    /// True when SQLite could not finish — a reader or writer was in the way.
-    /// Not an error: the frames stay in the WAL and the next call retries.
-    pub busy: bool,
-    /// Frames in the WAL when the checkpoint ran.
-    pub wal_frames: i64,
-    /// Frames it moved into the database file.
-    pub moved_frames: i64,
 }
 
 /// Knobs that must be settled before the first statement runs.
@@ -460,40 +418,6 @@ impl Store {
     /// The database file.
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join(DB_FILE)
-    }
-
-    /// The write-ahead log beside it.
-    ///
-    /// Exists only while the database is open and the log is non-empty — a
-    /// [`CheckpointMode::Truncate`] leaves the file present and zero-length,
-    /// and a clean close removes it. A replicator reads this directly, which
-    /// is why it is named here rather than reconstructed by every caller.
-    pub fn wal_path(&self) -> PathBuf {
-        let mut name = DB_FILE.to_string();
-        name.push_str("-wal");
-        self.data_dir.join(name)
-    }
-
-    /// Runs one WAL checkpoint.
-    ///
-    /// `busy` in the report is an outcome, not a failure: a reader held the
-    /// log open and the frames are still there to move next time. An actual
-    /// error means SQLite refused the statement.
-    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointReport> {
-        let conn = self.conn();
-        let sql = format!("PRAGMA wal_checkpoint({})", mode.as_sql());
-        let (busy, wal_frames, moved_frames) = conn.query_row(&sql, [], |row| {
-            Ok((
-                row.get::<_, i64>(0)? != 0,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        Ok(CheckpointReport {
-            busy,
-            wal_frames,
-            moved_frames,
-        })
     }
 
     /// Selects remote durability semantics for this process.
@@ -1896,14 +1820,11 @@ mod tests {
         for n in 0..2000 {
             store.set_config(&format!("probe.{n}"), "x").unwrap();
         }
-        let before = std::fs::metadata(store.wal_path()).unwrap().len();
-        assert!(before > 0, "the log should hold the writes nobody moved");
-
-        // And the embedder's own checkpoint empties it.
-        let report = store.checkpoint(CheckpointMode::Truncate).unwrap();
-        assert!(!report.busy, "{report:?}");
-        assert_eq!(std::fs::metadata(store.wal_path()).unwrap().len(), 0);
-        // The data survived the move into the database file.
+        let wal = dir.path().join(format!("{DB_FILE}-wal"));
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the log should still hold the writes nobody moved"
+        );
         assert_eq!(store.config("probe.1999").unwrap().as_deref(), Some("x"));
     }
 
