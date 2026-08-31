@@ -100,22 +100,48 @@ impl Tenant {
         let lock = LifecycleLock::acquire(&dir)
             .map_err(|error| DpError::io("locking the tenant data directory", error))?;
 
-        // A database already on disk is never restored over. That is partly
-        // the library's rule — a restore refuses a path that exists, so asking
-        // is an error rather than a no-op — and mostly the right one: this
-        // copy is by construction at least as new as the stream, which is
-        // only ever written *from* it. The case where it is not, a directory
-        // left by some older owner, is caught in `Replicator::start`, which
-        // refuses to open a database behind its own stream rather than
-        // silently shipping nothing.
+        // **The stream is authoritative.** A database already on disk is not
+        // evidence of anything: these pods have no durable storage, so the
+        // only way one is here is debris — a drain whose directory removal
+        // failed, or a reschedule onto a volume that outlived its last owner.
+        // Keeping it would be actively dangerous, because nothing downstream
+        // catches it: `celld-ltx`'s behind-replica check does not *refuse* a
+        // database behind its stream, it seeds the remote's newest segment as
+        // a local baseline so the next capture snapshots forward — which is
+        // exactly right after a restore, and which silently promotes a stale
+        // copy over a newer stream here. So the local copy goes and the
+        // stream is replayed.
+        //
+        // What that costs is bounded and already accepted: writes this pod
+        // made but had not shipped, which §5.3 caps at one replication
+        // interval on any ungraceful stop.
+        //
+        // The one case where the local copy *is* the identity is a stream
+        // that holds nothing — a pod that died between `Node::init` and the
+        // registration below — so that case keeps what is on disk. `restore`
+        // would refuse the existing path anyway; the point of asking first is
+        // that "the stream is empty" and "the stream's head is missing" are
+        // different answers, and only the first may initialize.
+        let db_client = || config.db_client(&network.org, &network.network);
         let restored = if dir.join(synch_store::DB_FILE).exists() {
-            tracing::info!(
-                tenant = %network.key(),
-                "a database is already on disk; keeping it rather than restoring"
-            );
-            false
+            if dbrepl::stream_is_empty(db_client()?).await? {
+                tracing::info!(
+                    tenant = %network.key(),
+                    "a database is on disk and the replica stream is empty; \
+                     keeping the local copy"
+                );
+                false
+            } else {
+                tracing::warn!(
+                    tenant = %network.key(),
+                    "discarding a leftover data directory: the replica stream \
+                     is authoritative and this copy cannot be shown to be current"
+                );
+                clear_data_dir(&dir)?;
+                dbrepl::restore(db_client()?, &dir).await?
+            }
         } else {
-            dbrepl::restore(config.db_client(&network.org, &network.network)?, &dir).await?
+            dbrepl::restore(db_client()?, &dir).await?
         };
         if !restored && !initialized(&dir).await? {
             // Nothing restorable and nothing settled on disk: a network never
@@ -521,6 +547,32 @@ impl Tenant {
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
     }
+}
+
+/// Empties a tenant's data directory, keeping the lifecycle lock.
+///
+/// The lock file stays because this process is holding a lock *on it*.
+/// Removing it would not release what we hold — the lock lives on the open
+/// descriptor — but it would let a second process create a fresh file and
+/// acquire that, which is the mutual exclusion gone precisely when two owners
+/// are the thing being guarded against.
+fn clear_data_dir(dir: &std::path::Path) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| DpError::io("reading the tenant data directory", error))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| DpError::io("reading the tenant data directory", error))?;
+        if entry.file_name() == synch_engine::LIFECYCLE_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        removed.map_err(|error| DpError::io("clearing the tenant data directory", error))?;
+    }
+    Ok(())
 }
 
 /// Whether `dir` already holds an initialized node.

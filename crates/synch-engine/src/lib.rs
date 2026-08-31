@@ -40,7 +40,7 @@ pub use compare::{CompareChange, CompareReport, CompareStatus};
 pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};
 pub use fetcher::{PreparedRange, Provider};
-pub use lifecycle::LifecycleLock;
+pub use lifecycle::{LifecycleLock, LIFECYCLE_FILE};
 pub use membership::{DomainHealth, DomainRefresh, ResolverStatus};
 pub use node::Node;
 pub use publisher::Publisher;

@@ -21,7 +21,13 @@ use std::path::Path;
 /// A stable name, because the point is that two *different* programs —
 /// `synch daemon run`, `synch cas migrate`, a hosting service embedding the
 /// engine — collide on it. Changing it would silently let them run at once.
-const LIFECYCLE_FILE: &str = "lifecycle.lock";
+/// The lock file's name inside the data directory.
+///
+/// Public because a caller that clears a data directory has to keep it: the
+/// lock is held on an open descriptor, so removing the file does not release
+/// what this process holds, but it does let a second process create a fresh
+/// one and acquire it — losing the mutual exclusion the lock exists for.
+pub const LIFECYCLE_FILE: &str = "lifecycle.lock";
 
 /// Process-held exclusive ownership of a data directory's mutable lifecycle.
 ///

@@ -666,24 +666,39 @@ document starts lying after an upgrade.
   nothing else; every other failure stays a failure and parks the tenant.
   That distinction is load-bearing: "there is nothing here" initializes a
   new identity, "I could not tell" must not.
-- **Never over an existing database**: a database already on disk is kept
-  rather than restored over. Partly the library's rule — a restore refuses
-  a path that exists — and mostly the right one, since the local copy is
-  by construction at least as new as a stream that is only ever written
-  *from* it. This is the crash-between-`init`-and-register path (§4.3),
-  and it is why the disk check is not redundant with the restore.
+- **The stream is authoritative, not the disk**: a database found in a
+  tenant directory is discarded and the stream replayed over it. These pods
+  have no durable storage, so a local database is not evidence of anything
+  — it is debris from a drain whose directory removal failed, or from a
+  volume that outlived its last owner — and keeping it is how a stale copy
+  ends up promoted over a newer stream (see **Single writer** below for why
+  nothing downstream catches that). The cost is bounded and already
+  accepted: writes made but not shipped, which this section caps at one
+  replication interval on any ungraceful stop. The single exception is a
+  stream that holds *nothing*, where the local copy is the identity: that
+  is the crash-between-`init`-and-register path (§4.3), and it is why the
+  disk check is not redundant with the restore.
 - **Drain and shutdown**: ship the tail, then close. The close is what
   releases the library's long-running read lock, and the drain waits for
   the thread to actually end — a caller that closes in order to remove the
   data directory needs the connection gone, not merely asked to go.
-- **Single writer**: correctness of the stream assumes one live replicator
-  per tenant DB, which is the same assumption the node itself makes
-  (`replicas: 1`, SERVERLESS §1) and is provided by shard ownership
-  (§7.2). The backstop for a shard-handover race is
-  `check_database_behind_replica`, run before any sync: a database that
-  starts behind its own stream is refused rather than opened, so the
-  failure mode is a tenant that parks and says so, not one that reports
-  healthy while shipping nothing.
+- **Single writer, and nothing enforces it**: correctness of the stream
+  assumes one live replicator per tenant DB, which is the same assumption
+  the node itself makes (`replicas: 1`, SERVERLESS §1) and is provided by
+  shard ownership (§7.2) — *only* by shard ownership. It is worth being
+  blunt about this, because an earlier draft of this document claimed a
+  backstop that does not exist. `check_database_behind_replica` is not a
+  refusal: when the local database is behind its stream the library seeds
+  the remote's newest segment as a local baseline so the next capture
+  snapshots forward. That is exactly right after a restore, where the local
+  copy has no segments of its own yet, and it is why the call is made — but
+  it means a *stale* database is repaired into a position to ship over the
+  stream rather than turned away. Two pods writing one stream therefore
+  lose the loser's writes silently, and the only thing standing between the
+  fleet and that is the rendezvous filter. Discarding leftover directories
+  (above) closes the reprovision half of it; the rolling-shard-count half is
+  a real exposure of one reconcile interval, named in §8 rather than papered
+  over.
 - **S3 or nothing**: the library ships two clients — S3-compatible object
   storage and a local directory — so a GCS or Azure deployment is refused
   at startup rather than per tenant. That is a real narrowing of what the
@@ -813,11 +828,16 @@ losing shard's next reconcile drains the tenant (shipping the DB tail),
 the gaining shard restores that stream and resumes the *same* identity; no
 zone change, no key change, no customer-visible event. The race — a
 rolling shard-count change where both pods briefly run the tenant — is one
-identity written by two processes, and the §5.3 backstop is what catches
-it: the second replicator's behind-replica check refuses to open, so the
-tenant parks and says so instead of reporting healthy while shipping
-nothing. Rare, bounded by one reconcile interval, and recoverable rather
-than corrupting.
+identity written by two processes, and — stated plainly because §5.3's
+first draft claimed otherwise — **nothing catches it**. The replication
+library does not refuse a database behind its stream; it repairs it into a
+position to ship over one. So for the reconcile interval in which both pods
+believe they own the tenant, both replicate, and the loser's writes leave
+the only durable copy. Bounded by one reconcile interval and by how rarely
+the shard count changes, and mitigated by doing shard-count changes as a
+stop-then-start rather than a rolling update — but a real cost of this
+design and not an eliminated one. The fix that would eliminate it is a
+lease on the stream, which the library has no notion of.
 
 Redundant hosting is a second *slot* (`cloud-2`, its own key, DB stream,
 and CAS claims over the same tenant prefix), assigned to a different shard
@@ -856,6 +876,8 @@ None of the engine's replication, storage, or membership code changes.
 | tenant DB lost, network alive | key replacement + metadata re-sync + re-adoption; no re-upload | §5.3 |
 | tenant DB lost *and* customer nodes gone | names and structure lost despite bytes surviving — the case DB replication exists for | prevented, not recovered: the replica stream is part of the contract |
 | shard pod rescheduled | the normal event: replacement pod restores every tenant DB from its stream; identities unchanged | §6 |
+| leftover tenant directory on a reused volume | discarded: the stream is replayed over it, losing at most that pod's unshipped tail | §5.3 |
+| **rolling shard-count change** | **two pods may own one tenant for a reconcile interval and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: change `SYNCH_DP_SHARDS` as a stop-then-start, never a rolling update (§5.3, §7.2)** |
 | pod killed without grace | up to one replication interval of DB writes unshipped; replica behind, never ahead | restore + re-sync closes the gap, §5.3 |
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
 | budget exhausted | admission stops; `held_back` visible in panel and heartbeat; nothing evicted | org raises plan; acquisition resumes |

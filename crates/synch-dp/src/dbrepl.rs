@@ -124,6 +124,15 @@ impl Replicator {
     /// this the fresh local database starts at a transaction id the remote is
     /// already past, so the upload loop never runs and the new writes are
     /// silently dropped.
+    ///
+    /// It is emphatically **not** a guard against a stale database, and must
+    /// not be read as one. Faced with a local copy behind its stream it seeds
+    /// the remote's newest segment as a local baseline so the next capture
+    /// snapshots *forward* — repairing that copy's ability to ship over the
+    /// stream rather than refusing it. Right after a restore, where the local
+    /// copy has no segments of its own yet; wrong for anything else, which is
+    /// why `Tenant::provision` discards leftover directories before it ever
+    /// gets here rather than relying on this call to notice.
     pub async fn start(
         db_path: &Path,
         client: DbClient,
@@ -319,6 +328,40 @@ fn close<C: ReplicaClient>(replica: Replica<C>) -> Result<()> {
     }
 }
 
+/// Whether a tenant's replica stream holds no LTX file at all.
+///
+/// Asked directly rather than inferred from a failed restore. Restoring at
+/// `TXID(0)` fails with `TxNotAvailable` for two very different reasons: the
+/// prefix is empty, or it holds files whose *head* is missing so no plan can
+/// start at transaction 1 — which an object-lifecycle rule on `db/`, or a
+/// collection sweep that died partway through deleting in ascending key
+/// order, both produce. Treating the second as "empty" would initialize a
+/// fresh identity over a network that is very much alive, so the two are
+/// separated here by listing the prefix and believing what is in it.
+pub async fn stream_is_empty(client: DbClient) -> Result<bool> {
+    match client {
+        DbClient::Objects(client) => stream_is_empty_with(&*client).await,
+        DbClient::Files(client) => stream_is_empty_with(&client).await,
+    }
+}
+
+/// [`stream_is_empty`] once the client's type is known.
+async fn stream_is_empty_with<C: ReplicaClient>(client: &C) -> Result<bool> {
+    // Every compaction level, because a snapshot at a higher level is as much
+    // evidence of a live stream as an L0 file is. One entry per level is all
+    // the question needs.
+    for level in 0..=celld_ltx::replica::SNAPSHOT_LEVEL {
+        let files = client
+            .ltx_files_bounded(level, celld_ltx::TXID(0), 1)
+            .await
+            .map_err(engine)?;
+        if !files.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Restores a tenant's database into `data_dir`, if the stream holds one.
 ///
 /// Returns `false` when there is nothing there — a network never hosted, or
@@ -346,20 +389,31 @@ async fn restore_with<C: ReplicaClient>(client: C, data_dir: &Path) -> Result<bo
             tracing::info!(?stats, "restored a tenant database from its replica stream");
             Ok(true)
         }
-        Err(error) if is_empty_stream(&error) => Ok(false),
+        // Not "this error means empty": *ask*. See `stream_is_empty` for the
+        // second thing this error means and why answering `false` to it would
+        // replace a live network's identity.
+        Err(error) if is_unsatisfiable_plan(&error) => match stream_is_empty_with(&client).await {
+            Ok(true) => Ok(false),
+            Ok(false) => Err(DpError::Engine(format!(
+                "the replica stream holds LTX files but no restorable chain \
+                 starting at the first transaction ({error}); refusing to \
+                 treat it as empty, because initializing here would replace \
+                 this network's identity"
+            ))),
+            Err(listing) => Err(listing),
+        },
         Err(error) => Err(engine(error)),
     }
 }
 
-/// Whether a restore failed only because the stream holds nothing yet.
+/// Whether a restore failed because no chain could be planned.
 ///
-/// Restoring at [`TXID(0)`](celld_ltx::TXID) asks for "whatever is latest", and
-/// the only way that plan comes back unsatisfiable is that the prefix holds no
-/// LTX files at all — so these two variants mean an empty stream here and
-/// nothing else. Deliberately narrow: every other failure stays an error, so a
-/// tenant whose stream exists but cannot be read parks instead of quietly
-/// initializing a second identity over the top of the one already in the zone.
-fn is_empty_stream(error: &celld_ltx::Error) -> bool {
+/// Says nothing about *why* — an empty prefix and a truncated head produce the
+/// same variant — so every caller pairs it with [`stream_is_empty`]. Every
+/// other failure stays an error, so a tenant whose stream exists but cannot be
+/// read parks instead of quietly initializing a second identity over the top
+/// of the one already in the zone.
+fn is_unsatisfiable_plan(error: &celld_ltx::Error) -> bool {
     matches!(
         error,
         celld_ltx::Error::TxNotAvailable | celld_ltx::Error::NoSnapshots
@@ -463,6 +517,33 @@ mod tests {
         replicator.tick().await.unwrap();
         replicator.tick().await.unwrap();
         replicator.close().await.unwrap();
+    }
+
+    /// The property the whole provisioning order rests on: a stream that
+    /// holds something says so, and one that holds nothing says that instead.
+    /// Getting these two confused is what would let a live network be
+    /// re-initialized under a fresh identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_says_whether_it_holds_anything() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        assert!(stream_is_empty(client(remote.path())).await.unwrap());
+
+        let store = open_store(source.path()).await;
+        let mut replicator =
+            Replicator::start(&store.db_path(), client(remote.path()), "acme/prod")
+                .await
+                .unwrap();
+        {
+            let store = store.clone();
+            synch_core::offload(move || store.set_config("dbrepl.probe", "shipped"))
+                .await
+                .unwrap();
+        }
+        replicator.flush().await.unwrap();
+        replicator.close().await.unwrap();
+
+        assert!(!stream_is_empty(client(remote.path())).await.unwrap());
     }
 
     /// A stream nothing has been written to is not an error — it is the signal
