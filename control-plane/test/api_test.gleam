@@ -3171,6 +3171,254 @@ pub fn disabling_hosting_removes_the_hosted_device_from_the_zone_test() {
   assert stamped == [[sqlite.Int(1)]]
 }
 
+/// Registers a key into a hosting slot, as the fleet does on every provision.
+fn register_slot(h: Harness, token: String, label: String, key: String) -> Int {
+  call(
+    h,
+    keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+      |> simulate.json_body(
+        json.object([
+          #("label", json.string(label)),
+          #("nk", json.string(key)),
+        ]),
+      ),
+  ).status
+}
+
+/// `DELETE …/device/keys/:nk`, in both dispositions.
+fn retire_slot_key(
+  h: Harness,
+  token: String,
+  network: String,
+  key: String,
+  revoke: Bool,
+) -> wisp.Response {
+  let suffix = case revoke {
+    True -> "?revoke=1"
+    False -> ""
+  }
+  call(
+    h,
+    keyed(
+      token,
+      Delete,
+      "/dp/v1/networks/acme/" <> network <> "/device/keys/" <> key <> suffix,
+    ),
+  )
+}
+
+/// The stored state of a key, by its z32 — the fact the route is about.
+fn key_state(h: Harness, key: String) -> String {
+  let conn = read_db(h)
+  let looked =
+    sqlite.query(conn, "SELECT state FROM device_keys WHERE nk_z32 = ?", [
+      sqlite.Text(key),
+    ])
+  sqlite.close(conn)
+  let assert Ok([[sqlite.Text(state)]]) = looked
+  state
+}
+
+/// A slot's only live key may be withdrawn, but not merely stood down.
+///
+/// The two dispositions differ in exactly one thing and it is the whole rule:
+/// retiring the last `active` key would leave a tenant the zone still names
+/// with no key it can present — an orphan no data-plane restart repairs, since
+/// the replacement `PUT` needs a live key to rotate from. Revoking it is
+/// allowed, because "this key is compromised" outranks "this tenant keeps
+/// working", and the recovery is a fresh registration over the revoked slot.
+pub fn retiring_the_last_active_key_is_refused_unless_revoking_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  let key = nk()
+  assert register_slot(h, token, "cloud-1", key) == 200
+  assert list.contains(published_nks(h), key)
+
+  let refused = retire_slot_key(h, token, "prod", key, False)
+  assert refused.status == 409
+  assert string.contains(simulate.read_body(refused), "last-active-key")
+  // Refused, not half-applied: the tenant is still able to present it, and
+  // the zone still names it.
+  assert key_state(h, key) == "active"
+  assert list.contains(published_nks(h), key)
+
+  // The same key, withdrawn outright, is allowed — and leaves the zone in the
+  // same commit, which is what a revocation is for.
+  let withdrawn = retire_slot_key(h, token, "prod", key, True)
+  assert withdrawn.status == 200
+  assert string.contains(simulate.read_body(withdrawn), "revoked")
+  assert key_state(h, key) == "revoked"
+  assert !list.contains(published_nks(h), key)
+
+  // And it is gone from the route's view too: `find_slot_key` skips revoked
+  // keys, so a retrying reconciler gets a 404 rather than a second audit row.
+  assert retire_slot_key(h, token, "prod", key, False).status == 404
+}
+
+/// Closing a rotation window: the key rotated away from is retirable, the one
+/// rotated to is not.
+///
+/// This is the pairing the route exists for. `register_device` opens the
+/// window by moving the old key to `retiring` and adding the new one `active`;
+/// without a way to close it the zone would carry two records under one label
+/// forever, and `zone/build` caps that at two — so the *next* rotation would
+/// be refused rather than this one being wrong.
+pub fn closing_a_rotation_window_retires_only_the_old_key_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  let old = nk()
+  let new = nk()
+  assert register_slot(h, token, "cloud-1", old) == 200
+  assert register_slot(h, token, "cloud-1", new) == 200
+  // The window: both resolvable, so customer bindings age out rather than
+  // breaking at the moment of the swap.
+  assert key_state(h, old) == "retiring"
+  assert key_state(h, new) == "active"
+  assert list.contains(published_nks(h), old)
+  assert list.contains(published_nks(h), new)
+
+  // The new key is now the sole active one, so standing it down is refused —
+  // the rule holds mid-rotation, which is when it matters most.
+  assert retire_slot_key(h, token, "prod", new, False).status == 409
+
+  // The old one is already `retiring`, so a plain close is accepted and
+  // idempotent; the fleet re-sends it on every rotation pass.
+  assert retire_slot_key(h, token, "prod", old, False).status == 200
+  assert key_state(h, old) == "retiring"
+
+  // Withdrawing it closes the window: one record under the label again, so the
+  // next rotation has room.
+  assert retire_slot_key(h, token, "prod", old, True).status == 200
+  assert key_state(h, old) == "revoked"
+  assert !list.contains(published_nks(h), old)
+  assert list.contains(published_nks(h), new)
+  // And the replacement key is untouched by any of it.
+  assert key_state(h, new) == "active"
+}
+
+/// The route reaches hosting slots and nothing else.
+///
+/// A `synchdp_` token names no org, so path confinement is the only thing
+/// standing between a leaked one and a customer's device key. `find_slot_key`
+/// requires all three: the named network, a `cloud-*` label, and a row the
+/// data plane itself created (§9).
+pub fn key_retirement_is_confined_to_hosting_slots_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("staging"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+  assert host_network(h, "acme", "staging", True) == 200
+  let token = mint_dataplane(h, "fleet")
+
+  // A customer's own device in the very network the token may write to.
+  let customer = nk()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      json.object([
+        #("label", json.string("nas")),
+        #("nk", json.string(customer)),
+      ]),
+    ).status
+
+  // The fleet's slot, in the other network.
+  let hosted = nk()
+  let assert 200 =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/staging/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(hosted)),
+          ]),
+        ),
+    ).status
+
+  // Not a `cloud-*` label, and not created by the data plane: unreachable,
+  // and it reads as "no such live key" rather than as a permission error,
+  // because the credential has no business knowing the device exists.
+  assert retire_slot_key(h, token, "prod", customer, True).status == 404
+  assert key_state(h, customer) == "active"
+  assert list.contains(published_nks(h), customer)
+
+  // A hosting slot, but of a different network than the path names.
+  assert retire_slot_key(h, token, "prod", hosted, True).status == 404
+  assert key_state(h, hosted) == "active"
+
+  // Named correctly, it works — so the 404s above are confinement rather than
+  // the route being broken.
+  assert retire_slot_key(h, token, "staging", hosted, True).status == 200
+  assert key_state(h, hosted) == "revoked"
+}
+
+/// Every `/dp/v1` route is closed to an unauthenticated caller.
+///
+/// Asserted route by route rather than on the listing alone: these are the
+/// fleet's writes, and one of them destroys customer data. A regression that
+/// opened a single handler while `GET /dp/v1/networks` stayed shut is exactly
+/// the shape a spot-check misses.
+pub fn the_dp_api_is_closed_without_a_credential_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  assert host_network(h, "acme", "prod", True) == 200
+
+  let anonymous = fn(method, path) {
+    call(h, simulate.request(method, path)).status
+  }
+  assert anonymous(Get, "/dp/v1/networks") == 401
+  assert anonymous(Put, "/dp/v1/networks/acme/prod/device") == 401
+  assert anonymous(Delete, "/dp/v1/networks/acme/prod/device/keys/" <> nk())
+    == 401
+  assert anonymous(Post, "/dp/v1/networks/acme/prod/status") == 401
+  assert anonymous(Delete, "/dp/v1/networks/acme/prod/storage") == 401
+
+  // A malformed bearer token is the same answer, not a 500 or a 403: an
+  // attacker learns nothing about which credentials exist.
+  assert call(h, keyed("synchdp_nonsense", Get, "/dp/v1/networks")).status
+    == 401
+}
+
 /// The steady-state poll is a 304, which is what makes a 60-second fleet-wide
 /// cadence cheap.
 pub fn the_desired_document_is_conditional_test() {
