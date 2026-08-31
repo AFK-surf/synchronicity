@@ -62,8 +62,24 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12]
 }
+
+/// V12: Cue integration — the map from a Cue Workspace to its org.
+///
+/// The integration provisions one org (and its default network) per Cue
+/// Workspace. This mapping is the natural key that makes provisioning
+/// idempotent: a repeat, a retry, or a concurrent call for the same Workspace
+/// converges on the one org. Kept out of `orgs` so the integration adds no
+/// column to a table the whole product writes with positional inserts.
+const v12 = "
+CREATE TABLE cue_workspace_orgs (
+  cue_workspace_id TEXT PRIMARY KEY,
+  org_id           TEXT NOT NULL UNIQUE REFERENCES orgs(id),
+  network_id       TEXT NOT NULL REFERENCES networks(id),
+  created_at       INTEGER NOT NULL
+);
+"
 
 /// V11: the browser every OAuth flow was started from.
 ///

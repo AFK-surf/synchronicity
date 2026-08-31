@@ -272,6 +272,7 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
       "ALTER TABLE oauth_states DROP COLUMN binding_token_hash",
       [],
     )
+  let assert Ok(_) = sqlite.exec(conn, "DROP TABLE cue_workspace_orgs", [])
   let assert Ok(v) = migrate.migrate(conn)
   assert v == migrate.build_version()
 

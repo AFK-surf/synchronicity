@@ -54,6 +54,14 @@ pub type Listen {
   Listen(address: String, port: Int)
 }
 
+/// Cue's server-to-server per-Workspace provisioning, when enabled. The secret
+/// authenticates Cue's backend; the OIDC provider is a single shared hub every
+/// Cue identity anchors to. The org and network are created per Workspace, so
+/// there is no fixed target org. Absent means the integration is off.
+pub type CueProvisioning {
+  CueProvisioning(secret: String, oidc_provider_id: String)
+}
+
 pub type Config {
   Config(
     role: Role,
@@ -97,6 +105,8 @@ pub type Config {
     /// The control-plane endpoints the apex record names, in publication
     /// order: this node's own first, then `CP_ENDPOINTS`.
     endpoints: List(String),
+    /// Cue integration provisioning, or `None` when disabled.
+    cue_provisioning: Option(CueProvisioning),
   )
 }
 
@@ -165,6 +175,7 @@ pub fn load() -> Result(Config, String) {
   use primary_url <- result.try(primary_url(role))
   use smtp <- result.try(smtp_config())
   use endpoints <- result.try(validated_endpoints(role))
+  use cue_provisioning <- result.try(cue_provisioning())
   Ok(Config(
     role,
     base_domain,
@@ -182,7 +193,30 @@ pub fn load() -> Result(Config, String) {
     dns_mode,
     primary_url,
     endpoints,
+    cue_provisioning,
   ))
+}
+
+/// `CP_CUE_PROVISIONING_*`: Cue's server-to-server user provisioning. Off
+/// unless `CP_CUE_PROVISIONING_ENABLED=true`, and enabling it requires the
+/// secret, the OIDC provider id and the target org id — an endpoint that mints
+/// users and memberships does not come up half-configured.
+fn cue_provisioning() -> Result(Option(CueProvisioning), String) {
+  case envoy.get("CP_CUE_PROVISIONING_ENABLED") {
+    Ok("true") -> {
+      use secret <- result.try(required("CP_CUE_PROVISIONING_SECRET"))
+      use Nil <- result.try(case string.length(secret) >= 32 {
+        True -> Ok(Nil)
+        False ->
+          Error("CP_CUE_PROVISIONING_SECRET must be at least 32 characters")
+      })
+      use provider_id <- result.try(required("CP_CUE_OIDC_PROVIDER_ID"))
+      Ok(Some(CueProvisioning(secret, provider_id)))
+    }
+    Ok("false") | Error(Nil) -> Ok(None)
+    Ok(other) ->
+      Error("CP_CUE_PROVISIONING_ENABLED must be true or false, got " <> other)
+  }
 }
 
 /// `CP_PRIMARY_URL`: where a replica's dashboard sends the writes it cannot do.
