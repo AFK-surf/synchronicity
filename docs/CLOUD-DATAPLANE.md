@@ -299,12 +299,18 @@ Provisioning → Identifying → Running → Draining → Retired
 
 For a network entering the desired set:
 
-1. Create `<base>/tenants/<org>/<net>/` and call
-   `Node::init(dir, Some(domain))`. This generates the device key into the
-   tenant's SQLite and leaves the origin unset — named identity comes from
-   the zone, as it must.
+1. Create `<base>/tenants/<org>/<net>/` and attempt a **restore** of the
+   tenant database from its replica stream (§5.3) — on an ephemeral pod
+   every provisioning is potentially a re-provisioning, and a restored DB
+   carries the device key and holds an existing identity. Only when
+   nothing restorable exists, call `Node::init(dir, Some(domain))`, which
+   generates a fresh device key into the tenant's SQLite and leaves the
+   origin unset — named identity comes from the zone, as it must.
 2. Read the public key back and `PUT /dp/v1/networks/:org/:net/device`
    with `{label: "cloud-<shard>", nk}`. The commit publishes the zone.
+   (After a restore this is the idempotent 200 no-op; after a fresh init
+   on a network whose old key is unrecoverable, it is the key-replacement
+   path.)
 3. Open with the daemon's own pattern (`open_once_named`): call
    `Node::open(config)`; on `EngineError::Unidentified` — the zone answer
    has not propagated to the resolver yet — poll on the same 30 s cadence
@@ -420,13 +426,17 @@ Decisions, with reasons:
 
 ### 4.6 Shutdown
 
-Process shutdown (SIGTERM = SIGINT, as the daemon insists, so Litestream
-ships the WAL tail): broadcast to every tenant's loops, `join` them, then
-`Node::shutdown()` per tenant — its four-step order (close admission, drain
-socket streams, retire endpoints) already handles the no-sockets case as a
-cheap no-op. The 30-second termination allowance from SERVERLESS scales:
-tenants shut down concurrently, and the deployment grants the pod the same
-30 s it grants a serverless daemon.
+Process shutdown (SIGTERM = SIGINT, as the daemon insists): broadcast to
+every tenant's loops, `join` them, then per tenant `Node::shutdown()` —
+its four-step order (close admission, drain socket streams, retire
+endpoints) already handles the no-sockets case as a cheap no-op — and
+finally a checkpoint-and-ship of that tenant's WAL tail by the in-process
+database replicator (§5.3), so the pod leaves nothing behind that the
+replica stream does not carry. The 30-second termination allowance from
+SERVERLESS scales: tenants shut down concurrently, and the deployment
+grants the pod the same 30 s it grants a serverless daemon. A pod killed
+without grace loses at most the replication interval (§5.3), the same
+asynchrony bound Litestream accepts.
 
 ---
 
@@ -442,7 +452,7 @@ tenants/<org>/<network>/        ← OpenDAL root for this tenant
   cas/<hh>/<hex>                ← payload   (append-only, SERVERLESS §6.5)
   cas/<hh>/<hex>.obao           ← outboard
   uploads/<id>/<n>              ← multipart staging, swept
-db/<org>/<network>/             ← Litestream replica of the tenant DB (§5.3)
+db/<org>/<network>/             ← tenant DB replica stream (§5.3)
 ```
 
 The CAS layer supports the alternative — many nodes on one shared root,
@@ -474,7 +484,9 @@ hosted replica share content addresses the way SERVERLESS designed.
 ### 5.2 Data dirs, scratch, and the cache
 
 `<base>/tenants/<org>/<net>/` is the tenant's `data_dir`: SQLite,
-`store/` cache, `cloud/` scratch. Per-tenant dirs give each tenant its own
+`store/` cache, `cloud/` scratch — all of it on the pod's ephemeral
+volume, all of it either replicated out (§5.3) or reconstructible, none of
+it mourned on reschedule. Per-tenant dirs give each tenant its own
 scratch generation marker for free — one tenant's cold start wipes one
 tenant's cache — and keep the engine's thread-local store-reentry guard
 happy, because a blocking task naturally touches exactly one tenant's
@@ -489,14 +501,71 @@ split can be lopsided or stingy without threatening correctness.
 
 ### 5.3 Database durability, and what a lost database costs
 
-Each tenant database follows the SERVERLESS posture: local file is a
-working copy, the Litestream replica under `db/<org>/<network>/` is what
-survives. The data plane maintains one generated Litestream configuration
-per shard covering its tenants' databases and supervises the Litestream
-process, regenerating and restarting it when the tenant set changes —
-restart is cheap (generations resume) and the staleness window it adds is
-of the same order as Litestream's own asynchrony. On provisioning, restore
-is attempted before init, exactly like a serverless daemon's boot.
+The data plane runs on **ephemeral pods with no durable local storage**:
+everything under `<base>` — every tenant's SQLite file, cache, and scratch
+— is a working copy that a reschedule deletes. So the SERVERLESS posture
+(local file is a working copy, the object-store replica is what survives)
+is not one deployment option here; it is the only description of the
+system, and the data plane **manages the database replicas itself,
+in-process**. There is no Litestream sidecar, no operator-maintained
+replication config, and no volume to mount: `synch-dp` carries a
+WAL-shipping replicator (`dbrepl`, one standing task per tenant) that
+speaks the same OpenDAL operator the CAS already uses.
+
+A sidecar was considered and rejected. The tenant set is dynamic — DBs
+appear and retire with every reconciler pass — and a config-file-plus-
+restart cycle per membership change is exactly the kind of process
+choreography an ephemeral pod is bad at. In-process replication follows a
+tenant's lifecycle for free (provision starts it, drain flushes and stops
+it), shares credentials and retry/timeout layers with the CAS client, and
+keeps the repository's one-self-contained-binary posture: SQLite is
+already compiled in; its replication should not be the one function
+outsourced to a Go binary in the image.
+
+The replica stream follows the generation model Litestream proved:
+
+```
+db/<org>/<network>/
+  <generation>/snapshot            ← compressed full copy at generation start
+  <generation>/wal/<index>         ← WAL segments, shipped in order
+```
+
+- **Generation**: a random id minted whenever the replicator starts from a
+  database it did not restore itself (first init, or restore from an older
+  generation). Within a generation, `snapshot + wal/*` replays to the
+  current database; frame salts and checksums in the WAL segments are what
+  make a torn or duplicated upload detectable on restore.
+- **Shipping**: the replicator holds its own read connection beside the
+  store's single writer (the store's 30 s `busy_timeout` exists precisely
+  because a replication checkpointer contends with it), reads new WAL
+  frames on a short interval (default 1 s, batched), uploads a segment,
+  and only then checkpoints. It owns checkpointing outright — engine
+  change **(d)**, §7.3 — so the writer can never truncate WAL frames that
+  have not been shipped. Acknowledged-but-unshipped writes are bounded by
+  the interval; as with Litestream, the replica can only be *behind* the
+  bucket's CAS state, never ahead, which is the direction §8.3 of
+  SERVERLESS already reasons about.
+- **Restore**: on provisioning, before any init — list generations, pick
+  the newest with a contiguous, checksum-valid WAL, download and replay,
+  then start a fresh generation. Only when nothing restorable exists does
+  `Node::init` run, exactly like a serverless daemon's boot.
+- **Drain and shutdown**: final checkpoint, ship the tail, write a
+  generation close marker, stop. This is the last step of §4.6.
+- **Single writer**: correctness of the stream assumes one live replicator
+  per tenant DB, which is the same assumption the node itself makes
+  (`replicas: 1`, SERVERLESS §1) and is provided by shard ownership
+  (§7.2). A shard-handover race — two pods briefly believing they own a
+  tenant — writes two *different generations*, not interleaved garbage;
+  restore picks one, and the loser's divergence is repaired by the ordinary
+  key-replacement path below. The generation model turns split-brain from
+  corruption into a recoverable fork.
+- **Protection**: the DB stream contains the device secret, so
+  `db/<org>/<network>/` objects are additionally encrypted by the
+  replicator with a per-deployment key from the environment (KMS-backed
+  where available) before upload. Bucket read access alone then yields
+  content — which the CAS prefix already yields — but not identities. This
+  is the "protect it separately from the CAS prefix" rule of SERVERLESS,
+  discharged without needing a second bucket.
 
 It is worth being precise about what the database is *for*, because it is
 less than it looks:
@@ -515,7 +584,8 @@ the old key is revoked control-plane-side, the zone republishes, customers
 re-bind), one metadata re-sync, and a `require_pair` pass over held
 roots. What it does *not* cost is re-uploading terabytes.
 
-The case Litestream actually protects is the one the service exists for:
+The case the replicator actually protects is the one the service exists
+for:
 **the hosted replica holds the last copy**. If the customer's nodes are
 gone *and* the tenant DB is gone, the bytes still sit in `cas/` but the
 tries that name them — filenames, versions, structure — are unrecoverable.
@@ -549,11 +619,11 @@ cheap re-provision that restores the DB and re-adopts the prefix; after
 it, a scheduled job deletes `tenants/<org>/<net>/` and `db/<org>/<net>/`
 and the hold's audit row records who disabled and when it fell due.
 
-**Shard loss**: a shard host dies. Its tenants' desired state still lists
-them; a replacement shard with the same ordinal restores each DB from
-Litestream and resumes each identity — same key, same label, no zone
-change at all. Only if the DB replica is also gone does the key-replacement
-path (§5.3) run.
+**Shard loss**: a shard pod dies — the *normal* event, since pods are
+ephemeral. Its tenants' desired state still lists them; the replacement
+pod with the same ordinal restores each DB from its replica stream and
+resumes each identity — same key, same label, no zone change at all. Only
+if the DB replica is also gone does the key-replacement path (§5.3) run.
 
 ---
 
@@ -567,7 +637,7 @@ path (§5.3) run.
 | SQLite | 1 file, 1 serialized connection | all access via the blocking pool |
 | OS threads | 0 | with engine change (a); today 4 (socket pool) |
 | tokio tasks | ~8 standing | §4.4 loop set |
-| Litestream | 1 replicated DB | one process per shard |
+| DB replicator | 1 standing task, 1 read connection | in-process, §5.3 |
 | memory | O(trie working set + cache index) | dominated by anti-entropy peaks |
 
 Shared, once per process: the tokio runtime and its blocking pool (sized
@@ -589,7 +659,7 @@ desired-state document, filtered by **rendezvous hashing on the network
 id** — no assignment state in the control plane, no coordination between
 shards, and a shard-count change moves ~1/n of tenants. A tenant's bucket
 prefix is keyed by network, not by shard, so a moved tenant keeps its CAS
-untouched; its DB moves by Litestream restore, or failing that by the
+untouched; its DB moves by replica-stream restore, or failing that by the
 §5.3 rebuild. During a handover the network may briefly carry two hosted
 devices (`cloud-2` draining, `cloud-3` provisioning) — which is just two
 replicas, a state the protocol is indifferent to.
@@ -608,6 +678,12 @@ Small, and all of independent value:
 - **(c)** A public equivalent of the CLI's `LifecycleLock` (flock per data
   dir) in the engine, so an embedder gets the two-daemons-one-dir refusal
   the daemon has; today it is `pub(crate)` in `synch-cli`.
+- **(d)** The store yields WAL checkpointing to the embedder: a mode that
+  sets `wal_autocheckpoint = 0` on the writer and exposes an explicit
+  checkpoint call, so the in-process DB replicator (§5.3) checkpoints only
+  after frames are shipped. Today the store assumes an external
+  checkpointer (its raised `busy_timeout` is Litestream-shaped); this
+  makes the same contract available to one living in the process.
 
 None of the engine's replication, storage, or membership code changes.
 
@@ -622,8 +698,9 @@ None of the engine's replication, storage, or membership code changes.
 | provider outage | writes fail closed (SERVERLESS §4): replica wants stay pending, nothing acks that isn't durable | wants retry; no data loss by construction |
 | one tenant's loop panics | that tenant restarts with backoff; process and other tenants unaffected | supervisor, §4.4 |
 | tenant DB lost, network alive | key replacement + metadata re-sync + re-adoption; no re-upload | §5.3 |
-| tenant DB lost *and* customer nodes gone | names and structure lost despite bytes surviving — the case Litestream exists for | prevented, not recovered: DB replication is part of the contract |
-| shard host lost | tenants resume on replacement shard from DB replicas; identities unchanged | §6 |
+| tenant DB lost *and* customer nodes gone | names and structure lost despite bytes surviving — the case DB replication exists for | prevented, not recovered: the replica stream is part of the contract |
+| shard pod rescheduled | the normal event: replacement pod restores every tenant DB from its stream; identities unchanged | §6 |
+| pod killed without grace | up to one replication interval of DB writes unshipped; replica behind, never ahead | restore + re-sync closes the gap, §5.3 |
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
 | budget exhausted | admission stops; `held_back` visible in panel and heartbeat; nothing evicted | org raises plan; acquisition resumes |
 | disk pressure on shard | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
@@ -668,7 +745,8 @@ None of the engine's replication, storage, or membership code changes.
   dedicated-shard tier, not a design change: the shard filter already
   makes "a shard that hosts one org" a configuration.
 - **Rekor/TUF pinning** rides per-tenant DBs (the engine stores pin state
-  in the node's config table), so a tenant restored from Litestream keeps
+  in the node's config table), so a tenant restored from its replica
+  stream keeps
   its transparency-log pins; the shared resolver bounds Sigstore traffic.
 
 ---
@@ -703,7 +781,7 @@ crates/synch-dp/
   src/tenant.rs        # per-network lifecycle: provision, identify,
                        #   loop set, supervise, drain, retire
   src/spaces.rs        # view-driven replica ensure/remove (§4.5)
-  src/litestream.rs    # generated config + process supervision (§5.3)
+  src/dbrepl.rs        # in-process WAL-shipping DB replicator (§5.3)
   src/metrics.rs
 ```
 
@@ -722,7 +800,8 @@ crates/synch-dp/
    e2e stack — a customer node publishes, the hosted tenant converges, the
    customer node deletes its copy, the bytes survive in the tenant prefix,
    the rebuilt-DB path re-adopts them.
-4. **Operations**: Litestream supervision, retention-hold deletion job,
+4. **Operations**: replicator hardening (restore fuzzing over torn and
+   forked streams), retention-hold deletion job,
    dashboards, the status heartbeat, runbook (`control-plane/ops/`).
 5. **Scale-out**: shard filter + rendezvous handover, then the
    dedicated-shard and redundant-hosting tiers as configuration.
@@ -740,10 +819,14 @@ crates/synch-dp/
 - **No cross-tenant dedup.** Two orgs storing the same bytes pay twice.
   Chosen in §5.1; the confidentiality and offboarding wins are worth more
   than the duplicate gigabytes.
-- **The database replica is load-bearing.** The design leans on Litestream
-  for the last-copy case; a deployment that skips it silently downgrades
-  "replica of record" to "replica while the customer also survives". The
-  runbook must treat a failed DB replica as an incident, not a warning.
+- **The database replica is load-bearing, and now first-party.** The
+  last-copy case rests on the in-process replicator rather than a proven
+  external tool — engineering the data plane takes on knowingly, because
+  ephemeral pods and a dynamic tenant set left the sidecar shape without a
+  leg to stand on (§5.3). The mitigations are owed, not optional: the
+  generation model is Litestream's, restore is exercised on every pod
+  reschedule rather than only in disasters, and a stalled stream is an
+  incident, not a warning.
 - **One more standing fleet.** The data plane is a new operated service
   with real state. Everything in this design that could be a daemon
   feature was kept a daemon feature precisely so that a customer who
