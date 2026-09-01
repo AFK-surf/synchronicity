@@ -3429,7 +3429,7 @@ pub fn closing_a_rotation_window_retires_only_the_old_key_test() {
   // The old one is already `retiring`, so a plain close is accepted — and
   // publishes nothing. A reconciler re-sends this on every rotation pass, and
   // the serial it would otherwise bump is the desired document's
-  // `generation`: a republish per pass would turn every shard's 304 into a
+  // `generation`: a republish per pass would turn every data plane's 304 into a
   // full document and re-sign the zone for a row that did not change.
   let settled = soa_serial(h)
   let repeated = retire_slot_key(h, token, "prod", old, False)
@@ -3788,26 +3788,6 @@ pub fn hosting_without_a_data_plane_is_assigned_to_nobody_test() {
   assert !string.contains(dp_document(h, token), "\"prod\"")
   assert host_network(h, "acme", "prod", True) == 200
   assert string.contains(dp_document(h, token), "\"prod\"")
-}
-
-/// A key minted before the fleet was named is refused, by name.
-///
-/// Fail-closed with the remedy in the message. The tempting alternative —
-/// treating a key that names no data plane as one that sees everything —
-/// would keep a fleet running through the upgrade by handing the oldest
-/// credential on the deployment the widest scope it has ever had.
-pub fn a_key_naming_no_data_plane_is_refused_test() {
-  let h = harness()
-  let assert Ok(conn) = db.open_primary(h.db_path)
-  let assert Ok(#(token, _prefix)) =
-    dataplane_key.create(conn, id.new(), "legacy", "dp-1", None, now_unix())
-  let assert Ok(_) =
-    sqlite.exec(conn, "UPDATE dataplane_keys SET dp_id = NULL", [])
-  sqlite.close(conn)
-
-  let answer = call(h, keyed(token, Get, "/dp/v1/networks"))
-  assert answer.status == 409
-  assert string.contains(simulate.read_body(answer), "dataplane_unnamed")
 }
 
 /// The document under an `If-None-Match`, which is how the fleet actually

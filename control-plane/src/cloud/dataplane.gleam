@@ -24,11 +24,8 @@
 //// noisy as "the fleet looks uneven" — reintroduces the two-writers case
 //// above under a friendlier name.
 
-import gleam/int
 import gleam/list
-import gleam/order
 import gleam/result
-import gleam/string
 import store/sqlite.{type Connection, Int as VInt, Text}
 
 /// Registers a data plane under an operator-chosen id.
@@ -124,8 +121,8 @@ pub fn place(
   case assigned {
     Ok(dp_id) -> Ok(Ok(dp_id))
     Error(Nil) -> {
-      use candidates <- result.try(list(conn))
-      case least_loaded(candidates) {
+      use emptiest <- result.try(least_loaded(conn))
+      case emptiest {
         Error(Nil) -> Ok(Error(Nil))
         Ok(dp_id) -> {
           use _ <- result.try(assign(conn, network_id, dp_id, now))
@@ -170,30 +167,27 @@ pub fn assign(
   |> result.replace(Nil)
 }
 
-/// The emptiest data plane, ties broken by id.
+/// The data plane holding the fewest hosted networks, ties broken by id.
 ///
-/// Separate from [`place`] so the rule is a pure function a test can state
-/// without a database: placement policy is the part of this module most
-/// likely to be argued about later, and it should be possible to argue about
-/// it in one screen.
-pub fn least_loaded(candidates: List(#(String, Int))) -> Result(String, Nil) {
-  candidates
-  |> list.fold(Error(Nil), fn(best, candidate) {
-    let #(id, count) = candidate
-    case best {
-      Error(Nil) -> Ok(#(id, count))
-      Ok(#(best_id, best_count)) -> {
-        let closer = case int.compare(count, best_count) {
-          order.Lt -> True
-          order.Gt -> False
-          order.Eq -> string.compare(id, best_id) == order.Lt
-        }
-        case closer {
-          True -> Ok(#(id, count))
-          False -> Ok(#(best_id, best_count))
-        }
-      }
-    }
-  })
-  |> result.map(fn(winner) { winner.0 })
+/// `Error(Nil)` when none is registered, which is a real state — see
+/// [`place`]. Ordered in the query rather than folded here: "fewest, then by
+/// name" is what `ORDER BY` says, and a hand-rolled comparison would be a
+/// second place for the rule to live.
+fn least_loaded(conn: Connection) -> Result(Result(String, Nil), sqlite.Error) {
+  use rows <- result.try(
+    sqlite.query(
+      conn,
+      "SELECT d.id
+     FROM data_planes d
+     LEFT JOIN networks n ON n.cloud_dp_id = d.id AND n.cloud_hosted = 1
+     GROUP BY d.id
+     ORDER BY count(n.id) ASC, d.id ASC
+     LIMIT 1",
+      [],
+    ),
+  )
+  case rows {
+    [[Text(dp_id)]] -> Ok(Ok(dp_id))
+    _ -> Ok(Error(Nil))
+  }
 }

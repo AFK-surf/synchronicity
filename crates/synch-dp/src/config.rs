@@ -13,9 +13,9 @@ use crate::error::{DpError, Result};
 /// The hosting slot this build claims (`docs/CLOUD-DATAPLANE.md` §3.4).
 ///
 /// One, because v1 hosts every network once. It is a constant rather than a
-/// setting so that no deployment can accidentally run two shards claiming the
-/// same slot for different networks — redundancy is a *second* slot, which is
-/// a design change, not a config change.
+/// setting so that no deployment can accidentally run two data planes
+/// claiming the same slot for different networks — redundancy is a *second*
+/// slot, which is a design change, not a config change.
 pub const SLOT: u32 = 1;
 
 /// The device label for [`SLOT`].
@@ -32,14 +32,6 @@ pub struct DpConfig {
     pub token: String,
     /// Where tenant data directories live, on the pod's ephemeral volume.
     pub base_dir: PathBuf,
-    /// A name for this pod, for logs and the status heartbeat.
-    ///
-    /// A fallback only: the authoritative name is the one the control plane
-    /// answers with (`Desired::dp`), because that is the name the assignment
-    /// is written against. This is what a log line says before the first poll
-    /// succeeds, and what the heartbeat carries if a control plane older than
-    /// the assignment work answers without one.
-    pub shard_name: String,
     /// How often to poll the control plane.
     pub poll_interval: Duration,
     /// The object store: OpenDAL service and its options.
@@ -55,7 +47,7 @@ pub struct DpConfig {
     /// Configuration rather than a constant in `main` because it is one half
     /// of a pair: every store touch of every tenant crosses this pool (§7.1),
     /// and [`max_inflight_per_tenant`](Self::max_inflight_per_tenant) is
-    /// derived from it so that the shard's whole inbound demand has a
+    /// derived from it so that this pod's whole inbound demand has a
     /// ceiling. Two numbers chosen in two places would agree only by
     /// accident.
     pub blocking_threads: usize,
@@ -66,7 +58,7 @@ pub struct DpConfig {
     /// ordinary cluster every peer that can send a request is an authorized
     /// member, members are extended basic trust not to DoS each other, and a
     /// member behaving abusively is a membership problem whose remedy is
-    /// `synch trust rm`. A shard cannot take that stance, because the
+    /// `synch trust rm`. A data plane cannot take that stance, because the
     /// membership belonging to org A is not org B's to curate while both
     /// share this process's blocking pool — so what §12 leaves to trust, this
     /// leaves to a semaphore.
@@ -190,7 +182,6 @@ impl DpConfig {
             control_url: control_url.trim_end_matches('/').to_string(),
             token: "synchdp_test".into(),
             base_dir: base_dir.into(),
-            shard_name: "dp-test".into(),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
                 service: "memory".into(),
@@ -224,8 +215,6 @@ impl DpConfig {
         // starting anyway would host whatever the control plane assigned this
         // token, which may be a different set entirely, while the operator
         // believes the old arithmetic still holds.
-        refuse_retired_sharding(&|key| std::env::var(key).is_ok())?;
-        let shard_name = std::env::var("SYNCH_DP_SHARD_NAME").unwrap_or_else(|_| "dp".to_string());
         let poll_interval = Duration::from_secs(parse::<u64>("SYNCH_DP_POLL_SECS", 60)?.max(1));
 
         let service = std::env::var("SYNCH_DP_CAS_BACKEND").unwrap_or_else(|_| "s3".to_string());
@@ -255,7 +244,7 @@ impl DpConfig {
                 max_inflight_per_tenant,
                 max_tenants,
                 blocking_threads,
-                "this shard's tenants can ask for more concurrent blocking work than the \
+                "this pod's tenants can ask for more concurrent blocking work than the \
                  pool has threads; one tenant's peers can then make another tenant wait"
             );
         }
@@ -264,7 +253,6 @@ impl DpConfig {
             control_url,
             token,
             base_dir,
-            shard_name,
             poll_interval,
             objects: ObjectConfig { service, options },
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
@@ -319,7 +307,7 @@ impl DpConfig {
     /// Refuses a deployment that cannot replicate tenant databases.
     ///
     /// Asked once at startup rather than discovered one tenant at a time. A
-    /// shard whose backend has no replication client would provision nodes,
+    /// data plane whose backend has no replication client would provision nodes,
     /// mint their device keys, get them named in customer zones, and then
     /// lose every one of them on its first reschedule — so the honest
     /// failure is to refuse to start (§5.3).
@@ -414,33 +402,6 @@ impl DpConfig {
     pub fn desired_key(&self) -> String {
         format!("dp/{}/desired.json", self.cache_id())
     }
-}
-
-/// Refuses a pod still configured for the sharding this no longer does.
-///
-/// Silence would be the dangerous answer. A deployment carrying
-/// `SYNCH_DP_SHARDS` was dividing the fleet's work by arithmetic each pod did
-/// for itself; this build divides it by what the control plane assigned this
-/// pod's token, which may be an entirely different set. Starting anyway would
-/// host that set correctly while the operator went on believing the old
-/// arithmetic held — and the two beliefs disagree most exactly where it hurts,
-/// on which pod owns which tenant's database stream.
-///
-/// Takes the lookup rather than reading the environment, so the rule can be
-/// stated in a test without a process-wide mutation racing every other test in
-/// the binary.
-fn refuse_retired_sharding(present: &dyn Fn(&str) -> bool) -> Result<()> {
-    for retired in ["SYNCH_DP_SHARD", "SYNCH_DP_SHARDS"] {
-        if present(retired) {
-            return Err(DpError::Config(format!(
-                "{retired} is no longer read: the control plane assigns \
-                 networks to data planes by name now. Register this pod with \
-                 `controlplane dataplane register <dp-id>`, mint its key with \
-                 `--dp <dp-id>`, and unset {retired}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Lowercase hex, for the cache key. `hex` is not a dependency of this crate
@@ -591,7 +552,6 @@ mod tests {
             control_url: "https://cp.example".into(),
             token: "synchdp_x".into(),
             base_dir: PathBuf::from("/run/synch-dp"),
-            shard_name: "dp".into(),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
                 service: "memory".into(),
@@ -611,7 +571,7 @@ mod tests {
     }
 
     /// The replication library speaks S3 and local files, and nothing else.
-    /// A backend it cannot write is a shard that would mint device keys, get
+    /// A backend it cannot write is a data plane that would mint device keys, get
     /// them named in customer zones, and lose them all on its first
     /// reschedule — so it has to be refused before any of that (§5.3).
     #[test]
@@ -653,29 +613,6 @@ mod tests {
         }
     }
 
-    /// A pod still configured for the old sharding is refused, and told what
-    /// to do instead.
-    ///
-    /// The alternative was ignoring the variables, and it is worse than it
-    /// looks: the pod would host exactly what the control plane assigned it
-    /// while its operator went on believing a shard count decided that — two
-    /// beliefs that disagree precisely about which pod owns which tenant's
-    /// database stream.
-    #[test]
-    fn a_pod_configured_for_the_old_sharding_is_refused() {
-        assert!(refuse_retired_sharding(&|_| false).is_ok());
-        for retired in ["SYNCH_DP_SHARD", "SYNCH_DP_SHARDS"] {
-            let error = refuse_retired_sharding(&|key| key == retired)
-                .expect_err("a retired setting must not be ignored");
-            let said = error.to_string();
-            assert!(said.contains(retired), "the refusal names it: {said}");
-            assert!(
-                said.contains("dataplane register"),
-                "and names the remedy: {said}"
-            );
-        }
-    }
-
     /// The fail-static cache is this data plane's alone, and it can be found
     /// before the control plane has been reached.
     ///
@@ -708,18 +645,18 @@ mod tests {
         config
     }
 
-    /// The two numbers that bound what a shard's peers can hold agree with
+    /// The two numbers that bound what a pod's peers can hold agree with
     /// each other at every size.
     ///
     /// This is the tenancy bound, not a tuning preference: a tenant's inbound
-    /// requests each occupy a blocking-pool thread, and if the shard's tenants
+    /// requests each occupy a blocking-pool thread, and if a pod's tenants
     /// can collectively ask for more threads than the pool has, one org's
     /// devices can make another org's tenant wait — which is the multi-tenant
     /// failure the ceiling exists to remove. Half the pool, so the work no
     /// peer asked for (the reconcile pass, the replication tickers, the
     /// heartbeats that are the billing record) always has somewhere to run.
     #[test]
-    fn a_shards_tenants_cannot_collectively_outbid_its_blocking_pool() {
+    fn a_pods_tenants_cannot_collectively_outbid_its_blocking_pool() {
         for max_tenants in [1u64, 4, 16, 64, 256, 1024, 4096] {
             let threads = default_blocking_threads(max_tenants);
             let each = default_max_inflight(threads, max_tenants);
@@ -728,7 +665,7 @@ mod tests {
                 "{max_tenants} tenants: {each} is at or below the per-connection \
                  stream cap, so one connection could wedge its own tenant"
             );
-            // The floor is allowed to win on a shard configured for more
+            // The floor is allowed to win on a pod configured for more
             // tenants than its pool can seat — see `default_max_inflight` for
             // why that floor is not negotiable — so the invariant is stated
             // where it can hold: wherever the share is what the arithmetic
@@ -747,7 +684,7 @@ mod tests {
 
     /// And a deployment that oversubscribes on purpose is told, not refused.
     #[test]
-    fn an_oversubscribed_shard_is_still_a_shard() {
+    fn an_oversubscribed_pod_still_runs() {
         // The clamp is what produces this: 4 096 tenants on 4 096 threads
         // cannot each have a floor's worth, and the honest answer is to run
         // anyway and say so rather than to refuse to boot over a ratio.
@@ -757,19 +694,8 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_budget_is_split_across_the_shards_capacity() {
+    fn the_cache_budget_is_split_across_the_pods_capacity() {
         let config = config();
         assert_eq!(config.cache_bytes_per_tenant(), 256);
-    }
-
-    #[test]
-    fn prefixes_are_keyed_by_network_not_by_shard() {
-        // §7.2: everything durable about a tenant survives a shard handover
-        // because no shard identity appears in any of these.
-        let a = config();
-        let b = config();
-        assert_eq!(a.cas_root("acme", "prod"), b.cas_root("acme", "prod"));
-        assert_eq!(a.db_prefix("acme", "prod"), b.db_prefix("acme", "prod"));
-        assert_eq!(a.tenant_dir("acme", "prod"), b.tenant_dir("acme", "prod"));
     }
 }

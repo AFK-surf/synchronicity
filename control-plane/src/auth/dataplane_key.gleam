@@ -25,7 +25,7 @@
 
 import auth/api_key.{nullable_int}
 import auth/principal.{type Principal, Dataplane, Principal}
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option}
 import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
@@ -137,7 +137,7 @@ pub fn authenticate(
          FROM dataplane_keys
          WHERE token_hash = ? AND (expires_at IS NULL OR expires_at > ?)"
       case sqlite.query(conn, sql, [Blob(hash), VInt(now)]) {
-        Ok([[Text(key_id), VInt(last_used), dp]]) -> {
+        Ok([[Text(key_id), VInt(last_used), Text(dp)]]) -> {
           case now - last_used > use_stamp_interval {
             True -> {
               let _ =
@@ -150,14 +150,6 @@ pub fn authenticate(
               Nil
             }
             False -> Nil
-          }
-          // A key minted before v14 names no data plane. It authenticates —
-          // refusing here would make an expired key and an unmigrated one the
-          // same error — and `/dp/v1` turns it away by name, with the remedy
-          // in the message.
-          let dp = case dp {
-            Text(dp_id) -> Some(dp_id)
-            _ -> None
           }
           Ok(Principal(system_user_id, Dataplane(key_id, dp)))
         }

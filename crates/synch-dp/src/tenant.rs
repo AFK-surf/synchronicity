@@ -343,7 +343,7 @@ impl Tenant {
             // socket ALPN for a peer to dial (§4.4).
             socket_workers: 0,
             // The slot label, never the pod's hostname — which would publish
-            // one name for every tenant on the shard.
+            // one name for every tenant on this data plane.
             name: slot_label(),
             // Never release a root no other member still holds: the service
             // must not be what turns "left the current tree" into "gone".
@@ -574,7 +574,7 @@ impl Tenant {
     ///
     /// The control plane computes this field carefully — only the `active`
     /// key is reported, and a fully revoked device reports none — and until
-    /// now nothing read it, so the shard could never notice that its
+    /// now nothing read it, so the data plane could never notice that its
     /// registration had been displaced. That is not hypothetical: the
     /// `cloud-<n>` label was reachable from customer-facing device routes,
     /// and a member who added their own key to the slot would leave this node
@@ -627,10 +627,10 @@ impl Tenant {
     }
 
     /// What this tenant holds, for the metering heartbeat (§3.3).
-    pub async fn status(&self, shard: &str) -> Result<Status> {
+    pub async fn status(&self, dp: &str) -> Result<Status> {
         let Some(node) = self.node.clone() else {
             return Ok(Status {
-                shard: shard.to_string(),
+                dp: dp.to_string(),
                 slot: SLOT,
                 ..Status::default()
             });
@@ -641,7 +641,7 @@ impl Tenant {
             held_bytes: coverage.held_bytes,
             wanted: coverage.wanted,
             last_sync_ns: coverage.last_sync_ns,
-            shard: shard.to_string(),
+            dp: dp.to_string(),
             slot: SLOT,
         })
     }
@@ -689,9 +689,9 @@ impl Tenant {
         &self.dir
     }
 
-    /// How much of the shard's volume this tenant's database occupies.
+    /// How much of this pod's volume this tenant's database occupies.
     ///
-    /// The one growth vector on a shard that nothing budgets, and therefore
+    /// The one growth vector on a data plane that nothing budgets, and therefore
     /// the one an operator has to be able to see. `budget_bytes` (§4.5) is an
     /// admission ceiling on *content* — the CAS, whose local footprint is
     /// separately capped by `cache_bytes_per_tenant` (§5.2) — and the CAS is

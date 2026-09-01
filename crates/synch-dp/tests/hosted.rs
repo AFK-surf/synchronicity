@@ -677,6 +677,7 @@ async fn a_stale_cache_never_authorizes_a_collection() {
     // a stale document can say, and the one it must not be believed about.
     let cached = serde_json::json!({
         "generation": 9,
+        "dp": DP,
         "networks": [],
         "collect": [{ "org": ORG, "network": NETWORK }],
     });

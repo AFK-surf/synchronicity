@@ -243,7 +243,7 @@ mod tests {
                 held_bytes: 3400,
                 wanted: 1,
                 last_sync_ns: 5,
-                shard: "dp-1".into(),
+                dp: "dp-1".into(),
                 slot: 1,
             },
         );

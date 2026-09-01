@@ -70,7 +70,7 @@ const default_retention = "current"
 /// The hosting slot a heartbeat is about when it does not say.
 ///
 /// v1 hosts every network once, in slot 1, so the hosted device is always
-/// `cloud-1` whichever shard happens to be running it (§3.4). The field is
+/// `cloud-1` whichever data plane happens to be running it (§3.4). The field is
 /// accepted anyway because redundant hosting is a second *slot* rather than a
 /// second anything else, and a heartbeat that could not name which one would
 /// have to be re-designed on the day that ships.
@@ -97,7 +97,7 @@ const retention_hold_seconds = 2_592_000
 /// `GET /dp/v1/networks` — every network of every org with hosting on.
 ///
 /// The whole of the fleet's steady-state traffic, so it carries an `ETag` and
-/// honours `If-None-Match`: one 304 per shard per poll interval is what this
+/// honours `If-None-Match`: one 304 per data plane per poll interval is what this
 /// costs when nothing has changed, which is almost always.
 ///
 /// **`generation` is the zone serial**, and the choice is worth stating
@@ -170,7 +170,7 @@ fn document(
 ) -> Response {
   // Assigned to *this* data plane, which since migration v14 is what decides
   // the fleet's division of labour. Two pods no longer derive overlapping
-  // answers from a shard count each read out of its own environment; each is
+  // answers from a fleet size each read out of its own environment; each is
   // told, and the telling is one column.
   //
   // A hosted network with no assignment appears in nobody's document. That is
@@ -796,7 +796,7 @@ pub fn retire_key(
               // registration to `unchanged` for exactly this reason, and the
               // reason is the same here. This serial is also the desired
               // document's `generation` and the first half of its `ETag`, so a
-              // republish per pass turns every shard's 304 into a full
+              // republish per pass turns every data plane's 304 into a full
               // document and re-signs the whole zone for nothing — and the
               // audit trail fills with retirements that did not happen.
               False, "retiring", _ ->
@@ -977,7 +977,7 @@ type Hold {
 /// `cloud_disabled_at` — the hosted devices were deleted a month ago, in the
 /// commit that stamped it — so the publish would re-sign and bump a
 /// deployment-wide serial for a fact the zone does not carry, making *every*
-/// shard refetch the document because one tenant's bucket was emptied. And
+/// data plane refetch the document because one tenant's bucket was emptied. And
 /// `zone_mutation` runs the publish through the transparency gate, which can
 /// hold a `Widening` back: a housekeeping call that could be refused because a
 /// ceremony step is outstanding is a call that would leave the fleet asking to
@@ -1159,11 +1159,18 @@ pub fn post_status(
     use held_bytes <- decode.field("held_bytes", decode.int)
     use wanted <- decode.field("wanted", decode.int)
     use last_sync_ns <- decode.field("last_sync_ns", decode.int)
-    use shard <- decode.field("shard", decode.string)
+    use dp_reported <- decode.field("dp", decode.string)
     use slot <- decode.optional_field("slot", default_slot, decode.int)
-    decode.success(#(held_roots, held_bytes, wanted, last_sync_ns, shard, slot))
+    decode.success(#(
+      held_roots,
+      held_bytes,
+      wanted,
+      last_sync_ns,
+      dp_reported,
+      slot,
+    ))
   }
-  use #(held_roots, held_bytes, wanted, last_sync_ns, shard, slot) <- body_decoder(
+  use #(held_roots, held_bytes, wanted, last_sync_ns, dp_reported, slot) <- body_decoder(
     req,
     decoder,
   )
@@ -1176,7 +1183,7 @@ pub fn post_status(
             conn,
             "INSERT INTO network_hosting_status
                (network_id, slot, held_roots, held_bytes, wanted,
-                last_sync_ns, shard, updated_at)
+                last_sync_ns, dp_id, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (network_id) DO UPDATE SET
                slot = excluded.slot,
@@ -1184,7 +1191,7 @@ pub fn post_status(
                held_bytes = excluded.held_bytes,
                wanted = excluded.wanted,
                last_sync_ns = excluded.last_sync_ns,
-               shard = excluded.shard,
+               dp_id = excluded.dp_id,
                updated_at = excluded.updated_at",
             [
               Text(network_id),
@@ -1193,7 +1200,7 @@ pub fn post_status(
               VInt(held_bytes),
               VInt(wanted),
               VInt(last_sync_ns),
-              Text(shard),
+              Text(dp_reported),
               VInt(now_unix()),
             ],
           )
@@ -1224,19 +1231,7 @@ pub fn post_status(
 /// would be a second, unaudited way into the reserved namespace.
 fn require_dataplane(who: Principal, next: fn(String) -> Response) -> Response {
   case who.credential {
-    principal.Dataplane(_, option.Some(dp)) -> next(dp)
-    // A key minted before migration v14 names no data plane, and a data plane
-    // with no name has no hosted set: every route below is scoped by it. The
-    // refusal names the remedy rather than saying "forbidden", because the
-    // operator reading it is upgrading a fleet and the fix is one command.
-    principal.Dataplane(_, option.None) ->
-      error_json(
-        409,
-        "dataplane_unnamed",
-        "this key names no data plane: mint one with "
-          <> "`controlplane dataplane-key mint <name> --dp <dp-id>` "
-          <> "and point this pod at it",
-      )
+    principal.Dataplane(_, dp) -> next(dp)
     _ ->
       error_json(
         403,

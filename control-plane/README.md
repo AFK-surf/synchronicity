@@ -308,9 +308,9 @@ place one can be created. That confinement is what bounds a leaked data-plane
 key: it can enumerate hosted networks and forge heartbeats, and its one write
 cannot displace or impersonate a customer's device.
 
-The suffix is the **slot**, not the shard. v1 hosts every network once, in slot
+The suffix is the **slot**, not the data plane. v1 hosts every network once, in slot
 1, so the device is always `cloud-1` whichever pod happens to be running it; a
-tenant moving between shards is no zone change at all. Redundant hosting, later,
+tenant moving between data planes is no zone change at all. Redundant hosting, later,
 is a second slot — `cloud-1` and `cloud-2` as two ordinary devices, because two
 replicas of one network is already something the protocol does.
 
@@ -505,7 +505,7 @@ does not apply here, because the `collect` list has its own component in the
 `ETag` and moves the tag by itself. Republishing would be worse than
 unnecessary: nothing in the zone depends on `cloud_disabled_at` (the hosted
 devices went a month earlier, in the commit that stamped it), so it would
-re-sign and bump a deployment-wide serial — making *every* shard refetch —
+re-sign and bump a deployment-wide serial — making *every* data plane refetch —
 because one tenant's bucket was emptied. It would also put a housekeeping call
 behind the transparency gate, where it could be held back and leave the fleet
 asked to collect the same prefix on every poll until a human noticed.

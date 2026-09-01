@@ -38,7 +38,7 @@ fn main() -> std::process::ExitCode {
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         // Every store touch of every tenant crosses this pool, serialized per
-        // tenant by that tenant's one connection (§7.1). Sized for the shard's
+        // tenant by that tenant's one connection (§7.1). Sized for this pod's
         // tenant capacity rather than left at the default.
         .max_blocking_threads(config.blocking_threads)
         .enable_all()
@@ -68,7 +68,7 @@ async fn run(config: DpConfig) -> synch_dp::Result<()> {
         "cloud data plane starting"
     );
     // Before anything provisions: a backend that cannot carry database
-    // streams is a shard that would lose every identity it creates (§5.3).
+    // streams is a data plane that would lose every identity it creates (§5.3).
     config.check_db_replication()?;
     let objects = ObjectStore::new(config.objects.operator()?);
     let control = ControlPlane::new(&config.control_url, &config.token)?;

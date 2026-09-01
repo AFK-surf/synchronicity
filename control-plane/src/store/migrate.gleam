@@ -68,16 +68,16 @@ fn migrations() -> List(String) {
 /// V14: data planes are named, and this service decides what each one hosts
 /// (docs/CLOUD-DATAPLANE.md §7.2).
 ///
-/// Until now no shard was named anywhere: every data plane was handed the
-/// same document and worked out its own share by rendezvous-hashing the
-/// network id against `SYNCH_DP_SHARDS`. That is elegant and it is wrong for
-/// this system, for one reason that no amount of hashing fixes — **two pods
-/// configured with different shard counts both believe they own a network,
-/// and nothing detects it.** They both open its database, both write its
-/// replica stream, and the loser's writes silently leave the only durable
-/// copy. The lock that would stop it is a `flock` on a data directory, which
-/// does not span pods. So the assignment moves here, where it is one row and
-/// two services cannot disagree about it.
+/// Which data plane hosts a network is a fact this service records, and the
+/// alternative worth naming is the one that looks cheaper: let each pod work
+/// its own share out by hashing the network id against a fleet size it reads
+/// from its own environment. That needs no rows and no coordination, and it
+/// has one failure no hashing fixes — **two pods that disagree about the
+/// fleet size both conclude they own a network, and nothing detects it.**
+/// They both open its database, both write its replica stream, and the
+/// loser's writes silently leave the only durable copy. The lock that would
+/// catch two writers is a `flock` on a data directory and does not span pods.
+/// One row here cannot be disagreed with.
 ///
 /// **`data_planes`** is the registry, and it exists so that "which data
 /// planes are there" is a question with an answer. Placement needs one — a
@@ -97,12 +97,15 @@ fn migrations() -> List(String) {
 /// misconfigured; it can only be copied, which is an operator deliberately
 /// sharing a secret rather than mistyping one.
 ///
-/// It is nullable because the column is added to rows that already exist. A
-/// key minted before this migration names no data plane, and `/dp/v1` refuses
-/// it by saying exactly that — fail-closed, and with the remedy in the
-/// message. Silently treating such a key as "sees everything" would have kept
-/// a fleet running through an upgrade by handing the oldest credential the
-/// widest scope.
+/// It is `NOT NULL`, and the table is rebuilt rather than altered to make it
+/// so. A key that names no data plane has no hosted set — every route on
+/// `/dp/v1` is scoped by it — so the column has no honest nullable state, and
+/// carrying one would mean a refusal arm in every handler for a row the
+/// schema should not permit. The keys that existed before this migration are
+/// dropped with it: there is no data plane to attribute them to, inventing
+/// one would be guessing at fleet topology, and the widest guess is the one
+/// an upgrade would most easily hide. An operator re-mints, which they must
+/// do anyway.
 ///
 /// **`networks.cloud_dp_id`** is the assignment. Nullable, and NULL is a real
 /// state rather than a gap: a network whose hosting is on but which no data
@@ -123,22 +126,56 @@ fn migrations() -> List(String) {
 /// describes. The queue outlives its network row on purpose (V13 says why),
 /// so it cannot look the owner up when the deletion falls due — and without
 /// an owner every data plane in the fleet would try to delete the same prefix
-/// on the same tick. Nullable for the same reason as the others: rows queued
-/// before this migration name no data plane, and an entry nobody owns is one
-/// nobody sweeps until an operator assigns it.
+/// on the same tick. `NOT NULL` for the reason the key column is: an entry
+/// nobody owns is an entry nobody sweeps, which is storage retained for ever
+/// with nothing left to say it should not be — the exact bug V13's queue
+/// exists to close.
+///
+/// **`network_hosting_status.shard` becomes `dp_id`.** The heartbeat's
+/// operational field named a pod that was interchangeable with every other
+/// one; it now names the data plane an assignment is filed against, which is
+/// the string an operator will search by. Renaming it is not tidiness — a
+/// column called `shard` invites the reader to look for a shard count.
+///
+/// **Nothing here preserves rows written before it**, and that is a
+/// deliberate reading of where this feature is rather than an oversight. The
+/// cloud data plane landed in V13, one release ago; there is no fleet in
+/// service to be compatible with, and paying for one in nullable columns and
+/// refusal arms would mean carrying the shape of a deployment that does not
+/// exist for as long as the schema does.
 const v14 = "
 CREATE TABLE data_planes (
   id         TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 64),
   created_at INTEGER NOT NULL
 );
 
-ALTER TABLE dataplane_keys ADD COLUMN dp_id TEXT REFERENCES data_planes(id);
+DROP TABLE dataplane_keys;
+CREATE TABLE dataplane_keys (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+  prefix       TEXT NOT NULL,
+  token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER,
+  dp_id        TEXT NOT NULL REFERENCES data_planes(id)
+);
 
 ALTER TABLE networks ADD COLUMN cloud_dp_id TEXT REFERENCES data_planes(id);
 CREATE INDEX networks_cloud_dp ON networks (cloud_dp_id)
   WHERE cloud_dp_id IS NOT NULL;
 
-ALTER TABLE cloud_collect_queue ADD COLUMN dp_id TEXT;
+DROP TABLE cloud_collect_queue;
+CREATE TABLE cloud_collect_queue (
+  org_slug     TEXT NOT NULL,
+  network_name TEXT NOT NULL,
+  disabled_at  INTEGER NOT NULL,
+  dp_id        TEXT NOT NULL,
+  PRIMARY KEY (org_slug, network_name)
+);
+CREATE INDEX cloud_collect_queue_due ON cloud_collect_queue (disabled_at);
+
+ALTER TABLE network_hosting_status RENAME COLUMN shard TO dp_id;
 "
 
 /// V12: Cue integration — the map from a Cue Workspace to its org.

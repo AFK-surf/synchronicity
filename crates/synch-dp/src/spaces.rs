@@ -2,9 +2,9 @@
 //!
 //! `docs/REPLICATION.md` makes a replica per-space and explicit; hosting is
 //! per-network and total. This module is the bridge: every space any origin
-//! publishes gets a replica, with the org's policy on it — up to
-//! [`MAX_REPLICATED_SPACES`], because "every space any origin publishes" is a
-//! number a member chooses and this is a shared process (§9.1).
+//! publishes gets a replica, with the org's policy on it — up to a ceiling,
+//! because "every space any origin publishes" is a number a member chooses
+//! and this pod is shared (§9.1).
 
 use synch_engine::Node;
 
@@ -26,24 +26,24 @@ pub struct Coverage {
 
 /// How many spaces this service will replicate for one tenant.
 ///
-/// A space is a plain string in the trie key that any member of the network
-/// may publish under (DESIGN §12), and this module's whole job is to turn each
-/// one it sees into a standing replica — which is a row that is written once
-/// and, by the rule below, never removed. So the number of spaces a member
-/// invents is the number of replicas this service creates, permanently, and
-/// the number of store queries every converge pass then makes: the coverage of
-/// each replica is read to re-derive the org's budget share. A member
-/// publishing one entry under each of a million space names costs itself
-/// almost nothing and makes its tenant's every pass a million queries long, on
-/// a store its own peers are already competing for, with the rows riding the
-/// replica stream to object storage for ever.
+/// A space is a plain string in the trie key that any member may publish
+/// under (DESIGN §12), so the number of them is a member's to choose — and
+/// this module's job is to turn each one into a standing replica, which is a
+/// row that rides the tenant's database to object storage and costs a
+/// coverage query on every converge pass. Unbounded, that is one network
+/// deciding how much of this pod every other network gets.
+///
+/// The ceiling is therefore about the pod, and only about the pod. **Which
+/// spaces land under it is not defended**: they arrive in whatever order the
+/// store returns them, so a member publishing thousands can take the
+/// allowance from its own org's real shares. That is a member degrading its
+/// own network, which is where DESIGN §12 leaves it — the org that holds the
+/// membership holds the remedy, and this service has no business ranking one
+/// of an org's own devices above another.
 ///
 /// Four thousand is three orders of magnitude past any real deployment — an
 /// org's spaces are its shares, and there are tens — so a tenant that reaches
-/// it is not a tenant with a lot of shares. The ceiling stops new replicas
-/// being *added*; everything already replicated goes on being replicated, and
-/// the refusal is loud, because a network at this ceiling has something wrong
-/// with it that an operator needs to see.
+/// it is not a tenant with a lot of shares, and the error-level log says so.
 const MAX_REPLICATED_SPACES: usize = 4096;
 
 /// Adds a replica for every space the network publishes.
@@ -56,15 +56,14 @@ const MAX_REPLICATED_SPACES: usize = 4096;
 /// holds no roots and costs nothing, while retention already shrinks what
 /// leaves the tree. Standing policies leave with the tenant, at teardown.
 ///
-/// That rule is also why [`MAX_REPLICATED_SPACES`] exists: what is never
-/// removed had better be bounded when a member chooses how much of it there
-/// is.
+/// That rule is also why the ceiling above exists: what is never removed had
+/// better be bounded when a member chooses how much of it there is.
 pub async fn ensure_replicas(node: &Node, network: &HostedNetwork) -> Result<()> {
     ensure_replicas_capped(node, network, MAX_REPLICATED_SPACES).await
 }
 
-/// [`ensure_replicas`] with the ceiling named, so a test can reach one without
-/// publishing four thousand spaces to get there.
+/// [`ensure_replicas`] with the ceiling named, so a test can reach one
+/// without publishing four thousand spaces to get there.
 async fn ensure_replicas_capped(
     node: &Node,
     network: &HostedNetwork,
@@ -77,11 +76,9 @@ async fn ensure_replicas_capped(
     synch_core::offload(move || {
         let spaces = node.store().known_spaces()?;
         let existing: Vec<synch_store::ReplicaRow> = node.store().replicas()?;
-        // Decided before the loop, and applied inside it as a stop rather than
+        // Decided before the loop and applied inside it as a stop rather than
         // as a filter over the result: a cap after the work is not a cap on
-        // the work (DESIGN §12). Past the ceiling the pass still converges the
-        // policy and budget of every replica that already exists — the
-        // customer's real spaces were the first ones seen — and adds none.
+        // the work (DESIGN §12).
         let room = ceiling.saturating_sub(existing.len());
         if spaces.len() > existing.len() + room {
             tracing::error!(
@@ -106,11 +103,11 @@ async fn ensure_replicas_capped(
                 .replica_coverage(&replica.holder(), UNREACHABLE_ATTEMPTS)?;
             held_elsewhere = held_elsewhere.saturating_add(coverage.held_bytes);
         }
-        // Indexed rather than scanned. The linear `find` this replaces made the
-        // pass quadratic in a number a member chooses — spaces on one side,
-        // replicas on the other — so a network with a great many of both spent
-        // the cost of *both* on every converge, before the ceiling above had
-        // anything to say about it.
+        // Indexed rather than scanned. The linear `find` this replaces made
+        // the pass quadratic in two numbers a member chooses — spaces on one
+        // side, replicas on the other — so a network with a great many of
+        // both spent the cost of *both* on every converge, before the ceiling
+        // above had anything to say about it.
         let by_space: std::collections::HashMap<&str, &synch_store::ReplicaRow> = existing
             .iter()
             .map(|replica| (replica.space.as_str(), replica))
@@ -203,17 +200,19 @@ mod tests {
     use super::*;
     use synch_engine::NodeConfig;
 
-    /// A member cannot make this service create replicas without end.
+    /// A member cannot publish its way past the ceiling.
     ///
     /// A space is a plain string any member may publish under, and this
     /// module turns each one into a standing replica that is never removed —
-    /// so without a ceiling the size of the replica table, the length of every
-    /// converge pass, and the size of the database riding the replica stream
-    /// are all a member's to choose. Both halves are asserted, because a
-    /// ceiling that also stopped the ordinary case would be worse than none:
-    /// the spaces under it are replicated, and only what is past it is not.
+    /// so without a ceiling the size of the replica table, the length of
+    /// every converge pass, and the size of the database riding the replica
+    /// stream are all a member's to choose, which is one network deciding how
+    /// much of this pod every other network gets. Both halves are asserted,
+    /// because a ceiling that also stopped the ordinary case would be worse
+    /// than none: the spaces under it are replicated, and only what is past
+    /// it is not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_member_cannot_publish_its_way_past_the_replica_ceiling() {
+    async fn a_member_cannot_publish_its_way_past_the_ceiling() {
         let _blocking = synch_core::BlockingScope::enter();
         let base = tempfile::tempdir().expect("a base dir");
         let dir = base.path().join("node");
@@ -277,7 +276,8 @@ mod tests {
         assert_eq!(replicas(node.clone()).await, 2);
 
         // Raised, the spaces that were held back are taken on — the ceiling
-        // is a bound, not a decision that those spaces are unwanted.
+        // is a bound on what this pod carries, not a decision that those
+        // spaces are unwanted.
         ensure_replicas_capped(&node, &network, 8)
             .await
             .expect("the third pass runs");

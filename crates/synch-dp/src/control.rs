@@ -143,27 +143,22 @@ pub struct Desired {
     pub generation: u64,
     /// The data plane the control plane resolved this token to.
     ///
-    /// This service's own name, told to it by the authority rather than
+    /// This pod's own name, told to it by the authority rather than
     /// configured into it. Assignment lives in the control plane
     /// (`docs/CLOUD-DATAPLANE.md` §7.2), so the name a network is filed
     /// against is the control plane's to state — and a pod that read its own
     /// name out of its environment could disagree with the row that decides
-    /// what it hosts, which is the whole failure the assignment removed.
+    /// what it hosts, which is the disagreement the assignment removes.
     ///
-    /// Defaulted, like `collect`, so this build still runs against a control
-    /// plane that predates the change: it then falls back to
-    /// `SYNCH_DP_SHARD_NAME` for the heartbeat and logs, and hosts whatever
-    /// the document lists.
-    #[serde(default)]
-    pub dp: Option<String>,
+    /// A document that did not say which data plane it was for would be a
+    /// set of tenants this pod could not name itself the owner of, and the
+    /// heartbeat it sends is the billing record.
+    pub dp: String,
     /// Every network with cloud hosting enabled.
     pub networks: Vec<HostedNetwork>,
-    /// Offboarded networks whose stored copy is now due for deletion.
-    ///
-    /// Defaulted rather than required, so a data plane still runs against a
-    /// control plane that predates collection — it hosts and replicates
-    /// correctly and simply collects nothing, which is the safe direction.
-    #[serde(default)]
+    /// Offboarded networks whose stored copy is now due for deletion, for
+    /// this data plane (§6). Empty on most polls, and empty is a statement:
+    /// nothing of this pod's is due.
     pub collect: Vec<Collectable>,
 }
 
@@ -335,9 +330,9 @@ pub struct Status {
     pub wanted: u64,
     /// When this tenant last completed a sync round.
     pub last_sync_ns: i64,
-    /// Which shard is serving the slot. Operational metadata, never in the
-    /// zone — a slot is durable, a shard is a pod (§3.4).
-    pub shard: String,
+    /// Which data plane is serving the slot. Operational metadata, never in
+    /// the zone — a slot is durable, a data plane is a pod (§3.4).
+    pub dp: String,
     /// The hosting slot this report is for.
     pub slot: u32,
 }
@@ -352,6 +347,7 @@ mod tests {
     fn the_desired_document_parses() {
         let json = serde_json::json!({
             "generation": 4183,
+            "dp": "dp-1",
             "networks": [
                 { "org": "acme", "network": "prod",
                   "domain": "prod.acme.synchronicity.example",
@@ -360,10 +356,14 @@ mod tests {
                   "device": { "label": "cloud-1", "nk": "abc", "state": "active" } },
                 { "org": "beta", "network": "dev",
                   "domain": "dev.beta.synchronicity.example" }
-            ]
+            ],
+            "collect": []
         });
         let desired: Desired = serde_json::from_value(json).unwrap();
         assert_eq!(desired.generation, 4183);
+        // The document says which data plane it is for, and this pod takes
+        // its own name from it rather than from its own configuration (§7.2).
+        assert_eq!(desired.dp, "dp-1");
         assert_eq!(desired.networks[0].key(), "acme/prod");
         assert_eq!(
             desired.networks[0].replica_policy(),

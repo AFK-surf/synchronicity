@@ -22,7 +22,7 @@ pub struct Reconciler {
     objects: ObjectStore,
     resolver: Option<Arc<synch_net::DnssecResolver>>,
     tenants: HashMap<String, Tenant>,
-    /// What this shard knows about each network's recent failures: how many,
+    /// What this pod knows about each network's recent failures: how many,
     /// and when it may next be tried.
     ///
     /// An entry outlives the failure that made it, and has to. The escalation
@@ -34,17 +34,16 @@ pub struct Reconciler {
     /// is a memory, and it is bounded by the desired set because
     /// `parked.retain` prunes to it every pass.
     parked: HashMap<String, Parked>,
-    /// Consecutive fresh polls that have answered "nothing on this shard".
+    /// Consecutive fresh polls that have answered "nothing for this data plane".
     empty_answers: u32,
     etag: Option<String>,
-    /// The name the control plane last answered with.
+    /// The name the control plane last answered with, once it has.
     ///
-    /// Logged when it changes, and used for the metering heartbeat's `shard`
-    /// field, so the billing record carries the id the assignment is actually
-    /// written against rather than a string this pod's environment chose
-    /// separately. `None` until the first successful poll, and against a
-    /// control plane that predates the assignment work.
-    dp: Option<String>,
+    /// Kept only so the log line fires on a change rather than every pass:
+    /// what a tick *acts* on is the name in the document it just read, never
+    /// this. `None` before the first answer, which is a pod that does not yet
+    /// know its own name — not a pod that has to guess one.
+    logged_dp: Option<String>,
     /// The last document this shard successfully acted on.
     ///
     /// In memory, and consulted before the bucket: a `304 Not Modified` means
@@ -207,7 +206,7 @@ impl Reconciler {
             objects,
             resolver,
             tenants: HashMap::new(),
-            dp: None,
+            logged_dp: None,
             parked: HashMap::new(),
             empty_answers: 0,
             etag: None,
@@ -251,17 +250,28 @@ impl Reconciler {
 
     /// One pass: poll, diff, converge, report.
     pub async fn tick(&mut self) -> Result<()> {
-        let (desired, fresh) = self.desired().await?;
+        let Some((desired, fresh)) = self.desired().await? else {
+            // A first boot that has reached neither the control plane nor its
+            // own cache. It does not know which networks to host, and it does
+            // not know its own name either — so there is nothing to converge
+            // and nothing to report, and saying so is better than acting on a
+            // stand-in empty document that names no data plane.
+            tracing::warn!(
+                "no desired state yet: the control plane has not answered and \
+                 this pod has no cached document to fall back on"
+            );
+            self.metrics.poll_failed();
+            return Ok(());
+        };
         self.metrics.observed_generation(desired.generation);
         // Said once per change rather than per pass. A pod that hosts nothing
-        // needs to be able to answer "which data plane am I?", and until the
-        // control plane names it the honest answer is that nobody has.
-        if desired.dp.is_some() && desired.dp != self.dp {
-            if let Some(dp) = &desired.dp {
-                tracing::info!(%dp, "this pod is data plane");
-            }
-            self.dp = desired.dp.clone();
+        // needs to be able to answer "which data plane am I?", and this is
+        // where it learns.
+        if self.logged_dp.as_deref() != Some(desired.dp.as_str()) {
+            tracing::info!(dp = %desired.dp, "this pod is data plane");
+            self.logged_dp = Some(desired.dp.clone());
         }
+        let dp = desired.dp.clone();
 
         // Names first, before anything derives a path or a delete prefix from
         // them. A refused entry is dropped rather than fatal: one malformed
@@ -486,7 +496,7 @@ impl Reconciler {
                 "holding collections until the control plane answers again"
             );
         }
-        self.report().await;
+        self.report(&dp).await;
         self.metrics.tenants(self.tenants.len(), self.waiting());
         Ok(())
     }
@@ -633,16 +643,6 @@ impl Reconciler {
         }
     }
 
-    /// The name this pod reports itself under.
-    ///
-    /// The control plane's answer when there is one, because that is the id
-    /// the assignment is filed against and the one an operator will search
-    /// for. `SYNCH_DP_SHARD_NAME` is the fallback for a control plane that
-    /// predates the assignment work.
-    fn reported_name(&self) -> &str {
-        self.dp.as_deref().unwrap_or(&self.config.shard_name)
-    }
-
     /// Sends each tenant's heartbeat.
     ///
     /// Concurrently, and under a deadline apiece. The heartbeat is the billing
@@ -650,8 +650,7 @@ impl Reconciler {
     /// sequential sweep hands one tenant's peers the ability to stop every
     /// other tenant on the shard being metered: hold the store of the first
     /// tenant in map order and nothing behind it is ever reported.
-    async fn report(&self) {
-        let name = self.reported_name();
+    async fn report(&self, dp: &str) {
         let (tenants, control, metrics) = (&self.tenants, &self.control, &self.metrics);
         join_all(
             tenants
@@ -664,7 +663,7 @@ impl Reconciler {
                     // volume is exactly the one whose store is too busy to
                     // answer a coverage query.
                     metrics.tenant_db_bytes(key, tenant.db_bytes());
-                    let measured = under_deadline(key, "status", tenant.status(name)).await;
+                    let measured = under_deadline(key, "status", tenant.status(dp)).await;
                     match measured {
                         Some(Ok(status)) => {
                             metrics.tenant_status(key, &status);
@@ -700,13 +699,13 @@ impl Reconciler {
     /// control-plane outage would otherwise boot knowing nothing and host
     /// nothing. What this cannot cover is a *first* boot with neither: there
     /// is no known set to serve, and that cold start waits.
-    async fn desired(&mut self) -> Result<(Desired, bool)> {
+    async fn desired(&mut self) -> Result<Option<(Desired, bool)>> {
         match self.control.poll(self.etag.as_deref()).await {
             // The control plane answered, and said "what you already have".
             // That is a fresh answer about a document we are holding.
             Ok(Poll::Unchanged) => match self.last.clone() {
-                Some(desired) => Ok((desired, true)),
-                None => self.cached().await.map(|desired| (desired, false)),
+                Some(desired) => Ok(Some((desired, true))),
+                None => Ok(self.cached().await?.map(|desired| (desired, false))),
             },
             Ok(Poll::Changed { desired, etag }) => {
                 self.etag = etag;
@@ -720,32 +719,34 @@ impl Reconciler {
                     }
                     Err(error) => tracing::warn!(%error, "could not encode the desired state"),
                 }
-                Ok((desired, true))
+                Ok(Some((desired, true)))
             }
             Err(error) => {
                 tracing::warn!(%error, "control plane unreachable; holding the current set");
                 self.metrics.poll_failed();
                 match self.last.clone() {
-                    Some(desired) => Ok((desired, false)),
-                    None => self.cached().await.map(|desired| (desired, false)),
+                    Some(desired) => Ok(Some((desired, false))),
+                    None => Ok(self.cached().await?.map(|desired| (desired, false))),
                 }
             }
         }
     }
 
-    /// The last document this shard successfully acted on.
-    async fn cached(&self) -> Result<Desired> {
+    /// The last document this pod successfully acted on, if it has one.
+    ///
+    /// `None` is the cold start with nothing: no cache object, and — since
+    /// this is only reached when the control plane did not answer — no
+    /// document at all. There is deliberately no empty stand-in for that. A
+    /// document is what tells this pod which data plane it is, so one
+    /// manufactured here would name none, and an empty tenant set is a claim
+    /// ("host nothing") rather than the absence of one.
+    async fn cached(&self) -> Result<Option<Desired>> {
         let key = self.config.desired_key();
         match self.objects.get_if_present(&key).await? {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            Some(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
                 crate::error::DpError::Control(format!("unreadable cached desired state: {error}"))
             }),
-            None => Ok(Desired {
-                generation: 0,
-                dp: None,
-                networks: Vec::new(),
-                collect: Vec::new(),
-            }),
+            None => Ok(None),
         }
     }
 }
@@ -762,7 +763,7 @@ mod tests {
         let config = test_config();
         let desired = Desired {
             generation: 7,
-            dp: Some("dp-1".into()),
+            dp: "dp-1".into(),
             collect: Vec::new(),
             networks: vec![HostedNetwork {
                 org: "acme".into(),
@@ -788,13 +789,19 @@ mod tests {
             Arc::new(Metrics::default()),
         );
         let cached = reconciler.cached().await.unwrap();
-        assert_eq!(cached, desired);
+        assert_eq!(cached, Some(desired));
     }
 
-    /// An empty bucket and no control plane is the one case fail-static cannot
-    /// cover, and it must be an empty set rather than an error.
+    /// An empty bucket and no control plane is the one case fail-static
+    /// cannot cover, and it answers "nothing known" rather than "host
+    /// nothing".
+    ///
+    /// The distinction is the point. An empty document is a *claim* — it says
+    /// this pod should be running no tenants, which is what the wholesale-
+    /// emptying guard exists to be careful about — and it would also have to
+    /// name a data plane, which a pod that has spoken to nobody cannot do.
     #[tokio::test]
-    async fn a_cold_start_with_no_cache_hosts_nothing() {
+    async fn a_cold_start_with_no_cache_knows_nothing() {
         let reconciler = Reconciler::new(
             test_config(),
             ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
@@ -802,8 +809,7 @@ mod tests {
             None,
             Arc::new(Metrics::default()),
         );
-        let cached = reconciler.cached().await.unwrap();
-        assert!(cached.networks.is_empty());
+        assert!(reconciler.cached().await.unwrap().is_none());
     }
 
     /// The fail-static promise, exercised through the real entry point
@@ -815,7 +821,7 @@ mod tests {
         let config = test_config();
         let cached = Desired {
             generation: 7,
-            dp: Some("dp-1".into()),
+            dp: "dp-1".into(),
             collect: Vec::new(),
             networks: vec![HostedNetwork {
                 org: "acme".into(),
@@ -838,7 +844,7 @@ mod tests {
             None,
             Arc::new(Metrics::default()),
         );
-        let (desired, fresh) = reconciler.desired().await.unwrap();
+        let (desired, fresh) = reconciler.desired().await.unwrap().expect("a cached set");
         assert_eq!(desired, cached, "the cached set is what a failed poll sees");
         assert!(
             !fresh,
@@ -980,39 +986,6 @@ mod tests {
         assert_eq!(Parked::after(Some(stale)).failures, 1);
     }
 
-    /// A pod reports itself under the name the control plane gave it.
-    ///
-    /// Assignment lives in the control plane now, so the name a network is
-    /// filed against is the control plane's to state — and the heartbeat is
-    /// the billing record, which had better carry the same string an operator
-    /// will search the assignment by. A pod that named itself out of its own
-    /// environment could disagree with the row that decides what it hosts,
-    /// which is the disagreement the whole change removes.
-    ///
-    /// The configured name survives as the fallback, for the boot before the
-    /// first successful poll and for a control plane older than this.
-    #[tokio::test]
-    async fn a_pod_reports_the_name_the_control_plane_gave_it() {
-        let mut reconciler = Reconciler::new(
-            test_config(),
-            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
-            ObjectStore::memory().unwrap(),
-            None,
-            Arc::new(Metrics::default()),
-        );
-        assert_eq!(
-            reconciler.reported_name(),
-            "dp-1",
-            "before the first answer, what this pod was configured with"
-        );
-        reconciler.dp = Some("dp-7".into());
-        assert_eq!(
-            reconciler.reported_name(),
-            "dp-7",
-            "and afterwards, what the authority calls it"
-        );
-    }
-
     /// A remembered failure is not a tenant that is down.
     ///
     /// The two are one map, because the backoff has to escalate across a
@@ -1053,7 +1026,6 @@ mod tests {
             control_url: "http://127.0.0.1:1".into(),
             token: "synchdp_x".into(),
             base_dir: std::path::PathBuf::from("/tmp/synch-dp-test"),
-            shard_name: "dp-1".into(),
             poll_interval: std::time::Duration::from_secs(60),
             objects: crate::config::ObjectConfig {
                 service: "memory".into(),

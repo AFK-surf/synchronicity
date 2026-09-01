@@ -23,8 +23,6 @@
 //// `actor` is who *made* the request. For a person they are the same string.
 //// For a key they are not, and the audit trail wants the second.
 
-import gleam/option.{type Option}
-
 pub type Principal {
   Principal(
     /// The user the rows this request writes are attributed to — the
@@ -80,11 +78,10 @@ pub type Credential {
   /// handler so that no route can forget to scope itself — the value is
   /// simply there, and a handler that needs it takes it.
   ///
-  /// `None` is a key minted before v14. It authenticates, and `/dp/v1`
-  /// refuses it by name: a credential that names no data plane cannot be
-  /// given one by guessing, and the widest guess is the one an upgrade would
-  /// most easily hide.
-  Dataplane(key_id: String, dp: Option(String))
+  /// Not optional, because a credential that named no data plane would have
+  /// no hosted set at all: every route on `/dp/v1` is scoped by this. The
+  /// column it comes from is `NOT NULL` for the same reason.
+  Dataplane(key_id: String, dp: String)
 }
 
 /// What the audit trail records as the actor.

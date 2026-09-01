@@ -261,7 +261,7 @@ It runs on pods with no durable disk, so it replicates each tenant's SQLite
 database to the bucket itself — Litestream's LTX format via the `celld-ltx`
 library, driven in-process rather than by a sidecar — and restores it on every
 reschedule. Everything durable about a tenant is keyed by network rather than
-by pod, so a rescheduled shard resumes the same identities with no zone change
+by pod, so a rescheduled data plane resumes the same identities with no zone change
 at all. Those streams carry device secret keys, so give the bucket encryption
 at rest and do not grant the `db/` prefix more widely than the `tenants/` one.
 
