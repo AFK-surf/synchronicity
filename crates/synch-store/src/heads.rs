@@ -199,6 +199,71 @@ impl Store {
         Ok(out)
     }
 
+    /// The origin of some head this node cannot yet materialize, if any.
+    ///
+    /// `Node::view_state`'s first question, asked per `replica ls` and per
+    /// status poll. It only ever needed one row, and reaching it through
+    /// [`Store::all_heads`] built every pending head — a `head_history` join
+    /// and a signature parsed apiece — to look at the first
+    /// (`docs/CLOUD-DATAPLANE.md` §7.1a).
+    ///
+    /// Reading `heads` alone is also the honest form of the question, and in
+    /// the one direction it must not fail in. A pending row means this node
+    /// holds no trie for that origin, whatever state the row is in; but
+    /// `all_heads` skips a row whose signature will not parse, and its join
+    /// drops one whose `head_history` row has gone. Both used to read as
+    /// "nothing pending", which reports a view as complete that is not.
+    pub fn pending_head_origin(&self) -> Result<Option<OriginId>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT origin_id FROM heads WHERE slot = 'pending' ORDER BY origin_id LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|origin| {
+            origin
+                .parse()
+                .map_err(|_| StoreError::column("heads.origin_id", "unparseable origin"))
+        })
+        .transpose()
+    }
+
+    /// A bound origin, other than `own`, whose complete trie this node does not
+    /// hold — if there is one.
+    ///
+    /// `Node::view_state`'s second question, and the expensive half of it: it
+    /// materialized every binding and then asked [`Store::complete_head`] per
+    /// row, so ten thousand bindings meant ten thousand point reads, each
+    /// joining `head_history` and parsing a signature, to establish that the
+    /// answer was `None` (`docs/CLOUD-DATAPLANE.md` §7.1a). The `NOT EXISTS`
+    /// seeks `heads`' primary key, and stops at the first origin that fails.
+    ///
+    /// Every binding is considered, live or expired, exactly as before. An
+    /// expired row is a trust decision that has lapsed but not yet been swept
+    /// — `expire_bindings` deletes it on the next maintenance pass — and
+    /// treating it as absent here would report the view complete in the window
+    /// between the lapse and the sweep.
+    pub fn bound_origin_without_complete_head(&self, own: &OriginId) -> Result<Option<OriginId>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT b.origin_id FROM bindings b
+             WHERE b.origin_id <> ?1
+               AND NOT EXISTS (SELECT 1 FROM heads h
+                               WHERE h.origin_id = b.origin_id AND h.slot = 'complete')
+             ORDER BY b.origin_id LIMIT 1",
+            params![own.canonical()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|origin| {
+            origin
+                .parse()
+                .map_err(|_| StoreError::column("bindings.origin_id", "unparseable origin"))
+        })
+        .transpose()
+    }
+
     /// Every slot for every origin.
     ///
     /// A row that will not build is skipped, not propagated. This is the bulk
@@ -1077,7 +1142,7 @@ mod tests {
     use synch_core::{Hash, OriginId};
 
     use super::*;
-    use crate::testutil::{origin, sign_head, store};
+    use crate::testutil::{origin, origin_named, sign_head, store};
 
     /// The pruning pre-filter never hides an origin that had a row to lose.
     ///
@@ -1351,6 +1416,165 @@ mod tests {
             found.unreadable,
             [broken.canonical()],
             "and the unreadable one is named rather than propagated or dropped"
+        );
+    }
+
+    /// A binding with no head, and a plain one, so the anti-join has both.
+    fn bind(store: &Store, origin: &OriginId, expires_at: Option<i64>) {
+        store
+            .put_binding(&crate::Binding {
+                origin: origin.clone(),
+                node_id: SecretKey::generate().public(),
+                source: crate::BindingSource::Dns,
+                domain: Some("x.example".to_string()),
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at,
+            })
+            .unwrap();
+    }
+
+    /// The indexed answer is the one the listing-and-looking loop gave.
+    ///
+    /// `Node::view_state` used to materialize every binding and ask
+    /// `complete_head` per row. The rewrite has to agree with that everywhere,
+    /// not merely on the empty case that a replica in good health is in — so
+    /// the old loop is written out here and the two are held against each
+    /// other over a table with every shape in it: an origin with a complete
+    /// head, one with only a pending head, one with no head at all, one bound
+    /// twice, and this node's own origin, which is exempt.
+    #[test]
+    fn the_bound_origin_without_a_head_is_the_one_the_loop_found() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let own = origin_named("self");
+
+        // `synced` has a complete head; `pending-only` has a head this node
+        // cannot materialize; `never` and `also-never` have none. `own` has
+        // none either, and must be skipped for being this node's own.
+        let synced = origin_named("synced");
+        store
+            .put_head(
+                Slot::Complete,
+                &SignedHead::sign(&key, synced.clone(), 1, Hash::EMPTY, 0),
+                0,
+                0,
+            )
+            .unwrap();
+        let pending_only = origin_named("pending-only");
+        store
+            .put_head(
+                Slot::Pending,
+                &SignedHead::sign(&key, pending_only.clone(), 1, Hash::new(b"p"), 0),
+                0,
+                0,
+            )
+            .unwrap();
+        let never = origin_named("never");
+        let also_never = origin_named("also-never");
+        for o in [&own, &synced, &pending_only, &never, &also_never] {
+            bind(&store, o, None);
+        }
+        // Bound twice, which is ordinary: one origin, two device keys.
+        bind(&store, &never, Some(i64::MAX));
+
+        // The loop this replaced, verbatim in shape.
+        let by_loop = |own: &OriginId| -> Option<OriginId> {
+            store
+                .bindings()
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.origin != *own)
+                .find(|b| store.complete_head(&b.origin).unwrap().is_none())
+                .map(|b| b.origin)
+        };
+
+        // `also-never` sorts first of the two that qualify, and a pending head
+        // is not a complete one, so `pending-only` qualifies as well.
+        let found = store.bound_origin_without_complete_head(&own).unwrap();
+        assert_eq!(found, Some(also_never.clone()));
+        assert_eq!(found, by_loop(&own), "the index and the loop must agree");
+
+        // Give every qualifying origin a complete head and the answer goes to
+        // `None` — which reports the view complete, so it has to be reached
+        // only when it is true.
+        for o in [&also_never, &never, &pending_only] {
+            store
+                .put_head(
+                    Slot::Complete,
+                    &SignedHead::sign(&key, o.clone(), 1, Hash::EMPTY, 0),
+                    0,
+                    0,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.bound_origin_without_complete_head(&own).unwrap(),
+            None
+        );
+        assert_eq!(by_loop(&own), None);
+
+        // The exemption is for this node's own origin and nothing else: ask as
+        // some other node and `self` is just another bound origin with no head.
+        let elsewhere = origin_named("elsewhere");
+        assert_eq!(
+            store
+                .bound_origin_without_complete_head(&elsewhere)
+                .unwrap(),
+            Some(own.clone())
+        );
+        assert_eq!(by_loop(&elsewhere), Some(own));
+    }
+
+    /// A pending head is reported however damaged its row is.
+    ///
+    /// This is the direction the question must not fail in: a pending slot
+    /// means this node holds no trie for that origin, and answering "nothing
+    /// pending" reports a view as complete that is not. `all_heads` — which
+    /// `view_state` used to ask — skips a row whose signature will not parse
+    /// and joins away one whose `head_history` row has gone, so both read as
+    /// nothing pending. Reading `heads` alone is why they no longer do.
+    #[test]
+    fn a_pending_head_is_reported_even_when_its_row_will_not_build() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        assert_eq!(store.pending_head_origin().unwrap(), None);
+
+        // A complete head is not a pending one.
+        store
+            .put_head(
+                Slot::Complete,
+                &SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0),
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.pending_head_origin().unwrap(), None);
+
+        let stuck = origin_named("stuck");
+        let head = SignedHead::sign(&key, stuck.clone(), 1, Hash::new(b"p"), 0);
+        store.put_head(Slot::Pending, &head, 0, 0).unwrap();
+        assert_eq!(store.pending_head_origin().unwrap(), Some(stuck.clone()));
+
+        // The history row this slot points at, gone — a repair case, and the
+        // one `all_heads`' join silently drops.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM head_history WHERE origin_id = ?1",
+                rusqlite::params![stuck.canonical()],
+            )
+            .unwrap();
+        assert!(
+            store.all_heads(Slot::Pending).unwrap().is_empty(),
+            "the listing loses it, which is the reason this query does not use it"
+        );
+        assert_eq!(
+            store.pending_head_origin().unwrap(),
+            Some(stuck),
+            "the slot is still occupied, so the view is still incomplete"
         );
     }
 }

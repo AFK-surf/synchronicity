@@ -422,14 +422,34 @@ impl Store {
                                  WHERE p.root = content_want.root AND p.holder = ?1)",
                 params![holder.render()],
             )?;
+            // `GROUP BY e.content` rather than `SELECT DISTINCT`, and the
+            // already-wanted rows excluded rather than left to the conflict
+            // clause. Both are about the pass that stages nothing, which is
+            // every pass after the first: this runs on the standing loop's
+            // every sweep, and a replica of ten thousand nodes has two hundred
+            // thousand entries to re-derive the same want set from
+            // (`docs/CLOUD-DATAPLANE.md` §7.1a).
+            //
+            // `DISTINCT` ranged over `(content, size, prev)` — the whole
+            // projected row — so it could not be answered from
+            // `entries_by_space_content`'s ordering and built a temporary
+            // B-tree over every entry instead. Grouping by the column the
+            // uniqueness is actually about lets the ordered scan answer it.
+            // `size` and `prev` are then read from an arbitrary row of each
+            // group, which is what `DISTINCT` plus `DO NOTHING` already did
+            // with them: `size` is fixed by the content hash, and `prev` is a
+            // delta-descent hint whose two candidates are equally good.
             Ok(tx.execute(
                 "INSERT INTO content_want (root, holder, size, prev, first_wanted)
-                 SELECT DISTINCT e.content, ?2, e.size, e.prev, ?3
+                 SELECT e.content, ?2, e.size, e.prev, ?3
                    FROM entries e
                   WHERE e.space = ?1
                     AND e.content IS NOT NULL
                     AND NOT EXISTS (SELECT 1 FROM pins p
                                      WHERE p.root = e.content AND p.holder = ?2)
+                    AND NOT EXISTS (SELECT 1 FROM content_want w
+                                     WHERE w.root = e.content AND w.holder = ?2)
+                  GROUP BY e.content
                  ON CONFLICT(root, holder) DO NOTHING",
                 params![space, holder.render(), now],
             )?)
@@ -954,6 +974,62 @@ mod tests {
         assert_eq!(wants.len(), 1);
         assert_eq!(wants[0].root, missing);
         assert_eq!(wants[0].size, 9);
+    }
+
+    /// One want per root, and nothing restaged on a pass that has nothing to do.
+    ///
+    /// This is the behaviour the staging query's rewrite had to preserve, not a
+    /// test that tells the two versions apart — both give these answers, which
+    /// is the point of writing it down. The rewrite groups by `content` where
+    /// it used to `SELECT DISTINCT` the whole projected row, so what it pins is
+    /// the two ways that row could vary while naming the same object: several
+    /// paths, several origins, and a differing `prev`. Grouping must still
+    /// yield exactly one want — and the second pass, which is every pass the
+    /// standing loop actually runs, must stage nothing and leave the first
+    /// pass's row untouched.
+    #[test]
+    fn one_root_named_many_ways_stages_one_want_and_restages_none() {
+        let (_dir, store) = store();
+        let shared = synch_core::Hash::new(b"shared");
+        let mut first = synch_core::FileEntry::file(11, 1, shared, 1);
+        first.prev = Some(synch_core::Hash::new(b"older"));
+        let mut second = synch_core::FileEntry::file(11, 1, shared, 1);
+        second.prev = Some(synch_core::Hash::new(b"different"));
+        let third = synch_core::FileEntry::file(11, 1, shared, 1);
+
+        // The same content at two paths under one origin, and again under
+        // another — each with a different idea of what preceded it.
+        store
+            .put_entry(&origin(), "media", "a.bin", &first)
+            .unwrap();
+        store
+            .put_entry(&origin(), "media", "b.bin", &second)
+            .unwrap();
+        store
+            .put_entry(&origin_named("other"), "media", "c.bin", &third)
+            .unwrap();
+
+        assert_eq!(
+            store.stage_space_wants("media", &media(), 5).unwrap(),
+            1,
+            "three entries naming one root are one want"
+        );
+        let wants = store.wants_of(&media()).unwrap();
+        assert_eq!(wants.len(), 1);
+        assert_eq!(wants[0].root, shared);
+        assert_eq!(wants[0].size, 11);
+        assert_eq!(wants[0].first_wanted, 5);
+
+        // A second pass has nothing to stage, and must not touch the row it
+        // finds: `first_wanted` is what the fetch loop ages a backlog by, so
+        // restaging would keep it perpetually new.
+        assert_eq!(store.stage_space_wants("media", &media(), 9).unwrap(), 0);
+        let wants = store.wants_of(&media()).unwrap();
+        assert_eq!(wants.len(), 1);
+        assert_eq!(
+            wants[0].first_wanted, 5,
+            "the second pass must not restamp the first pass's want"
+        );
     }
 
     #[test]

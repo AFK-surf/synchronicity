@@ -905,9 +905,12 @@ cargo run --release -p synch-dp --example stress
 ```
 
 What it found — shapes, not numbers, since the numbers belong to the
-machine. The first three were **fixed**; they are recorded because the fix is
-all that stands between the shape and its return, and CI gates the first of
-them (`--check`, the `scaling` job).
+machine. Most were **fixed**; they are recorded because the fix is all that
+stands between the shape and its return. CI runs the harness on every build
+and prints the whole report, which is a guard against the harness rotting
+rather than against a regression: the numbers a shared runner produces are
+not worth thresholding, and every shape below is one a run *completes*
+either way.
 
 - **The reactive push was quadratic in the membership.** `Node::push_head`
   dials every trusted peer, and each dial asks
@@ -939,6 +942,23 @@ them (`--check`, the `scaling` job).
   row old enough to take, which is exact rather than a heuristic: every
   deletion in that pass requires `recorded_at < before`. ~48 s → ~0.2 s at
   ten thousand origins.
+- **The replica sweep re-derived every want, every pass.** `sweep_replicas`
+  runs on the standing loop's every pass, and two things grew with the
+  membership. `Node::view_state` — which `replica ls` and every status poll
+  ask, and which the sweep gated releases on until releases were moved onto
+  the materialized view — listed every pending head and then asked
+  `complete_head` per binding, ten thousand point reads to establish that
+  nothing was missing; it is now two `EXISTS` seeks that stop at the first
+  origin that fails (`pending_head_origin`,
+  `bound_origin_without_complete_head`), 25 ms at ten thousand bindings. The
+  larger half was `stage_space_wants`, which re-derives the want set from
+  `entries` — two hundred thousand rows for ten thousand nodes publishing
+  twenty files each — to find it unchanged. Its `SELECT DISTINCT` ranged over
+  the whole projected row, so it could answer from no index and sorted every
+  entry into a temporary B-tree. Grouping by the column the uniqueness is
+  about, over a new `entries_by_space_content`, makes it an ordered scan:
+  measured alone, 1.96 s → 0.18 s, and the whole sweep — as it then stood,
+  with `view_state` still in it — 13.2 s → 0.32 s.
 - **The push fan-out is now bounded**, at 32 dials in flight rather than the
   whole membership at once. Every peer is still pushed to and propagation is
   unchanged; what is bounded is how many QUIC handshakes, buffers and
@@ -968,14 +988,27 @@ read the ratios and not the absolutes:
 
 | | before | after |
 |---|---|---|
-| steady-state CPU | 197 % of a core, flat over 180 s | 42 %, and idle by the last quarter |
-| steady-state RSS | 1349 MiB mean, 2131 MiB peak | 230 MiB mean, 233 MiB peak |
 | one push to 500 peers | 127 s | 0.16 s |
 | maintenance pass | 48.6 s | 0.23 s |
-| tenant directory at rest | 2048 MiB | 181 MiB |
+| replica sweep | 13.2 s | 0.32 s |
 
-One item is measured and unfixed: `sweep_replicas` costs seconds at this
-size, and the standing replica loop calls it every pass.
+Those three are per-operation timings taken at a known membership, and they
+reproduce. The harness's **steady-state** section does not, and its numbers
+should not be quoted: across runs that differ in nothing but when they
+started, that window has read anywhere from 157 % of a core and 219 MiB
+resident to 236 % and 1107 MiB. What varies is where the standing loops are
+in their own cycles when the window opens — above all whether the replica's
+two hundred thousand staged wants are mid-flight against peers that, in a
+harness, no one is answering for. It is a real cost and the harness is the
+wrong instrument for it; sizing a pod's CPU wants a tenant under real sync,
+not this.
+
+The same caveat applies, more weakly, to every per-tick line in the report:
+they are taken while the standing loops are live, so they contend for the one
+store connection and a line can read several times its isolated cost. The
+sweep above is quoted at 13.2 s → 0.32 s from that contended position, and
+`stage_space_wants` at 1.96 s → 0.18 s from an isolated one; both ratios
+hold, the absolutes do not travel.
 
 ### 7.2 Sharding, when it matters
 

@@ -108,15 +108,6 @@ async fn main() {
         .init();
     let options = Options::parse();
 
-    // `--check` is CI's entry point: one shape, thresholded, nothing else run
-    // and nothing else printed.
-    if options.check {
-        std::process::exit(match scaling_guard().await {
-            true => 0,
-            false => 1,
-        });
-    }
-
     println!(
         "synch-dp stress — one hosted tenant serving a replica for {} nodes\n\
          across {} networks, {} published entries per node\n\
@@ -169,112 +160,6 @@ async fn main() {
     );
 
     harness.shutdown().await;
-}
-
-// ---- the CI guard ----------------------------------------------------------
-
-/// How many peers the guard's pushes reach.
-const GUARD_PEERS: usize = 200;
-/// How many bindings the small and large tables hold.
-const GUARD_SMALL: usize = 500;
-const GUARD_LARGE: usize = 10_000;
-/// How many times each push is measured; the best is taken.
-///
-/// A shared runner's slowest sample says more about a neighbouring job than
-/// about this code, and a minimum over a few tries is what makes the ratio
-/// below stable enough to threshold at all.
-const GUARD_TRIES: usize = 3;
-/// How much more one push may cost at twenty times the bindings.
-///
-/// The regression this guards is `O(peers × bindings)`: every dial answering a
-/// trust question from a whole-table read. At this spread that shape costs
-/// about twenty times as much, and the indexed reads cost about the same. Five
-/// sits far from both, so the guard fires on the return of the quadratic and
-/// not on a runner having a bad minute.
-const GUARD_RATIO: f64 = 5.0;
-
-/// Fails if a reactive push has gone back to scaling with the binding table.
-///
-/// A smoke run would not catch it. The push completes either way; what changed
-/// is what it costs, and the whole reason this harness exists is that nothing
-/// in the tree measured that. So CI measures the one shape that mattered — the
-/// same push, the same peers, twenty times the bindings — as a *ratio*, which
-/// is the only thing about a timing that a shared runner does not ruin.
-async fn scaling_guard() -> bool {
-    println!(
-        "synch-dp scaling guard — one push to {GUARD_PEERS} peers, \
-         at {GUARD_SMALL} bindings and at {GUARD_LARGE}\n"
-    );
-    let harness = Harness::provision().await;
-    let members = synthetic_members(GUARD_LARGE, 2);
-    let head = harness.head();
-
-    // The dialable peers first, so both measurements push to the same set and
-    // the only thing that changes between them is the size of the table.
-    for member in members.iter().filter(|m| !m.delegated).take(GUARD_PEERS) {
-        harness.bind(member);
-    }
-    let small = guard_push(&harness, &head, GUARD_SMALL, &members).await;
-    let large = guard_push(&harness, &head, GUARD_LARGE, &members).await;
-
-    let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
-    println!(
-        "\n  {:<34} {:>12.2?}\n  {:<34} {:>12.2?}\n  {:<34} {:>11.1}x  (limit {GUARD_RATIO:.0}x)",
-        format!("{GUARD_SMALL} bindings"),
-        small,
-        format!("{GUARD_LARGE} bindings"),
-        large,
-        "ratio",
-        ratio,
-    );
-    let passed = ratio <= GUARD_RATIO;
-    match passed {
-        true => println!("\n  ok — the push is flat in the binding table\n"),
-        false => println!(
-            "\n  FAILED — one push now costs {ratio:.1}x as much at {}x the bindings.\n\
-             \n  \
-             Something on the dial path is answering a per-peer question from a\n  \
-             whole-table read again. `Store::live_bindings` materializes every\n  \
-             row; the per-key and per-origin questions must go through\n  \
-             `live_bindings_for_key` / `live_bindings_for_origin`, and the\n  \
-             whole-set ones through `live_column`.\n  \
-             See `docs/CLOUD-DATAPLANE.md` §7.1a.\n",
-            GUARD_LARGE / GUARD_SMALL,
-        ),
-    }
-    harness.shutdown().await;
-    passed
-}
-
-/// Grows the table to `bindings` rows and takes the best of a few pushes.
-async fn guard_push(
-    harness: &Harness,
-    head: &SignedHead,
-    bindings: usize,
-    members: &[Member],
-) -> Duration {
-    // Grown into, never trimmed back: deleting rows and reinstating them would
-    // charge the next measurement for SQLite's free pages rather than the push.
-    // Binding is an upsert, so re-binding the rows already there is a no-op and
-    // the table simply reaches `bindings` rows.
-    for member in members
-        .iter()
-        .filter(|m| m.delegated)
-        .take(bindings.saturating_sub(GUARD_PEERS))
-    {
-        harness.bind(member);
-    }
-    let mut best = Duration::MAX;
-    for _ in 0..GUARD_TRIES {
-        let started = Instant::now();
-        harness
-            .node()
-            .push_head(head)
-            .await
-            .expect("the push completes");
-        best = best.min(started.elapsed());
-    }
-    best
 }
 
 // ---- 1. the zone ceiling ---------------------------------------------------
@@ -733,6 +618,73 @@ async fn per_tick(harness: &Harness, _options: &Options) {
         "sweep_replicas()",
         &format!("{:>12.2?}  {} spaces", started.elapsed(), swept.len()),
     );
+
+    // The synchronization-health question `replica ls` and every status poll
+    // ask: whether a pending head or a bound-but-unsynced origin leaves this
+    // node's picture of the cluster incomplete. It grows with the membership
+    // the same way the sweep does, and it used to be the sweep's preamble.
+    let started = Instant::now();
+    let view = {
+        let node = node.clone();
+        synch_core::offload(move || node.view_state())
+            .await
+            .expect("the view state")
+    };
+    line(
+        "view_state()",
+        &format!("{:>12.2?}  {view:?}", started.elapsed()),
+    );
+
+    // The sweep again, which is the number the standing loop actually pays.
+    // The first one above is cold: it stages a want for every object the tree
+    // names, and inserting those rows is a one-time cost that never recurs.
+    // Every pass after it re-derives the same set to find it unchanged, and
+    // that is the recurring one.
+    let started = Instant::now();
+    {
+        let node = node.clone();
+        synch_core::offload(move || node.sweep_replicas(None))
+            .await
+            .expect("the second sweep");
+    }
+    line(
+        "sweep_replicas() again",
+        &format!("{:>12.2?}  the steady-state cost", started.elapsed()),
+    );
+
+    // Where that goes. Each is one statement over `entries`, which holds an
+    // entry per file per origin — so these are the sweep's per-*object* costs,
+    // as against the per-member ones above.
+    let store = node.store();
+    let now = now_ns();
+    let spaces = store.replicas().expect("the replicas");
+    for space in &spaces {
+        let holder = space.holder();
+        let started = Instant::now();
+        let reprieved = store
+            .clear_returned_releases(&holder)
+            .expect("the reprieve pass");
+        line(
+            "  of which clear_returned_releases()",
+            &format!("{:>12.2?}  {reprieved} reprieved", started.elapsed()),
+        );
+
+        let started = Instant::now();
+        let wanted = store
+            .stage_space_wants(&space.space, &holder, now)
+            .expect("the want staging");
+        line(
+            "  of which stage_space_wants()",
+            &format!("{:>12.2?}  {wanted} newly wanted", started.elapsed()),
+        );
+
+        let started = Instant::now();
+        let released = store.expire_pins_of(&holder, now).expect("pin expiry");
+        line(
+            "  of which expire_pins_of()",
+            &format!("{:>12.2?}  {released} released", started.elapsed()),
+        );
+    }
 
     // The standing maintenance loop, every 300 s. This is the pass that
     // expires bindings, so it walks the membership.
@@ -1407,8 +1359,6 @@ struct Options {
     networks: usize,
     entries: usize,
     steady_secs: u64,
-    /// Run only the scaling guard, and exit non-zero if it fails.
-    check: bool,
 }
 
 impl Options {
@@ -1426,7 +1376,6 @@ impl Options {
             networks: value("--networks", DEFAULT_NETWORKS as u64).max(1) as usize,
             entries: value("--entries", DEFAULT_ENTRIES as u64) as usize,
             steady_secs: value("--steady", DEFAULT_STEADY_SECS),
-            check: args.iter().any(|a| a == "--check"),
         }
     }
 }

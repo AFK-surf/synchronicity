@@ -88,6 +88,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V21_REPLICATION),
     Migration::Sql(V22_SOCKETS),
     Migration::Sql(V23_SOURCE_REPLICA_ROLES),
+    Migration::Sql(V24_ENTRIES_BY_SPACE_CONTENT),
     Migration::Rust {
         name: "path-based socket activation",
         run: v24_socket_activations,
@@ -139,6 +140,26 @@ fn v24_socket_activations(tx: &Transaction<'_>) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// v24 — the content a space names, in one index.
+///
+/// `stage_space_wants` runs on every replica sweep — the standing loop's every
+/// pass — and each of its statements asks the same question: the distinct
+/// `content` of a space's entries. `entries_by_path` leads on `space` but
+/// carries `path`, so answering it meant a table lookup per entry to fetch the
+/// column and a temporary B-tree to make it distinct. At two hundred thousand
+/// entries — ten thousand nodes publishing twenty files each — that was six
+/// seconds a pass to arrive at the set the previous pass arrived at
+/// (`docs/CLOUD-DATAPLANE.md` §7.1a).
+///
+/// Leading on `space` and carrying `content` makes it a covering range scan
+/// already in `content` order, so `DISTINCT` becomes skipping equal neighbours
+/// rather than sorting the set. It does not replace `entries_by_content`, which
+/// is sought the other way round — by content, across every space — by the
+/// release path.
+const V24_ENTRIES_BY_SPACE_CONTENT: &str = r#"
+CREATE INDEX entries_by_space_content ON entries (space, content);
+"#;
 
 /// v23 — local participation is two independent roles.
 ///
@@ -909,6 +930,7 @@ CREATE TABLE entries (
 );
 CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
+CREATE INDEX entries_by_space_content ON entries (space, content);
 CREATE TABLE blob_providers (
   object_root BLOB NOT NULL,
   origin_id   TEXT NOT NULL,
