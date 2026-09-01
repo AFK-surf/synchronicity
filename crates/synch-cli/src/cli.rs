@@ -44,6 +44,17 @@ pub struct Cli {
     #[arg(long, global = true, env = "SYNCH_CAS_CACHE_BYTES")]
     pub cas_cache_bytes: Option<u64>,
 
+    /// Maximum number of distinct CAS objects a replica fetches concurrently.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_REPLICA_CONCURRENCY",
+        default_value_t = synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+        value_parser = parse_positive_usize,
+        value_name = "COUNT"
+    )]
+    pub replica_concurrency: usize,
+
     /// S3 bucket (also used by compatible endpoints such as MinIO).
     #[arg(long, global = true, env = "SYNCH_S3_BUCKET")]
     pub s3_bucket: Option<String>,
@@ -1073,6 +1084,14 @@ impl ByteRange {
     }
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(value) => Ok(value),
+        Err(_) => Err(format!("expected a positive integer, got `{value}`")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -1093,6 +1112,21 @@ mod tests {
                 command: DaemonCommand::Start
             }
         ));
+    }
+
+    #[test]
+    fn replica_concurrency_defaults_to_sixteen_and_is_configurable() {
+        let default = Cli::parse_from(["synch", "daemon", "run"]);
+        assert_eq!(
+            default.replica_concurrency,
+            synch_engine::DEFAULT_REPLICA_CONCURRENCY
+        );
+
+        let configured = Cli::parse_from(["synch", "--replica-concurrency", "32", "daemon", "run"]);
+        assert_eq!(configured.replica_concurrency, 32);
+        assert!(
+            Cli::try_parse_from(["synch", "--replica-concurrency", "0", "daemon", "run"]).is_err()
+        );
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct DpConfig {
     pub cache_bytes_total: u64,
     /// How many tenants this pod is sized for. Divides the cache budget.
     pub max_tenants: u64,
+    /// How many distinct CAS objects each tenant fetches concurrently.
+    pub replica_concurrency: usize,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
     /// How each tenant's endpoint is bound.
@@ -170,6 +172,7 @@ impl DpConfig {
             },
             cache_bytes_total: 64 * 1024 * 1024,
             max_tenants: 4,
+            replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -204,6 +207,11 @@ impl DpConfig {
         let service = std::env::var("SYNCH_DP_CAS_BACKEND").unwrap_or_else(|_| "s3".to_string());
         let mut options = HashMap::new();
         collect_options(&service, &mut options);
+        let replica_concurrency = replica_concurrency(
+            std::env::var("SYNCH_DP_REPLICA_CONCURRENCY")
+                .ok()
+                .as_deref(),
+        )?;
 
         Ok(Self {
             control_url,
@@ -216,6 +224,7 @@ impl DpConfig {
             objects: ObjectConfig { service, options },
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
             max_tenants: parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1),
+            replica_concurrency,
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions {
@@ -406,6 +415,22 @@ fn parse<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
     }
 }
 
+fn replica_concurrency(value: Option<&str>) -> Result<usize> {
+    let value = match value {
+        None => return Ok(synch_engine::DEFAULT_REPLICA_CONCURRENCY),
+        Some(value) => value,
+    };
+    match value.trim().parse::<usize>() {
+        Ok(0) => Err(DpError::Config(
+            "SYNCH_DP_REPLICA_CONCURRENCY must be at least 1".into(),
+        )),
+        Ok(value) => Ok(value),
+        Err(_) => Err(DpError::Config(format!(
+            "SYNCH_DP_REPLICA_CONCURRENCY is not a number: {value}"
+        ))),
+    }
+}
+
 /// Reads the zone-key transparency policy.
 ///
 /// `require` remains the default. `off` exists for private deployments whose
@@ -441,6 +466,7 @@ mod tests {
             },
             cache_bytes_total: 1024,
             max_tenants: 4,
+            replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -471,6 +497,22 @@ mod tests {
             assert!(
                 error.to_string().contains(service),
                 "the refusal should name the backend: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn replica_concurrency_defaults_to_sixteen_and_is_configurable() {
+        assert_eq!(
+            replica_concurrency(None).unwrap(),
+            synch_engine::DEFAULT_REPLICA_CONCURRENCY
+        );
+        assert_eq!(replica_concurrency(Some(" 23 ")).unwrap(), 23);
+        for invalid in ["0", "many"] {
+            let error = replica_concurrency(Some(invalid)).unwrap_err();
+            assert!(
+                error.to_string().contains("SYNCH_DP_REPLICA_CONCURRENCY"),
+                "the error should name the setting: {error}"
             );
         }
     }

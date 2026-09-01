@@ -37,7 +37,7 @@ pub mod watcher;
 
 pub use adopt_tree::AdoptTreeOptions;
 pub use compare::{CompareChange, CompareReport, CompareStatus};
-pub use config::{default_data_dir, NodeConfig};
+pub use config::{default_data_dir, NodeConfig, DEFAULT_REPLICA_CONCURRENCY};
 pub use error::{EngineError, Result};
 pub use fetcher::{PreparedRange, Provider};
 pub use lifecycle::{LifecycleLock, LIFECYCLE_FILE};

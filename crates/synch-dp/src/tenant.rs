@@ -337,6 +337,7 @@ impl Tenant {
             // Never release a root no other member still holds: the service
             // must not be what turns "left the current tree" into "gone".
             replica_release_floor: 1,
+            replica_concurrency: config.replica_concurrency,
             ..NodeConfig::new(&self.dir)
         })
     }

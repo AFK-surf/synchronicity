@@ -6,6 +6,9 @@ use synch_net::NetOptions;
 
 use crate::error::{EngineError, Result};
 
+/// How many distinct CAS objects a replica fetches concurrently by default.
+pub const DEFAULT_REPLICA_CONCURRENCY: usize = 16;
+
 /// Where a node's data directory lives by default (§10).
 pub fn default_data_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("", "", "synchronicity")
@@ -83,10 +86,9 @@ pub struct NodeConfig {
     /// How many objects a replica fetches at once — concurrently, which is
     /// what makes this a rate limit rather than a batch size.
     ///
-    /// Deliberately low. Replica fetches share the endpoint with anti-entropy
-    /// and with foreground reads, and nothing schedules between them today
-    /// (§13): a replica that saturates the link it shares with the cluster's
-    /// actual users is a worse problem than one that converges overnight.
+    /// Bounded because replica fetches share the endpoint with anti-entropy and
+    /// foreground reads, and nothing schedules between them today (§13). The
+    /// shipped default is [`DEFAULT_REPLICA_CONCURRENCY`].
     pub replica_concurrency: usize,
     /// The smallest object a fetch will run the delta descent for
     /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
@@ -165,7 +167,7 @@ impl NodeConfig {
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
             replica_interval: Duration::from_secs(300),
-            replica_concurrency: 4,
+            replica_concurrency: DEFAULT_REPLICA_CONCURRENCY,
             replica_release_floor: 1,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             pending_head_ttl: Duration::from_secs(900),
@@ -192,4 +194,18 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "synchronicity".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_fetches_sixteen_replica_objects_by_default() {
+        assert_eq!(
+            NodeConfig::new("unused").replica_concurrency,
+            DEFAULT_REPLICA_CONCURRENCY
+        );
+        assert_eq!(DEFAULT_REPLICA_CONCURRENCY, 16);
+    }
 }

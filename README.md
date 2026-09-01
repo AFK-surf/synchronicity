@@ -163,6 +163,7 @@ export SYNCH_S3_BUCKET=my-synch-cas
 export SYNCH_S3_REGION=us-east-1
 export SYNCH_CAS_ROOT=nodes/production
 export SYNCH_CAS_CACHE_BYTES=10737418240     # 10 GiB maintenance target
+export SYNCH_REPLICA_CONCURRENCY=16           # concurrent CAS roots per replica
 
 synch init --domain cluster.example.com     # once, only if restore found no database
 synch daemon start
@@ -190,6 +191,8 @@ and peer content it pins. Use `own` to upload only locally created content, or
 `all` to make the node a durable replica of every object it fetches completely.
 `SYNCH_CAS_CACHE_BYTES` is a maintenance target, not a per-request hard limit;
 on Unix, omitting it targets at least 20% free space.
+Replica convergence fetches 16 distinct CAS objects concurrently by default;
+set `SYNCH_REPLICA_CONCURRENCY` or `--replica-concurrency` to tune that bound.
 
 For production deployment:
 
