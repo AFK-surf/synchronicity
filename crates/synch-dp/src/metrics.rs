@@ -31,6 +31,17 @@ pub struct Metrics {
     /// network. §10 promised an operator could alert on this; this is what
     /// they alert on.
     replication_failures: Mutex<BTreeMap<String, u64>>,
+    /// Per tenant: how much of the shard's volume its database occupies.
+    ///
+    /// The shard's one unbudgeted resource, and the only cross-tenant failure
+    /// left that no ceiling in this service prevents — see
+    /// [`Tenant::db_bytes`](crate::tenant::Tenant::db_bytes). Content is
+    /// bounded twice over (the org's `budget_bytes` on admission, the
+    /// per-tenant `cache_bytes` on the local footprint); the metadata a
+    /// network's members publish is bounded by neither, lands in one SQLite
+    /// file, and shares a volume with every other tenant on the pod. An
+    /// operator alerts on this climbing against a flat `held_bytes`.
+    db_bytes: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
@@ -80,6 +91,13 @@ impl Metrics {
         }
     }
 
+    /// Records how much of the shard's volume one tenant's database occupies.
+    pub fn tenant_db_bytes(&self, key: &str, bytes: u64) {
+        if let Ok(mut sizes) = self.db_bytes.lock() {
+            sizes.insert(key.to_string(), bytes);
+        }
+    }
+
     /// Forgets a tenant this shard no longer runs.
     ///
     /// Called on every drain. Without it a pod that has rebalanced a few
@@ -91,6 +109,9 @@ impl Metrics {
         }
         if let Ok(mut failures) = self.replication_failures.lock() {
             failures.remove(key);
+        }
+        if let Ok(mut sizes) = self.db_bytes.lock() {
+            sizes.remove(key);
         }
     }
 
@@ -152,6 +173,21 @@ impl Metrics {
             ));
         }
 
+        let db_bytes = match self.db_bytes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        out.push_str(
+            "# HELP synch_dp_tenant_db_bytes Bytes this tenant's database occupies on the shard's volume.\n",
+        );
+        out.push_str("# TYPE synch_dp_tenant_db_bytes gauge\n");
+        for (key, bytes) in &db_bytes {
+            let (org, network) = split_key(key);
+            out.push_str(&format!(
+                "synch_dp_tenant_db_bytes{{org=\"{org}\",network=\"{network}\"}} {bytes}\n"
+            ));
+        }
+
         let per_tenant = match self.per_tenant.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -207,7 +243,7 @@ mod tests {
                 held_bytes: 3400,
                 wanted: 1,
                 last_sync_ns: 5,
-                shard: "dp-1".into(),
+                dp: "dp-1".into(),
                 slot: 1,
             },
         );

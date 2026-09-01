@@ -70,7 +70,18 @@ pub type Credential {
   /// The `Principal`'s `user_id` for one of these is the `system-dataplane`
   /// row migration v12 seeds, because `devices.created_by` references `users`
   /// and the rows this credential writes have to name something true.
-  Dataplane(key_id: String)
+  ///
+  /// `dp` is the data plane the key was minted for (migration v14): the
+  /// identity that decides *which* hosted networks this caller may see and
+  /// write, as against `key_id`, which only says which credential was
+  /// presented. It rides the principal rather than being looked up per
+  /// handler so that no route can forget to scope itself — the value is
+  /// simply there, and a handler that needs it takes it.
+  ///
+  /// Not optional, because a credential that named no data plane would have
+  /// no hosted set at all: every route on `/dp/v1` is scoped by this. The
+  /// column it comes from is `NOT NULL` for the same reason.
+  Dataplane(key_id: String, dp: String)
 }
 
 /// What the audit trail records as the actor.
@@ -89,6 +100,6 @@ pub fn actor(who: Principal) -> String {
     // and belongs to the deployment. A trail that spelled them the same way
     // would invite a reader to look the second one up in the first place and
     // conclude the key had been revoked.
-    Dataplane(key_id) -> "dpkey:" <> key_id
+    Dataplane(key_id, _) -> "dpkey:" <> key_id
   }
 }

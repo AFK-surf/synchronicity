@@ -97,6 +97,16 @@ pub(crate) struct SockProtocol {
     /// peer keeps the connection. An admitted invocation runs unbounded —
     /// the socket runtime's own deadlines govern it.
     open_timeout: Duration,
+    /// The endpoint-wide in-flight gate, shared with every other ALPN mounted
+    /// on this endpoint (`crate::serve::Inflight`).
+    ///
+    /// Taken around the accept gate only, never around an admitted
+    /// invocation. A socket invocation is *supposed* to be long-lived, so
+    /// holding an endpoint-wide slot for its whole run would make one
+    /// `--listen` client's open sessions a ceiling on every other peer's
+    /// requests. What the gate is for is the unbounded thing — the store call
+    /// an unauthenticated dialer reaches by completing a handshake.
+    inflight: crate::serve::Inflight,
 }
 
 #[derive(Debug, Default)]
@@ -191,7 +201,14 @@ impl SockProtocol {
             on_unknown_key: None,
             state: Arc::new(ProtocolState::default()),
             open_timeout,
+            inflight: None,
         }
+    }
+
+    /// Gates this handler's accept path on the endpoint-wide semaphore.
+    pub(crate) fn inflight(mut self, gate: crate::serve::Inflight) -> Self {
+        self.inflight = gate;
+        self
     }
 
     /// Rings `wake` whenever a connection is refused for an unknown key (§3.4).
@@ -226,13 +243,18 @@ impl ProtocolHandler for SockProtocol {
         // The same accept gate as the other two ALPNs — literally: the §3.2
         // rule is membership policy, and this file's own rationale for
         // `serve_connection` is "one implementation, because two drift".
-        crate::serve::admit(
-            &self.store,
-            &connection,
-            &remote,
-            self.on_unknown_key.as_ref(),
-        )
-        .await?;
+        {
+            let Ok(_admission) = crate::serve::slot(&self.inflight).await else {
+                return Ok(());
+            };
+            crate::serve::admit(
+                &self.store,
+                &connection,
+                &remote,
+                self.on_unknown_key.as_ref(),
+            )
+            .await?;
+        }
 
         // One uni-stream per connection, opened before anything is served, so
         // that a status always has somewhere to go. A trailer on the data

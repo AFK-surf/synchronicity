@@ -41,7 +41,7 @@ docs/REPLICATION.md, `CP README` is control-plane/README.md.
   customer's zone. Customer nodes need no new protocol, no new
   configuration, and no software upgrade to benefit: they see one more
   trusted peer that fetches eagerly and serves well.
-- **Multi-tenant economics.** One process (later: a small shard set) hosts
+- **Multi-tenant economics.** One process (later: a small fleet of them) hosts
   hundreds of networks. Tenants share a binary, a blocking pool, a DNSSEC
   resolver, and a bucket — and share nothing else: not a key, not a
   database, not an object-store prefix.
@@ -157,17 +157,21 @@ CREATE TABLE dataplane_keys (
   token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
   created_at INTEGER NOT NULL,
   expires_at INTEGER,
-  last_used_at INTEGER
+  last_used_at INTEGER,
+  dp_id      TEXT REFERENCES data_planes(id)   -- v14, §7.2
 );
 ```
 
 - Minted only from the operator CLI: `controlplane dataplane-key mint
-  <name>`, printing the token once, the same posture as `seed-admin`. No
-  HTTP route mints or lists these keys — the credential that can see every
-  org is never reachable *through* the API it authorizes.
+  <name> --dp <dp-id>`, printing the token once, the same posture as
+  `seed-admin`. No HTTP route mints or lists these keys — the credential
+  that can see every org is never reachable *through* the API it
+  authorizes. The `--dp` is required and names a registered data plane
+  (§7.2): a key carries the identity that decides what it may see, so a
+  pod's share cannot be misconfigured, only its secret copied.
 - Sent as `Authorization: Bearer synchdp_…`. The distinct prefix keeps the
   two bearer namespaces from ever being confused in logs or middleware, and
-  `check_principal` grows a `Dataplane(key_id)` constructor that is accepted
+  `check_principal` grows a `Dataplane(key_id, dp)` constructor that is accepted
   **only** by `/dp/v1/*` routes — `check_org` refuses it outright, so a
   leaked data-plane key cannot touch the org API at all.
 - The `/dp/v1` GET routes are served by read replicas too (they are reads of
@@ -178,11 +182,13 @@ CREATE TABLE dataplane_keys (
 
 Five routes under `/dp/v1`, all requiring the data-plane principal.
 
-**`GET /dp/v1/networks`** — the desired-state document. Every network of
-every org with `cloud_hosted = 1`:
+**`GET /dp/v1/networks`** — the desired-state document. Every network with
+`cloud_hosted = 1` **assigned to the calling data plane** (§7.2), of every
+org:
 
 ```json
 { "generation": 4183,
+  "dp": "dp-1",
   "collect": [ { "org": "beta", "network": "old" } ],
   "networks": [
     { "org": "acme", "network": "prod",
@@ -192,6 +198,12 @@ every org with `cloud_hosted = 1`:
       "device": { "label": "cloud-1", "nk": "…", "state": "active" } } ] }
 ```
 
+- `dp` is the data plane the caller's token names — this pod's own name,
+  told to it by the authority. A pod that read its name out of its own
+  environment could disagree with the row that decides what it hosts, which
+  is the disagreement §7.2 exists to remove; and a pod hosting nothing can
+  still answer "which data plane am I?", which is the first question asked
+  of one. It is also what the metering heartbeat's `dp` field carries.
 - `domain` is the membership domain, verbatim what `Node::set_domain`
   takes; the data plane never assembles names itself.
 - `budget_bytes` and `retention` are **policy, decided control-plane side**
@@ -203,7 +215,12 @@ every org with `cloud_hosted = 1`:
   a restarted, disk-less data plane can tell "network I have never joined"
   from "network whose identity I must recover" (§5.3).
 - `collect` names offboarded networks whose retention hold (§6) has run
-  out — the fleet's instruction to delete what it stored.
+  out — this data plane's instruction to delete what *it* stored. Scoped
+  the same way the network list is, from the owner stamped on the queue row
+  when hosting went off: the queue outlives the network row, so by the time
+  a deletion falls due there is nowhere left to look the owner up, and an
+  unscoped list would have every pod in the fleet race on one customer's
+  prefix.
 - `generation` is the zone's serial, bumped by any change that shapes the
   hosted set. The response's `ETag` is derived from it **and from the
   collections now due**, which is not a refinement but a correctness fix: a
@@ -211,7 +228,21 @@ every org with `cloud_hosted = 1`:
   fact, so a tag built from the serial alone would answer 304 for ever and
   the collection would never happen at all. The tag folds in both a count
   and a sum of the due stamps, because a count alone is unchanged when one
-  network falls due in the same interval another is collected.
+  network falls due in the same interval another is collected. The tag also
+  names the data plane, since two pods polling one deployment hold
+  different documents.
+
+A key minted before §7.2 names no data plane. Every route here refuses it
+with `dataplane_unnamed` and the command that fixes it, rather than
+treating "names nothing" as "sees everything" — which is the reading that
+would carry a fleet through the upgrade by handing the oldest credential on
+the deployment the widest scope it has ever had.
+
+The four writes below are scoped the same way: a network assigned to
+another data plane answers 404, because on a surface that enumerates by
+assignment "not yours" and "not there" are the same answer. Without that,
+the assignment would be a filter on the GET that any pod could step around
+by naming a route directly.
 
 **`PUT /dp/v1/networks/:org/:net/device`** — idempotent registration of the
 hosted device's key:
@@ -277,7 +308,7 @@ per tenant every few minutes:
 ```json
 { "held_roots": 12034, "held_bytes": 481036337152,
   "wanted": 3, "last_sync_ns": 1756600000000000000,
-  "shard": "dp-1" }
+  "dp": "dp-1" }
 ```
 
 Stored (last write wins, one row per network) — unlike the browse tunnel's
@@ -308,14 +339,14 @@ deciding by label would either lock them out of their own row or, when
 they disabled hosting, delete it.
 
 The suffix is the **hosting slot**,
-*not* the shard: v1 hosts every network once, in slot 1, so the device is
-always `cloud-1`, whichever shard happens to run it. A slot is a durable
-identity and shards are interchangeable pods — the same distinction that
-keys the DB replica stream by network rather than by shard (§5.3), and it
-is what lets a tenant move between shards (§7.2) with no zone change at
+*not* the data plane: v1 hosts every network once, in slot 1, so the device
+is always `cloud-1`, whichever pod happens to run it. A slot is a durable
+identity and a pod is replaceable — the same distinction that keys the DB
+replica stream by network rather than by pod (§5.3), and it is what lets a
+tenant be reassigned (§7.2) with no zone change at
 all. Redundant hosting, later, is a second slot: `cloud-1` and `cloud-2`
 as two ordinary devices, because two replicas of one network is already a
-thing the protocol does. Which shard currently serves a slot is
+thing the protocol does. Which data plane currently serves a slot is
 operational metadata, carried in the status heartbeat, never in the zone.
 
 ---
@@ -347,8 +378,8 @@ the engine's own standing loops (interval + jitter, work is idempotent,
 missing a tick costs latency not correctness):
 
 1. **Poll** `GET /dp/v1/networks` (default every 60 s, `If-None-Match`).
-   On success, persist the shard-filtered document to
-   `dp/<shard>/desired.json` **in the bucket** (local disk is ephemeral,
+   On success, persist the answered document to
+   `dp/<token-fingerprint>/desired.json` **in the bucket** (local disk is ephemeral,
    §5.3) before acting on it — the data plane **fails static**: if the
    control plane is unreachable for an hour, the current tenant set keeps
    replicating, and a pod rescheduled while the control plane is down
@@ -357,7 +388,7 @@ missing a tick costs latency not correctness):
    *successful* poll that omits the network). What fail-static cannot
    cover is a *first* boot with no bucket copy and no control plane —
    there is no known set to serve; that cold start waits.
-2. **Diff** desired against running, filtered to this shard (§7):
+2. **Diff** desired against running (§7.2 scopes the document itself):
    - *new network* → provision (§4.3);
    - *running and desired* → converge policy: budget or retention changed →
      `set_replica` on every configured replica;
@@ -567,7 +598,7 @@ tenants/<org>/<network>/        ← OpenDAL root for this tenant
   uploads/<id>/<n>              ← multipart staging (unused in v1: no write
                                    surface exists, §4.4)
 db/<org>/<network>/             ← tenant DB replica stream (§5.3)
-dp/<shard>/desired.json         ← fail-static desired-state cache (§4.2)
+dp/<fingerprint>/desired.json   ← fail-static desired-state cache (§4.2)
 ```
 
 The CAS layer supports the alternative — many nodes on one shared root,
@@ -607,7 +638,7 @@ tenant's cache — and keep the engine's thread-local store-reentry guard
 happy, because a blocking task naturally touches exactly one tenant's
 store.
 
-`cache_bytes` is always explicit: the volume budget divided by the shard's
+`cache_bytes` is always explicit: the volume budget divided by this pod's
 tenant capacity. The Unix free-space default is a single-node policy and
 is documented (by the store's own code) to thrash when N nodes share a
 volume; the data plane never relies on it. Cache here is pure performance
@@ -709,7 +740,7 @@ document starts lying after an upgrade.
 - **Single writer, and nothing enforces it**: correctness of the stream
   assumes one live replicator per tenant DB, which is the same assumption
   the node itself makes (`replicas: 1`, SERVERLESS §1) and is provided by
-  shard ownership (§7.2) — *only* by shard ownership. It is worth being
+  the assignment (§7.2) — *only* by the assignment. It is worth being
   blunt about this, because an earlier draft of this document claimed a
   backstop that does not exist. `check_database_behind_replica` is not a
   refusal: when the local database is behind its stream the library seeds
@@ -719,14 +750,14 @@ document starts lying after an upgrade.
   it means a *stale* database is repaired into a position to ship over the
   stream rather than turned away. Two pods writing one stream therefore
   lose the loser's writes silently, and the only thing standing between the
-  fleet and that is the rendezvous filter. Discarding leftover directories
-  (above) closes the reprovision half of it; the rolling-shard-count half is
-  a real exposure of one reconcile interval, named in §8 rather than papered
+  fleet and that is the one row that says who hosts the tenant. Discarding
+  leftover directories (above) closes the reprovision half of it; the other
+  half is one token in two pods' hands, named in §8 rather than papered
   over.
 - **S3 or nothing**: the library ships two clients — S3-compatible object
   storage and a local directory — so a GCS or Azure deployment is refused
   at startup rather than per tenant. That is a real narrowing of what the
-  CAS itself supports, and it is the honest one: a shard that cannot write
+  CAS itself supports, and it is the honest one: a data plane that cannot write
   a database stream would mint device keys, get them named in customer
   zones, and lose every one of them on its first reschedule.
 - **Protection**: not this layer's business, and an earlier draft was
@@ -803,11 +834,11 @@ control plane believing storage is gone while the bill continues. Two
 independent locks guard it, because this is the one operation in the
 design that destroys customer data — the control plane refuses to mark a
 still-hosted network collected, and the data plane refuses to collect a
-tenant its own shard is running. The hold is control-plane policy for the
+tenant it is itself running. The hold is control-plane policy for the
 same reason the flag is: the service holding the bucket credentials should
 not also hold the opinion about when a customer's bytes may go.
 
-**Shard loss**: a shard pod dies — the *normal* event, since pods are
+**Pod loss**: a data plane's pod dies — the *normal* event, since pods are
 ephemeral. Its tenants' desired state still lists them; the replacement
 pod with the same ordinal restores each DB from its replica stream and
 resumes each identity — same key, same label, no zone change at all. Only
@@ -815,7 +846,7 @@ if the DB replica is also gone does the key-replacement path (§5.3) run.
 
 ---
 
-## 7. Scaling and sharding
+## 7. Scaling, and how the fleet divides its work
 
 ### 7.1 What a tenant costs
 
@@ -827,6 +858,7 @@ if the DB replica is also gone does the key-replacement path (§5.3) run.
 | tokio tasks | ~8 standing | §4.4 loop set |
 | DB replicator | 1 standing task, 1 read connection | in-process, §5.3 |
 | memory | O(trie working set + cache index) | dominated by anti-entropy peaks |
+| blocking-pool slots | ≤ `SYNCH_DP_MAX_INFLIGHT_PER_TENANT` from peers | the tenancy bound, §9.1 |
 
 Shared, once per process: the tokio runtime and its blocking pool (sized
 deliberately: every store touch of every tenant crosses it), one
@@ -835,38 +867,83 @@ must be — one Sigstore outage should cost one attempt a day, not N), the
 reqwest client, the metrics registry.
 
 The practical v1 ceiling is file descriptors and blocking-pool contention,
-not CPU: **O(hundreds) of networks per shard**, which one instance
+not CPU: **O(hundreds) of networks per data plane**, which one instance
 ("scale-to-one", the serverless posture) serves for a long time before
-sharding matters.
+a second one matters.
 
-### 7.2 Sharding, when it matters
+Blocking-pool contention is also the thing a hostile tenant reaches for, so
+it is not left to capacity planning alone. `SYNCH_DP_BLOCKING_THREADS` (a
+ceiling tokio grows into on demand, default sized from
+`SYNCH_DP_MAX_TENANTS`) and `SYNCH_DP_MAX_INFLIGHT_PER_TENANT` are chosen
+together, such that a pod's tenants collectively cannot ask for more
+than half the pool and the other half stays available for the reconcile
+pass, the replication tickers and the heartbeats. §9.1 is why.
 
-Shards are declared, not discovered: `SYNCH_DP_SHARD=2`
-`SYNCH_DP_SHARDS=4`. Each shard runs the same reconciler over the same
-desired-state document, filtered by **rendezvous hashing on the network
-id** — no assignment state in the control plane, no coordination between
-shards, and a shard-count change moves ~1/n of tenants. Everything durable
-about a tenant is keyed by network, never by shard — the CAS prefix, the
-DB stream, the `cloud-1` device identity (§3.4) — so a handover is: the
-losing shard's next reconcile drains the tenant (shipping the DB tail),
-the gaining shard restores that stream and resumes the *same* identity; no
-zone change, no key change, no customer-visible event. The race — a
-rolling shard-count change where both pods briefly run the tenant — is one
-identity written by two processes, and — stated plainly because §5.3's
-first draft claimed otherwise — **nothing catches it**. The replication
-library does not refuse a database behind its stream; it repairs it into a
-position to ship over one. So for the reconcile interval in which both pods
-believe they own the tenant, both replicate, and the loser's writes leave
-the only durable copy. Bounded by one reconcile interval and by how rarely
-the shard count changes, and mitigated by doing shard-count changes as a
-stop-then-start rather than a rolling update — but a real cost of this
-design and not an eliminated one. The fix that would eliminate it is a
-lease on the stream, which the library has no notion of.
+### 7.2 Assignment: the control plane decides
+
+Each data plane has a **name**, and the control plane records which
+networks it hosts. `data_planes` is the registry, `networks.cloud_dp_id`
+is the assignment, and `GET /dp/v1/networks` answers with the caller's
+share and nothing else (migration v14).
+
+**A data plane's name is carried by its credential, not by its
+environment.** `controlplane dataplane register dp-1` names the pod;
+`controlplane dataplane-key mint fleet --dp dp-1` mints a key that names
+it; the pod is given only `SYNCH_DP_CONTROL_URL` and `SYNCH_DP_TOKEN` and
+learns which data plane it is from the document it polls. The rejected
+alternative was a fleet-wide key plus an id in the pod's environment,
+which is friendlier to a StatefulSet and has a silent failure mode: a
+typo there authenticates perfectly and hosts nothing, or hosts another
+pod's networks, and neither shows up as an error. A key that names its
+data plane cannot be mistyped into naming a different one.
+
+**Placement happens once**, when an org switches hosting on: the network
+goes to the least-loaded registered data plane, and nothing moves it
+afterwards. A network re-enabled inside its retention hold therefore
+returns to the pod that still holds its database stream and its bucket
+prefix rather than to whichever pod is emptiest that minute. Moving one is
+`controlplane dataplane assign <org> <network> <dp-id>`, run by an
+operator who knows the losing pod has drained the tenant. There is
+deliberately **no automatic reassignment**: a rebalancer decides on a
+signal as noisy as "the fleet looks uneven", and the thing it would decide
+is which pod opens a database stream — see below for why that is the one
+decision this design will not make by itself.
+
+A hosted network with no assignment is hosted by nobody. That is the safe
+direction, it is what a deployment with no data plane registered yet
+looks like, and it is visible: the enable call answers `data_plane: null`
+and `controlplane dataplane list` names every unassigned network under the
+fleet's counts. Handing such a network to whichever pod asked first would
+be a placement decision made by a race.
+
+Everything durable about a tenant stays keyed by network, never by data
+plane — the CAS prefix, the DB stream, the `cloud-1` device identity
+(§3.4) — so a handover is unchanged: the losing pod's next reconcile
+drains the tenant (shipping the DB tail), the gaining pod restores that
+stream and resumes the *same* identity; no zone change, no key change, no
+customer-visible event.
+
+**The alternative worth naming**, because it looks cheaper: let each pod
+derive its own share by hashing the network id against a fleet size it
+reads from its own environment. No rows, no coordination, and a fleet-size
+change moves only ~1/n of tenants. It has one failure no hashing fixes —
+**two pods that disagree about the fleet size both conclude they own a
+network, and nothing catches it.** The replication library does not refuse
+a database behind its stream; it repairs it into a position to ship over
+one. So both replicate, and the loser's writes leave the only durable
+copy. The `LifecycleLock` that would catch two writers is a `flock` on a
+data directory and does not span pods. Guarding it needs an operational
+rule about how the fleet size is changed, which is the kind of rule that
+holds until the night it does not; one row here cannot be disagreed with.
+
+What that does *not* eliminate is two pods holding the same token, which
+is an operator copying a secret rather than a misconfiguration — and one
+this service cannot tell from the legitimate case of a pod being replaced.
 
 Redundant hosting is a second *slot* (`cloud-2`, its own key, DB stream,
-and CAS claims over the same tenant prefix), assigned to a different shard
-by hashing on (network, slot) — future work only because billing and the
-status API assume one row per network today.
+and CAS claims over the same tenant prefix), assigned to a different data
+plane — future work only because billing and the status API assume one row
+per network today.
 
 ### 7.3 Engine changes required
 
@@ -899,13 +976,18 @@ None of the engine's replication, storage, or membership code changes.
 | one tenant's loop panics | that tenant restarts with backoff; process and other tenants unaffected | supervisor, §4.4 |
 | tenant DB lost, network alive | key replacement + metadata re-sync + re-adoption; no re-upload | §5.3 |
 | tenant DB lost *and* customer nodes gone | names and structure lost despite bytes surviving — the case DB replication exists for | prevented, not recovered: the replica stream is part of the contract |
-| shard pod rescheduled | the normal event: replacement pod restores every tenant DB from its stream; identities unchanged | §6 |
+| a data plane's pod rescheduled | the normal event: replacement pod restores every tenant DB from its stream; identities unchanged | §6 |
 | leftover tenant directory on a reused volume | discarded: the stream is replayed over it, losing at most that pod's unshipped tail | §5.3 |
-| **rolling shard-count change** | **two pods may own one tenant for a reconcile interval and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: change `SYNCH_DP_SHARDS` as a stop-then-start, never a rolling update (§5.3, §7.2)** |
+| network hosted but assigned to no data plane | replicated by nobody; the enable call answered `data_plane: null` | register a data plane, or `dataplane assign` it (§7.2) |
+| **one token held by two pods** | **both own the tenant and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: a data plane's key names it, so this is an operator copying a secret rather than a misconfiguration. Mint a key per pod (§7.2)** |
 | pod killed without grace | up to one replication interval of DB writes unshipped; replica behind, never ahead | restore + re-sync closes the gap, §5.3 |
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
 | budget exhausted | admission stops; the engine's own `held_back` shows in the replication panel; nothing evicted. The metering heartbeat does **not** carry it — `wanted` climbing against a flat `held_bytes` is what an operator reads instead | org raises plan; acquisition resumes |
-| disk pressure on shard | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
+| disk pressure on a pod | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
+| **one tenant's members flood its endpoint** | that tenant's endpoint queues at its inbound ceiling; other tenants unaffected | §9.1 |
+| **one tenant's store is jammed by its own peers** | that tenant overruns its share of the reconcile pass and is skipped for it; every other tenant is still converged, metered and supervised | §9.1 |
+| **one tenant's members publish a great many spaces** | replicas stop being added at the ceiling, loudly; the pass stays bounded | §9.1 |
+| **one tenant's members inflate its metadata** | `synch_dp_tenant_db_bytes` climbs against a flat `held_bytes`; **not** bounded — the volume can still fill and take the pod with it | §9.1, open |
 
 ---
 
@@ -935,10 +1017,10 @@ None of the engine's replication, storage, or membership code changes.
   not already do better, and its loss would strand every tenant's identity
   at once.
 - **Blast radius of a compromised data-plane host**: every hosted
-  network's content and device secrets on that shard — but no customer
+  network's content and device secrets on that pod — but no customer
   device keys, no zone keys, no control-plane credentials beyond the
   data-plane key, which reaches only `/dp/v1`. Zone authority stays in the
-  control plane; a compromised shard cannot admit new members anywhere.
+  control plane; a compromised data plane cannot admit new members anywhere.
 - **Blast radius of a leaked data-plane key**: enumeration of hosted
   networks and forged heartbeats; device registration is the one write,
   and it is confined to the reserved `cloud-*` label namespace, so it
@@ -955,24 +1037,141 @@ None of the engine's replication, storage, or membership code changes.
   no code path holds two tenants' stores (enforced in practice by the
   engine's own off-runtime and reentry guards, and by the reconciler's
   one-tenant-per-task structure). An org that requires hard isolation is a
-  dedicated-shard tier, not a design change: the shard filter already
-  makes "a shard that hosts one org" a configuration.
+  dedicated-data-plane tier, not a design change: the assignment already
+  makes "a data plane that hosts one org" a configuration.
 - **Rekor/TUF pinning** rides per-tenant DBs (the engine stores pin state
   in the node's config table), so a tenant restored from its replica
   stream keeps
   its transparency-log pins; the shared resolver bounds Sigstore traffic.
 
+### 9.1 Resource exhaustion, where §12's trust stance runs out
+
+DESIGN §12 declines per-peer rate limits and per-origin quotas, on purpose
+and with a stated reason: every peer that can send a request at all is an
+authorized member, members are extended basic trust not to DoS each other,
+and a member behaving abusively is a *membership* problem whose remedy is
+`synch trust rm` or removal from the zone. That is the right stance for a
+cluster. **It does not survive this service**, and the reason is one
+sentence: the membership belonging to org A is not org B's to curate, and
+org B's tenant is in the same process. §12's remedy is available — but it
+is available to the wrong party. Everything below is the difference
+between what a node does about a hostile member and what a multi-tenant
+*host* must.
+
+What this changes is only the resources tenants share. The protocol's own
+sanity bounds are unchanged and do the work they always did: a peer with
+no live binding is closed out after the handshake, batches are capped on
+both count and bytes, keys and trie values are bounded, deep chains are
+refused, and content is verified against object roots so a peer can
+withhold but never inject. The gap was never one malformed message. It was
+that nothing capped *how many* well-formed ones one network could have in
+flight, and that everything a tenant does — its heartbeat, its
+converge, its drain — ran through resources every other tenant needed.
+
+- **The inbound ceiling.** Every request handler on both ALPNs offloads its
+  store work onto the process's one blocking pool (§7.1), and nothing
+  capped how many connections a peer opens. A tenant's store calls
+  serialize on that tenant's single connection mutex, so the pool threads
+  are spent *waiting* rather than working: a member of one org could hold
+  the whole pool, and every other tenant's publishing, membership renewal
+  and heartbeat queued behind it. Each tenant's endpoint now carries an
+  endpoint-wide in-flight cap (`NetOptions::max_inflight_requests`,
+  `SYNCH_DP_MAX_INFLIGHT_PER_TENANT`), taken around the admission check as
+  well as every request — admission is a store call, and it is the one
+  store call an *unauthenticated* dialer reaches, so a gate starting after
+  it would leave a QUIC handshake buying unbounded queued work. The
+  default is derived from the pool size and `SYNCH_DP_MAX_TENANTS` so a
+  pod's tenants collectively cannot outbid half its pool; the other half
+  is reserved for the work no peer asked for.
+- **The pass is fanned out and deadlined.** A reconcile pass used to visit
+  tenants one at a time, and every per-tenant step in it — provision,
+  converge, measure, heartbeat — waits on the store that tenant's own peers
+  keep busy. That made each tenant's latency the sum of the others': one
+  jammed tenant meant nothing else was converged, no heartbeat was sent
+  (which is the billing record, §10), the failed-loop supervisor never ran
+  and nothing collected. Tenants are now visited together, each under its
+  own deadline; a tenant that overruns is logged and skipped for that
+  pass. Drains are the deliberate exception — concurrent, but never cut
+  short, because abandoning one half way would remove a data directory
+  while the node is still writing to it.
+- **Restarts back off.** Re-provisioning discards the local database and
+  replays the whole replica stream, so a tenant whose standing loops keep
+  dying bought a full restore every poll — object-store egress and
+  blocking-pool time charged to every other tenant on the pod. The first
+  restart is still immediate; the rest back off to a cap, and forget the
+  backoff after half an hour of health.
+- **A ceiling on replicated spaces.** §4.5's rule is "every space the
+  network publishes gets a replica", and a space is a plain string in the
+  trie key any member may publish under (DESIGN §12). The number of them is
+  therefore a member's to choose, and each one became a replica row that is
+  written once and — by §4.5's own reasoning, which is right — never
+  removed. So one member publishing under a million space names bought a
+  million permanent rows, a converge pass a million store queries long, and
+  a database that size riding the replica stream to object storage for
+  ever. There is now a ceiling (4 096), it stops the work rather than
+  filtering the result, and reaching it is an error-level log naming the
+  count. The same pass no longer scans the replica list per space either:
+  that made it quadratic in two numbers a member chooses.
+
+  **Which spaces land under the ceiling is deliberately not defended.** They
+  arrive in whatever order the store returns them, so a member publishing
+  thousands can take the allowance from its own org's real shares. That is a
+  member degrading its own network — §12's case, with §12's remedy in the
+  hands of the org that holds the membership — and an earlier draft of this
+  work spent a per-origin allowance, a ledger and an attribution rule
+  defending against it. Ranking one of an org's own devices above another is
+  not a judgement this service is in a position to make, and the machinery
+  to fake it was larger than the ceiling it protected.
+- **What is still not bounded: tenant metadata.** `budget_bytes` (§4.5) is
+  an admission ceiling on *content*, and a tenant's local content footprint
+  is separately capped by `cache_bytes` (§5.2). Neither covers the trie
+  nodes, out-of-line values, heads and head history a network's members
+  publish, which this node adopts in full because that is what replicating
+  a network means. They land in one SQLite file on a volume every tenant on
+  the pod shares, and they ride the replica stream. A member publishing a
+  million tiny entries costs almost no content bytes, passes every budget
+  this design has, and can fill the pod's volume out from under every
+  other tenant. This is reported and not enforced: `synch_dp_tenant_db_bytes`
+  climbing on one tenant against a flat `held_bytes` is what an operator
+  alerts on. Enforcing it belongs where the plan does — the control plane
+  already sizes `budget_bytes` per org, and extending it to cover metadata
+  is its change to make. A ceiling invented in the data plane would take a
+  paying customer's tenant down for having a lot of files.
+- **What a member can still do to its own tenant.** An in-flight slot is
+  held for the whole of a request, the read included, so a peer that opens
+  a stream and then says nothing holds a slot until the 120 s stream
+  timeout. Enough such streams stall that tenant's endpoint. That is
+  deliberately left where §12 puts it: it is one org's members degrading
+  one org's replica, with §12's remedy available to exactly the party who
+  has it. The per-tenant ceiling is floored at twice the per-connection
+  stream cap so that a *single* connection can never do it, and no amount
+  of it reaches another tenant.
+- **Isolation remains by ownership, not sandboxing.** Nothing here changes
+  §9's last-but-one bullet: tenants still share an address space, and the
+  guarantee against cross-tenant *data* flow is still that no code path
+  holds two tenants' stores. What changes is availability — the containment
+  no longer depends on every org's members behaving. An org that requires
+  hard isolation is still a dedicated-data-plane tier, which the assignment
+  already makes a configuration.
+
 ---
 
 ## 10. Observability and metering
 
-- Prometheus per shard. What is actually exported today, rather than a
+- Prometheus per data plane. What is actually exported today, rather than a
   wish list: `synch_dp_tenants_running` / `_parked`,
   `synch_dp_poll_failures`, `synch_dp_reconcile_failures`,
   `synch_dp_desired_generation`, `synch_dp_storage_collected`, and — per
   tenant, labelled `{org, network}` — `synch_dp_held_bytes`,
-  `synch_dp_held_roots`, `synch_dp_wanted` and
-  `synch_dp_replication_failures`.
+  `synch_dp_held_roots`, `synch_dp_wanted`,
+  `synch_dp_replication_failures` and `synch_dp_tenant_db_bytes`.
+- **`synch_dp_tenant_db_bytes` is the other one to alert on**, and it is
+  here for the reason §9.1 gives: it is the pod's one unbudgeted
+  resource. Content is bounded twice over; the metadata a network's members
+  publish is bounded by neither, and it shares one volume with every tenant
+  on the pod. Climbing on one tenant against a flat `synch_dp_held_bytes`
+  is a network inflating metadata, and it is visible before the volume
+  fills rather than after.
 - **`synch_dp_replication_failures` is the one to alert on**, and it is
   here because an earlier draft promised an operator could alert on a
   stalled stream while exporting nothing that showed one. It counts a
@@ -1003,9 +1202,9 @@ None of the engine's replication, storage, or membership code changes.
 ```
 crates/synch-dp/
   src/main.rs          # config from env, runtime, signals, metrics server
-  src/config.rs        # the environment, the shard filter, the slot
+  src/config.rs        # the environment, the pool sizing, the slot
   src/control.rs       # /dp/v1 client: poll (ETag), register, heartbeat
-  src/reconciler.rs    # desired-state diff, fail-static cache, shard filter
+  src/reconciler.rs    # desired-state diff, fail-static cache, placement
   src/tenant.rs        # per-network lifecycle: provision, identify,
                        #   loop set, supervise, drain, retire
   src/spaces.rs        # space-driven replica ensure (§4.5 — never removes)
@@ -1025,10 +1224,12 @@ crates/synch-dp/
    promise that nobody else checkpoints it.
 2. **Control plane.** Migration v12 (`cloud_hosted`, `cloud_disabled_at`,
    `dataplane_keys`, `network_hosting_status`, the `system-dataplane`
-   user), the admin toggle with its audit events and its dashboard switch,
-   the five `/dp/v1` routes, the `Dataplane` principal that `check_org`
-   refuses outright, the reserved `cloud-*` label namespace, and
-   `controlplane dataplane-key mint`.
+   user) and v14 (`data_planes`, the `dp_id` columns), the admin toggle with
+   its audit events and its dashboard switch, the five `/dp/v1` routes
+   scoped to the caller's data plane, the `Dataplane` principal that
+   `check_org` refuses outright, the reserved `cloud-*` label namespace, and
+   `controlplane dataplane register` / `list` / `assign` /
+   `dataplane-key mint --dp`.
 3. **`synch-dp`.** Restore-or-init, register, identify, replicate,
    converge, rotate, heartbeat, collect, drain.
 4. **Offboarding is closed.** Disabling drains the tenant and removes its
@@ -1037,21 +1238,21 @@ crates/synch-dp/
    the database stream, then reports it. Two locks guard the one operation
    here that destroys customer data: the control plane refuses to mark a
    still-hosted network collected, and the data plane refuses to collect a
-   tenant this shard is running.
+   tenant this data plane is running.
 5. **Rotation is driven**, not merely possible: the tenant's own database
    carries the deadline, so a rotation survives the pod that started it.
 
 ### What a v2 would add
 
-- **Redundant hosting** — a second slot (`cloud-2`) on a different shard.
-  The slot model (§3.4) and the shard filter are built for it; what is
+- **Redundant hosting** — a second slot (`cloud-2`) on a different data
+  plane. The slot model (§3.4) and the assignment are built for it; what is
   missing is billing and a status API that assume one row per network.
 - **Delegate-scoped hosting** (§9): the hosted node admitted for named
   spaces only, so the fleet never sees the rest. A different product tier,
   not a fix.
-- **Cross-shard handover exercised against a live fleet.** The rendezvous
-  filter is implemented and unit-tested; no test moves a running tenant
-  between two processes.
+- **Handover exercised against a live fleet.** `dataplane assign` is
+  implemented and tested against the database; no test moves a *running*
+  tenant between two processes.
 - **Restore fuzzing** over torn and forked streams. Restore is exercised
   on every provisioning, and a unit test round-trips a shipped stream back
   into a database; the library carries its own tests for torn and

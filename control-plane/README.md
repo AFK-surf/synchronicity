@@ -308,9 +308,9 @@ place one can be created. That confinement is what bounds a leaked data-plane
 key: it can enumerate hosted networks and forge heartbeats, and its one write
 cannot displace or impersonate a customer's device.
 
-The suffix is the **slot**, not the shard. v1 hosts every network once, in slot
+The suffix is the **slot**, not the data plane. v1 hosts every network once, in slot
 1, so the device is always `cloud-1` whichever pod happens to be running it; a
-tenant moving between shards is no zone change at all. Redundant hosting, later,
+tenant moving between data planes is no zone change at all. Redundant hosting, later,
 is a second slot — `cloud-1` and `cloud-2` as two ordinary devices, because two
 replicas of one network is already something the protocol does.
 
@@ -324,8 +324,19 @@ credential can be allowed to ask. So it is a fourth kind, in its own table,
 resolved to its own principal:
 
 ```sh
-controlplane dataplane-key mint dp-1 --expires-in 31536000
+controlplane dataplane register dp-1
+controlplane dataplane-key mint dp-1 --dp dp-1 --expires-in 31536000
 ```
+
+The key names the data plane it was minted for, and that is what decides
+which networks it may see and write: `data_planes` is the fleet's registry,
+`networks.cloud_dp_id` is the assignment, and `GET /dp/v1/networks` answers
+with the caller's share alone. Placement happens once, when an org switches
+hosting on — the least-loaded pod takes it, and nothing moves it afterwards
+except `controlplane dataplane assign <org> <network> <dp-id>`.
+`controlplane dataplane list` shows the fleet's counts and names every hosted
+network assigned to nobody. See docs/CLOUD-DATAPLANE.md §7.2 for why the
+name rides the credential rather than the pod's environment.
 
 Printed once, the same posture as `seed-admin`, and **no HTTP route mints,
 renames or lists these keys** — the credential that can see every org is never
@@ -494,7 +505,7 @@ does not apply here, because the `collect` list has its own component in the
 `ETag` and moves the tag by itself. Republishing would be worse than
 unnecessary: nothing in the zone depends on `cloud_disabled_at` (the hosted
 devices went a month earlier, in the commit that stamped it), so it would
-re-sign and bump a deployment-wide serial — making *every* shard refetch —
+re-sign and bump a deployment-wide serial — making *every* data plane refetch —
 because one tenant's bucket was emptied. It would also put a housekeeping call
 behind the transparency gate, where it could be held back and leave the fleet
 asked to collect the same prefix on every poll until a human noticed.

@@ -155,7 +155,7 @@ impl Replicator {
         let (ready, opened) = oneshot::channel();
         let worker = std::thread::Builder::new()
             // Named for the tenant: a stuck thread in a stack dump has to say
-            // which of a shard's tenants it belongs to.
+            // which of this pod's tenants it belongs to.
             .name(format!("ltx-{tenant}"))
             .spawn(move || serve(db_path, client, requests, ready))
             .map_err(|error| DpError::io("spawning the replication thread", error))?;

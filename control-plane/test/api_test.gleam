@@ -7,6 +7,7 @@ import api/skill
 import auth/dataplane_key
 import auth/google
 import auth/session
+import cloud/dataplane
 import dns/name as dns_name
 import dns/serve
 import dns/wire
@@ -52,6 +53,12 @@ fn harness_sized(pool_size: Int) -> Harness {
       [],
     )
   let assert Ok(#(token, live)) = session.create(conn, "u-admin", now_unix())
+  // One data plane, registered before any org exists — the order a real
+  // deployment stands up in, and the one that makes hosting a switch rather
+  // than a switch plus a ticket. A network enabled with no data plane
+  // registered is a real state and has its own test; it is not the state
+  // every other test should have to think about.
+  let assert Ok(_) = dataplane.register(conn, "dp-1", now_unix())
   let assert Ok(_) = publish.publish(conn, csk, now_unix(), "test:boot")
   sqlite.close(conn)
   let assert Ok(api_pool) = db.start_primary_pool(db_path, pool_size)
@@ -2893,10 +2900,21 @@ pub fn deleting_a_network_takes_its_join_keys_test() {
 /// Mints a data-plane key the way the operator CLI does, straight against the
 /// table: there is deliberately no HTTP route that mints one, so a test cannot
 /// go through the API to get it either.
+///
+/// The key names `dp-1`, the data plane `harness` registers.
 fn mint_dataplane(h: Harness, name: String) -> String {
+  mint_dataplane_for(h, name, "dp-1")
+}
+
+/// The same, for a named data plane — the fleet has more than one pod in the
+/// tests that are about which pod sees what. Registering is idempotent-ish
+/// here on purpose: `dp-1` already exists, and a second key for it is
+/// ordinary.
+fn mint_dataplane_for(h: Harness, name: String, dp_id: String) -> String {
   let assert Ok(conn) = db.open_primary(h.db_path)
+  let _ = dataplane.register(conn, dp_id, now_unix())
   let assert Ok(#(token, _prefix)) =
-    dataplane_key.create(conn, id.new(), name, None, now_unix())
+    dataplane_key.create(conn, id.new(), name, dp_id, None, now_unix())
   sqlite.close(conn)
   token
 }
@@ -3411,7 +3429,7 @@ pub fn closing_a_rotation_window_retires_only_the_old_key_test() {
   // The old one is already `retiring`, so a plain close is accepted — and
   // publishes nothing. A reconciler re-sends this on every rotation pass, and
   // the serial it would otherwise bump is the desired document's
-  // `generation`: a republish per pass would turn every shard's 304 into a
+  // `generation`: a republish per pass would turn every data plane's 304 into a
   // full document and re-sign the zone for a row that did not change.
   let settled = soa_serial(h)
   let repeated = retire_slot_key(h, token, "prod", old, False)
@@ -3625,6 +3643,151 @@ fn age_hold(h: Harness, network: String, seconds: Int) -> Nil {
 /// The desired-state document, as the fleet reads it.
 fn dp_document(h: Harness, token: String) -> String {
   simulate.read_body(call(h, keyed(token, Get, "/dp/v1/networks")))
+}
+
+/// The fleet decides what a data plane hosts, and one pod cannot reach
+/// another's tenant (migration v14, docs/CLOUD-DATAPLANE.md §7.2).
+///
+/// The property this replaces was rendezvous hashing done independently on
+/// each pod, whose failure was that two pods configured differently both
+/// answered "mine" and nothing noticed. So both halves are asserted here:
+/// the network appears in exactly one document, and the *other* pod is
+/// refused when it names that network directly — because a scope that were
+/// only a filter on the GET would be one any pod could step around by
+/// addressing a route.
+pub fn a_network_is_hosted_by_exactly_one_data_plane_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  // `dp-2` exists before hosting is switched on, so placement has a real
+  // choice to make and "it picked the only one there was" cannot pass for it.
+  let second = mint_dataplane_for(h, "fleet-2", "dp-2")
+  let first = mint_dataplane(h, "fleet-1")
+  assert host_network(h, "acme", "prod", True) == 200
+
+  let one = dp_document(h, first)
+  let two = dp_document(h, second)
+  assert string.contains(one, "\"prod\"") != string.contains(two, "\"prod\"")
+
+  // Whichever pod did not get it cannot register a device for it either. The
+  // refusal is a 404: on a surface that enumerates by assignment, "not yours"
+  // and "not there" are the same answer.
+  let outsider = case string.contains(one, "\"prod\"") {
+    True -> second
+    False -> first
+  }
+  let refused =
+    call(
+      h,
+      keyed(outsider, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(nk())),
+          ]),
+        ),
+    )
+  assert refused.status == 404
+}
+
+/// Placement runs once. A network that comes back inside its retention hold
+/// returns to the data plane that still holds its database stream and its
+/// bucket prefix — not to whichever pod happens to be emptiest this minute,
+/// which is how a second pod would come to open a stream the first one is
+/// still writing.
+pub fn re_enabling_hosting_keeps_the_same_data_plane_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let first = mint_dataplane(h, "fleet-1")
+  assert host_network(h, "acme", "prod", True) == 200
+  assert string.contains(dp_document(h, first), "\"prod\"")
+
+  // Off, then a second, empty pod joins the fleet — the state in which a
+  // least-loaded rule with no memory would move the tenant.
+  assert host_network(h, "acme", "prod", False) == 200
+  let second = mint_dataplane_for(h, "fleet-2", "dp-2")
+  assert host_network(h, "acme", "prod", True) == 200
+
+  assert string.contains(dp_document(h, first), "\"prod\"")
+  assert !string.contains(dp_document(h, second), "\"prod\"")
+}
+
+/// A hosted network with no data plane is hosted by nobody, and says so.
+///
+/// The safe direction, and the one that has to be stated: handing an
+/// unassigned network to whichever pod asked first would be a placement
+/// decision made by a race. The org's toggle still succeeds — an org admin
+/// cannot register a data plane and should not be failed for the deployment
+/// not having one — and the answer names the gap.
+pub fn hosting_without_a_data_plane_is_assigned_to_nobody_test() {
+  let h = harness()
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) = sqlite.exec(conn, "DELETE FROM data_planes", [])
+  sqlite.close(conn)
+
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let enabled =
+    call_json(
+      h,
+      Put,
+      "/api/orgs/acme/networks/prod/cloud-hosting/enabled",
+      json.object([#("enabled", json.bool(True))]),
+    )
+  assert enabled.status == 200
+  assert string.contains(simulate.read_body(enabled), "\"data_plane\":null")
+
+  // And once a pod exists, the next toggle places it.
+  let token = mint_dataplane(h, "fleet")
+  assert !string.contains(dp_document(h, token), "\"prod\"")
+  assert host_network(h, "acme", "prod", True) == 200
+  assert string.contains(dp_document(h, token), "\"prod\"")
 }
 
 /// The document under an `If-None-Match`, which is how the fleet actually

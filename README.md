@@ -237,9 +237,14 @@ object storage. A customer turns it on with one per-network switch in the
 control plane and needs no new protocol, no configuration and no upgrade — they
 gain a member that fetches eagerly and serves well.
 
+Each data plane is named in the control plane (`controlplane dataplane
+register dp-1`) and its key names it, so which networks a pod hosts is one
+column there rather than arithmetic each pod does for itself. The pod is told
+only where the control plane is and which token to present.
+
 ```sh
 export SYNCH_DP_CONTROL_URL=https://cp.example
-export SYNCH_DP_TOKEN=synchdp_…             # minted by `controlplane dataplane-key mint`
+export SYNCH_DP_TOKEN=synchdp_…             # `controlplane dataplane-key mint <name> --dp <dp-id>`
 export SYNCH_DP_BASE_DIR=/run/synch-dp      # ephemeral; nothing here survives a restart
 export SYNCH_DP_CAS_BACKEND=s3
 export SYNCH_DP_S3_BUCKET=synch-hosted
@@ -256,7 +261,7 @@ It runs on pods with no durable disk, so it replicates each tenant's SQLite
 database to the bucket itself — Litestream's LTX format via the `celld-ltx`
 library, driven in-process rather than by a sidecar — and restores it on every
 reschedule. Everything durable about a tenant is keyed by network rather than
-by pod, so a rescheduled shard resumes the same identities with no zone change
+by pod, so a rescheduled data plane resumes the same identities with no zone change
 at all. Those streams carry device secret keys, so give the bucket encryption
 at rest and do not grant the `db/` prefix more widely than the `tenants/` one.
 

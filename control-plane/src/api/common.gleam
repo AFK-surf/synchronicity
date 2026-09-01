@@ -108,7 +108,7 @@ pub fn check_org(
   case who.credential {
     principal.Cookie(_) -> member_org(conn, slug, who.user_id, minimum)
     principal.JoinKey(_, _, _) -> Error(middleware.join_key_refused())
-    principal.Dataplane(_) -> Error(middleware.dataplane_refused())
+    principal.Dataplane(_, _) -> Error(middleware.dataplane_refused())
     principal.ApiKey(_, key_org_id, role_text) ->
       case
         sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)])
@@ -457,7 +457,7 @@ fn credential_fields(
     // revoked" rather than "this was never an org key". There is no minter to
     // name: these are minted at the operator CLI, where the actor is the
     // machine somebody had a shell on.
-    principal.Dataplane(key_id) -> describe_dataplane_key(conn, key_id)
+    principal.Dataplane(key_id, _) -> describe_dataplane_key(conn, key_id)
   }
 }
 

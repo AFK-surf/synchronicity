@@ -186,6 +186,9 @@ pub(crate) struct BlobProtocol {
     store: Arc<Store>,
     backend: Arc<dyn synch_store::backend::CasBackend>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    /// The endpoint-wide in-flight gate, shared with every other ALPN mounted
+    /// on this endpoint (`crate::serve::Inflight`).
+    inflight: crate::serve::Inflight,
 }
 
 impl BlobProtocol {
@@ -198,7 +201,14 @@ impl BlobProtocol {
             store,
             backend,
             on_unknown_key: None,
+            inflight: None,
         }
+    }
+
+    /// Gates this handler on the endpoint-wide in-flight semaphore.
+    pub(crate) fn inflight(mut self, gate: crate::serve::Inflight) -> Self {
+        self.inflight = gate;
+        self
     }
 
     /// Rings `wake` whenever a connection is refused for an unknown key (§3.4).
@@ -215,6 +225,7 @@ impl ProtocolHandler for BlobProtocol {
             &self.store.clone(),
             connection,
             self.on_unknown_key.as_ref(),
+            &self.inflight,
             |_| std::future::ready(()),
             move |peer, mut send, mut recv| {
                 let handler = handler.clone();

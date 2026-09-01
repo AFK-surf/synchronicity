@@ -141,12 +141,26 @@ init_and_join() {
 init_and_join node-1 "$WORKDIR/node-1" "$NODE1_PORT"
 init_and_join node-2 "$WORKDIR/node-2" "$NODE2_PORT"
 init_and_join node-3 "$WORKDIR/node-3" "$NODE3_PORT"
+# The fleet is named before any org switches hosting on, which is the order a
+# real deployment stands up in: placement runs inside the enable, and a network
+# enabled while no data plane is registered is assigned to nobody by design
+# (docs/CLOUD-DATAPLANE.md §7.2).
+"${CP_BIN[@]}" dataplane register e2e-dp
+
 curl -fsS -b "$WORKDIR/cookies" -H "x-csrf: $CSRF" \
   -H 'content-type: application/json' -X PUT -d '{"enabled":true}' \
   "$CP_URL/api/orgs/acme/networks/prod/cloud-hosting/enabled" \
   > "$WORKDIR/hosting.json"
+# The enable answers which data plane took the network. Asserting it here is
+# what keeps a silent regression to "assigned to nobody" from looking like a
+# data plane that is merely slow to converge, forty lines further down.
+grep -q '"data_plane":"e2e-dp"' "$WORKDIR/hosting.json" || {
+  echo "FAIL: cloud hosting was enabled but assigned to no data plane" >&2
+  cat "$WORKDIR/hosting.json" >&2
+  exit 1
+}
 
-"${CP_BIN[@]}" dataplane-key mint e2e-fleet > "$WORKDIR/dp-key.out"
+"${CP_BIN[@]}" dataplane-key mint e2e-fleet --dp e2e-dp > "$WORKDIR/dp-key.out"
 DP_TOKEN=$(grep '^synchdp_' "$WORKDIR/dp-key.out")
 
 printf 'written only by node-1\n' > "$WORKDIR/source-1/from-node-1.txt"

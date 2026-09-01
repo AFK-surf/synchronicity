@@ -62,8 +62,121 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14]
 }
+
+/// V14: data planes are named, and this service decides what each one hosts
+/// (docs/CLOUD-DATAPLANE.md §7.2).
+///
+/// Which data plane hosts a network is a fact this service records, and the
+/// alternative worth naming is the one that looks cheaper: let each pod work
+/// its own share out by hashing the network id against a fleet size it reads
+/// from its own environment. That needs no rows and no coordination, and it
+/// has one failure no hashing fixes — **two pods that disagree about the
+/// fleet size both conclude they own a network, and nothing detects it.**
+/// They both open its database, both write its replica stream, and the
+/// loser's writes silently leave the only durable copy. The lock that would
+/// catch two writers is a `flock` on a data directory and does not span pods.
+/// One row here cannot be disagreed with.
+///
+/// **`data_planes`** is the registry, and it exists so that "which data
+/// planes are there" is a question with an answer. Placement needs one — a
+/// network cannot be assigned round-robin over a set nobody has written down
+/// — and so does the operator, who otherwise learns the fleet's shape by
+/// reading credentials. `id` is the operator's own name for the pod
+/// (`dp-1`), not a generated one: it appears in logs, in the heartbeat and
+/// in `dataplane list`, and a name an operator chose is one they can match
+/// against their own deployment.
+///
+/// **`dataplane_keys.dp_id`** is what makes a data plane's identity
+/// unforgeable rather than announced. The alternative — a fleet-wide key and
+/// an id in the pod's environment — was rejected because its failure mode is
+/// silent: a typo in that variable yields a data plane that authenticates
+/// perfectly and hosts nothing, or hosts another pod's networks, and neither
+/// shows up as an error anywhere. A key that names its data plane cannot be
+/// misconfigured; it can only be copied, which is an operator deliberately
+/// sharing a secret rather than mistyping one.
+///
+/// It is `NOT NULL`, and the table is rebuilt rather than altered to make it
+/// so. A key that names no data plane has no hosted set — every route on
+/// `/dp/v1` is scoped by it — so the column has no honest nullable state, and
+/// carrying one would mean a refusal arm in every handler for a row the
+/// schema should not permit. The keys that existed before this migration are
+/// dropped with it: there is no data plane to attribute them to, inventing
+/// one would be guessing at fleet topology, and the widest guess is the one
+/// an upgrade would most easily hide. An operator re-mints, which they must
+/// do anyway.
+///
+/// **`networks.cloud_dp_id`** is the assignment. Nullable, and NULL is a real
+/// state rather than a gap: a network whose hosting is on but which no data
+/// plane has been given is *unhosted*, and it stays that way until one is
+/// registered. That is the safe direction — nothing is hosted by accident —
+/// and `set_cloud_hosting` closes it in the ordinary case by placing the
+/// network on the least-loaded data plane as it switches hosting on.
+///
+/// Placement happens **once**. An assigned network is never moved by this
+/// service, and there is deliberately no rebalancer: moving a tenant means
+/// draining one pod's database and restoring it on another, and doing that
+/// automatically — on a signal as noisy as "the fleet looks uneven" — is how
+/// the two-writers case above gets reintroduced under a different name. A
+/// move is `dataplane assign`, run by an operator who knows the losing pod is
+/// down.
+///
+/// **`cloud_collect_queue.dp_id`** carries the assignment past the thing it
+/// describes. The queue outlives its network row on purpose (V13 says why),
+/// so it cannot look the owner up when the deletion falls due — and without
+/// an owner every data plane in the fleet would try to delete the same prefix
+/// on the same tick. `NOT NULL` for the reason the key column is: an entry
+/// nobody owns is an entry nobody sweeps, which is storage retained for ever
+/// with nothing left to say it should not be — the exact bug V13's queue
+/// exists to close.
+///
+/// **`network_hosting_status.shard` becomes `dp_id`.** The heartbeat's
+/// operational field named a pod that was interchangeable with every other
+/// one; it now names the data plane an assignment is filed against, which is
+/// the string an operator will search by. Renaming it is not tidiness — a
+/// column called `shard` invites the reader to look for a shard count.
+///
+/// **Nothing here preserves rows written before it**, and that is a
+/// deliberate reading of where this feature is rather than an oversight. The
+/// cloud data plane landed in V13, one release ago; there is no fleet in
+/// service to be compatible with, and paying for one in nullable columns and
+/// refusal arms would mean carrying the shape of a deployment that does not
+/// exist for as long as the schema does.
+const v14 = "
+CREATE TABLE data_planes (
+  id         TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 64),
+  created_at INTEGER NOT NULL
+);
+
+DROP TABLE dataplane_keys;
+CREATE TABLE dataplane_keys (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+  prefix       TEXT NOT NULL,
+  token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER,
+  dp_id        TEXT NOT NULL REFERENCES data_planes(id)
+);
+
+ALTER TABLE networks ADD COLUMN cloud_dp_id TEXT REFERENCES data_planes(id);
+CREATE INDEX networks_cloud_dp ON networks (cloud_dp_id)
+  WHERE cloud_dp_id IS NOT NULL;
+
+DROP TABLE cloud_collect_queue;
+CREATE TABLE cloud_collect_queue (
+  org_slug     TEXT NOT NULL,
+  network_name TEXT NOT NULL,
+  disabled_at  INTEGER NOT NULL,
+  dp_id        TEXT NOT NULL,
+  PRIMARY KEY (org_slug, network_name)
+);
+CREATE INDEX cloud_collect_queue_due ON cloud_collect_queue (disabled_at);
+
+ALTER TABLE network_hosting_status RENAME COLUMN shard TO dp_id;
+"
 
 /// V12: Cue integration — the map from a Cue Workspace to its org.
 ///

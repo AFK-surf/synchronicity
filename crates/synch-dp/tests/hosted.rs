@@ -30,6 +30,8 @@ const PROBE_KEY: &str = "hosted.probe";
 const PROBE_VALUE: &str = "written-while-running";
 
 const APEX: &str = "prod.acme.example";
+/// The data plane this stub says the test's token belongs to.
+const DP: &str = "dp-1";
 const ORG: &str = "acme";
 const NETWORK: &str = "prod";
 
@@ -92,6 +94,11 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
                 };
                 Json(serde_json::json!({
                     "generation": 1,
+                    // The name the control plane resolved this token to. The
+                    // real one answers it because assignment lives there now
+                    // (§7.2), and the fleet takes its own name from the
+                    // authority rather than from its own environment.
+                    "dp": DP,
                     "networks": networks,
                     "collect": cp.collect,
                 }))
@@ -216,6 +223,14 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
 
     let mut config = DpConfig::for_test(base.path(), &cp_url);
     config.net = synch_net::NetOptions::loopback();
+    // The tightest ceiling the endpoint gate accepts, held for the whole of
+    // this test. The gate is what stops one org's devices holding the blocking
+    // pool every tenant on a shard shares (§9), and the risk in having one at
+    // all is that it bounds correctness rather than only concurrency — a
+    // handler that needed two slots at once would deadlock here, and a peer
+    // exchange that needed them would never finish. So the claim this suite is
+    // built on is made to pass through the narrowest gate there is.
+    config.max_inflight_per_tenant = 1;
 
     let network = HostedNetwork {
         org: ORG.into(),
@@ -338,6 +353,13 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
         .sync_with_peer(&customer.node_id())
         .await
         .expect("one anti-entropy round with the customer");
+    // And the other way, so the tenant's *serve* path runs under the ceiling
+    // set above rather than only its client path: a gate that wedged an
+    // inbound exchange would hang here.
+    customer
+        .sync_with_peer(&hosted.node_id())
+        .await
+        .expect("one anti-entropy round driven from the customer");
     tenant
         .converge(&network, &config, &control)
         .await
@@ -383,6 +405,21 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
         "the hosted copy should be durable in the bucket"
     );
     assert!(row.complete, "and complete");
+
+    // ---- and the shard can see what it is costing the volume -----------
+    // `synch_dp_tenant_db_bytes` is the alert for the one resource nothing on
+    // a shard budgets: content is bounded twice over, but the metadata a
+    // network's members publish is bounded by neither budget, lands in one
+    // SQLite file, and shares a volume with every other tenant on the pod
+    // (`Tenant::db_bytes`). A gauge that quietly reported zero — a renamed
+    // file, a wrong sidecar suffix — would be worse than no gauge at all, so
+    // the measurement is taken against a tenant that has really written
+    // something.
+    assert!(
+        tenant.db_bytes() > 0,
+        "a running tenant's database occupies the shard's volume, and the \
+         gauge an operator alerts on has to say so"
+    );
 
     // ---- and it survives the customer losing its copy ------------------
     // The last-copy case the service exists for (§5.3). The customer's node
@@ -640,6 +677,7 @@ async fn a_stale_cache_never_authorizes_a_collection() {
     // a stale document can say, and the one it must not be believed about.
     let cached = serde_json::json!({
         "generation": 9,
+        "dp": DP,
         "networks": [],
         "collect": [{ "org": ORG, "network": NETWORK }],
     });

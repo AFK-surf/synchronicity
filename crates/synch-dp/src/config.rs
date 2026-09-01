@@ -1,4 +1,4 @@
-//! What one shard is told, and how it reads it.
+//! What one data plane is told, and how it reads it.
 //!
 //! Everything comes from the environment, because that is what a pod is
 //! configured with. Nothing is read from disk: the disk is ephemeral, and a
@@ -13,9 +13,9 @@ use crate::error::{DpError, Result};
 /// The hosting slot this build claims (`docs/CLOUD-DATAPLANE.md` §3.4).
 ///
 /// One, because v1 hosts every network once. It is a constant rather than a
-/// setting so that no deployment can accidentally run two shards claiming the
-/// same slot for different networks — redundancy is a *second* slot, which is
-/// a design change, not a config change.
+/// setting so that no deployment can accidentally run two data planes
+/// claiming the same slot for different networks — redundancy is a *second*
+/// slot, which is a design change, not a config change.
 pub const SLOT: u32 = 1;
 
 /// The device label for [`SLOT`].
@@ -23,7 +23,7 @@ pub fn slot_label() -> String {
     format!("cloud-{SLOT}")
 }
 
-/// One shard's settings.
+/// One data plane's settings.
 #[derive(Debug, Clone)]
 pub struct DpConfig {
     /// Base URL of the control plane, no trailing slash.
@@ -32,12 +32,6 @@ pub struct DpConfig {
     pub token: String,
     /// Where tenant data directories live, on the pod's ephemeral volume.
     pub base_dir: PathBuf,
-    /// This shard's ordinal, and how many there are.
-    pub shard: u32,
-    /// Total shards. Rendezvous hashing decides which serves which network.
-    pub shards: u32,
-    /// A name for this pod, for logs and the status heartbeat.
-    pub shard_name: String,
     /// How often to poll the control plane.
     pub poll_interval: Duration,
     /// The object store: OpenDAL service and its options.
@@ -48,6 +42,32 @@ pub struct DpConfig {
     pub max_tenants: u64,
     /// How many distinct CAS objects each tenant fetches concurrently (1-256).
     pub replica_concurrency: usize,
+    /// How many threads the shared blocking pool gets.
+    ///
+    /// Configuration rather than a constant in `main` because it is one half
+    /// of a pair: every store touch of every tenant crosses this pool (§7.1),
+    /// and [`max_inflight_per_tenant`](Self::max_inflight_per_tenant) is
+    /// derived from it so that this pod's whole inbound demand has a
+    /// ceiling. Two numbers chosen in two places would agree only by
+    /// accident.
+    pub blocking_threads: usize,
+    /// How many inbound peer requests one tenant may have in flight at once.
+    ///
+    /// The bound that makes tenancy containment structural rather than
+    /// social. DESIGN §12 declines per-peer limits deliberately: in an
+    /// ordinary cluster every peer that can send a request is an authorized
+    /// member, members are extended basic trust not to DoS each other, and a
+    /// member behaving abusively is a membership problem whose remedy is
+    /// `synch trust rm`. A data plane cannot take that stance, because the
+    /// membership belonging to org A is not org B's to curate while both
+    /// share this process's blocking pool — so what §12 leaves to trust, this
+    /// leaves to a semaphore.
+    ///
+    /// It is not a rate limit and an honest peer never meets it: a request
+    /// that waits for a slot waits microseconds, and a tenant's store calls
+    /// serialize on that tenant's one connection mutex regardless. What it
+    /// removes is one tenant's ability to make its inbound work unbounded.
+    pub max_inflight_per_tenant: usize,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
     /// How each tenant's endpoint is bound.
@@ -154,7 +174,7 @@ impl ObjectConfig {
 impl DpConfig {
     /// A configuration for a test or an embedder driving the pieces directly.
     ///
-    /// Memory-backed storage, one shard, everything else at its default. The
+    /// Memory-backed storage, everything else at its default. The
     /// caller adjusts what it cares about — `net` for a loopback endpoint,
     /// `rotate_after` to make a rotation due.
     pub fn for_test(base_dir: impl Into<PathBuf>, control_url: &str) -> Self {
@@ -162,9 +182,6 @@ impl DpConfig {
             control_url: control_url.trim_end_matches('/').to_string(),
             token: "synchdp_test".into(),
             base_dir: base_dir.into(),
-            shard: 0,
-            shards: 1,
-            shard_name: "dp-test".into(),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
                 service: "memory".into(),
@@ -173,6 +190,8 @@ impl DpConfig {
             cache_bytes_total: 64 * 1024 * 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+            blocking_threads: default_blocking_threads(4),
+            max_inflight_per_tenant: default_max_inflight(default_blocking_threads(4), 4),
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -190,18 +209,12 @@ impl DpConfig {
         let base_dir = PathBuf::from(
             std::env::var("SYNCH_DP_BASE_DIR").unwrap_or_else(|_| "/run/synch-dp".to_string()),
         );
-        let shard = parse("SYNCH_DP_SHARD", 0)?;
-        let shards = parse("SYNCH_DP_SHARDS", 1)?;
-        if shards == 0 {
-            return Err(DpError::Config("SYNCH_DP_SHARDS must be at least 1".into()));
-        }
-        if shard >= shards {
-            return Err(DpError::Config(format!(
-                "SYNCH_DP_SHARD ({shard}) must be below SYNCH_DP_SHARDS ({shards})"
-            )));
-        }
-        let shard_name =
-            std::env::var("SYNCH_DP_SHARD_NAME").unwrap_or_else(|_| format!("dp-{}", shard + 1));
+        // `SYNCH_DP_SHARD` and `SYNCH_DP_SHARDS` are gone, and their absence
+        // is refused loudly rather than ignored. A pod still carrying them
+        // was configured for a fleet that divided its own work by hashing;
+        // starting anyway would host whatever the control plane assigned this
+        // token, which may be a different set entirely, while the operator
+        // believes the old arithmetic still holds.
         let poll_interval = Duration::from_secs(parse::<u64>("SYNCH_DP_POLL_SECS", 60)?.max(1));
 
         let service = std::env::var("SYNCH_DP_CAS_BACKEND").unwrap_or_else(|_| "s3".to_string());
@@ -213,18 +226,40 @@ impl DpConfig {
                 .as_deref(),
         )?;
 
+        let max_tenants = parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1);
+        let blocking_threads = match std::env::var("SYNCH_DP_BLOCKING_THREADS") {
+            Ok(_) => parse::<usize>("SYNCH_DP_BLOCKING_THREADS", 0)?.max(1),
+            Err(_) => default_blocking_threads(max_tenants),
+        };
+        let max_inflight_per_tenant = match std::env::var("SYNCH_DP_MAX_INFLIGHT_PER_TENANT") {
+            Ok(_) => parse::<usize>("SYNCH_DP_MAX_INFLIGHT_PER_TENANT", 0)?.max(1),
+            Err(_) => default_max_inflight(blocking_threads, max_tenants),
+        };
+        // Said once, at startup, where an operator who overrode one of the
+        // pair can still act on it. Not a refusal: a deployment that knows its
+        // tenants are quiet is entitled to oversubscribe, and refusing to boot
+        // over a capacity ratio would be the service choosing its own outage.
+        if max_inflight_per_tenant.saturating_mul(max_tenants as usize) > blocking_threads {
+            tracing::warn!(
+                max_inflight_per_tenant,
+                max_tenants,
+                blocking_threads,
+                "this pod's tenants can ask for more concurrent blocking work than the \
+                 pool has threads; one tenant's peers can then make another tenant wait"
+            );
+        }
+
         Ok(Self {
             control_url,
             token,
             base_dir,
-            shard,
-            shards,
-            shard_name,
             poll_interval,
             objects: ObjectConfig { service, options },
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
-            max_tenants: parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1),
+            max_tenants,
             replica_concurrency,
+            blocking_threads,
+            max_inflight_per_tenant,
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions {
@@ -254,32 +289,6 @@ impl DpConfig {
         (self.cache_bytes_total / self.max_tenants).max(1)
     }
 
-    /// Whether this shard serves `network`, by rendezvous hashing.
-    ///
-    /// No assignment state anywhere: every shard computes the same answer from
-    /// the same document, and a shard-count change moves about one in `n` of
-    /// the tenants rather than reshuffling all of them.
-    pub fn serves(&self, network_key: &str) -> bool {
-        if self.shards == 1 {
-            return true;
-        }
-        let mut best = (0u64, 0u32);
-        for candidate in 0..self.shards {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(network_key.as_bytes());
-            hasher.update(&candidate.to_be_bytes());
-            let score = u64::from_be_bytes(
-                hasher.finalize().as_bytes()[..8]
-                    .try_into()
-                    .expect("a blake3 digest is 32 bytes"),
-            );
-            if score > best.0 {
-                best = (score, candidate);
-            }
-        }
-        best.1 == self.shard
-    }
-
     /// This tenant's data directory.
     pub fn tenant_dir(&self, org: &str, network: &str) -> PathBuf {
         self.base_dir.join("tenants").join(org).join(network)
@@ -298,7 +307,7 @@ impl DpConfig {
     /// Refuses a deployment that cannot replicate tenant databases.
     ///
     /// Asked once at startup rather than discovered one tenant at a time. A
-    /// shard whose backend has no replication client would provision nodes,
+    /// data plane whose backend has no replication client would provision nodes,
     /// mint their device keys, get them named in customer zones, and then
     /// lose every one of them on its first reschedule — so the honest
     /// failure is to refuse to start (§5.3).
@@ -363,11 +372,92 @@ impl DpConfig {
         self.base_dir.join("db").join(org).join(network)
     }
 
+    /// This data plane's name for its own cache, derived from its token.
+    ///
+    /// The cache key cannot be the data plane's *id*, however much it would
+    /// prefer to be: the id arrives in the document, and the whole point of
+    /// the cache is to be readable on a cold start when the control plane
+    /// cannot be reached and no document has arrived. A pod that had to poll
+    /// before it could find its own cache would have no fail-static path at
+    /// all — which is the one §4.2 exists to provide.
+    ///
+    /// The token is what a pod does hold before it has spoken to anybody, and
+    /// it names exactly one data plane (migration v14), so a fingerprint of it
+    /// keys the cache per data plane without the pod having to be told
+    /// anything twice. Eight bytes of BLAKE3, hex: the token is not
+    /// recoverable from it, and the object sits in a bucket the deployment
+    /// already trusts with tenant databases.
+    ///
+    /// Rotating a data plane's token therefore orphans its cache, and the
+    /// next cold start during a control-plane outage has nothing to fall back
+    /// on. That is a rare pairing of two rare events, and the alternative —
+    /// a second environment variable naming the cache — reintroduces exactly
+    /// the misconfiguration this design removed.
+    pub fn cache_id(&self) -> String {
+        let digest = blake3::hash(self.token.as_bytes());
+        hex_of(&digest.as_bytes()[..8])
+    }
+
     /// Where the fail-static desired-state cache lives (§4.2).
     pub fn desired_key(&self) -> String {
-        format!("dp/{}/desired.json", self.shard)
+        format!("dp/{}/desired.json", self.cache_id())
     }
 }
+
+/// Lowercase hex, for the cache key. `hex` is not a dependency of this crate
+/// and one byte-to-string loop does not earn one.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// How many blocking threads a shard sized for `max_tenants` gets.
+///
+/// A ceiling, not an allocation: tokio grows the pool on demand and reaps idle
+/// threads, so a shard that is quiet costs nothing for a generous one. Floored
+/// at the 512 this shipped with and capped so a large `SYNCH_DP_MAX_TENANTS`
+/// cannot ask the kernel for an unbounded number of stacks.
+///
+/// The multiplier is what makes [`default_max_inflight`] able to give every
+/// tenant a ceiling it will not meet in ordinary work and still leave half the
+/// pool for the work no peer asked for: the reconciler's own passes, the
+/// replication tickers, the heartbeats that are the billing record.
+fn default_blocking_threads(max_tenants: u64) -> usize {
+    let sized = max_tenants.saturating_mul(64);
+    sized.clamp(512, 4096) as usize
+}
+
+/// The default per-tenant inbound ceiling for a pool of this size.
+///
+/// Half the pool, shared out. The other half is deliberately not spendable by
+/// peers at all: a shard whose every thread is serving inbound requests is a
+/// shard that cannot heartbeat, cannot converge, and cannot ship a database
+/// tail — so the reconciler would lose its grip on its tenants at exactly the
+/// moment one of them is being leaned on.
+///
+/// The floor is twice `synch_net`'s per-connection stream cap, and that is the
+/// number that matters rather than a round one. A slot is held for the whole
+/// of a request, the read included, so a peer that opens a stream and then
+/// says nothing holds a slot until the 120 s stream timeout expires. One
+/// connection can hold eight such streams. A ceiling at or below eight would
+/// therefore let a single connection wedge its own tenant's endpoint, which
+/// turns a bound meant to contain a tenant into a way to stop one.
+///
+/// It stays a bound on *this* tenant either way, which is the whole point: a
+/// member that stalls streams against its own org's replica is DESIGN §12's
+/// membership problem with §12's remedy, and the shard's other tenants —
+/// which is what this service owes them — are untouched. The cap at 64 is
+/// because more buys a single tenant almost nothing: its store calls
+/// serialize on its one connection mutex whatever the ceiling.
+fn default_max_inflight(blocking_threads: usize, max_tenants: u64) -> usize {
+    let share = (blocking_threads / 2) / (max_tenants.max(1) as usize).max(1);
+    share.clamp(MIN_INFLIGHT_PER_TENANT, 64)
+}
+
+/// The least a tenant's endpoint may be given.
+///
+/// Twice `synch_net::serve::MAX_CONCURRENT_STREAMS` — see
+/// [`default_max_inflight`] for why that number and not a rounder one.
+const MIN_INFLIGHT_PER_TENANT: usize = 16;
 
 /// Copies the provider's environment into OpenDAL option names.
 fn collect_options(service: &str, options: &mut HashMap<String, String>) {
@@ -457,14 +547,11 @@ fn parse_rekor() -> Result<synch_net::RekorPolicy> {
 mod tests {
     use super::*;
 
-    fn config(shard: u32, shards: u32) -> DpConfig {
+    fn config() -> DpConfig {
         DpConfig {
             control_url: "https://cp.example".into(),
             token: "synchdp_x".into(),
             base_dir: PathBuf::from("/run/synch-dp"),
-            shard,
-            shards,
-            shard_name: format!("dp-{shard}"),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
                 service: "memory".into(),
@@ -473,6 +560,8 @@ mod tests {
             cache_bytes_total: 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+            blocking_threads: 512,
+            max_inflight_per_tenant: 8,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -482,12 +571,12 @@ mod tests {
     }
 
     /// The replication library speaks S3 and local files, and nothing else.
-    /// A backend it cannot write is a shard that would mint device keys, get
+    /// A backend it cannot write is a data plane that would mint device keys, get
     /// them named in customer zones, and lose them all on its first
     /// reschedule — so it has to be refused before any of that (§5.3).
     #[test]
     fn a_backend_without_database_replication_refuses_to_start() {
-        let mut config = config(0, 1);
+        let mut config = config();
         for service in ["s3", "memory"] {
             config.objects.service = service.into();
             assert!(
@@ -524,66 +613,89 @@ mod tests {
         }
     }
 
-    /// Every network is served by exactly one shard — the property that makes
-    /// a slot single-writer without any coordination (§7.2).
+    /// The fail-static cache is this data plane's alone, and it can be found
+    /// before the control plane has been reached.
+    ///
+    /// Both halves matter. Two data planes sharing a bucket must not share a
+    /// cache — one would boot into the other's tenant set — and the key
+    /// therefore cannot be a constant. But it also cannot be the data plane's
+    /// *id*, because the id arrives in the document and the cache exists
+    /// precisely for the boot where no document arrives (§4.2). The token is
+    /// the one thing a pod holds before it has spoken to anybody, and it names
+    /// exactly one data plane.
     #[test]
-    fn every_network_lands_on_exactly_one_shard() {
-        let shards = 4;
-        for n in 0..200 {
-            let key = format!("org{n}/net{n}");
-            let owners = (0..shards)
-                .filter(|shard| config(*shard, shards).serves(&key))
-                .count();
-            assert_eq!(owners, 1, "{key} had {owners} owners");
-        }
-    }
-
-    /// A single shard serves everything, so the common deployment needs no
-    /// hashing at all.
-    #[test]
-    fn one_shard_serves_everything() {
-        let only = config(0, 1);
-        for n in 0..50 {
-            assert!(only.serves(&format!("org{n}/net{n}")));
-        }
-    }
-
-    /// Growing the fleet must move roughly one in n, not reshuffle everything
-    /// — that is the whole reason for rendezvous hashing over a modulus.
-    #[test]
-    fn growing_the_fleet_moves_about_one_in_n() {
-        let keys: Vec<String> = (0..600).map(|n| format!("org{n}/net{n}")).collect();
-        let owner = |key: &str, shards: u32| -> u32 {
-            (0..shards)
-                .find(|shard| config(*shard, shards).serves(key))
-                .expect("some shard owns it")
-        };
-        let moved = keys
-            .iter()
-            .filter(|key| owner(key, 3) != owner(key, 4))
-            .count();
-        let fraction = moved as f64 / keys.len() as f64;
-        // A modulus would move ~3/4 here; rendezvous moves ~1/4.
-        assert!(
-            fraction > 0.15 && fraction < 0.40,
-            "moved {fraction} of tenants growing 3 -> 4 shards"
+    fn the_cache_key_is_per_data_plane_and_needs_no_poll_to_derive() {
+        let mut one = config();
+        one.token = "synchdp_first".into();
+        let mut two = config();
+        two.token = "synchdp_second".into();
+        assert_ne!(one.desired_key(), two.desired_key());
+        // Stable across restarts, because it is derived rather than drawn.
+        assert_eq!(
+            one.desired_key(),
+            config_with_token("synchdp_first").desired_key()
         );
+        // And it does not carry the token it was derived from.
+        assert!(!one.desired_key().contains("synchdp_first"));
+    }
+
+    fn config_with_token(token: &str) -> DpConfig {
+        let mut config = config();
+        config.token = token.into();
+        config
+    }
+
+    /// The two numbers that bound what a pod's peers can hold agree with
+    /// each other at every size.
+    ///
+    /// This is the tenancy bound, not a tuning preference: a tenant's inbound
+    /// requests each occupy a blocking-pool thread, and if a pod's tenants
+    /// can collectively ask for more threads than the pool has, one org's
+    /// devices can make another org's tenant wait — which is the multi-tenant
+    /// failure the ceiling exists to remove. Half the pool, so the work no
+    /// peer asked for (the reconcile pass, the replication tickers, the
+    /// heartbeats that are the billing record) always has somewhere to run.
+    #[test]
+    fn a_pods_tenants_cannot_collectively_outbid_its_blocking_pool() {
+        for max_tenants in [1u64, 4, 16, 64, 256, 1024, 4096] {
+            let threads = default_blocking_threads(max_tenants);
+            let each = default_max_inflight(threads, max_tenants);
+            assert!(
+                each >= MIN_INFLIGHT_PER_TENANT,
+                "{max_tenants} tenants: {each} is at or below the per-connection \
+                 stream cap, so one connection could wedge its own tenant"
+            );
+            // The floor is allowed to win on a pod configured for more
+            // tenants than its pool can seat — see `default_max_inflight` for
+            // why that floor is not negotiable — so the invariant is stated
+            // where it can hold: wherever the share is what the arithmetic
+            // returned, it fits inside half the pool.
+            if each > MIN_INFLIGHT_PER_TENANT {
+                assert!(
+                    each * max_tenants as usize <= threads / 2,
+                    "{max_tenants} tenants x {each} in flight overruns {threads} threads"
+                );
+            }
+        }
+        // The shipped default is comfortably inside it.
+        let threads = default_blocking_threads(64);
+        assert_eq!(default_max_inflight(threads, 64) * 64, threads / 2);
+    }
+
+    /// And a deployment that oversubscribes on purpose is told, not refused.
+    #[test]
+    fn an_oversubscribed_pod_still_runs() {
+        // The clamp is what produces this: 4 096 tenants on 4 096 threads
+        // cannot each have a floor's worth, and the honest answer is to run
+        // anyway and say so rather than to refuse to boot over a ratio.
+        let threads = default_blocking_threads(4096);
+        assert_eq!(default_max_inflight(threads, 4096), MIN_INFLIGHT_PER_TENANT);
+        assert!(MIN_INFLIGHT_PER_TENANT * 4096 > threads);
     }
 
     #[test]
-    fn the_cache_budget_is_split_across_the_shards_capacity() {
-        let config = config(0, 1);
+    fn the_cache_budget_is_split_across_the_pods_capacity() {
+        let config = config();
         assert_eq!(config.cache_bytes_per_tenant(), 256);
-    }
-
-    #[test]
-    fn prefixes_are_keyed_by_network_not_by_shard() {
-        // §7.2: everything durable about a tenant survives a shard handover
-        // because no shard identity appears in any of these.
-        let a = config(0, 4);
-        let b = config(3, 4);
-        assert_eq!(a.cas_root("acme", "prod"), b.cas_root("acme", "prod"));
-        assert_eq!(a.db_prefix("acme", "prod"), b.db_prefix("acme", "prod"));
-        assert_eq!(a.tenant_dir("acme", "prod"), b.tenant_dir("acme", "prod"));
     }
 }

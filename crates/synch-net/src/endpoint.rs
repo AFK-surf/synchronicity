@@ -138,6 +138,34 @@ pub struct NetOptions {
     /// a socket that proxies is supposed to be long-lived. `None` is the
     /// default bound.
     pub sockets_open_timeout: Option<std::time::Duration>,
+    /// How many inbound requests this endpoint may have in flight at once,
+    /// across every connection and every ALPN it serves.
+    ///
+    /// `None` — the default, and the daemon's setting — leaves the only bound
+    /// the per-connection one (`serve::MAX_CONCURRENT_STREAMS`), which is
+    /// DESIGN §12's deliberate stance: a peer that can send a request at all is
+    /// an authorized member of *this* cluster, members are extended basic trust
+    /// not to DoS each other, and a member behaving abusively is a membership
+    /// problem with a membership remedy.
+    ///
+    /// That stance does not survive being embedded. A process serving several
+    /// clusters that do not trust each other — the cloud data plane, one node
+    /// per hosted network (`docs/CLOUD-DATAPLANE.md` §4.1) — shares one tokio
+    /// blocking pool between all of them, and every request handler on both
+    /// ALPNs offloads its store work onto it. Nothing caps how many connections
+    /// one peer opens, so a single member of one cluster can hold the whole
+    /// pool: the store calls serialize on that node's one connection mutex, so
+    /// the threads are spent *waiting*, and every other tenant's publishing,
+    /// membership renewal and heartbeat queues behind them. The remedy §12
+    /// names is unavailable there — org A's membership is not org B's to
+    /// curate — so an embedder in that position sets a ceiling instead, and the
+    /// containment becomes structural rather than social.
+    ///
+    /// It is a bound on concurrency, not a rate limit: an honest peer never
+    /// notices one, because a request that has to wait for a slot waits
+    /// microseconds. What it removes is the ability to make one endpoint's
+    /// inbound work unbounded.
+    pub max_inflight_requests: Option<usize>,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -359,6 +387,14 @@ impl Net {
                 })
             })?;
 
+        // One gate for the endpoint, shared by every ALPN mounted on it: the
+        // resource it protects — the process's blocking pool — is shared too,
+        // so a per-protocol cap would be three caps that add up to nothing in
+        // particular.
+        let inflight: crate::serve::Inflight = options
+            .max_inflight_requests
+            .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
+
         let router = Router::builder(endpoint)
             .accept(
                 ALPN_MPT,
@@ -369,7 +405,8 @@ impl Net {
                         .clone()
                         .unwrap_or_else(|| Arc::new(RefuseHeads) as Arc<dyn crate::HeadSink>),
                 )
-                .on_unknown_key(options.on_unknown_key.clone()),
+                .on_unknown_key(options.on_unknown_key.clone())
+                .inflight(inflight.clone()),
             )
             .accept(
                 ALPN_BLOB,
@@ -379,7 +416,8 @@ impl Net {
                         Arc::new(synch_store::backend::LocalFs::new(store.clone()))
                     }),
                 )
-                .on_unknown_key(options.on_unknown_key.clone()),
+                .on_unknown_key(options.on_unknown_key.clone())
+                .inflight(inflight.clone()),
             );
         let sockets = options.sockets.clone().map(|service| {
             crate::sock::SockProtocol::new(
@@ -390,6 +428,7 @@ impl Net {
                     .unwrap_or(crate::serve::STREAM_TIMEOUT),
             )
             .on_unknown_key(options.on_unknown_key.clone())
+            .inflight(inflight.clone())
         });
         let router = match &sockets {
             Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),
