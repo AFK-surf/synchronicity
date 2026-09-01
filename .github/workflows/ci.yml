@@ -213,8 +213,11 @@ jobs:
           build-args: --wfail
           test: false
           use-mathlib-cache: false
-          nanoda: true
-          nanoda-allow-sorry: false
+          # Recheck every compiled declaration with Lean's standalone kernel
+          # checker, then reject sorryAx and any unapproved custom axiom.
+          leanchecker: true
+          leanchecker-args: Synchronicity
+          axiom-audit: true
       - name: Check Rust/Lean implementation anchors
         run: specs/lean/check-anchors.sh
 
