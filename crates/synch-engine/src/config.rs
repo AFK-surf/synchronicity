@@ -16,6 +16,8 @@ pub const DEFAULT_REPLICA_CONCURRENCY: usize = 16;
 /// and connection storm rather than useful throughput.
 pub const MAX_REPLICA_CONCURRENCY: usize = 256;
 
+const _: () = assert!(DEFAULT_REPLICA_CONCURRENCY <= MAX_REPLICA_CONCURRENCY);
+
 /// Where a node's data directory lives by default (§10).
 pub fn default_data_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("", "", "synchronicity")
@@ -214,6 +216,5 @@ mod tests {
             DEFAULT_REPLICA_CONCURRENCY
         );
         assert_eq!(DEFAULT_REPLICA_CONCURRENCY, 16);
-        assert!(DEFAULT_REPLICA_CONCURRENCY <= MAX_REPLICA_CONCURRENCY);
     }
 }
