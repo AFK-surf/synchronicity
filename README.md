@@ -192,7 +192,8 @@ and peer content it pins. Use `own` to upload only locally created content, or
 `SYNCH_CAS_CACHE_BYTES` is a maintenance target, not a per-request hard limit;
 on Unix, omitting it targets at least 20% free space.
 Replica convergence fetches 16 distinct CAS objects concurrently by default;
-set `SYNCH_REPLICA_CONCURRENCY` or `--replica-concurrency` to tune that bound.
+set `SYNCH_REPLICA_CONCURRENCY` or `--replica-concurrency` to tune it from 1 to
+256.
 
 For production deployment:
 

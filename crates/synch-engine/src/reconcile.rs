@@ -1793,16 +1793,14 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
-    /// Merges another peer exchange into one anti-entropy round's report.
-    pub(crate) fn merge(&mut self, other: SyncReport) {
-        self.heads_pushed += other.heads_pushed;
-        self.heads_accepted += other.heads_accepted;
-        self.heads_rejected += other.heads_rejected;
-        self.tries_completed += other.tries_completed;
-        self.heads_abandoned += other.heads_abandoned;
-        for origin in other.failed_origins {
-            self.left_behind(&origin);
-        }
+    /// Whether this exchange completed locally visible state.
+    ///
+    /// Pushing heads advances the peer, accepting a pending head only records a
+    /// pointer, and abandoning or refusing one merely unwedges the slot. None
+    /// stops periodic fallback to another candidate; only a completed trie has
+    /// moved what local readers can observe.
+    pub(crate) fn made_local_progress(&self) -> bool {
+        self.tries_completed > 0
     }
 
     /// Records that this origin was left behind, once however often it is said.

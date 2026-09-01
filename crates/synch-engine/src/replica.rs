@@ -49,13 +49,6 @@ const MIN_BACKOFF: Duration = Duration::from_secs(60);
 /// The longest, reached after a handful of failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(6 * 3600);
 
-/// Ready candidates held behind the rolling concurrency slots.
-///
-/// Large enough that one slow slot cannot empty the queue, bounded so a pass
-/// still returns to publish claims and re-read policy while bootstrapping a
-/// very large space.
-const FETCH_WINDOW_MULTIPLIER: usize = 8;
-
 /// What one sweep did to one space.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -375,7 +368,6 @@ impl Node {
     async fn fetch_wants(&self, only: Option<PinHolder>) -> Result<FetchReport> {
         let mut report = FetchReport::default();
         let limit = self.config().replica_concurrency.max(1);
-        let window = limit.saturating_mul(FETCH_WINDOW_MULTIPLIER);
         // Candidates are drawn per holder and then ranked together. One global
         // queue ordered by age would let a space with a large old backlog
         // starve every other replica outright, and would leave the
@@ -424,9 +416,6 @@ impl Node {
                 continue;
             };
             if matches!(want.holder, PinHolder::Source(_)) {
-                if admitted.len() >= window {
-                    break;
-                }
                 admitted.push(WantPlan { want, space });
                 continue;
             }
@@ -440,7 +429,6 @@ impl Node {
                     let (root, holder) = (want.root, want.holder.clone());
                     crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
                 }
-                Some(_) if admitted.len() >= window => break,
                 Some((held, budget)) if held.saturating_add(want.size) > *budget => {
                     // Skipped, not stopped: a smaller want further down still
                     // fits, and rejecting one must not end the pass. Nothing is
@@ -462,8 +450,10 @@ impl Node {
         // and the knob is named for it. Fixed batches make one dead provider's
         // timeout a barrier in front of every later object; refilling a slot as
         // soon as its object finishes contains that failure to one slot.
-        let outcomes = crate::join::futures_buffered(
-            admitted.iter().enumerate().map(|(i, plan)| async move {
+        let queued: Vec<_> = admitted
+            .iter()
+            .enumerate()
+            .map(|(i, plan)| async move {
                 let held = self
                     .hold_object(
                         &plan.want.root,
@@ -475,10 +465,9 @@ impl Node {
                 // Completion order differs from input order. Carry the
                 // index so each failure is recorded against its own want.
                 (i, held)
-            }),
-            limit,
-        )
-        .await;
+            })
+            .collect();
+        let outcomes = crate::join::futures_buffered(queued, limit).await;
 
         for (i, outcome) in outcomes {
             let plan = &admitted[i];

@@ -46,7 +46,7 @@ pub struct DpConfig {
     pub cache_bytes_total: u64,
     /// How many tenants this pod is sized for. Divides the cache budget.
     pub max_tenants: u64,
-    /// How many distinct CAS objects each tenant fetches concurrently.
+    /// How many distinct CAS objects each tenant fetches concurrently (1-256).
     pub replica_concurrency: usize,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
@@ -424,6 +424,12 @@ fn replica_concurrency(value: Option<&str>) -> Result<usize> {
         Ok(0) => Err(DpError::Config(
             "SYNCH_DP_REPLICA_CONCURRENCY must be at least 1".into(),
         )),
+        Ok(value) if value > synch_engine::MAX_REPLICA_CONCURRENCY => {
+            Err(DpError::Config(format!(
+                "SYNCH_DP_REPLICA_CONCURRENCY must be at most {}",
+                synch_engine::MAX_REPLICA_CONCURRENCY
+            )))
+        }
         Ok(value) => Ok(value),
         Err(_) => Err(DpError::Config(format!(
             "SYNCH_DP_REPLICA_CONCURRENCY is not a number: {value}"
@@ -508,7 +514,8 @@ mod tests {
             synch_engine::DEFAULT_REPLICA_CONCURRENCY
         );
         assert_eq!(replica_concurrency(Some(" 23 ")).unwrap(), 23);
-        for invalid in ["0", "many"] {
+        let too_large = (synch_engine::MAX_REPLICA_CONCURRENCY + 1).to_string();
+        for invalid in ["0", "many", &too_large] {
             let error = replica_concurrency(Some(invalid)).unwrap_err();
             assert!(
                 error.to_string().contains("SYNCH_DP_REPLICA_CONCURRENCY"),

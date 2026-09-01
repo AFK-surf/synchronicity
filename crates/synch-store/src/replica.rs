@@ -230,6 +230,9 @@ impl Store {
         limit: usize,
         rotate: usize,
     ) -> Result<Vec<WantRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         // Ranked within a space, then interleaved across them. Ranking the
         // pooled candidates globally is what §3.3 first specified and it
         // starves: a space bootstrapping four million equally-rare objects
@@ -237,37 +240,33 @@ impl Store {
         // added afterwards fetches nothing until the first one drains — months,
         // at four objects a pass. Rarity is the right order *within* a space;
         // between spaces the only defensible order is a turn each.
-        let mut per_space = Vec::new();
-        // Source repair is first: a published own entry is a stronger promise
-        // than filling out an additional replica copy.
+        let mut holders = Vec::new();
         for source in self.sources()? {
-            let holder = PinHolder::Source(source.space);
-            let ready = self.wants_ready_of(
-                &holder,
-                now,
-                min_backoff,
-                max_backoff,
-                limit * RARITY_WINDOW,
-            )?;
-            if !ready.is_empty() {
-                per_space.push(self.rank_rarest_first(ready)?.into_iter());
-            }
+            holders.push(PinHolder::Source(source.space));
         }
         for space in self.replicas()? {
-            let ready = self.wants_ready_of(
-                &space.holder(),
-                now,
-                min_backoff,
-                max_backoff,
-                limit * RARITY_WINDOW,
-            )?;
+            holders.push(space.holder());
+        }
+        let holder_count = holders.len();
+        if holder_count > 0 {
+            holders.rotate_left(rotate % holder_count);
+        }
+        // Engine-side policy decides whether a ready want fits its holder's
+        // remaining budget, so every holder must contribute at least one
+        // candidate in this pass. Otherwise empty, backed-off, or over-budget
+        // holders inside an early slice hide healthy work behind them. Divide
+        // the rolling window between all holders instead of asking every one
+        // for a full window: candidate memory is O(holders + window), not the
+        // old O(holders * window).
+        let window = limit.saturating_mul(RARITY_WINDOW);
+        let per_holder_limit = window.div_ceil(holders.len().max(1)).max(1);
+        let mut per_space = Vec::with_capacity(holders.len());
+        for holder in holders {
+            let ready =
+                self.wants_ready_of(&holder, now, min_backoff, max_backoff, per_holder_limit)?;
             if !ready.is_empty() {
                 per_space.push(self.rank_rarest_first(ready)?.into_iter());
             }
-        }
-        let spaces = per_space.len();
-        if spaces > 0 {
-            per_space.rotate_left(rotate % spaces);
         }
         // Interleaved, not truncated: the caller may decline some — a want
         // larger than a space's remaining budget, say — so it is handed a
@@ -305,8 +304,13 @@ impl Store {
         max_backoff: i64,
         limit: usize,
     ) -> Result<Vec<WantRow>> {
-        let ready =
-            self.wants_ready_of(holder, now, min_backoff, max_backoff, limit * RARITY_WINDOW)?;
+        let ready = self.wants_ready_of(
+            holder,
+            now,
+            min_backoff,
+            max_backoff,
+            limit.saturating_mul(RARITY_WINDOW),
+        )?;
         self.rank_rarest_first(ready)
     }
 
@@ -1287,6 +1291,59 @@ mod tests {
             ids.len(),
             "every space must lead the interleave within one turn of the list; \
              served: {served:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_work_is_bounded_globally_across_holders() {
+        let (_dir, store) = store();
+        for id in ["a", "b", "c", "d", "e", "f"] {
+            configure_replica(&store, id);
+            let holder = PinHolder::Replica(id.to_string());
+            for n in 0..20u8 {
+                store
+                    .stage_want(
+                        &synch_core::Hash::new(&[id.as_bytes()[0], n]),
+                        &holder,
+                        10,
+                        None,
+                        i64::from(n),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let limit = 2;
+        let batch = store
+            .wants_to_attempt(1_000_000, 60, 3600, limit, 0)
+            .unwrap();
+        let mut holders: Vec<&PinHolder> = Vec::new();
+        for want in &batch {
+            if !holders.contains(&&want.holder) {
+                holders.push(&want.holder);
+            }
+        }
+        assert!(
+            batch.len() <= limit * RARITY_WINDOW + holders.len(),
+            "candidate rows must be linear in the holder count plus the global window"
+        );
+        assert_eq!(holders.len(), 6, "every ready holder must remain visible");
+    }
+
+    #[test]
+    fn empty_holders_do_not_hide_ready_work_outside_the_slot_count() {
+        let (_dir, store) = store();
+        for id in ["a", "b", "c"] {
+            configure_replica(&store, id);
+        }
+        let ready = PinHolder::Replica("c".to_string());
+        let root = synch_core::Hash::new(b"ready behind two empty holders");
+        store.stage_want(&root, &ready, 10, None, 1).unwrap();
+
+        let batch = store.wants_to_attempt(1_000_000, 60, 3600, 2, 0).unwrap();
+        assert!(
+            batch.iter().any(|want| want.root == root),
+            "empty holders inside the nominal slot count must not postpone a ready holder"
         );
     }
 

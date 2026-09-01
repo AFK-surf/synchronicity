@@ -429,8 +429,9 @@ try to close the whole shortfall alone. Both are therefore always set
 explicitly.
 
 `SYNCH_DP_REPLICA_CONCURRENCY` bounds the number of distinct CAS objects each
-tenant fetches concurrently. It defaults to 16, matching the ordinary daemon;
-provider fanout within each individual object remains a separate engine bound.
+tenant fetches concurrently. It defaults to 16, matching the ordinary daemon,
+and accepts values from 1 through 256; provider fanout within each individual
+object remains a separate engine bound.
 
 ### 4.4 The loop set
 

@@ -481,7 +481,10 @@ async fn anti_entropy_reaches_a_fresh_peer_beside_a_stale_one() {
     );
 
     let report = replica.node.anti_entropy_round().await.unwrap();
-    assert_eq!(report.reached, 2, "both healthy peers should answer");
+    assert!(
+        report.peer.is_some(),
+        "at least one healthy peer should answer"
+    );
     assert_eq!(
         replica
             .node

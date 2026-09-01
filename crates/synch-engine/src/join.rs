@@ -38,10 +38,7 @@ pub(crate) async fn futures_join<F: Future>(
 /// Unlike chunking the input into fixed waves, every completion immediately
 /// admits the next future. One slow or broken operation therefore occupies one
 /// slot without holding all later work behind its timeout.
-pub(crate) async fn futures_buffered<F: Future>(
-    futures: impl IntoIterator<Item = F>,
-    limit: usize,
-) -> Vec<F::Output> {
+pub(crate) async fn futures_buffered<F: Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output> {
     let mut queued = futures.into_iter();
     let limit = limit.max(1);
     let mut pending: Vec<std::pin::Pin<Box<F>>> = Vec::with_capacity(limit);
@@ -107,5 +104,46 @@ mod tests {
             .expect("the third future should report that it started");
         release_slow.send(()).unwrap();
         assert_eq!(running.await.unwrap(), vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn the_buffer_never_starts_more_than_the_limit() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let two_started = Arc::new(tokio::sync::Notify::new());
+        let (release, _) = tokio::sync::watch::channel(false);
+        let futures: Vec<_> = (0..6)
+            .map(|value| {
+                let started = started.clone();
+                let two_started = two_started.clone();
+                let mut release = release.subscribe();
+                async move {
+                    if started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                        two_started.notify_one();
+                    }
+                    while !*release.borrow() {
+                        release.changed().await.unwrap();
+                    }
+                    value
+                }
+            })
+            .collect();
+
+        let running = tokio::spawn(futures_buffered(futures, 2));
+        tokio::time::timeout(std::time::Duration::from_secs(1), two_started.notified())
+            .await
+            .expect("the first two futures should start");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "queued futures must not start before an in-flight slot opens"
+        );
+        release.send(true).unwrap();
+        assert_eq!(running.await.unwrap().len(), 6);
     }
 }

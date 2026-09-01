@@ -44,7 +44,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "SYNCH_CAS_CACHE_BYTES")]
     pub cas_cache_bytes: Option<u64>,
 
-    /// Maximum number of distinct CAS objects a replica fetches concurrently.
+    /// Number of distinct CAS objects a replica fetches concurrently (1-256).
     #[arg(
         long,
         global = true,
@@ -1087,6 +1087,10 @@ impl ByteRange {
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(0) => Err("must be at least 1".to_string()),
+        Ok(value) if value > synch_engine::MAX_REPLICA_CONCURRENCY => Err(format!(
+            "must be at most {}",
+            synch_engine::MAX_REPLICA_CONCURRENCY
+        )),
         Ok(value) => Ok(value),
         Err(_) => Err(format!("expected a positive integer, got `{value}`")),
     }
@@ -1127,6 +1131,15 @@ mod tests {
         assert!(
             Cli::try_parse_from(["synch", "--replica-concurrency", "0", "daemon", "run"]).is_err()
         );
+        let too_large = (synch_engine::MAX_REPLICA_CONCURRENCY + 1).to_string();
+        assert!(Cli::try_parse_from([
+            "synch",
+            "--replica-concurrency",
+            &too_large,
+            "daemon",
+            "run"
+        ])
+        .is_err());
     }
 
     #[test]

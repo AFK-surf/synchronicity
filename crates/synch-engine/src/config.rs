@@ -9,6 +9,13 @@ use crate::error::{EngineError, Result};
 /// How many distinct CAS objects a replica fetches concurrently by default.
 pub const DEFAULT_REPLICA_CONCURRENCY: usize = 16;
 
+/// Largest replica fetch concurrency accepted from a host configuration.
+///
+/// Each slot may fan out to several providers and the ready-candidate window is
+/// a multiple of this value, so an unbounded operator value is an allocation
+/// and connection storm rather than useful throughput.
+pub const MAX_REPLICA_CONCURRENCY: usize = 256;
+
 /// Where a node's data directory lives by default (§10).
 pub fn default_data_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("", "", "synchronicity")
@@ -88,7 +95,8 @@ pub struct NodeConfig {
     ///
     /// Bounded because replica fetches share the endpoint with anti-entropy and
     /// foreground reads, and nothing schedules between them today (§13). The
-    /// shipped default is [`DEFAULT_REPLICA_CONCURRENCY`].
+    /// shipped default is [`DEFAULT_REPLICA_CONCURRENCY`], and the accepted
+    /// range is 1 through [`MAX_REPLICA_CONCURRENCY`].
     pub replica_concurrency: usize,
     /// The smallest object a fetch will run the delta descent for
     /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
@@ -115,15 +123,14 @@ pub struct NodeConfig {
     /// peer holding the trie has had many rounds to serve it, short enough that
     /// an origin is not stranded for an afternoon.
     pub pending_head_ttl: Duration,
-    /// How long one anti-entropy exchange with one peer may take (§5.3).
+    /// How long an explicit anti-entropy exchange with one peer may take (§5.3).
     ///
     /// `synch-net` deadlines every individual request, but a round issues as
     /// many as the peer's answers call for — one trie fetch per head it hands
     /// back, each of those looping until it stops making progress — so the
-    /// per-request deadlines bound no exchange. A peer answering each request
-    /// just inside its deadline could therefore hold its task for as long as it
-    /// liked; this budget contains that task while the round's other peer
-    /// exchanges continue concurrently.
+    /// per-request deadlines bound no exchange. Explicit operator-driven syncs
+    /// get this full budget; the standing periodic scheduler applies a smaller
+    /// per-peer cap so one bad member cannot postpone trying the next candidate.
     ///
     /// Ten anti-entropy intervals at the defaults: far more than a real round
     /// needs even on a cold bootstrap, since a round that runs out of budget
@@ -207,5 +214,6 @@ mod tests {
             DEFAULT_REPLICA_CONCURRENCY
         );
         assert_eq!(DEFAULT_REPLICA_CONCURRENCY, 16);
+        assert!(DEFAULT_REPLICA_CONCURRENCY <= MAX_REPLICA_CONCURRENCY);
     }
 }
