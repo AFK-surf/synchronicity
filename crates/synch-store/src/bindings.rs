@@ -478,26 +478,84 @@ impl Store {
 
     /// Every origin with at least one live binding.
     pub fn trusted_origins(&self, now: i64) -> Result<Vec<OriginId>> {
-        let mut out: Vec<OriginId> = self
-            .live_bindings(now)?
-            .into_iter()
-            .map(|b| b.origin)
-            .collect();
+        let mut out = Vec::new();
+        self.live_column("origin_id", now, |row| {
+            out.push(origin_column(row.get(0)?, "bindings.origin_id")?);
+            Ok(())
+        })?;
         out.sort();
         out.dedup();
         Ok(out)
     }
 
     /// Every device key with at least one live binding, for dialing.
+    ///
+    /// Read once per reactive push and once per anti-entropy round, so it is
+    /// the one whole-set question on a hot path. It answers in SQL rather than
+    /// by filtering [`Store::live_bindings`]: at ten thousand bindings that
+    /// built ten thousand `Binding` values — parsing an origin, a key and a
+    /// space list apiece — to return a column of keys
+    /// (`docs/CLOUD-DATAPLANE.md` §7.1a).
     pub fn trusted_keys(&self, now: i64) -> Result<Vec<NodeId>> {
-        let mut out: Vec<NodeId> = self
-            .live_bindings(now)?
-            .into_iter()
-            .map(|b| b.node_id)
-            .collect();
+        let mut out = Vec::new();
+        self.live_column("node_id", now, |row| {
+            out.push(key_column(row.get(0)?, "bindings.node_id")?);
+            Ok(())
+        })?;
         out.sort_by_key(|k| *k.as_bytes());
         out.dedup();
         Ok(out)
+    }
+
+    /// Runs `take` over one column of every live binding.
+    ///
+    /// The liveness rule of [`Store::live_bindings`], expressed where the rows
+    /// are: an unexpired row, and — for a delegated one — an issuer that still
+    /// holds a live rooted binding of its own. The `EXISTS` clause is the
+    /// cascade, and it seeks on the primary key rather than scanning, so
+    /// derived trust still dies with its source without the whole table being
+    /// read to work that out.
+    ///
+    /// A clock that cannot date a trust decision honors no expiring binding at
+    /// all ([`Binding::is_live`]), which is a different query rather than a
+    /// different parameter: `now < expires_at` holds for every row in the table
+    /// when `now` is the epoch, so the comparison has to be absent, not false.
+    fn live_column(
+        &self,
+        column: &str,
+        now: i64,
+        mut take: impl FnMut(&rusqlite::Row<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let now = self.trust_instant(now)?;
+        let datable = synch_core::clock_is_trusted(now);
+        let unexpired = match datable {
+            true => "(%.expires_at IS NULL OR ?1 < %.expires_at)",
+            false => "%.expires_at IS NULL",
+        };
+        let sql = format!(
+            "SELECT DISTINCT b.{column} FROM bindings b
+             WHERE {outer}
+               AND (b.source <> 'delegated'
+                    OR (b.issuer <> '' AND EXISTS (
+                          SELECT 1 FROM bindings r
+                          WHERE r.origin_id = b.issuer
+                            AND r.source IN ('static', 'dns')
+                            AND {inner})))",
+            outer = unexpired.replace("%.", "b."),
+            inner = unexpired.replace("%.", "r."),
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        // The undatable query names no `?1`, and binding one to a statement
+        // that does not use it is an error rather than a spare argument.
+        let mut rows = match datable {
+            true => stmt.query(params![now])?,
+            false => stmt.query([])?,
+        };
+        while let Some(row) = rows.next()? {
+            take(row)?;
+        }
+        Ok(())
     }
 
     /// The live device keys currently bound to an origin, for dialing (§3.3).
@@ -1345,6 +1403,89 @@ mod tests {
             .unwrap();
         assert!(!BindingSource::Delegated.is_rooted());
         assert!(!store.is_trusted_key(&second, at(10)).unwrap());
+    }
+
+    /// `trusted_keys` and `trusted_origins` answer in SQL what
+    /// `live_bindings` answers in Rust, so they are held to it directly.
+    ///
+    /// The table is built to exercise every branch the two implementations
+    /// could disagree on: a static binding that consults no clock, a live and
+    /// an expired DNS one, a delegation whose issuer is rooted and live, one
+    /// whose issuer's own binding has lapsed, and one naming no issuer at all.
+    /// Then both clocks, because an undatable reading honors no expiring
+    /// binding and that is the case a `now < expires_at` comparison gets
+    /// exactly backwards.
+    #[test]
+    fn the_sql_liveness_rule_agrees_with_the_rust_one() {
+        let (_d, store) = store();
+        let rooted = OriginId::named("nas", "x.example").unwrap();
+        let lapsing = OriginId::named("vps", "x.example").unwrap();
+        let rooted_key = SecretKey::generate().public();
+        let lapsing_key = SecretKey::generate().public();
+        let statically = SecretKey::generate().public();
+        let vouched = SecretKey::generate().public();
+        let orphaned = SecretKey::generate().public();
+        let issuerless = SecretKey::generate().public();
+
+        store
+            .put_binding(&binding(rooted.clone(), rooted_key, Some(at(1000))))
+            .unwrap();
+        store
+            .put_binding(&binding(lapsing.clone(), lapsing_key, Some(at(100))))
+            .unwrap();
+        store
+            .put_binding(&binding(
+                OriginId::named("box", "x.example").unwrap(),
+                statically,
+                None,
+            ))
+            .unwrap();
+        store
+            .put_binding(&delegation(vouched, rooted, &["photos"]))
+            .unwrap();
+        store
+            .put_binding(&delegation(orphaned, lapsing, &["docs"]))
+            .unwrap();
+        let mut no_issuer = delegation(issuerless, OriginId::Key(rooted_key), &["docs"]);
+        no_issuer.issuer = None;
+        store.put_binding(&no_issuer).unwrap();
+
+        // `at(500)`: `vps` has lapsed, so the delegation it issued is cut off
+        // with it while `nas`'s still stands. `at(5000)`: everything expiring
+        // has gone and only the static binding is left. `0`: an undatable
+        // clock, which honors no expiring binding and so leaves the same one.
+        for now in [at(50), at(500), at(5000), 0] {
+            let mut keys: Vec<NodeId> = store
+                .live_bindings(now)
+                .unwrap()
+                .into_iter()
+                .map(|b| b.node_id)
+                .collect();
+            keys.sort_by_key(|k| *k.as_bytes());
+            keys.dedup();
+            assert_eq!(store.trusted_keys(now).unwrap(), keys, "keys at {now}");
+
+            let mut origins: Vec<OriginId> = store
+                .live_bindings(now)
+                .unwrap()
+                .into_iter()
+                .map(|b| b.origin)
+                .collect();
+            origins.sort();
+            origins.dedup();
+            assert_eq!(
+                store.trusted_origins(now).unwrap(),
+                origins,
+                "origins at {now}"
+            );
+        }
+
+        // And the table really did exercise the branches: if every reading
+        // gave the same answer the loop above would prove nothing.
+        assert_eq!(store.trusted_keys(at(50)).unwrap().len(), 5);
+        assert_eq!(store.trusted_keys(at(500)).unwrap().len(), 3);
+        assert_eq!(store.trusted_keys(at(5000)).unwrap().len(), 1);
+        assert_eq!(store.trusted_keys(0).unwrap().len(), 1);
     }
 
     /// The delegate-to-delegate rule (§5.5), and the cascade under it.
