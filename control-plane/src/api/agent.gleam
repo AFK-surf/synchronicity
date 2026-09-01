@@ -255,8 +255,8 @@ pub type ReplicaSpace {
     oldest_want: Int,
     /// When the soonest scheduled release falls due, unix nanoseconds, or 0.
     next_release: Int,
-    /// Whether every bound origin has synchronized a complete materialized
-    /// head. Release sweeps continue from the heads already materialized.
+    /// Whether there are no pending heads and every bound origin has a
+    /// materialized baseline. Release sweeps continue from complete heads.
     view_complete: Bool,
     view_reason: String,
   )

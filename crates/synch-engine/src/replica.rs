@@ -92,7 +92,8 @@ pub struct FetchReport {
     pub over_budget: usize,
 }
 
-/// Whether every bound origin has synchronized a complete materialized head.
+/// Whether there are no pending heads and every bound origin has a complete
+/// materialized baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewState {
     /// Every bound origin has a complete head materialized.
@@ -128,7 +129,7 @@ pub struct ReplicaStatus {
     pub oldest_want: Option<i64>,
     /// When the soonest scheduled release falls due.
     pub next_release: Option<i64>,
-    /// Whether every bound origin has synchronized a complete head.
+    /// Whether synchronization has no pending or missing baseline head.
     pub view: ViewState,
     /// Objects the tree has stopped naming that this node is holding anyway,
     /// because too few other origins advertise them (§4.3).
@@ -289,7 +290,7 @@ impl Node {
         Ok(out)
     }
 
-    /// Whether every bound origin has a complete materialized view.
+    /// Whether synchronization has no pending or missing baseline head.
     ///
     /// This is synchronization health for reporting. Release sweeps use the
     /// complete heads already materialized in `entries` and do not gate on it.

@@ -59,10 +59,8 @@ extension Listings {
         out.budgetReached = rest.contains("reached")
       } else if body.hasPrefix("view") {
         let rest = Anchor.after("view", in: body) ?? ""
-        // New daemons report `incomplete: {why}`. Accept the former
-        // `incomplete, releases paused: {why}` wording during upgrades too.
+        // Incomplete synchronization is reported as `incomplete: {why}`.
         out.incompleteReason = Anchor.after("incomplete: ", in: rest)
-          ?? Anchor.after("releases paused: ", in: rest)
       } else if body.hasPrefix("from ") {
         // `from {origin:<32} {bytes:>14} B`. Split on tokens rather than on
         // the padding: an origin is a single token — a name or a `key:` form —

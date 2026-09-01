@@ -442,8 +442,8 @@ pub(crate) struct ReplicaSpaceJson {
     pub oldest_want: Option<i64>,
     /// When the soonest scheduled release falls due, unix nanoseconds.
     pub next_release: Option<i64>,
-    /// Whether every bound origin has a complete materialized head. Kept as a
-    /// synchronization-health field; release sweeps do not gate on it.
+    /// Whether there are no pending heads and every bound origin has a complete
+    /// materialized baseline. Release sweeps do not gate on it.
     pub view_complete: bool,
     /// Why synchronization is incomplete, when it is.
     pub view_reason: Option<String>,

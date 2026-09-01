@@ -122,16 +122,6 @@ struct ParserTests {
     #expect(status.isAlarming)
   }
 
-  @Test func replicaStatusAcceptsTheFormerPausedWordingDuringAnUpgrade() {
-    let status = Listings.replicaStatus([
-      "photos   forever retention",
-      "  held                  0 objects               0 B",
-      "  view          incomplete, releases paused: nas has not answered",
-    ])
-    #expect(status.incompleteReason == "nas has not answered")
-    #expect(status.unrecognized.isEmpty)
-  }
-
   @Test func aSpaceThatDoesNotReplicateSaysSoRatherThanReadingAsEmpty() {
     let status = Listings.replicaStatus(["notes   indexed /Users/me/notes   not replicated"])
     #expect(!status.isReplicating)
