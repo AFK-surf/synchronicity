@@ -63,9 +63,10 @@ are the content leaves materialized from active tries, and a graph model of trie
 mark/sweep. The system theorem says every live source leaf names available
 content and every live replica leaf names either pinned available content or a
 want for that same holder and root. It covers protection removal as well as
-acquisition, protected explicit deletion, writer abort, cache eviction, and the
-two GC phases. Rust and Lean carry matching checked anchors at their
-linearization points; run `lean/check-anchors.sh` after changing either side.
+acquisition, protected explicit deletion, writer abort, cache eviction, the
+unprotected removal of staged (non-durable) rows, and the two GC phases. Rust
+and Lean carry matching checked anchors at their linearization points; run
+`lean/check-anchors.sh` after changing either side.
 
 ```sh
 cd specs/lean

@@ -157,14 +157,17 @@ impl Store {
         // `CasGc.TakePossession` is this immediate want-to-pin transaction;
         // its availability check is part of the transition, not a caller fact.
         self.with_immediate_tx(|tx| {
-            // Held, not merely known. A `blobs` row exists for a partial fetch
-            // too, so a row alone would let a claim stand over a 0%-complete
-            // object — exactly what this function's own doc says cannot happen.
-            // The predicate is `pin_object`'s, and it belongs in the store
-            // rather than in the discipline of every caller.
+            // Held durably, not merely known or cached. A `blobs` row exists
+            // for a partial fetch too, so a row alone would let a claim stand
+            // over a 0%-complete object — exactly what this function's own doc
+            // says cannot happen — and on a cloud backend a complete row is a
+            // scratch copy the backend may drop until `durable=1`. The
+            // predicate is `Store::pin`'s, for the reason given there, and it
+            // belongs in the store rather than in the discipline of every
+            // caller: `hold_object` finalizes before calling this, and this is
+            // what makes that ordering a fact rather than a convention.
             let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs
-                                WHERE root = ?1 AND (complete != 0 OR durable != 0))",
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
                 params![root.as_bytes().to_vec()],
                 |row| row.get(0),
             )?;

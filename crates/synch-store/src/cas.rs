@@ -66,15 +66,19 @@ impl Txn<'_> {
                 )))
             }
         }
+        let holder = PinHolder::Source(space.to_string()).render();
         self.conn().execute(
             "INSERT INTO pins (root, holder, created_at, release_after)
              VALUES (?1, ?2, ?3, NULL)
              ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-            params![
-                root.as_bytes().to_vec(),
-                PinHolder::Source(space.to_string()).render(),
-                now,
-            ],
+            params![root.as_bytes().to_vec(), holder, now],
+        )?;
+        // Held is not wanted. A source want exists only as a repair intent
+        // left by a heal, and the durable row just verified is that repair;
+        // `SystemSafety.SourcePublish` retires the want in the same step.
+        self.conn().execute(
+            "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
+            params![root.as_bytes().to_vec(), holder],
         )?;
         Ok(())
     }
@@ -1040,6 +1044,9 @@ impl Store {
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
+        // LEAN-MODEL: cas-adopt-durable
+        // `SystemSafety.AdoptRemote` is this row creation from a remote pair
+        // the backend has just confirmed; it only ever adds availability.
         self.with_immediate_tx(|tx| {
             let existing: Option<i64> = tx
                 .query_row(
@@ -1243,6 +1250,13 @@ impl Store {
         if self.is_being_written(root) {
             return Ok(false);
         }
+        // LEAN-MODEL: cas-drop-staged-row
+        // `SystemSafety.DropStaged` is this row removal of a non-durable cache
+        // claim, and the same transition behind `reconcile_scratch_generation`
+        // and the `commit_cas_migration` discard. None of the three consults
+        // `pins`: `staged_row_drop_is_unpinned` is why they need not, and
+        // `Store::pin`'s `durable` predicate is what makes that theorem true
+        // of the store.
         conn.execute(
             "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
             params![root.as_bytes().to_vec()],
@@ -1389,13 +1403,21 @@ impl Store {
         // `SystemSafety.Pin` includes the held-object check and pin insertion
         // in this immediate transaction.
         self.with_immediate_tx(|tx| {
-            // Held, not merely known: a `blobs` row exists for a partial fetch
-            // too. `take_possession` enforces the same thing on the other entry
-            // point, and a promise about bytes belongs in the store rather than
-            // in the discipline of every caller.
+            // Held *durably*, not merely known or cached: a `blobs` row exists
+            // for a partial fetch too, and on a cloud backend a complete row
+            // is only a scratch copy until the backend has taken it
+            // (`durable=1`). A pin is a promise about the durable tier, so the
+            // predicate is `durable` alone, which is `SystemSafety.Available`
+            // and the fact the whole GC argument rests on: every path that
+            // drops a staged row without consulting `pins` — cache eviction,
+            // a scratch-generation reset, a backend migration — is safe only
+            // because a non-durable row can never be pinned. On the local
+            // backend a complete row is durable by construction, so nothing
+            // changes there. `take_possession` enforces the same thing on the
+            // other entry point, and a promise about bytes belongs in the
+            // store rather than in the discipline of every caller.
             let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs
-                                WHERE root = ?1 AND (complete != 0 OR durable != 0))",
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
                 params![root.as_bytes().to_vec()],
                 |row| row.get(0),
             )?;
@@ -1412,14 +1434,32 @@ impl Store {
         })
     }
 
-    /// Drops one holder's claim. Returns whether there was one to drop.
+    /// Drops one holder's claim. Returns whether one was dropped.
+    ///
+    /// A role holder's claim is refused while an entry in its space still
+    /// names the root: a source's or replica's pin is what the live leaf
+    /// stands on, and removing it from underneath is exactly the state the
+    /// model forbids. The operator's claim has no leaf behind it and goes
+    /// unconditionally.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
         // LEAN-MODEL: cas-unpin
-        // `SystemSafety.Unpin` requires this holder's live role to have ended.
-        let dropped = self.conn().execute(
-            "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
-            params![root.as_bytes().to_vec(), holder.render()],
-        )?;
+        // `SystemSafety.Unpin` requires this holder's live role to have ended;
+        // for a role holder that guard is the entry check in this DELETE.
+        let dropped = match holder.space() {
+            None => self.conn().execute(
+                "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
+                params![root.as_bytes().to_vec(), holder.render()],
+            )?,
+            Some(space) => self.conn().execute(
+                "DELETE FROM pins
+                  WHERE root = ?1 AND holder = ?2
+                    AND NOT EXISTS (
+                      SELECT 1 FROM entries
+                       WHERE entries.space = ?3 AND entries.content = pins.root
+                    )",
+                params![root.as_bytes().to_vec(), holder.render(), space],
+            )?,
+        };
         Ok(dropped > 0)
     }
 
@@ -2205,6 +2245,78 @@ mod tests {
 
         let inline = cache.ingest_bytes(b"inline", 2).unwrap();
         assert!(!cache.blob(&inline).unwrap().unwrap().durable);
+    }
+
+    /// A pin is a promise about the durable tier. A complete scratch copy on a
+    /// cloud backend is not one, and the store says so at both entry points —
+    /// which is what lets the staged-row drops skip the pin check
+    /// (`SystemSafety.staged_row_drop_is_unpinned`).
+    #[test]
+    fn a_staged_cloud_row_cannot_be_pinned_or_possessed() {
+        let (_d, store) = store();
+        store.set_remote_cas(true);
+        let root = store.ingest_bytes(&data(100_000), 0).unwrap();
+        let row = store.blob(&root).unwrap().unwrap();
+        assert!(row.complete && !row.durable);
+
+        assert!(!store.pin(&root, &PinHolder::Operator, 1).unwrap());
+        let replica = PinHolder::Replica("media".into());
+        assert!(store.stage_want(&root, &replica, 100_000, None, 1).unwrap());
+        assert!(!store.take_possession(&root, &replica, 2).unwrap());
+        assert_eq!(
+            store.wants_of(&replica).unwrap().len(),
+            1,
+            "a refused possession keeps the want"
+        );
+        assert!(store.pinned_blobs().unwrap().is_empty());
+        // So the scratch reset may drop the row without asking anyone.
+        assert!(store.reconcile_scratch_generation("fresh").unwrap());
+        assert!(store.blob(&root).unwrap().is_none());
+
+        // Once the backend has the bytes, both claims stand.
+        let root = store.ingest_bytes(&data(100_000), 3).unwrap();
+        store.mark_blob_durable(&root).unwrap();
+        assert!(store.pin(&root, &PinHolder::Operator, 4).unwrap());
+        assert!(store.take_possession(&root, &replica, 5).unwrap());
+        assert!(store.wants_of(&replica).unwrap().is_empty());
+    }
+
+    /// A role's pin is what its live leaf stands on, so the role cannot let
+    /// go while an entry in its space still names the root
+    /// (`SystemSafety.Unpin`). The operator's claim has no leaf behind it.
+    #[test]
+    fn a_role_holder_cannot_unpin_content_its_space_still_names() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100_000), 0).unwrap();
+        let replica = PinHolder::Replica("media".into());
+        assert!(store.pin(&root, &replica, 1).unwrap());
+        store
+            .put_entry(
+                &crate::testutil::origin(),
+                "media",
+                "a",
+                &synch_core::FileEntry::file(100_000, 0, root, 1),
+            )
+            .unwrap();
+        assert!(
+            !store.unpin(&root, &replica).unwrap(),
+            "the leaf still stands on this pin"
+        );
+        assert_eq!(store.pinned_blobs().unwrap(), vec![root]);
+
+        assert!(store.pin(&root, &PinHolder::Operator, 2).unwrap());
+        assert!(store.unpin(&root, &PinHolder::Operator).unwrap());
+
+        // An entry in some other space is not this role's leaf.
+        let other = PinHolder::Replica("docs".into());
+        assert!(store.pin(&root, &other, 3).unwrap());
+        assert!(store.unpin(&root, &other).unwrap());
+
+        store
+            .delete_entry(&crate::testutil::origin(), "media", "a")
+            .unwrap();
+        assert!(store.unpin(&root, &replica).unwrap());
+        assert!(store.pinned_blobs().unwrap().is_empty());
     }
 
     use crate::testutil::{data, store};
