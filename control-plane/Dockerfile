@@ -42,7 +42,7 @@ RUN npx tsc -b && npx vite build
 # SQLite in a separate OS process is that this project has no NIFs — so
 # this stage also stays on the build platform. The one native artifact,
 # `priv/csqlite`, is compiled per-architecture in the next stage.
-FROM --platform=$BUILDPLATFORM erlang:${ERLANG_VERSION}-slim AS shipment
+FROM --platform=$BUILDPLATFORM docker.io/erlang:${ERLANG_VERSION}-slim AS shipment
 ARG GLEAM_VERSION
 ARG GLEAM_SHA256_X86_64
 ARG GLEAM_SHA256_AARCH64
