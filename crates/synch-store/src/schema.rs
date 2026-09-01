@@ -157,10 +157,6 @@ fn v24_socket_activations(tx: &Transaction<'_>) -> Result<()> {
 /// neighbours rather than sorting the set. It does not replace
 /// `entries_by_content`, which is sought the other way round — by content,
 /// across every space — by the release path.
-///
-/// This step follows the socket-activation one because the chain is
-/// positional: a database stamped 24 has run that step, and inserting anything
-/// ahead of it would run it a second time on a table it already dropped.
 const V25_ENTRIES_BY_SPACE_CONTENT: &str = r#"
 CREATE INDEX entries_by_space_content ON entries (space, content);
 "#;

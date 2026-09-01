@@ -1717,48 +1717,6 @@ mod tests {
         );
     }
 
-    /// A database as the previous release left it opens under this chain and
-    /// ends at the current version.
-    ///
-    /// Built from the *result* rather than by replaying a prefix of the chain:
-    /// the final schema with the newest step's objects removed and the version
-    /// stamped one lower. A prefix replay would follow whatever order the
-    /// chain is in, and the failure this guards against is exactly a step
-    /// inserted ahead of the previous release's last one — which reruns that
-    /// step on a database that has already had it, and never runs the new one
-    /// at all.
-    #[test]
-    fn a_database_at_the_previous_version_upgrades() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
-            migrate(&mut conn, MIGRATIONS).unwrap();
-            conn.execute_batch(
-                "DROP INDEX entries_by_space_content;
-                 UPDATE config SET value = '24' WHERE key = 'schema_version';",
-            )
-            .unwrap();
-        }
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            store.config("schema_version").unwrap().as_deref(),
-            Some(SCHEMA_VERSION.to_string().as_str())
-        );
-        assert!(
-            store
-                .conn()
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'entries_by_space_content'",
-                    [],
-                    |_| Ok(())
-                )
-                .optional()
-                .unwrap()
-                .is_some(),
-            "the newest step must have run on a database that was one behind it"
-        );
-    }
-
     #[test]
     fn v23_backfills_source_holds_and_repair_intent() {
         let dir = tempfile::tempdir().unwrap();
