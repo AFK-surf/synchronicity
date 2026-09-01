@@ -108,6 +108,15 @@ async fn main() {
         .init();
     let options = Options::parse();
 
+    // `--check` is CI's entry point: one shape, thresholded, nothing else run
+    // and nothing else printed.
+    if options.check {
+        std::process::exit(match scaling_guard().await {
+            true => 0,
+            false => 1,
+        });
+    }
+
     println!(
         "synch-dp stress — one hosted tenant serving a replica for {} nodes\n\
          across {} networks, {} published entries per node\n\
@@ -160,6 +169,112 @@ async fn main() {
     );
 
     harness.shutdown().await;
+}
+
+// ---- the CI guard ----------------------------------------------------------
+
+/// How many peers the guard's pushes reach.
+const GUARD_PEERS: usize = 200;
+/// How many bindings the small and large tables hold.
+const GUARD_SMALL: usize = 500;
+const GUARD_LARGE: usize = 10_000;
+/// How many times each push is measured; the best is taken.
+///
+/// A shared runner's slowest sample says more about a neighbouring job than
+/// about this code, and a minimum over a few tries is what makes the ratio
+/// below stable enough to threshold at all.
+const GUARD_TRIES: usize = 3;
+/// How much more one push may cost at twenty times the bindings.
+///
+/// The regression this guards is `O(peers × bindings)`: every dial answering a
+/// trust question from a whole-table read. At this spread that shape costs
+/// about twenty times as much, and the indexed reads cost about the same. Five
+/// sits far from both, so the guard fires on the return of the quadratic and
+/// not on a runner having a bad minute.
+const GUARD_RATIO: f64 = 5.0;
+
+/// Fails if a reactive push has gone back to scaling with the binding table.
+///
+/// A smoke run would not catch it. The push completes either way; what changed
+/// is what it costs, and the whole reason this harness exists is that nothing
+/// in the tree measured that. So CI measures the one shape that mattered — the
+/// same push, the same peers, twenty times the bindings — as a *ratio*, which
+/// is the only thing about a timing that a shared runner does not ruin.
+async fn scaling_guard() -> bool {
+    println!(
+        "synch-dp scaling guard — one push to {GUARD_PEERS} peers, \
+         at {GUARD_SMALL} bindings and at {GUARD_LARGE}\n"
+    );
+    let harness = Harness::provision().await;
+    let members = synthetic_members(GUARD_LARGE, 2);
+    let head = harness.head();
+
+    // The dialable peers first, so both measurements push to the same set and
+    // the only thing that changes between them is the size of the table.
+    for member in members.iter().filter(|m| !m.delegated).take(GUARD_PEERS) {
+        harness.bind(member);
+    }
+    let small = guard_push(&harness, &head, GUARD_SMALL, &members).await;
+    let large = guard_push(&harness, &head, GUARD_LARGE, &members).await;
+
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::EPSILON);
+    println!(
+        "\n  {:<34} {:>12.2?}\n  {:<34} {:>12.2?}\n  {:<34} {:>11.1}x  (limit {GUARD_RATIO:.0}x)",
+        format!("{GUARD_SMALL} bindings"),
+        small,
+        format!("{GUARD_LARGE} bindings"),
+        large,
+        "ratio",
+        ratio,
+    );
+    let passed = ratio <= GUARD_RATIO;
+    match passed {
+        true => println!("\n  ok — the push is flat in the binding table\n"),
+        false => println!(
+            "\n  FAILED — one push now costs {ratio:.1}x as much at {}x the bindings.\n\
+             \n  \
+             Something on the dial path is answering a per-peer question from a\n  \
+             whole-table read again. `Store::live_bindings` materializes every\n  \
+             row; the per-key and per-origin questions must go through\n  \
+             `live_bindings_for_key` / `live_bindings_for_origin`, and the\n  \
+             whole-set ones through `live_column`.\n  \
+             See `docs/CLOUD-DATAPLANE.md` §7.1a.\n",
+            GUARD_LARGE / GUARD_SMALL,
+        ),
+    }
+    harness.shutdown().await;
+    passed
+}
+
+/// Grows the table to `bindings` rows and takes the best of a few pushes.
+async fn guard_push(
+    harness: &Harness,
+    head: &SignedHead,
+    bindings: usize,
+    members: &[Member],
+) -> Duration {
+    // Grown into, never trimmed back: deleting rows and reinstating them would
+    // charge the next measurement for SQLite's free pages rather than the push.
+    // Binding is an upsert, so re-binding the rows already there is a no-op and
+    // the table simply reaches `bindings` rows.
+    for member in members
+        .iter()
+        .filter(|m| m.delegated)
+        .take(bindings.saturating_sub(GUARD_PEERS))
+    {
+        harness.bind(member);
+    }
+    let mut best = Duration::MAX;
+    for _ in 0..GUARD_TRIES {
+        let started = Instant::now();
+        harness
+            .node()
+            .push_head(head)
+            .await
+            .expect("the push completes");
+        best = best.min(started.elapsed());
+    }
+    best
 }
 
 // ---- 1. the zone ceiling ---------------------------------------------------
@@ -314,27 +429,9 @@ async fn probe(node: &Node, probe_record: &str, size: usize) -> Probed {
 async fn membership(harness: &Harness, options: &Options) -> Vec<Member> {
     section("membership table");
     let before = Meter::now();
-    let per_network = options.members.div_ceil(options.networks);
 
     let started = Instant::now();
-    let members: Vec<Member> = (0..options.members)
-        .map(|i| {
-            let network = i / per_network;
-            // Network 0 is this tenant's own: its members are the ones the
-            // zone names. Everything else is another network entirely.
-            let domain = if network == 0 {
-                APEX.to_string()
-            } else {
-                format!("net{network:03}.example")
-            };
-            Member {
-                origin: OriginId::named(&format!("node{i:05}"), &domain).expect("a named origin"),
-                key: fake_secret(i),
-                domain,
-                delegated: network != 0,
-            }
-        })
-        .collect();
+    let members = synthetic_members(options.members, options.networks);
     rate(
         "generating node identities",
         started.elapsed(),
@@ -666,21 +763,41 @@ async fn per_tick(harness: &Harness, _options: &Options) {
         &format!("{:>12.2?}  {expired} lapsed", started.elapsed()),
     );
 
+    // What the pass actually prunes: the origins holding a row old enough to
+    // take, not every origin in the history. Both are timed, because the gap
+    // between them *is* the change — pruning opens a write transaction per
+    // origin, so the second number is what ten thousand of those cost.
+    let retention = now - Duration::from_secs(7 * 24 * 3600).as_nanos() as i64;
     let started = Instant::now();
-    let origins = store.history_origins().expect("history origins");
-    let listed = started.elapsed();
+    let due = store
+        .history_origins_before(retention)
+        .expect("prunable origins");
+    let filtered = started.elapsed();
     let started = Instant::now();
-    for origin in &origins {
-        store.prune_history_before(origin, now).expect("pruning");
+    for origin in &due {
+        store
+            .prune_history_before(origin, retention)
+            .expect("pruning");
     }
     line(
         "  of which history pruning",
         &format!(
-            "{:>12.2?}  {} origins ({:.2?} to list them)",
+            "{:>12.2?}  {} origins due ({:.2?} to find them)",
             started.elapsed(),
-            origins.len(),
-            listed
+            due.len(),
+            filtered
         ),
+    );
+    let all = store.history_origins().expect("history origins");
+    let started = Instant::now();
+    for origin in &all {
+        store
+            .prune_history_before(origin, retention)
+            .expect("pruning");
+    }
+    line(
+        "    what asking every origin costs",
+        &format!("{:>12.2?}  {} origins", started.elapsed(), all.len()),
     );
 
     let started = Instant::now();
@@ -737,6 +854,7 @@ async fn steady(harness: &Harness, options: &Options) {
         options.steady_secs
     ));
     let before = Meter::now();
+    let wal_before = db_part(harness.tenant_dir(), "-wal");
     let mut peak_rss = before.rss;
     let mut rss = Vec::new();
     // Per-second, not just start-to-end. A replica that has just come up is
@@ -792,6 +910,18 @@ async fn steady(harness: &Harness, options: &Options) {
         ),
     );
     line("RSS, peak", &format!("{:>12}", mib(peak_rss)));
+    // The question `Tenant::db_bytes`' doc comment raises and nothing answers:
+    // under `Checkpointing::Embedder` only the replicator's post-ship
+    // checkpoint truncates the log, so does it drain once writes stop, or does
+    // it stay? An idle window is exactly where that shows.
+    line(
+        "write-ahead log, after idling",
+        &format!(
+            "{:>12}  (was {} entering the window)",
+            mib(db_part(harness.tenant_dir(), "-wal")),
+            mib(wal_before),
+        ),
+    );
     // The loop set is the tenant's whole job, and a panicked loop leaves a
     // tenant that looks healthy from outside while it has stopped publishing
     // or stopped renewing its membership lease (`Tenant::has_failed_loop`).
@@ -811,6 +941,31 @@ async fn steady(harness: &Harness, options: &Options) {
 }
 
 // ---- the harness -----------------------------------------------------------
+
+/// `count` node identities spread across `networks` networks.
+///
+/// Network 0 is this tenant's own, so its members are the ones the zone names
+/// and the only ones that are ever dialable; everything else is another network
+/// entirely, reaching this one by delegation (§3.5). Derived from the index so
+/// a run is reproducible.
+fn synthetic_members(count: usize, networks: usize) -> Vec<Member> {
+    let per_network = count.div_ceil(networks.max(1));
+    (0..count)
+        .map(|i| {
+            let network = i / per_network;
+            let domain = match network {
+                0 => APEX.to_string(),
+                n => format!("net{n:03}.example"),
+            };
+            Member {
+                origin: OriginId::named(&format!("node{i:05}"), &domain).expect("a named origin"),
+                key: fake_secret(i),
+                domain,
+                delegated: network != 0,
+            }
+        })
+        .collect()
+}
 
 /// One node the replica serves.
 struct Member {
@@ -1252,6 +1407,8 @@ struct Options {
     networks: usize,
     entries: usize,
     steady_secs: u64,
+    /// Run only the scaling guard, and exit non-zero if it fails.
+    check: bool,
 }
 
 impl Options {
@@ -1269,6 +1426,7 @@ impl Options {
             networks: value("--networks", DEFAULT_NETWORKS as u64).max(1) as usize,
             entries: value("--entries", DEFAULT_ENTRIES as u64) as usize,
             steady_secs: value("--steady", DEFAULT_STEADY_SECS),
+            check: args.iter().any(|a| a == "--check"),
         }
     }
 }

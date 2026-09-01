@@ -235,3 +235,27 @@ jobs:
       # Small parameters keep it under a minute; the real numbers come from
       # running it on a machine whose scheduler you own.
       - run: cargo run --release -p synch-engine --example bench -- --files 500 --object-mib 16
+      # The data plane's harness, same posture: small parameters, run for
+      # compilation and for not falling over, not for its timings.
+      - run: cargo run --release -p synch-dp --example stress -- --members 200 --networks 4 --entries 5 --steady 5
+
+  scaling:
+    name: data-plane scaling guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Unlike `bench` above, this one *is* a gate — because the regression it
+      # guards is invisible to a smoke run. A reactive push completes whether
+      # or not each dial answers its trust question by materializing the whole
+      # binding table; only the cost changes, by two orders of magnitude at ten
+      # thousand bindings (`docs/CLOUD-DATAPLANE.md` §7.1a).
+      #
+      # It thresholds a *ratio* — the same push to the same peers at twenty
+      # times the bindings — which is the only thing about a timing a shared
+      # runner does not ruin, and takes the best of three tries at each size.
+      # Measured at ~1.4x healthy and ~10x with the whole-table read put back;
+      # the limit is 5x, which is far from both.
+      - run: cargo run --release -p synch-dp --example stress -- --check
