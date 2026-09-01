@@ -25,11 +25,22 @@ fn main() -> std::process::ExitCode {
     // in exactly one place per binary (`synch_net::tls`).
     synch_net::tls::install_crypto_provider();
 
+    // Read before the runtime is built, because it sizes the runtime: the pool
+    // and the per-tenant inbound ceiling are one pair of numbers, and
+    // `DpConfig` is where they are chosen together (`config::DpConfig`).
+    let config = match DpConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "the data plane cannot start");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         // Every store touch of every tenant crosses this pool, serialized per
         // tenant by that tenant's one connection (§7.1). Sized for the shard's
         // tenant capacity rather than left at the default.
-        .max_blocking_threads(blocking_threads())
+        .max_blocking_threads(config.blocking_threads)
         .enable_all()
         .build()
     {
@@ -40,7 +51,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    match runtime.block_on(run()) {
+    match runtime.block_on(run(config)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "the data plane stopped");
@@ -49,20 +60,13 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// How many blocking threads the shared pool gets.
-fn blocking_threads() -> usize {
-    std::env::var("SYNCH_DP_BLOCKING_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(512)
-}
-
-async fn run() -> synch_dp::Result<()> {
-    let config = DpConfig::from_env()?;
+async fn run(config: DpConfig) -> synch_dp::Result<()> {
     tracing::info!(
         shard = config.shard,
         shards = config.shards,
         base_dir = %config.base_dir.display(),
+        blocking_threads = config.blocking_threads,
+        max_inflight_per_tenant = config.max_inflight_per_tenant,
         "cloud data plane starting"
     );
     // Before anything provisions: a backend that cannot carry database

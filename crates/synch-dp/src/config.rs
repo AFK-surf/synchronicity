@@ -48,6 +48,32 @@ pub struct DpConfig {
     pub max_tenants: u64,
     /// How many distinct CAS objects each tenant fetches concurrently (1-256).
     pub replica_concurrency: usize,
+    /// How many threads the shared blocking pool gets.
+    ///
+    /// Configuration rather than a constant in `main` because it is one half
+    /// of a pair: every store touch of every tenant crosses this pool (§7.1),
+    /// and [`max_inflight_per_tenant`](Self::max_inflight_per_tenant) is
+    /// derived from it so that the shard's whole inbound demand has a
+    /// ceiling. Two numbers chosen in two places would agree only by
+    /// accident.
+    pub blocking_threads: usize,
+    /// How many inbound peer requests one tenant may have in flight at once.
+    ///
+    /// The bound that makes tenancy containment structural rather than
+    /// social. DESIGN §12 declines per-peer limits deliberately: in an
+    /// ordinary cluster every peer that can send a request is an authorized
+    /// member, members are extended basic trust not to DoS each other, and a
+    /// member behaving abusively is a membership problem whose remedy is
+    /// `synch trust rm`. A shard cannot take that stance, because the
+    /// membership belonging to org A is not org B's to curate while both
+    /// share this process's blocking pool — so what §12 leaves to trust, this
+    /// leaves to a semaphore.
+    ///
+    /// It is not a rate limit and an honest peer never meets it: a request
+    /// that waits for a slot waits microseconds, and a tenant's store calls
+    /// serialize on that tenant's one connection mutex regardless. What it
+    /// removes is one tenant's ability to make its inbound work unbounded.
+    pub max_inflight_per_tenant: usize,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
     /// How each tenant's endpoint is bound.
@@ -173,6 +199,8 @@ impl DpConfig {
             cache_bytes_total: 64 * 1024 * 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+            blocking_threads: default_blocking_threads(4),
+            max_inflight_per_tenant: default_max_inflight(default_blocking_threads(4), 4),
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -213,6 +241,29 @@ impl DpConfig {
                 .as_deref(),
         )?;
 
+        let max_tenants = parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1);
+        let blocking_threads = match std::env::var("SYNCH_DP_BLOCKING_THREADS") {
+            Ok(_) => parse::<usize>("SYNCH_DP_BLOCKING_THREADS", 0)?.max(1),
+            Err(_) => default_blocking_threads(max_tenants),
+        };
+        let max_inflight_per_tenant = match std::env::var("SYNCH_DP_MAX_INFLIGHT_PER_TENANT") {
+            Ok(_) => parse::<usize>("SYNCH_DP_MAX_INFLIGHT_PER_TENANT", 0)?.max(1),
+            Err(_) => default_max_inflight(blocking_threads, max_tenants),
+        };
+        // Said once, at startup, where an operator who overrode one of the
+        // pair can still act on it. Not a refusal: a deployment that knows its
+        // tenants are quiet is entitled to oversubscribe, and refusing to boot
+        // over a capacity ratio would be the service choosing its own outage.
+        if max_inflight_per_tenant.saturating_mul(max_tenants as usize) > blocking_threads {
+            tracing::warn!(
+                max_inflight_per_tenant,
+                max_tenants,
+                blocking_threads,
+                "this shard's tenants can ask for more concurrent blocking work than the \
+                 pool has threads; one tenant's peers can then make another tenant wait"
+            );
+        }
+
         Ok(Self {
             control_url,
             token,
@@ -223,8 +274,10 @@ impl DpConfig {
             poll_interval,
             objects: ObjectConfig { service, options },
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
-            max_tenants: parse::<u64>("SYNCH_DP_MAX_TENANTS", 64)?.max(1),
+            max_tenants,
             replica_concurrency,
+            blocking_threads,
+            max_inflight_per_tenant,
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions {
@@ -369,6 +422,55 @@ impl DpConfig {
     }
 }
 
+/// How many blocking threads a shard sized for `max_tenants` gets.
+///
+/// A ceiling, not an allocation: tokio grows the pool on demand and reaps idle
+/// threads, so a shard that is quiet costs nothing for a generous one. Floored
+/// at the 512 this shipped with and capped so a large `SYNCH_DP_MAX_TENANTS`
+/// cannot ask the kernel for an unbounded number of stacks.
+///
+/// The multiplier is what makes [`default_max_inflight`] able to give every
+/// tenant a ceiling it will not meet in ordinary work and still leave half the
+/// pool for the work no peer asked for: the reconciler's own passes, the
+/// replication tickers, the heartbeats that are the billing record.
+fn default_blocking_threads(max_tenants: u64) -> usize {
+    let sized = max_tenants.saturating_mul(64);
+    sized.clamp(512, 4096) as usize
+}
+
+/// The default per-tenant inbound ceiling for a pool of this size.
+///
+/// Half the pool, shared out. The other half is deliberately not spendable by
+/// peers at all: a shard whose every thread is serving inbound requests is a
+/// shard that cannot heartbeat, cannot converge, and cannot ship a database
+/// tail — so the reconciler would lose its grip on its tenants at exactly the
+/// moment one of them is being leaned on.
+///
+/// The floor is twice `synch_net`'s per-connection stream cap, and that is the
+/// number that matters rather than a round one. A slot is held for the whole
+/// of a request, the read included, so a peer that opens a stream and then
+/// says nothing holds a slot until the 120 s stream timeout expires. One
+/// connection can hold eight such streams. A ceiling at or below eight would
+/// therefore let a single connection wedge its own tenant's endpoint, which
+/// turns a bound meant to contain a tenant into a way to stop one.
+///
+/// It stays a bound on *this* tenant either way, which is the whole point: a
+/// member that stalls streams against its own org's replica is DESIGN §12's
+/// membership problem with §12's remedy, and the shard's other tenants —
+/// which is what this service owes them — are untouched. The cap at 64 is
+/// because more buys a single tenant almost nothing: its store calls
+/// serialize on its one connection mutex whatever the ceiling.
+fn default_max_inflight(blocking_threads: usize, max_tenants: u64) -> usize {
+    let share = (blocking_threads / 2) / (max_tenants.max(1) as usize).max(1);
+    share.clamp(MIN_INFLIGHT_PER_TENANT, 64)
+}
+
+/// The least a tenant's endpoint may be given.
+///
+/// Twice `synch_net::serve::MAX_CONCURRENT_STREAMS` — see
+/// [`default_max_inflight`] for why that number and not a rounder one.
+const MIN_INFLIGHT_PER_TENANT: usize = 16;
+
 /// Copies the provider's environment into OpenDAL option names.
 fn collect_options(service: &str, options: &mut HashMap<String, String>) {
     let pairs: &[(&str, &str)] = match service {
@@ -473,6 +575,8 @@ mod tests {
             cache_bytes_total: 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+            blocking_threads: 512,
+            max_inflight_per_tenant: 8,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
@@ -568,6 +672,54 @@ mod tests {
             fraction > 0.15 && fraction < 0.40,
             "moved {fraction} of tenants growing 3 -> 4 shards"
         );
+    }
+
+    /// The two numbers that bound what a shard's peers can hold agree with
+    /// each other at every size.
+    ///
+    /// This is the tenancy bound, not a tuning preference: a tenant's inbound
+    /// requests each occupy a blocking-pool thread, and if the shard's tenants
+    /// can collectively ask for more threads than the pool has, one org's
+    /// devices can make another org's tenant wait — which is the multi-tenant
+    /// failure the ceiling exists to remove. Half the pool, so the work no
+    /// peer asked for (the reconcile pass, the replication tickers, the
+    /// heartbeats that are the billing record) always has somewhere to run.
+    #[test]
+    fn a_shards_tenants_cannot_collectively_outbid_its_blocking_pool() {
+        for max_tenants in [1u64, 4, 16, 64, 256, 1024, 4096] {
+            let threads = default_blocking_threads(max_tenants);
+            let each = default_max_inflight(threads, max_tenants);
+            assert!(
+                each >= MIN_INFLIGHT_PER_TENANT,
+                "{max_tenants} tenants: {each} is at or below the per-connection \
+                 stream cap, so one connection could wedge its own tenant"
+            );
+            // The floor is allowed to win on a shard configured for more
+            // tenants than its pool can seat — see `default_max_inflight` for
+            // why that floor is not negotiable — so the invariant is stated
+            // where it can hold: wherever the share is what the arithmetic
+            // returned, it fits inside half the pool.
+            if each > MIN_INFLIGHT_PER_TENANT {
+                assert!(
+                    each * max_tenants as usize <= threads / 2,
+                    "{max_tenants} tenants x {each} in flight overruns {threads} threads"
+                );
+            }
+        }
+        // The shipped default is comfortably inside it.
+        let threads = default_blocking_threads(64);
+        assert_eq!(default_max_inflight(threads, 64) * 64, threads / 2);
+    }
+
+    /// And a deployment that oversubscribes on purpose is told, not refused.
+    #[test]
+    fn an_oversubscribed_shard_is_still_a_shard() {
+        // The clamp is what produces this: 4 096 tenants on 4 096 threads
+        // cannot each have a floor's worth, and the honest answer is to run
+        // anyway and say so rather than to refuse to boot over a ratio.
+        let threads = default_blocking_threads(4096);
+        assert_eq!(default_max_inflight(threads, 4096), MIN_INFLIGHT_PER_TENANT);
+        assert!(MIN_INFLIGHT_PER_TENANT * 4096 > threads);
     }
 
     #[test]

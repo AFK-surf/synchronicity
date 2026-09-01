@@ -323,7 +323,18 @@ impl Tenant {
             // The replicator owns the log, so no frame is recycled before it
             // has been shipped (§5.3).
             checkpointing: synch_store::Checkpointing::Embedder,
-            net: config.net.clone(),
+            // The tenancy bound (§9). Everything else about this node is
+            // per-tenant already — its directory, database, key, endpoint and
+            // prefix — but its *inbound work* was not: every request handler
+            // offloads onto the one blocking pool this process shares between
+            // every tenant, and nothing capped how many requests one
+            // network's devices could have in flight. A member of one org
+            // could hold the pool and make every other org's tenant wait.
+            // See `DpConfig::max_inflight_per_tenant`.
+            net: synch_net::NetOptions {
+                max_inflight_requests: Some(config.max_inflight_per_tenant),
+                ..config.net.clone()
+            },
             // Identity settles inside `Node::open`, from a resolver it builds
             // out of these options — so a tenant that cannot resolve its zone
             // here never learns its name, whatever is installed afterwards.
@@ -676,6 +687,47 @@ impl Tenant {
     /// The tenant's data directory, removed after a drain.
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// How much of the shard's volume this tenant's database occupies.
+    ///
+    /// The one growth vector on a shard that nothing budgets, and therefore
+    /// the one an operator has to be able to see. `budget_bytes` (§4.5) is an
+    /// admission ceiling on *content* — the CAS, whose local footprint is
+    /// separately capped by `cache_bytes_per_tenant` (§5.2) — and the CAS is
+    /// not what grows here. What grows here is metadata: the trie nodes,
+    /// out-of-line values, heads and head history a network's members publish,
+    /// which this node adopts in full because that is what replicating a
+    /// network means, and which lands in one SQLite file on a volume every
+    /// tenant on the pod shares. A member publishing a million tiny entries
+    /// costs almost no content bytes, passes every budget the design has, and
+    /// fills the disk out from under every other tenant.
+    ///
+    /// Reported rather than enforced, deliberately. A quota belongs where the
+    /// plan does — the control plane already sizes `budget_bytes` per org, and
+    /// extending it to cover metadata is its change to make — while a ceiling
+    /// invented here would take a paying customer's tenant down for the crime
+    /// of having a lot of files. So this is the alert:
+    /// `synch_dp_tenant_db_bytes` climbing on one tenant against a flat
+    /// `held_bytes` is a network inflating metadata, and it is visible before
+    /// the volume fills rather than after.
+    ///
+    /// Three `stat` calls, so it is cheap enough for every pass. The file, its
+    /// write-ahead log — which under `Checkpointing::Embedder` is held open by
+    /// the replicator and can be the larger of the two — and the shared-memory
+    /// index.
+    pub fn db_bytes(&self) -> u64 {
+        let db = self.dir.join(synch_store::DB_FILE);
+        let sidecar = |suffix: &str| {
+            let mut name = db.clone().into_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        [db.clone(), sidecar("-wal"), sidecar("-shm")]
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .fold(0u64, u64::saturating_add)
     }
 }
 

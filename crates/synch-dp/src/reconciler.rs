@@ -22,8 +22,18 @@ pub struct Reconciler {
     objects: ObjectStore,
     resolver: Option<Arc<synch_net::DnssecResolver>>,
     tenants: HashMap<String, Tenant>,
-    /// Networks that failed to provision, and when to try again.
-    parked: HashMap<String, std::time::Instant>,
+    /// What this shard knows about each network's recent failures: how many,
+    /// and when it may next be tried.
+    ///
+    /// An entry outlives the failure that made it, and has to. The escalation
+    /// decays by *time*, not by success — a tenant that comes back and dies
+    /// again a minute later is crash-looping, and forgetting its history the
+    /// moment it provisioned would reset the backoff on every lap, which is
+    /// the loop the backoff exists to break. [`PARK_DECAY`] is what forgets.
+    /// An entry whose `retry_at` has passed is not holding anything back; it
+    /// is a memory, and it is bounded by the desired set because
+    /// `parked.retain` prunes to it every pass.
+    parked: HashMap<String, Parked>,
     /// Consecutive fresh polls that have answered "nothing on this shard".
     empty_answers: u32,
     etag: Option<String>,
@@ -45,6 +55,132 @@ pub struct Reconciler {
 /// directories — and a genuine offboarding of the last network still
 /// completes without an operator.
 const EMPTY_SET_CONFIRMATIONS: u32 = 3;
+
+/// How long one tenant may take over its share of a reconcile pass.
+///
+/// Every per-tenant step in a pass — provisioning, converging, measuring what
+/// it holds, heartbeating — ends up waiting on that tenant's one store
+/// connection, and that connection is exactly what a tenant's own peers keep
+/// busy. Without a deadline a tenant whose members are leaning on it holds the
+/// pass, and the pass is the shard's only supervisor: no other tenant is
+/// converged, no heartbeat is sent (which is the billing record, §10), the
+/// failed-loop restart never fires, and nothing collects. One tenant's peers
+/// would be running every other tenant's control loop.
+///
+/// Generous, because an honest tenant's pass is milliseconds and a cold
+/// tenant's restore is the one step that legitimately takes seconds.
+const TENANT_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The longest a tenant that keeps failing is parked between attempts.
+const MAX_PARK: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How long a tenant must go without failing before its backoff is forgotten.
+///
+/// Otherwise a tenant that restarts once a day arrives at the cap after a
+/// fortnight and stays there.
+const PARK_DECAY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// A network this shard is not running, and when it may try again.
+#[derive(Debug, Clone, Copy)]
+struct Parked {
+    /// When the next attempt is allowed.
+    retry_at: std::time::Instant,
+    /// When the failure that parked it happened, for [`PARK_DECAY`].
+    at: std::time::Instant,
+    /// Consecutive failures, which is what sets the wait.
+    failures: u32,
+}
+
+impl Parked {
+    /// The park that follows one more failure after `previous`.
+    ///
+    /// The first failure waits the identity poll, which is the common case and
+    /// not really a failure at all — a zone that has not named the key yet
+    /// (§4.3). Each one after it doubles, up to [`MAX_PARK`].
+    ///
+    /// Backing off matters most for the failure that is *not* a wait: a tenant
+    /// whose standing loops keep dying is drained and re-provisioned, and
+    /// provisioning discards the local database and replays the whole replica
+    /// stream (`Tenant::provision`). Retried every poll, that is one full
+    /// restore per minute per crash-looping tenant — object-store egress, disk
+    /// churn and blocking-pool time charged to every other tenant on the
+    /// shard, for a tenant that is not working anyway.
+    fn after(previous: Option<Parked>) -> Parked {
+        let now = std::time::Instant::now();
+        let failures = match previous {
+            Some(previous) if now.duration_since(previous.at) < PARK_DECAY => {
+                previous.failures.saturating_add(1)
+            }
+            _ => 1,
+        };
+        let wait = crate::tenant::identity_poll()
+            .saturating_mul(1u32 << failures.saturating_sub(1).min(8))
+            .min(MAX_PARK);
+        Parked {
+            retry_at: now + wait,
+            at: now,
+            failures,
+        }
+    }
+}
+
+/// Runs several futures to completion together, collecting their outputs.
+///
+/// A hand-rolled join rather than a `futures` dependency, in the shape the
+/// engine already uses for the same job (`synch_engine::join`): no
+/// cancellation, no early return, every branch polled to the end.
+///
+/// The fan-out is deliberately unbounded, and it is bounded anyway — by the
+/// tenant count, which is what `SYNCH_DP_MAX_TENANTS` declares and what the
+/// blocking pool is sized against (`DpConfig::blocking_threads`). What must
+/// not happen is the opposite: a pass that visits tenants one at a time makes
+/// every tenant's latency the sum of the others', which is how one tenant's
+/// peers reach every other tenant on the shard.
+async fn join_all<F: std::future::Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut out = Vec::with_capacity(pending.len());
+    std::future::poll_fn(move |cx| {
+        let mut index = 0;
+        while index < pending.len() {
+            match pending[index].as_mut().poll(cx) {
+                std::task::Poll::Ready(value) => {
+                    out.push(value);
+                    pending.remove(index);
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        if pending.is_empty() {
+            std::task::Poll::Ready(std::mem::take(&mut out))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Runs one tenant's share of a pass under [`TENANT_PASS_TIMEOUT`].
+///
+/// A timeout drops the future rather than cancelling the work behind it: a
+/// store call already handed to the blocking pool runs to completion whatever
+/// this does. What it recovers is the *pass* — this shard's ability to go on
+/// supervising every other tenant while one of them is stuck.
+async fn under_deadline<T>(
+    tenant: &str,
+    what: &'static str,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match tokio::time::timeout(TENANT_PASS_TIMEOUT, work).await {
+        Ok(done) => Some(done),
+        Err(_) => {
+            tracing::warn!(
+                %tenant, step = what, seconds = TENANT_PASS_TIMEOUT.as_secs(),
+                "a tenant overran its share of the reconcile pass; carrying on without it"
+            );
+            None
+        }
+    }
+}
 
 impl Reconciler {
     /// Builds a reconciler. The resolver is shared by every tenant: it holds
@@ -192,21 +328,42 @@ impl Reconciler {
             .filter(|key| !wanted.contains_key(*key))
             .cloned()
             .collect();
-        for key in gone {
-            if let Some(tenant) = self.tenants.remove(&key) {
-                let dir = tenant.dir().to_path_buf();
-                tracing::info!(tenant = %key, "network is no longer hosted; draining");
-                tenant.drain().await;
-                // The local copy only; the bucket prefix and the replica
-                // stream keep their retention hold, which the control plane
-                // owns and a scheduled job collects (§6).
-                if let Err(error) = std::fs::remove_dir_all(&dir) {
-                    tracing::warn!(tenant = %key, %error, "could not remove the tenant directory");
-                }
+        // Concurrently: a drain waits for the tenant's standing loops and its
+        // final database ship, both of which wait on a store that tenant's own
+        // peers keep busy. Offboarding one network must not hold up the pass
+        // that supervises the rest.
+        //
+        // Deliberately *not* under a deadline, unlike every other per-tenant
+        // step in this pass. Abandoning a drain half way would leave the
+        // node's endpoint and its replication ticker still writing while the
+        // line below removes the directory underneath them; a slow drain costs
+        // this pass, a truncated one costs the tenant its unshipped tail
+        // (§4.6). What bounds a drain instead is its own structure — the loops
+        // stop on a signal, the final ship is capped at three attempts — and
+        // the inbound ceiling that stops a tenant's peers monopolising the
+        // store it is trying to close.
+        let draining: Vec<(String, Tenant)> = gone
+            .into_iter()
+            .filter_map(|key| self.tenants.remove_entry(&key))
+            .collect();
+        join_all(draining.into_iter().map(|(key, tenant)| async move {
+            let dir = tenant.dir().to_path_buf();
+            tracing::info!(tenant = %key, "network is no longer hosted; draining");
+            tenant.drain().await;
+            // The local copy only; the bucket prefix and the replica
+            // stream keep their retention hold, which the control plane
+            // owns and a scheduled job collects (§6).
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(tenant = %key, %error, "could not remove the tenant directory");
             }
+            key
+        }))
+        .await
+        .into_iter()
+        .for_each(|key| {
             self.parked.remove(&key);
             self.metrics.forget_tenant(&key);
-        }
+        });
 
         // Parked entries for networks nobody wants any more. A network that
         // never provisioned successfully is by definition not in `tenants`,
@@ -223,31 +380,81 @@ impl Reconciler {
         // renewing the membership lease that is the tenant boundary itself.
         // Draining and re-provisioning is the whole of the restart, and it is
         // per tenant: one panicking loop must not be another tenant's outage.
-        let failed: Vec<String> = self
+        //
+        // The restart is backed off from the second one on. Re-provisioning
+        // replays the whole replica stream over a discarded local database
+        // (`Tenant::provision`), so a tenant whose loops keep dying would
+        // otherwise buy a full restore every poll — object-store egress and
+        // blocking-pool time charged to every other tenant on the shard, for a
+        // tenant that is not working anyway. The first restart is still
+        // immediate: a loop that panicked once is a tenant that should be back
+        // before anybody notices.
+        let failing: Vec<String> = self
             .tenants
             .iter()
             .filter(|(_, tenant)| tenant.has_failed_loop())
             .map(|(key, _)| key.clone())
             .collect();
-        for key in failed {
-            if let Some(tenant) = self.tenants.remove(&key) {
-                tracing::error!(tenant = %key, "a standing loop stopped; restarting the tenant");
-                self.metrics.reconcile_failed();
-                tenant.drain().await;
+        let failed: Vec<(String, Tenant)> = failing
+            .into_iter()
+            .filter_map(|key| self.tenants.remove_entry(&key))
+            .collect();
+        for (key, _) in &failed {
+            tracing::error!(tenant = %key, "a standing loop stopped; restarting the tenant");
+            self.metrics.reconcile_failed();
+            let mut park = Parked::after(self.parked.get(key).copied());
+            if park.failures == 1 {
+                // Recorded even though nothing is being waited for. The count
+                // is what makes the *second* failure back off, and a first
+                // restart that left no trace would reset the escalation every
+                // time — a tenant crash-looping forever at one full replica
+                // restore per poll, which is the whole thing this prevents.
+                park.retry_at = park.at;
+            } else {
+                tracing::error!(
+                    tenant = %key, failures = park.failures,
+                    "this tenant keeps losing a standing loop; backing off its restart"
+                );
+            }
+            self.parked.insert(key.clone(), park);
+        }
+        join_all(failed.into_iter().map(|(_, tenant)| tenant.drain())).await;
+
+        // Existing tenants and new ones, both fanned out rather than walked.
+        // A pass that visits tenants one at a time makes each tenant's latency
+        // the sum of every other tenant's, which is precisely how one org's
+        // devices reach another org's tenant: `converge` waits on a store that
+        // the tenant's own peers keep busy, and everything behind it in the
+        // queue waits with it.
+        let mut newcomers = Vec::new();
+        let mut standing = HashMap::new();
+        for (key, network) in wanted {
+            match self.tenants.contains_key(&key) {
+                true => {
+                    standing.insert(key, network);
+                }
+                false => newcomers.push((key, network)),
             }
         }
 
-        for (key, network) in wanted {
-            match self.tenants.get_mut(&key) {
-                Some(tenant) => {
-                    if let Err(error) = tenant.converge(&network, &self.config, &self.control).await
-                    {
+        {
+            // Field borrows rather than `&self`, so the tenants can be held
+            // mutably while the configuration and the control client are read.
+            let (tenants, config, control) = (&mut self.tenants, &self.config, &self.control);
+            join_all(tenants.iter_mut().filter_map(|(key, tenant)| {
+                let network = standing.get(key)?.clone();
+                Some(async move {
+                    let converged =
+                        under_deadline(key, "converge", tenant.converge(&network, config, control));
+                    if let Some(Err(error)) = converged.await {
                         tracing::warn!(tenant = %key, %error, "converging the tenant failed");
                     }
-                }
-                None => self.provision(key, network).await,
-            }
+                })
+            }))
+            .await;
         }
+
+        self.provision_all(newcomers).await;
 
         // Collection is the one irreversible act here, so it runs only on a
         // document the control plane answered *this pass*. The fail-static
@@ -264,41 +471,92 @@ impl Reconciler {
             );
         }
         self.report().await;
-        self.metrics.tenants(self.tenants.len(), self.parked.len());
+        self.metrics.tenants(self.tenants.len(), self.waiting());
         Ok(())
     }
 
-    /// Provisions one network, parking it on failure.
-    async fn provision(&mut self, key: String, network: HostedNetwork) {
-        if let Some(retry_at) = self.parked.get(&key) {
-            if *retry_at > std::time::Instant::now() {
-                return;
-            }
-        }
-        match Tenant::provision(
+    /// Provisions the networks this shard is not yet running, parking those
+    /// that fail.
+    ///
+    /// Concurrently and under a deadline apiece. Provisioning is the longest
+    /// per-tenant step there is — it restores a whole database from the
+    /// replica stream — so a shard cold-starting a hundred tenants one at a
+    /// time takes a hundred restores' worth of wall clock before the last of
+    /// them serves anything, and one tenant whose restore stalls used to mean
+    /// none of the others ever started.
+    async fn provision_all(&mut self, wanted: Vec<(String, HostedNetwork)>) {
+        let now = std::time::Instant::now();
+        let due: Vec<(String, HostedNetwork)> = wanted
+            .into_iter()
+            .filter(|(key, _)| {
+                self.parked
+                    .get(key)
+                    .is_none_or(|parked| parked.retry_at <= now)
+            })
+            .collect();
+        let (config, control, resolver, metrics) = (
             &self.config,
             &self.control,
-            self.resolver.clone(),
-            network,
+            &self.resolver,
             self.metrics.clone(),
-        )
-        .await
-        {
-            Ok(tenant) => {
-                self.parked.remove(&key);
-                self.tenants.insert(key, tenant);
+        );
+        let outcomes = join_all(due.into_iter().map(|(key, network)| {
+            let metrics = metrics.clone();
+            async move {
+                let provisioned = under_deadline(
+                    &key,
+                    "provision",
+                    Tenant::provision(config, control, resolver.clone(), network, metrics),
+                )
+                .await;
+                (key, provisioned)
             }
-            Err(error) => {
-                // The common case here is a zone that has not named the key
-                // yet, which is a wait rather than a fault; the retry cadence
-                // is the daemon's own (§4.3).
-                tracing::info!(tenant = %key, %error, "tenant not ready; will retry");
-                self.parked.insert(
-                    key,
-                    std::time::Instant::now() + crate::tenant::identity_poll(),
-                );
+        }))
+        .await;
+
+        for (key, provisioned) in outcomes {
+            match provisioned {
+                Some(Ok(tenant)) => {
+                    // The record of what went before is deliberately left in
+                    // place — see the field's own note. It holds nothing back
+                    // once `retry_at` has passed, and it is what stops a
+                    // tenant that provisions, dies, and provisions again from
+                    // restarting at full speed for ever.
+                    self.tenants.insert(key, tenant);
+                }
+                Some(Err(error)) => {
+                    // The common case here is a zone that has not named the
+                    // key yet, which is a wait rather than a fault; the first
+                    // retry is at the daemon's own cadence (§4.3), and only a
+                    // tenant that keeps failing is made to wait longer.
+                    tracing::info!(tenant = %key, %error, "tenant not ready; will retry");
+                    self.park(key);
+                }
+                // The deadline already said what happened, loudly.
+                None => self.park(key),
             }
         }
+    }
+
+    /// Parks a network until its backoff expires.
+    fn park(&mut self, key: String) {
+        let park = Parked::after(self.parked.get(&key).copied());
+        self.parked.insert(key, park);
+    }
+
+    /// How many networks are actually waiting to be provisioned.
+    ///
+    /// Not `parked.len()`. The map keeps a memory of past failures so the
+    /// backoff can escalate across a successful restart (see the field), and
+    /// counting those would have `synch_dp_tenants_parked` report every tenant
+    /// that ever had a bad minute as one that is down now — a gauge an
+    /// operator would learn to ignore, which is worse than not having it.
+    fn waiting(&self) -> usize {
+        let now = std::time::Instant::now();
+        self.parked
+            .values()
+            .filter(|parked| parked.retry_at > now)
+            .count()
     }
 
     /// Deletes the stored copy of offboarded tenants whose hold has run (§6).
@@ -360,27 +618,54 @@ impl Reconciler {
     }
 
     /// Sends each tenant's heartbeat.
-    async fn report(&mut self) {
-        for (key, tenant) in &self.tenants {
-            if tenant.state != State::Running {
-                continue;
-            }
-            match tenant.status(&self.config.shard_name).await {
-                Ok(status) => {
-                    self.metrics.tenant_status(key, &status);
-                    if let Err(error) = self
-                        .control
-                        .report_status(&tenant.network.org, &tenant.network.network, &status)
-                        .await
-                    {
-                        tracing::warn!(tenant = %key, %error, "status heartbeat failed");
+    ///
+    /// Concurrently, and under a deadline apiece. The heartbeat is the billing
+    /// record (§10) and it is measured by reading the tenant's store, so a
+    /// sequential sweep hands one tenant's peers the ability to stop every
+    /// other tenant on the shard being metered: hold the store of the first
+    /// tenant in map order and nothing behind it is ever reported.
+    async fn report(&self) {
+        let (tenants, config, control, metrics) =
+            (&self.tenants, &self.config, &self.control, &self.metrics);
+        join_all(
+            tenants
+                .iter()
+                .filter(|(_, tenant)| tenant.state == State::Running)
+                .map(|(key, tenant)| async move {
+                    // Three `stat` calls, not a store read, so it is recorded
+                    // whatever the store is doing — which is the point: the
+                    // tenant whose database is running away with the shard's
+                    // volume is exactly the one whose store is too busy to
+                    // answer a coverage query.
+                    metrics.tenant_db_bytes(key, tenant.db_bytes());
+                    let measured =
+                        under_deadline(key, "status", tenant.status(&config.shard_name)).await;
+                    match measured {
+                        Some(Ok(status)) => {
+                            metrics.tenant_status(key, &status);
+                            let sent = under_deadline(
+                                key,
+                                "heartbeat",
+                                control.report_status(
+                                    &tenant.network.org,
+                                    &tenant.network.network,
+                                    &status,
+                                ),
+                            )
+                            .await;
+                            if let Some(Err(error)) = sent {
+                                tracing::warn!(tenant = %key, %error, "status heartbeat failed");
+                            }
+                        }
+                        Some(Err(error)) => tracing::warn!(
+                            tenant = %key, %error,
+                            "could not measure what the tenant holds"
+                        ),
+                        None => {}
                     }
-                }
-                Err(error) => {
-                    tracing::warn!(tenant = %key, %error, "could not measure what the tenant holds")
-                }
-            }
-        }
+                }),
+        )
+        .await;
     }
 
     /// The desired document: from the control plane, or from the bucket.
@@ -596,6 +881,112 @@ mod tests {
         .names_are_safe());
     }
 
+    /// A pass visits its tenants together, not one after another.
+    ///
+    /// The property that keeps one tenant's peers off every other tenant's
+    /// control loop. Every per-tenant step in a pass ends up waiting on that
+    /// tenant's one store connection, and that connection is what the tenant's
+    /// own members keep busy — so a pass that walks the map in order makes
+    /// each tenant's latency the sum of the others', and the first slow tenant
+    /// in map order stops the rest being converged, metered or supervised.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_visits_its_tenants_together() {
+        let started = tokio::time::Instant::now();
+        let slow = |_| async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        };
+        join_all((0..20).map(slow)).await;
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_secs(10),
+            "twenty tenants took one tenant's time, not twenty"
+        );
+    }
+
+    /// And a tenant that never finishes its step gives the pass back anyway.
+    ///
+    /// Without this a tenant whose store its own peers have jammed holds the
+    /// pass indefinitely: no heartbeat for anyone (which is the billing
+    /// record), no failed-loop restart, no collection. The work behind the
+    /// deadline is not cancelled — a store call already on the blocking pool
+    /// runs to completion regardless — what is recovered is the shard's
+    /// ability to go on supervising everything else.
+    #[tokio::test(start_paused = true)]
+    async fn a_tenant_that_overruns_does_not_keep_the_pass() {
+        let stuck = under_deadline("acme/prod", "converge", std::future::pending::<()>());
+        assert!(stuck.await.is_none());
+    }
+
+    /// A tenant that keeps failing is made to wait longer each time, and one
+    /// that has been well for a while starts over.
+    ///
+    /// The backoff is not politeness. Re-provisioning discards the local
+    /// database and replays the whole replica stream, so a tenant whose
+    /// standing loops keep dying would buy a full restore every poll —
+    /// object-store egress, disk churn and blocking-pool time charged to every
+    /// other tenant on the shard, for a tenant that is not working anyway.
+    #[test]
+    fn a_tenant_that_keeps_failing_is_made_to_wait_longer() {
+        let first = Parked::after(None);
+        assert_eq!(first.failures, 1);
+        let second = Parked::after(Some(first));
+        assert_eq!(second.failures, 2);
+        assert!(
+            second.retry_at.duration_since(second.at) > first.retry_at.duration_since(first.at),
+            "a repeat failure waits longer than the first"
+        );
+
+        // And it is capped, so a tenant is never parked out of existence.
+        let mut park = first;
+        for _ in 0..40 {
+            park = Parked::after(Some(park));
+        }
+        assert!(park.retry_at.duration_since(park.at) <= MAX_PARK);
+
+        // A failure long after the last one is a first failure again: a tenant
+        // that restarts once a month must not arrive at the cap and stay there.
+        let stale = Parked {
+            at: std::time::Instant::now() - PARK_DECAY * 2,
+            ..park
+        };
+        assert_eq!(Parked::after(Some(stale)).failures, 1);
+    }
+
+    /// A remembered failure is not a tenant that is down.
+    ///
+    /// The two are one map, because the backoff has to escalate across a
+    /// successful restart — a crash loop is exactly the sequence "fails,
+    /// provisions, fails again", and a count cleared by the success in the
+    /// middle resets on every lap. But `synch_dp_tenants_parked` answers "how
+    /// many networks is this shard not running", and a gauge that also counted
+    /// every tenant that ever had a bad minute is one an operator learns to
+    /// ignore.
+    #[test]
+    fn a_remembered_failure_is_not_a_parked_tenant() {
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let key = "acme/prod".to_string();
+        reconciler.park(key.clone());
+        assert_eq!(reconciler.waiting(), 1, "a fresh park is a tenant waiting");
+
+        // Its wait elapses and it provisions; the count of what went wrong
+        // stays, because the next failure has to escalate from it.
+        let remembered = reconciler.parked.get_mut(&key).expect("the entry");
+        remembered.retry_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(reconciler.waiting(), 0, "and afterwards it is not");
+        assert_eq!(reconciler.parked[&key].failures, 1);
+        reconciler.park(key.clone());
+        assert_eq!(
+            reconciler.parked[&key].failures, 2,
+            "the next failure escalates rather than starting over"
+        );
+    }
+
     fn test_config() -> DpConfig {
         DpConfig {
             control_url: "http://127.0.0.1:1".into(),
@@ -612,6 +1003,8 @@ mod tests {
             cache_bytes_total: 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
+            blocking_threads: 512,
+            max_inflight_per_tenant: 8,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),

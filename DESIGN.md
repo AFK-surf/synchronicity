@@ -2137,7 +2137,18 @@ CI (GitHub Actions):
   per-origin publish quotas** — a member behaving abusively is a membership problem,
   and the remedy is the membership machinery: `synch trust rm` or removal from the
   DNS record set cuts the node off from all *future* participation — connections
-  refused, new heads ignored. Data it already published stays replicated (nothing
+  refused, new heads ignored.
+
+  The stance holds because the party bearing the cost is the party holding the
+  remedy. That equivalence is what an *embedder* can break, and one does: the cloud
+  data plane runs one node per hosted network in one process, and org A's members are
+  not org B's to curate. So `NetOptions::max_inflight_requests` exists — off by
+  default, because a daemon serving one cluster wants the stance above — and caps how
+  much of the shared blocking pool one endpoint's peers can hold at once. It is a
+  concurrency bound rather than a rate limit: an honest peer waits microseconds for a
+  slot and never notices. See docs/CLOUD-DATAPLANE.md §9.1 for what a multi-tenant
+  host must add on top of this section, and — stated there rather than left implied —
+  what it still does not bound. Data it already published stays replicated (nothing
   cascades deletion through everyone's tries — that would hand any removal a blast
   radius) and ages out with normal retention; `synch doctor` lists origins whose
   data is held without a live binding. What remains are sanity bounds that

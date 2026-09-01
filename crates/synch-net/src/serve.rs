@@ -35,6 +35,11 @@ use synch_store::Store;
 /// rather than under a rate limiter. What this does bound is the cost of one
 /// connection, which is what keeps an ordinary peer's pipelining from being
 /// mistaken for that.
+///
+/// An embedder that cannot take §12's trust stance — one process serving
+/// several clusters that do not trust each other — asks for
+/// [`NetOptions::max_inflight_requests`](crate::NetOptions::max_inflight_requests)
+/// as well, which bounds the same cost across the whole endpoint.
 pub(crate) const MAX_CONCURRENT_STREAMS: usize = 8;
 
 /// How long one request may take, start to finish.
@@ -48,6 +53,31 @@ pub(crate) const MAX_CONCURRENT_STREAMS: usize = 8;
 /// object is real disk work.
 pub(crate) const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The endpoint-wide in-flight gate, when the embedder asked for one.
+///
+/// Shared by every connection on every ALPN this endpoint serves — see
+/// [`NetOptions::max_inflight_requests`](crate::NetOptions::max_inflight_requests)
+/// for why an embedder wants it and a daemon does not.
+pub(crate) type Inflight = Option<Arc<tokio::sync::Semaphore>>;
+
+/// Takes a slot in the endpoint-wide gate, if there is one.
+///
+/// `None` when no gate is configured, which is the daemon's case and costs
+/// nothing. The semaphore is never closed, so the error arm is unreachable in
+/// practice; it is written as "no slot, stop serving" rather than unwrapped,
+/// because a closed gate must not be read as an open one.
+pub(crate) async fn slot(
+    inflight: &Inflight,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    match inflight {
+        None => Ok(None),
+        Some(gate) => match gate.clone().acquire_owned().await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(_) => Err(()),
+        },
+    }
+}
+
 /// Serves one accepted connection until the peer closes it or its binding
 /// lapses.
 ///
@@ -57,10 +87,18 @@ pub(crate) const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// peer's cryptographically established device key, which the handshake settled
 /// — reports its own failures to the peer in its own vocabulary, and finishes
 /// the send side.
+///
+/// `inflight` is the endpoint-wide gate. It is taken around the admission
+/// check as well as around every dispatched stream, and that is deliberate:
+/// [`admit`] is a store call, it is the one store call an *unauthenticated*
+/// dialer can reach, and a gate that started after admission would leave the
+/// cheapest thing to send — a QUIC handshake — buying an unbounded queue of
+/// blocking-pool work.
 pub(crate) async fn serve_connection<D, F, S, G>(
     store: &Arc<Store>,
     connection: Connection,
     on_unknown_key: Option<&Arc<tokio::sync::Notify>>,
+    inflight: &Inflight,
     mut on_request: G,
     dispatch: D,
 ) -> Result<(), AcceptError>
@@ -71,11 +109,22 @@ where
     S: std::future::Future<Output = ()>,
 {
     let remote = connection.remote_id();
-    admit(store, &connection, &remote, on_unknown_key).await?;
-    on_request(remote).await;
+    {
+        let Ok(_admission) = slot(inflight).await else {
+            return Ok(());
+        };
+        admit(store, &connection, &remote, on_unknown_key).await?;
+        on_request(remote).await;
+    }
 
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     while let Ok((send, recv)) = connection.accept_bi().await {
+        // Before the binding re-check, not after it: that check is a store
+        // call too, so a stream that never gets past it has still spent a
+        // slot on the blocking pool.
+        let Ok(shared) = slot(inflight).await else {
+            break;
+        };
         if !still_admitted(store, &connection, &remote).await {
             break;
         }
@@ -86,6 +135,7 @@ where
         let dispatch = dispatch.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _shared = shared;
             if tokio::time::timeout(STREAM_TIMEOUT, dispatch(remote, send, recv))
                 .await
                 .is_err()

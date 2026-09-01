@@ -827,6 +827,7 @@ if the DB replica is also gone does the key-replacement path (§5.3) run.
 | tokio tasks | ~8 standing | §4.4 loop set |
 | DB replicator | 1 standing task, 1 read connection | in-process, §5.3 |
 | memory | O(trie working set + cache index) | dominated by anti-entropy peaks |
+| blocking-pool slots | ≤ `SYNCH_DP_MAX_INFLIGHT_PER_TENANT` from peers | the tenancy bound, §9.1 |
 
 Shared, once per process: the tokio runtime and its blocking pool (sized
 deliberately: every store touch of every tenant crosses it), one
@@ -838,6 +839,14 @@ The practical v1 ceiling is file descriptors and blocking-pool contention,
 not CPU: **O(hundreds) of networks per shard**, which one instance
 ("scale-to-one", the serverless posture) serves for a long time before
 sharding matters.
+
+Blocking-pool contention is also the thing a hostile tenant reaches for, so
+it is not left to capacity planning alone. `SYNCH_DP_BLOCKING_THREADS` (a
+ceiling tokio grows into on demand, default sized from
+`SYNCH_DP_MAX_TENANTS`) and `SYNCH_DP_MAX_INFLIGHT_PER_TENANT` are chosen
+together, such that the shard's tenants collectively cannot ask for more
+than half the pool and the other half stays available for the reconcile
+pass, the replication tickers and the heartbeats. §9.1 is why.
 
 ### 7.2 Sharding, when it matters
 
@@ -906,6 +915,10 @@ None of the engine's replication, storage, or membership code changes.
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
 | budget exhausted | admission stops; the engine's own `held_back` shows in the replication panel; nothing evicted. The metering heartbeat does **not** carry it — `wanted` climbing against a flat `held_bytes` is what an operator reads instead | org raises plan; acquisition resumes |
 | disk pressure on shard | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
+| **one tenant's members flood its endpoint** | that tenant's endpoint queues at its inbound ceiling; other tenants unaffected | §9.1 |
+| **one tenant's store is jammed by its own peers** | that tenant overruns its share of the reconcile pass and is skipped for it; every other tenant is still converged, metered and supervised | §9.1 |
+| **one tenant's members publish a great many spaces** | replicas stop being added at the ceiling, loudly; the pass stays bounded | §9.1 |
+| **one tenant's members inflate its metadata** | `synch_dp_tenant_db_bytes` climbs against a flat `held_bytes`; **not** bounded — the volume can still fill and take the shard with it | §9.1, open |
 
 ---
 
@@ -962,6 +975,107 @@ None of the engine's replication, storage, or membership code changes.
   stream keeps
   its transparency-log pins; the shared resolver bounds Sigstore traffic.
 
+### 9.1 Resource exhaustion, where §12's trust stance runs out
+
+DESIGN §12 declines per-peer rate limits and per-origin quotas, on purpose
+and with a stated reason: every peer that can send a request at all is an
+authorized member, members are extended basic trust not to DoS each other,
+and a member behaving abusively is a *membership* problem whose remedy is
+`synch trust rm` or removal from the zone. That is the right stance for a
+cluster. **It does not survive this service**, and the reason is one
+sentence: the membership belonging to org A is not org B's to curate, and
+org B's tenant is in the same process. §12's remedy is available — but it
+is available to the wrong party. Everything below is the difference
+between what a node does about a hostile member and what a *shard* must.
+
+What this changes is only the resources tenants share. The protocol's own
+sanity bounds are unchanged and do the work they always did: a peer with
+no live binding is closed out after the handshake, batches are capped on
+both count and bytes, keys and trie values are bounded, deep chains are
+refused, and content is verified against object roots so a peer can
+withhold but never inject. The gap was never one malformed message. It was
+that nothing capped *how many* well-formed ones one network could have in
+flight, and that everything a tenant does — its heartbeat, its
+converge, its drain — ran through resources every other tenant needed.
+
+- **The inbound ceiling.** Every request handler on both ALPNs offloads its
+  store work onto the process's one blocking pool (§7.1), and nothing
+  capped how many connections a peer opens. A tenant's store calls
+  serialize on that tenant's single connection mutex, so the pool threads
+  are spent *waiting* rather than working: a member of one org could hold
+  the whole pool, and every other tenant's publishing, membership renewal
+  and heartbeat queued behind it. Each tenant's endpoint now carries an
+  endpoint-wide in-flight cap (`NetOptions::max_inflight_requests`,
+  `SYNCH_DP_MAX_INFLIGHT_PER_TENANT`), taken around the admission check as
+  well as every request — admission is a store call, and it is the one
+  store call an *unauthenticated* dialer reaches, so a gate starting after
+  it would leave a QUIC handshake buying unbounded queued work. The
+  default is derived from the pool size and `SYNCH_DP_MAX_TENANTS` so a
+  shard's tenants collectively cannot outbid half its pool; the other half
+  is reserved for the work no peer asked for.
+- **The pass is fanned out and deadlined.** A reconcile pass used to visit
+  tenants one at a time, and every per-tenant step in it — provision,
+  converge, measure, heartbeat — waits on the store that tenant's own peers
+  keep busy. That made each tenant's latency the sum of the others': one
+  jammed tenant meant nothing else was converged, no heartbeat was sent
+  (which is the billing record, §10), the failed-loop supervisor never ran
+  and nothing collected. Tenants are now visited together, each under its
+  own deadline; a tenant that overruns is logged and skipped for that
+  pass. Drains are the deliberate exception — concurrent, but never cut
+  short, because abandoning one half way would remove a data directory
+  while the node is still writing to it.
+- **Restarts back off.** Re-provisioning discards the local database and
+  replays the whole replica stream, so a tenant whose standing loops keep
+  dying bought a full restore every poll — object-store egress and
+  blocking-pool time charged to every other tenant on the shard. The first
+  restart is still immediate; the rest back off to a cap, and forget the
+  backoff after half an hour of health.
+- **A ceiling on replicated spaces.** §4.5's rule is "every space the network
+  publishes gets a replica", and a space is a plain string in the trie key any
+  member may publish under (DESIGN §12). The number of them is therefore a
+  member's to choose, and each one became a replica row that is written once
+  and — by §4.5's own reasoning, which is right — never removed. So one
+  member publishing one entry under each of a million space names bought a
+  million permanent rows, a converge pass a million store queries long on a
+  store its own peers were already competing for, and a database that size
+  riding the replica stream to object storage for ever. There is now a
+  ceiling (4 096, three orders of magnitude past any real org's shares), it
+  stops the work rather than filtering the result, and reaching it is an
+  error-level log naming the count. Replicas already taken on are unaffected.
+  The same pass no longer scans the replica list per space either: that made
+  it quadratic in two numbers a member chooses.
+- **What is still not bounded: tenant metadata.** `budget_bytes` (§4.5) is
+  an admission ceiling on *content*, and a tenant's local content footprint
+  is separately capped by `cache_bytes` (§5.2). Neither covers the trie
+  nodes, out-of-line values, heads and head history a network's members
+  publish, which this node adopts in full because that is what replicating
+  a network means. They land in one SQLite file on a volume every tenant on
+  the pod shares, and they ride the replica stream. A member publishing a
+  million tiny entries costs almost no content bytes, passes every budget
+  this design has, and can fill the shard's volume out from under every
+  other tenant. This is reported and not enforced: `synch_dp_tenant_db_bytes`
+  climbing on one tenant against a flat `held_bytes` is what an operator
+  alerts on. Enforcing it belongs where the plan does — the control plane
+  already sizes `budget_bytes` per org, and extending it to cover metadata
+  is its change to make. A ceiling invented in the data plane would take a
+  paying customer's tenant down for having a lot of files.
+- **What a member can still do to its own tenant.** An in-flight slot is
+  held for the whole of a request, the read included, so a peer that opens
+  a stream and then says nothing holds a slot until the 120 s stream
+  timeout. Enough such streams stall that tenant's endpoint. That is
+  deliberately left where §12 puts it: it is one org's members degrading
+  one org's replica, with §12's remedy available to exactly the party who
+  has it. The per-tenant ceiling is floored at twice the per-connection
+  stream cap so that a *single* connection can never do it, and no amount
+  of it reaches another tenant.
+- **Isolation remains by ownership, not sandboxing.** Nothing here changes
+  §9's last-but-one bullet: tenants still share an address space, and the
+  guarantee against cross-tenant *data* flow is still that no code path
+  holds two tenants' stores. What changes is availability — the containment
+  no longer depends on every org's members behaving. An org that requires
+  hard isolation is still a dedicated-shard tier, which the shard filter
+  already makes a configuration.
+
 ---
 
 ## 10. Observability and metering
@@ -971,8 +1085,15 @@ None of the engine's replication, storage, or membership code changes.
   `synch_dp_poll_failures`, `synch_dp_reconcile_failures`,
   `synch_dp_desired_generation`, `synch_dp_storage_collected`, and — per
   tenant, labelled `{org, network}` — `synch_dp_held_bytes`,
-  `synch_dp_held_roots`, `synch_dp_wanted` and
-  `synch_dp_replication_failures`.
+  `synch_dp_held_roots`, `synch_dp_wanted`,
+  `synch_dp_replication_failures` and `synch_dp_tenant_db_bytes`.
+- **`synch_dp_tenant_db_bytes` is the other one to alert on**, and it is
+  here for the reason §9.1 gives: it is the shard's one unbudgeted
+  resource. Content is bounded twice over; the metadata a network's members
+  publish is bounded by neither, and it shares one volume with every tenant
+  on the pod. Climbing on one tenant against a flat `synch_dp_held_bytes`
+  is a network inflating metadata, and it is visible before the volume
+  fills rather than after.
 - **`synch_dp_replication_failures` is the one to alert on**, and it is
   here because an earlier draft promised an operator could alert on a
   stalled stream while exporting nothing that showed one. It counts a

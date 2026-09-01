@@ -75,6 +75,9 @@ pub(crate) struct MptProtocol {
     store: Arc<Store>,
     heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    /// The endpoint-wide in-flight gate, shared with every other ALPN mounted
+    /// on this endpoint (`crate::serve::Inflight`).
+    inflight: crate::serve::Inflight,
     /// When each peer's sighting was last written, shared across every
     /// connection this handler serves.
     last_sighting: Arc<std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>>,
@@ -87,8 +90,15 @@ impl MptProtocol {
             store,
             heads,
             on_unknown_key: None,
+            inflight: None,
             last_sighting: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Gates this handler on the endpoint-wide in-flight semaphore.
+    pub(crate) fn inflight(mut self, gate: crate::serve::Inflight) -> Self {
+        self.inflight = gate;
+        self
     }
 
     /// Rings `wake` whenever a connection is refused for an unknown key — a
@@ -155,6 +165,7 @@ impl ProtocolHandler for MptProtocol {
             &self.store.clone(),
             connection,
             self.on_unknown_key.as_ref(),
+            &self.inflight,
             sighting,
             move |peer, mut send, mut recv| {
                 let handler = handler.clone();
@@ -1246,6 +1257,113 @@ mod tests {
 
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
+    }
+
+    /// A sink that reports how many requests were ever being served at once.
+    ///
+    /// The measurement has to be taken inside the handler's own blocking
+    /// closure, because that is the resource under discussion: every request
+    /// on both ALPNs offloads its store work onto the process's one blocking
+    /// pool, and "how many at once" is exactly how much of that pool one
+    /// endpoint's peers can hold.
+    #[derive(Debug, Default)]
+    struct Counting {
+        now: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeadSink for Counting {
+        fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError> {
+            use std::sync::atomic::Ordering;
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Long enough that four requests issued together overlap on any
+            // machine, and short enough not to slow the suite down.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        fn observe_summaries_from(
+            &self,
+            _peer: NodeId,
+            _summaries: &[HeadSummary],
+            _now: i64,
+        ) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn offer_head(&self, _head: &SignedHead, _now: i64) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn heads_for(&self, _origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An embedder can cap what one endpoint's peers hold at once, and without
+    /// the cap they hold as much as they ask for.
+    ///
+    /// This is the bound the multi-tenant data plane rests on
+    /// (`docs/CLOUD-DATAPLANE.md` §9): one process, one node per hosted
+    /// network, one blocking pool between all of them. DESIGN §12 declines
+    /// per-peer limits because in a single cluster a peer that can send a
+    /// request is a member and abuse is a membership problem — but org A's
+    /// membership is not org B's to curate, so an embedder serving both asks
+    /// for a ceiling and gets containment that does not depend on anybody's
+    /// good behaviour.
+    ///
+    /// Both halves are asserted, because the cap proves nothing on its own: a
+    /// test that only showed "at most one at a time" would pass just as
+    /// happily against a responder that never overlapped anything.
+    #[tokio::test]
+    async fn an_endpoint_wide_cap_bounds_what_one_peer_can_hold() {
+        async fn peak_under(limit: Option<usize>) -> usize {
+            let (_dir, store) = test_store();
+            let sink = std::sync::Arc::new(Counting::default());
+            let options = crate::endpoint::NetOptions {
+                heads: Some(sink.clone() as std::sync::Arc<dyn HeadSink>),
+                max_inflight_requests: limit,
+                ..crate::endpoint::NetOptions::loopback()
+            };
+            let (server, client, _client_dir) = trusting_pair(store, options).await;
+            let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+            // Four at once on one connection, so the only thing that can hold
+            // them apart is the endpoint-wide gate: the per-connection cap is
+            // eight and never bites here.
+            let exchanges: Vec<_> = (0..4)
+                .map(|_| {
+                    let mpt = mpt.clone();
+                    tokio::spawn(async move {
+                        let _ = mpt
+                            .head_exchange(Vec::new(), DeclaredScope::Untrusted, |_| {
+                                (Vec::new(), Vec::new())
+                            })
+                            .await;
+                    })
+                })
+                .collect();
+            for task in exchanges {
+                let _ = task.await;
+            }
+            client.shutdown().await.unwrap();
+            server.shutdown().await.unwrap();
+            sink.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        assert!(
+            peak_under(None).await > 1,
+            "without a ceiling a peer's pipelined requests are served together — \
+             which is the behaviour a single-cluster daemon wants, and the \
+             behaviour a shared process cannot afford"
+        );
+        assert_eq!(
+            peak_under(Some(1)).await,
+            1,
+            "with a ceiling of one, one is all a peer can ever hold"
+        );
     }
 
     /// A stream that stalls mid-message does not stop the connection serving
