@@ -45,6 +45,11 @@ tracing-subscriber.workspace = true
 # DNSSEC signer.
 synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
+# The stress harness signs a head per synthetic member, which is the one thing
+# in this crate's tree that needs a *secret* key: nothing the data plane does
+# in production signs on another origin's behalf, so this stays a dev
+# dependency rather than joining the list above.
+iroh-base.workspace = true
 
 [lints]
 workspace = true
