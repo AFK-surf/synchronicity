@@ -26,14 +26,11 @@ The proof boundary is explicit:
   `TakePossession` require `Available`, which requires `durable`, and
   `Store::pin`/`take_possession` enforce exactly that predicate
   (`staged_row_drop_is_unpinned`);
-- verified content hashes identify the bytes, and the configured durable
-  backend satisfies its write contract. A backend that loses an object it
-  acknowledged (an S3 `NoSuchKey` on a durable root) breaks that assumption;
-  the `heal_missing_*` paths that respond to it lower `durable`, convert
-  source and replica pins into repair wants, and leave operator pins in place.
-  Those transitions, and the source-holder wants they create, are outside the
-  model on purpose: they describe recovery from a broken assumption, not an
-  execution the theorems cover.
+- verified content hashes identify the bytes, and — in `SystemSafety` — the
+  configured durable backend satisfies its write contract. `FaultTolerant`
+  drops that last assumption: it adds unguarded loss steps and the two
+  `heal_missing_*` transitions, and proves the weaker invariant that survives
+  them (below).
 
 There are three layers:
 
@@ -42,7 +39,9 @@ There are three layers:
   materialized leaves of active tries as `sourceLive`, `replicaLive`, or
   metadata-only `ordinaryLive` relations;
 - `TrieGraph` states GC's graph obligation over every node reachable from every
-  retained trie root.
+  retained trie root;
+- `FaultTolerant` re-proves the system invariant with the backend allowed to
+  lose what it acknowledged.
 
 The principal system theorems are
 `SystemSafety.source_live_content_is_available` and
@@ -54,6 +53,26 @@ materialized-leaf and entry removal, pin/unpin/expiry, want
 removal/take-possession, protected deletion, and both GC phases.
 `TrieGraph.gc_preserves_complete_retained_root` supplies the analogous
 node-graph property.
+
+`FaultTolerant` is the same cell and the same twenty-two transitions with two
+environment steps added — `LoseRemote` and `LoseBytes`, with no guard — and the
+two heals Rust runs when a read discovers the loss. `HealRemote` and `HealLocal`
+mirror `heal_missing_durable_blob` and `heal_missing_local_blob`: withdraw the
+durable claim, turn every role holder's pin into a repair want, leave the
+operator's pin alone. Live holders are roles (`IsRole`), which is why
+`SourcePublish` and `ReplicaPromote` carry that guard. The invariant that
+survives replaces `Available` with `Durable` (row present, backend claim
+standing) and gives the operator no clause. Its theorems:
+`role_pin_stands_on_durable_row`, or equivalently `role_pin_is_available_or_lost`
+— a source's or replica's pin stands on content that is available or that the
+backend has lost and the heal has not yet run; `no_role_pin_over_withdrawn_claim`;
+`source_live_is_held_or_wanted` and `replica_live_is_held_or_wanted`;
+`heal_converts_role_pins`; and, stated so it is not mistaken for a guarantee,
+`heal_keeps_operator_pin`. `fault_free_is_reachable` embeds every `SystemSafety`
+execution, so the strong theorems remain the fault-free specialization. Not
+modelled: that a heal ever runs, that a want is ever satisfied, or that the
+backend's `NotFound` is true — a spurious one triggers a heal that errs in the
+safe direction, a pin becoming a want and a refetch.
 
 `MptGc` is deliberately looser than the code where the code's own ordering is
 not what the invariant rests on: a fetch batch may commit after the pending

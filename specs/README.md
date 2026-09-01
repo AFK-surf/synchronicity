@@ -57,16 +57,20 @@ proof.
 
 ## Lean — CAS / mptsync / ingest safety
 
-[`lean/`](lean/) contains unbounded inductive proofs at three resolutions: the
+[`lean/`](lean/) contains unbounded inductive proofs at four resolutions: the
 small per-root protocol, a root/holder-indexed system model whose live relations
-are the content leaves materialized from active tries, and a graph model of trie
-mark/sweep. The system theorem says every live source leaf names available
-content and every live replica leaf names either pinned available content or a
-want for that same holder and root. It covers protection removal as well as
-acquisition, protected explicit deletion, writer abort, cache eviction, the
-unprotected removal of staged (non-durable) rows, and the two GC phases. Rust
-and Lean carry matching checked anchors at their linearization points; run
-`lean/check-anchors.sh` after changing either side.
+are the content leaves materialized from active tries, a graph model of trie
+mark/sweep, and a fault-tolerant re-proof of the system model with the durable
+backend allowed to lose what it acknowledged. The system theorem says every
+live source leaf names available content and every live replica leaf names
+either pinned available content or a want for that same holder and root. It
+covers protection removal as well as acquisition, protected explicit deletion,
+writer abort, cache eviction, the unprotected removal of staged (non-durable)
+rows, and the two GC phases. Under backend loss, the surviving theorem is that
+a role's pin stands on content that is available or that the backend lost and
+the heal has not yet converted into a want. Rust and Lean carry matching checked
+anchors at their linearization points; run `lean/check-anchors.sh` after
+changing either side.
 
 ```sh
 cd specs/lean

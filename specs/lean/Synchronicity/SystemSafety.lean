@@ -19,6 +19,14 @@ def add (p : Holder → Prop) (holder : Holder) : Holder → Prop :=
 def drop (p : Holder → Prop) (holder : Holder) : Holder → Prop :=
   fun candidate => p candidate ∧ candidate ≠ holder
 
+/-- The operator's holder, `synch pin add`.  Every other holder is a role a
+space configures — a source or a replica — and only roles stand behind live
+leaves.  `FaultTolerant` needs the distinction because the heal paths treat the
+two differently. -/
+def operator : Holder := 0
+
+def IsRole (holder : Holder) : Prop := holder ≠ operator
+
 structure Cell where
   entry : Prop := False
   pin : Holder → Prop := fun _ => False
@@ -101,7 +109,7 @@ def DropStaged (c c' : Cell) : Prop :=
 
 /- RUST-REF: cas-source-publish — `node.rs::Node::publish`. -/
 def SourcePublish (holder : Holder) (c c' : Cell) : Prop :=
-  ¬c.sweeping ∧ Available c ∧
+  IsRole holder ∧ ¬c.sweeping ∧ Available c ∧
   c' = { c with
     entry := True
     pin := add c.pin holder
@@ -110,7 +118,7 @@ def SourcePublish (holder : Holder) (c c' : Cell) : Prop :=
 
 /- RUST-REF: cas-remote-promotion — `reconcile.rs::try_promote`. -/
 def ReplicaPromote (holder : Holder) (c c' : Cell) : Prop :=
-  ¬c.sweeping ∧
+  IsRole holder ∧ ¬c.sweeping ∧
   ((Available c ∧ c' = { c with
       entry := True
       pin := add c.pin holder
@@ -156,7 +164,8 @@ def ExpirePin (holder : Holder) (c c' : Cell) : Prop := Unpin holder c c'
 
 /- RUST-IMPL: cas-drop-want — `replica.rs::Store::drop_want`. -/
 def DropWant (holder : Holder) (c c' : Cell) : Prop :=
-  ¬c.replicaLive holder ∧ c' = { c with want := drop c.want holder }
+  ¬c.sourceLive holder ∧ ¬c.replicaLive holder ∧
+  c' = { c with want := drop c.want holder }
 
 /- RUST-REF: cas-take-possession — `replica.rs::take_possession`. -/
 def TakePossession (holder : Holder) (c c' : Cell) : Prop :=
@@ -319,7 +328,7 @@ theorem cell_invariant_step (hinv : Invariant c) (hstep : CellStep c c') :
         · exact ⟨old.1, Or.inr wanted⟩
   | sourcePublish h =>
       rename_i target
-      rcases h with ⟨notSweeping, available, rfl⟩
+      rcases h with ⟨_, notSweeping, available, rfl⟩
       refine ⟨?_, ?_, ?_, ?_, ?_⟩
       · intro candidate pinned
         rcases pinned with rfl | old
@@ -343,7 +352,7 @@ theorem cell_invariant_step (hinv : Invariant c) (hstep : CellStep c c') :
         exact False.elim (notSweeping sweeping)
   | replicaPromote h =>
       rename_i target
-      rcases h with ⟨notSweeping, held | missing⟩
+      rcases h with ⟨_, notSweeping, held | missing⟩
       · rcases held with ⟨available, rfl⟩
         refine ⟨?_, ?_, ?_, ?_, ?_⟩
         · intro candidate pinned
@@ -463,7 +472,7 @@ theorem cell_invariant_step (hinv : Invariant c) (hstep : CellStep c c') :
           old.2.2⟩
   | dropWant h =>
       rename_i target
-      rcases h with ⟨noReplica, rfl⟩
+      rcases h with ⟨_, noReplica, rfl⟩
       refine ⟨pins, sources, ?_, ordinary, sweepInv⟩
       intro candidate live
       by_cases same : candidate = target
@@ -606,7 +615,7 @@ theorem replica_promotion_before_gc_blocks_collection
   intro ⟨swept, gc⟩
   have promotedInv := cell_invariant_step hinv (.replicaPromote promote)
   have live : promoted.replicaLive holder := by
-    rcases promote with ⟨_, held | missing⟩ <;> simp_all [add]
+    rcases promote with ⟨_, _, held | missing⟩ <;> simp_all [add]
   exact gc_cannot_collect_live_content promotedInv
     ⟨holder, Or.inr (Or.inl live)⟩ gc
 
@@ -618,7 +627,7 @@ theorem gc_before_replica_promotion_records_want
   have noPin : ∀ candidate, ¬c.pin candidate := by
     intro candidate pinned
     exact gc.1.2.2.1 ⟨candidate, pinned⟩
-  rcases promote with ⟨_, held | missing⟩
+  rcases promote with ⟨_, _, held | missing⟩
   · have committedRowMissing : ¬committed.row := by
       rcases gc with ⟨_, rfl⟩
       exact id

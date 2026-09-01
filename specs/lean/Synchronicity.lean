@@ -1,4 +1,5 @@
 import Synchronicity.CasGc
+import Synchronicity.FaultTolerant
 import Synchronicity.MptGc
 import Synchronicity.Safety
 import Synchronicity.SystemSafety
