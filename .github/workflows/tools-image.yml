@@ -1,0 +1,166 @@
+name: tools image
+
+# Builds the root Dockerfile — `synch`, `synch-s3` and `synch-dp` in one
+# image — and publishes it to GHCR as
+# ghcr.io/<owner>/synchronicity/tools, beside the control plane's own
+# image. Pull requests build both architectures but push nothing; only
+# main and tags produce images.
+#
+# Nothing is published until the same image has run a node: `smoke`
+# builds the amd64 half into the local daemon and runs ops/image-smoke.sh
+# against it, and `image` needs it. The workspace suite already proves
+# the code; what only running the image catches is the packaging — a
+# binary for the wrong architecture, a runtime without ca-certificates, a
+# data directory the service user cannot write, a gateway that cannot
+# find the daemon's socket.
+#
+# The two triggers watch different paths, deliberately. Every push to
+# main that changes the workspace has to produce an image, so `push`
+# watches the sources too. A pull request pays a release build of the
+# whole workspace, twice over, for a job that publishes nothing — so it
+# runs only when the *image's own* definition changes, which is the
+# change a reviewer cannot check by reading. A source change that breaks
+# the image (a new runtime dependency, say) therefore surfaces on main,
+# where `smoke` still gates the publish: the workflow goes red and no
+# broken image is pushed. Run it on the pull request by hand
+# (workflow_dispatch on the branch) when a change looks like it could.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'ops/image-smoke.sh'
+      - '.github/workflows/tools-image.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'ops/image-smoke.sh'
+      - '.github/workflows/tools-image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/tools
+
+jobs:
+  # Run the image before anyone can pull it. Single-architecture and
+  # `load: true`, because the docker exporter takes exactly one platform
+  # and the arm64 half is the same Dockerfile compiled for another
+  # target — what is being tested here is packaging, not codegen. Its
+  # cache lands in its own scope so the amd64-only export cannot evict
+  # the multi-arch cache `image` reads.
+  smoke:
+    name: smoke test the image
+    runs-on: ubuntu-latest
+    # A release build of the whole workspace, from an empty cache on the
+    # first run of any changed source. That is the job, not a hang.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: synch-tools:smoke
+          cache-from: |
+            type=gha,scope=smoke
+            type=gha
+          cache-to: type=gha,mode=max,scope=smoke
+          # The docker exporter `load: true` needs cannot carry
+          # attestations; the published build below makes them.
+          provenance: false
+
+      - run: ./ops/image-smoke.sh synch-tools:smoke
+
+  image:
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      # Signed build provenance for the pushed image.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is emulated, but the compile is not: the Dockerfile pins the
+      # build stage to $BUILDPLATFORM and cross-compiles with
+      # cargo-zigbuild, so QEMU is left with the runtime stage's one
+      # `apt-get install ca-certificates` and the useradd beside it. An
+      # emulated rustc building this workspace would cost hours.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=synchronicity tools
+            org.opencontainers.image.description=The synchronicity CLI and daemon, the S3 gateway, and the cloud data plane in one image
+            org.opencontainers.image.licenses=MIT
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The smoke scope first: its amd64 layers are already warm from
+          # the job above, so this build only has arm64 left to do.
+          cache-from: |
+            type=gha,scope=smoke
+            type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

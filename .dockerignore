@@ -1,0 +1,20 @@
+# The build context is the repository root, but the image builds three Rust
+# binaries and nothing else, so only the workspace itself is an input:
+# Cargo.toml, Cargo.lock, crates/ and vendor/ (russh is a path dependency).
+#
+# Excluding by allowlist rather than by exception list, because the cost of
+# the two mistakes is not the same: a stray directory in the context only
+# makes the build slower and invalidates layers when it changes, but a
+# missing input fails the build loudly. Everything the image genuinely
+# needs is re-included below.
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates/
+!vendor/
+
+# Build outputs that would otherwise ride along inside those trees. A host
+# target/ is both enormous and the wrong architecture.
+**/target/
+**/*.rs.bk
