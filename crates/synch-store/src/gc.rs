@@ -51,6 +51,9 @@ impl Store {
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub(crate) fn gc_trie(&self) -> Result<GcStats> {
+        // LEAN-MODEL: mpt-trie-gc
+        // `MptGc.TrieGc` models this whole immediate transaction, not its
+        // individual reads and deletes; splitting it invalidates the theorem.
         let mut stats = GcStats::default();
         let (swept_nodes, swept_values, roots) =
             self.transaction(|txn| -> Result<(usize, usize, Vec<Hash>)> {
@@ -121,6 +124,9 @@ impl Store {
     /// collected, without it it is. Every write path stamps the column, which
     /// is all this needs.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
+        // LEAN-MODEL: cas-retention-elapses
+        // `CasGc.Age` abstracts crossing this `before` horizon; it grants no
+        // permission by itself, only removes the freshness guard.
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
         let mut stats = GcStats::default();

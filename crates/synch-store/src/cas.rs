@@ -796,6 +796,9 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
+        // LEAN-MODEL: cas-write-complete-commit
+        // `CasGc.CommitComplete` abstracts this complete-row commit. File
+        // callers hold the write lease; inline callers have no unlink window.
         let durable = self.complete_is_durable();
         upsert_blob_row(
             &self.conn(),
@@ -872,6 +875,9 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
+        // LEAN-MODEL: cas-write-groups-commit
+        // `CasGc.CommitGroups` abstracts both partial and completing bitmap
+        // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
             let settlement = settle_size(
@@ -1552,6 +1558,9 @@ impl Store {
             return Ok(false);
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // LEAN-MODEL: cas-gc-row-commit
+        // `CasGc.GcCommit` is this conditional row transition. Its guard is
+        // intentionally re-read here, not inherited from the candidate scan.
         let rows = tx.execute(
             "DELETE FROM blobs
                WHERE root = ?1
@@ -1565,6 +1574,9 @@ impl Store {
         tx.commit()?;
         let deleted = rows > 0;
         if deleted {
+            // LEAN-MODEL: cas-gc-unlink
+            // `CasGc.GcUnlink` is separate from the row commit because the
+            // filesystem cannot join SQLite; `conn` remains held between them.
             let _ = std::fs::remove_file(self.blob_path(root));
             let _ = std::fs::remove_file(self.outboard_path(root));
         }

@@ -1501,6 +1501,12 @@ impl Node {
 
         let head = self
             .store()
+            // LEAN-MODEL: cas-source-publish
+            // `Safety.sourcePublish` pairs `CasGc.SourcePublish` with the trie
+            // transition below: durable check, pin, entry and head share commit.
+            // LEAN-MODEL: mpt-own-publish
+            // `MptGc.OwnPublish` models the trie/head/materialized side of this
+            // same transaction; it is complete because this node built it.
             .transaction(|txn| -> Result<Option<SignedHead>> {
                 // Read the head we are about to displace inside the transaction:
                 // the root we build on and the seq we build past have to come from

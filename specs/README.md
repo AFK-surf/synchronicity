@@ -1,11 +1,11 @@
 # specs — model-checked corners of the design
 
-TLA+ specifications for the mechanisms whose correctness rests on
-interleavings rather than on any single code path. The Rust test suite
-samples those interleavings; TLC checks all of them within small bounds.
-A spec here verifies the *algorithm* the design document states, not the
-Rust that implements it — the comments in each spec name the code it
-models so drift is reviewable.
+TLA+ models and Lean proofs for mechanisms whose correctness rests on
+interleavings rather than on any single code path. The Rust test suite samples
+those interleavings; TLC explores bounded state spaces and Lean proves
+inductive invariants. A spec here verifies the *algorithm* the design document
+states, not the Rust compiler output; checked anchors keep the model and its
+implementation linearization points reviewably aligned.
 
 ## Running
 
@@ -55,13 +55,28 @@ recovery quiesce reaches every peer. That assumption — not the gap, not
 the timer — is what carries the guarantee; the partitioned config is the
 proof.
 
-## What is deliberately not modeled
+## Lean — CAS / mptsync / ingest safety
+
+[`lean/`](lean/) contains the unbounded inductive proof for the per-root
+transition system. It proves that every reachable pin still has durable
+content, that a write lease excludes content GC, that retained complete tries
+survive trie GC, and that promotion either preserves held content or creates a
+want. Rust and Lean carry matching checked anchors at their linearization
+points; run `lean/check-anchors.sh` after changing either side.
+
+```sh
+cd specs/lean
+lake build --wfail
+./check-anchors.sh
+```
+
+## What Recovery.tla deliberately does not model
 
 Signatures (perfect by assumption; only the origin's key signs its
 heads), trie contents and fetch (a head stands atomically for its trie —
 pending-head promotion has interleavings of its own and belongs in a
 separate spec), and wall-clock time (the adversarial schedule already
-contains every early-timer interleaving). Candidate next specs, in value
-order: pending-head promotion and fork-evidence retention, GC's mark set
-against concurrent fetch and publish, tombstone expiry against lagging
-peers.
+contains every early-timer interleaving). The Lean model now covers pending
+promotion and GC at the root/content state level; it still abstracts trie node
+graphs, SQLite and filesystem behavior behind the named Rust linearization
+points.

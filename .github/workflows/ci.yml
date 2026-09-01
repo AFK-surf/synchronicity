@@ -200,6 +200,24 @@ jobs:
             exit 1
           fi
 
+  lean:
+    name: lean (CAS / mptsync / ingest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: specs/lean
+          build: true
+          build-args: --wfail
+          test: false
+          use-mathlib-cache: false
+          nanoda: true
+          nanoda-allow-sorry: false
+      - name: Check Rust/Lean implementation anchors
+        run: specs/lean/check-anchors.sh
+
   bench:
     name: benchmark (smoke)
     runs-on: ubuntu-latest

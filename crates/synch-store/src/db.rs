@@ -1153,6 +1153,9 @@ impl Store {
     /// held (each reads its row after, through `blob`), so this only orders
     /// them; it never nests.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
+        // LEAN-MODEL: cas-write-lease-begin
+        // `CasGc.BeginWrite` models this ordered guard acquisition plus the
+        // insertion into `writing`; neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
         *self.writing().entry(*root).or_insert(0) += 1;
         WriteLease {
