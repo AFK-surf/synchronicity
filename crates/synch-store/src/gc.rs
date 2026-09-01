@@ -68,6 +68,9 @@ impl Store {
                 // multiplier is in the thousands for a node that publishes
                 // steadily. All of it inside the immediate transaction below,
                 // which holds the one write connection.
+                // LEAN-MODEL: mpt-trie-mark-sweep
+                // `TrieGraph.GcSweep` states the graph-level obligation: every
+                // stored node reachable from any retained root is in the mark set.
                 let trie = Trie::new(txn);
                 let mut marked = synch_mpt::Reachable::default();
                 for root in &roots {
@@ -215,6 +218,7 @@ impl Store {
                 // nothing can make the file live in between. The `stat` is
                 // inside it too: it is the reading the verdict rests on.
                 let conn = self.conn();
+                let _ordered_against_writers = self.cas_order();
                 let Ok(meta) = std::fs::metadata(&path) else {
                     continue;
                 };

@@ -1127,6 +1127,9 @@ impl Txn<'_> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<usize> {
+        // LEAN-MODEL: mpt-materialize-live-diff
+        // `SystemSafety` models each changed leaf by its add/remove and entry
+        // transitions. Rust commits the entire collection with the head flip.
         // Scoped exactly as the fetch that filled this trie was: a node
         // reading under a scope holds only that part, and materializing what
         // it does not hold is not a thing it could do (§5.5). For this node's

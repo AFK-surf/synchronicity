@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
 async-trait.workspace = true
 bao-tree.workspace = true

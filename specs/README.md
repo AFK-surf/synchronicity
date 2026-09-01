@@ -57,12 +57,15 @@ proof.
 
 ## Lean — CAS / mptsync / ingest safety
 
-[`lean/`](lean/) contains the unbounded inductive proof for the per-root
-transition system. It proves that every reachable pin still has durable
-content, that a write lease excludes content GC, that retained complete tries
-survive trie GC, and that promotion either preserves held content or creates a
-want. Rust and Lean carry matching checked anchors at their linearization
-points; run `lean/check-anchors.sh` after changing either side.
+[`lean/`](lean/) contains unbounded inductive proofs at three resolutions: the
+small per-root protocol, a root/holder-indexed system model whose live relations
+are the content leaves materialized from active tries, and a graph model of trie
+mark/sweep. The system theorem says every live source leaf names available
+content and every live replica leaf names either pinned available content or a
+want for that same holder and root. It covers protection removal as well as
+acquisition, protected explicit deletion, writer abort, cache eviction, and the
+two GC phases. Rust and Lean carry matching checked anchors at their
+linearization points; run `lean/check-anchors.sh` after changing either side.
 
 ```sh
 cd specs/lean
@@ -77,6 +80,7 @@ heads), trie contents and fetch (a head stands atomically for its trie —
 pending-head promotion has interleavings of its own and belongs in a
 separate spec), and wall-clock time (the adversarial schedule already
 contains every early-timer interleaving). The Lean model now covers pending
-promotion and GC at the root/content state level; it still abstracts trie node
-graphs, SQLite and filesystem behavior behind the named Rust linearization
-points.
+promotion and GC at the root/content level, and `TrieGraph` covers the retained
+node reachability obligation. SQLite, filesystem, and Rust operational
+semantics remain trusted behind the named linearization points; the anchor
+checker is traceability, not a compiler-to-Lean refinement proof.
