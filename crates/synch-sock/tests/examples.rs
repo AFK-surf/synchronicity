@@ -531,9 +531,9 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
         .expect("a loopback listener");
     let port = listener.local_addr().unwrap().port();
 
-    // Two complete endpoint rings put one chunk in the blocked host writer
-    // and leave the second ring full. The final byte then becomes a pump
-    // remainder at the same moment the upstream reaches terminal HUP.
+    // More than one endpoint ring leaves data available after the caller path
+    // has become backpressured. The final byte then becomes a pump remainder
+    // at the same moment the upstream reaches terminal HUP.
     let prefix: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
     let tail = vec![0xfe];
     let mut expected = prefix.clone();
@@ -618,13 +618,23 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
         .await
         .expect("the upstream did not send its prefix")
         .expect("the upstream stopped before its prefix");
-    // A generous bound with a gentle poll: filling the path takes several
-    // ring-to-writer handoffs across threads, and on a loaded CI runner a
-    // hot yield loop under a tight clock has timed out spuriously.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // Observe quiescence after at least one ring has entered the caller-facing
+    // path. The writer can take anywhere from one pump-sized chunk to a whole
+    // ring before it blocks on the 1 KiB duplex; an 8192-byte counter threshold
+    // therefore depended on task scheduling and was not guaranteed to be
+    // reached. A stable counter directly observes the backpressure this test
+    // needs.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut last = 0;
+        let mut stable_since = std::time::Instant::now();
         loop {
             let seen = registry.snapshot(None, std::time::Instant::now());
-            if seen.first().is_some_and(|info| info.bytes_out >= 8192) {
+            let bytes_out = seen.first().map_or(0, |info| info.bytes_out);
+            if bytes_out != last {
+                last = bytes_out;
+                stable_since = std::time::Instant::now();
+            }
+            if bytes_out >= 4096 && stable_since.elapsed() >= std::time::Duration::from_millis(50) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;

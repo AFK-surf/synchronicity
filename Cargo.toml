@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/russh"]
+# `leanprover/lean-action` checks the proof environment with nanoda by cloning
+# a transient Rust package here. Keep that checker out of this Rust workspace;
+# otherwise Cargo walks up to this manifest and refuses to build the clone.
+exclude = ["vendor/russh", "specs/lean/_nanoda_lib"]
 
 [workspace.package]
 version = "0.1.7"
