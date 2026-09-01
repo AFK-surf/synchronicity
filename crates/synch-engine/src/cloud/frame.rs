@@ -442,11 +442,10 @@ pub(crate) struct ReplicaSpaceJson {
     pub oldest_want: Option<i64>,
     /// When the soonest scheduled release falls due, unix nanoseconds.
     pub next_release: Option<i64>,
-    /// Whether releases are running at all. A paused view is the difference
-    /// between a replica that is behaving and one that is stuck, so it travels
-    /// as its own field rather than being inferred from the counts.
+    /// Whether every bound origin has a complete materialized head. Kept as a
+    /// synchronization-health field; release sweeps do not gate on it.
     pub view_complete: bool,
-    /// Why they are paused, when they are.
+    /// Why synchronization is incomplete, when it is.
     pub view_reason: Option<String>,
 }
 

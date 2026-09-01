@@ -324,17 +324,16 @@ async fn forever_retention_releases_nothing() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
-/// §3.6: absence of a reference is not evidence that a reference was removed.
-///
-/// The hazard is not hypothetical. `set_read_scope` throws away every foreign
-/// origin's `entries` rows by design, so for a moment the tree looks empty —
-/// and a sweep that scheduled releases from a listing would let go of the whole
-/// store at exactly that moment.
+/// Only complete materialized heads contribute GC roots. Changing scope
+/// demotes foreign heads and removes their old materialized entries, so those
+/// origins stop contributing until they are promoted under the new scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
+async fn a_sweep_continues_from_the_materialized_view_while_sync_is_incomplete() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
-    let replica = spawn("replica").await;
+    // Isolate the materialized-view rule from the independent provider floor:
+    // the scope transition deliberately clears provider rows too.
+    let replica = spawn_node_with("replica", |config| config.replica_release_floor = 0).await;
     introduce(&[&publisher, &replica]);
 
     publisher
@@ -355,8 +354,8 @@ async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     // A scope change discards every foreign origin's entries and drops their
-    // complete heads back to pending. Nothing was deleted; this node's
-    // knowledge is what changed.
+    // complete heads back to pending. Until promotion, that origin contributes
+    // no roots to the new scoped materialized view.
     let scoped = replica.node.clone();
     let state = off_runtime(move || {
         scoped
@@ -376,9 +375,12 @@ async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
     let after = coverage(&replica.node).await;
     assert_eq!(
         after.releasing, 0,
-        "a sweep with an incomplete view must schedule nothing, even at zero grace"
+        "zero grace expires the release in the same sweep"
     );
-    assert_eq!(after.held, 1, "and must certainly not drop anything");
+    assert_eq!(
+        after.held, 0,
+        "an incomplete origin no longer blocks the sweep"
+    );
 
     shutdown(&[&publisher.node, &replica.node]).await;
 }

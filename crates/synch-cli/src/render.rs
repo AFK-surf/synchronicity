@@ -152,9 +152,8 @@ pub fn duration(seconds: i64) -> String {
 /// folded into `wanted`: objects with no provider are not a backlog, they are
 /// versions that are probably already gone, and the difference is the whole
 /// reason to run a replica. `releasing` is what an operator checks before
-/// deleting something they may want back. And `view` says whether releases are
-/// running at all, because "paused" is the difference between a replica that is
-/// behaving and one that is stuck.
+/// deleting something they may want back. And `view` says whether every bound
+/// origin has synchronized a complete materialized head.
 pub fn replica_status(status: &ReplicaStatus) -> Lines {
     let space = &status.replica;
     let mut out = vec![format!(
@@ -220,8 +219,8 @@ pub fn replica_status(status: &ReplicaStatus) -> Lines {
         });
     }
     out.push(match status.view.reason() {
-        None => "  view          complete — releases are running".to_string(),
-        Some(why) => format!("  view          incomplete, releases paused: {why}"),
+        None => "  view          complete".to_string(),
+        Some(why) => format!("  view          incomplete: {why}"),
     });
     // Whose content this is, because a budget raises the question and cannot
     // answer it: any member can publish, and every replica of the space fetches

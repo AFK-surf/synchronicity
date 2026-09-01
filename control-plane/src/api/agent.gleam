@@ -255,8 +255,8 @@ pub type ReplicaSpace {
     oldest_want: Int,
     /// When the soonest scheduled release falls due, unix nanoseconds, or 0.
     next_release: Int,
-    /// Whether releases are running at all. Paused is the difference between
-    /// a replica that is behaving and one that is stuck.
+    /// Whether every bound origin has synchronized a complete materialized
+    /// head. Release sweeps continue from the heads already materialized.
     view_complete: Bool,
     view_reason: String,
   )

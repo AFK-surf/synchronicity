@@ -50,6 +50,12 @@ synch replica rm media --pin-held
 A replica acquires every content root named by the visible current entries for
 its space, from every origin. It publishes no file entries of its own.
 
+Release sweeps use only materialized complete heads. A newer pending head does
+not replace its origin's last complete entries, and an origin that has not yet
+materialized a complete head contributes no GC roots. Incomplete
+synchronization is reported as health information but does not pause releases
+for unrelated complete views.
+
 Retention policies are:
 
 - `current`: roots leaving the current tree are released after the grace

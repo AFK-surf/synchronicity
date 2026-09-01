@@ -17,14 +17,11 @@
 //!   flips a head) reacts to one promotion at a time and is the only one that
 //!   ever has positive evidence that a root left the tree.
 //!
-//! The asymmetry between the last two is the load-bearing rule of the whole
-//! design, and §3.6 is where it is argued: **a release is driven by an observed
-//! change; absence of a reference is not evidence that a reference was
-//! removed.** `entries` empties routinely without anything being deleted —
-//! `set_read_scope` discards every foreign origin's rows by design,
-//! `rematerialize` empties one origin transiently, a lapsed binding empties
-//! another — and a sweep that scheduled releases from any of those would let go
-//! of a store that nothing is wrong with.
+//! Releases follow the committed materialized view: only complete heads write
+//! `entries`, a pending head leaves its origin's previous complete entries in
+//! place, and an origin with no complete head contributes no GC roots yet.
+//! Synchronization health remains visible, but it is not a node-wide release
+//! barrier.
 
 use std::time::Duration;
 
@@ -95,18 +92,18 @@ pub struct FetchReport {
     pub over_budget: usize,
 }
 
-/// Whether this node's view of the tree is complete enough to release from
-/// (§3.6).
+/// Whether every bound origin has synchronized a complete materialized head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewState {
     /// Every bound origin has a complete head materialized.
     Complete,
-    /// It does not, and this is why. Releases are paused; fetching continues.
+    /// It does not, and this is why. Fetching and release sweeps continue from
+    /// the materialized complete view.
     Incomplete(String),
 }
 
 impl ViewState {
-    /// True if releases may run.
+    /// True if synchronization is complete.
     pub fn is_complete(&self) -> bool {
         matches!(self, ViewState::Complete)
     }
@@ -131,7 +128,7 @@ pub struct ReplicaStatus {
     pub oldest_want: Option<i64>,
     /// When the soonest scheduled release falls due.
     pub next_release: Option<i64>,
-    /// Whether releases are running.
+    /// Whether every bound origin has synchronized a complete head.
     pub view: ViewState,
     /// Objects the tree has stopped naming that this node is holding anyway,
     /// because too few other origins advertise them (§4.3).
@@ -253,16 +250,10 @@ impl Node {
         Ok(())
     }
 
-    /// Reconciles every replica — or one — against the unified tree.
-    ///
-    /// Staging is safe from a listing: the worst a spurious want costs is a
-    /// fetch of something already held, which the fetch loop resolves in one
-    /// local lookup. Releasing is not, so it happens here only behind
-    /// [`Node::view_state`], and the live path (§3.4) is what schedules
-    /// releases in the ordinary case.
+    /// Reconciles every replica — or one — against the materialized complete
+    /// view. Pending heads neither add nor remove references until promotion.
     pub fn sweep_replicas(&self, only: Option<&str>) -> Result<Vec<(String, SweepReport)>> {
         let now = self.store().read_instant()?;
-        let view = self.view_state()?;
         let mut out = Vec::new();
         for space in self.store().replicas()? {
             if only.is_some_and(|id| id != space.space) {
@@ -274,7 +265,7 @@ impl Node {
             // for release on the strength of the half of that the sweep saw.
             let reprieved = self.store().clear_returned_releases(&holder)?;
             let wanted = self.store().stage_space_wants(&space.space, &holder, now)?;
-            let scheduled = if space.retention.releases() && view.is_complete() {
+            let scheduled = if space.retention.releases() {
                 let at = now.saturating_add(space.grace_secs().saturating_mul(1_000_000_000));
                 self.store().schedule_stale_releases_above(
                     &holder,
@@ -284,10 +275,6 @@ impl Node {
             } else {
                 0
             };
-            // Expiry runs even when the view is incomplete. These releases were
-            // decided when it was complete — by the live path, or by an earlier
-            // sweep — and holding them back would mean one unreachable peer
-            // froze every space's grace window indefinitely.
             let released = self.store().expire_pins_of(&holder, now)?;
             out.push((
                 space.space.clone(),
@@ -302,17 +289,13 @@ impl Node {
         Ok(out)
     }
 
-    /// Whether releases may run (§3.6).
+    /// Whether every bound origin has a complete materialized view.
     ///
-    /// Three preconditions, all locally checkable, all cheap. The question they
-    /// answer is not "is this node healthy" but the narrower "is `entries` a
-    /// faithful picture of what the cluster currently publishes" — because that
-    /// is the only thing a release is entitled to be decided from.
+    /// This is synchronization health for reporting. Release sweeps use the
+    /// complete heads already materialized in `entries` and do not gate on it.
     pub fn view_state(&self) -> Result<ViewState> {
-        // A pending head is a head whose trie this node does not hold, so the
-        // origin's entries are either absent or stale for as long as it sits
-        // there. Its content is not garbage; this node's knowledge of it is
-        // incomplete, which is exactly the case absence cannot distinguish.
+        // A pending head is newer than the materialized view. The prior
+        // complete entries, when any, remain the release sweep's GC roots.
         let pending = self.store().all_heads(synch_store::heads::Slot::Pending)?;
         if let Some(head) = pending.first() {
             return Ok(ViewState::Incomplete(format!(
@@ -321,7 +304,7 @@ impl Node {
             )));
         }
         // A bound origin with no complete head has never been synced here, or
-        // was reset. Either way its entries are missing rather than deleted.
+        // was reset. It contributes no GC roots until a head is materialized.
         for binding in self.store().bindings()? {
             if binding.origin == *self.origin() {
                 continue;

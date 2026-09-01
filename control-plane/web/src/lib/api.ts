@@ -268,6 +268,7 @@ export interface ReplicaSpace {
   held_back: number
   oldest_want: number
   next_release: number
+  // Synchronization health; release sweeps continue from complete heads.
   view_complete: boolean
   view_reason: string
 }

@@ -34,13 +34,13 @@ struct ParserTests {
     let status = Listings.replicaStatus([
       "probe-replica   indexed /private/tmp/hecatia-replica-check   current retention   grace 30d",
       "  held                  0 objects               0 B",
-      "  view          complete — releases are running",
+      "  view          complete",
       "  claim   \(key) says it holds 0 objects (0 B, still fetching, tree, grace 30d)",
     ])
     #expect(status.isReplicating)
     #expect(status.held == 0)
     #expect(status.heldBytes == 0)
-    #expect(status.pausedReason == nil)
+    #expect(status.incompleteReason == nil)
     #expect(status.claims.count == 1)
     #expect(!status.isAlarming)
     #expect(status.unrecognized.isEmpty)
@@ -52,7 +52,7 @@ struct ParserTests {
       "probe-replica   indexed /private/tmp/hecatia-replica-check   forever retention",
       "  held                  0 objects               0 B",
       "  budget        500000000 B, 0 B of it used",
-      "  view          complete — releases are running",
+      "  view          complete",
     ])
     #expect(status.budgetBytes == 500_000_000)
     #expect(status.heldBytes == 0)
@@ -79,7 +79,7 @@ struct ParserTests {
       "  unreachable           1 objects           800 B   <- no provider has answered for these",
       "  held back             3 objects                     too few peers advertise these to let them go",
       "  budget        1000000 B, 4096000 B of it used",
-      "  view          complete — releases are running",
+      "  view          complete",
       "  from nas@x.example                      3100000 B",
       "  claim   laptop@x.example says it holds 4108 objects (4098000 B, nothing outstanding, tree)",
     ])
@@ -100,7 +100,7 @@ struct ParserTests {
     // however much has been used — which renders as permanently full.
     #expect(status.budgetBytes == 1_000_000)
     #expect(!status.budgetReached)
-    #expect(status.pausedReason == nil)
+    #expect(status.incompleteReason == nil)
     #expect(status.byOrigin.first?.origin == "nas@x.example")
     #expect(status.byOrigin.first?.bytes == 3_100_000)
     #expect(status.claims.count == 1)
@@ -114,12 +114,22 @@ struct ParserTests {
     let status = Listings.replicaStatus([
       "photos   indexed —   forever retention",
       "  held          412880123 objects  944892805120 B",
-      "  view          incomplete, releases paused: 3 of 5 devices have not answered",
+      "  view          incomplete: 3 of 5 devices have not answered",
     ])
     #expect(status.held == 412_880_123)
     #expect(status.heldBytes == 944_892_805_120)
-    #expect(status.pausedReason == "3 of 5 devices have not answered")
+    #expect(status.incompleteReason == "3 of 5 devices have not answered")
     #expect(status.isAlarming)
+  }
+
+  @Test func replicaStatusAcceptsTheFormerPausedWordingDuringAnUpgrade() {
+    let status = Listings.replicaStatus([
+      "photos   forever retention",
+      "  held                  0 objects               0 B",
+      "  view          incomplete, releases paused: nas has not answered",
+    ])
+    #expect(status.incompleteReason == "nas has not answered")
+    #expect(status.unrecognized.isEmpty)
   }
 
   @Test func aSpaceThatDoesNotReplicateSaysSoRatherThanReadingAsEmpty() {
