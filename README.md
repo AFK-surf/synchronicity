@@ -20,6 +20,88 @@ The binaries are `target/release/synch` (CLI and daemon) and
 `target/release/synch-s3` (S3 gateway). SQLite is compiled in and TLS is rustls,
 so neither needs a system library.
 
+## Container image
+
+`ghcr.io/afk-surf/synchronicity/tools`, built from [`Dockerfile`](Dockerfile)
+by [`.github/workflows/tools-image.yml`](.github/workflows/tools-image.yml) for
+`linux/amd64` and `linux/arm64`. `latest` follows `main`; tagged releases get
+`X.Y.Z` and `X.Y`; every build is also tagged `sha-<commit>` and carries signed
+build provenance (`gh attestation verify oci://…` / `cosign verify-attestation`).
+The control plane is a separate service in a separate language and keeps its own
+image, [`ghcr.io/afk-surf/synchronicity/control-plane`](control-plane/README.md#container-image).
+
+One image holds all three Linux programs — `synch`, `synch-s3` and `synch-dp` —
+because they are deployed together: the gateway is a control client of the
+daemon and opens no database of its own, and the data plane embeds the same
+engine. There is no entrypoint wrapper, so the command names the tool:
+
+```sh
+docker volume create synch-data
+
+# One node, its data directory on a named volume. A fresh named volume
+# inherits the image's ownership, which is how the non-root service (uid
+# 10001) gets a writable data directory on first run.
+docker run --rm -v synch-data:/var/lib/synch \
+  ghcr.io/afk-surf/synchronicity/tools \
+  synch init --domain cluster.example.com
+
+# The gateway's port is published here, not when it is started: a
+# container's ports are fixed at `docker run`.
+docker run -d --name synch-node \
+  -v synch-data:/var/lib/synch \
+  -v /srv/media:/srv/media \
+  -p 9000:9000 \
+  ghcr.io/afk-surf/synchronicity/tools \
+  synch daemon run
+
+# Every other command is a control client of that daemon, so it runs in
+# the same container against the same data directory.
+docker exec synch-node synch source add media /srv/media
+docker exec synch-node synch source scan media
+docker exec synch-node synch-s3 bucket add media media --read-write
+printf '%s' "$S3_SECRET" |
+  docker exec -i synch-node synch-s3 access-key add AKIAEXAMPLE --secret-stdin
+docker exec -d synch-node synch-s3 serve --listen 0.0.0.0:9000
+```
+
+- **Volumes.** `/var/lib/synch` is the data directory — the database, the CAS
+  and the control socket — and `SYNCH_DATA_DIR` points at it. That default is a
+  path and not a policy, but it is not optional either: without it the CLI asks
+  the platform for a data directory and a container with no `HOME` has none.
+  Source directories are mounted separately, wherever you like. The data plane's
+  `SYNCH_DP_BASE_DIR` is `/var/lib/synch-dp`, a plain directory rather than a
+  volume, because that state is genuinely ephemeral — one directory per hosted
+  tenant, restored from object storage after a reschedule.
+- **Ports.** Only the gateway has a fixed one: 9000/tcp, and `synch-s3 serve`
+  binds `127.0.0.1` unless `--listen` says otherwise, so a published port needs
+  `--listen 0.0.0.0:9000` and real access keys (`--anonymous` refuses anything
+  but loopback). The daemon's QUIC endpoint takes an ephemeral UDP port unless
+  `--bind` names one.
+- **Nothing else is configured.** Every setting that decides what a container
+  *is* — the membership domain, the CAS backend and its credentials, the data
+  plane's control URL and token — stays unset and required, so a misconfigured
+  container fails at startup rather than running as something nobody asked for.
+- **glibc, not the static musl of the release tarballs.** These are
+  long-running servers; the image is built against the runtime's own glibc
+  2.36, which is the configuration the test suite runs on.
+
+Nothing is published until that exact image has run a node:
+[`ops/image-smoke.sh`](ops/image-smoke.sh) does what this section describes —
+`init`, `daemon run`, a source scanned and published, `synch cat` reading it
+back, and `synch-s3` serving the same object over HTTP — and checks what only
+running it can check: all three binaries present and built for this
+architecture, `synch-dp` reaching its configuration check, a data directory the
+uid-10001 service can write, the gateway finding the control socket, and a
+clean shutdown on `synch daemon stop`. The publish job depends on it, so a
+green image is one that ran.
+
+To build and test it locally, from the repository root:
+
+```sh
+docker build -t synch-tools:dev .
+./ops/image-smoke.sh synch-tools:dev
+```
+
 ## Usage
 
 Set up a node. `synch init` creates the datadir, `synch daemon start` launches
