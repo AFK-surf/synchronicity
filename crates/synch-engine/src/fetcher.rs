@@ -397,12 +397,14 @@ impl Node {
         } else {
             self.providers_off_runtime(root, size).await?
         };
+        let mut discovery_used = false;
         if providers.is_empty() && !remaining.is_empty() {
             // No local ad covers this root — a cold cache, or an origin just
             // admitted whose ads have not replicated yet. Peers may know who
             // holds it, and a hint costs at most a wasted dial because content
             // is hash-verified regardless (§5.1).
             providers = self.ask_peers_for_providers(root, size).await?;
+            discovery_used = true;
         }
 
         let fanout = self.config().fetch_fanout.max(1);
@@ -415,11 +417,28 @@ impl Node {
         // online. §6.4 promises the opposite — a provider that cannot help is
         // dropped and its groups are re-split across *the remainder*.
         let mut pool: Vec<Provider> = providers;
+        let mut retired = std::collections::HashSet::new();
         // Providers are retired only by failing, so a round that makes no
         // progress at all must end the loop or it would spin forever.
         loop {
-            if remaining.is_empty() || pool.is_empty() {
+            if remaining.is_empty() {
                 break;
+            }
+            if pool.is_empty() {
+                // Published ads can outlive their publishers. Once every known
+                // provider has failed, spend one bounded discovery walk asking
+                // live peers for a replacement. Cloud replicas use aggregate
+                // coverage rather than one `b:` record per object, so this is
+                // how a last cloud copy is found after the original nodes die.
+                if discovery_used {
+                    break;
+                }
+                discovery_used = true;
+                pool = self.ask_peers_for_providers(root, size).await?;
+                pool.retain(|provider| !retired.contains(&provider.origin));
+                if pool.is_empty() {
+                    break;
+                }
             }
             let mut chosen: Vec<Provider> = Vec::new();
             for provider in pool.iter() {
@@ -476,11 +495,7 @@ impl Node {
                 (provider.origin.clone(), got, outcome)
             }))
             .await;
-            let mut progressed = false;
             for (origin, got, result) in results {
-                if !got.is_empty() {
-                    progressed = true;
-                }
                 remaining = remaining.difference(&got);
                 report.fetched = report.fetched.union(&got);
                 match result {
@@ -489,6 +504,7 @@ impl Node {
                             // Served nothing despite claiming the range: its
                             // ads overstate what it has, so stop asking.
                             pool.retain(|p| p.origin != origin);
+                            retired.insert(origin);
                         }
                     }
                     Err(e) => {
@@ -497,12 +513,12 @@ impl Node {
                         // next batch offers it to whoever is left.
                         tracing::debug!(origin = %origin, error = %e, "provider failed");
                         pool.retain(|p| p.origin != origin);
+                        retired.insert(origin);
                     }
                 }
             }
-            if !progressed && pool.is_empty() {
-                break;
-            }
+            // No-progress providers were retired above. A now-empty pool gets
+            // its single rediscovery chance at the top of the loop.
         }
 
         if !report.fetched.is_empty() || !report.promoted.is_empty() {
@@ -1731,6 +1747,55 @@ mod tests {
             1
         );
         assert!(!node.provider_discovery_backed_off(&unheld, now_ns()));
+    }
+
+    /// Stale ads for vanished publishers must not suppress discovery of a live
+    /// replica that holds the last copy but advertises only aggregate coverage.
+    #[tokio::test]
+    async fn a_fetch_rediscovers_after_every_known_provider_fails() {
+        let (_fetcher_dir, fetcher) = node().await;
+        let (_provider_dir, provider) = node().await;
+        let provider_origin = provider.origin().clone();
+        let fetcher_origin = fetcher.origin().clone();
+        link(&fetcher, &provider, &provider_origin);
+        link(&provider, &fetcher, &fetcher_origin);
+
+        let payload = b"the cloud replica has the last copy".to_vec();
+        let root = provider.store().ingest_bytes(&payload, now_ns()).unwrap();
+
+        // It is known as an object provider, but speaks no blob protocol and
+        // names no replacement. The real holder is a peer, not a provider row.
+        let ghost =
+            CountingPeer::bind("vanished", Hash::new(b"another root"), provider_origin).await;
+        ghost.known_to(&fetcher);
+        fetcher
+            .store()
+            .put_provider(
+                &root,
+                &ghost.origin,
+                &BlobAd::complete(payload.len() as u64),
+            )
+            .unwrap();
+
+        let wanted = ChunkRanges::single(0, group_count(payload.len() as u64));
+        let report = fetcher
+            .fetch_groups_from(&root, payload.len() as u64, &wanted, &[])
+            .await
+            .unwrap();
+        assert!(report.complete);
+        assert!(report.providers_tried >= 2);
+        assert_eq!(
+            fetcher
+                .cas_backend()
+                .read_range(root, 0, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload
+        );
+
+        ghost.endpoint.close().await;
+        fetcher.shutdown().await.unwrap();
+        provider.shutdown().await.unwrap();
     }
 
     #[tokio::test]

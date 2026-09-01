@@ -32,6 +32,7 @@ import api/reads.{type Reads}
 import auth/dataplane_key
 import auth/principal.{type Principal}
 import dns/name
+import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
@@ -125,15 +126,12 @@ const retention_hold_seconds = 2_592_000
 /// *never*. The tenant's storage would be retained forever, which is the very
 /// bug this list exists to fix.
 ///
-/// So the `ETag` carries a second component: how many networks are due, and
-/// the sum of their `cloud_disabled_at` stamps (`collection_mark`). The count
-/// alone would nearly do, and is what one reaches for first — but it has a
-/// blind spot the sum closes: within one poll interval a network can fall due
-/// while another is collected, leaving the count where it was and the set
-/// different. Two integers that both move under any realistic change to the
-/// due set cost one aggregate query on a column already being scanned, and
-/// they make the tag a statement about the whole document rather than about
-/// the zone alone.
+/// So the `ETag` carries a second component: a SHA-256 fingerprint of the
+/// canonical collection set (`collection_mark`). Counting rows, or counting
+/// and summing their timestamps, is not an entity tag: distinct sets can have
+/// the same aggregate. Fingerprinting the ordered names and stamps makes the
+/// tag a statement about the whole document rather than a useful-but-lossy
+/// summary of it.
 ///
 /// What remains, and is fine: a collection can be **up to one poll interval
 /// late**. The tag moves the moment the hold elapses, but nothing pushes — the
@@ -283,34 +281,52 @@ fn collectable(
   )
 }
 
-/// The `collect` list's contribution to the `ETag`: how many networks are due,
-/// and the sum of their stamps.
+/// The `collect` list's contribution to the `ETag`: a fingerprint of every
+/// due network and its offboarding stamp, in canonical order.
 ///
-/// The same predicate as `collectable`, as an aggregate, so the tag cannot
+/// The same predicate as `collectable`, so the tag cannot
 /// describe a set the body would not produce. A read that fails is an error
-/// and not a `#(0, 0)`: a tag computed from a failed count would be a *stable*
+/// and not an empty digest: a tag computed from a failed read would be a *stable*
 /// tag, and a fleet holding it would go on getting 304s for a document nobody
 /// could build. The 500 is the honest answer and the one that retries.
-fn collection_mark(
-  conn: Connection,
-  due_before: Int,
-) -> Result(#(Int, Int), Nil) {
-  let counted =
+fn collection_mark(conn: Connection, due_before: Int) -> Result(String, Nil) {
+  let due =
     sqlite.query(
       conn,
-      "SELECT count(*), coalesce(sum(q.disabled_at), 0)
+      "SELECT q.org_slug, q.network_name, q.disabled_at
        FROM cloud_collect_queue q
        WHERE q.disabled_at <= ?
          AND NOT EXISTS (
            SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
            WHERE o.slug = q.org_slug AND n.name = q.network_name
              AND n.cloud_hosted = 1
-         )",
+         )
+       ORDER BY q.org_slug, q.network_name",
       [VInt(due_before)],
     )
-  case counted {
-    Ok([row]) -> Ok(#(int_at(row, 0), int_at(row, 1)))
-    _ -> Error(Nil)
+  case due {
+    Ok(rows) -> {
+      let canonical =
+        rows
+        |> list.map(fn(row) {
+          // Slugs and network names are DNS labels, so neither contains the
+          // NUL separators. Including lengths would be equivalent; the
+          // separators keep this representation compact and unambiguous.
+          text_at(row, 0)
+          <> "\u{0000}"
+          <> text_at(row, 1)
+          <> "\u{0000}"
+          <> int.to_string(int_at(row, 2))
+          <> "\u{0000}"
+        })
+        |> string.concat
+      Ok(
+        id.hash_token(canonical)
+        |> bit_array.base16_encode
+        |> string.lowercase,
+      )
+    }
+    Error(_) -> Error(Nil)
   }
 }
 
@@ -340,15 +356,8 @@ fn device_json(hosted: List(List(sqlite.Value)), network_id: String) -> Json {
 /// time changes (`desired_state` has the argument). `generation` in the body
 /// stays the serial alone — it is the zone's number and the fleet logs it as
 /// such — while the tag is about this response, which is what an `ETag` is for.
-fn etag(generation: Int, mark: #(Int, Int)) -> String {
-  let #(due, stamps) = mark
-  "\"dp-"
-  <> int.to_string(generation)
-  <> "-"
-  <> int.to_string(due)
-  <> "."
-  <> int.to_string(stamps)
-  <> "\""
+fn etag(generation: Int, mark: String) -> String {
+  "\"dp-" <> int.to_string(generation) <> "-" <> mark <> "\""
 }
 
 // -- device registration -----------------------------------------------------

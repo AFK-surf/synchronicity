@@ -161,6 +161,11 @@ export SYNCH_DP_S3_REGION=us-east-1
 synch-dp
 ```
 
+Membership uses DNSSEC plus Rekor zone-key transparency by default. A private
+deployment whose DNSSEC root is intentionally absent from the public log must
+state that trust choice explicitly with `SYNCH_DP_REKOR=off`, just as a regular
+node would use `synch --rekor off`.
+
 It runs on pods with no durable disk, so it replicates each tenant's SQLite
 database to the bucket itself — Litestream's LTX format via the `celld-ltx`
 library, driven in-process rather than by a sidecar — and restores it on every

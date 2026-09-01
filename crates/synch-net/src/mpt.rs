@@ -432,8 +432,22 @@ impl MptProtocol {
                 // mutex there, so its cost would be borne by every other
                 // connection and timer in the process.
                 let store = self.store().clone();
-                let mut ads =
-                    crate::blocking::offload(move || Ok(store.providers(&object_root)?)).await?;
+                let mut ads = crate::blocking::offload(move || {
+                    let own = store.self_origin()?.zip(store.local_ad(&object_root)?);
+                    let mut ads = store.providers(&object_root)?;
+                    if let Some((origin, ad)) = own {
+                        // A cloud replica may hold an object durably without
+                        // publishing a per-object `b:` record in its aggregate
+                        // replica head. Name this responder directly so a cold
+                        // peer can recover bytes after every original publisher
+                        // has disappeared. Prefer the fresh local fact over a
+                        // possibly stale materialized ad for the same origin.
+                        ads.retain(|(candidate, _)| candidate != &origin);
+                        ads.insert(0, (origin, ad));
+                    }
+                    Ok(ads)
+                })
+                .await?;
                 ads.truncate(MAX_PROVIDER_ADS);
                 write_frame(send, &MptMessage::Providers { ads }).await?;
                 Ok(())
@@ -1154,6 +1168,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ads.len(), 1);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A holder names itself even when no published `b:` record materialized a
+    /// provider row for it. Cloud replicas deliberately aggregate their object
+    /// coverage, so this is the route by which a cold node finds the last copy.
+    #[tokio::test]
+    async fn find_providers_names_the_responder_when_it_holds_the_object() {
+        let (_dir, store) = test_store();
+        let origin = OriginId::named("cloud-1", "x.example").unwrap();
+        store.set_self_origin(&origin).unwrap();
+        let payload = b"the last copy is in cloud storage";
+        let root = store.ingest_bytes(payload, now_ns()).unwrap();
+        assert!(store.providers(&root).unwrap().is_empty());
+
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+        let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+        let ads = mpt.find_providers(root).await.unwrap();
+        assert_eq!(ads, vec![(origin, BlobAd::complete(payload.len() as u64))]);
+
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }

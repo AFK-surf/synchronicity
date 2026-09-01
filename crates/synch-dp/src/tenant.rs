@@ -570,7 +570,11 @@ impl Tenant {
     /// would turn one bad answer into a replaced node. An operator wants to
     /// know; the loud log and the reconcile-failure counter are how.
     async fn check_registration(&self, node: &Node, network: &HostedNetwork) {
-        let held = match node.device_keys() {
+        let read = {
+            let node = node.clone();
+            synch_core::offload(move || node.device_keys()).await
+        };
+        let held = match read {
             Ok(keys) => keys,
             Err(error) => {
                 tracing::warn!(tenant = %network.key(), %error, "could not read this node's keys");
