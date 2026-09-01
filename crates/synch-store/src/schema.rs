@@ -88,11 +88,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V21_REPLICATION),
     Migration::Sql(V22_SOCKETS),
     Migration::Sql(V23_SOURCE_REPLICA_ROLES),
-    Migration::Sql(V24_ENTRIES_BY_SPACE_CONTENT),
     Migration::Rust {
         name: "path-based socket activation",
         run: v24_socket_activations,
     },
+    Migration::Sql(V25_ENTRIES_BY_SPACE_CONTENT),
 ];
 
 /// v24 — path-based socket activation replaces declaration-and-approval.
@@ -141,23 +141,27 @@ fn v24_socket_activations(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-/// v24 — the content a space names, in one index.
+/// v25 — the content a space names, in one index.
 ///
 /// `stage_space_wants` runs on every replica sweep — the standing loop's every
-/// pass — and each of its statements asks the same question: the distinct
-/// `content` of a space's entries. `entries_by_path` leads on `space` but
-/// carries `path`, so answering it meant a table lookup per entry to fetch the
-/// column and a temporary B-tree to make it distinct. At two hundred thousand
-/// entries — ten thousand nodes publishing twenty files each — that was six
-/// seconds a pass to arrive at the set the previous pass arrived at
-/// (`docs/CLOUD-DATAPLANE.md` §7.1a).
+/// pass — and its staging statement asks for the distinct `content` of a
+/// space's entries. `entries_by_path` leads on `space` but carries `path`, so
+/// answering that meant a table lookup per entry to fetch the column and a
+/// temporary B-tree to make it distinct: at two hundred thousand entries — ten
+/// thousand nodes publishing twenty files each — seconds a pass, to arrive at
+/// the set the previous pass arrived at. `docs/CLOUD-DATAPLANE.md` §7.1a has
+/// the measurements; an order of magnitude is what travels.
 ///
 /// Leading on `space` and carrying `content` makes it a covering range scan
-/// already in `content` order, so `DISTINCT` becomes skipping equal neighbours
-/// rather than sorting the set. It does not replace `entries_by_content`, which
-/// is sought the other way round — by content, across every space — by the
-/// release path.
-const V24_ENTRIES_BY_SPACE_CONTENT: &str = r#"
+/// already in `content` order, so grouping by `content` becomes skipping equal
+/// neighbours rather than sorting the set. It does not replace
+/// `entries_by_content`, which is sought the other way round — by content,
+/// across every space — by the release path.
+///
+/// This step follows the socket-activation one because the chain is
+/// positional: a database stamped 24 has run that step, and inserting anything
+/// ahead of it would run it a second time on a table it already dropped.
+const V25_ENTRIES_BY_SPACE_CONTENT: &str = r#"
 CREATE INDEX entries_by_space_content ON entries (space, content);
 "#;
 

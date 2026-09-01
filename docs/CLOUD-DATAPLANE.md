@@ -1010,8 +1010,6 @@ sweep above is quoted at 13.2 s → 0.32 s from that contended position, and
 `stage_space_wants` at 1.96 s → 0.18 s from an isolated one; both ratios
 hold, the absolutes do not travel.
 
-### 7.2 Sharding, when it matters
-
 ### 7.2 Assignment: the control plane decides
 
 Each data plane has a **name**, and the control plane records which

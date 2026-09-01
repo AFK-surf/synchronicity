@@ -244,6 +244,14 @@ impl Store {
     /// — `expire_bindings` deletes it on the next maintenance pass — and
     /// treating it as absent here would report the view complete in the window
     /// between the lapse and the sweep.
+    ///
+    /// On the `heads` side this reads the slot alone where the loop read the
+    /// head through [`Store::complete_head`], which joins `head_history` and
+    /// parses the signature. The two differ only on a complete row whose
+    /// history row is gone or will not parse — the loop called that missing
+    /// (or failed outright), this calls it held. That row cannot arise from
+    /// pruning, which exempts the rows the slots point at, so it is a repair
+    /// case, and what it reaches is a status line rather than a release.
     pub fn bound_origin_without_complete_head(&self, own: &OriginId) -> Result<Option<OriginId>> {
         let conn = self.conn();
         conn.query_row(
