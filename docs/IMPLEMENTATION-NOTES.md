@@ -19,10 +19,12 @@ nested per-directory ignore files are not implemented.
 ### §5.2 — abandonment across multiple advertisers
 
 "Three full rounds **across all advertisers**" is implemented as three
-unproductive rounds against the peer currently being fetched from. Since the
-anti-entropy scheduler picks a random peer each round, a persistently unservable
-head is still abandoned and re-selected; the difference is that the count is
-per-session rather than global.
+unproductive rounds against the peer currently being fetched from. The
+anti-entropy scheduler samples at most three trusted peers and tries them in
+sequence until one advances local state. A stale, slow, or unreachable member
+therefore does not end the round, while the bounded sample preserves gossip's
+cluster-wide work bound. The remaining difference is that the abandonment
+count is per-session rather than global.
 
 ## Differences in detail
 

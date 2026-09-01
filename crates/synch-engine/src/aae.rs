@@ -5,9 +5,11 @@
 //! propagation on a connected cluster. A head *received* from a peer is not
 //! relayed onward; at the §12 sizes the publisher's own fan-out already reaches
 //! everyone it can reach, so the pull path below is what covers a member the
-//! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) one random
-//! trusted peer gets a full `Hello` push-pull exchange, which repairs anything
-//! the reactive path missed and is the mechanism that guarantees convergence.
+//! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) a
+//! bounded random sample of trusted peers gets a full `Hello` push-pull
+//! exchange. Candidates are tried in sequence until one advances local state,
+//! so a bad member cannot hide a healthy one without turning every round into
+//! an all-to-all exchange.
 
 use std::time::Duration;
 
@@ -22,7 +24,7 @@ use crate::{
 /// The outcome of one anti-entropy round.
 #[derive(Debug, Clone, Default)]
 pub struct RoundReport {
-    /// The peer contacted, if any was reachable.
+    /// The peer whose exchange is reported, if any was reachable.
     pub peer: Option<NodeId>,
     /// What the exchange achieved.
     pub sync: SyncReport,
@@ -32,12 +34,22 @@ pub struct RoundReport {
 
 /// The shortest gap between two anti-entropy rounds driven by a pushed head.
 ///
-/// A round dials every reachable peer, so answering each push with its own
-/// round would let one origin publishing in a burst — an import, a large
-/// rename — turn one node's publishes into a dial storm across the membership.
-/// The bell holds at most one permit, so a burst arriving inside the floor costs
-/// one extra round rather than one per head.
+/// Even a bounded round may dial several candidates, so answering each push
+/// with its own round would let one origin publishing in a burst — an import,
+/// a large rename — turn one node's publishes into a dial storm. The bell holds
+/// at most one permit, so a burst arriving inside the floor costs one extra
+/// round rather than one per head.
 const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
+
+/// Maximum peers considered by one standing anti-entropy round.
+const ANTI_ENTROPY_FANOUT: usize = 3;
+
+/// Per-peer budget used by the standing scheduler.
+///
+/// Explicit `sync_with_peer` calls retain the operator's full configured
+/// budget. Periodic repair needs a smaller ceiling so a responsive but broken
+/// peer cannot consume minutes before the next candidate is tried.
+const PERIODIC_PEER_BUDGET: Duration = Duration::from_secs(30);
 
 impl Node {
     /// Runs one `Hello` push-pull exchange with a specific peer.
@@ -47,13 +59,33 @@ impl Node {
     /// peer's to choose — one `fetch_pending` per head it hands back, each
     /// looping to [`MAX_UNPRODUCTIVE_ROUNDS`], plus a pass over every pending
     /// head — so per-request deadlines compose into no bound at all. A peer
-    /// answering just inside each one would hold this loop indefinitely, and
-    /// `anti_entropy_round` returns on the first success, so no other peer
-    /// would be reached and no pending trie fetched for as long as it kept that
-    /// up.
+    /// answering just inside each one could monopolize a sequential scheduler.
+    /// Explicit calls get the configured whole-round budget. The standing
+    /// scheduler uses a smaller per-peer cap while trying its bounded fallback
+    /// candidates.
     ///
     /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
+        self.sync_with_peer_budget(node_id, self.config().sync_round_budget)
+            .await
+    }
+
+    async fn sync_with_peer_budget(
+        &self,
+        node_id: &NodeId,
+        budget: Duration,
+    ) -> Result<SyncReport> {
+        tokio::time::timeout(budget, self.sync_with_peer_inner(node_id))
+            .await
+            .map_err(|_| {
+                EngineError::invalid(format!(
+                    "the sync round with {} outran its {budget:?} budget",
+                    node_id.fmt_short()
+                ))
+            })?
+    }
+
+    async fn sync_with_peer_inner(&self, node_id: &NodeId) -> Result<SyncReport> {
         // The address lookup and latency record are store work and must stay
         // off the runtime worker driving the endpoint (§10).
         let addr = {
@@ -64,15 +96,7 @@ impl Node {
         .unwrap_or_else(|| iroh::EndpointAddr::new(*node_id));
         let started = std::time::Instant::now();
         let client = self.net().connect_mpt(addr).await?;
-        let budget = self.config().sync_round_budget;
-        let report = tokio::time::timeout(budget, self.syncer().sync_with(&client))
-            .await
-            .map_err(|_| {
-                EngineError::invalid(format!(
-                    "the sync round with {} outran its {budget:?} budget",
-                    node_id.fmt_short()
-                ))
-            })??;
+        let report = self.syncer().sync_with(&client).await?;
         let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
         let node = self.clone();
         let key = *node_id;
@@ -134,24 +158,35 @@ impl Node {
             .collect())
     }
 
-    /// Runs one periodic round: pick one random trusted peer and sync with it.
+    /// Runs one periodic round over a bounded random sample of trusted peers.
     ///
-    /// Picking randomly rather than round-robin is what makes the gossip
-    /// converge in `O(log N)` rounds after a partition heals.
+    /// Candidates are tried sequentially because reconciliation shares one
+    /// pending slot per origin: concurrent exchanges can otherwise abandon a
+    /// head while another healthy peer is fetching it. A reachable peer that
+    /// only receives our state does not end the fallback; the round stops when
+    /// an exchange advances local state or the sample is exhausted.
     pub async fn anti_entropy_round(&self) -> Result<RoundReport> {
-        let peers = self.dialable_peers_off_runtime().await?;
+        let mut peers = self.dialable_peers_off_runtime().await?;
         if peers.is_empty() {
             return Ok(RoundReport::default());
         }
-        let mut report = RoundReport::default();
         let start = (jitter_seed() % peers.len() as u64) as usize;
-        for offset in 0..peers.len() {
-            let peer = peers[(start + offset) % peers.len()];
-            match self.sync_with_peer(&peer).await {
+        peers.rotate_left(start);
+        peers.truncate(ANTI_ENTROPY_FANOUT);
+
+        let mut report = RoundReport::default();
+        let budget = self.config().sync_round_budget.min(PERIODIC_PEER_BUDGET);
+        for peer in peers {
+            match self.sync_with_peer_budget(&peer, budget).await {
                 Ok(sync) => {
-                    report.peer = Some(peer);
-                    report.sync = sync;
-                    return Ok(report);
+                    let made_local_progress = sync.made_local_progress();
+                    if report.peer.is_none() || made_local_progress {
+                        report.peer = Some(peer);
+                        report.sync = sync;
+                    }
+                    if made_local_progress {
+                        return Ok(report);
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
@@ -206,7 +241,6 @@ impl Node {
     }
 
     /// Runs the periodic anti-entropy loop until `shutdown` resolves.
-    /// Runs the periodic anti-entropy loop until `shutdown` resolves.
     ///
     /// Woken by the clock or by a head landing in the pending slot, whichever
     /// comes first. The second is what makes reactive push mean anything: a
@@ -229,7 +263,7 @@ impl Node {
             };
             // A bell that rings inside the floor is answered late rather than
             // dropped: an origin publishing in a burst pushes once per head,
-            // and each round dials the whole membership. The interval arm is
+            // and each round may dial several candidates. The interval arm is
             // never delayed by this, because it is already longer.
             let since = last.elapsed();
             if since < REACTIVE_FLOOR {

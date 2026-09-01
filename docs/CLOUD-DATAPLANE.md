@@ -416,6 +416,7 @@ NodeConfig {
     socket_workers: 0,                   // §4.4 — engine change (a)
     name: "cloud-1".into(),              // the slot label; never the hostname
     replica_release_floor: 1,            // never release the last copy
+    replica_concurrency: dp_config.replica_concurrency,
     ..NodeConfig::new(tenant_dir)
 }
 ```
@@ -426,6 +427,11 @@ every tenant, and the cloud cache's Unix default (20 % free on the
 filesystem) is per-node `statvfs` on a shared volume — N tenants would each
 try to close the whole shortfall alone. Both are therefore always set
 explicitly.
+
+`SYNCH_DP_REPLICA_CONCURRENCY` bounds the number of distinct CAS objects each
+tenant fetches concurrently. It defaults to 16, matching the ordinary daemon,
+and accepts values from 1 through 256; provider fanout within each individual
+object remains a separate engine bound.
 
 ### 4.4 The loop set
 

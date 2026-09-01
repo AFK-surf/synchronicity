@@ -611,6 +611,7 @@ mod tests {
             },
             cache_bytes_total: 1024,
             max_tenants: 4,
+            replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
             metrics_addr: None,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),

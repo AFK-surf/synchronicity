@@ -11,7 +11,7 @@ use synch_engine::{replica::ViewState, Node};
 use synch_store::{PinHolder, ReplicaPolicy};
 
 mod common;
-use common::{off_runtime, shutdown, spawn_node as spawn, trust_all as introduce};
+use common::{off_runtime, shutdown, spawn_node as spawn, spawn_node_with, trust_all as introduce};
 
 fn holder() -> PinHolder {
     PinHolder::Replica("media".into())
@@ -609,6 +609,64 @@ async fn a_budget_stops_fetching_and_releases_nothing() {
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     shutdown(&[&publisher.node, &replica.node]).await;
+}
+
+/// Over-budget spaces must not consume candidate selection before the engine
+/// reaches a healthy space in the same pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_budget_holders_do_not_hide_an_in_budget_holder() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let replica = spawn_node_with("replica", |config| config.replica_concurrency = 2).await;
+
+    let node = replica.node.clone();
+    let healthy = off_runtime(move || {
+        for space in ["a", "b"] {
+            node.add_replica(space, ReplicaPolicy::Current, None, Some(0), None)
+                .unwrap();
+            node.store()
+                .stage_want(
+                    &synch_core::Hash::new(format!("over budget {space}").as_bytes()),
+                    &PinHolder::Replica(space.to_string()),
+                    10,
+                    None,
+                    1,
+                )
+                .unwrap();
+        }
+        node.add_replica("c", ReplicaPolicy::Current, None, None, None)
+            .unwrap();
+        let healthy = node
+            .store()
+            .ingest_bytes(b"fits the healthy holder", 1)
+            .unwrap();
+        node.store()
+            .stage_want(
+                &healthy,
+                &PinHolder::Replica("c".to_string()),
+                b"fits the healthy holder".len() as u64,
+                None,
+                1,
+            )
+            .unwrap();
+        healthy
+    })
+    .await;
+
+    let report = replica.node.fetch_content_wants().await.unwrap();
+    assert_eq!(report.over_budget, 2, "both zero-budget wants are skipped");
+    assert_eq!(
+        report.held, 1,
+        "the healthy holder must run in the same pass"
+    );
+    assert!(replica
+        .node
+        .store()
+        .pins_for(&healthy)
+        .unwrap()
+        .iter()
+        .any(|pin| pin.holder == PinHolder::Replica("c".to_string())));
+
+    shutdown(&[&replica.node]).await;
 }
 
 /// A GC pass between the fetch and the pin does not take the bytes.

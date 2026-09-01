@@ -1793,6 +1793,16 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
+    /// Whether this exchange completed locally visible state.
+    ///
+    /// Pushing heads advances the peer, accepting a pending head only records a
+    /// pointer, and abandoning or refusing one merely unwedges the slot. None
+    /// stops periodic fallback to another candidate; only a completed trie has
+    /// moved what local readers can observe.
+    pub(crate) fn made_local_progress(&self) -> bool {
+        self.tries_completed > 0
+    }
+
     /// Records that this origin was left behind, once however often it is said.
     ///
     /// The number is rendered as "N origin(s) left behind", and two paths reach

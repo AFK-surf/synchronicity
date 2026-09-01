@@ -35,6 +35,7 @@ pub fn data_dir(cli: &Cli) -> Result<PathBuf> {
 /// Builds the node configuration from the CLI flags.
 pub(crate) fn node_config(cli: &Cli) -> Result<NodeConfig> {
     let mut config = NodeConfig::new(data_dir(cli)?);
+    config.replica_concurrency = cli.replica_concurrency;
     config.net.offline = cli.offline;
     if let Some(bind) = &cli.bind {
         config.net.bind_addr = Some(bind.parse().context("--bind wants HOST:PORT")?);
@@ -1213,6 +1214,12 @@ mod tests {
         let cloud = node_config(&emulator).unwrap().cloud.unwrap();
         assert_eq!(cloud.options["skip_signature"], "true");
         assert_eq!(cloud.options["disable_vm_metadata"], "true");
+    }
+
+    #[test]
+    fn replica_concurrency_reaches_the_node_config() {
+        let cli = Cli::parse_from(["synch", "--replica-concurrency", "23", "daemon", "run"]);
+        assert_eq!(node_config(&cli).unwrap().replica_concurrency, 23);
     }
 
     #[test]

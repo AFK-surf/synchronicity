@@ -542,6 +542,13 @@ impl Node {
 
     /// Opens an initialized data directory and binds the endpoint.
     pub async fn open(mut config: NodeConfig) -> Result<Node> {
+        if !(1..=crate::MAX_REPLICA_CONCURRENCY).contains(&config.replica_concurrency) {
+            return Err(EngineError::invalid(format!(
+                "replica_concurrency must be between 1 and {}, got {}",
+                crate::MAX_REPLICA_CONCURRENCY,
+                config.replica_concurrency
+            )));
+        }
         let cloud_cas = config
             .cloud
             .as_ref()
@@ -1920,6 +1927,18 @@ mod tests {
 
     fn node_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn replica_concurrency_must_stay_inside_the_engine_bound() {
+        for value in [0, crate::MAX_REPLICA_CONCURRENCY + 1] {
+            let dir = node_dir();
+            let mut config = NodeConfig::loopback(dir.path());
+            config.replica_concurrency = value;
+            let error = Node::open(config).await.unwrap_err().to_string();
+            assert!(error.contains("replica_concurrency"), "{error}");
+            assert!(error.contains("between 1 and"), "{error}");
+        }
     }
 
     #[tokio::test]

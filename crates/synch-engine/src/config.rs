@@ -6,6 +6,18 @@ use synch_net::NetOptions;
 
 use crate::error::{EngineError, Result};
 
+/// How many distinct CAS objects a replica fetches concurrently by default.
+pub const DEFAULT_REPLICA_CONCURRENCY: usize = 16;
+
+/// Largest replica fetch concurrency accepted from a host configuration.
+///
+/// Each slot may fan out to several providers and the ready-candidate window is
+/// a multiple of this value, so an unbounded operator value is an allocation
+/// and connection storm rather than useful throughput.
+pub const MAX_REPLICA_CONCURRENCY: usize = 256;
+
+const _: () = assert!(DEFAULT_REPLICA_CONCURRENCY <= MAX_REPLICA_CONCURRENCY);
+
 /// Where a node's data directory lives by default (§10).
 pub fn default_data_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("", "", "synchronicity")
@@ -83,10 +95,10 @@ pub struct NodeConfig {
     /// How many objects a replica fetches at once — concurrently, which is
     /// what makes this a rate limit rather than a batch size.
     ///
-    /// Deliberately low. Replica fetches share the endpoint with anti-entropy
-    /// and with foreground reads, and nothing schedules between them today
-    /// (§13): a replica that saturates the link it shares with the cluster's
-    /// actual users is a worse problem than one that converges overnight.
+    /// Bounded because replica fetches share the endpoint with anti-entropy and
+    /// foreground reads, and nothing schedules between them today (§13). The
+    /// shipped default is [`DEFAULT_REPLICA_CONCURRENCY`], and the accepted
+    /// range is 1 through [`MAX_REPLICA_CONCURRENCY`].
     pub replica_concurrency: usize,
     /// The smallest object a fetch will run the delta descent for
     /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
@@ -113,15 +125,14 @@ pub struct NodeConfig {
     /// peer holding the trie has had many rounds to serve it, short enough that
     /// an origin is not stranded for an afternoon.
     pub pending_head_ttl: Duration,
-    /// How long one anti-entropy round with one peer may take in total (§5.3).
+    /// How long an explicit anti-entropy exchange with one peer may take (§5.3).
     ///
     /// `synch-net` deadlines every individual request, but a round issues as
     /// many as the peer's answers call for — one trie fetch per head it hands
     /// back, each of those looping until it stops making progress — so the
-    /// per-request deadlines bound no round. A peer answering each request just
-    /// inside its deadline could therefore hold the periodic loop for as long
-    /// as it liked, and since a round returns on its first success, no other
-    /// peer was reached while it did.
+    /// per-request deadlines bound no exchange. Explicit operator-driven syncs
+    /// get this full budget; the standing periodic scheduler applies a smaller
+    /// per-peer cap so one bad member cannot postpone trying the next candidate.
     ///
     /// Ten anti-entropy intervals at the defaults: far more than a real round
     /// needs even on a cold bootstrap, since a round that runs out of budget
@@ -165,7 +176,7 @@ impl NodeConfig {
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
             replica_interval: Duration::from_secs(300),
-            replica_concurrency: 4,
+            replica_concurrency: DEFAULT_REPLICA_CONCURRENCY,
             replica_release_floor: 1,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             pending_head_ttl: Duration::from_secs(900),
@@ -192,4 +203,18 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "synchronicity".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_fetches_sixteen_replica_objects_by_default() {
+        assert_eq!(
+            NodeConfig::new("unused").replica_concurrency,
+            DEFAULT_REPLICA_CONCURRENCY
+        );
+        assert_eq!(DEFAULT_REPLICA_CONCURRENCY, 16);
+    }
 }
