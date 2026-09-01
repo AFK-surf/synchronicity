@@ -141,6 +141,21 @@ pub struct Desired {
     /// Bumped by any change to the set or its fields.
     #[serde(default)]
     pub generation: u64,
+    /// The data plane the control plane resolved this token to.
+    ///
+    /// This service's own name, told to it by the authority rather than
+    /// configured into it. Assignment lives in the control plane
+    /// (`docs/CLOUD-DATAPLANE.md` §7.2), so the name a network is filed
+    /// against is the control plane's to state — and a pod that read its own
+    /// name out of its environment could disagree with the row that decides
+    /// what it hosts, which is the whole failure the assignment removed.
+    ///
+    /// Defaulted, like `collect`, so this build still runs against a control
+    /// plane that predates the change: it then falls back to
+    /// `SYNCH_DP_SHARD_NAME` for the heartbeat and logs, and hosts whatever
+    /// the document lists.
+    #[serde(default)]
+    pub dp: Option<String>,
     /// Every network with cloud hosting enabled.
     pub networks: Vec<HostedNetwork>,
     /// Offboarded networks whose stored copy is now due for deletion.

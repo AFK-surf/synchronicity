@@ -23,6 +23,8 @@
 //// `actor` is who *made* the request. For a person they are the same string.
 //// For a key they are not, and the audit trail wants the second.
 
+import gleam/option.{type Option}
+
 pub type Principal {
   Principal(
     /// The user the rows this request writes are attributed to — the
@@ -70,7 +72,19 @@ pub type Credential {
   /// The `Principal`'s `user_id` for one of these is the `system-dataplane`
   /// row migration v12 seeds, because `devices.created_by` references `users`
   /// and the rows this credential writes have to name something true.
-  Dataplane(key_id: String)
+  ///
+  /// `dp` is the data plane the key was minted for (migration v14): the
+  /// identity that decides *which* hosted networks this caller may see and
+  /// write, as against `key_id`, which only says which credential was
+  /// presented. It rides the principal rather than being looked up per
+  /// handler so that no route can forget to scope itself — the value is
+  /// simply there, and a handler that needs it takes it.
+  ///
+  /// `None` is a key minted before v14. It authenticates, and `/dp/v1`
+  /// refuses it by name: a credential that names no data plane cannot be
+  /// given one by guessing, and the widest guess is the one an upgrade would
+  /// most easily hide.
+  Dataplane(key_id: String, dp: Option(String))
 }
 
 /// What the audit trail records as the actor.
@@ -89,6 +103,6 @@ pub fn actor(who: Principal) -> String {
     // and belongs to the deployment. A trail that spelled them the same way
     // would invite a reader to look the second one up in the first place and
     // conclude the key had been revoked.
-    Dataplane(key_id) -> "dpkey:" <> key_id
+    Dataplane(key_id, _) -> "dpkey:" <> key_id
   }
 }

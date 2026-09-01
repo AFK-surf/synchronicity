@@ -37,6 +37,14 @@ pub struct Reconciler {
     /// Consecutive fresh polls that have answered "nothing on this shard".
     empty_answers: u32,
     etag: Option<String>,
+    /// The name the control plane last answered with.
+    ///
+    /// Logged when it changes, and used for the metering heartbeat's `shard`
+    /// field, so the billing record carries the id the assignment is actually
+    /// written against rather than a string this pod's environment chose
+    /// separately. `None` until the first successful poll, and against a
+    /// control plane that predates the assignment work.
+    dp: Option<String>,
     /// The last document this shard successfully acted on.
     ///
     /// In memory, and consulted before the bucket: a `304 Not Modified` means
@@ -199,6 +207,7 @@ impl Reconciler {
             objects,
             resolver,
             tenants: HashMap::new(),
+            dp: None,
             parked: HashMap::new(),
             empty_answers: 0,
             etag: None,
@@ -244,6 +253,15 @@ impl Reconciler {
     pub async fn tick(&mut self) -> Result<()> {
         let (desired, fresh) = self.desired().await?;
         self.metrics.observed_generation(desired.generation);
+        // Said once per change rather than per pass. A pod that hosts nothing
+        // needs to be able to answer "which data plane am I?", and until the
+        // control plane names it the honest answer is that nobody has.
+        if desired.dp.is_some() && desired.dp != self.dp {
+            if let Some(dp) = &desired.dp {
+                tracing::info!(%dp, "this pod is data plane");
+            }
+            self.dp = desired.dp.clone();
+        }
 
         // Names first, before anything derives a path or a delete prefix from
         // them. A refused entry is dropped rather than fatal: one malformed
@@ -260,7 +278,6 @@ impl Reconciler {
                     false
                 }
             })
-            .filter(|network| self.config.serves(&network.key()))
             .collect();
         let mine: Vec<HostedNetwork> = desired
             .networks
@@ -274,7 +291,6 @@ impl Reconciler {
                     false
                 }
             })
-            .filter(|network| self.config.serves(&network.key()))
             .collect();
         let wanted: HashMap<String, HostedNetwork> = mine
             .into_iter()
@@ -617,6 +633,16 @@ impl Reconciler {
         }
     }
 
+    /// The name this pod reports itself under.
+    ///
+    /// The control plane's answer when there is one, because that is the id
+    /// the assignment is filed against and the one an operator will search
+    /// for. `SYNCH_DP_SHARD_NAME` is the fallback for a control plane that
+    /// predates the assignment work.
+    fn reported_name(&self) -> &str {
+        self.dp.as_deref().unwrap_or(&self.config.shard_name)
+    }
+
     /// Sends each tenant's heartbeat.
     ///
     /// Concurrently, and under a deadline apiece. The heartbeat is the billing
@@ -625,8 +651,8 @@ impl Reconciler {
     /// other tenant on the shard being metered: hold the store of the first
     /// tenant in map order and nothing behind it is ever reported.
     async fn report(&self) {
-        let (tenants, config, control, metrics) =
-            (&self.tenants, &self.config, &self.control, &self.metrics);
+        let name = self.reported_name();
+        let (tenants, control, metrics) = (&self.tenants, &self.control, &self.metrics);
         join_all(
             tenants
                 .iter()
@@ -638,8 +664,7 @@ impl Reconciler {
                     // volume is exactly the one whose store is too busy to
                     // answer a coverage query.
                     metrics.tenant_db_bytes(key, tenant.db_bytes());
-                    let measured =
-                        under_deadline(key, "status", tenant.status(&config.shard_name)).await;
+                    let measured = under_deadline(key, "status", tenant.status(name)).await;
                     match measured {
                         Some(Ok(status)) => {
                             metrics.tenant_status(key, &status);
@@ -717,6 +742,7 @@ impl Reconciler {
             }),
             None => Ok(Desired {
                 generation: 0,
+                dp: None,
                 networks: Vec::new(),
                 collect: Vec::new(),
             }),
@@ -736,6 +762,7 @@ mod tests {
         let config = test_config();
         let desired = Desired {
             generation: 7,
+            dp: Some("dp-1".into()),
             collect: Vec::new(),
             networks: vec![HostedNetwork {
                 org: "acme".into(),
@@ -788,6 +815,7 @@ mod tests {
         let config = test_config();
         let cached = Desired {
             generation: 7,
+            dp: Some("dp-1".into()),
             collect: Vec::new(),
             networks: vec![HostedNetwork {
                 org: "acme".into(),
@@ -952,6 +980,39 @@ mod tests {
         assert_eq!(Parked::after(Some(stale)).failures, 1);
     }
 
+    /// A pod reports itself under the name the control plane gave it.
+    ///
+    /// Assignment lives in the control plane now, so the name a network is
+    /// filed against is the control plane's to state — and the heartbeat is
+    /// the billing record, which had better carry the same string an operator
+    /// will search the assignment by. A pod that named itself out of its own
+    /// environment could disagree with the row that decides what it hosts,
+    /// which is the disagreement the whole change removes.
+    ///
+    /// The configured name survives as the fallback, for the boot before the
+    /// first successful poll and for a control plane older than this.
+    #[tokio::test]
+    async fn a_pod_reports_the_name_the_control_plane_gave_it() {
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        assert_eq!(
+            reconciler.reported_name(),
+            "dp-1",
+            "before the first answer, what this pod was configured with"
+        );
+        reconciler.dp = Some("dp-7".into());
+        assert_eq!(
+            reconciler.reported_name(),
+            "dp-7",
+            "and afterwards, what the authority calls it"
+        );
+    }
+
     /// A remembered failure is not a tenant that is down.
     ///
     /// The two are one map, because the backoff has to escalate across a
@@ -992,8 +1053,6 @@ mod tests {
             control_url: "http://127.0.0.1:1".into(),
             token: "synchdp_x".into(),
             base_dir: std::path::PathBuf::from("/tmp/synch-dp-test"),
-            shard: 0,
-            shards: 1,
             shard_name: "dp-1".into(),
             poll_interval: std::time::Duration::from_secs(60),
             objects: crate::config::ObjectConfig {

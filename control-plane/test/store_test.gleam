@@ -273,6 +273,14 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
       [],
     )
   // Newest first, the reverse of the order the migrations created them.
+  // V14's index before its column, because SQLite refuses to drop an indexed
+  // one, and its column before the table it references. The `dp_id` columns
+  // on `dataplane_keys` and `cloud_collect_queue` need no line of their own:
+  // V13's undo below takes both tables whole.
+  let assert Ok(_) = sqlite.exec(conn, "DROP INDEX networks_cloud_dp", [])
+  let assert Ok(_) =
+    sqlite.exec(conn, "ALTER TABLE networks DROP COLUMN cloud_dp_id", [])
+  let assert Ok(_) = sqlite.exec(conn, "DROP TABLE data_planes", [])
   let assert Ok(_) = sqlite.exec(conn, "DROP INDEX networks_cloud_hosted", [])
   let assert Ok(_) =
     sqlite.exec(conn, "ALTER TABLE networks DROP COLUMN cloud_hosted", [])

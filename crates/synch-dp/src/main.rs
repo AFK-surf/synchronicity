@@ -62,8 +62,6 @@ fn main() -> std::process::ExitCode {
 
 async fn run(config: DpConfig) -> synch_dp::Result<()> {
     tracing::info!(
-        shard = config.shard,
-        shards = config.shards,
         base_dir = %config.base_dir.display(),
         blocking_threads = config.blocking_threads,
         max_inflight_per_tenant = config.max_inflight_per_tenant,

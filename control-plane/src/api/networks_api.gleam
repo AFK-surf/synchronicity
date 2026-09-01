@@ -12,6 +12,7 @@ import api/middleware.{error_json, now_unix}
 import api/reads.{type Reads}
 import auth/dataplane_key
 import auth/principal.{type Principal}
+import cloud/dataplane
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
@@ -238,6 +239,12 @@ pub fn delete_network(
                 // them has to as well. `DO NOTHING` because a network deleted
                 // *during* its hold already has a clock running and must not
                 // have it restarted.
+                //
+                // The owning data plane is copied onto the queue row in the
+                // same statement, and this is the path where that matters
+                // most: in a moment there will be no `networks` row left to
+                // read it from, and a queue entry naming no owner is one no
+                // data plane sweeps (migration v14).
                 use hosted <- result.try(is_hosted(conn, network_id))
                 use _ <- result.try(case hosted {
                   False -> Ok(Nil)
@@ -245,10 +252,16 @@ pub fn delete_network(
                     sqlite.exec(
                       conn,
                       "INSERT INTO cloud_collect_queue
-                         (org_slug, network_name, disabled_at)
-                       VALUES (?, ?, ?)
+                         (org_slug, network_name, disabled_at, dp_id)
+                       SELECT ?1, ?2, ?3, n.cloud_dp_id
+                       FROM networks n WHERE n.id = ?4
                        ON CONFLICT (org_slug, network_name) DO NOTHING",
-                      [Text(slug), Text(network), VInt(now_unix())],
+                      [
+                        Text(slug),
+                        Text(network),
+                        VInt(now_unix()),
+                        Text(network_id),
+                      ],
                     )
                     |> result.replace(Nil)
                 })
@@ -365,13 +378,27 @@ pub fn set_cloud_hosting(
               // the collection another 30 days out — storage retained, and
               // billed, for ever.
               False, True ->
+                // The owning data plane rides along, read from the row this
+                // statement is about: the queue outlives the network, so by
+                // the time the hold elapses there is nowhere to look it up,
+                // and an entry naming no owner is one no data plane sweeps
+                // (migration v14). It is part of the `INSERT` rather than a
+                // follow-up `UPDATE` so that `DO NOTHING` still means nothing
+                // — a repeated disable must leave the existing row entirely
+                // alone, stamp included.
                 sqlite.exec(
                   conn,
                   "INSERT INTO cloud_collect_queue
-                     (org_slug, network_name, disabled_at)
-                   VALUES (?, ?, ?)
+                     (org_slug, network_name, disabled_at, dp_id)
+                   SELECT ?1, ?2, ?3, n.cloud_dp_id
+                   FROM networks n WHERE n.id = ?4
                    ON CONFLICT (org_slug, network_name) DO NOTHING",
-                  [Text(slug), Text(network), VInt(now_unix())],
+                  [
+                    Text(slug),
+                    Text(network),
+                    VInt(now_unix()),
+                    Text(network_id),
+                  ],
                 )
                 |> result.replace(Nil)
               False, False -> Ok(Nil)
@@ -380,20 +407,49 @@ pub fn set_cloud_hosting(
               True -> Ok(0)
               False -> retire_hosted_devices(conn, network_id)
             })
+            // Placement, in the transaction that switches hosting on. It runs
+            // *after* the flag is written so the least-loaded count includes
+            // this network, and it is a no-op for a network that already has
+            // a data plane: an assignment is made once and thereafter changed
+            // only by an operator (`cloud/dataplane`). That is what returns a
+            // network re-enabled inside its retention hold to the pod that
+            // still holds its database stream, rather than to whichever pod
+            // happens to be emptiest this minute.
+            //
+            // An empty fleet assigns nothing and is not an error. The network
+            // stays unhosted until a data plane is registered, which is the
+            // safe direction and is visible in `dataplane unassigned` — where
+            // refusing the toggle would fail an org-admin action for a reason
+            // an org admin can neither see nor fix.
+            use placed <- result.try(case enabled {
+              True -> dataplane.place(conn, network_id, now_unix())
+              False -> dataplane.assignment(conn, network_id)
+            })
             use _ <- result.try(
               audit(conn, who, org_id, action, [
                 #("network", json.string(network)),
                 #("devices_removed", json.int(removed)),
+                #("data_plane", case placed {
+                  Ok(dp_id) -> json.string(dp_id)
+                  Error(Nil) -> json.null()
+                }),
               ]),
             )
-            Ok(removed)
+            Ok(#(removed, placed))
           }
           case work {
-            Ok(removed) ->
+            // `data_plane: null` on an enable is the one answer a caller has
+            // to act on: hosting is on, and no data plane will pick the
+            // network up until the deployment registers one.
+            Ok(#(removed, placed)) ->
               Ok(
                 json.object([
                   #("enabled", json.bool(enabled)),
                   #("devices_removed", json.int(removed)),
+                  #("data_plane", case placed {
+                    Ok(dp_id) -> json.string(dp_id)
+                    Error(Nil) -> json.null()
+                  }),
                 ]),
               )
             Error(e) -> Error(constraint_response(e))

@@ -37,6 +37,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
@@ -139,20 +140,20 @@ const retention_hold_seconds = 2_592_000
 /// after it fell due is not a correctness problem; a deletion that never
 /// happens is, and that is the one this closes.
 pub fn desired_state(req: Request, reads: Reads, who: Principal) -> Response {
-  use <- require_dataplane(who)
+  use dp <- require_dataplane(who)
   reads.with_db(reads, fn(conn) {
     // One reading of the clock for the tag and the body both: two would let a
     // second tick between them and answer a `collect` list the `ETag` does not
     // describe.
     let due_before = now_unix() - retention_hold_seconds
-    case model.read_meta(conn), collection_mark(conn, due_before) {
+    case model.read_meta(conn), collection_mark(conn, dp, due_before) {
       Ok(meta), Ok(mark) -> {
-        let tag = etag(meta.soa_serial, mark)
+        let tag = etag(dp, meta.soa_serial, mark)
         case list.key_find(req.headers, "if-none-match") == Ok(tag) {
           True ->
             wisp.response(304)
             |> wisp.set_header("etag", tag)
-          False -> document(conn, meta, due_before, tag)
+          False -> document(conn, dp, meta, due_before, tag)
         }
       }
       _, _ -> db_error()
@@ -162,18 +163,29 @@ pub fn desired_state(req: Request, reads: Reads, who: Principal) -> Response {
 
 fn document(
   conn: Connection,
+  dp: String,
   meta: model.ZoneMeta,
   due_before: Int,
   tag: String,
 ) -> Response {
+  // Assigned to *this* data plane, which since migration v14 is what decides
+  // the fleet's division of labour. Two pods no longer derive overlapping
+  // answers from a shard count each read out of its own environment; each is
+  // told, and the telling is one column.
+  //
+  // A hosted network with no assignment appears in nobody's document. That is
+  // the safe direction and it is visible — `dataplane list` shows the fleet's
+  // counts and `dataplane unassigned` names the gap — where the alternative,
+  // handing an unassigned network to whoever asked first, is a placement
+  // decision made by a race.
   let networks =
     sqlite.query(
       conn,
       "SELECT o.slug, n.name, n.id
        FROM networks n JOIN orgs o ON o.id = n.org_id
-       WHERE n.cloud_hosted = 1
+       WHERE n.cloud_hosted = 1 AND n.cloud_dp_id = ?
        ORDER BY o.slug, n.name",
-      [],
+      [Text(dp)],
     )
   // The hosted device of each network, in one statement rather than one per
   // network: the fleet polls this every minute and a query per tenant would
@@ -193,13 +205,13 @@ fn document(
        JOIN devices d ON d.id = nd.device_id
        JOIN device_keys k ON k.device_id = d.id
        JOIN networks n ON n.id = nd.network_id
-       WHERE n.cloud_hosted = 1 AND k.state = 'active'
+       WHERE n.cloud_hosted = 1 AND n.cloud_dp_id = ? AND k.state = 'active'
          AND d.label GLOB 'cloud-*'
          AND d.created_by = ?
        ORDER BY nd.network_id, d.label",
-      [Text(dataplane_key.system_user_id)],
+      [Text(dp), Text(dataplane_key.system_user_id)],
     )
-  let due = collectable(conn, due_before)
+  let due = collectable(conn, dp, due_before)
   case networks, devices, due {
     Ok(network_rows), Ok(device_rows), Ok(due_rows) -> {
       // Already narrowed to devices this service created (`created_by`), which
@@ -213,6 +225,12 @@ fn document(
       let apex = string.drop_end(name.to_string(meta.apex), 1)
       json.object([
         #("generation", json.int(meta.soa_serial)),
+        // The data plane's own name, told to it by the authority rather than
+        // configured into it. A pod that hosts nothing can then say which pod
+        // it is, which is the first question asked of one, and the metering
+        // heartbeat reports the id this service assigned by instead of a
+        // string the deployment chose separately and could get wrong.
+        #("dp", json.string(dp)),
         #(
           "networks",
           json.array(network_rows, fn(row) {
@@ -262,22 +280,36 @@ fn document(
 /// rather than just the stamp: they are written in one transaction and cannot
 /// disagree, and a list that could ever name a *hosted* network is a list this
 /// service must not be able to produce.
+///
+/// Scoped to the data plane that was hosting the network when it was
+/// offboarded (`q.dp_id`, migration v14). The queue outlives the network row
+/// on purpose, so the owner cannot be looked up when the deletion falls due —
+/// it has to have been written down at disable time. Without it every data
+/// plane in the fleet would be told to delete the same prefix on the same
+/// tick: not wrong, exactly, since the sweep is idempotent, but N pods racing
+/// on one customer's bytes is not a thing to arrange on purpose.
+///
+/// A row with no `dp_id` — queued before v14, or queued while the network sat
+/// unassigned — is nobody's, and is therefore swept by nobody until an
+/// operator gives it an owner. Storage retained is recoverable; storage
+/// deleted by a pod that was never hosting it is not.
 fn collectable(
   conn: Connection,
+  dp: String,
   due_before: Int,
 ) -> Result(List(List(sqlite.Value)), sqlite.Error) {
   sqlite.query(
     conn,
     "SELECT q.org_slug, q.network_name
      FROM cloud_collect_queue q
-     WHERE q.disabled_at <= ?
+     WHERE q.disabled_at <= ? AND q.dp_id = ?
        AND NOT EXISTS (
          SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
          WHERE o.slug = q.org_slug AND n.name = q.network_name
            AND n.cloud_hosted = 1
        )
      ORDER BY q.org_slug, q.network_name",
-    [VInt(due_before)],
+    [VInt(due_before), Text(dp)],
   )
 }
 
@@ -289,20 +321,24 @@ fn collectable(
 /// and not an empty digest: a tag computed from a failed read would be a *stable*
 /// tag, and a fleet holding it would go on getting 304s for a document nobody
 /// could build. The 500 is the honest answer and the one that retries.
-fn collection_mark(conn: Connection, due_before: Int) -> Result(String, Nil) {
+fn collection_mark(
+  conn: Connection,
+  dp: String,
+  due_before: Int,
+) -> Result(String, Nil) {
   let due =
     sqlite.query(
       conn,
       "SELECT q.org_slug, q.network_name, q.disabled_at
        FROM cloud_collect_queue q
-       WHERE q.disabled_at <= ?
+       WHERE q.disabled_at <= ? AND q.dp_id = ?
          AND NOT EXISTS (
            SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
            WHERE o.slug = q.org_slug AND n.name = q.network_name
              AND n.cloud_hosted = 1
          )
        ORDER BY q.org_slug, q.network_name",
-      [VInt(due_before)],
+      [VInt(due_before), Text(dp)],
     )
   case due {
     Ok(rows) -> {
@@ -356,8 +392,12 @@ fn device_json(hosted: List(List(sqlite.Value)), network_id: String) -> Json {
 /// time changes (`desired_state` has the argument). `generation` in the body
 /// stays the serial alone — it is the zone's number and the fleet logs it as
 /// such — while the tag is about this response, which is what an `ETag` is for.
-fn etag(generation: Int, mark: String) -> String {
-  "\"dp-" <> int.to_string(generation) <> "-" <> mark <> "\""
+/// The data plane's own name is the first component, because the document is
+/// now per data plane: two pods polling one deployment hold different bodies,
+/// and a tag that did not say which would let a proxy — or a pod handed the
+/// wrong token — answer one pod with the other's 304.
+fn etag(dp: String, generation: Int, mark: String) -> String {
+  "\"dp-" <> dp <> "-" <> int.to_string(generation) <> "-" <> mark <> "\""
 }
 
 // -- device registration -----------------------------------------------------
@@ -408,7 +448,7 @@ pub fn register_device(
   slug: String,
   network: String,
 ) -> Response {
-  use <- require_dataplane(who)
+  use dp <- require_dataplane(who)
   let decoder = {
     use label <- decode.field("label", decode.string)
     use nk <- decode.field("nk", decode.string)
@@ -430,7 +470,7 @@ pub fn register_device(
     _, Error(Nil) -> refused(build.InvalidNk(nk))
     True, Ok(nk_bytes) ->
       with_db(ctx, fn(conn) {
-        case hosted_network(conn, slug, network) {
+        case own_network(conn, dp, slug, network) {
           Error(refusal) -> refusal
           // The flag is enforced *here*, which is the whole reason it is not a
           // zone fact: an org that switched hosting off a second ago must not
@@ -729,7 +769,7 @@ pub fn retire_key(
   network: String,
   nk: String,
 ) -> Response {
-  use <- require_dataplane(who)
+  use dp <- require_dataplane(who)
   let revoking = query(req, "revoke") == "1"
   with_db(ctx, fn(conn) {
     // The `cloud_hosted` flag is deliberately *not* required here. Disabling
@@ -737,7 +777,13 @@ pub fn retire_key(
     // findable belongs to a tenant that is still hosted or to one mid-teardown
     // — and refusing to revoke a key because the switch already went off would
     // close the door on exactly the cleanup this route is for.
-    case hosted_network(conn, slug, network) {
+    //
+    // The *assignment* is required, unlike the flag: a key is a tenant's
+    // identity, and standing one down is the one act on this surface that can
+    // leave another data plane's running tenant unable to sign. Disabling
+    // hosting does not clear `cloud_dp_id`, so the pod that was hosting the
+    // network can still finish its own teardown here.
+    case own_network(conn, dp, slug, network) {
       Error(refusal) -> refusal
       Ok(#(org_id, network_id, _)) ->
         case find_slot_key(conn, network_id, nk) {
@@ -943,14 +989,18 @@ pub fn collect_storage(
   slug: String,
   network: String,
 ) -> Response {
-  use <- require_dataplane(who)
+  use dp <- require_dataplane(who)
   with_db(ctx, fn(conn) {
     // Deliberately NOT `hosted_network`: the whole point of the queue is that
     // it outlives the network row, so a network deleted while offboarded has
     // bytes to collect and nothing left in `networks` to look them up by. The
     // hosting check that used to come from that lookup is folded into
     // `read_hold` instead, where it reads the live flag by slug and name.
-    case read_hold(conn, slug, network) {
+    //
+    // The assignment travels with the queue row for the same reason, and is
+    // checked there: an offboarded network's owner cannot be read from a
+    // `networks` row that may already be gone.
+    case read_hold(conn, dp, slug, network) {
       Error(refusal) -> refusal
       Ok(Hosted) ->
         error_json(
@@ -1035,6 +1085,7 @@ const action_collect = "cloud-hosting.storage.collect"
 /// slug and name — is hosted, and its storage is live.
 fn read_hold(
   conn: Connection,
+  dp: String,
   slug: String,
   network: String,
 ) -> Result(Hold, Response) {
@@ -1045,12 +1096,16 @@ fn read_hold(
        WHERE o.slug = ? AND n.name = ? AND n.cloud_hosted = 1",
       [Text(slug), Text(network)],
     )
+  // Matched on the queue row's own `dp_id`, which is the owner recorded when
+  // hosting went off (migration v14). A data plane that was never hosting
+  // this network reads `Collected` — nothing here for it — rather than being
+  // handed a stranger's prefix to confirm the deletion of.
   let queued =
     sqlite.query(
       conn,
       "SELECT disabled_at FROM cloud_collect_queue
-       WHERE org_slug = ? AND network_name = ?",
-      [Text(slug), Text(network)],
+       WHERE org_slug = ? AND network_name = ? AND dp_id = ?",
+      [Text(slug), Text(network), Text(dp)],
     )
   case hosted, queued {
     Ok([[VInt(n)]]), _ if n > 0 -> Ok(Hosted)
@@ -1098,7 +1153,7 @@ pub fn post_status(
   slug: String,
   network: String,
 ) -> Response {
-  use <- require_dataplane(who)
+  use dp <- require_dataplane(who)
   let decoder = {
     use held_roots <- decode.field("held_roots", decode.int)
     use held_bytes <- decode.field("held_bytes", decode.int)
@@ -1113,7 +1168,7 @@ pub fn post_status(
     decoder,
   )
   with_db(ctx, fn(conn) {
-    case hosted_network(conn, slug, network) {
+    case own_network(conn, dp, slug, network) {
       Error(refusal) -> refusal
       Ok(#(_, network_id, _)) -> {
         let written =
@@ -1167,9 +1222,21 @@ pub fn post_status(
 /// hosting service's credential is minted at the operator CLI and the fleet
 /// holds it, and a dashboard user who could register hosted devices by hand
 /// would be a second, unaudited way into the reserved namespace.
-fn require_dataplane(who: Principal, next: fn() -> Response) -> Response {
+fn require_dataplane(who: Principal, next: fn(String) -> Response) -> Response {
   case who.credential {
-    principal.Dataplane(_) -> next()
+    principal.Dataplane(_, option.Some(dp)) -> next(dp)
+    // A key minted before migration v14 names no data plane, and a data plane
+    // with no name has no hosted set: every route below is scoped by it. The
+    // refusal names the remedy rather than saying "forbidden", because the
+    // operator reading it is upgrading a fleet and the fix is one command.
+    principal.Dataplane(_, option.None) ->
+      error_json(
+        409,
+        "dataplane_unnamed",
+        "this key names no data plane: mint one with "
+          <> "`controlplane dataplane-key mint <name> --dp <dp-id>` "
+          <> "and point this pod at it",
+      )
     _ ->
       error_json(
         403,
@@ -1177,6 +1244,42 @@ fn require_dataplane(who: Principal, next: fn() -> Response) -> Response {
         "this endpoint answers the hosting service's own credential "
           <> "(Authorization: Bearer synchdp_…) and no other",
       )
+  }
+}
+
+/// The org, the network and its hosting state, refusing a network this data
+/// plane is not the one assigned to.
+///
+/// The check is here rather than at each caller because it is the same
+/// question every write on this surface asks, and because a route that forgot
+/// to ask it would make the assignment advisory — a filter on the GET that
+/// any pod could step around by naming a network directly. Two data planes
+/// writing one tenant's device registrations, heartbeats and key retirements
+/// is the confusion the assignment exists to remove.
+///
+/// A network assigned elsewhere answers 404 rather than 403, and that is
+/// deliberate: from this caller's point of view it is not a network it can
+/// see, and the honest shape of "not yours" on a surface that enumerates by
+/// assignment is the same shape as "not there". The log line on the other side
+/// says which data plane does own it.
+fn own_network(
+  conn: Connection,
+  dp: String,
+  slug: String,
+  network: String,
+) -> Result(#(String, String, Bool), Response) {
+  case hosted_network(conn, slug, network) {
+    Error(refusal) -> Error(refusal)
+    Ok(#(org_id, network_id, hosted, assigned)) ->
+      case assigned == option.Some(dp) {
+        True -> Ok(#(org_id, network_id, hosted))
+        False ->
+          Error(error_json(
+            404,
+            "not_found",
+            "no such network on this data plane",
+          ))
+      }
   }
 }
 
@@ -1197,18 +1300,23 @@ fn hosted_network(
   conn: Connection,
   slug: String,
   network: String,
-) -> Result(#(String, String, Bool), Response) {
+) -> Result(#(String, String, Bool, option.Option(String)), Response) {
   let looked =
     sqlite.query(
       conn,
-      "SELECT o.id, n.id, n.cloud_hosted FROM orgs o
+      "SELECT o.id, n.id, n.cloud_hosted, n.cloud_dp_id FROM orgs o
        JOIN networks n ON n.org_id = o.id AND n.name = ?
        WHERE o.slug = ?",
       [Text(network), Text(slug)],
     )
   case looked {
-    Ok([[Text(org_id), Text(network_id), VInt(hosted)]]) ->
-      Ok(#(org_id, network_id, hosted != 0))
+    Ok([[Text(org_id), Text(network_id), VInt(hosted), assigned]]) -> {
+      let assigned = case assigned {
+        Text(dp) -> option.Some(dp)
+        _ -> option.None
+      }
+      Ok(#(org_id, network_id, hosted != 0, assigned))
+    }
     Ok(_) -> Error(error_json(404, "not_found", "no such network"))
     Error(_) -> Error(db_error())
   }

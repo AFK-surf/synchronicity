@@ -25,7 +25,7 @@
 
 import auth/api_key.{nullable_int}
 import auth/principal.{type Principal, Dataplane, Principal}
-import gleam/option.{type Option}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
@@ -57,15 +57,27 @@ const use_stamp_interval = 3600
 /// operator happened to run the mint.
 pub const system_user_id = "system-dataplane"
 
-/// Mints a key. Returns the token and the display prefix; the row's id is an
-/// argument, because the caller needs it for the audit row either way.
+/// Mints a key for one data plane. Returns the token and the display prefix;
+/// the row's id is an argument, because the caller needs it for the audit row
+/// either way.
 ///
 /// The token is the only copy — nothing stored can reproduce it, so an
 /// operator who loses it mints another and deletes this row.
+///
+/// `dp_id` is required, and that is the whole of what makes a data plane's
+/// identity unforgeable (migration v14). The rejected alternative was a
+/// fleet-wide key plus an id in the pod's environment, and its failure mode
+/// is what settled it: a typo there authenticates perfectly and hosts
+/// nothing, or hosts another pod's networks, and neither is an error anybody
+/// sees. A key that names its data plane cannot be mistyped into naming a
+/// different one. It can be *copied*, which is an operator deliberately
+/// sharing a secret rather than fumbling a variable — and one this service
+/// cannot tell from the legitimate case of a pod being replaced.
 pub fn create(
   conn: Connection,
   key_id: String,
   name: String,
+  dp_id: String,
   expires_at: Option(Int),
   now: Int,
 ) -> Result(#(String, String), sqlite.Error) {
@@ -79,8 +91,9 @@ pub fn create(
       // names them: a VALUES list is the thing that silently shifts when a
       // table is rebuilt.
       "INSERT INTO dataplane_keys
-         (id, name, prefix, token_hash, created_at, expires_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)",
+         (id, name, prefix, token_hash, created_at, expires_at, last_used_at,
+          dp_id)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
       [
         Text(key_id),
         Text(name),
@@ -88,6 +101,7 @@ pub fn create(
         Blob(id.hash_token(token)),
         VInt(now),
         nullable_int(expires_at),
+        Text(dp_id),
       ],
     )
   case insert {
@@ -119,11 +133,11 @@ pub fn authenticate(
     True -> {
       let hash = id.hash_token(token)
       let sql =
-        "SELECT id, coalesce(last_used_at, 0)
+        "SELECT id, coalesce(last_used_at, 0), dp_id
          FROM dataplane_keys
          WHERE token_hash = ? AND (expires_at IS NULL OR expires_at > ?)"
       case sqlite.query(conn, sql, [Blob(hash), VInt(now)]) {
-        Ok([[Text(key_id), VInt(last_used)]]) -> {
+        Ok([[Text(key_id), VInt(last_used), dp]]) -> {
           case now - last_used > use_stamp_interval {
             True -> {
               let _ =
@@ -137,7 +151,15 @@ pub fn authenticate(
             }
             False -> Nil
           }
-          Ok(Principal(system_user_id, Dataplane(key_id)))
+          // A key minted before v14 names no data plane. It authenticates —
+          // refusing here would make an expired key and an unmigrated one the
+          // same error — and `/dp/v1` turns it away by name, with the remedy
+          // in the message.
+          let dp = case dp {
+            Text(dp_id) -> Some(dp_id)
+            _ -> None
+          }
+          Ok(Principal(system_user_id, Dataplane(key_id, dp)))
         }
         _ -> Error(Nil)
       }

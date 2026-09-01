@@ -185,12 +185,17 @@ pub fn delete_org(
             // each of them: the bytes in the bucket outlive every row here, so
             // the instruction to collect them is written before the rows go.
             // `DO NOTHING` leaves a clock that is already running alone.
+            //
+            // Each row carries the data plane that was hosting that network,
+            // read from the row that is about to be deleted — after this
+            // statement there is nowhere left to look it up, and a queue entry
+            // naming no owner is one no data plane sweeps (migration v14).
             use _ <- result.try(
               sqlite.exec(
                 conn,
                 "INSERT INTO cloud_collect_queue
-                   (org_slug, network_name, disabled_at)
-                 SELECT ?1, n.name, ?2 FROM networks n
+                   (org_slug, network_name, disabled_at, dp_id)
+                 SELECT ?1, n.name, ?2, n.cloud_dp_id FROM networks n
                  WHERE n.org_id = ?3 AND n.cloud_hosted = 1
                  ON CONFLICT (org_slug, network_name) DO NOTHING",
                 [Text(slug), VInt(now_unix()), Text(org_id)],

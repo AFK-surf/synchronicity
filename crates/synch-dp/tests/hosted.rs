@@ -30,6 +30,8 @@ const PROBE_KEY: &str = "hosted.probe";
 const PROBE_VALUE: &str = "written-while-running";
 
 const APEX: &str = "prod.acme.example";
+/// The data plane this stub says the test's token belongs to.
+const DP: &str = "dp-1";
 const ORG: &str = "acme";
 const NETWORK: &str = "prod";
 
@@ -92,6 +94,11 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
                 };
                 Json(serde_json::json!({
                     "generation": 1,
+                    // The name the control plane resolved this token to. The
+                    // real one answers it because assignment lives there now
+                    // (§7.2), and the fleet takes its own name from the
+                    // authority rather than from its own environment.
+                    "dp": DP,
                     "networks": networks,
                     "collect": cp.collect,
                 }))

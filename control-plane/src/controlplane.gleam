@@ -34,6 +34,7 @@ import auth/dataplane_key
 import auth/github
 import auth/google
 import auth/magic
+import cloud/dataplane
 import config.{type Config, Primary, Replica}
 import dns/name
 import dns/serve as dns_serve
@@ -97,14 +98,23 @@ pub fn main() {
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     // `key_name` rather than `name`: this module imports `dns/name`, and a
     // binding of that name would shadow the module for the rest of the clause.
-    ["dataplane-key", "mint", key_name] ->
-      run_or_die(fn() { dataplane_key_mint(key_name, "") })
-    ["dataplane-key", "mint", key_name, "--expires-in", seconds] ->
-      run_or_die(fn() { dataplane_key_mint(key_name, seconds) })
+    // The data plane a key is minted for is required, not optional. A key
+    // that named no data plane is one `/dp/v1` has to refuse, so accepting
+    // the mint and failing at the poll would move the error away from the
+    // person who can fix it (docs/CLOUD-DATAPLANE.md §7.2).
+    ["dataplane-key", "mint", key_name, "--dp", dp_id] ->
+      run_or_die(fn() { dataplane_key_mint(key_name, dp_id, "") })
+    ["dataplane-key", "mint", key_name, "--dp", dp_id, "--expires-in", seconds] ->
+      run_or_die(fn() { dataplane_key_mint(key_name, dp_id, seconds) })
+    ["dataplane", "register", dp_id] ->
+      run_or_die(fn() { dataplane_register(dp_id) })
+    ["dataplane", "list"] -> run_or_die(dataplane_list)
+    ["dataplane", "assign", org_slug, network_name, dp_id] ->
+      run_or_die(fn() { dataplane_assign(org_slug, network_name, dp_id) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | dataplane-key mint <name> [--expires-in <secs>] | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | dataplane register <dp-id> | dataplane list | dataplane assign <org> <network> <dp-id> | dataplane-key mint <name> --dp <dp-id> [--expires-in <secs>] | migrate-check",
       )
       halt(2)
     }
@@ -800,6 +810,7 @@ fn seed_admin(email: String) -> Result(Nil, String) {
 /// stop every hosted tenant converging at an hour nobody chose.
 fn dataplane_key_mint(
   key_name: String,
+  dp_id: String,
   expires_in: String,
 ) -> Result(Nil, String) {
   use cfg <- result.try(config.load())
@@ -815,9 +826,27 @@ fn dataplane_key_mint(
       }
   })
   use conn <- result.try(open_primary_db(cfg))
+  // The data plane has to exist first. The foreign key would refuse the
+  // insert anyway, but a constraint violation names a column and this names
+  // the mistake — and the fix, which is one command away.
+  use known <- result.try(
+    dataplane.exists(conn, dp_id)
+    |> result.map_error(fn(e) { "reading the fleet: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(case known {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "no data plane called "
+        <> dp_id
+        <> ": register it first with `controlplane dataplane register "
+        <> dp_id
+        <> "`",
+      )
+  })
   let key_id = id.new()
   use #(token, prefix) <- result.try(
-    dataplane_key.create(conn, key_id, key_name, expires_at, now)
+    dataplane_key.create(conn, key_id, key_name, dp_id, expires_at, now)
     |> result.map_error(fn(e) { "minting the key: " <> string.inspect(e) }),
   )
   // The mint goes in the trail, with `org_id` NULL because this credential
@@ -837,6 +866,7 @@ fn dataplane_key_mint(
             json.object([
               #("id", json.string(key_id)),
               #("name", json.string(key_name)),
+              #("dp", json.string(dp_id)),
               #("prefix", json.string(prefix)),
               #("expires_at", json.nullable(expires_at, json.int)),
             ]),
@@ -852,7 +882,8 @@ fn dataplane_key_mint(
     <> key_id
     <> " ("
     <> key_name
-    <> ") minted"
+    <> ") minted for data plane "
+    <> dp_id
     <> case expires_at {
       option.Some(at) -> ", expires at " <> int.to_string(at)
       option.None -> ", no expiry"
@@ -861,6 +892,211 @@ fn dataplane_key_mint(
     <> token
     <> "\n; give it to the data plane as SYNCH_DP_TOKEN; it is sent as\n"
     <> "; Authorization: Bearer <token> and reaches /dp/v1 and nothing else.",
+  )
+  Ok(Nil)
+}
+
+/// `dataplane register <dp-id>` — names one pod of the hosting fleet.
+///
+/// The id is the operator's own name for the pod, because it is the string
+/// they will read back in logs, in `dataplane list`, and in the metering
+/// heartbeat every tenant on that pod sends. There is no HTTP route that does
+/// this, for the reason there is none that mints a key: the fleet's shape is
+/// not something the credential authenticating against it should be able to
+/// change (docs/CLOUD-DATAPLANE.md §3.2).
+fn dataplane_register(dp_id: String) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  // Asked before the insert so a repeat says what happened rather than
+  // reporting a UNIQUE violation at an operator. The registry is not a
+  // hot path and the race is a human running one command twice.
+  use known <- result.try(
+    dataplane.exists(conn, dp_id)
+    |> result.map_error(fn(e) { "reading the fleet: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(case known {
+    False -> Ok(Nil)
+    True -> Error("data plane " <> dp_id <> " is already registered")
+  })
+  use _ <- result.try(
+    dataplane.register(conn, dp_id, now)
+    |> result.map_error(fn(e) {
+      "registering " <> dp_id <> ": " <> string.inspect(e)
+    }),
+  )
+  use _ <- result.try(
+    sqlite.exec(
+      conn,
+      "INSERT INTO audit_log (at, actor, org_id, action, detail)
+       VALUES (?, 'system:dataplane-register', NULL, 'dataplane.register', ?)",
+      [
+        sqlite.Int(now),
+        sqlite.Text(json.to_string(json.object([#("dp", json.string(dp_id))]))),
+      ],
+    )
+    |> result.map_error(fn(e) {
+      "recording the registration: " <> string.inspect(e)
+    }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "data plane "
+    <> dp_id
+    <> " registered\n; mint its key with `controlplane dataplane-key mint "
+    <> dp_id
+    <> " --dp "
+    <> dp_id
+    <> "`",
+  )
+  Ok(Nil)
+}
+
+/// `dataplane list` — the fleet, and what each pod is carrying.
+///
+/// The hosted-network count is the number an operator places by, and the
+/// unassigned tally under it is the one they act on: a hosted network with no
+/// data plane is replicated by nobody, and nothing else in the system says so
+/// out loud.
+fn dataplane_list() -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use conn <- result.try(open_primary_db(cfg))
+  use fleet <- result.try(
+    dataplane.list(conn)
+    |> result.map_error(fn(e) { "reading the fleet: " <> string.inspect(e) }),
+  )
+  use orphans <- result.try(
+    sqlite.query(
+      conn,
+      "SELECT o.slug, n.name FROM networks n JOIN orgs o ON o.id = n.org_id
+       WHERE n.cloud_hosted = 1 AND n.cloud_dp_id IS NULL
+       ORDER BY o.slug, n.name",
+      [],
+    )
+    |> result.map_error(fn(e) {
+      "reading unassigned networks: " <> string.inspect(e)
+    }),
+  )
+  sqlite.close(conn)
+  case fleet {
+    [] -> io.println("no data planes registered")
+    _ ->
+      list.each(fleet, fn(row) {
+        let #(dp_id, hosted) = row
+        io.println(dp_id <> "\t" <> int.to_string(hosted) <> " hosted")
+      })
+  }
+  case orphans {
+    [] -> Nil
+    rows -> {
+      io.println(
+        "\n"
+        <> int.to_string(list.length(rows))
+        <> " hosted network(s) assigned to no data plane — replicated by nobody:",
+      )
+      list.each(rows, fn(row) {
+        case row {
+          [sqlite.Text(slug), sqlite.Text(network)] ->
+            io.println("  " <> slug <> "/" <> network)
+          _ -> Nil
+        }
+      })
+    }
+  }
+  Ok(Nil)
+}
+
+/// `dataplane assign <org> <network> <dp-id>` — moves one network's hosting.
+///
+/// The only path that reassigns, and it is an operator's on purpose. Moving a
+/// tenant means one pod stops writing its database stream and another starts;
+/// nothing in this service can tell that the losing pod has actually stopped,
+/// so the judgement is left with the person who can look. Automating it on a
+/// signal as noisy as "the fleet looks uneven" is how two pods end up writing
+/// one tenant's stream, which is the failure the whole assignment exists to
+/// remove (docs/CLOUD-DATAPLANE.md §7.2).
+fn dataplane_assign(
+  org_slug: String,
+  network_name: String,
+  dp_id: String,
+) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  use known <- result.try(
+    dataplane.exists(conn, dp_id)
+    |> result.map_error(fn(e) { "reading the fleet: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(case known {
+    True -> Ok(Nil)
+    False -> Error("no data plane called " <> dp_id)
+  })
+  use rows <- result.try(
+    sqlite.query(
+      conn,
+      "SELECT n.id FROM networks n JOIN orgs o ON o.id = n.org_id
+       WHERE o.slug = ? AND n.name = ?",
+      [sqlite.Text(org_slug), sqlite.Text(network_name)],
+    )
+    |> result.map_error(fn(e) {
+      "looking up the network: " <> string.inspect(e)
+    }),
+  )
+  use network_id <- result.try(case rows {
+    [[sqlite.Text(network_id)]] -> Ok(network_id)
+    _ -> Error("no network " <> org_slug <> "/" <> network_name)
+  })
+  use previous <- result.try(
+    dataplane.assignment(conn, network_id)
+    |> result.map_error(fn(e) {
+      "reading the assignment: " <> string.inspect(e)
+    }),
+  )
+  use _ <- result.try(
+    dataplane.assign(conn, network_id, dp_id, now)
+    |> result.map_error(fn(e) { "assigning: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(
+    sqlite.exec(
+      conn,
+      "INSERT INTO audit_log (at, actor, org_id, action, detail)
+       VALUES (?, 'system:dataplane-assign', NULL, 'dataplane.assign', ?)",
+      [
+        sqlite.Int(now),
+        sqlite.Text(
+          json.to_string(
+            json.object([
+              #("org", json.string(org_slug)),
+              #("network", json.string(network_name)),
+              #("dp", json.string(dp_id)),
+              #("from", case previous {
+                Ok(from) -> json.string(from)
+                Error(Nil) -> json.null()
+              }),
+            ]),
+          ),
+        ),
+      ],
+    )
+    |> result.map_error(fn(e) {
+      "recording the assignment: " <> string.inspect(e)
+    }),
+  )
+  sqlite.close(conn)
+  io.println(
+    org_slug
+    <> "/"
+    <> network_name
+    <> " is now hosted by "
+    <> dp_id
+    <> case previous {
+      Ok(from) if from != dp_id ->
+        "\n; it was on "
+        <> from
+        <> ": make sure that pod has drained the tenant before this one"
+        <> "\n; opens the same database stream"
+      _ -> ""
+    },
   )
   Ok(Nil)
 }

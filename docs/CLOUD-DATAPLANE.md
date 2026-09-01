@@ -157,17 +157,21 @@ CREATE TABLE dataplane_keys (
   token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
   created_at INTEGER NOT NULL,
   expires_at INTEGER,
-  last_used_at INTEGER
+  last_used_at INTEGER,
+  dp_id      TEXT REFERENCES data_planes(id)   -- v14, §7.2
 );
 ```
 
 - Minted only from the operator CLI: `controlplane dataplane-key mint
-  <name>`, printing the token once, the same posture as `seed-admin`. No
-  HTTP route mints or lists these keys — the credential that can see every
-  org is never reachable *through* the API it authorizes.
+  <name> --dp <dp-id>`, printing the token once, the same posture as
+  `seed-admin`. No HTTP route mints or lists these keys — the credential
+  that can see every org is never reachable *through* the API it
+  authorizes. The `--dp` is required and names a registered data plane
+  (§7.2): a key carries the identity that decides what it may see, so a
+  pod's share cannot be misconfigured, only its secret copied.
 - Sent as `Authorization: Bearer synchdp_…`. The distinct prefix keeps the
   two bearer namespaces from ever being confused in logs or middleware, and
-  `check_principal` grows a `Dataplane(key_id)` constructor that is accepted
+  `check_principal` grows a `Dataplane(key_id, dp)` constructor that is accepted
   **only** by `/dp/v1/*` routes — `check_org` refuses it outright, so a
   leaked data-plane key cannot touch the org API at all.
 - The `/dp/v1` GET routes are served by read replicas too (they are reads of
@@ -178,11 +182,13 @@ CREATE TABLE dataplane_keys (
 
 Five routes under `/dp/v1`, all requiring the data-plane principal.
 
-**`GET /dp/v1/networks`** — the desired-state document. Every network of
-every org with `cloud_hosted = 1`:
+**`GET /dp/v1/networks`** — the desired-state document. Every network with
+`cloud_hosted = 1` **assigned to the calling data plane** (§7.2), of every
+org:
 
 ```json
 { "generation": 4183,
+  "dp": "dp-1",
   "collect": [ { "org": "beta", "network": "old" } ],
   "networks": [
     { "org": "acme", "network": "prod",
@@ -192,6 +198,12 @@ every org with `cloud_hosted = 1`:
       "device": { "label": "cloud-1", "nk": "…", "state": "active" } } ] }
 ```
 
+- `dp` is the data plane the caller's token names — this pod's own name,
+  told to it by the authority. A pod that read its name out of its own
+  environment could disagree with the row that decides what it hosts, which
+  is the disagreement §7.2 exists to remove; and a pod hosting nothing can
+  still answer "which data plane am I?", which is the first question asked
+  of one. It is also what the metering heartbeat's `shard` field carries.
 - `domain` is the membership domain, verbatim what `Node::set_domain`
   takes; the data plane never assembles names itself.
 - `budget_bytes` and `retention` are **policy, decided control-plane side**
@@ -203,7 +215,12 @@ every org with `cloud_hosted = 1`:
   a restarted, disk-less data plane can tell "network I have never joined"
   from "network whose identity I must recover" (§5.3).
 - `collect` names offboarded networks whose retention hold (§6) has run
-  out — the fleet's instruction to delete what it stored.
+  out — this data plane's instruction to delete what *it* stored. Scoped
+  the same way the network list is, from the owner stamped on the queue row
+  when hosting went off: the queue outlives the network row, so by the time
+  a deletion falls due there is nowhere left to look the owner up, and an
+  unscoped list would have every pod in the fleet race on one customer's
+  prefix.
 - `generation` is the zone's serial, bumped by any change that shapes the
   hosted set. The response's `ETag` is derived from it **and from the
   collections now due**, which is not a refinement but a correctness fix: a
@@ -211,7 +228,21 @@ every org with `cloud_hosted = 1`:
   fact, so a tag built from the serial alone would answer 304 for ever and
   the collection would never happen at all. The tag folds in both a count
   and a sum of the due stamps, because a count alone is unchanged when one
-  network falls due in the same interval another is collected.
+  network falls due in the same interval another is collected. The tag also
+  names the data plane, since two pods polling one deployment hold
+  different documents.
+
+A key minted before §7.2 names no data plane. Every route here refuses it
+with `dataplane_unnamed` and the command that fixes it, rather than
+treating "names nothing" as "sees everything" — which is the reading that
+would carry a fleet through the upgrade by handing the oldest credential on
+the deployment the widest scope it has ever had.
+
+The four writes below are scoped the same way: a network assigned to
+another data plane answers 404, because on a surface that enumerates by
+assignment "not yours" and "not there" are the same answer. Without that,
+the assignment would be a filter on the GET that any pod could step around
+by naming a route directly.
 
 **`PUT /dp/v1/networks/:org/:net/device`** — idempotent registration of the
 hosted device's key:
@@ -848,34 +879,79 @@ together, such that the shard's tenants collectively cannot ask for more
 than half the pool and the other half stays available for the reconcile
 pass, the replication tickers and the heartbeats. §9.1 is why.
 
-### 7.2 Sharding, when it matters
+### 7.2 Assignment: the control plane decides
 
-Shards are declared, not discovered: `SYNCH_DP_SHARD=2`
-`SYNCH_DP_SHARDS=4`. Each shard runs the same reconciler over the same
-desired-state document, filtered by **rendezvous hashing on the network
-id** — no assignment state in the control plane, no coordination between
-shards, and a shard-count change moves ~1/n of tenants. Everything durable
-about a tenant is keyed by network, never by shard — the CAS prefix, the
-DB stream, the `cloud-1` device identity (§3.4) — so a handover is: the
-losing shard's next reconcile drains the tenant (shipping the DB tail),
-the gaining shard restores that stream and resumes the *same* identity; no
-zone change, no key change, no customer-visible event. The race — a
-rolling shard-count change where both pods briefly run the tenant — is one
-identity written by two processes, and — stated plainly because §5.3's
-first draft claimed otherwise — **nothing catches it**. The replication
-library does not refuse a database behind its stream; it repairs it into a
-position to ship over one. So for the reconcile interval in which both pods
-believe they own the tenant, both replicate, and the loser's writes leave
-the only durable copy. Bounded by one reconcile interval and by how rarely
-the shard count changes, and mitigated by doing shard-count changes as a
-stop-then-start rather than a rolling update — but a real cost of this
-design and not an eliminated one. The fix that would eliminate it is a
-lease on the stream, which the library has no notion of.
+Each data plane has a **name**, and the control plane records which
+networks it hosts. `data_planes` is the registry, `networks.cloud_dp_id`
+is the assignment, and `GET /dp/v1/networks` answers with the caller's
+share and nothing else (migration v14).
+
+**A data plane's name is carried by its credential, not by its
+environment.** `controlplane dataplane register dp-1` names the pod;
+`controlplane dataplane-key mint fleet --dp dp-1` mints a key that names
+it; the pod is given only `SYNCH_DP_CONTROL_URL` and `SYNCH_DP_TOKEN` and
+learns which data plane it is from the document it polls. The rejected
+alternative was a fleet-wide key plus an id in the pod's environment,
+which is friendlier to a StatefulSet and has a silent failure mode: a
+typo there authenticates perfectly and hosts nothing, or hosts another
+pod's networks, and neither shows up as an error. A key that names its
+data plane cannot be mistyped into naming a different one.
+
+**Placement happens once**, when an org switches hosting on: the network
+goes to the least-loaded registered data plane, and nothing moves it
+afterwards. A network re-enabled inside its retention hold therefore
+returns to the pod that still holds its database stream and its bucket
+prefix rather than to whichever pod is emptiest that minute. Moving one is
+`controlplane dataplane assign <org> <network> <dp-id>`, run by an
+operator who knows the losing pod has drained the tenant. There is
+deliberately **no automatic re-sharding**: a rebalancer decides on a
+signal as noisy as "the fleet looks uneven", and the thing it would decide
+is which pod opens a database stream — see below for why that is the one
+decision this design will not make by itself.
+
+A hosted network with no assignment is hosted by nobody. That is the safe
+direction, it is what a deployment with no data plane registered yet
+looks like, and it is visible: the enable call answers `data_plane: null`
+and `controlplane dataplane list` names every unassigned network under the
+fleet's counts. Handing such a network to whichever pod asked first would
+be a placement decision made by a race.
+
+Everything durable about a tenant stays keyed by network, never by data
+plane — the CAS prefix, the DB stream, the `cloud-1` device identity
+(§3.4) — so a handover is unchanged: the losing pod's next reconcile
+drains the tenant (shipping the DB tail), the gaining pod restores that
+stream and resumes the *same* identity; no zone change, no key change, no
+customer-visible event.
+
+**What this replaces, and why.** Until v14 shards were declared
+per pod (`SYNCH_DP_SHARD=2 SYNCH_DP_SHARDS=4`) and each derived its own
+share by **rendezvous hashing on the network id** — no assignment state
+anywhere, no coordination, and a shard-count change moving ~1/n of
+tenants. It is a nice property and it had one failure the hashing could
+not fix: two pods configured with different counts both compute "mine"
+for the same network, and **nothing catches it**. The replication library
+does not refuse a database behind its stream; it repairs it into a
+position to ship over one. So both replicate, and the loser's writes
+leave the only durable copy. The `LifecycleLock` that would catch two
+writers is a `flock` on a data directory and does not span pods.
+
+That failure needed a rolling shard-count change to trigger, and the
+mitigation was an operational rule — change the count as a stop-then-start
+— which is exactly the kind of rule that holds until the night it does
+not. One row in the control plane removes the class: two services cannot
+disagree about a column, and the only thing that reassigns is an operator
+saying so. `SYNCH_DP_SHARD` and `SYNCH_DP_SHARDS` are refused at startup
+rather than ignored, because a pod still carrying them was configured for
+arithmetic that no longer runs.
+
+What is *not* eliminated is two pods holding the same token, which is an
+operator copying a secret rather than mistyping a variable — and one this
+service cannot tell from the legitimate case of a pod being replaced.
 
 Redundant hosting is a second *slot* (`cloud-2`, its own key, DB stream,
-and CAS claims over the same tenant prefix), assigned to a different shard
-by hashing on (network, slot) — future work only because billing and the
-status API assume one row per network today.
+and CAS claims over the same tenant prefix), assigned to a different data
+plane — future work only because billing and the status API assume one row
+per network today.
 
 ### 7.3 Engine changes required
 
@@ -910,7 +986,8 @@ None of the engine's replication, storage, or membership code changes.
 | tenant DB lost *and* customer nodes gone | names and structure lost despite bytes surviving — the case DB replication exists for | prevented, not recovered: the replica stream is part of the contract |
 | shard pod rescheduled | the normal event: replacement pod restores every tenant DB from its stream; identities unchanged | §6 |
 | leftover tenant directory on a reused volume | discarded: the stream is replayed over it, losing at most that pod's unshipped tail | §5.3 |
-| **rolling shard-count change** | **two pods may own one tenant for a reconcile interval and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: change `SYNCH_DP_SHARDS` as a stop-then-start, never a rolling update (§5.3, §7.2)** |
+| network hosted but assigned to no data plane | replicated by nobody; the enable call answered `data_plane: null` | register a data plane, or `dataplane assign` it (§7.2) |
+| **one token held by two pods** | **both own the tenant and both write its stream; the loser's writes are lost silently — nothing detects this** | **not recovered: a data plane's key names it, so this is an operator copying a secret rather than a misconfiguration. Mint a key per pod (§7.2)** |
 | pod killed without grace | up to one replication interval of DB writes unshipped; replica behind, never ahead | restore + re-sync closes the gap, §5.3 |
 | bucket prefix deleted by mistake | `NotFound` heal (SERVERLESS §6.4): durable claims withdrawn, wants re-staged, re-fetched from customer nodes while they hold copies | the one unrecoverable case is prefix loss *and* customer loss together |
 | budget exhausted | admission stops; the engine's own `held_back` shows in the replication panel; nothing evicted. The metering heartbeat does **not** carry it — `wanted` climbing against a flat `held_bytes` is what an operator reads instead | org raises plan; acquisition resumes |
@@ -1146,10 +1223,12 @@ crates/synch-dp/
    promise that nobody else checkpoints it.
 2. **Control plane.** Migration v12 (`cloud_hosted`, `cloud_disabled_at`,
    `dataplane_keys`, `network_hosting_status`, the `system-dataplane`
-   user), the admin toggle with its audit events and its dashboard switch,
-   the five `/dp/v1` routes, the `Dataplane` principal that `check_org`
-   refuses outright, the reserved `cloud-*` label namespace, and
-   `controlplane dataplane-key mint`.
+   user) and v14 (`data_planes`, the `dp_id` columns), the admin toggle with
+   its audit events and its dashboard switch, the five `/dp/v1` routes
+   scoped to the caller's data plane, the `Dataplane` principal that
+   `check_org` refuses outright, the reserved `cloud-*` label namespace, and
+   `controlplane dataplane register` / `list` / `assign` /
+   `dataplane-key mint --dp`.
 3. **`synch-dp`.** Restore-or-init, register, identify, replicate,
    converge, rotate, heartbeat, collect, drain.
 4. **Offboarding is closed.** Disabling drains the tenant and removes its

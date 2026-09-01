@@ -324,8 +324,19 @@ credential can be allowed to ask. So it is a fourth kind, in its own table,
 resolved to its own principal:
 
 ```sh
-controlplane dataplane-key mint dp-1 --expires-in 31536000
+controlplane dataplane register dp-1
+controlplane dataplane-key mint dp-1 --dp dp-1 --expires-in 31536000
 ```
+
+The key names the data plane it was minted for, and that is what decides
+which networks it may see and write: `data_planes` is the fleet's registry,
+`networks.cloud_dp_id` is the assignment, and `GET /dp/v1/networks` answers
+with the caller's share alone. Placement happens once, when an org switches
+hosting on — the least-loaded pod takes it, and nothing moves it afterwards
+except `controlplane dataplane assign <org> <network> <dp-id>`.
+`controlplane dataplane list` shows the fleet's counts and names every hosted
+network assigned to nobody. See docs/CLOUD-DATAPLANE.md §7.2 for why the
+name rides the credential rather than the pod's environment.
 
 Printed once, the same posture as `seed-admin`, and **no HTTP route mints,
 renames or lists these keys** — the credential that can see every org is never

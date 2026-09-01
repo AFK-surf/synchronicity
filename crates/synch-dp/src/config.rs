@@ -1,4 +1,4 @@
-//! What one shard is told, and how it reads it.
+//! What one data plane is told, and how it reads it.
 //!
 //! Everything comes from the environment, because that is what a pod is
 //! configured with. Nothing is read from disk: the disk is ephemeral, and a
@@ -23,7 +23,7 @@ pub fn slot_label() -> String {
     format!("cloud-{SLOT}")
 }
 
-/// One shard's settings.
+/// One data plane's settings.
 #[derive(Debug, Clone)]
 pub struct DpConfig {
     /// Base URL of the control plane, no trailing slash.
@@ -32,11 +32,13 @@ pub struct DpConfig {
     pub token: String,
     /// Where tenant data directories live, on the pod's ephemeral volume.
     pub base_dir: PathBuf,
-    /// This shard's ordinal, and how many there are.
-    pub shard: u32,
-    /// Total shards. Rendezvous hashing decides which serves which network.
-    pub shards: u32,
     /// A name for this pod, for logs and the status heartbeat.
+    ///
+    /// A fallback only: the authoritative name is the one the control plane
+    /// answers with (`Desired::dp`), because that is the name the assignment
+    /// is written against. This is what a log line says before the first poll
+    /// succeeds, and what the heartbeat carries if a control plane older than
+    /// the assignment work answers without one.
     pub shard_name: String,
     /// How often to poll the control plane.
     pub poll_interval: Duration,
@@ -180,7 +182,7 @@ impl ObjectConfig {
 impl DpConfig {
     /// A configuration for a test or an embedder driving the pieces directly.
     ///
-    /// Memory-backed storage, one shard, everything else at its default. The
+    /// Memory-backed storage, everything else at its default. The
     /// caller adjusts what it cares about — `net` for a loopback endpoint,
     /// `rotate_after` to make a rotation due.
     pub fn for_test(base_dir: impl Into<PathBuf>, control_url: &str) -> Self {
@@ -188,8 +190,6 @@ impl DpConfig {
             control_url: control_url.trim_end_matches('/').to_string(),
             token: "synchdp_test".into(),
             base_dir: base_dir.into(),
-            shard: 0,
-            shards: 1,
             shard_name: "dp-test".into(),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
@@ -218,18 +218,14 @@ impl DpConfig {
         let base_dir = PathBuf::from(
             std::env::var("SYNCH_DP_BASE_DIR").unwrap_or_else(|_| "/run/synch-dp".to_string()),
         );
-        let shard = parse("SYNCH_DP_SHARD", 0)?;
-        let shards = parse("SYNCH_DP_SHARDS", 1)?;
-        if shards == 0 {
-            return Err(DpError::Config("SYNCH_DP_SHARDS must be at least 1".into()));
-        }
-        if shard >= shards {
-            return Err(DpError::Config(format!(
-                "SYNCH_DP_SHARD ({shard}) must be below SYNCH_DP_SHARDS ({shards})"
-            )));
-        }
-        let shard_name =
-            std::env::var("SYNCH_DP_SHARD_NAME").unwrap_or_else(|_| format!("dp-{}", shard + 1));
+        // `SYNCH_DP_SHARD` and `SYNCH_DP_SHARDS` are gone, and their absence
+        // is refused loudly rather than ignored. A pod still carrying them
+        // was configured for a fleet that divided its own work by hashing;
+        // starting anyway would host whatever the control plane assigned this
+        // token, which may be a different set entirely, while the operator
+        // believes the old arithmetic still holds.
+        refuse_retired_sharding(&|key| std::env::var(key).is_ok())?;
+        let shard_name = std::env::var("SYNCH_DP_SHARD_NAME").unwrap_or_else(|_| "dp".to_string());
         let poll_interval = Duration::from_secs(parse::<u64>("SYNCH_DP_POLL_SECS", 60)?.max(1));
 
         let service = std::env::var("SYNCH_DP_CAS_BACKEND").unwrap_or_else(|_| "s3".to_string());
@@ -268,8 +264,6 @@ impl DpConfig {
             control_url,
             token,
             base_dir,
-            shard,
-            shards,
             shard_name,
             poll_interval,
             objects: ObjectConfig { service, options },
@@ -305,32 +299,6 @@ impl DpConfig {
     /// The cache each tenant may fill.
     pub fn cache_bytes_per_tenant(&self) -> u64 {
         (self.cache_bytes_total / self.max_tenants).max(1)
-    }
-
-    /// Whether this shard serves `network`, by rendezvous hashing.
-    ///
-    /// No assignment state anywhere: every shard computes the same answer from
-    /// the same document, and a shard-count change moves about one in `n` of
-    /// the tenants rather than reshuffling all of them.
-    pub fn serves(&self, network_key: &str) -> bool {
-        if self.shards == 1 {
-            return true;
-        }
-        let mut best = (0u64, 0u32);
-        for candidate in 0..self.shards {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(network_key.as_bytes());
-            hasher.update(&candidate.to_be_bytes());
-            let score = u64::from_be_bytes(
-                hasher.finalize().as_bytes()[..8]
-                    .try_into()
-                    .expect("a blake3 digest is 32 bytes"),
-            );
-            if score > best.0 {
-                best = (score, candidate);
-            }
-        }
-        best.1 == self.shard
     }
 
     /// This tenant's data directory.
@@ -416,10 +384,69 @@ impl DpConfig {
         self.base_dir.join("db").join(org).join(network)
     }
 
+    /// This data plane's name for its own cache, derived from its token.
+    ///
+    /// The cache key cannot be the data plane's *id*, however much it would
+    /// prefer to be: the id arrives in the document, and the whole point of
+    /// the cache is to be readable on a cold start when the control plane
+    /// cannot be reached and no document has arrived. A pod that had to poll
+    /// before it could find its own cache would have no fail-static path at
+    /// all — which is the one §4.2 exists to provide.
+    ///
+    /// The token is what a pod does hold before it has spoken to anybody, and
+    /// it names exactly one data plane (migration v14), so a fingerprint of it
+    /// keys the cache per data plane without the pod having to be told
+    /// anything twice. Eight bytes of BLAKE3, hex: the token is not
+    /// recoverable from it, and the object sits in a bucket the deployment
+    /// already trusts with tenant databases.
+    ///
+    /// Rotating a data plane's token therefore orphans its cache, and the
+    /// next cold start during a control-plane outage has nothing to fall back
+    /// on. That is a rare pairing of two rare events, and the alternative —
+    /// a second environment variable naming the cache — reintroduces exactly
+    /// the misconfiguration this design removed.
+    pub fn cache_id(&self) -> String {
+        let digest = blake3::hash(self.token.as_bytes());
+        hex_of(&digest.as_bytes()[..8])
+    }
+
     /// Where the fail-static desired-state cache lives (§4.2).
     pub fn desired_key(&self) -> String {
-        format!("dp/{}/desired.json", self.shard)
+        format!("dp/{}/desired.json", self.cache_id())
     }
+}
+
+/// Refuses a pod still configured for the sharding this no longer does.
+///
+/// Silence would be the dangerous answer. A deployment carrying
+/// `SYNCH_DP_SHARDS` was dividing the fleet's work by arithmetic each pod did
+/// for itself; this build divides it by what the control plane assigned this
+/// pod's token, which may be an entirely different set. Starting anyway would
+/// host that set correctly while the operator went on believing the old
+/// arithmetic held — and the two beliefs disagree most exactly where it hurts,
+/// on which pod owns which tenant's database stream.
+///
+/// Takes the lookup rather than reading the environment, so the rule can be
+/// stated in a test without a process-wide mutation racing every other test in
+/// the binary.
+fn refuse_retired_sharding(present: &dyn Fn(&str) -> bool) -> Result<()> {
+    for retired in ["SYNCH_DP_SHARD", "SYNCH_DP_SHARDS"] {
+        if present(retired) {
+            return Err(DpError::Config(format!(
+                "{retired} is no longer read: the control plane assigns \
+                 networks to data planes by name now. Register this pod with \
+                 `controlplane dataplane register <dp-id>`, mint its key with \
+                 `--dp <dp-id>`, and unset {retired}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Lowercase hex, for the cache key. `hex` is not a dependency of this crate
+/// and one byte-to-string loop does not earn one.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// How many blocking threads a shard sized for `max_tenants` gets.
@@ -559,14 +586,12 @@ fn parse_rekor() -> Result<synch_net::RekorPolicy> {
 mod tests {
     use super::*;
 
-    fn config(shard: u32, shards: u32) -> DpConfig {
+    fn config() -> DpConfig {
         DpConfig {
             control_url: "https://cp.example".into(),
             token: "synchdp_x".into(),
             base_dir: PathBuf::from("/run/synch-dp"),
-            shard,
-            shards,
-            shard_name: format!("dp-{shard}"),
+            shard_name: "dp".into(),
             poll_interval: Duration::from_secs(60),
             objects: ObjectConfig {
                 service: "memory".into(),
@@ -591,7 +616,7 @@ mod tests {
     /// reschedule — so it has to be refused before any of that (§5.3).
     #[test]
     fn a_backend_without_database_replication_refuses_to_start() {
-        let mut config = config(0, 1);
+        let mut config = config();
         for service in ["s3", "memory"] {
             config.objects.service = service.into();
             assert!(
@@ -628,50 +653,59 @@ mod tests {
         }
     }
 
-    /// Every network is served by exactly one shard — the property that makes
-    /// a slot single-writer without any coordination (§7.2).
+    /// A pod still configured for the old sharding is refused, and told what
+    /// to do instead.
+    ///
+    /// The alternative was ignoring the variables, and it is worse than it
+    /// looks: the pod would host exactly what the control plane assigned it
+    /// while its operator went on believing a shard count decided that — two
+    /// beliefs that disagree precisely about which pod owns which tenant's
+    /// database stream.
     #[test]
-    fn every_network_lands_on_exactly_one_shard() {
-        let shards = 4;
-        for n in 0..200 {
-            let key = format!("org{n}/net{n}");
-            let owners = (0..shards)
-                .filter(|shard| config(*shard, shards).serves(&key))
-                .count();
-            assert_eq!(owners, 1, "{key} had {owners} owners");
+    fn a_pod_configured_for_the_old_sharding_is_refused() {
+        assert!(refuse_retired_sharding(&|_| false).is_ok());
+        for retired in ["SYNCH_DP_SHARD", "SYNCH_DP_SHARDS"] {
+            let error = refuse_retired_sharding(&|key| key == retired)
+                .expect_err("a retired setting must not be ignored");
+            let said = error.to_string();
+            assert!(said.contains(retired), "the refusal names it: {said}");
+            assert!(
+                said.contains("dataplane register"),
+                "and names the remedy: {said}"
+            );
         }
     }
 
-    /// A single shard serves everything, so the common deployment needs no
-    /// hashing at all.
+    /// The fail-static cache is this data plane's alone, and it can be found
+    /// before the control plane has been reached.
+    ///
+    /// Both halves matter. Two data planes sharing a bucket must not share a
+    /// cache — one would boot into the other's tenant set — and the key
+    /// therefore cannot be a constant. But it also cannot be the data plane's
+    /// *id*, because the id arrives in the document and the cache exists
+    /// precisely for the boot where no document arrives (§4.2). The token is
+    /// the one thing a pod holds before it has spoken to anybody, and it names
+    /// exactly one data plane.
     #[test]
-    fn one_shard_serves_everything() {
-        let only = config(0, 1);
-        for n in 0..50 {
-            assert!(only.serves(&format!("org{n}/net{n}")));
-        }
-    }
-
-    /// Growing the fleet must move roughly one in n, not reshuffle everything
-    /// — that is the whole reason for rendezvous hashing over a modulus.
-    #[test]
-    fn growing_the_fleet_moves_about_one_in_n() {
-        let keys: Vec<String> = (0..600).map(|n| format!("org{n}/net{n}")).collect();
-        let owner = |key: &str, shards: u32| -> u32 {
-            (0..shards)
-                .find(|shard| config(*shard, shards).serves(key))
-                .expect("some shard owns it")
-        };
-        let moved = keys
-            .iter()
-            .filter(|key| owner(key, 3) != owner(key, 4))
-            .count();
-        let fraction = moved as f64 / keys.len() as f64;
-        // A modulus would move ~3/4 here; rendezvous moves ~1/4.
-        assert!(
-            fraction > 0.15 && fraction < 0.40,
-            "moved {fraction} of tenants growing 3 -> 4 shards"
+    fn the_cache_key_is_per_data_plane_and_needs_no_poll_to_derive() {
+        let mut one = config();
+        one.token = "synchdp_first".into();
+        let mut two = config();
+        two.token = "synchdp_second".into();
+        assert_ne!(one.desired_key(), two.desired_key());
+        // Stable across restarts, because it is derived rather than drawn.
+        assert_eq!(
+            one.desired_key(),
+            config_with_token("synchdp_first").desired_key()
         );
+        // And it does not carry the token it was derived from.
+        assert!(!one.desired_key().contains("synchdp_first"));
+    }
+
+    fn config_with_token(token: &str) -> DpConfig {
+        let mut config = config();
+        config.token = token.into();
+        config
     }
 
     /// The two numbers that bound what a shard's peers can hold agree with
@@ -724,7 +758,7 @@ mod tests {
 
     #[test]
     fn the_cache_budget_is_split_across_the_shards_capacity() {
-        let config = config(0, 1);
+        let config = config();
         assert_eq!(config.cache_bytes_per_tenant(), 256);
     }
 
@@ -732,8 +766,8 @@ mod tests {
     fn prefixes_are_keyed_by_network_not_by_shard() {
         // §7.2: everything durable about a tenant survives a shard handover
         // because no shard identity appears in any of these.
-        let a = config(0, 4);
-        let b = config(3, 4);
+        let a = config();
+        let b = config();
         assert_eq!(a.cas_root("acme", "prod"), b.cas_root("acme", "prod"));
         assert_eq!(a.db_prefix("acme", "prod"), b.db_prefix("acme", "prod"));
         assert_eq!(a.tenant_dir("acme", "prod"), b.tenant_dir("acme", "prod"));
