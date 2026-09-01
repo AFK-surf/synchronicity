@@ -1082,6 +1082,10 @@ impl Store {
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
+        // LEAN-MODEL: cas-heal-missing-durable
+        // `FaultTolerant.HealRemote` is this transaction: the durable claim is
+        // withdrawn, role pins become wants, the operator's pin is left alone.
+        // The backend losing the object is the environment step before it.
         self.with_immediate_tx(|tx| {
             let key = root.as_bytes().to_vec();
             // Read before anything is written: this row is the most
@@ -1153,6 +1157,9 @@ impl Store {
     /// Invalidates a local complete claim after the payload is missing or
     /// truncated, preserving every standing role as a repair intent.
     fn heal_missing_local_blob(&self, root: &Hash) -> Result<()> {
+        // LEAN-MODEL: cas-heal-missing-local
+        // `FaultTolerant.HealLocal` is this transaction, the local-bytes twin
+        // of the one above.
         self.with_immediate_tx(|tx| {
             let key = root.as_bytes().to_vec();
             let size: Option<i64> = tx
