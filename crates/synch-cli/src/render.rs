@@ -152,9 +152,8 @@ pub fn duration(seconds: i64) -> String {
 /// folded into `wanted`: objects with no provider are not a backlog, they are
 /// versions that are probably already gone, and the difference is the whole
 /// reason to run a replica. `releasing` is what an operator checks before
-/// deleting something they may want back. And `view` says whether releases are
-/// running at all, because "paused" is the difference between a replica that is
-/// behaving and one that is stuck.
+/// deleting something they may want back. And `view` says whether there are no
+/// pending heads and every bound origin has a materialized baseline.
 pub fn replica_status(status: &ReplicaStatus) -> Lines {
     let space = &status.replica;
     let mut out = vec![format!(
@@ -220,8 +219,8 @@ pub fn replica_status(status: &ReplicaStatus) -> Lines {
         });
     }
     out.push(match status.view.reason() {
-        None => "  view          complete — releases are running".to_string(),
-        Some(why) => format!("  view          incomplete, releases paused: {why}"),
+        None => "  view          complete".to_string(),
+        Some(why) => format!("  view          incomplete: {why}"),
     });
     // Whose content this is, because a budget raises the question and cannot
     // answer it: any member can publish, and every replica of the space fetches
@@ -625,9 +624,8 @@ pub fn doctor(node: &Node) -> Lines {
     ));
 
     // Replication belongs in the examination rather than only in `replica ls`,
-    // because the two lines that matter here are ones nobody thinks to look
-    // for: content no provider will serve, and releases that have stopped
-    // running. Both mean a replica is not doing what it was asked to.
+    // because content no provider will serve and incomplete synchronization
+    // are both easy to miss while reading the aggregate counts.
     for space in node.store().replicas()? {
         let status = node.replica_status(&space.space)?;
         out.push(format!(
@@ -645,8 +643,8 @@ pub fn doctor(node: &Node) -> Lines {
         ));
         if let Some(why) = status.view.reason() {
             out.push(format!(
-                "  releases are paused: {why} — this node is holding more than its \
-                 policy asks, which is the safe direction"
+                "  synchronization is incomplete: {why} — release sweeps continue from \
+                 materialized complete heads"
             ));
         }
     }

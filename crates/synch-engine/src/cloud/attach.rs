@@ -1202,10 +1202,10 @@ async fn delegations(node: &Node, id: u32) -> Result<Up> {
 /// `media` is replicated and both be right, so an answer that did not say
 /// *whose* it was would be worse than no answer.
 ///
-/// The view is read once rather than per space. It is a property of this
-/// node's whole picture — a pending head, or a bound origin it has never
-/// synced — and asking per space would re-run the same two scans of `heads`
-/// and `bindings` for every replica to reach the same verdict.
+/// Synchronization health is read once rather than per space. It is a property
+/// of this node's whole picture — a pending head, or a bound origin it has
+/// never synced — and asking per space would re-run the same two scans of
+/// `heads` and `bindings` for every replica to reach the same verdict.
 async fn replication(node: &Node, id: u32) -> Result<Up> {
     let node = node.clone();
     crate::blocking::offload(move || {

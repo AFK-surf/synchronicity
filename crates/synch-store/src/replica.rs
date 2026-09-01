@@ -29,27 +29,6 @@ const RARITY_WINDOW: usize = 8;
 pub(crate) const NOT_SELF: &str = "origin_id != COALESCE(
         (SELECT value FROM config WHERE key = 'self_origin_id'), '')";
 
-/// The §3.6 precondition, as a SQL predicate.
-///
-/// True when this node's picture of what the cluster publishes is a faithful
-/// one: no head is sitting pending — its origin's entries are absent or stale
-/// while one does — and no bound origin is missing a complete head, which would
-/// mean this node has never materialized what that member publishes. Either
-/// makes "no entry names this root" mean "I do not know", and a release decided
-/// from that is a release decided from ignorance.
-///
-/// Spliced into a `WHERE` rather than checked first, so it cannot go stale
-/// between the check and the update it guards. Every splice site is a pure
-/// conjunction; this fragment contains a top-level `AND` of its own and would
-/// need parentheses in any other context.
-const VIEW_IS_COMPLETE: &str = "NOT EXISTS (SELECT 1 FROM heads WHERE slot = 'pending')
-     AND NOT EXISTS (
-           SELECT 1 FROM bindings b
-            WHERE b.origin_id != COALESCE(
-                    (SELECT value FROM config WHERE key = 'self_origin_id'), '')
-              AND NOT EXISTS (SELECT 1 FROM heads h
-                               WHERE h.origin_id = b.origin_id AND h.slot = 'complete'))";
-
 use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
 
@@ -484,27 +463,20 @@ impl Store {
     /// space deciding for another. Holding more than strictly necessary is the
     /// safe direction and the only one available without per-space refcounting.
     ///
-    /// The completeness precondition (`docs/REPLICATION.md` §3.6) is part of the
-    /// statement rather than a check the caller makes first, because a check
-    /// the caller makes first is a check that can go stale: an operator's
-    /// `scope set` landing between it and this update commits `set_read_scope`'s
-    /// wholesale delete of every foreign origin's entries, after which this
-    /// would schedule a release for every root only those entries named. As one
-    /// statement the two cannot separate. `synch_engine`'s `Node::view_state`
-    /// answers the same question for reporting, and says *why* when the answer
-    /// is no. (Named rather than linked: the dependency runs the other way.)
+    /// `entries` contains only materialized complete heads. A pending head does
+    /// not replace its origin's last complete view, and an origin with no
+    /// complete head contributes no references yet. GC therefore follows this
+    /// committed view directly instead of turning incomplete synchronization
+    /// elsewhere on the node into a global release barrier.
     pub(crate) fn schedule_stale_releases(&self, holder: &PinHolder, at: i64) -> Result<usize> {
         Ok(self.conn().execute(
-            &format!(
-                "UPDATE pins SET release_after = ?2
+            "UPDATE pins SET release_after = ?2
                   WHERE holder = ?1
                     AND release_after IS NULL
                     AND EXISTS (SELECT 1 FROM replicas r
                                  WHERE 'replica:' || r.space = ?1
                                    AND r.retention = 'current')
-                    AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
-                    AND {VIEW_IS_COMPLETE}"
-            ),
+                    AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)",
             params![holder.render(), at],
         )?)
     }
@@ -540,8 +512,7 @@ impl Store {
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND (SELECT COUNT(*) FROM blob_providers p
                           WHERE p.object_root = pins.root AND p.complete != 0
-                            AND p.{NOT_SELF}) >= ?3
-                    AND {VIEW_IS_COMPLETE}"
+                            AND p.{NOT_SELF}) >= ?3"
             ),
             params![holder.render(), at, floor],
         )?)
@@ -553,9 +524,6 @@ impl Store {
         if floor <= 0 {
             return Ok(0);
         }
-        // The view predicate is here too, so a paused view is never reported as
-        // the replication floor holding things back: they are different reasons
-        // and `replica ls` prints them on different lines.
         Ok(self.conn().query_row(
             &format!(
                 "SELECT COUNT(*) FROM pins
@@ -564,8 +532,7 @@ impl Store {
                     AND NOT EXISTS (SELECT 1 FROM entries WHERE entries.content = pins.root)
                     AND (SELECT COUNT(*) FROM blob_providers p
                           WHERE p.object_root = pins.root AND p.complete != 0
-                            AND p.{NOT_SELF}) < ?2
-                    AND {VIEW_IS_COMPLETE}"
+                            AND p.{NOT_SELF}) < ?2"
             ),
             params![holder.render(), floor],
             |row| row.get::<_, i64>(0),
@@ -1035,39 +1002,45 @@ mod tests {
     }
 
     #[test]
-    fn a_release_is_refused_while_a_head_sits_pending() {
+    fn a_pending_head_keeps_complete_entries_without_blocking_other_releases() {
         let (_dir, store) = store();
         configure_replica(&store, "media");
-        let first = store.ingest_bytes(b"payload", 0).unwrap();
-        store.pin(&first, &media(), 1).unwrap();
+        let referenced = store.ingest_bytes(b"referenced", 0).unwrap();
+        store
+            .put_entry(
+                &origin(),
+                "media",
+                "kept.bin",
+                &synch_core::FileEntry::file(10, 1, referenced, 1),
+            )
+            .unwrap();
+        store.pin(&referenced, &media(), 1).unwrap();
 
-        // With a complete view, an unreferenced root is scheduled.
-        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 1);
-
-        // A pending head means that origin's entries are absent or stale, so
-        // "nothing names this root" becomes ignorance rather than evidence.
-        // The check is part of the statement, not a precondition a caller can
-        // read and then act on after it has gone stale.
+        // A newer pending head does not replace the materialized entries from
+        // the prior complete head. Those entries remain GC roots, while an
+        // unrelated stale pin may still progress through its grace period.
         let key = iroh_base::SecretKey::generate();
         let head = crate::testutil::sign_head(&key, 1, 7);
         store
             .put_head(crate::heads::Slot::Pending, &head, 1, 1)
             .unwrap();
-        let second = store.ingest_bytes(b"another payload", 0).unwrap();
-        store.pin(&second, &media(), 1).unwrap();
-        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 0);
-        assert_eq!(store.pins_for(&second).unwrap()[0].release_after, None);
+        let stale = store.ingest_bytes(b"stale", 0).unwrap();
+        store.pin(&stale, &media(), 1).unwrap();
+
+        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 1);
+        assert_eq!(store.pins_for(&referenced).unwrap()[0].release_after, None);
+        assert_eq!(store.pins_for(&stale).unwrap()[0].release_after, Some(500));
     }
 
     #[test]
-    fn a_release_is_refused_while_a_bound_origin_has_published_nothing_here() {
+    fn a_bound_origin_without_a_complete_head_does_not_block_releases() {
         let (_dir, store) = store();
         configure_replica(&store, "media");
         let root = store.ingest_bytes(b"payload", 0).unwrap();
         store.pin(&root, &media(), 1).unwrap();
 
-        // A member this node admits but has never synced: its entries are
-        // missing, not deleted.
+        // A member this node admits but has never synced contributes no
+        // materialized references until its first complete head arrives.
         let key = iroh_base::SecretKey::generate().public();
         store
             .put_binding(&crate::Binding {
@@ -1082,7 +1055,8 @@ mod tests {
                 expires_at: None,
             })
             .unwrap();
-        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 0);
+        assert_eq!(store.schedule_stale_releases(&media(), 500).unwrap(), 1);
+        assert_eq!(store.pins_for(&root).unwrap()[0].release_after, Some(500));
     }
 
     #[test]

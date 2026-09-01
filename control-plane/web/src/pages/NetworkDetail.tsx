@@ -388,6 +388,11 @@ function SpaceRow({
       <td className="px-4 py-2">
         <div>{node.device}</div>
         <div className="font-mono text-xs text-neutral-500">{node.origin}</div>
+        {!space.view_complete && (
+          <div className="text-xs text-amber-300" title={space.view_reason}>
+            sync incomplete: {space.view_reason}
+          </div>
+        )}
       </td>
       <td className="px-4 py-2 font-mono">{space.space}</td>
       <td className="px-4 py-2">
@@ -431,24 +436,13 @@ function SpaceRow({
         )}
       </td>
       <td className="px-4 py-2">
-        {!space.view_complete ? (
-          // Ahead of the count, because it explains it: a paused view is why
-          // nothing is leaving, and reading "0 releasing" without it says the
-          // replica is idle when it is stuck.
-          <div className="text-amber-300" title={space.view_reason}>
-            paused
-          </div>
-        ) : (
-          <div>{space.releasing.toLocaleString()}</div>
-        )}
+        <div>{space.releasing.toLocaleString()}</div>
         <div className="text-xs text-neutral-500">
-          {!space.view_complete
-            ? space.view_reason
-            : space.releasing > 0
-              ? `${bytes(space.releasing_bytes)}, soonest ${remaining(space.next_release)}`
-              : space.held_back > 0
-                ? `${space.held_back.toLocaleString()} held back: too few peers`
-                : '—'}
+          {space.releasing > 0
+            ? `${bytes(space.releasing_bytes)}, soonest ${remaining(space.next_release)}`
+            : space.held_back > 0
+              ? `${space.held_back.toLocaleString()} held back: too few peers`
+              : '—'}
         </div>
       </td>
     </tr>

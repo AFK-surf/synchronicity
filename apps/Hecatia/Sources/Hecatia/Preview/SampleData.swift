@@ -33,7 +33,7 @@ enum SampleData {
       claims: ["nas@x.example says it holds 4108 objects (4098000000 B, nothing outstanding, tree, grace 7d)"]),
     "media": ReplicaStatus(
       held: 412_880, heldBytes: 944_892_805_120, budgetBytes: 1_000_000_000_000,
-      pausedReason: "3 of 5 devices have not answered since yesterday"),
+      incompleteReason: "3 of 5 devices have not answered since yesterday"),
   ]
 
   static func day(_ offset: Int) -> Date {

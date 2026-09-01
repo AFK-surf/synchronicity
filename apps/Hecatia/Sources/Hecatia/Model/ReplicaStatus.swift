@@ -10,9 +10,8 @@ import Foundation
 ///   provider and are probably already gone; the difference between them and a
 ///   backlog is the whole reason to run a replica. The daemon has already
 ///   subtracted them from the `wanted` line it prints.
-/// - `view: incomplete` is shown *instead of and ahead of* the releasing count,
-///   not beside it. Paused releases are the difference between a replica that
-///   is behaving and one that is stuck.
+/// - `view: incomplete` is synchronization health. Release counts remain
+///   visible because sweeps continue from materialized complete heads.
 /// - `claims` are claims. This node cannot check another node's disk, so they
 ///   are never rendered as verified coverage.
 struct ReplicaStatus: Hashable, Sendable {
@@ -47,8 +46,8 @@ struct ReplicaStatus: Hashable, Sendable {
   /// A ceiling on bytes held for this space, if one is set.
   var budgetBytes: Int64?
   var budgetReached = false
-  /// nil when releases are running; the daemon's reason when they are paused.
-  var pausedReason: String?
+  /// The daemon's reason when synchronization is incomplete.
+  var incompleteReason: String?
   /// The daemon's own phrasing, kept verbatim — `(soonest leaves in 3d)`.
   var soonestRelease: String?
   var oldestWant: String?
@@ -64,5 +63,5 @@ struct ReplicaStatus: Hashable, Sendable {
   var unrecognized: [String] = []
 
   /// The one thing worth interrupting someone over.
-  var isAlarming: Bool { unreachable > 0 || pausedReason != nil }
+  var isAlarming: Bool { unreachable > 0 || incompleteReason != nil }
 }

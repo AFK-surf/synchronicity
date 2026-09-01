@@ -9,9 +9,8 @@ import SwiftUI
 /// - `unreachable` is its own line, in warning colour, and is never added into
 ///   the backlog. Those objects have no provider; they are probably already
 ///   gone. The daemon has already subtracted them from `wanted`.
-/// - "releases paused" replaces the releasing count rather than sitting beside
-///   it, and comes first. A paused view is the difference between converging
-///   and stuck, and it is the thing to read first.
+/// - Incomplete synchronization is shown as health information without hiding
+///   the releasing count, because sweeps continue from complete heads.
 /// - Claims are quoted as claims. This Mac cannot check another node's disk,
 ///   so a claim is never drawn as coverage.
 struct ReplicationInspector: View {
@@ -66,10 +65,8 @@ struct ReplicationInspector: View {
   @ViewBuilder
   private func coverage(_ status: ReplicaStatus) -> some View {
     VStack(alignment: .leading, spacing: Theme.Space.s) {
-      // First, and instead of the releasing line: a replica whose releases are
-      // paused is not behaving, and that outranks every count under it.
-      if let why = status.pausedReason {
-        Label("Releases paused: \(why)", systemImage: "pause.circle")
+      if let why = status.incompleteReason {
+        Label("Sync incomplete: \(why)", systemImage: "exclamationmark.triangle")
           .font(.callout).foregroundStyle(Theme.ink(Theme.warning))
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -81,7 +78,7 @@ struct ReplicationInspector: View {
             "Wanted", "\(status.wanted)", Bytes.short(status.wantedBytes),
             note: status.oldestWant.map { "oldest \($0)" }, tint: nil)
         }
-        if status.releasing > 0, status.pausedReason == nil {
+        if status.releasing > 0 {
           figure(
             "Releasing", "\(status.releasing)", Bytes.short(status.releasingBytes),
             note: status.soonestRelease.map { "soonest in \($0)" }, tint: nil)
@@ -204,9 +201,9 @@ private struct InspectorPreview: View {
     space: sampleSpace("archive"), status: SampleData.replicaStatus["archive"])
 }
 
-#Preview("Releases paused") {
-  // A replica without a checkout: no projected files, a budget, and a pause
-  // that replaces the releasing count rather than sitting beside it.
+#Preview("Sync incomplete") {
+  // A replica without a checkout: no projected files, a budget, and incomplete
+  // synchronization reported independently of release progress.
   InspectorPreview(space: sampleSpace("media"), status: SampleData.replicaStatus["media"])
 }
 

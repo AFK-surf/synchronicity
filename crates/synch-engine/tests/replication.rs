@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use synch_engine::{replica::ViewState, Node};
+use synch_engine::{reconcile::HeadOutcome, replica::ViewState, Node};
 use synch_store::{PinHolder, ReplicaPolicy};
 
 mod common;
@@ -104,6 +104,118 @@ async fn a_replica_holds_what_the_publisher_publishes_and_keeps_what_it_supersed
     assert_eq!(bytes, b"first cut");
 
     shutdown(&[&publisher.node, &replica.node]).await;
+}
+
+/// A pending head is not a replacement for the last complete materialized
+/// view. The sweep keeps roots named by seq 1 while seq 2 is unavailable, but
+/// it does not let that pending head block an unrelated stale release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_update_keeps_the_last_complete_roots_without_blocking_the_sweep() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn_node_with("replica", |config| config.replica_release_floor = 0).await;
+    introduce(&[&publisher, &replica]);
+
+    publisher
+        .node
+        .add_filesystem_source("media", publisher.space.path())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("a.bin"), b"version one").unwrap();
+    let first = publisher.node.scan_publish_push().await.unwrap().unwrap();
+
+    let replicating = replica.node.clone();
+    off_runtime(move || {
+        replicating
+            .add_replica("media", ReplicaPolicy::Current, Some(3600), None, None)
+            .unwrap();
+    })
+    .await;
+    converge(&replica.node, &publisher.node).await;
+
+    let referenced = replica
+        .node
+        .store()
+        .entry(publisher.node.origin(), "media", "a.bin")
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap();
+    assert_eq!(
+        replica
+            .node
+            .store()
+            .complete_head(publisher.node.origin())
+            .unwrap(),
+        Some(first.clone())
+    );
+
+    // A stale pin gives the sweep independent work to do while seq 2 waits.
+    let stale = replica
+        .node
+        .store()
+        .ingest_bytes(b"unreferenced replica content", synch_core::now_ns())
+        .unwrap();
+    replica
+        .node
+        .store()
+        .pin(&stale, &holder(), synch_core::now_ns())
+        .unwrap();
+
+    // Stop the publisher pushing seq 2 to the replica, then take it offline so
+    // the offered head cannot be fetched and promoted in the background.
+    publisher
+        .node
+        .store()
+        .remove_origin_bindings(replica.node.origin())
+        .unwrap();
+    std::fs::write(publisher.space.path().join("a.bin"), b"version two").unwrap();
+    let second = publisher.node.scan_publish_push().await.unwrap().unwrap();
+    publisher.node.shutdown().await.unwrap();
+
+    assert_eq!(
+        replica
+            .node
+            .syncer()
+            .offer_head(&second, synch_core::now_ns())
+            .unwrap(),
+        HeadOutcome::Pending
+    );
+    assert_eq!(
+        replica
+            .node
+            .store()
+            .complete_head(publisher.node.origin())
+            .unwrap(),
+        Some(first),
+        "seq 1 remains the materialized view while seq 2 is pending"
+    );
+    assert_eq!(
+        replica
+            .node
+            .store()
+            .entry(publisher.node.origin(), "media", "a.bin")
+            .unwrap()
+            .unwrap()
+            .content,
+        Some(referenced)
+    );
+
+    let sweeping = replica.node.clone();
+    let report = off_runtime(move || sweeping.sweep_replicas(None).unwrap()).await;
+    assert_eq!(report[0].1.scheduled, 1, "only the unrelated pin is stale");
+    assert_eq!(
+        replica.node.store().pins_for(&referenced).unwrap()[0].release_after,
+        None,
+        "the last complete entry remains a GC root"
+    );
+    assert!(
+        replica.node.store().pins_for(&stale).unwrap()[0]
+            .release_after
+            .is_some(),
+        "the pending update must not block unrelated release work"
+    );
+
+    shutdown(&[&replica.node]).await;
 }
 
 /// The live path does the work, not the sweep (§3.4).
@@ -324,17 +436,16 @@ async fn forever_retention_releases_nothing() {
     shutdown(&[&publisher.node, &replica.node]).await;
 }
 
-/// §3.6: absence of a reference is not evidence that a reference was removed.
-///
-/// The hazard is not hypothetical. `set_read_scope` throws away every foreign
-/// origin's `entries` rows by design, so for a moment the tree looks empty —
-/// and a sweep that scheduled releases from a listing would let go of the whole
-/// store at exactly that moment.
+/// Only complete materialized heads contribute GC roots. Changing scope
+/// demotes foreign heads and removes their old materialized entries, so those
+/// origins stop contributing until they are promoted under the new scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
+async fn a_sweep_continues_from_the_materialized_view_while_sync_is_incomplete() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
-    let replica = spawn("replica").await;
+    // Isolate the materialized-view rule from the independent provider floor:
+    // the scope transition deliberately clears provider rows too.
+    let replica = spawn_node_with("replica", |config| config.replica_release_floor = 0).await;
     introduce(&[&publisher, &replica]);
 
     publisher
@@ -355,8 +466,8 @@ async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
     assert_eq!(coverage(&replica.node).await.held, 1);
 
     // A scope change discards every foreign origin's entries and drops their
-    // complete heads back to pending. Nothing was deleted; this node's
-    // knowledge is what changed.
+    // complete heads back to pending. Until promotion, that origin contributes
+    // no roots to the new scoped materialized view.
     let scoped = replica.node.clone();
     let state = off_runtime(move || {
         scoped
@@ -376,9 +487,12 @@ async fn a_sweep_releases_nothing_while_the_view_is_incomplete() {
     let after = coverage(&replica.node).await;
     assert_eq!(
         after.releasing, 0,
-        "a sweep with an incomplete view must schedule nothing, even at zero grace"
+        "zero grace expires the release in the same sweep"
     );
-    assert_eq!(after.held, 1, "and must certainly not drop anything");
+    assert_eq!(
+        after.held, 0,
+        "an incomplete origin no longer blocks the sweep"
+    );
 
     shutdown(&[&publisher.node, &replica.node]).await;
 }
