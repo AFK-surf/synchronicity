@@ -892,6 +892,56 @@ together, such that a pod's tenants collectively cannot ask for more
 than half the pool and the other half stays available for the reconcile
 pass, the replication tickers and the heartbeats. §9.1 is why.
 
+### 7.1a What a *node* costs
+
+The table above is per tenant, and the ceiling above is in tenants. Neither
+sizes the other axis: a tenant is one tenant whether the replica it runs
+serves three nodes or ten thousand, and several of the engine's standing
+costs are per node. `crates/synch-dp/examples/stress.rs` measures that axis
+against a real provisioned tenant, at a configurable node count:
+
+```sh
+cargo run --release -p synch-dp --example stress
+```
+
+What it finds — shapes, not numbers, since the numbers belong to the machine:
+
+- **Membership is not free but it is cheap.** Ten thousand bindings install
+  in well under a second and cost single-digit MiB of RSS. `dialable_peers`
+  scans the whole table on every push and every anti-entropy round, and at
+  ten thousand rows that is ~100 ms of blocking-pool time apiece.
+- **The reactive push is quadratic.** `Node::push_head` dials every trusted
+  peer, and each dial calls `Store::refuse_metadata_sync`, which
+  materializes the entire binding table before the `own_issuers().is_empty()`
+  guard that discards it — twice, since `own_issuers` calls `live_bindings`
+  again. So one publish is `O(dialable × bindings)`: at 500 dialable peers
+  and ten thousand bindings it is minutes of CPU, and the standing
+  `run_replicas` loop reaches it through `publish_material_claims` whenever
+  coverage moves. Hoisting the `issuers.is_empty()` check above the
+  `live_bindings` call makes it `O(1)` for every node that is not a
+  delegate, which is every hosted replica.
+- **The maintenance pass grows faster than the origin count.** It walks
+  every complete head to build the GC mark set, and ten times the origins
+  costs well over a hundred times the pass. It runs every 300 s on the
+  blocking pool, where it is in front of every other tenant's store work on
+  the shard.
+- **The WAL, not the database, is the disk.** A tenant opens under
+  `Checkpointing::Embedder` so the replicator owns checkpointing (§5.3), so
+  the WAL is bounded by shipping rather than by SQLite's autocheckpoint.
+  Under ingest it runs one to two orders of magnitude larger than the
+  database file it fronts, and a pod's ephemeral volume has to be sized for
+  it.
+- **One zone cannot name a large network.** Membership is a single
+  `_synchronicity.<domain>` TXT RRset and a DNS message is bounded by a
+  16-bit length, so a zone tops out around 500 members — measured, by
+  bisection, in the harness's first section. Past that a signed RRset cannot
+  be produced. Nodes beyond one zone's worth belong to other networks and
+  reach a replica as delegations (§3.5), which is also why they are never
+  dialed: `dialable_peers` is `trusted_keys`, and a delegated origin is not
+  one.
+
+### 7.2 Sharding, when it matters
+
 ### 7.2 Assignment: the control plane decides
 
 Each data plane has a **name**, and the control plane records which
