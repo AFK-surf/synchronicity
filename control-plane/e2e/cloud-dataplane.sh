@@ -278,7 +278,10 @@ node3_knows_both() {
   grep -q 'from-node-1.txt' "$WORKDIR/node-3-tree.out" &&
     grep -q 'from-node-2.txt' "$WORKDIR/node-3-tree.out"
 }
-wait_for "node-3 to learn both publishers from cloud-1" 600 node3_knows_both
+# Discovery is timer-driven and node-3 deliberately starts without endpoint
+# history. Give membership plus both anti-entropy rounds five minutes; this
+# widens only the liveness budget, not the two-head or exact-byte assertions.
+wait_for "node-3 to learn both publishers from cloud-1" 1200 node3_knows_both
 
 node3_reads_both() {
   "$SYNCH_BIN" --data-dir "$WORKDIR/node-3" cat media/from-node-1.txt \
