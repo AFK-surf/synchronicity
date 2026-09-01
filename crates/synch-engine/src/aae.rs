@@ -218,7 +218,7 @@ impl Node {
     /// publish waits for all of them before it returns, while run together one
     /// slow peer costs one deadline rather than delaying every peer behind it.
     ///
-    /// Bounded concurrently, though, at [`PUSH_FANOUT`]. Every peer at once is
+    /// Bounded concurrently, though, at `PUSH_FANOUT`. Every peer at once is
     /// the shape §5.3 was written for at the N ≤ 100 sizes §12 assumes, and it
     /// is a dial storm at the sizes a hosted replica sees: an in-flight dial
     /// holds a QUIC handshake, its buffers and a file descriptor, and this is

@@ -1638,4 +1638,214 @@ mod tests {
         assert!(store.set_read_scope(None).unwrap());
         assert!(store.local_trie_scope().unwrap().is_full());
     }
+
+    /// Every narrowed trust query gives the answer the whole-table read gave.
+    ///
+    /// The reads below were rewritten from [`Store::live_bindings`] — which
+    /// materializes the table — to index seeks and, for the whole-set ones, to
+    /// SQL (`docs/CLOUD-DATAPLANE.md` §7.1a). That is a rewrite of the one rule
+    /// the whole trust model rests on, in eight places at once, so it is held
+    /// against the original rather than argued: `live_bindings` is the oracle,
+    /// and each narrowed query must agree with it over tables built to contain
+    /// the cases that distinguish them — an origin bound by several sources, a
+    /// key bound to several origins, delegated rows with a live issuer, a
+    /// lapsed issuer and no issuer at all, and expiries on both sides of now.
+    ///
+    /// Both clocks, because the liveness rule differs between them: a node
+    /// whose clock cannot date a trust decision honors no expiring binding, and
+    /// the SQL half expresses that as a different statement rather than a
+    /// different parameter.
+    #[test]
+    fn the_narrowed_trust_queries_agree_with_the_whole_table_read() {
+        let sortkey = |b: &Binding| {
+            (
+                b.origin.canonical(),
+                *b.node_id.as_bytes(),
+                b.source.as_str().to_string(),
+                b.issuer.as_ref().map(|i| i.canonical()),
+            )
+        };
+        let datable = MIN_TRUSTED_NS + 86_400_000_000_000;
+        for seed in 0..120u64 {
+            let (_dir, store) = store();
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut next = || {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng >> 33) as u32
+            };
+            // Undatable on every third table, which is the clock a node has
+            // before NTP and after a dead RTC.
+            let now = match seed % 3 {
+                0 => 1,
+                _ => datable,
+            };
+
+            let origins: Vec<OriginId> = (0..5)
+                .map(|i| OriginId::named(&format!("o{i}"), "x.example").unwrap())
+                .collect();
+            let keys: Vec<SecretKey> = (0..5).map(|_| SecretKey::generate()).collect();
+            store
+                .add_device_key(&keys[0], crate::KeyState::Active, 0)
+                .unwrap();
+            if next() % 2 == 0 {
+                store
+                    .add_device_key(&keys[1], crate::KeyState::Active, 0)
+                    .unwrap();
+            }
+            if next() % 3 != 0 {
+                store.set_self_origin(&origins[0]).unwrap();
+            }
+            for _ in 0..12 {
+                let source = match next() % 3 {
+                    0 => BindingSource::Static,
+                    1 => BindingSource::Dns,
+                    _ => BindingSource::Delegated,
+                };
+                store
+                    .put_binding(&Binding {
+                        origin: origins[(next() as usize) % origins.len()].clone(),
+                        node_id: keys[(next() as usize) % keys.len()].public(),
+                        source,
+                        domain: Some("x.example".into()),
+                        // A quarter of the delegated rows name no issuer, which
+                        // is the row nothing can have vouched for.
+                        issuer: match source {
+                            BindingSource::Delegated => match next() % 4 {
+                                0 => None,
+                                n => Some(origins[(n as usize) % origins.len()].clone()),
+                            },
+                            _ => None,
+                        },
+                        spaces: vec!["media".into()],
+                        note: None,
+                        added_at: 0,
+                        expires_at: match next() % 3 {
+                            0 => None,
+                            1 => Some(datable + 3_600_000_000_000),
+                            _ => Some(datable - 3_600_000_000_000),
+                        },
+                    })
+                    .unwrap();
+            }
+
+            let live = store.live_bindings(now).unwrap();
+
+            let mut want: Vec<_> = live.iter().map(|b| b.node_id).collect();
+            want.sort_by_key(|k| *k.as_bytes());
+            want.dedup();
+            assert_eq!(
+                store.trusted_keys(now).unwrap(),
+                want,
+                "trusted_keys seed {seed}"
+            );
+
+            let mut want: Vec<_> = live.iter().map(|b| b.origin.clone()).collect();
+            want.sort();
+            want.dedup();
+            assert_eq!(
+                store.trusted_origins(now).unwrap(),
+                want,
+                "trusted_origins seed {seed}"
+            );
+
+            for key in keys.iter().map(|k| k.public()) {
+                let mut want: Vec<_> = live.iter().filter(|b| b.node_id == key).cloned().collect();
+                let mut got = store.live_bindings_for_key(&key, now).unwrap();
+                want.sort_by_key(sortkey);
+                got.sort_by_key(sortkey);
+                assert_eq!(got, want, "live_bindings_for_key seed {seed}");
+                assert_eq!(
+                    store.is_trusted_key(&key, now).unwrap(),
+                    !want.is_empty(),
+                    "is_trusted_key seed {seed}"
+                );
+                for origin in &origins {
+                    assert_eq!(
+                        store.is_bound(origin, &key, now).unwrap(),
+                        want.iter().any(|b| &b.origin == origin),
+                        "is_bound seed {seed}"
+                    );
+                }
+                // The delegate-to-delegate gate, which is the one on the path
+                // of every metadata dial.
+                let issuers = store.own_issuers(now).unwrap();
+                let members: Vec<&OriginId> = live
+                    .iter()
+                    .filter(|b| b.node_id == key && b.is_rooted())
+                    .map(|b| &b.origin)
+                    .collect();
+                let refused = !issuers.is_empty()
+                    && (members.is_empty()
+                        || !members.iter().any(|o| {
+                            issuers.iter().any(|i| {
+                                *o == i || (o.domain().is_some() && o.domain() == i.domain())
+                            })
+                        }));
+                assert_eq!(
+                    store.refuse_metadata_sync(&key, now).unwrap().is_some(),
+                    refused,
+                    "refuse_metadata_sync seed {seed}"
+                );
+            }
+
+            for origin in &origins {
+                let mut want: Vec<_> = live
+                    .iter()
+                    .filter(|b| &b.origin == origin)
+                    .map(|b| b.node_id)
+                    .collect();
+                let mut got = store.keys_for_origin(origin, now).unwrap();
+                want.sort_by_key(|k| *k.as_bytes());
+                got.sort_by_key(|k| *k.as_bytes());
+                assert_eq!(got, want, "keys_for_origin seed {seed}");
+
+                let mut want: Vec<_> = live
+                    .iter()
+                    .filter(|b| &b.origin == origin)
+                    .cloned()
+                    .collect();
+                let mut got = store.live_bindings_for_origin(origin, now).unwrap();
+                want.sort_by_key(sortkey);
+                got.sort_by_key(sortkey);
+                assert_eq!(got, want, "live_bindings_for_origin seed {seed}");
+            }
+
+            let own = store.own_keys().unwrap();
+            let mut want: Vec<OriginId> = live
+                .iter()
+                .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+                .filter_map(|b| b.issuer.clone())
+                .collect();
+            let mut got = store.own_issuers(now).unwrap();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "own_issuers seed {seed}");
+
+            let self_origin = store.self_origin().unwrap();
+            assert_eq!(
+                store.own_rooted_in_foreign_origin(now).unwrap(),
+                live.iter().any(|b| {
+                    b.is_rooted()
+                        && own.contains(&b.node_id)
+                        && self_origin.as_ref().is_none_or(|o| o != &b.origin)
+                }),
+                "own_rooted_in_foreign_origin seed {seed}"
+            );
+
+            let mut want: Vec<String> = live
+                .iter()
+                .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+                .flat_map(|b| b.spaces.clone())
+                .collect();
+            want.sort();
+            want.dedup();
+            assert_eq!(
+                store.own_grant(now).unwrap(),
+                (!want.is_empty()).then_some(want),
+                "own_grant seed {seed}"
+            );
+        }
+    }
 }
