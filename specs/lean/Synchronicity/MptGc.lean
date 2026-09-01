@@ -19,10 +19,27 @@ def Invariant (s : State) : Prop :=
 def OfferPending (s s' : State) : Prop :=
   s' = { s with retained := True, pending := True }
 
-/- RUST-IMPL: mpt-fetch-batch — `reconcile.rs::fetch_pending` batch commit. -/
+/- RUST-IMPL: mpt-retain-only — `reconcile.rs::offer_head`, the `NotNewer`
+   arm.  A verified head that loses the ordering comparison is still history
+   and fork evidence, so its root enters GC retention without any slot
+   pointing at it. -/
+def Retain (s s' : State) : Prop :=
+  s' = { s with retained := True }
+
+/- RUST-IMPL: mpt-fetch-batch — `reconcile.rs::fetch_pending` batch commit.
+   Unguarded: the fetch reads the pending slot once and commits batches
+   afterwards, so a batch may land after the slot was cleared or the root
+   left retention.  Such nodes are unreferenced and the next `TrieGc` takes
+   them; the invariant does not depend on the guard. -/
 def LearnBatch (s s' : State) : Prop :=
-  s.pending ∧ s.retained ∧
-  (s' = s ∨ s' = { s with complete := True })
+  s' = s ∨ s' = { s with complete := True }
+
+/- RUST-IMPL: mpt-drop-pending — `reconcile.rs::try_promote` clearing an
+   overtaken or refused pending head, `sweep_pending_heads`, and the read-scope
+   demotion in `bindings.rs`.  The root stays retained through `head_history`
+   until pruned. -/
+def DropPending (s s' : State) : Prop :=
+  s' = { s with pending := False }
 
 /- RUST-IMPL: mpt-trie-gc — `gc.rs::gc_trie`. -/
 def TrieGc (s s' : State) : Prop :=
@@ -48,7 +65,9 @@ def OwnPublish (s s' : State) : Prop :=
 
 inductive Step : State → State → Prop where
   | offerPending : OfferPending s s' → Step s s'
+  | retain : Retain s s' → Step s s'
   | learnBatch : LearnBatch s s' → Step s s'
+  | dropPending : DropPending s s' → Step s s'
   | trieGc : TrieGc s s' → Step s s'
   | promote : Promote s s' → Step s s'
   | ownPublish : OwnPublish s s' → Step s s'
@@ -56,7 +75,9 @@ inductive Step : State → State → Prop where
 /- mptsync/GC work that does not flip or mint a head. -/
 inductive SyncStep : State → State → Prop where
   | offerPending : OfferPending s s' → SyncStep s s'
+  | retain : Retain s s' → SyncStep s s'
   | learnBatch : LearnBatch s s' → SyncStep s s'
+  | dropPending : DropPending s s' → SyncStep s s'
   | trieGc : TrieGc s s' → SyncStep s s'
 
 def Initial : State := {}
@@ -71,7 +92,9 @@ theorem initial_invariant : Invariant Initial := by
 theorem invariant_step (hinv : Invariant s) (hstep : Step s s') : Invariant s' := by
   cases hstep with
   | offerPending h => simp_all [OfferPending, Invariant]
-  | learnBatch h => rcases h.2.2 with unchanged | closed <;> simp_all [Invariant]
+  | retain h => simp_all [Retain, Invariant]
+  | learnBatch h => rcases h with unchanged | closed <;> simp_all [Invariant]
+  | dropPending h => simp_all [DropPending, Invariant]
   | trieGc h => rcases h with held | dead <;> simp_all [Invariant]
   | promote h => simp_all [Promote, Invariant]
   | ownPublish h => simp_all [OwnPublish, Invariant]
@@ -79,7 +102,9 @@ theorem invariant_step (hinv : Invariant s) (hstep : Step s s') : Invariant s' :
 theorem sync_invariant_step (hinv : Invariant s) (hstep : SyncStep s s') : Invariant s' := by
   cases hstep with
   | offerPending h => exact invariant_step hinv (.offerPending h)
+  | retain h => exact invariant_step hinv (.retain h)
   | learnBatch h => exact invariant_step hinv (.learnBatch h)
+  | dropPending h => exact invariant_step hinv (.dropPending h)
   | trieGc h => exact invariant_step hinv (.trieGc h)
 
 theorem reachable_invariant (h : Reachable s) : Invariant s := by

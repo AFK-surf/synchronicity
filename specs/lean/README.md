@@ -17,11 +17,23 @@ The proof boundary is explicit:
   opened `Store` values in that process share one CAS writer/GC coordinator;
 - SQLite immediate transactions are atomic;
 - the shared CAS coordinator orders lease registration against every unlink;
-- production deletion re-checks entry, pin, and writer protection; the only
-  unconditional deletion helper is compiled for tests and lies outside the
-  safety transition system;
+- production deletion of durable content re-checks entry, pin, and writer
+  protection; the only unconditional deletion helper is compiled for tests and
+  lies outside the safety transition system;
+- a *staged* row (`durable = 0`) may be dropped without consulting pins — by
+  cache eviction, a scratch-generation reset, or a backend migration — and
+  `SystemSafety.DropStaged` models that. It is safe because `Pin` and
+  `TakePossession` require `Available`, which requires `durable`, and
+  `Store::pin`/`take_possession` enforce exactly that predicate
+  (`staged_row_drop_is_unpinned`);
 - verified content hashes identify the bytes, and the configured durable
-  backend satisfies its write contract.
+  backend satisfies its write contract. A backend that loses an object it
+  acknowledged (an S3 `NoSuchKey` on a durable root) breaks that assumption;
+  the `heal_missing_*` paths that respond to it lower `durable`, convert
+  source and replica pins into repair wants, and leave operator pins in place.
+  Those transitions, and the source-holder wants they create, are outside the
+  model on purpose: they describe recovery from a broken assumption, not an
+  execution the theorems cover.
 
 There are three layers:
 
@@ -37,10 +49,18 @@ The principal system theorems are
 `SystemSafety.replica_live_content_is_pin_or_want`. They quantify over the
 actual holder and content root, so a claim for one root cannot discharge a leaf
 for another. The reachable transition closure includes writes and aborts,
-cache eviction, publication/promotion, materialized-leaf and entry removal,
-pin/unpin/expiry, want removal/take-possession, protected deletion, and both GC
-phases. `TrieGraph.gc_preserves_complete_retained_root` supplies the analogous
+cache eviction, staged-row removal, remote adoption, publication/promotion,
+materialized-leaf and entry removal, pin/unpin/expiry, want
+removal/take-possession, protected deletion, and both GC phases.
+`TrieGraph.gc_preserves_complete_retained_root` supplies the analogous
 node-graph property.
+
+`MptGc` is deliberately looser than the code where the code's own ordering is
+not what the invariant rests on: a fetch batch may commit after the pending
+slot was cleared (`LearnBatch` is unguarded), a head that loses the ordering
+comparison is retained without a slot (`Retain`), and the pending slot may be
+cleared without a flip (`DropPending`). Each is a transition Rust performs, and
+each preserves `active → retained ∧ complete ∧ materialized` trivially.
 
 What remains trusted rather than proved is the refinement from Rust statements
 to Lean transitions. Anchors make that obligation auditable but do not prove

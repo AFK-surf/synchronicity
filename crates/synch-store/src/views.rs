@@ -1335,6 +1335,18 @@ fn content_wants(
          ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
         params![root.as_bytes().to_vec(), target.holder, now],
     )?;
+    // Held is not wanted. A want staged while the root was still on its way
+    // — an earlier promotion of the same bytes, say — is retired by the pin
+    // that supersedes it, in the same transaction, so a replica is never held
+    // and wanted at once (`SystemSafety.ReplicaPromote`). The sweep's
+    // `stage_space_wants` does the same for anything that got here before this
+    // line existed.
+    tx.execute(
+        "DELETE FROM content_want
+          WHERE root = ?1 AND holder = ?2
+            AND EXISTS (SELECT 1 FROM pins WHERE root = ?1 AND holder = ?2)",
+        params![root.as_bytes().to_vec(), target.holder],
+    )?;
     tx.execute(
         "INSERT INTO content_want (root, holder, size, prev, first_wanted)
          SELECT ?1, ?2, ?3, ?4, ?5
@@ -2236,6 +2248,50 @@ mod tests {
         assert_eq!(
             store.published_paths(&mine, "other").unwrap(),
             Vec::<String>::new()
+        );
+    }
+
+    /// A replica leaf whose content is already durable takes a pin and
+    /// retires any want staged for it in the same transaction, so held and
+    /// wanted never coexist (`SystemSafety.ReplicaPromote`).
+    #[test]
+    fn a_replica_pin_retires_the_want_it_supersedes() {
+        let (_d, store) = store();
+        let o = origin_named("nas");
+        store
+            .put_replica(&ReplicaRow {
+                space: "media".into(),
+                retention: ReplicaPolicy::Current,
+                grace: Some(60),
+                budget: None,
+                checkout_path: None,
+            })
+            .unwrap();
+        let holder = crate::PinHolder::Replica("media".into());
+        let payload = vec![7u8; 100_000];
+        let root = Hash::new(&payload);
+        // Wanted first, while nothing was held; then the bytes arrive some
+        // other way — a `synch cat`, another space's ingest.
+        assert!(store.stage_want(&root, &holder, 100_000, None, 1).unwrap());
+        assert_eq!(store.ingest_bytes(&payload, 2).unwrap(), root);
+
+        let trie = Trie::new(&store);
+        let entry = FileEntry::file(100_000, 3, root, 1);
+        let with = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("media", "clip.bin").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
+            .unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, with))
+            .unwrap();
+
+        assert_eq!(store.pinned_blobs().unwrap(), vec![root]);
+        assert!(
+            store.wants_of(&holder).unwrap().is_empty(),
+            "held is not wanted"
         );
     }
 }

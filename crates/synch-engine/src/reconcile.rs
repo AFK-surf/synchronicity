@@ -495,6 +495,9 @@ impl Syncer {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
             } else {
+                // LEAN-MODEL: mpt-retain-only
+                // `MptGc.Retain`: the history row above keeps this root in
+                // the GC mark set even though no slot ever points at it.
                 HeadOutcome::NotNewer
             };
 
@@ -629,6 +632,11 @@ impl Syncer {
                     complete = displaced.as_ref().map(|h| h.seq).unwrap_or(0),
                     "dropping a pending head the complete slot has overtaken"
                 );
+                // LEAN-MODEL: mpt-drop-pending
+                // `MptGc.DropPending` is every clearing of the pending slot
+                // that does not flip it: this one, the refusal above,
+                // `sweep_pending_heads`, and a read-scope change. The root
+                // stays retained through `head_history` until pruned.
                 txn.clear_head(origin, Slot::Pending)?;
                 return Ok(Promotion::Idle);
             }

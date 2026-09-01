@@ -82,9 +82,22 @@ def FinalizeRemote (c c' : Cell) : Prop :=
 def Age (c c' : Cell) : Prop :=
   c' = { c with fresh := False }
 
+/- RUST-IMPL: cas-adopt-durable — `cas.rs::Store::adopt_durable_blob`.
+   A cold durable row reconstructed after the remote backend confirmed the
+   final pair exists. -/
+def AdoptRemote (c c' : Cell) : Prop :=
+  ¬c.sweeping ∧ c' = { c with row := True, remote := True, durable := True }
+
 /- RUST-IMPL: cas-cache-evict — `cas.rs::clear_blob_cache`. -/
 def CacheEvict (c c' : Cell) : Prop :=
   c.remote ∧ c.durable ∧ c' = { c with bytes := False }
+
+/- RUST-IMPL: cas-drop-staged-row — the non-durable branch of
+   `cas.rs::clear_blob_cache`, `reconcile_scratch_generation`, and the
+   `commit_cas_migration` discard.  None of them consult `pins`; the invariant
+   is what makes that safe (`staged_row_drop_is_unpinned`). -/
+def DropStaged (c c' : Cell) : Prop :=
+  ¬c.durable ∧ ¬c.writing ∧ c' = { c with row := False, bytes := False }
 
 /- RUST-REF: cas-source-publish — `node.rs::Node::publish`. -/
 def SourcePublish (holder : Holder) (c c' : Cell) : Prop :=
@@ -170,7 +183,9 @@ inductive CellStep : Cell → Cell → Prop where
   | commitAvailable : CommitAvailable c c' → CellStep c c'
   | finalizeRemote : FinalizeRemote c c' → CellStep c c'
   | age : Age c c' → CellStep c c'
+  | adoptRemote : AdoptRemote c c' → CellStep c c'
   | cacheEvict : CacheEvict c c' → CellStep c c'
+  | dropStaged : DropStaged c c' → CellStep c c'
   | sourcePublish : SourcePublish holder c c' → CellStep c c'
   | replicaPromote : ReplicaPromote holder c c' → CellStep c c'
   | ordinaryPromote : OrdinaryPromote holder c c' → CellStep c c'
@@ -259,6 +274,36 @@ theorem cell_invariant_step (hinv : Invariant c) (hstep : CellStep c c') :
   | age h =>
       rcases h with ⟨rfl⟩
       exact ⟨pins, sources, replicas, ordinary, sweepInv⟩
+  | adoptRemote h =>
+      rcases h with ⟨notSweeping, rfl⟩
+      refine ⟨?_, ?_, ?_, ordinary, ?_⟩
+      · intro holder _
+        simp [Available]
+      · intro holder live
+        have old := sources holder live
+        exact ⟨old.1, old.2.1, by simp [Available]⟩
+      · intro holder live
+        have old := replicas holder live
+        rcases old.2 with pinned | wanted
+        · exact ⟨old.1, Or.inl ⟨pinned.1, by simp [Available]⟩⟩
+        · exact ⟨old.1, Or.inr wanted⟩
+      · intro sweeping
+        exact False.elim (notSweeping sweeping)
+  | dropStaged h =>
+      rcases h with ⟨notDurable, _, rfl⟩
+      refine ⟨?_, ?_, ?_, ordinary, ?_⟩
+      · intro holder pinned
+        exact False.elim (notDurable (pins holder pinned).2.1)
+      · intro holder live
+        exact False.elim (notDurable (sources holder live).2.2.2.1)
+      · intro holder live
+        have old := replicas holder live
+        rcases old.2 with pinned | wanted
+        · exact False.elim (notDurable pinned.2.2.1)
+        · exact ⟨old.1, Or.inr wanted⟩
+      · intro sweeping
+        have old := sweepInv sweeping
+        exact ⟨old.1, old.2.1, old.2.2.1, id⟩
   | cacheEvict h =>
       rcases h with ⟨remote, durable, rfl⟩
       refine ⟨?_, ?_, ?_, ordinary, sweepInv⟩
@@ -543,6 +588,17 @@ theorem protected_delete_cannot_delete_live_content
 theorem protected_delete_cannot_delete_pinned
     (pinned : c.pin holder) (delete : ProtectedDelete c c') : False :=
   delete.1.2.1 ⟨holder, pinned⟩
+
+/- The paths that drop a staged row never consult `pins`.  They do not need
+   to: a pin is only ever granted over durable content, so a non-durable row
+   is unpinned in every reachable state. -/
+theorem staged_row_drop_is_unpinned
+    (hinv : Invariant c) (drop : DropStaged c c') (pinned : c.pin holder) : False :=
+  drop.1 (hinv.1 holder pinned).2.1
+
+theorem staged_row_drop_has_no_source_leaf
+    (hinv : Invariant c) (drop : DropStaged c c') (live : c.sourceLive holder) : False :=
+  drop.1 (hinv.2.1 holder live).2.2.2.1
 
 theorem replica_promotion_before_gc_blocks_collection
     (hinv : Invariant c) (promote : ReplicaPromote holder c promoted) :
