@@ -4,7 +4,8 @@
 //! every step is idempotent, and missing a tick costs latency rather than
 //! correctness.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::DpConfig;
@@ -12,7 +13,7 @@ use crate::control::{ControlPlane, Desired, HostedNetwork, Poll};
 use crate::error::Result;
 use crate::metrics::Metrics;
 use crate::store::ObjectStore;
-use crate::tenant::{State, Tenant};
+use crate::tenant::Tenant;
 
 /// The service, reconciling what it runs against what it is told to run.
 #[derive(Debug)]
@@ -21,7 +22,23 @@ pub struct Reconciler {
     control: ControlPlane,
     objects: ObjectStore,
     resolver: Option<Arc<synch_net::DnssecResolver>>,
+    /// Per-tenant work that outlives a reconcile pass.
+    ///
+    /// A tenant is owned by exactly one of `tenants` and `jobs`. Moving the
+    /// tenant into a job keeps operations for that tenant serialized without
+    /// making unrelated tenants wait for it to finish.
+    jobs: HashMap<String, TenantJob>,
+    /// Irreversible storage sweeps, kept separate from tenant ownership.
+    collections: HashMap<String, CollectionJob>,
+    /// Bounds all active lifecycle work to the capacity this pod declares.
+    job_slots: Arc<tokio::sync::Semaphore>,
+    /// A separate bound for restore/open work, derived from the blocking pool.
+    provision_slots: Arc<tokio::sync::Semaphore>,
+    /// Wakes the supervisor to reap outcomes and refresh gauges promptly.
+    job_wake: Arc<tokio::sync::Notify>,
     tenants: HashMap<String, Tenant>,
+    /// Keys in the latest validated desired document.
+    wanted: HashSet<String>,
     /// What this pod knows about each network's recent failures: how many,
     /// and when it may next be tried.
     ///
@@ -63,19 +80,19 @@ pub struct Reconciler {
 /// completes without an operator.
 const EMPTY_SET_CONFIRMATIONS: u32 = 3;
 
-/// How long one tenant may take over its share of a reconcile pass.
+/// How long one routine tenant operation may take.
 ///
-/// Every per-tenant step in a pass — provisioning, converging, measuring what
-/// it holds, heartbeating — ends up waiting on that tenant's one store
+/// Converging, measuring what a tenant holds, and heartbeating all end up
+/// waiting on that tenant's one store
 /// connection, and that connection is exactly what a tenant's own peers keep
-/// busy. Without a deadline a tenant whose members are leaning on it holds the
-/// pass, and the pass is the shard's only supervisor: no other tenant is
-/// converged, no heartbeat is sent (which is the billing record, §10), the
-/// failed-loop restart never fires, and nothing collects. One tenant's peers
-/// would be running every other tenant's control loop.
+/// busy. Persistent jobs isolate that wait from other tenants; this deadline
+/// also ensures the affected slot returns to the scheduler, retries partial
+/// idempotent work, and keeps attempting its billing heartbeat.
 ///
-/// Generous, because an honest tenant's pass is milliseconds and a cold
-/// tenant's restore is the one step that legitimately takes seconds.
+/// Provisioning is deliberately excluded. It has operation-specific network
+/// and object-store deadlines and runs as a persistent job: imposing this
+/// aggregate deadline on restore plus startup peer re-adoption used to drop a
+/// live endpoint halfway through construction.
 const TENANT_PASS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The longest a tenant that keeps failing is parked between attempts.
@@ -96,6 +113,58 @@ struct Parked {
     at: std::time::Instant,
     /// Consecutive failures, which is what sets the wait.
     failures: u32,
+}
+
+/// The one operation currently owning a tenant slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantJobKind {
+    Provisioning,
+    Reconciling,
+    Draining { forget: bool },
+    CleaningAfterPanic,
+    Forgetting,
+}
+
+/// Work left running between desired-state polls.
+#[derive(Debug)]
+struct TenantJob {
+    kind: TenantJobKind,
+    dir: std::path::PathBuf,
+    /// Provisioning may be cancelled only before it acquires its permits and
+    /// begins touching the tenant directory.
+    cancel_before_start: Option<tokio::sync::oneshot::Sender<()>>,
+    completed: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<TenantJobOutput>,
+}
+
+#[derive(Debug)]
+struct CollectionJob {
+    completed: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Ownership returned by a completed tenant job.
+#[derive(Debug)]
+enum TenantJobOutput {
+    Provisioned(Result<Tenant>),
+    Reconciled(Tenant),
+    Drained,
+    Cancelled,
+    CleanedAfterPanic,
+    Forgotten,
+}
+
+/// A completion bell that rings on success and during panic unwinding.
+struct WakeOnDrop {
+    wake: Arc<tokio::sync::Notify>,
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.completed.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
 }
 
 impl Parked {
@@ -131,18 +200,12 @@ impl Parked {
     }
 }
 
-/// Runs several futures to completion together, collecting their outputs.
+/// Waits for already-started shutdown work together, collecting its outputs.
 ///
 /// A hand-rolled join rather than a `futures` dependency, in the shape the
 /// engine already uses for the same job (`synch_engine::join`): no
-/// cancellation, no early return, every branch polled to the end.
-///
-/// The fan-out is deliberately unbounded, and it is bounded anyway — by the
-/// tenant count, which is what `SYNCH_DP_MAX_TENANTS` declares and what the
-/// blocking pool is sized against (`DpConfig::blocking_threads`). What must
-/// not happen is the opposite: a pass that visits tenants one at a time makes
-/// every tenant's latency the sum of the others', which is how one tenant's
-/// peers reach every other tenant on the shard.
+/// cancellation, no early return, every branch polled to the end. Ordinary
+/// reconciliation does not use a join at all; its jobs persist across passes.
 async fn join_all<F: std::future::Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
     let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut out = Vec::with_capacity(pending.len());
@@ -166,12 +229,12 @@ async fn join_all<F: std::future::Future>(futures: impl IntoIterator<Item = F>) 
     .await
 }
 
-/// Runs one tenant's share of a pass under [`TENANT_PASS_TIMEOUT`].
+/// Runs one routine tenant operation under [`TENANT_PASS_TIMEOUT`].
 ///
 /// A timeout drops the future rather than cancelling the work behind it: a
 /// store call already handed to the blocking pool runs to completion whatever
-/// this does. What it recovers is the *pass* — this shard's ability to go on
-/// supervising every other tenant while one of them is stuck.
+/// this does. The job owns the Tenant throughout, so the timeout returns that
+/// slot to its scheduler without affecting any other tenant's job.
 async fn under_deadline<T>(
     tenant: &str,
     what: &'static str,
@@ -200,12 +263,25 @@ impl Reconciler {
         resolver: Option<Arc<synch_net::DnssecResolver>>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let job_limit = usize::try_from(config.max_tenants)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        // The blocking pool is sized at 64 threads per tenant until its cap.
+        // Use the same unit here so an oversized desired document cannot make
+        // cold restores consume more capacity than the pool was built for.
+        let provision_limit = (config.blocking_threads / 64).max(1).min(job_limit);
         Self {
             config,
             control,
             objects,
             resolver,
+            jobs: HashMap::new(),
+            collections: HashMap::new(),
+            job_slots: Arc::new(tokio::sync::Semaphore::new(job_limit)),
+            provision_slots: Arc::new(tokio::sync::Semaphore::new(provision_limit)),
+            job_wake: Arc::new(tokio::sync::Notify::new()),
             tenants: HashMap::new(),
+            wanted: HashSet::new(),
             logged_dp: None,
             parked: HashMap::new(),
             empty_answers: 0,
@@ -227,20 +303,80 @@ impl Reconciler {
                         self.metrics.reconcile_failed();
                     }
                 }
+                _ = self.job_wake.notified() => {
+                    self.reap_known_jobs().await;
+                }
                 _ = shutdown.recv() => break,
             }
         }
-        // Every tenant gets its drain, and they run concurrently: the pod's
-        // termination grace is one budget shared by all of them, and a shard
-        // holding hundreds of tenants cannot spend it one at a time — the
-        // ones at the back of a sequential queue would be SIGKILLed before
-        // shipping their tails, which is the loss the replicator exists to
-        // prevent (§4.6).
-        let drains: Vec<_> = self
+        self.shutdown().await;
+    }
+
+    /// Starts healthy drains immediately, then gathers in-flight ownership as
+    /// jobs finish. A slow provision must not spend the pod's termination
+    /// grace before already-running tenants begin shipping their final tails.
+    async fn shutdown(&mut self) {
+        let mut drains: Vec<tokio::task::JoinHandle<()>> = self
             .tenants
             .drain()
             .map(|(_, tenant)| tokio::spawn(tenant.drain()))
             .collect();
+
+        // A provision still waiting for capacity has no directory, endpoint,
+        // or tenant to clean up. Once it begins, the receiver is dropped and
+        // sending fails; that job is allowed to return owned state normally.
+        for job in self.jobs.values_mut() {
+            if let Some(cancel) = job.cancel_before_start.take() {
+                let _ = cancel.send(());
+            }
+        }
+
+        let (finished, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+        let job_count = self.jobs.len();
+        for (key, job) in self.jobs.drain() {
+            let finished = finished.clone();
+            tokio::spawn(async move {
+                let outcome = job.handle.await;
+                let _ = finished.send((key, job.kind, job.dir, outcome));
+            });
+        }
+        drop(finished);
+        for _ in 0..job_count {
+            let Some((key, kind, dir, outcome)) = outcomes.recv().await else {
+                break;
+            };
+            match outcome {
+                Ok(TenantJobOutput::Provisioned(Ok(tenant)))
+                | Ok(TenantJobOutput::Reconciled(tenant)) => {
+                    drains.push(tokio::spawn(tenant.drain()));
+                }
+                Ok(TenantJobOutput::Provisioned(Err(error))) => {
+                    tracing::info!(tenant = %key, %error, "a provisioning job ended during shutdown");
+                }
+                Ok(TenantJobOutput::Drained) => {
+                    if matches!(kind, TenantJobKind::Draining { forget: true }) {
+                        self.forget_local_on_shutdown(&key, dir).await;
+                    }
+                }
+                Ok(
+                    TenantJobOutput::Cancelled
+                    | TenantJobOutput::CleanedAfterPanic
+                    | TenantJobOutput::Forgotten,
+                ) => {}
+                Err(error) => tracing::warn!(tenant = %key, %error, "a tenant job did not finish"),
+            }
+        }
+
+        let collections: Vec<_> = self
+            .collections
+            .drain()
+            .map(|(_, job)| job.handle)
+            .collect();
+        for outcome in join_all(collections).await {
+            if let Err(error) = outcome {
+                tracing::warn!(%error, "a storage collection job did not finish");
+            }
+        }
         for handle in drains {
             if let Err(error) = handle.await {
                 tracing::warn!(%error, "a tenant drain did not finish");
@@ -248,7 +384,24 @@ impl Reconciler {
         }
     }
 
-    /// One pass: poll, diff, converge, report.
+    async fn forget_local_on_shutdown(&self, key: &str, dir: std::path::PathBuf) {
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await {
+            Ok(Ok(())) => self.metrics.forget_tenant(key),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.metrics.forget_tenant(key);
+            }
+            Ok(Err(error)) => tracing::warn!(
+                tenant = %key, %error,
+                "could not remove the retired tenant directory during shutdown"
+            ),
+            Err(error) => tracing::warn!(
+                tenant = %key, %error,
+                "the retired tenant directory removal task failed during shutdown"
+            ),
+        }
+    }
+
+    /// One pass: poll, diff, reap completed work, and schedule each idle slot.
     pub async fn tick(&mut self) -> Result<()> {
         let Some((desired, fresh)) = self.desired().await? else {
             // A first boot that has reached neither the control plane nor its
@@ -307,6 +460,11 @@ impl Reconciler {
             .map(|network| (network.key(), network))
             .collect();
 
+        // Jobs finish independently of the polling cadence. Reclaim their
+        // tenants before deciding what the latest desired document asks each
+        // slot to do next.
+        self.reap_known_jobs().await;
+
         // An empty set while tenants are running is the shape of every way
         // this can go wrong at once — a stale cache, a truncated answer, a
         // misconfigured shard — so it is not acted on until several
@@ -323,13 +481,14 @@ impl Reconciler {
         // and never running the collection sweep, which is the exact bug §6
         // exists to fix. Refusing costs a few poll intervals; refusing
         // permanently costs the customer their offboarding.
-        if wanted.is_empty() && !self.tenants.is_empty() {
+        let active = self.active_tenants();
+        if wanted.is_empty() && active > 0 {
             if fresh {
                 self.empty_answers = self.empty_answers.saturating_add(1);
             }
             if self.empty_answers < EMPTY_SET_CONFIRMATIONS {
                 tracing::error!(
-                    tenants = self.tenants.len(),
+                    tenants = active,
                     confirmations = self.empty_answers,
                     needed = EMPTY_SET_CONFIRMATIONS,
                     "an empty desired set while tenants are running; waiting for it to be confirmed"
@@ -338,66 +497,53 @@ impl Reconciler {
                 return Ok(());
             }
             tracing::warn!(
-                tenants = self.tenants.len(),
+                tenants = active,
                 "an empty desired set confirmed; draining every tenant on this shard"
             );
         } else {
             self.empty_answers = 0;
         }
+        // Only intent this pass is actually willing to act on may drive
+        // completion wakes between polls. In particular, an unconfirmed empty
+        // answer must not let a later job completion retire local state.
+        self.wanted = wanted.keys().cloned().collect();
 
-        // Retire what is no longer wanted. Reaching here at all means a
-        // *successful* poll said so — an unreachable control plane leaves the
-        // set frozen rather than tearing anything down (§4.2).
+        // Retire idle tenants that are no longer wanted. A tenant already in
+        // a job is not cancelled: the next pass reaps it and schedules its
+        // drain. Arbitrary task abortion is not a safe endpoint close.
         let gone: Vec<String> = self
             .tenants
             .keys()
             .filter(|key| !wanted.contains_key(*key))
             .cloned()
             .collect();
-        // Concurrently: a drain waits for the tenant's standing loops and its
-        // final database ship, both of which wait on a store that tenant's own
-        // peers keep busy. Offboarding one network must not hold up the pass
-        // that supervises the rest.
-        //
-        // Deliberately *not* under a deadline, unlike every other per-tenant
-        // step in this pass. Abandoning a drain half way would leave the
-        // node's endpoint and its replication ticker still writing while the
-        // line below removes the directory underneath them; a slow drain costs
-        // this pass, a truncated one costs the tenant its unshipped tail
-        // (§4.6). What bounds a drain instead is its own structure — the loops
-        // stop on a signal, the final ship is capped at three attempts — and
-        // the inbound ceiling that stops a tenant's peers monopolising the
-        // store it is trying to close.
-        let draining: Vec<(String, Tenant)> = gone
-            .into_iter()
-            .filter_map(|key| self.tenants.remove_entry(&key))
-            .collect();
-        join_all(draining.into_iter().map(|(key, tenant)| async move {
-            let dir = tenant.dir().to_path_buf();
-            tracing::info!(tenant = %key, "network is no longer hosted; draining");
-            tenant.drain().await;
-            // The local copy only; the bucket prefix and the replica
-            // stream keep their retention hold, which the control plane
-            // owns and a scheduled job collects (§6).
-            if let Err(error) = std::fs::remove_dir_all(&dir) {
-                tracing::warn!(tenant = %key, %error, "could not remove the tenant directory");
+        for key in gone {
+            if let Some(tenant) = self.tenants.remove(&key) {
+                tracing::info!(tenant = %key, "network is no longer hosted; draining");
+                self.start_drain(key.clone(), tenant, true);
             }
-            key
-        }))
-        .await
-        .into_iter()
-        .for_each(|key| {
             self.parked.remove(&key);
-            self.metrics.forget_tenant(&key);
-        });
+        }
 
-        // Parked entries for networks nobody wants any more. A network that
-        // never provisioned successfully is by definition not in `tenants`,
-        // so the loop above never reaches it: without this, one org disabling
-        // hosting on a network this shard could never open leaves an entry
-        // that outlives the process and keeps `synch_dp_tenants_parked` over-
-        // reporting for ever.
-        self.parked.retain(|key, _| wanted.contains_key(key));
+        // An absent parked tenant can still have a restored or initialized
+        // directory. Retire that local copy under a tracked job before remote
+        // collection is allowed; otherwise collecting an empty stream and
+        // later re-enabling could make provisioning adopt stale local state.
+        let abandoned: Vec<String> = self
+            .parked
+            .keys()
+            .filter(|key| !wanted.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in abandoned {
+            self.parked.remove(&key);
+            if !self.jobs.contains_key(&key) {
+                let (org, network) = key
+                    .split_once('/')
+                    .expect("validated tenant keys contain one slash");
+                self.start_forget(key.clone(), self.config.tenant_dir(org, network));
+            }
+        }
 
         // A tenant whose standing loops have died is re-provisioned rather
         // than converged. It looks healthy from every angle that matters
@@ -421,14 +567,10 @@ impl Reconciler {
             .filter(|(_, tenant)| tenant.has_failed_loop())
             .map(|(key, _)| key.clone())
             .collect();
-        let failed: Vec<(String, Tenant)> = failing
-            .into_iter()
-            .filter_map(|key| self.tenants.remove_entry(&key))
-            .collect();
-        for (key, _) in &failed {
+        for key in failing {
             tracing::error!(tenant = %key, "a standing loop stopped; restarting the tenant");
             self.metrics.reconcile_failed();
-            let mut park = Parked::after(self.parked.get(key).copied());
+            let mut park = Parked::after(self.parked.get(&key).copied());
             if park.failures == 1 {
                 // Recorded even though nothing is being waited for. The count
                 // is what makes the *second* failure back off, and a first
@@ -443,44 +585,44 @@ impl Reconciler {
                 );
             }
             self.parked.insert(key.clone(), park);
-        }
-        join_all(failed.into_iter().map(|(_, tenant)| tenant.drain())).await;
-
-        // Existing tenants and new ones, both fanned out rather than walked.
-        // A pass that visits tenants one at a time makes each tenant's latency
-        // the sum of every other tenant's, which is precisely how one org's
-        // devices reach another org's tenant: `converge` waits on a store that
-        // the tenant's own peers keep busy, and everything behind it in the
-        // queue waits with it.
-        let mut newcomers = Vec::new();
-        let mut standing = HashMap::new();
-        for (key, network) in wanted {
-            match self.tenants.contains_key(&key) {
-                true => {
-                    standing.insert(key, network);
-                }
-                false => newcomers.push((key, network)),
+            if let Some(tenant) = self.tenants.remove(&key) {
+                self.start_drain(key, tenant, false);
             }
         }
 
-        {
-            // Field borrows rather than `&self`, so the tenants can be held
-            // mutably while the configuration and the control client are read.
-            let (tenants, config, control) = (&mut self.tenants, &self.config, &self.control);
-            join_all(tenants.iter_mut().filter_map(|(key, tenant)| {
-                let network = standing.get(key)?.clone();
-                Some(async move {
-                    let converged =
-                        under_deadline(key, "converge", tenant.converge(&network, config, control));
-                    if let Some(Err(error)) = converged.await {
-                        tracing::warn!(tenant = %key, %error, "converging the tenant failed");
-                    }
-                })
-            }))
-            .await;
+        // Each idle tenant advances independently. The job owns the Tenant
+        // until it finishes, which is both the per-tenant serialization lock
+        // and the absence of any cross-tenant phase barrier.
+        let standing: Vec<String> = self
+            .tenants
+            .keys()
+            .filter(|key| wanted.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in standing {
+            let Some(tenant) = self.tenants.remove(&key) else {
+                continue;
+            };
+            self.start_reconcile(key.clone(), tenant, wanted[&key].clone(), dp.clone());
         }
 
-        self.provision_all(newcomers).await;
+        let now = std::time::Instant::now();
+        for (key, network) in &wanted {
+            if self.tenants.contains_key(key)
+                || self.jobs.contains_key(key)
+                || self.collections.contains_key(key)
+            {
+                continue;
+            }
+            if self
+                .parked
+                .get(key)
+                .is_some_and(|parked| parked.retry_at > now)
+            {
+                continue;
+            }
+            self.start_provision(key.clone(), network.clone());
+        }
 
         // Collection is the one irreversible act here, so it runs only on a
         // document the control plane answered *this pass*. The fail-static
@@ -489,79 +631,375 @@ impl Reconciler {
         // partitioned from the control plane could delete a prefix the org
         // had since re-enabled, and never know.
         if fresh {
-            self.collect(&collectable).await;
+            self.start_collections(&collectable);
         } else if !collectable.is_empty() {
             tracing::info!(
                 due = collectable.len(),
                 "holding collections until the control plane answers again"
             );
         }
-        self.report(&dp).await;
-        self.metrics.tenants(self.tenants.len(), self.waiting());
+        self.metrics.tenants(self.running_tenants(), self.waiting());
         Ok(())
     }
 
-    /// Provisions the networks this shard is not yet running, parking those
-    /// that fail.
-    ///
-    /// Concurrently and under a deadline apiece. Provisioning is the longest
-    /// per-tenant step there is — it restores a whole database from the
-    /// replica stream — so a shard cold-starting a hundred tenants one at a
-    /// time takes a hundred restores' worth of wall clock before the last of
-    /// them serves anything, and one tenant whose restore stalls used to mean
-    /// none of the others ever started.
-    async fn provision_all(&mut self, wanted: Vec<(String, HostedNetwork)>) {
-        let now = std::time::Instant::now();
-        let due: Vec<(String, HostedNetwork)> = wanted
-            .into_iter()
-            .filter(|(key, _)| {
-                self.parked
-                    .get(key)
-                    .is_none_or(|parked| parked.retry_at <= now)
-            })
-            .collect();
-        let (config, control, resolver, metrics) = (
-            &self.config,
-            &self.control,
-            &self.resolver,
-            self.metrics.clone(),
-        );
-        let outcomes = join_all(due.into_iter().map(|(key, network)| {
-            let metrics = metrics.clone();
-            async move {
-                let provisioned = under_deadline(
-                    &key,
-                    "provision",
-                    Tenant::provision(config, control, resolver.clone(), network, metrics),
-                )
-                .await;
-                (key, provisioned)
-            }
-        }))
-        .await;
+    /// Reaps against the latest known intent and refreshes aggregate gauges.
+    async fn reap_known_jobs(&mut self) {
+        let wanted = self.wanted.clone();
+        self.reap_finished_jobs(&wanted).await;
+        self.reap_finished_collections().await;
+        self.metrics.tenants(self.running_tenants(), self.waiting());
+    }
 
-        for (key, provisioned) in outcomes {
-            match provisioned {
-                Some(Ok(tenant)) => {
-                    // The record of what went before is deliberately left in
-                    // place — see the field's own note. It holds nothing back
-                    // once `retry_at` has passed, and it is what stops a
-                    // tenant that provisions, dies, and provisions again from
-                    // restarting at full speed for ever.
+    /// Reclaims every job that completed since the previous pass.
+    async fn reap_finished_jobs(&mut self, wanted: &HashSet<String>) {
+        let finished: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.completed.load(Ordering::Acquire) || job.handle.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            let Some(job) = self.jobs.remove(&key) else {
+                continue;
+            };
+            let kind = job.kind;
+            let dir = job.dir.clone();
+            match job.handle.await {
+                Ok(TenantJobOutput::Provisioned(Ok(tenant))) => {
                     self.tenants.insert(key, tenant);
                 }
-                Some(Err(error)) => {
-                    // The common case here is a zone that has not named the
-                    // key yet, which is a wait rather than a fault; the first
-                    // retry is at the daemon's own cadence (§4.3), and only a
-                    // tenant that keeps failing is made to wait longer.
+                Ok(TenantJobOutput::Provisioned(Err(error))) => {
                     tracing::info!(tenant = %key, %error, "tenant not ready; will retry");
-                    self.park(key);
+                    if wanted.contains(&key) {
+                        self.park(key);
+                    } else {
+                        self.start_forget(key, dir);
+                    }
                 }
-                // The deadline already said what happened, loudly.
-                None => self.park(key),
+                Ok(TenantJobOutput::Reconciled(tenant)) => {
+                    self.tenants.insert(key, tenant);
+                }
+                Ok(TenantJobOutput::Drained) => {
+                    // Intent may have changed while the non-cancellable drain
+                    // ran. Latest offboarding intent always upgrades a restart
+                    // drain to local retirement before collection can begin.
+                    if matches!(kind, TenantJobKind::Draining { forget: true })
+                        || !wanted.contains(&key)
+                    {
+                        self.start_forget(key, dir);
+                    }
+                }
+                Ok(TenantJobOutput::CleanedAfterPanic) => {
+                    if wanted.contains(&key) {
+                        self.park(key);
+                    } else {
+                        self.start_forget(key, dir);
+                    }
+                }
+                Ok(TenantJobOutput::Forgotten) => {
+                    self.parked.remove(&key);
+                    self.metrics.forget_tenant(&key);
+                }
+                Ok(TenantJobOutput::Cancelled) => {}
+                Err(error) => {
+                    tracing::error!(tenant = %key, %error, ?kind, "a tenant job panicked");
+                    self.metrics.reconcile_failed();
+                    // Tenant::Drop keeps the lifecycle lock until its detached
+                    // endpoint/replicator cleanup finishes. Keep this slot
+                    // visible behind a lock-acquisition barrier so neither
+                    // collection nor reprovisioning can race that teardown.
+                    if kind == TenantJobKind::Forgetting {
+                        self.start_forget(key, dir);
+                    } else {
+                        self.start_cleanup_barrier(key, dir);
+                    }
+                }
             }
         }
+    }
+
+    /// Starts a provision without tying its lifetime to this reconcile pass.
+    fn start_provision(&mut self, key: String, network: HostedNetwork) {
+        assert!(!self.jobs.contains_key(&key), "one job per tenant");
+        let config = self.config.clone();
+        let dir = config.tenant_dir(&network.org, &network.network);
+        let control = self.control.clone();
+        let resolver = self.resolver.clone();
+        let metrics = self.metrics.clone();
+        let job_slots = self.job_slots.clone();
+        let provision_slots = self.provision_slots.clone();
+        let wake = self.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let (cancel_before_start, mut cancelled) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            // Provisioning takes its narrower permit first, so jobs waiting on
+            // that bound never occupy every general lifecycle slot.
+            let acquire = async {
+                let provision = provision_slots
+                    .acquire_owned()
+                    .await
+                    .expect("the provisioning semaphore is never closed");
+                let job = job_slots
+                    .acquire_owned()
+                    .await
+                    .expect("the tenant-job semaphore is never closed");
+                (provision, job)
+            };
+            let permits = tokio::select! {
+                biased;
+                _ = &mut cancelled => None,
+                permits = acquire => Some(permits),
+            };
+            let Some((_provision_slot, _job_slot)) = permits else {
+                return TenantJobOutput::Cancelled;
+            };
+            // From here cancellation is unsafe: provisioning may own a
+            // lifecycle lock or endpoint, so shutdown must gather its result.
+            drop(cancelled);
+            TenantJobOutput::Provisioned(
+                Tenant::provision(&config, &control, resolver, network, metrics).await,
+            )
+        });
+        self.jobs.insert(
+            key,
+            TenantJob {
+                kind: TenantJobKind::Provisioning,
+                dir,
+                cancel_before_start: Some(cancel_before_start),
+                completed,
+                handle,
+            },
+        );
+    }
+
+    /// Runs convergence and its resulting heartbeat as one ordered operation
+    /// for this tenant, independently of every other tenant.
+    fn start_reconcile(
+        &mut self,
+        key: String,
+        mut tenant: Tenant,
+        network: HostedNetwork,
+        dp: String,
+    ) {
+        assert!(!self.jobs.contains_key(&key), "one job per tenant");
+        let dir = tenant.dir().to_path_buf();
+        let config = self.config.clone();
+        let control = self.control.clone();
+        let metrics = self.metrics.clone();
+        let job_slots = self.job_slots.clone();
+        let wake = self.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let job_key = key.clone();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            let _job_slot = job_slots
+                .acquire_owned()
+                .await
+                .expect("the tenant-job semaphore is never closed");
+            let converged = under_deadline(
+                &job_key,
+                "converge",
+                tenant.converge(&network, &config, &control),
+            )
+            .await;
+            if let Some(Err(error)) = converged {
+                tracing::warn!(tenant = %job_key, %error, "converging the tenant failed");
+            }
+
+            metrics.tenant_db_bytes(&job_key, tenant.db_bytes());
+            let measured = under_deadline(&job_key, "status", tenant.status(&dp)).await;
+            match measured {
+                Some(Ok(status)) => {
+                    metrics.tenant_status(&job_key, &status);
+                    let sent = under_deadline(
+                        &job_key,
+                        "heartbeat",
+                        control.report_status(
+                            &tenant.network.org,
+                            &tenant.network.network,
+                            &status,
+                        ),
+                    )
+                    .await;
+                    if let Some(Err(error)) = sent {
+                        tracing::warn!(tenant = %job_key, %error, "status heartbeat failed");
+                    }
+                }
+                Some(Err(error)) => tracing::warn!(
+                    tenant = %job_key, %error,
+                    "could not measure what the tenant holds"
+                ),
+                None => {}
+            }
+            TenantJobOutput::Reconciled(tenant)
+        });
+        self.jobs.insert(
+            key,
+            TenantJob {
+                kind: TenantJobKind::Reconciling,
+                dir,
+                cancel_before_start: None,
+                completed,
+                handle,
+            },
+        );
+    }
+
+    /// Starts an orderly drain. It has no aggregate deadline: abandoning it
+    /// halfway can remove a database underneath a live endpoint or lose its
+    /// final replication tail.
+    fn start_drain(&mut self, key: String, tenant: Tenant, forget: bool) {
+        assert!(!self.jobs.contains_key(&key), "one job per tenant");
+        let dir = tenant.dir().to_path_buf();
+        let job_slots = self.job_slots.clone();
+        let wake = self.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            let _job_slot = job_slots
+                .acquire_owned()
+                .await
+                .expect("the tenant-job semaphore is never closed");
+            tenant.drain().await;
+            TenantJobOutput::Drained
+        });
+        self.jobs.insert(
+            key,
+            TenantJob {
+                kind: TenantJobKind::Draining { forget },
+                dir,
+                cancel_before_start: None,
+                completed,
+                handle,
+            },
+        );
+    }
+
+    /// Waits until panic-triggered `Tenant::Drop` has released the directory.
+    fn start_cleanup_barrier(&mut self, key: String, dir: std::path::PathBuf) {
+        assert!(!self.jobs.contains_key(&key), "one job per tenant");
+        let wake = self.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let barrier_dir = dir.clone();
+        let job_key = key.clone();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            loop {
+                let probe = barrier_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    synch_engine::LifecycleLock::acquire(&probe)
+                })
+                .await
+                {
+                    Ok(Ok(lock)) => {
+                        drop(lock);
+                        return TenantJobOutput::CleanedAfterPanic;
+                    }
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        tenant = %job_key, %error,
+                        "could not verify that a panicked tenant released its directory"
+                    ),
+                    Err(error) => tracing::warn!(
+                        tenant = %job_key, %error,
+                        "the tenant cleanup barrier's lock probe failed"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        self.jobs.insert(
+            key,
+            TenantJob {
+                kind: TenantJobKind::CleaningAfterPanic,
+                dir,
+                cancel_before_start: None,
+                completed,
+                handle,
+            },
+        );
+    }
+
+    /// Removes a retired local copy before allowing remote collection.
+    fn start_forget(&mut self, key: String, dir: std::path::PathBuf) {
+        assert!(!self.jobs.contains_key(&key), "one job per tenant");
+        let wake = self.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let job_slots = self.job_slots.clone();
+        let forget_dir = dir.clone();
+        let job_key = key.clone();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            let _job_slot = job_slots
+                .acquire_owned()
+                .await
+                .expect("the tenant-job semaphore is never closed");
+            loop {
+                let target = forget_dir.clone();
+                match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target)).await {
+                    Ok(Ok(())) => return TenantJobOutput::Forgotten,
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return TenantJobOutput::Forgotten;
+                    }
+                    Ok(Err(error)) => tracing::warn!(
+                        tenant = %job_key, %error,
+                        "could not remove the retired tenant directory; retrying"
+                    ),
+                    Err(error) => tracing::warn!(
+                        tenant = %job_key, %error,
+                        "the retired tenant directory removal task failed; retrying"
+                    ),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        self.jobs.insert(
+            key,
+            TenantJob {
+                kind: TenantJobKind::Forgetting,
+                dir,
+                cancel_before_start: None,
+                completed,
+                handle,
+            },
+        );
+    }
+
+    /// Tenants whose endpoints are live, including those temporarily owned by
+    /// a convergence job.
+    fn running_tenants(&self) -> usize {
+        self.tenants.len()
+            + self
+                .jobs
+                .values()
+                .filter(|job| job.kind == TenantJobKind::Reconciling)
+                .count()
+    }
+
+    /// Every occupied slot, including provisioning and draining ones.
+    fn active_tenants(&self) -> usize {
+        self.tenants.len() + self.jobs.len()
     }
 
     /// Parks a network until its backoff expires.
@@ -579,10 +1017,17 @@ impl Reconciler {
     /// operator would learn to ignore, which is worse than not having it.
     fn waiting(&self) -> usize {
         let now = std::time::Instant::now();
-        self.parked
+        let provisioning = self
+            .jobs
             .values()
-            .filter(|parked| parked.retry_at > now)
-            .count()
+            .filter(|job| job.kind == TenantJobKind::Provisioning)
+            .count();
+        provisioning
+            + self
+                .parked
+                .values()
+                .filter(|parked| parked.retry_at > now)
+                .count()
     }
 
     /// Deletes the stored copy of offboarded tenants whose hold has run (§6).
@@ -597,15 +1042,37 @@ impl Reconciler {
     /// document says. The control plane refuses to mark a hosted network
     /// collected too, so this is the second of two locks on the one operation
     /// in this design that destroys customer data.
-    async fn collect(&mut self, collectable: &[crate::control::Collectable]) {
+    fn start_collections(&mut self, collectable: &[crate::control::Collectable]) {
         for network in collectable {
             let key = network.key();
-            if self.tenants.contains_key(&key) {
+            if self.tenants.contains_key(&key) || self.jobs.contains_key(&key) {
                 tracing::error!(
                     tenant = %key,
-                    "refusing to collect storage for a tenant this shard is running"
+                    "refusing to collect storage for a tenant with live lifecycle work"
                 );
                 continue;
+            }
+            if self.collections.contains_key(&key) {
+                continue;
+            }
+            let local = self.config.tenant_dir(&network.org, &network.network);
+            match std::fs::metadata(&local) {
+                Ok(_) => {
+                    tracing::warn!(
+                        tenant = %key,
+                        "retiring a leftover local directory before collecting remote storage"
+                    );
+                    self.start_forget(key, local);
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(
+                        tenant = %key, %error,
+                        "cannot prove the local tenant directory is absent; refusing collection"
+                    );
+                    continue;
+                }
             }
             let cas = self.config.cas_root(&network.org, &network.network);
             let db = self.config.db_prefix(&network.org, &network.network);
@@ -613,83 +1080,67 @@ impl Reconciler {
             // this operator's own root it is the same path without it.
             let cas_prefix = cas.trim_start_matches('/').to_string();
             let db_prefix = format!("{db}/");
-            let deleted = async {
-                self.objects.remove_prefix(&cas_prefix).await?;
-                self.objects.remove_prefix(&db_prefix).await
-            }
-            .await;
-            match deleted {
-                Ok(()) => {
-                    if let Err(error) = self
-                        .control
-                        .storage_collected(&network.org, &network.network)
-                        .await
-                    {
-                        // The bytes are gone; the record of it is not. Next
-                        // pass re-deletes nothing and re-reports.
-                        tracing::warn!(
-                            tenant = %key, %error,
-                            "deleted the tenant's storage but could not record it"
-                        );
-                        continue;
+            let objects = self.objects.clone();
+            let control = self.control.clone();
+            let metrics = self.metrics.clone();
+            let org = network.org.clone();
+            let network = network.network.clone();
+            let job_key = key.clone();
+            let wake = self.job_wake.clone();
+            let completed = Arc::new(AtomicBool::new(false));
+            let completion = completed.clone();
+            let handle = tokio::spawn(async move {
+                let _wake = WakeOnDrop {
+                    wake,
+                    completed: completion,
+                };
+                let deleted = async {
+                    objects.remove_prefix(&cas_prefix).await?;
+                    objects.remove_prefix(&db_prefix).await
+                }
+                .await;
+                match deleted {
+                    Ok(()) => {
+                        if let Err(error) = control.storage_collected(&org, &network).await {
+                            // The bytes are gone; the record of it is not. A
+                            // later fresh pass re-deletes nothing and reports
+                            // it again.
+                            tracing::warn!(
+                                tenant = %job_key, %error,
+                                "deleted the tenant's storage but could not record it"
+                            );
+                            return;
+                        }
+                        metrics.collected();
+                        tracing::info!(tenant = %job_key, "collected an offboarded tenant's storage");
                     }
-                    self.metrics.collected();
-                    tracing::info!(tenant = %key, "collected an offboarded tenant's storage");
+                    Err(error) => {
+                        tracing::warn!(tenant = %job_key, %error, "could not delete tenant storage")
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(tenant = %key, %error, "could not delete tenant storage")
-                }
-            }
+            });
+            self.collections
+                .insert(key, CollectionJob { completed, handle });
         }
     }
 
-    /// Sends each tenant's heartbeat.
-    ///
-    /// Concurrently, and under a deadline apiece. The heartbeat is the billing
-    /// record (§10) and it is measured by reading the tenant's store, so a
-    /// sequential sweep hands one tenant's peers the ability to stop every
-    /// other tenant on the shard being metered: hold the store of the first
-    /// tenant in map order and nothing behind it is ever reported.
-    async fn report(&self, dp: &str) {
-        let (tenants, control, metrics) = (&self.tenants, &self.control, &self.metrics);
-        join_all(
-            tenants
-                .iter()
-                .filter(|(_, tenant)| tenant.state == State::Running)
-                .map(|(key, tenant)| async move {
-                    // Three `stat` calls, not a store read, so it is recorded
-                    // whatever the store is doing — which is the point: the
-                    // tenant whose database is running away with the shard's
-                    // volume is exactly the one whose store is too busy to
-                    // answer a coverage query.
-                    metrics.tenant_db_bytes(key, tenant.db_bytes());
-                    let measured = under_deadline(key, "status", tenant.status(dp)).await;
-                    match measured {
-                        Some(Ok(status)) => {
-                            metrics.tenant_status(key, &status);
-                            let sent = under_deadline(
-                                key,
-                                "heartbeat",
-                                control.report_status(
-                                    &tenant.network.org,
-                                    &tenant.network.network,
-                                    &status,
-                                ),
-                            )
-                            .await;
-                            if let Some(Err(error)) = sent {
-                                tracing::warn!(tenant = %key, %error, "status heartbeat failed");
-                            }
-                        }
-                        Some(Err(error)) => tracing::warn!(
-                            tenant = %key, %error,
-                            "could not measure what the tenant holds"
-                        ),
-                        None => {}
-                    }
-                }),
-        )
-        .await;
+    /// Observes collection panics without making completed handles accumulate.
+    async fn reap_finished_collections(&mut self) {
+        let finished: Vec<String> = self
+            .collections
+            .iter()
+            .filter(|(_, job)| job.completed.load(Ordering::Acquire) || job.handle.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            let Some(job) = self.collections.remove(&key) else {
+                continue;
+            };
+            if let Err(error) = job.handle.await {
+                tracing::error!(tenant = %key, %error, "a storage collection job panicked");
+                self.metrics.reconcile_failed();
+            }
+        }
     }
 
     /// The desired document: from the control plane, or from the bucket.
@@ -915,16 +1366,10 @@ mod tests {
         .names_are_safe());
     }
 
-    /// A pass visits its tenants together, not one after another.
-    ///
-    /// The property that keeps one tenant's peers off every other tenant's
-    /// control loop. Every per-tenant step in a pass ends up waiting on that
-    /// tenant's one store connection, and that connection is what the tenant's
-    /// own members keep busy — so a pass that walks the map in order makes
-    /// each tenant's latency the sum of the others', and the first slow tenant
-    /// in map order stops the rest being converged, metered or supervised.
+    /// Shutdown joins already-running work rather than awaiting it one item at
+    /// a time. Ordinary reconciliation uses persistent jobs instead.
     #[tokio::test(start_paused = true)]
-    async fn a_pass_visits_its_tenants_together() {
+    async fn shutdown_work_is_joined_concurrently() {
         let started = tokio::time::Instant::now();
         let slow = |_| async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -949,6 +1394,279 @@ mod tests {
     async fn a_tenant_that_overruns_does_not_keep_the_pass() {
         let stuck = under_deadline("acme/prod", "converge", std::future::pending::<()>());
         assert!(stuck.await.is_none());
+    }
+
+    /// Provisioning belongs to the tenant slot, not to the pass that started
+    /// it. A restore or startup re-adoption may legitimately span polls; the
+    /// reconciler must leave that job alone and keep supervising other slots.
+    #[tokio::test]
+    async fn an_unfinished_provision_survives_the_pass_that_started_it() {
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let key = "acme/prod".to_string();
+        let wanted = HashSet::from([key.clone()]);
+        let dir = std::path::PathBuf::from("/tmp/synch-dp-test/tenants/acme/prod");
+        let (release, held) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = held.await;
+            TenantJobOutput::Provisioned(Err(crate::DpError::Engine("not ready".into())))
+        });
+        reconciler.jobs.insert(
+            key.clone(),
+            TenantJob {
+                kind: TenantJobKind::Provisioning,
+                dir,
+                cancel_before_start: None,
+                completed: Arc::new(AtomicBool::new(false)),
+                handle,
+            },
+        );
+
+        reconciler.reap_finished_jobs(&wanted).await;
+        assert!(reconciler.jobs.contains_key(&key));
+        assert_eq!(
+            reconciler.waiting(),
+            1,
+            "provisioning is visible as waiting"
+        );
+
+        release.send(()).unwrap();
+        while !reconciler.jobs[&key].handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        reconciler.reap_finished_jobs(&wanted).await;
+        assert!(!reconciler.jobs.contains_key(&key));
+        assert!(reconciler.parked.contains_key(&key));
+    }
+
+    /// A slow in-flight job must not spend the termination grace before an
+    /// otherwise idle tenant starts its final drain.
+    #[tokio::test]
+    async fn shutdown_drains_idle_tenants_while_jobs_are_still_running() {
+        let base = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.base_dir = base.path().to_path_buf();
+        let mut reconciler = Reconciler::new(
+            config.clone(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let key = "acme/prod".to_string();
+        let dir = config.tenant_dir("acme", "prod");
+        reconciler.tenants.insert(
+            key,
+            Tenant::for_reconciler_test(hosted_network("acme", "prod"), dir.clone()),
+        );
+
+        let (release, held) = tokio::sync::oneshot::channel();
+        let slow_dir = config.tenant_dir("acme", "slow");
+        let handle = tokio::spawn(async move {
+            let _ = held.await;
+            TenantJobOutput::Cancelled
+        });
+        reconciler.jobs.insert(
+            "acme/slow".into(),
+            TenantJob {
+                kind: TenantJobKind::Provisioning,
+                dir: slow_dir,
+                cancel_before_start: None,
+                completed: Arc::new(AtomicBool::new(false)),
+                handle,
+            },
+        );
+
+        let shutting_down = tokio::spawn(async move { reconciler.shutdown().await });
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match synch_engine::LifecycleLock::acquire(&dir) {
+                    Ok(lock) => break lock,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("probing the drained directory failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the idle tenant should drain before the slow job finishes");
+        drop(acquired);
+        assert!(
+            !shutting_down.is_finished(),
+            "the synthetic job is still held"
+        );
+        release.send(()).unwrap();
+        shutting_down.await.unwrap();
+    }
+
+    /// A provision that has not acquired capacity has touched no tenant state
+    /// and can be cancelled immediately during shutdown.
+    #[tokio::test]
+    async fn shutdown_cancels_provisions_that_have_not_started() {
+        let mut config = test_config();
+        config.max_tenants = 1;
+        let mut reconciler = Reconciler::new(
+            config,
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let held = reconciler
+            .provision_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        reconciler.start_provision("acme/prod".into(), hosted_network("acme", "prod"));
+        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), reconciler.shutdown())
+            .await
+            .expect("a queued provision should not hold shutdown");
+        drop(held);
+    }
+
+    /// A restart drain adopts later offboarding intent and removes its local
+    /// copy before collection can run.
+    #[tokio::test]
+    async fn a_restart_drain_is_upgraded_when_the_tenant_is_offboarded() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("tenant");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stale"), b"local").unwrap();
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let key = "acme/prod".to_string();
+        reconciler.jobs.insert(
+            key.clone(),
+            TenantJob {
+                kind: TenantJobKind::Draining { forget: false },
+                dir: dir.clone(),
+                cancel_before_start: None,
+                completed: Arc::new(AtomicBool::new(false)),
+                handle: tokio::spawn(async { TenantJobOutput::Drained }),
+            },
+        );
+        wait_for_job(&reconciler, &key).await;
+        reconciler.reap_finished_jobs(&HashSet::new()).await;
+        assert_eq!(reconciler.jobs[&key].kind, TenantJobKind::Forgetting);
+        wait_for_job(&reconciler, &key).await;
+        reconciler.reap_finished_jobs(&HashSet::new()).await;
+        assert!(!dir.exists(), "the stale local database must be retired");
+        assert!(!reconciler.jobs.contains_key(&key));
+    }
+
+    /// A panic leaves a lifecycle-lock barrier in the slot until detached
+    /// Tenant::Drop cleanup has really released the directory.
+    #[tokio::test]
+    async fn collection_cannot_race_a_panicked_tenants_cleanup() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("tenant");
+        let held = synch_engine::LifecycleLock::acquire(&dir).unwrap();
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            Arc::new(Metrics::default()),
+        );
+        let key = "acme/prod".to_string();
+        let handle: tokio::task::JoinHandle<TenantJobOutput> =
+            tokio::spawn(async { panic!("synthetic tenant panic") });
+        reconciler.jobs.insert(
+            key.clone(),
+            TenantJob {
+                kind: TenantJobKind::Reconciling,
+                dir: dir.clone(),
+                cancel_before_start: None,
+                completed: Arc::new(AtomicBool::new(false)),
+                handle,
+            },
+        );
+        wait_for_job(&reconciler, &key).await;
+        reconciler.reap_finished_jobs(&HashSet::new()).await;
+        assert_eq!(
+            reconciler.jobs[&key].kind,
+            TenantJobKind::CleaningAfterPanic
+        );
+        reconciler.start_collections(&[crate::control::Collectable {
+            org: "acme".into(),
+            network: "prod".into(),
+        }]);
+        assert!(
+            reconciler.collections.is_empty(),
+            "collection stays blocked behind the cleanup barrier"
+        );
+
+        drop(held);
+        wait_for_job(&reconciler, &key).await;
+        reconciler.reap_finished_jobs(&HashSet::new()).await;
+        assert_eq!(reconciler.jobs[&key].kind, TenantJobKind::Forgetting);
+        wait_for_job(&reconciler, &key).await;
+        reconciler.reap_finished_jobs(&HashSet::new()).await;
+        assert!(!reconciler.jobs.contains_key(&key));
+        assert!(!dir.exists());
+    }
+
+    /// Completion wakes let gauges observe a returned live tenant without
+    /// waiting for the next minute-long desired-state poll.
+    #[tokio::test]
+    async fn completed_jobs_refresh_metrics_immediately() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("tenant");
+        let metrics = Arc::new(Metrics::default());
+        let mut reconciler = Reconciler::new(
+            test_config(),
+            ControlPlane::new("http://127.0.0.1:1", "synchdp_x").unwrap(),
+            ObjectStore::memory().unwrap(),
+            None,
+            metrics.clone(),
+        );
+        let key = "acme/prod".to_string();
+        reconciler.wanted.insert(key.clone());
+        let tenant = Tenant::for_reconciler_test(hosted_network("acme", "prod"), dir);
+        let wake = reconciler.job_wake.clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion = completed.clone();
+        let handle = tokio::spawn(async move {
+            let _wake = WakeOnDrop {
+                wake,
+                completed: completion,
+            };
+            TenantJobOutput::Reconciled(tenant)
+        });
+        reconciler.jobs.insert(
+            key.clone(),
+            TenantJob {
+                kind: TenantJobKind::Reconciling,
+                dir: base.path().join("tenant"),
+                cancel_before_start: None,
+                completed,
+                handle,
+            },
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reconciler.job_wake.notified(),
+        )
+        .await
+        .unwrap();
+        reconciler.reap_known_jobs().await;
+        let rendered = metrics.render();
+        assert!(rendered.contains("synch_dp_tenants_running 1"));
+        assert!(rendered.contains("synch_dp_tenants_parked 0"));
+        reconciler.tenants.remove(&key).unwrap().drain().await;
     }
 
     /// A tenant that keeps failing is made to wait longer each time, and one
@@ -1019,6 +1737,27 @@ mod tests {
             reconciler.parked[&key].failures, 2,
             "the next failure escalates rather than starting over"
         );
+    }
+
+    fn hosted_network(org: &str, network: &str) -> HostedNetwork {
+        HostedNetwork {
+            org: org.into(),
+            network: network.into(),
+            domain: format!("{org}.example"),
+            budget_bytes: 0,
+            retention: "current".into(),
+            device: None,
+        }
+    }
+
+    async fn wait_for_job(reconciler: &Reconciler, key: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !reconciler.jobs[key].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the synthetic tenant job should finish");
     }
 
     fn test_config() -> DpConfig {

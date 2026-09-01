@@ -97,6 +97,22 @@ pub struct Tenant {
 }
 
 impl Tenant {
+    #[cfg(test)]
+    pub(crate) fn for_reconciler_test(network: HostedNetwork, dir: PathBuf) -> Self {
+        let lock = LifecycleLock::acquire(&dir).expect("the test tenant owns its directory");
+        Self {
+            network,
+            state: State::Running,
+            node: None,
+            lock: Some(lock),
+            shutdown: broadcast::channel(1).0,
+            loops: Vec::new(),
+            replication_finish: None,
+            replication_task: None,
+            dir,
+        }
+    }
+
     /// Provisions a tenant: restore or initialize, register, open, identify.
     ///
     /// On an ephemeral pod every provisioning is potentially a
@@ -252,11 +268,17 @@ impl Tenant {
             node.set_dns_resolver(Ok(resolver));
         }
 
+        // From this point the Tenant owns the live endpoint. Provisioning now
+        // normally runs to completion in a persistent reconciler job, but this
+        // ordering also makes a task panic or future cancellation safe while
+        // the runtime is live: Drop can close the node instead of letting iroh
+        // abort an unowned endpoint.
+        self.node = Some(node.clone());
+
         // Everything from here can fail, and the node is already open and
-        // serving — so failures go through `started`, which shuts it down
-        // before propagating. Without that, a failed open leaks an endpoint
-        // and its tasks, and the retry 30 seconds later rewrites the database
-        // file underneath them.
+        // serving — so the error branch shuts it down before propagating.
+        // Without that, a failed start leaks an endpoint and its tasks, and
+        // the retry 30 seconds later rewrites the database underneath them.
         match self.start(node.clone(), config, resolver, metrics).await {
             Ok(()) => {
                 self.state = State::Running;
@@ -264,11 +286,13 @@ impl Tenant {
                 Ok(())
             }
             Err(error) => {
-                if let Err(stop) = node.shutdown().await {
-                    tracing::warn!(
-                        tenant = %self.network.key(), %stop,
-                        "could not shut down a node that failed to start"
-                    );
+                if let Some(node) = self.node.take() {
+                    if let Err(stop) = node.shutdown().await {
+                        tracing::warn!(
+                            tenant = %self.network.key(), %stop,
+                            "could not shut down a node that failed to start"
+                        );
+                    }
                 }
                 Err(error)
             }
@@ -298,7 +322,6 @@ impl Tenant {
 
         self.spawn_loops(&node, resolver);
         self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL, metrics);
-        self.node = Some(node.clone());
 
         // Publishes this node's own trie once, now that re-adoption has
         // settled what its head should be.

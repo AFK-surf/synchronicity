@@ -605,6 +605,21 @@ async fn an_offboarded_tenants_storage_is_collected_and_reported() {
         Arc::new(synch_dp::metrics::Metrics::default()),
     );
     reconciler.tick().await.expect("one reconcile pass");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !cp_state
+                .lock()
+                .expect("the stub's lock")
+                .collected
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the independent collection job should finish");
 
     // The bytes, first.
     assert!(

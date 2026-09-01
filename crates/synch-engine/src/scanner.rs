@@ -68,6 +68,46 @@ impl ScanReport {
     }
 }
 
+/// Re-indexes local paths against `origin` without requiring a bound node.
+///
+/// Node opening runs this before it creates an endpoint, so every await after
+/// an endpoint exists transfers that endpoint directly into its owning Node.
+pub(crate) fn reconcile_local_files_in(
+    store: &synch_store::Store,
+    origin: &synch_core::OriginId,
+) -> Result<usize> {
+    let root = store
+        .complete_head(origin)?
+        .map(|head| head.root)
+        .unwrap_or(Hash::EMPTY);
+    let trie = Trie::new(store);
+    let mut dropped = 0;
+    for space in store.sources()? {
+        if space.local_path.is_none() {
+            continue;
+        }
+        for row in store.local_file_rows(&space.space)? {
+            let published = trie
+                .get(root, &file_key(&space.space, &row.relpath)?)?
+                .as_deref()
+                .map(decode_entry)
+                .transpose()?
+                .and_then(|entry| published_signal(&entry));
+            if published == row.content {
+                continue;
+            }
+            tracing::debug!(
+                space = %space.space,
+                path = %row.relpath,
+                "re-indexing a path the published root does not corroborate"
+            );
+            store.remove_local_file(&space.space, &row.relpath)?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
 impl Node {
     /// Whether a configured space deliberately has no local checkout.
     pub fn is_api_source(&self, space_id: &str) -> Result<bool> {
@@ -674,37 +714,7 @@ impl Node {
     /// local, so the check costs one trie lookup per indexed file and no I/O
     /// beyond the database. Returns how many rows were dropped.
     pub fn reconcile_local_files(&self) -> Result<usize> {
-        let root = self.current_root()?;
-        let trie = Trie::new(self.store().as_ref());
-        let mut dropped = 0;
-        for space in self.store().sources()? {
-            if space.local_path.is_none() {
-                continue;
-            }
-            for row in self.store().local_file_rows(&space.space)? {
-                // The signal a row records is the content root for a file and
-                // the hashed link target for a symlink, so the published entry
-                // has to be read the same way or every open would re-index
-                // every link.
-                let published = trie
-                    .get(root, &file_key(&space.space, &row.relpath)?)?
-                    .as_deref()
-                    .map(decode_entry)
-                    .transpose()?
-                    .and_then(|entry| published_signal(&entry));
-                if published == row.content {
-                    continue;
-                }
-                tracing::debug!(
-                    space = %space.space,
-                    path = %row.relpath,
-                    "re-indexing a path the published root does not corroborate"
-                );
-                self.store().remove_local_file(&space.space, &row.relpath)?;
-                dropped += 1;
-            }
-        }
-        Ok(dropped)
+        reconcile_local_files_in(self.store(), self.origin())
     }
 
     /// Adopts a peer's version of a path as our own (§8, `synch adopt path`).

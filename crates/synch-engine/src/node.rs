@@ -779,6 +779,25 @@ impl Node {
         if socket_pool.is_some() {
             config.net.sockets = Some(Arc::new(dispatch.clone()));
         }
+
+        // A batch that was still buffered when the process died was never
+        // published, and the scanner would skip those files forever (§7.1).
+        // Do this before binding the endpoint: after `Net::bind` returns there
+        // must be no await between a live endpoint and the Node that owns it.
+        let reindexed = {
+            let store = store.clone();
+            let origin = origin.clone();
+            crate::blocking::offload(move || {
+                crate::scanner::reconcile_local_files_in(&store, &origin)
+            })
+            .await?
+        };
+        if reindexed > 0 {
+            tracing::info!(
+                paths = reindexed,
+                "re-indexing paths whose staged changes never reached a root"
+            );
+        }
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
@@ -816,21 +835,6 @@ impl Node {
         // else that can await, so the window in which a connection finds it
         // unbound is as short as construction allows.
         dispatch.bind(&node);
-
-        // A batch that was still buffered when the process died was never
-        // published, and the scanner would skip those files forever (§7.1).
-        // Opening is where that is noticed and undone — one trie lookup per
-        // indexed file, so it goes off the runtime with the rest.
-        let reindexed = {
-            let node = node.clone();
-            crate::blocking::offload(move || node.reconcile_local_files()).await?
-        };
-        if reindexed > 0 {
-            tracing::info!(
-                paths = reindexed,
-                "re-indexing paths whose staged changes never reached a root"
-            );
-        }
         Ok(node)
     }
 

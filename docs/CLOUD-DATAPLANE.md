@@ -398,6 +398,13 @@ missing a tick costs latency not correctness):
 3. **Report**: per-tenant status POSTs (§3.3), Prometheus metrics labelled
    by org/network, one log line per state transition.
 
+The poll schedules work; it does not wait at a cross-tenant phase barrier.
+Each tenant slot owns at most one persistent job, and that job carries the
+tenant through its ordered provision, converge/report, or drain operation.
+Unfinished work remains live across polls. A later desired document is
+coalesced into the next job for that tenant, while unrelated tenants continue
+advancing immediately.
+
 Tenant states, cached per tenant in `<tenant-dir>/state` — a convenience,
 not a record: every state is re-derivable on a fresh pod from the desired
 document, the control plane's `device` field, and what the bucket holds:
@@ -581,6 +588,12 @@ SERVERLESS scales: tenants shut down concurrently, and the deployment
 grants the pod the same 30 s it grants a serverless daemon. A pod killed
 without grace loses at most the replication interval (§5.3), the same
 asynchrony bound Litestream accepts.
+
+Idle tenants begin that drain immediately, before shutdown waits for any
+in-flight lifecycle job. Provisions still waiting for a capacity permit are
+cancelled because they own nothing yet; provisions that have started return
+their tenant normally and are drained on return. Thus one slow startup cannot
+spend every healthy tenant's opportunity to ship its tail.
 
 ---
 
@@ -985,7 +998,7 @@ None of the engine's replication, storage, or membership code changes.
 | budget exhausted | admission stops; the engine's own `held_back` shows in the replication panel; nothing evicted. The metering heartbeat does **not** carry it — `wanted` climbing against a flat `held_bytes` is what an operator reads instead | org raises plan; acquisition resumes |
 | disk pressure on a pod | per-tenant explicit `cache_bytes` prevents cross-tenant eviction storms; cache-only data is re-hydratable | §5.2 |
 | **one tenant's members flood its endpoint** | that tenant's endpoint queues at its inbound ceiling; other tenants unaffected | §9.1 |
-| **one tenant's store is jammed by its own peers** | that tenant overruns its share of the reconcile pass and is skipped for it; every other tenant is still converged, metered and supervised | §9.1 |
+| **one tenant's store is jammed by its own peers** | that tenant's routine job times out and retries; every other tenant's job continues to converge, meter and supervise independently | §9.1 |
 | **one tenant's members publish a great many spaces** | replicas stop being added at the ceiling, loudly; the pass stays bounded | §9.1 |
 | **one tenant's members inflate its metadata** | `synch_dp_tenant_db_bytes` climbs against a flat `held_bytes`; **not** bounded — the volume can still fill and take the pod with it | §9.1, open |
 
@@ -1083,17 +1096,23 @@ converge, its drain — ran through resources every other tenant needed.
   default is derived from the pool size and `SYNCH_DP_MAX_TENANTS` so a
   pod's tenants collectively cannot outbid half its pool; the other half
   is reserved for the work no peer asked for.
-- **The pass is fanned out and deadlined.** A reconcile pass used to visit
-  tenants one at a time, and every per-tenant step in it — provision,
-  converge, measure, heartbeat — waits on the store that tenant's own peers
-  keep busy. That made each tenant's latency the sum of the others': one
-  jammed tenant meant nothing else was converged, no heartbeat was sent
-  (which is the billing record, §10), the failed-loop supervisor never ran
-  and nothing collected. Tenants are now visited together, each under its
-  own deadline; a tenant that overruns is logged and skipped for that
-  pass. Drains are the deliberate exception — concurrent, but never cut
-  short, because abandoning one half way would remove a data directory
-  while the node is still writing to it.
+- **Tenant jobs have no cross-tenant barrier.** Provision, converge/report,
+  and drain are persistent per-tenant jobs. A slow restore or startup peer
+  re-adoption remains owned across polls instead of blocking the pass or being
+  cancelled with a live endpoint. Routine converge, measure and heartbeat
+  operations retain per-operation deadlines so a jammed tenant returns to its
+  scheduler and retries. Drains are never cut short, because abandoning one
+  halfway would remove a data directory while the node is still writing to
+  it. One tenant's latency is therefore never added to another tenant's. A
+  pod-wide semaphore caps active lifecycle jobs at `SYNCH_DP_MAX_TENANTS`; a
+  separate restore/open semaphore is derived from the blocking-pool capacity,
+  so a mistaken oversized assignment cannot turn cold start into unbounded
+  object-store and disk work. Completion wakes refresh gauges without waiting
+  for the next poll. If a job panics, its slot remains occupied behind a
+  lifecycle-lock barrier until detached endpoint and replicator cleanup has
+  actually finished. Offboarding then removes the local directory under a
+  tracked job before remote collection can begin, including when a restart
+  drain was already underway.
 - **Restarts back off.** Re-provisioning discards the local database and
   replays the whole replica stream, so a tenant whose standing loops keep
   dying bought a full restore every poll — object-store egress and
