@@ -82,14 +82,21 @@ wait_for() {
   local what=$1
   local attempts=$2
   shift 2
-  for _ in $(seq 1 "$attempts"); do
+  # Stage markers, so the runner's per-line timestamps say how long each
+  # convergence took rather than only whether it happened.
+  echo "waiting for $what"
+  for attempt in $(seq 1 "$attempts"); do
     if "$@"; then
+      echo "ok: $what (attempt $attempt)"
       return 0
     fi
     sleep 0.25
   done
   echo "FAIL: timed out waiting for $what" >&2
-  tail -100 "$CP_LOG" "$NODE1_LOG" "$NODE2_LOG" "$NODE3_LOG" "$DP_LOG" \
+  # `-n`, not the obsolete `-100`: GNU tail rejects that form with more than
+  # one file ("option used in invalid context"), and with stderr discarded
+  # the dump was silently empty on every failure this script ever had.
+  tail -n 100 "$CP_LOG" "$NODE1_LOG" "$NODE2_LOG" "$NODE3_LOG" "$DP_LOG" \
     2>/dev/null || true
   return 1
 }
