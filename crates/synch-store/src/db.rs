@@ -1,9 +1,10 @@
 //! The SQLite store: open, configuration, device keys, and the trie node store.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
 };
 
 use iroh_base::SecretKey;
@@ -216,8 +217,8 @@ pub struct Store {
     complete_roots: Mutex<std::collections::HashSet<Hash>>,
     /// Objects a CAS write is currently between its first byte and its commit.
     ///
-    /// The collector and the writers agree about *rows* — every blob row goes
-    /// through the one connection — and did not agree about *bytes*.
+    /// The collector and the writers agree about *rows* through SQLite and did
+    /// not originally agree about *bytes*.
     /// `write_slice` and `write_proof` do all their file IO with no lock held
     /// (creating, growing, decoding, two fsyncs and two parent fsyncs) and only
     /// then take the connection to commit the bitmap. So a sweep could decide an
@@ -233,15 +234,42 @@ pub struct Store {
     /// exactly this window and could not: holding it only forces the writer's
     /// commit to land later, which is the wrong side. What was missing is a fact
     /// the collector could read — "somebody is writing this object" — so here it
-    /// is. Held for the whole write, consulted by both sweeps under the
-    /// connection guard, and in memory because the CAS has one writer process:
-    /// the daemon.
-    writing: Mutex<std::collections::HashMap<Hash, usize>>,
+    /// is. Held for the whole write and consulted by every sweep while it holds
+    /// the shared order guard. The registry is process-wide per canonical
+    /// datadir, so independently opened Store values see the same fact; the
+    /// lifecycle lock excludes a second process.
+    cas_coord: Arc<CasCoord>,
     /// A latch this crate's own tests use to stop a CAS write between its
     /// bytes and its row — the window `writing` exists for. Absent from every
     /// other build.
     #[cfg(test)]
     write_window: Mutex<Option<std::sync::Arc<WriteWindow>>>,
+}
+
+/// Process-wide CAS ordering shared by every `Store` opened on one datadir.
+///
+/// The lifecycle lock excludes other processes. This registry closes the
+/// smaller same-process hole: two independently opened Store values must still
+/// agree about writers and serialize lease registration against unlink.
+#[derive(Debug, Default)]
+struct CasCoord {
+    order: Mutex<()>,
+    writing: Mutex<HashMap<Hash, usize>>,
+}
+
+fn cas_coord_for(data_dir: &Path) -> Arc<CasCoord> {
+    static COORDS: OnceLock<Mutex<HashMap<PathBuf, Weak<CasCoord>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let mut coords = COORDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(coord) = coords.get(&key).and_then(Weak::upgrade) {
+        return coord;
+    }
+    let coord = Arc::new(CasCoord::default());
+    coords.insert(key, Arc::downgrade(&coord));
+    coord
 }
 
 /// A pause a test can install inside a CAS write, at the instant the payload is
@@ -310,6 +338,9 @@ pub(crate) struct WriteLease<'a> {
 
 impl Drop for WriteLease<'_> {
     fn drop(&mut self) {
+        // LEAN-MODEL: cas-write-lease-end
+        // `SystemSafety.WriteAbort` also covers the successful lease end: the
+        // protection disappears only after the writer has stopped touching bytes.
         let mut writing = self.store.writing();
         if let Some(count) = writing.get_mut(&self.root) {
             *count -= 1;
@@ -375,12 +406,13 @@ impl Store {
         // without it — so the store defends its own files unconditionally.
         harden_permissions(&data_dir);
         let conn = Connection::open(data_dir.join(DB_FILE))?;
+        let cas_coord = cas_coord_for(&data_dir);
         let store = Store {
             conn: Mutex::new(conn),
             data_dir,
             remote_cas: std::sync::atomic::AtomicBool::new(false),
             complete_roots: Mutex::new(std::collections::HashSet::new()),
-            writing: Mutex::new(std::collections::HashMap::new()),
+            cas_coord,
             #[cfg(test)]
             write_window: Mutex::new(None),
         };
@@ -1132,28 +1164,39 @@ impl Store {
     }
 
     fn writing(&self) -> MutexGuard<'_, std::collections::HashMap<Hash, usize>> {
-        self.writing.lock().unwrap_or_else(PoisonError::into_inner)
+        self.cas_coord
+            .writing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn cas_order(&self) -> MutexGuard<'_, ()> {
+        self.cas_coord
+            .order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Marks `root` as being written until the returned lease is dropped.
     ///
     /// Taken *before* the first byte and held past the commit, which is what
     /// makes the mark meaningful: a sweep that reads it while holding the
-    /// connection guard either sees the mark — and leaves the object alone — or
-    /// runs entirely before the writer started, in which case the writer opens
-    /// the payload fresh and its row describes what it actually wrote.
+    /// shared CAS order guard either sees the mark — and leaves the object alone
+    /// — or runs entirely before the writer started, in which case the writer
+    /// opens the payload fresh and its row describes what it actually wrote.
     ///
-    /// Which is why the mark is taken *through* the connection guard, briefly,
-    /// rather than on the lease map alone. The sweeps hold that guard from
-    /// their `is_being_written` check through the unlink, but nothing on a
-    /// writer's path from the lease to its first byte touches it — so a lease
-    /// taken on the map alone could land after the check and rename a payload
-    /// into place before the unlink, leaving a row that claims a complete
-    /// object with no bytes. Every caller takes the lease with no connection
-    /// held (each reads its row after, through `blob`), so this only orders
-    /// them; it never nests.
+    /// Which is why the mark is taken through both the Store connection guard
+    /// and the process-wide CAS order guard, briefly, rather than on the lease
+    /// map alone. Sweeps hold those guards from their `is_being_written` check
+    /// through unlink. A lease landing after the check therefore cannot rename
+    /// a payload into place before that unlink, even when writer and sweep use
+    /// independently opened Store values.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
+        // LEAN-MODEL: cas-write-lease-begin
+        // `CasGc.BeginWrite` models this ordered guard acquisition plus the
+        // insertion into `writing`; neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
+        let _ordered_across_store_instances = self.cas_order();
         *self.writing().entry(*root).or_insert(0) += 1;
         WriteLease {
             store: self,
@@ -1163,8 +1206,8 @@ impl Store {
 
     /// True if a CAS write is in flight for `root`.
     ///
-    /// Read by both sweeps while they hold the connection guard, so the answer
-    /// cannot go stale between the decision and the unlink.
+    /// Read by both sweeps while they hold the shared CAS order guard, so the
+    /// answer cannot go stale between the decision and the unlink.
     pub(crate) fn is_being_written(&self, root: &Hash) -> bool {
         self.writing().contains_key(root)
     }

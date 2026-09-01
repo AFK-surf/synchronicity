@@ -796,6 +796,9 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
+        // LEAN-MODEL: cas-write-complete-commit
+        // `CasGc.CommitComplete` abstracts this complete-row commit. File
+        // callers hold the write lease; inline callers have no unlink window.
         let durable = self.complete_is_durable();
         upsert_blob_row(
             &self.conn(),
@@ -872,6 +875,9 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
+        // LEAN-MODEL: cas-write-groups-commit
+        // `CasGc.CommitGroups` abstracts both partial and completing bitmap
+        // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
             let settlement = settle_size(
@@ -1229,7 +1235,11 @@ impl Store {
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
+        // LEAN-MODEL: cas-cache-evict
+        // `SystemSafety.CacheEvict` retains remote durability when local cache
+        // bytes disappear; callers select durable cache rows.
         let conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
         if self.is_being_written(root) {
             return Ok(false);
         }
@@ -1375,6 +1385,9 @@ impl Store {
     /// under a live entry is exactly the evidence that the release was decided
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
+        // LEAN-MODEL: cas-pin
+        // `SystemSafety.Pin` includes the held-object check and pin insertion
+        // in this immediate transaction.
         self.with_immediate_tx(|tx| {
             // Held, not merely known: a `blobs` row exists for a partial fetch
             // too. `take_possession` enforces the same thing on the other entry
@@ -1401,6 +1414,8 @@ impl Store {
 
     /// Drops one holder's claim. Returns whether there was one to drop.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
+        // LEAN-MODEL: cas-unpin
+        // `SystemSafety.Unpin` requires this holder's live role to have ended.
         let dropped = self.conn().execute(
             "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder.render()],
@@ -1437,9 +1452,15 @@ impl Store {
     /// sweep visits any more: a space removed with its pins kept still has
     /// claims that were scheduled before it went.
     pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
+        // LEAN-MODEL: cas-expire-pin
+        // `SystemSafety.ExpirePin` covers this holder-specific path and the
+        // node-wide variant below. Both re-check that no live entry returned.
         Ok(self.conn().execute(
             "DELETE FROM pins
-              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2",
+              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2
+                AND NOT EXISTS (
+                  SELECT 1 FROM entries WHERE entries.content = pins.root
+                )",
             params![holder.render(), now],
         )?)
     }
@@ -1447,8 +1468,14 @@ impl Store {
     /// Drops claims whose scheduled release has arrived, so that every other
     /// predicate over `pins` can stay free of the clock. Returns how many went.
     pub fn expire_pins(&self, now: i64) -> Result<usize> {
+        // As above, the entry predicate is re-checked here so a stale schedule
+        // is harmless.
         Ok(self.conn().execute(
-            "DELETE FROM pins WHERE release_after IS NOT NULL AND release_after <= ?1",
+            "DELETE FROM pins
+              WHERE release_after IS NOT NULL AND release_after <= ?1
+                AND NOT EXISTS (
+                  SELECT 1 FROM entries WHERE entries.content = pins.root
+                )",
             params![now],
         )?)
     }
@@ -1528,9 +1555,10 @@ impl Store {
     ///
     /// Returns whether the object was deleted.
     pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
-        // The connection guard is held across the unlinks, not just across the
-        // transaction, so no *row* writer can slip between the delete and the
-        // files going.
+        // The connection and shared CAS order guards are held across the
+        // unlinks, not just across the transaction, so no row writer or writer
+        // from an independently opened Store can slip between the decision and
+        // the files going.
         //
         // Every writer of a blob row goes through this mutex; no writer of a
         // blob's *bytes* does.
@@ -1548,10 +1576,14 @@ impl Store {
         // So the writer's own mark is consulted, under the same guard. A write
         // in flight is not a collectable object, whatever the row says.
         let mut conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
         if self.is_being_written(root) {
             return Ok(false);
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // LEAN-MODEL: cas-gc-row-commit
+        // `CasGc.GcCommit` is this conditional row transition. Its guard is
+        // intentionally re-read here, not inherited from the candidate scan.
         let rows = tx.execute(
             "DELETE FROM blobs
                WHERE root = ?1
@@ -1565,6 +1597,9 @@ impl Store {
         tx.commit()?;
         let deleted = rows > 0;
         if deleted {
+            // LEAN-MODEL: cas-gc-unlink
+            // `CasGc.GcUnlink` is separate from the row commit because the
+            // filesystem cannot join SQLite; `conn` remains held between them.
             let _ = std::fs::remove_file(self.blob_path(root));
             let _ = std::fs::remove_file(self.outboard_path(root));
         }
@@ -1572,13 +1607,53 @@ impl Store {
         Ok(deleted)
     }
 
-    /// Deletes an object's payload, outboard, and index row.
+    /// Deletes an unprotected object's payload, outboard, and index row.
     ///
-    /// Unconditional: for callers that have already decided, such as an
-    /// explicit `synch rm`. GC goes through `delete_blob_if_collectable`
-    /// instead, which re-checks the predicate against the same transaction that
-    /// does the delete.
+    /// Unlike GC this has no age horizon, but it still re-checks every safety
+    /// predicate in the transaction that removes the row. An API called
+    /// "delete" must not be a back door around a live entry or pin: callers
+    /// remove those claims first, then delete the now-unprotected cache object.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
+        let mut conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
+        if self.is_being_written(root) {
+            return Err(StoreError::invalid(format!(
+                "blob {root} is being written and cannot be deleted"
+            )));
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // LEAN-MODEL: cas-protected-delete
+        // `SystemSafety.ProtectedDelete` is this no-entry/no-pin/no-writer
+        // transition. The checks and row deletion are one write transaction.
+        let protected: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1)
+                 OR EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+            params![root.as_bytes().to_vec()],
+            |row| row.get(0),
+        )?;
+        if protected {
+            return Err(StoreError::invalid(format!(
+                "blob {root} is referenced or pinned and cannot be deleted"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM blobs WHERE root = ?1",
+            params![root.as_bytes().to_vec()],
+        )?;
+        tx.commit()?;
+        let _ = std::fs::remove_file(self.blob_path(root));
+        let _ = std::fs::remove_file(self.outboard_path(root));
+        drop(conn);
+        Ok(())
+    }
+
+    /// Simulates storage loss for recovery and race tests.
+    ///
+    /// Production code has no unconditional deletion path: bypassing the
+    /// protection predicate would invalidate the CAS safety invariant.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn force_delete_blob_for_test(&self, root: &Hash) -> Result<()> {
         // Row first, bytes second. The reverse order leaves the dangerous
         // orphan: a crash between the unlink and the delete leaves a row saying
         // `complete=1` with no bytes behind it, so `has_complete_blob` keeps
@@ -2382,6 +2457,10 @@ mod tests {
         store.unpin(&root, &PinHolder::Operator).unwrap();
         assert_eq!(store.pinned_blobs().unwrap(), vec![root]);
         assert!(store.blob(&root).unwrap().unwrap().pinned);
+        let refused = store.delete_blob(&root);
+        assert!(matches!(refused, Err(StoreError::Invalid(_))));
+        assert!(store.blob(&root).unwrap().is_some());
+        assert!(store.blob_path(&root).exists());
         store.unpin(&root, &replica).unwrap();
         assert!(store.pinned_blobs().unwrap().is_empty());
         assert!(!store.blob(&root).unwrap().unwrap().pinned);
@@ -2566,7 +2645,7 @@ mod tests {
             assert!(store.blob_path(&root).exists());
             // And the orphan sweep leaves its files alone too, even with the row
             // gone — which is the shape a resumed fetch into a stale payload has.
-            store.delete_blob(&root).unwrap();
+            store.force_delete_blob_for_test(&root).unwrap();
             std::fs::write(store.blob_path(&root), &payload).unwrap();
             assert_eq!(store.gc_orphans(i64::MAX).unwrap(), 0);
             assert!(store.blob_path(&root).exists());
@@ -2575,6 +2654,28 @@ mod tests {
         // Once the lease is gone both sweeps do their job.
         assert!(store.gc_orphans(i64::MAX).unwrap() > 0);
         assert!(!store.blob_path(&root).exists());
+    }
+
+    #[test]
+    fn independently_opened_stores_share_write_gc_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Store::open(dir.path()).unwrap();
+        let collector = Store::open(dir.path()).unwrap();
+        let root = writer.ingest_bytes(&data(100_000), 0).unwrap();
+
+        let lease = writer.lease_write(&root);
+        assert!(writer.is_being_written(&root));
+        assert!(collector.is_being_written(&root));
+        assert!(!collector
+            .delete_blob_if_collectable(&root, i64::MAX)
+            .unwrap());
+        assert!(writer.blob_path(&root).exists());
+        drop(lease);
+
+        assert!(collector
+            .delete_blob_if_collectable(&root, i64::MAX)
+            .unwrap());
+        assert!(!writer.blob_path(&root).exists());
     }
 
     #[test]
@@ -2701,7 +2802,7 @@ mod tests {
             .unwrap();
 
         // A stale orphan: the files are there, no row accounts for them.
-        store.delete_blob(&root).unwrap();
+        store.force_delete_blob_for_test(&root).unwrap();
         std::fs::write(store.blob_path(&root), vec![0u8; size as usize]).unwrap();
 
         // A fetch resumes into it while the sweep runs.

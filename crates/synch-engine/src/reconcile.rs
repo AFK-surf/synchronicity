@@ -465,6 +465,9 @@ impl Syncer {
         // read the same floor, both decide they supersede it, and both write
         // the pending slot, so the lower one clobbers the higher and the higher
         // survives only in `head_history` with nothing to re-drive it.
+        // LEAN-MODEL: mpt-offer-pending
+        // `MptGc.OfferPending` models the history row and pending slot written
+        // here together; history is what places this root in trie GC retention.
         let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
             // Verified heads are provable history and fork evidence even
             // when they lose the ordering comparison, so they are retained
@@ -568,6 +571,12 @@ impl Syncer {
         // What the transaction judged, for the fault arm: it rolls back, so the
         // head cannot be recovered from the slot afterwards.
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
+        // LEAN-MODEL: mpt-promote
+        // `Safety` pairs `MptGc.Promote` with content materialization: the
+        // completeness check, slot flip and derived views share this commit.
+        // LEAN-MODEL: cas-remote-promotion
+        // `CasGc.OrdinaryPromote`/`ReplicaPromote` model the entry plus the
+        // pin-or-want decision made by `materialize_diff` below.
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
                 return Ok(Promotion::Idle);
@@ -850,6 +859,10 @@ impl Syncer {
                     // what §10 asks of a multi-step write; nothing is lost by a
                     // rollback either, since trie nodes are content-addressed
                     // and simply re-fetched.
+                    // LEAN-MODEL: mpt-fetch-batch
+                    // `MptGc.LearnBatch` abstracts the transaction that makes a
+                    // connected verified batch visible; only the last may close
+                    // the root and make `complete` true.
                     store.transaction(|txn| {
                         take_served(
                             &requested,

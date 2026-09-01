@@ -2612,7 +2612,7 @@ mod tests {
         // Shape a self-readopted head whose older SQLite snapshot lacks the
         // blob row. Maintenance must keep the recovered own ad while the
         // provider-serving path reconstructs the cold row from final keys.
-        node.store().delete_blob(&root).unwrap();
+        node.store().force_delete_blob_for_test(&root).unwrap();
         assert!(node.store().blob(&root).unwrap().is_none());
         node.reconstruct_recovered_cloud_rows().await.unwrap();
         assert!(node.ad_reconciliation_changes().unwrap().is_empty());
@@ -2637,7 +2637,9 @@ mod tests {
         )])
         .unwrap();
         assert!(!node.store().content_is_referenced(&pinned.root).unwrap());
-        node.store().delete_blob(&pinned.root).unwrap();
+        node.store()
+            .force_delete_blob_for_test(&pinned.root)
+            .unwrap();
         assert!(node.store().blob(&pinned.root).unwrap().is_none());
         node.reconstruct_recovered_cloud_rows().await.unwrap();
         let recovered_pin = node.store().blob(&pinned.root).unwrap().unwrap();

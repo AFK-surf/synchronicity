@@ -115,8 +115,9 @@ pub trait CasBackend: std::fmt::Debug + Send + Sync + 'static {
     async fn finalize(&self, root: Hash, size: u64) -> Result<()>;
     /// Writes a complete object to a local target atomically.
     async fn materialize(&self, root: Hash, size: u64, target: PathBuf) -> Result<Materialization>;
-    /// Deletes the local claim/cache; LocalFs also removes its private bytes,
-    /// while Cloud keeps globally addressed final objects append-only.
+    /// Deletes an unprotected local claim/cache; a live entry, pin, or writer
+    /// makes the operation fail. LocalFs also removes its private bytes, while
+    /// Cloud keeps globally addressed final objects append-only.
     async fn delete(&self, root: Hash) -> Result<()>;
     /// Whether multipart parts must be persisted through backend object APIs.
     fn remote_upload_parts(&self) -> bool {
@@ -872,6 +873,9 @@ impl CasBackend for Cloud {
         };
         let store = self.store.clone();
         blocking(move || {
+            // LEAN-MODEL: cas-cloud-finalize
+            // `CasGc.FinalizeRemote` begins only after the remote pair write
+            // above succeeded; a GC winner makes this row update return false.
             if store.mark_blob_durable(&root)? {
                 Ok(())
             } else {

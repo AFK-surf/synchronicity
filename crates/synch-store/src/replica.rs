@@ -131,8 +131,16 @@ impl Store {
 
     /// Drops one want, whether it was satisfied or has stopped being wanted.
     pub fn drop_want(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
+        // LEAN-MODEL: cas-drop-want
+        // `SystemSafety.DropWant` requires the replica leaf to have left the
+        // materialized active view before its unsatisfied intent is retired;
+        // the entry guard makes that requirement local to this DELETE.
         Ok(self.conn().execute(
-            "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
+            "DELETE FROM content_want
+              WHERE root = ?1 AND holder = ?2
+                AND NOT EXISTS (
+                  SELECT 1 FROM entries WHERE entries.content = content_want.root
+                )",
             params![root.as_bytes().to_vec(), holder.render()],
         )? > 0)
     }
@@ -145,6 +153,9 @@ impl Store {
     /// records that this node means to keep the object, and a GC pass in that
     /// window is entitled to take it.
     pub fn take_possession(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
+        // LEAN-MODEL: cas-take-possession
+        // `CasGc.TakePossession` is this immediate want-to-pin transaction;
+        // its availability check is part of the transition, not a caller fact.
         self.with_immediate_tx(|tx| {
             // Held, not merely known. A `blobs` row exists for a partial fetch
             // too, so a row alone would let a claim stand over a 0%-complete
@@ -872,6 +883,32 @@ mod tests {
             .unwrap();
         assert_eq!(store.clear_returned_releases(&media()).unwrap(), 1);
         assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
+    }
+
+    #[test]
+    fn expiry_and_want_drop_recheck_the_live_entry() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        store.pin(&root, &media(), 1).unwrap();
+        store.schedule_release(&root, &media(), 2).unwrap();
+        store.stage_want(&root, &media(), 7, None, 1).unwrap();
+
+        // Simulate a root returning after both decisions but before either
+        // cleanup statement. Correctness must not depend on a separate
+        // reprieve pass winning that race.
+        store
+            .put_entry(
+                &origin(),
+                "media",
+                "returned.bin",
+                &synch_core::FileEntry::file(7, 1, root, 1),
+            )
+            .unwrap();
+
+        assert_eq!(store.expire_pins_of(&media(), i64::MAX).unwrap(), 0);
+        assert!(!store.drop_want(&root, &media()).unwrap());
+        assert!(store.blob(&root).unwrap().unwrap().pinned);
+        assert_eq!(store.wants_of(&media()).unwrap().len(), 1);
     }
 
     #[test]
