@@ -654,6 +654,72 @@ async fn per_tick(harness: &Harness, _options: &Options) {
             &format!("{:>12.2?}  failed: {error}", started.elapsed()),
         ),
     }
+
+    // The pass is a dozen steps and the total says nothing about which one
+    // grew. These are the ones the store exposes; the rest is the remainder.
+    let store = node.store();
+    let now = now_ns();
+    let started = Instant::now();
+    let expired = store.expire_bindings(now).expect("binding expiry");
+    line(
+        "  of which expire_bindings()",
+        &format!("{:>12.2?}  {expired} lapsed", started.elapsed()),
+    );
+
+    let started = Instant::now();
+    let origins = store.history_origins().expect("history origins");
+    let listed = started.elapsed();
+    let started = Instant::now();
+    for origin in &origins {
+        store.prune_history_before(origin, now).expect("pruning");
+    }
+    line(
+        "  of which history pruning",
+        &format!(
+            "{:>12.2?}  {} origins ({:.2?} to list them)",
+            started.elapsed(),
+            origins.len(),
+            listed
+        ),
+    );
+
+    let started = Instant::now();
+    let stats = store.gc(now).expect("the collection");
+    line(
+        "  of which gc()",
+        &format!(
+            "{:>12.2?}  {} roots marked",
+            started.elapsed(),
+            stats.roots_marked
+        ),
+    );
+
+    let started = Instant::now();
+    store
+        .collapse_grantless_scope(now)
+        .expect("the scope check");
+    line(
+        "  of which the scope check",
+        &format!("{:>12.2?}", started.elapsed()),
+    );
+
+    let started = Instant::now();
+    let reading = store.read_instant().expect("the store's reading");
+    let released = store.expire_pins(reading).expect("pin expiry");
+    line(
+        "  of which expire_pins()",
+        &format!("{:>12.2?}  {released} released", started.elapsed()),
+    );
+
+    let started = Instant::now();
+    let pending = store
+        .all_heads(Slot::Pending)
+        .expect("the pending heads")
+        .len();
+    line(
+        "  of which the pending sweep",
+        &format!("{:>12.2?}  {pending} pending heads", started.elapsed()),
+    );
 }
 
 // ---- 6. steady state -------------------------------------------------------

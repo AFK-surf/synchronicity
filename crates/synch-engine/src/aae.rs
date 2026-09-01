@@ -41,6 +41,20 @@ pub struct RoundReport {
 /// round rather than one per head.
 const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
 
+/// How many head pushes may be in flight at once.
+///
+/// The reactive path reaches the whole membership, and on a hosted replica
+/// that is hundreds of peers rather than the N ≤ 100 §12 assumes. What is
+/// bounded here is not the work — every peer is still pushed to — but how much
+/// of it is resident at any instant: an in-flight dial holds a QUIC handshake,
+/// its buffers and a descriptor, and file descriptors are what
+/// `docs/CLOUD-DATAPLANE.md` §7.1 names as the practical ceiling.
+///
+/// Thirty-two is chosen to keep the wall time of a full fan-out inside the
+/// two-second reactive floor above at ordinary dial latencies, so the bound
+/// costs propagation nothing that the floor was not already spending.
+const PUSH_FANOUT: usize = 32;
+
 /// Maximum peers considered by one standing anti-entropy round.
 const ANTI_ENTROPY_FANOUT: usize = 3;
 
@@ -199,29 +213,40 @@ impl Node {
 
     /// Pushes a head to every trusted peer (§5.3, reactive path).
     ///
-    /// All of them at once. Each push is bounded by a dial timeout and a request
-    /// deadline, so a peer that has gone dark costs seconds — but sequentially
-    /// those seconds add up across the membership and a publish waits for all of
-    /// them before it returns. Run together, one slow peer costs one deadline
-    /// rather than delaying every peer behind it.
+    /// Concurrently, because each push is bounded by a dial timeout and a
+    /// request deadline: sequentially those add up across the membership and a
+    /// publish waits for all of them before it returns, while run together one
+    /// slow peer costs one deadline rather than delaying every peer behind it.
+    ///
+    /// Bounded concurrently, though, at [`PUSH_FANOUT`]. Every peer at once is
+    /// the shape §5.3 was written for at the N ≤ 100 sizes §12 assumes, and it
+    /// is a dial storm at the sizes a hosted replica sees: an in-flight dial
+    /// holds a QUIC handshake, its buffers and a file descriptor, and this is
+    /// reached from the standing replica loop through
+    /// [`Node::publish_material_claims`] whenever coverage moves. The buffer
+    /// admits the next peer the instant one finishes, so the total is still one
+    /// deadline plus the queue rather than a deadline per peer.
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
         let targets = self.dial_targets().await?;
-        let results = crate::join::futures_join(targets.into_iter().map(|(peer, addr)| async move {
-            match self.net().connect_mpt(addr).await {
-                Ok(client) => match client.push_head(head).await {
-                    Ok(()) => true,
+        let pushes: Vec<_> = targets
+            .into_iter()
+            .map(|(peer, addr)| async move {
+                match self.net().connect_mpt(addr).await {
+                    Ok(client) => match client.push_head(head).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
+                            false
+                        }
+                    },
                     Err(e) => {
-                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
+                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
                         false
                     }
-                },
-                Err(e) => {
-                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
-                    false
                 }
-            }
-        }))
-        .await;
+            })
+            .collect();
+        let results = crate::join::futures_buffered(pushes, PUSH_FANOUT).await;
         Ok(results.into_iter().filter(|pushed| *pushed).count())
     }
 
@@ -399,7 +424,15 @@ impl Node {
             .min(i64::MAX as u128) as i64;
         let before = now.saturating_sub(retention);
         let mut pruned = 0;
-        for origin in self.store().history_origins()? {
+        // Only the origins with a row old enough to be taken. Pruning opens an
+        // immediate transaction per origin, so asking every origin in the
+        // history cost one write-lock acquisition each to conclude there was
+        // nothing to do — five minutely, ahead of every other tenant's store
+        // work on a shard (`docs/CLOUD-DATAPLANE.md` §7.1a). The filter is
+        // exact rather than a heuristic: every deletion below requires
+        // `recorded_at < before`, so an origin with no such row has nothing
+        // this pass could take.
+        for origin in self.store().history_origins_before(before)? {
             // Per origin, so one origin's history cannot stop another's from
             // being pruned — and so the trie sweep below still runs.
             if let Some(n) = contained(

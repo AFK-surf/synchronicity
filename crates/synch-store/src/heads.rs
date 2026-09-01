@@ -521,10 +521,35 @@ impl Store {
 
     /// Every origin that has retained history.
     pub fn history_origins(&self) -> Result<Vec<OriginId>> {
+        self.history_origins_matching("", params![])
+    }
+
+    /// The origins holding at least one retained root older than `before`.
+    ///
+    /// Which is to say: the only origins [`Store::prune_history_before`] can
+    /// take a row from, since every one of its deletions requires
+    /// `recorded_at < before`. The maintenance pass asks with this rather than
+    /// with [`Store::history_origins`] because pruning opens an *immediate*
+    /// transaction per origin — it has to, to decide and delete over one
+    /// snapshot — and on a replica of ten thousand origins that was ten
+    /// thousand write-lock acquisitions every five minutes to delete nothing,
+    /// in front of every other tenant's store work on the shard
+    /// (`docs/CLOUD-DATAPLANE.md` §7.1a). In a settled steady state this
+    /// returns empty and the pass costs one read.
+    pub fn history_origins_before(&self, before: i64) -> Result<Vec<OriginId>> {
+        self.history_origins_matching("WHERE recorded_at < ?1", params![before])
+    }
+
+    fn history_origins_matching(
+        &self,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<OriginId>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT origin_id FROM head_history ORDER BY origin_id")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT origin_id FROM head_history {filter} ORDER BY origin_id"
+        ))?;
+        let rows = stmt.query_map(args, |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(origin_column(row?, "head_history.origin_id")?);
@@ -1053,6 +1078,61 @@ mod tests {
 
     use super::*;
     use crate::testutil::{origin, sign_head, store};
+
+    /// The pruning pre-filter never hides an origin that had a row to lose.
+    ///
+    /// `maintenance_pass` asks `history_origins_before` instead of
+    /// `history_origins` so it does not open a write transaction per origin to
+    /// conclude there was nothing to prune. That is only sound if the two
+    /// disagree exactly where pruning is a no-op, so the claim is checked
+    /// against pruning itself rather than argued: every origin the filter drops
+    /// must prune nothing, and every origin it keeps must be one the unfiltered
+    /// listing had too.
+    #[test]
+    fn the_pruning_prefilter_hides_only_origins_with_nothing_to_prune() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        // Six origins recorded across the window: three well before the
+        // horizon, three after it, so the filter has both to sort.
+        for (i, recorded_at) in [10, 20, 30, 5_000, 6_000, 7_000].into_iter().enumerate() {
+            let o = OriginId::named(&format!("n{i}"), "x.example").unwrap();
+            // Two roots apiece, so an origin has something left to prune after
+            // the exemption for the highest seq it is on record at.
+            for seq in 1..=3 {
+                let head =
+                    SignedHead::sign(&key, o.clone(), seq, Hash::new(&[i as u8, seq as u8]), 0);
+                store
+                    .record_history(&head, recorded_at + seq as i64)
+                    .unwrap();
+            }
+        }
+
+        let before = 1_000;
+        let all = store.history_origins().unwrap();
+        let candidates = store.history_origins_before(before).unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(candidates.len(), 3, "only the aged origins are candidates");
+        assert!(
+            candidates.iter().all(|o| all.contains(o)),
+            "the filter must narrow the listing, never add to it"
+        );
+
+        // The claim that matters: what it dropped had nothing to give.
+        for origin in all.iter().filter(|o| !candidates.contains(o)) {
+            assert_eq!(
+                store.prune_history_before(origin, before).unwrap(),
+                0,
+                "{origin} was filtered out but had rows to prune"
+            );
+        }
+        // And what it kept did — otherwise the assertion above is satisfied by
+        // a filter that keeps everything, or by a pass that prunes nothing.
+        let pruned: usize = candidates
+            .iter()
+            .map(|o| store.prune_history_before(o, before).unwrap())
+            .sum();
+        assert!(pruned > 0, "the aged origins should have lost rows");
+    }
 
     #[test]
     fn head_slots_round_trip() {
