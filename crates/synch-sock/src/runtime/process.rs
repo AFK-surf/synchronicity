@@ -945,13 +945,28 @@ mod tests {
         });
         let mut seen = Vec::new();
         let settle = std::time::Duration::from_millis(500);
+        // Wait for the shell's first bytes against a deadline, and only then
+        // treat a quiet `settle` window as "it has finished printing". Using
+        // one 500ms window for both jobs made bash's startup the pass
+        // condition: a loaded CI runner that takes longer than that to reach
+        // the prompt left `seen` empty and failed the test, which is what
+        // happened on ubuntu.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while seen.is_empty() {
+            match rx.recv_timeout(settle) {
+                Ok(chunk) => seen.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the pty closed before the shell printed anything")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the shell printed nothing before its prompt"
+                ),
+            }
+        }
         while let Ok(chunk) = rx.recv_timeout(settle) {
             seen.extend_from_slice(&chunk);
         }
-        assert!(
-            !seen.is_empty(),
-            "the shell printed nothing before its prompt"
-        );
         assert!(
             pty_write_all(&writer, b"echo pty-probe-$((6*7))\nexit 0\n"),
             "typing at the PTY failed"
