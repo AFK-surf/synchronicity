@@ -904,33 +904,55 @@ against a real provisioned tenant, at a configurable node count:
 cargo run --release -p synch-dp --example stress
 ```
 
-What it finds — shapes, not numbers, since the numbers belong to the machine:
+What it found — shapes, not numbers, since the numbers belong to the
+machine. The first three were **fixed**; they are recorded because the fix is
+all that stands between the shape and its return, and CI gates the first of
+them (`--check`, the `scaling` job).
 
-- **Membership is not free but it is cheap.** Ten thousand bindings install
-  in well under a second and cost single-digit MiB of RSS. `dialable_peers`
-  scans the whole table on every push and every anti-entropy round, and at
-  ten thousand rows that is ~100 ms of blocking-pool time apiece.
-- **The reactive push is quadratic.** `Node::push_head` dials every trusted
-  peer, and each dial calls `Store::refuse_metadata_sync`, which
-  materializes the entire binding table before the `own_issuers().is_empty()`
-  guard that discards it — twice, since `own_issuers` calls `live_bindings`
-  again. So one publish is `O(dialable × bindings)`: at 500 dialable peers
-  and ten thousand bindings it is minutes of CPU, and the standing
-  `run_replicas` loop reaches it through `publish_material_claims` whenever
-  coverage moves. Hoisting the `issuers.is_empty()` check above the
-  `live_bindings` call makes it `O(1)` for every node that is not a
-  delegate, which is every hosted replica.
-- **The maintenance pass grows faster than the origin count.** It walks
-  every complete head to build the GC mark set, and ten times the origins
-  costs well over a hundred times the pass. It runs every 300 s on the
-  blocking pool, where it is in front of every other tenant's store work on
-  the shard.
-- **The WAL, not the database, is the disk.** A tenant opens under
-  `Checkpointing::Embedder` so the replicator owns checkpointing (§5.3), so
-  the WAL is bounded by shipping rather than by SQLite's autocheckpoint.
-  Under ingest it runs one to two orders of magnitude larger than the
-  database file it fronts, and a pod's ephemeral volume has to be sized for
-  it.
+- **The reactive push was quadratic in the membership.** `Node::push_head`
+  dials every trusted peer, and each dial asks
+  `Store::refuse_metadata_sync` whether this node is somebody's delegate.
+  That was answered from `Store::live_bindings`, which materializes the
+  whole table — so one publish cost `O(dialable × bindings)`: minutes of CPU
+  at 500 peers and ten thousand bindings, reached from the standing
+  `run_replicas` loop through `publish_material_claims` whenever coverage
+  moves. Every per-key and per-origin trust question now goes through
+  `live_bindings_for_key` / `live_bindings_for_origin`, which seek an index
+  and apply the delegation cascade one issuer at a time. The same question is
+  also the connection-accept gate, and runs per request and per slice, so
+  this was never only about pushing. At 100 peers and ten thousand bindings:
+  20.5 s → 0.14 s.
+- **The whole-membership queries materialized the table to return a
+  column.** `trusted_keys` is read once per push and once per anti-entropy
+  round, and it built ten thousand `Binding` values — an origin, a key and a
+  space list parsed apiece — to hand back keys. `live_column` expresses the
+  same liveness rule in SQL, cascade included as an `EXISTS` seek: 132 ms →
+  9 ms at ten thousand bindings. A cache was the alternative and was not
+  taken — bindings are written from the resolver, the promotion path, the
+  expiry sweep and the operator, and a missed invalidation here is a node
+  dialling a peer whose trust has lapsed.
+- **The maintenance pass took a write transaction per origin to prune
+  nothing.** Pruning history opens an immediate transaction — it must, to
+  decide and delete over one snapshot — and the pass asked every origin in
+  `head_history`, five minutely, in front of every other tenant's store work
+  on the shard. `history_origins_before` narrows it to the origins holding a
+  row old enough to take, which is exact rather than a heuristic: every
+  deletion in that pass requires `recorded_at < before`. ~48 s → ~0.2 s at
+  ten thousand origins.
+- **The push fan-out is now bounded**, at 32 dials in flight rather than the
+  whole membership at once. Every peer is still pushed to and propagation is
+  unchanged; what is bounded is how many QUIC handshakes, buffers and
+  descriptors are resident at an instant — descriptors being the ceiling
+  §7.1 already names.
+- **The WAL is not a leak.** A tenant opens under
+  `Checkpointing::Embedder`, so only the replicator's post-ship checkpoint
+  truncates the log, and under a hard ingest burst it does run one to two
+  orders of magnitude larger than the database file it fronts. It drains on
+  its own once writes stop — measured across an idle window, 2.4 GiB down to
+  under 2 MiB. So it is bounded by write *rate* against the one-second
+  replication interval rather than by nothing, and
+  `synch_dp_tenant_db_bytes` (§7.1) is the right response to it rather than
+  a checkpoint knob.
 - **One zone cannot name a large network.** Membership is a single
   `_synchronicity.<domain>` TXT RRset and a DNS message is bounded by a
   16-bit length, so a zone tops out around 500 members — measured, by
@@ -938,7 +960,22 @@ What it finds — shapes, not numbers, since the numbers belong to the machine:
   be produced. Nodes beyond one zone's worth belong to other networks and
   reach a replica as delegations (§3.5), which is also why they are never
   dialed: `dialable_peers` is `trusted_keys`, and a delegated origin is not
-  one.
+  one. A property of the design, not a defect to fix here.
+
+What it adds up to for one tenant replicating ten thousand nodes across
+twenty networks, each publishing twenty entries — on a four-vCPU machine, so
+read the ratios and not the absolutes:
+
+| | before | after |
+|---|---|---|
+| steady-state CPU | 197 % of a core, flat over 180 s | 42 %, and idle by the last quarter |
+| steady-state RSS | 1349 MiB mean, 2131 MiB peak | 230 MiB mean, 233 MiB peak |
+| one push to 500 peers | 127 s | 0.16 s |
+| maintenance pass | 48.6 s | 0.23 s |
+| tenant directory at rest | 2048 MiB | 181 MiB |
+
+One item is measured and unfixed: `sweep_replicas` costs seconds at this
+size, and the standing replica loop calls it every pass.
 
 ### 7.2 Sharding, when it matters
 
