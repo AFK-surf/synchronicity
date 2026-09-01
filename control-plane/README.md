@@ -281,9 +281,10 @@ carries a `soa_serial` like every other zone-shaping call: turning hosting
 *off* deletes the network's `cloud-*` devices in the same commit, so the flag
 and the membership record it caused stop being true together — the zone must
 never go on naming a hosted key the org has just withdrawn consent for. And
-turning it *on* publishes too, even though nothing in the zone changes, because
-the serial is what the fleet's `If-None-Match` poll is watching (below); a
-grant that did not move it would be a network nobody ever hosted.
+turning it *on* publishes too, even though nothing in the zone changes, so the
+grant itself passes the same widening transparency gate as the hosted-device
+registration it causes next. Desired-state discovery does not depend on that
+publish: the fleet's `If-None-Match` tag hashes the response body (below).
 
 Disabling also stamps `cloud_disabled_at`, which starts the retention clock
 over the tenant's object storage — re-enabling within the hold is a cheap

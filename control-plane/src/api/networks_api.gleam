@@ -303,14 +303,13 @@ pub fn delete_network(
 ///     zone change and must be the *same* commit — the flag and the membership
 ///     record it caused have to stop being true together, or the zone goes on
 ///     naming a hosted key the org has just withdrawn consent for.
-///   * Turning it *on* changes nothing in the zone, but it does change the
-///     data plane's desired-state document — and that document's `generation`
-///     is the zone serial (`api/dataplane_api`), so a toggle that did not
-///     publish would be a network the fleet's `If-None-Match` poll never
-///     notices. Making the grant itself `Widening` also puts it behind the
-///     transparency gate, which is honest: the very next thing that happens is
-///     a device registration that widens the zone for real, and being refused
-///     now rather than a minute later names the ceremony step that is missing.
+///   * Turning it *on* changes nothing in the zone, but making the grant itself
+///     `Widening` puts it behind the transparency gate. That is honest: the very
+///     next thing that happens is a device registration that widens the zone
+///     for real, and being refused now rather than a minute later names the
+///     ceremony step that is missing. Desired-state discovery does not depend
+///     on this publish: its ETag hashes the response body
+///     (`api/dataplane_api`).
 ///
 /// A `cloud_collect_queue` row starts the retention clock over the tenant's
 /// object storage, so one is written on the way out and removed on the way

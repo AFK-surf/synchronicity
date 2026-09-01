@@ -14,6 +14,8 @@ import dns/wire
 import email/mailer
 import exception
 import fixtures.{nk, now_unix, tmp_db}
+import gleam/bit_array
+import gleam/crypto
 import gleam/erlang/process
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/int
@@ -3599,6 +3601,11 @@ pub fn the_desired_document_is_conditional_test() {
   let first = call(h, keyed(token, Get, "/dp/v1/networks"))
   assert first.status == 200
   let assert Ok(tag) = list.key_find(first.headers, "etag")
+  let digest =
+    crypto.hash(crypto.Sha256, <<simulate.read_body(first):utf8>>)
+    |> bit_array.base16_encode
+    |> string.lowercase
+  assert tag == "\"sha256-" <> digest <> "\""
 
   let again =
     call(
@@ -3607,6 +3614,51 @@ pub fn the_desired_document_is_conditional_test() {
         |> simulate.header("if-none-match", tag),
     )
   assert again.status == 304
+}
+
+/// Assignment changes the desired document without changing the DNS zone.
+///
+/// An ETag derived from the zone serial therefore strands both sides on their
+/// old documents: the previous owner keeps the tenant and the new owner never
+/// opens it. A tag over the response bytes changes for both representations.
+pub fn assigning_a_hosted_network_moves_the_desired_etags_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let first = mint_dataplane(h, "fleet-1")
+  let second = mint_dataplane_for(h, "fleet-2", "dp-2")
+  assert host_network(h, "acme", "prod", True) == 200
+
+  let first_before = call(h, keyed(first, Get, "/dp/v1/networks"))
+  let second_before = call(h, keyed(second, Get, "/dp/v1/networks"))
+  let assert Ok(first_tag) = list.key_find(first_before.headers, "etag")
+  let assert Ok(second_tag) = list.key_find(second_before.headers, "etag")
+  assert string.contains(simulate.read_body(first_before), "\"prod\"")
+  assert !string.contains(simulate.read_body(second_before), "\"prod\"")
+
+  let serial = soa_serial(h)
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE networks SET cloud_dp_id = 'dp-2' WHERE name = 'prod'",
+      [],
+    )
+  sqlite.close(conn)
+  assert soa_serial(h) == serial
+
+  let first_after = dp_poll(h, first, first_tag)
+  let second_after = dp_poll(h, second, second_tag)
+  assert first_after.status == 200
+  assert second_after.status == 200
+  assert !string.contains(simulate.read_body(first_after), "\"prod\"")
+  assert string.contains(simulate.read_body(second_after), "\"prod\"")
 }
 
 // ---- the retention hold ------------------------------------------------------

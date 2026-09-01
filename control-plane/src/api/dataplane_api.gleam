@@ -24,7 +24,7 @@
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
-  audit, body_decoder, constraint_response, db_error, int_at, ok_json, text_at,
+  audit, body_decoder, constraint_response, db_error, ok_json, text_at,
   transaction, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
@@ -33,6 +33,7 @@ import auth/dataplane_key
 import auth/principal.{type Principal}
 import dns/name
 import gleam/bit_array
+import gleam/crypto
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json.{type Json}
@@ -100,45 +101,25 @@ const retention_hold_seconds = 2_592_000
 /// honours `If-None-Match`: one 304 per data plane per poll interval is what this
 /// costs when nothing has changed, which is almost always.
 ///
-/// **`generation` is the zone serial**, and the choice is worth stating
-/// because two other candidates are worse. There is no `updated_at` on
-/// `networks` to take a `max` of, and adding one would mean a counter this
-/// service has to remember to bump — the class of mistake that shows up as a
-/// fleet quietly serving last week's tenant set. The zone serial is already
-/// bumped, in the same transaction, by every mutation that can change this
-/// document: a device registered or retired here, a network deleted, an org
-/// renamed, and — because `networks_api.set_cloud_hosting` is deliberately a
-/// `zone_mutation` in both directions — the hosting toggle itself. It is
-/// strictly increasing and it is one column.
+/// **The `ETag` is the SHA-256 of the response body.** That is the one
+/// definition which cannot forget an input. In particular, assigning an
+/// already-hosted network to another data plane changes `cloud_dp_id` without
+/// publishing DNS and therefore without moving the zone serial; and a network
+/// enters `collect` because a retention deadline passes, with no transaction
+/// at all. A tag assembled from selected counters or fingerprints has to know
+/// about both exceptions and every exception added later. Hashing the exact
+/// bytes sent on a 200 makes the representation itself the authority.
 ///
-/// What it is not is *tight*. It is deployment-wide, so any zone change
-/// anywhere moves it, and the hourly re-sign moves it too. The failure mode of
-/// a loose generation is an extra full fetch of a small document; the failure
-/// mode of a tight one that misses a change is a network that never gets
-/// hosted. This errs in the direction that costs bytes.
-///
-/// **The `collect` list is the one input the serial cannot see**, and that is
-/// worth spelling out rather than leaving as a hole somebody finds later. A
-/// network becomes due for collection because a *clock* passed its
-/// `cloud_disabled_at + retention_hold_seconds` — no transaction ran, no zone
-/// fact changed, so the serial sits exactly where it was. A generation that
-/// was only the serial would therefore answer `304` to every poll after the
-/// hold elapsed, and the fleet would never see the entry at all: not late,
-/// *never*. The tenant's storage would be retained forever, which is the very
-/// bug this list exists to fix.
-///
-/// So the `ETag` carries a second component: a SHA-256 fingerprint of the
-/// canonical collection set (`collection_mark`). Counting rows, or counting
-/// and summing their timestamps, is not an entity tag: distinct sets can have
-/// the same aggregate. Fingerprinting the ordered names and stamps makes the
-/// tag a statement about the whole document rather than a useful-but-lossy
-/// summary of it.
+/// Building the small document on a steady-state poll costs the ordered
+/// network, device and collection queries plus one serialization. The 304
+/// still avoids sending and parsing it across the fleet, and correctness is
+/// not made to depend on maintaining a parallel invalidation scheme.
 ///
 /// What remains, and is fine: a collection can be **up to one poll interval
-/// late**. The tag moves the moment the hold elapses, but nothing pushes — the
-/// fleet finds out when it next asks. A deletion that happens sixty seconds
-/// after it fell due is not a correctness problem; a deletion that never
-/// happens is, and that is the one this closes.
+/// late**. The body and therefore its tag move once the hold elapses, but
+/// nothing pushes — the fleet finds out when it next asks. A deletion that
+/// happens sixty seconds after it fell due is not a correctness problem; a
+/// deletion that never happens is, and that is the one this closes.
 pub fn desired_state(req: Request, reads: Reads, who: Principal) -> Response {
   use dp <- require_dataplane(who)
   reads.with_db(reads, fn(conn) {
@@ -146,17 +127,24 @@ pub fn desired_state(req: Request, reads: Reads, who: Principal) -> Response {
     // second tick between them and answer a `collect` list the `ETag` does not
     // describe.
     let due_before = now_unix() - retention_hold_seconds
-    case model.read_meta(conn), collection_mark(conn, dp, due_before) {
-      Ok(meta), Ok(mark) -> {
-        let tag = etag(dp, meta.soa_serial, mark)
-        case list.key_find(req.headers, "if-none-match") == Ok(tag) {
-          True ->
-            wisp.response(304)
-            |> wisp.set_header("etag", tag)
-          False -> document(conn, dp, meta, due_before, tag)
+    case model.read_meta(conn) {
+      Ok(meta) ->
+        case document(conn, dp, meta, due_before) {
+          Ok(body) -> {
+            let tag = etag(body)
+            case list.key_find(req.headers, "if-none-match") == Ok(tag) {
+              True ->
+                wisp.response(304)
+                |> wisp.set_header("etag", tag)
+              False ->
+                body
+                |> wisp.json_response(200)
+                |> wisp.set_header("etag", tag)
+            }
+          }
+          Error(_) -> db_error()
         }
-      }
-      _, _ -> db_error()
+      Error(_) -> db_error()
     }
   })
 }
@@ -166,8 +154,7 @@ fn document(
   dp: String,
   meta: model.ZoneMeta,
   due_before: Int,
-  tag: String,
-) -> Response {
+) -> Result(String, Nil) {
   // Assigned to *this* data plane, which since migration v14 is what decides
   // the fleet's division of labour. Two pods no longer derive overlapping
   // answers from a fleet size each read out of its own environment; each is
@@ -223,49 +210,49 @@ fn document(
       // from: the data plane hands the result straight to `Node::set_domain`
       // and never assembles a name itself.
       let apex = string.drop_end(name.to_string(meta.apex), 1)
-      json.object([
-        #("generation", json.int(meta.soa_serial)),
-        // The data plane's own name, told to it by the authority rather than
-        // configured into it. A pod that hosts nothing can then say which pod
-        // it is, which is the first question asked of one, and the metering
-        // heartbeat reports the id this service assigned by instead of a
-        // string the deployment chose separately and could get wrong.
-        #("dp", json.string(dp)),
-        #(
-          "networks",
-          json.array(network_rows, fn(row) {
-            let slug = text_at(row, 0)
-            let network = text_at(row, 1)
-            json.object([
-              #("org", json.string(slug)),
-              #("network", json.string(network)),
-              #("domain", json.string(network <> "." <> slug <> "." <> apex)),
-              #("budget_bytes", json.int(default_budget_bytes)),
-              #("retention", json.string(default_retention)),
-              #("device", device_json(hosted, text_at(row, 2))),
-            ])
-          }),
-        ),
-        // Deliberately just the two names. Everything the fleet needs to build
-        // the prefixes is here — `tenants/<org>/<net>/` and `db/<org>/<net>/`
-        // are named by the same pair as the tenant itself (§5.1) — and adding
-        // the stamp or the deadline would be handing a service that holds the
-        // credentials a second opinion about whether the hold has run.
-        #(
-          "collect",
-          json.array(due_rows, fn(row) {
-            json.object([
-              #("org", json.string(text_at(row, 0))),
-              #("network", json.string(text_at(row, 1))),
-            ])
-          }),
-        ),
-      ])
-      |> json.to_string
-      |> wisp.json_response(200)
-      |> wisp.set_header("etag", tag)
+      Ok(
+        json.object([
+          #("generation", json.int(meta.soa_serial)),
+          // The data plane's own name, told to it by the authority rather than
+          // configured into it. A pod that hosts nothing can then say which pod
+          // it is, which is the first question asked of one, and the metering
+          // heartbeat reports the id this service assigned by instead of a
+          // string the deployment chose separately and could get wrong.
+          #("dp", json.string(dp)),
+          #(
+            "networks",
+            json.array(network_rows, fn(row) {
+              let slug = text_at(row, 0)
+              let network = text_at(row, 1)
+              json.object([
+                #("org", json.string(slug)),
+                #("network", json.string(network)),
+                #("domain", json.string(network <> "." <> slug <> "." <> apex)),
+                #("budget_bytes", json.int(default_budget_bytes)),
+                #("retention", json.string(default_retention)),
+                #("device", device_json(hosted, text_at(row, 2))),
+              ])
+            }),
+          ),
+          // Deliberately just the two names. Everything the fleet needs to build
+          // the prefixes is here — `tenants/<org>/<net>/` and `db/<org>/<net>/`
+          // are named by the same pair as the tenant itself (§5.1) — and adding
+          // the stamp or the deadline would be handing a service that holds the
+          // credentials a second opinion about whether the hold has run.
+          #(
+            "collect",
+            json.array(due_rows, fn(row) {
+              json.object([
+                #("org", json.string(text_at(row, 0))),
+                #("network", json.string(text_at(row, 1))),
+              ])
+            }),
+          ),
+        ])
+        |> json.to_string,
+      )
     }
-    _, _, _ -> db_error()
+    _, _, _ -> Error(Nil)
   }
 }
 
@@ -313,59 +300,6 @@ fn collectable(
   )
 }
 
-/// The `collect` list's contribution to the `ETag`: a fingerprint of every
-/// due network and its offboarding stamp, in canonical order.
-///
-/// The same predicate as `collectable`, so the tag cannot
-/// describe a set the body would not produce. A read that fails is an error
-/// and not an empty digest: a tag computed from a failed read would be a *stable*
-/// tag, and a fleet holding it would go on getting 304s for a document nobody
-/// could build. The 500 is the honest answer and the one that retries.
-fn collection_mark(
-  conn: Connection,
-  dp: String,
-  due_before: Int,
-) -> Result(String, Nil) {
-  let due =
-    sqlite.query(
-      conn,
-      "SELECT q.org_slug, q.network_name, q.disabled_at
-       FROM cloud_collect_queue q
-       WHERE q.disabled_at <= ? AND q.dp_id = ?
-         AND NOT EXISTS (
-           SELECT 1 FROM networks n JOIN orgs o ON o.id = n.org_id
-           WHERE o.slug = q.org_slug AND n.name = q.network_name
-             AND n.cloud_hosted = 1
-         )
-       ORDER BY q.org_slug, q.network_name",
-      [VInt(due_before), Text(dp)],
-    )
-  case due {
-    Ok(rows) -> {
-      let canonical =
-        rows
-        |> list.map(fn(row) {
-          // Slugs and network names are DNS labels, so neither contains the
-          // NUL separators. Including lengths would be equivalent; the
-          // separators keep this representation compact and unambiguous.
-          text_at(row, 0)
-          <> "\u{0000}"
-          <> text_at(row, 1)
-          <> "\u{0000}"
-          <> int.to_string(int_at(row, 2))
-          <> "\u{0000}"
-        })
-        |> string.concat
-      Ok(
-        id.hash_token(canonical)
-        |> bit_array.base16_encode
-        |> string.lowercase,
-      )
-    }
-    Error(_) -> Error(Nil)
-  }
-}
-
 fn device_json(hosted: List(List(sqlite.Value)), network_id: String) -> Json {
   case list.find(hosted, fn(row) { text_at(row, 0) == network_id }) {
     Ok(row) ->
@@ -381,23 +315,18 @@ fn device_json(hosted: List(List(sqlite.Value)), network_id: String) -> Json {
   }
 }
 
-/// The document's `ETag`: its generation, then the `collect` list's mark.
+/// A strong entity tag over the exact JSON representation returned on a 200.
 ///
-/// Strong rather than weak: the body is byte-identical for a given pair, since
-/// every input to it is read in one connection's snapshot of the same database
-/// against one reading of the clock.
-///
-/// Two components because the document has two kinds of input. The serial
-/// covers everything a transaction changes; the mark covers the one thing only
-/// time changes (`desired_state` has the argument). `generation` in the body
-/// stays the serial alone — it is the zone's number and the fleet logs it as
-/// such — while the tag is about this response, which is what an `ETag` is for.
-/// The data plane's own name is the first component, because the document is
-/// now per data plane: two pods polling one deployment hold different bodies,
-/// and a tag that did not say which would let a proxy — or a pod handed the
-/// wrong token — answer one pod with the other's 304.
-fn etag(dp: String, generation: Int, mark: String) -> String {
-  "\"dp-" <> dp <> "-" <> int.to_string(generation) <> "-" <> mark <> "\""
+/// The body is serialized once, hashed here, and the same string is sent below;
+/// formatting changes therefore invalidate the tag too, as a strong ETag
+/// requires. `sha256-` is only a human-readable algorithm label inside HTTP's
+/// opaque quoted value.
+fn etag(body: String) -> String {
+  let digest =
+    crypto.hash(crypto.Sha256, <<body:utf8>>)
+    |> bit_array.base16_encode
+    |> string.lowercase
+  "\"sha256-" <> digest <> "\""
 }
 
 // -- device registration -----------------------------------------------------
@@ -962,18 +891,10 @@ type Hold {
 /// happened, the same way `changed` does on the registration.
 ///
 /// **Not a `zone_mutation`, and the choice is the interesting one here.** The
-/// precedent points the other way: `networks_api.set_cloud_hosting` republishes
-/// even when turning hosting *on* changes nothing in the zone, purely so that
-/// the serial — the desired-state document's generation — moves and the
-/// fleet's `If-None-Match` poll notices. By that logic this write, which also
-/// changes the document, would republish too.
-///
-/// It does not, for two reasons that hold together. First, the reason the
-/// toggle borrowed the serial does not apply: the `collect` list has its own
-/// component in the `ETag` (`collection_mark`), which moves precisely when a
-/// network joins or leaves that list and never for anything else, so the fleet
-/// sees this write without the zone being touched. Second, republishing would
-/// be actively worse than useless. Nothing in the zone depends on
+/// desired-state ETag hashes the response body, so removing this instruction
+/// from `collect` is visible without borrowing the DNS serial as an unrelated
+/// invalidation counter. Republishing would be actively worse than useless.
+/// Nothing in the zone depends on
 /// `cloud_disabled_at` — the hosted devices were deleted a month ago, in the
 /// commit that stamped it — so the publish would re-sign and bump a
 /// deployment-wide serial for a fact the zone does not carry, making *every*
