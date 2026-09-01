@@ -49,6 +49,13 @@ const MIN_BACKOFF: Duration = Duration::from_secs(60);
 /// The longest, reached after a handful of failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(6 * 3600);
 
+/// Ready candidates held behind the rolling concurrency slots.
+///
+/// Large enough that one slow slot cannot empty the queue, bounded so a pass
+/// still returns to publish claims and re-read policy while bootstrapping a
+/// very large space.
+const FETCH_WINDOW_MULTIPLIER: usize = 8;
+
 /// What one sweep did to one space.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -338,11 +345,14 @@ impl Node {
 
     /// Fetches source repairs and replica wants, rarest first.
     ///
-    /// One pass takes at most `replica_concurrency` objects. Everything about
-    /// the fetch itself is the ordinary §6.4 path — provider fanout, delta
-    /// descent against the recorded donor, resumption — so a replica gets the
-    /// best case of the descent for free: it is fetching version *n+1* of a
-    /// file whose version *n* it is guaranteed to hold.
+    /// One pass keeps at most `replica_concurrency` objects in flight. A ranked,
+    /// bounded candidate window feeds those slots continuously, so one bad
+    /// provider consumes one slot rather than holding the next fixed batch
+    /// behind its timeout. Everything about each fetch is the ordinary §6.4
+    /// path — provider fanout, delta descent against the recorded donor,
+    /// resumption — so a replica gets the best case of the descent for free: it
+    /// is fetching version *n+1* of a file whose version *n* it is guaranteed
+    /// to hold.
     pub async fn fetch_content_wants(&self) -> Result<FetchReport> {
         self.fetch_wants(None).await
     }
@@ -365,6 +375,7 @@ impl Node {
     async fn fetch_wants(&self, only: Option<PinHolder>) -> Result<FetchReport> {
         let mut report = FetchReport::default();
         let limit = self.config().replica_concurrency.max(1);
+        let window = limit.saturating_mul(FETCH_WINDOW_MULTIPLIER);
         // Candidates are drawn per holder and then ranked together. One global
         // queue ordered by age would let a space with a large old backlog
         // starve every other replica outright, and would leave the
@@ -413,7 +424,7 @@ impl Node {
                 continue;
             };
             if matches!(want.holder, PinHolder::Source(_)) {
-                if admitted.len() >= limit {
+                if admitted.len() >= window {
                     break;
                 }
                 admitted.push(WantPlan { want, space });
@@ -429,10 +440,7 @@ impl Node {
                     let (root, holder) = (want.root, want.holder.clone());
                     crate::blocking::offload(move || Ok(store.drop_want(&root, &holder)?)).await?;
                 }
-                // Checked before the budget arm, so a full batch stops rather
-                // than going on to count every remaining candidate as
-                // over-budget in a report nobody can act on.
-                Some(_) if admitted.len() >= limit => break,
+                Some(_) if admitted.len() >= window => break,
                 Some((held, budget)) if held.saturating_add(want.size) > *budget => {
                     // Skipped, not stopped: a smaller want further down still
                     // fits, and rejecting one must not end the pass. Nothing is
@@ -450,11 +458,12 @@ impl Node {
             }
         }
 
-        // Concurrent, because this is the only network-bound step and the knob
-        // is named for it: one object at a time would leave a replica on a fat
-        // link converging at the latency of a single provider.
-        let outcomes =
-            crate::join::futures_join(admitted.iter().enumerate().map(|(i, plan)| async move {
+        // A rolling concurrency window, because this is the network-bound step
+        // and the knob is named for it. Fixed batches make one dead provider's
+        // timeout a barrier in front of every later object; refilling a slot as
+        // soon as its object finishes contains that failure to one slot.
+        let outcomes = crate::join::futures_buffered(
+            admitted.iter().enumerate().map(|(i, plan)| async move {
                 let held = self
                     .hold_object(
                         &plan.want.root,
@@ -463,18 +472,13 @@ impl Node {
                         &plan.want.holder,
                     )
                     .await;
-                // The index travels with the outcome because `futures_join`
-                // returns them in *completion* order: zipping against the input
-                // order pairs each want with whichever other want happened to
-                // finish in its place. A slow success beside a fast failure
-                // then records the failure against the object that succeeded —
-                // whose want row is already gone, so the update matches nothing
-                // — and credits the failed one as held, leaving it with no
-                // attempt recorded, no backoff, and no path to the
-                // `unreachable` count that exists to say a version is gone.
+                // Completion order differs from input order. Carry the
+                // index so each failure is recorded against its own want.
                 (i, held)
-            }))
-            .await;
+            }),
+            limit,
+        )
+        .await;
 
         for (i, outcome) in outcomes {
             let plan = &admitted[i];
@@ -790,8 +794,9 @@ impl Node {
     /// a space newly replicated — and once before the first wait, so a node
     /// restarted with a backlog starts working through it rather than waiting
     /// out an interval. The fetch loop runs after each sweep and then keeps
-    /// running while it is making progress: one pass takes at most
-    /// `replica_concurrency` objects, and a cold replica has millions.
+    /// running while it is making progress: one pass keeps at most
+    /// `replica_concurrency` objects in flight over a bounded candidate window,
+    /// and a cold replica has millions.
     pub async fn run_replicas(&self, shutdown: impl std::future::Future<Output = ()>) {
         crate::aae::run_standing(
             shutdown,

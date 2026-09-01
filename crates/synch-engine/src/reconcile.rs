@@ -1793,6 +1793,18 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
+    /// Merges another peer exchange into one anti-entropy round's report.
+    pub(crate) fn merge(&mut self, other: SyncReport) {
+        self.heads_pushed += other.heads_pushed;
+        self.heads_accepted += other.heads_accepted;
+        self.heads_rejected += other.heads_rejected;
+        self.tries_completed += other.tries_completed;
+        self.heads_abandoned += other.heads_abandoned;
+        for origin in other.failed_origins {
+            self.left_behind(&origin);
+        }
+    }
+
     /// Records that this origin was left behind, once however often it is said.
     ///
     /// The number is rendered as "N origin(s) left behind", and two paths reach

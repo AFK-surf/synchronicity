@@ -454,6 +454,47 @@ async fn convergence_survives_a_partition() {
     shutdown(&[&nas.node, &laptop.node]).await;
 }
 
+/// A reachable but stale member must not consume the one anti-entropy peer a
+/// round contacts and leave newer state waiting for a later interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anti_entropy_reaches_a_fresh_peer_beside_a_stale_one() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let source = spawn("source").await;
+    let stale = spawn("stale").await;
+    let replica = spawn("replica").await;
+    introduce(&[&source, &stale, &replica]);
+
+    source
+        .node
+        .add_filesystem_source("media", source.space.path())
+        .unwrap();
+    std::fs::write(source.space.path().join("fresh.txt"), b"fresh").unwrap();
+    let head = source.node.scan_and_publish().unwrap().1.unwrap();
+    assert_eq!(
+        stale
+            .node
+            .store()
+            .complete_head(source.node.origin())
+            .unwrap(),
+        None,
+        "the stale peer must not learn the head before the tested round"
+    );
+
+    let report = replica.node.anti_entropy_round().await.unwrap();
+    assert_eq!(report.reached, 2, "both healthy peers should answer");
+    assert_eq!(
+        replica
+            .node
+            .store()
+            .complete_head(source.node.origin())
+            .unwrap(),
+        Some(head),
+        "the stale peer must not hide the source's newer head"
+    );
+
+    shutdown(&[&source.node, &stale.node, &replica.node]).await;
+}
+
 /// §9.2: a pin starts by fetching what it guards — pinning content this node
 /// has never read must not mark zero rows and report success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

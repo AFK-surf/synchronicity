@@ -201,7 +201,7 @@ impl Store {
     /// The wants worth attempting now, rarest first, drawn per space.
     ///
     /// Returns a ranked *window* rather than exactly `limit` rows: `limit` is
-    /// how many the caller means to start, and it may decline some of them.
+    /// how many the caller keeps in flight, and it may decline some candidates.
     ///
     /// Rarity is the count of origins advertising the object, ascending, so the
     /// object with one advertised holder outranks the object with nine: a
@@ -219,11 +219,9 @@ impl Store {
     /// rather than twice it, and capped so that a row which somehow
     /// accumulated thousands of attempts cannot overflow it.
     /// `rotate` is which space leads this round. The interleave is fair over
-    /// the whole window, but the caller admits only the first `limit` rows, and
-    /// `replicas` is ordered by id — so with more spaces than
-    /// `replica_concurrency` the same leading few would be served for ever and
-    /// the rest would wait out the first's backlog. Advancing it by one per
-    /// pass gives every space the lead within one turn of the list.
+    /// the whole window, but the first `limit` rows occupy the initial
+    /// concurrency slots, and `replicas` is ordered by id. Advancing it by one
+    /// per pass keeps the same spaces from always leading those slots.
     pub fn wants_to_attempt(
         &self,
         now: i64,

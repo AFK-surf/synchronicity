@@ -5,9 +5,10 @@
 //! propagation on a connected cluster. A head *received* from a peer is not
 //! relayed onward; at the §12 sizes the publisher's own fan-out already reaches
 //! everyone it can reach, so the pull path below is what covers a member the
-//! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) one random
-//! trusted peer gets a full `Hello` push-pull exchange, which repairs anything
-//! the reactive path missed and is the mechanism that guarantees convergence.
+//! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) every
+//! trusted peer gets a full `Hello` push-pull exchange concurrently. A stale,
+//! slow, or unreachable peer therefore cannot stand between this node and a
+//! healthy one that has the missing state.
 
 use std::time::Duration;
 
@@ -22,8 +23,10 @@ use crate::{
 /// The outcome of one anti-entropy round.
 #[derive(Debug, Clone, Default)]
 pub struct RoundReport {
-    /// The peer contacted, if any was reachable.
+    /// The first peer whose exchange completed, if any was reachable.
     pub peer: Option<NodeId>,
+    /// Peers that completed an exchange this round.
+    pub reached: usize,
     /// What the exchange achieved.
     pub sync: SyncReport,
     /// Peers that could not be reached this round.
@@ -47,10 +50,9 @@ impl Node {
     /// peer's to choose — one `fetch_pending` per head it hands back, each
     /// looping to [`MAX_UNPRODUCTIVE_ROUNDS`], plus a pass over every pending
     /// head — so per-request deadlines compose into no bound at all. A peer
-    /// answering just inside each one would hold this loop indefinitely, and
-    /// `anti_entropy_round` returns on the first success, so no other peer
-    /// would be reached and no pending trie fetched for as long as it kept that
-    /// up.
+    /// answering just inside each one could monopolize a sequential scheduler.
+    /// The whole-round budget now contains that peer's concurrent task while
+    /// healthy peers continue their own exchanges.
     ///
     /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
@@ -134,24 +136,28 @@ impl Node {
             .collect())
     }
 
-    /// Runs one periodic round: pick one random trusted peer and sync with it.
+    /// Runs one periodic round against every trusted peer concurrently.
     ///
-    /// Picking randomly rather than round-robin is what makes the gossip
-    /// converge in `O(log N)` rounds after a partition heals.
+    /// A slow or stale peer must not stand in front of a healthy peer in a
+    /// sequential order. Each exchange has its own whole-round budget, and the
+    /// successes commit independently while failed peers are counted.
     pub async fn anti_entropy_round(&self) -> Result<RoundReport> {
         let peers = self.dialable_peers_off_runtime().await?;
         if peers.is_empty() {
             return Ok(RoundReport::default());
         }
+        let outcomes = crate::join::futures_join(peers.into_iter().map(|peer| async move {
+            let result = self.sync_with_peer(&peer).await;
+            (peer, result)
+        }))
+        .await;
         let mut report = RoundReport::default();
-        let start = (jitter_seed() % peers.len() as u64) as usize;
-        for offset in 0..peers.len() {
-            let peer = peers[(start + offset) % peers.len()];
-            match self.sync_with_peer(&peer).await {
+        for (peer, outcome) in outcomes {
+            match outcome {
                 Ok(sync) => {
-                    report.peer = Some(peer);
-                    report.sync = sync;
-                    return Ok(report);
+                    report.peer.get_or_insert(peer);
+                    report.reached += 1;
+                    report.sync.merge(sync);
                 }
                 Err(e) => {
                     tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
@@ -205,7 +211,6 @@ impl Node {
         jittered(self.config().aae_interval)
     }
 
-    /// Runs the periodic anti-entropy loop until `shutdown` resolves.
     /// Runs the periodic anti-entropy loop until `shutdown` resolves.
     ///
     /// Woken by the clock or by a head landing in the pending slot, whichever

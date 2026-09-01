@@ -115,15 +115,15 @@ pub struct NodeConfig {
     /// peer holding the trie has had many rounds to serve it, short enough that
     /// an origin is not stranded for an afternoon.
     pub pending_head_ttl: Duration,
-    /// How long one anti-entropy round with one peer may take in total (§5.3).
+    /// How long one anti-entropy exchange with one peer may take (§5.3).
     ///
     /// `synch-net` deadlines every individual request, but a round issues as
     /// many as the peer's answers call for — one trie fetch per head it hands
     /// back, each of those looping until it stops making progress — so the
-    /// per-request deadlines bound no round. A peer answering each request just
-    /// inside its deadline could therefore hold the periodic loop for as long
-    /// as it liked, and since a round returns on its first success, no other
-    /// peer was reached while it did.
+    /// per-request deadlines bound no exchange. A peer answering each request
+    /// just inside its deadline could therefore hold its task for as long as it
+    /// liked; this budget contains that task while the round's other peer
+    /// exchanges continue concurrently.
     ///
     /// Ten anti-entropy intervals at the defaults: far more than a real round
     /// needs even on a cold bootstrap, since a round that runs out of budget
