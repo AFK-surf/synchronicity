@@ -78,7 +78,11 @@ pub struct Tenant {
     pub state: State,
     node: Option<Node>,
     /// Held for as long as the tenant owns its data directory.
-    _lock: LifecycleLock,
+    ///
+    /// An `Option` so [`Drop`] can move it into the task that closes a node
+    /// nobody drained: the claim on the directory has to outlive the endpoint
+    /// still writing to it.
+    lock: Option<LifecycleLock>,
     shutdown: broadcast::Sender<()>,
     loops: Vec<tokio::task::JoinHandle<()>>,
     /// Tells the replication ticker to make its final ship and close.
@@ -209,7 +213,7 @@ impl Tenant {
             network,
             state: State::Provisioning,
             node: None,
-            _lock: lock,
+            lock: Some(lock),
             shutdown: broadcast::channel(1).0,
             loops: Vec::new(),
             replication_finish: None,
@@ -674,6 +678,90 @@ impl Tenant {
     }
 }
 
+impl Drop for Tenant {
+    /// Closes a node nobody drained, and keeps the directory claimed until it
+    /// is really shut.
+    ///
+    /// `drain` takes the node, so on the ordinary path this is a no-op. What
+    /// it covers is the tenant dropped without one — `Reconciler::run`'s
+    /// `select!` dropping a `tick()` future at shutdown, or a `provision` that
+    /// fails after `Tenant::start` has stored the node. `Node` has no `Drop`
+    /// of its own: only `shutdown` retires the endpoint and its tasks, so a
+    /// dropped tenant otherwise leaves a live UDP socket and an open store for
+    /// the life of the process.
+    ///
+    /// The lifecycle lock goes with it rather than being released here. That
+    /// ordering is the point: releasing it while the endpoint is still up
+    /// would let the next `provision` for the same network open a second store
+    /// and a second replicator over the same database and stream — two writers
+    /// on the one thing the lock exists to keep single.
+    ///
+    /// A drop cannot await, so the *whole* of [`drain`](Tenant::drain)'s
+    /// ordering is moved into the spawned task rather than only the node
+    /// close. Taking the pieces out here is what makes that possible, and it
+    /// is not optional: the fields left behind drop in declaration order the
+    /// moment this returns, and two of those drops are signals.
+    /// `replication_finish` is a oneshot whose *drop* ends the ticker, so
+    /// leaving it would start the tail ship immediately — concurrently with
+    /// six standing loops still writing and a node still open. The tail ship
+    /// is the last acknowledged write a tenant has; under
+    /// `Checkpointing::Embedder` the replicator is also what pins the WAL, so
+    /// once it closes, frames written after it can be recycled with no shipped
+    /// copy. That is precisely the loss `drain` orders itself to avoid, and a
+    /// `Drop` that only closed the node would reintroduce it on the one path
+    /// this exists to cover.
+    ///
+    /// Off a runtime there is nothing to spawn onto. The node then stays open
+    /// for the life of the process, so the lock is *leaked* rather than
+    /// released: releasing it beside a live endpoint is the two-writers case
+    /// above, and a lock this process never gives up is the honest
+    /// representation of a directory this process never let go of.
+    fn drop(&mut self) {
+        let Some(node) = self.node.take() else {
+            return;
+        };
+        let tenant = self.network.key();
+        let lock = self.lock.take();
+        // Same order as `drain`, for the same reason: loops down, node closed,
+        // log tail shipped last.
+        let _ = self.shutdown.send(());
+        let loops = std::mem::take(&mut self.loops);
+        let finish = self.replication_finish.take();
+        let task = self.replication_task.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    for handle in loops {
+                        if let Err(error) = handle.await {
+                            tracing::warn!(%tenant, %error, "a dropped tenant's loop did not stop cleanly");
+                        }
+                    }
+                    if let Err(error) = node.shutdown().await {
+                        tracing::warn!(%tenant, %error, "closing a dropped tenant's node failed");
+                    }
+                    if let Some(finish) = finish {
+                        let _ = finish.send(());
+                    }
+                    if let Some(task) = task {
+                        if let Err(error) = task.await {
+                            tracing::error!(%tenant, %error, "a dropped tenant's replication ticker did not stop cleanly");
+                        }
+                    }
+                    drop(lock);
+                });
+            }
+            Err(_) => {
+                std::mem::forget(lock);
+                tracing::error!(
+                    %tenant,
+                    "a tenant was dropped off a runtime; its node stays open, and its \
+                     data directory stays locked, until the process ends"
+                );
+            }
+        }
+    }
+}
+
 /// Empties a tenant's data directory, keeping the lifecycle lock.
 ///
 /// The lock file stays because this process is holding a lock *on it*.
@@ -731,4 +819,104 @@ fn is_unidentified(error: &synch_engine::EngineError) -> bool {
 /// How long a parked tenant waits before re-opening.
 pub fn identity_poll() -> Duration {
     IDENTITY_POLL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tenant nobody drained still runs the whole of `drain`'s teardown,
+    /// in `drain`'s order.
+    ///
+    /// The path is real rather than hypothetical: `Reconciler::run`'s
+    /// `select!` drops a `tick()` future at shutdown. [`Node`] has no `Drop`
+    /// of its own — only `shutdown` retires the endpoint and its tasks — so
+    /// without this the process would carry a live UDP socket and an open
+    /// store until it exited.
+    ///
+    /// What is asserted is the *order*, because the release on its own proves
+    /// nothing: `LifecycleLock` unlocks when it is dropped, so a `Tenant` with
+    /// no `Drop` impl at all gives the directory back just as promptly. The
+    /// claim that needs a test is the one `drain` spends its whole body on —
+    /// that nothing still writing to the directory outlives the claim on it.
+    /// So a standing loop is made to take a visible moment to finish, and the
+    /// lock must not come back before it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_tenant_finishes_its_teardown_before_it_lets_go() {
+        let _blocking = synch_core::BlockingScope::enter();
+        let base = tempfile::tempdir().expect("a base dir");
+        let dir = base.path().join("tenant");
+        {
+            let dir = dir.clone();
+            synch_core::offload(move || Node::init(&dir, None))
+                .await
+                .expect("the tenant initializes");
+        }
+        let lock = LifecycleLock::acquire(&dir).expect("the lifecycle lock");
+        let node = Node::open(NodeConfig::loopback(&dir))
+            .await
+            .expect("the tenant opens");
+
+        // A stand-in for the six standing loops: it stops when the tenant says
+        // so, and takes long enough about it that "did the drop wait?" is a
+        // question with an observable answer.
+        let (shutdown, mut signal) = broadcast::channel(1);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loop_done = Arc::clone(&stopped);
+        let standing = tokio::spawn(async move {
+            let _ = signal.recv().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            loop_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let tenant = Tenant {
+            network: HostedNetwork {
+                org: "acme".into(),
+                network: "prod".into(),
+                domain: "prod.acme.example".into(),
+                budget_bytes: 0,
+                retention: "current".into(),
+                device: None,
+            },
+            state: State::Running,
+            node: Some(node),
+            lock: Some(lock),
+            shutdown,
+            loops: vec![standing],
+            replication_finish: None,
+            replication_task: None,
+            dir: dir.clone(),
+        };
+
+        // While it is alive the directory is claimed, which is what makes the
+        // assertion after the drop mean anything.
+        assert!(
+            LifecycleLock::acquire(&dir).is_err(),
+            "a running tenant holds its data directory"
+        );
+
+        drop(tenant);
+
+        let mut released = None;
+        for _ in 0..200 {
+            match LifecycleLock::acquire(&dir) {
+                Ok(lock) => {
+                    released = Some(lock);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(
+            released.is_some(),
+            "a dropped tenant must not hold its data directory for the life of \
+             the process"
+        );
+        assert!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the directory was handed back while a loop was still writing to \
+             it — the next tenant to take this lock would be the second writer \
+             the lock exists to prevent"
+        );
+    }
 }

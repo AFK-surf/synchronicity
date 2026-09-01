@@ -233,6 +233,26 @@ struct ChannelBinding {
     guest_closed: Arc<Notify>,
 }
 
+/// What [`SshState::outstanding_kind`] found.
+///
+/// Three answers where a plain `Option` gave two, and the missing one is the
+/// whole point: "absent because the connection is gone" is not "absent
+/// because you made it up".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outstanding {
+    /// The event is live, and this is its kind.
+    Kind(u32),
+    /// Not here, and the connection has gone — so we cannot tell whether the
+    /// guest held this id legitimately or made it up, and it no longer
+    /// matters: `close` empties `outstanding` wholesale, and no answer given
+    /// now can reach a peer either way. Read it as *cannot tell*, not as
+    /// *did nothing wrong*; treating it as a fault is what would turn an
+    /// ordinary teardown into a guest error.
+    Abandoned,
+    /// No such event on a live connection: the guest's mistake.
+    Unknown,
+}
+
 /// What answering an event did.
 ///
 /// A guest that answers correctly has done its job whether or not anyone was
@@ -405,13 +425,31 @@ impl SshState {
             .clone()
     }
 
-    pub(crate) fn event_kind(&self, id: u64) -> Option<u32> {
-        self.events
+    /// What an event id names, and — when it names nothing — why.
+    ///
+    /// Every helper that answers an event checks the kind first, because
+    /// delivering an auth decision to a channel-open token would end the
+    /// connection rather than fail one call. That check has to make the same
+    /// distinction [`reply`](Self::reply) makes: `close` empties `outstanding`
+    /// wholesale, so after a teardown an id the guest legitimately holds is
+    /// simply not here, and reporting that as the guest's mistake is what
+    /// [`Replied::Abandoned`] exists to stop. A lookup that could only say
+    /// "absent" would put every one of those helpers back on the wrong side
+    /// of the race, whatever `reply` did afterwards — which is exactly where
+    /// three of them were.
+    pub(crate) fn outstanding_kind(&self, id: u64) -> Outstanding {
+        let kind = self
+            .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .outstanding
             .get(&id)
-            .map(|event| event.kind)
+            .map(|event| event.kind);
+        match kind {
+            Some(kind) => Outstanding::Kind(kind),
+            None if self.is_closed() => Outstanding::Abandoned,
+            None => Outstanding::Unknown,
+        }
     }
 
     /// Answers an outstanding event.
@@ -2317,6 +2355,7 @@ pub(crate) fn generate_host_key() -> Result<PrivateKey, russh::keys::ssh_key::Er
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::ssh::Outstanding;
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -2364,6 +2403,46 @@ mod tests {
             state.reply(header.id, Decision::Done),
             Ok(Replied::Abandoned),
             "a teardown is not a failed reply"
+        );
+    }
+
+    /// The half of that fix which was missing.
+    ///
+    /// `reply` told teardown and mistake apart, but three of the five helpers
+    /// that answer events check the *kind* first — and that lookup could only
+    /// say "absent", so on a closed connection they returned `ESTATE` from
+    /// their own precheck and never reached `reply` at all. The flake was
+    /// only fixed for `sy_ssh_event_done`, the one helper with no precheck;
+    /// the same guest's `auth_reply` still failed the same race.
+    #[test]
+    fn the_kind_lookup_tells_a_teardown_from_a_mistake() {
+        let state = SshState::new(Arc::new(Readiness::default()));
+        let (tx, rx) = oneshot::channel();
+        state
+            .push(Event::auth(EVENT_AUTH_NONE, "test", tx))
+            .expect("the event is pushed");
+        let header = state.next().expect("the guest takes the event");
+
+        assert_eq!(
+            state.outstanding_kind(header.id),
+            Outstanding::Kind(EVENT_AUTH_NONE),
+            "live while the connection is up"
+        );
+        assert_eq!(
+            state.outstanding_kind(4242),
+            Outstanding::Unknown,
+            "an id that never named an event is the guest's mistake"
+        );
+
+        state.close(0);
+        drop(rx);
+
+        assert_eq!(
+            state.outstanding_kind(header.id),
+            Outstanding::Abandoned,
+            "an id the guest legitimately holds is not a mistake once the \
+             connection has gone — the precheck must say so, or the helper \
+             fails the race before `reply` can get it right"
         );
     }
 
@@ -2527,7 +2606,11 @@ mod tests {
             state.next().is_none(),
             "no event was pushed for the oversized username"
         );
-        assert_eq!(state.event_kind(1), None, "no event id was consumed");
+        assert_eq!(
+            state.outstanding_kind(1),
+            Outstanding::Unknown,
+            "no event id was consumed"
+        );
     }
 
     #[test]
@@ -2581,7 +2664,10 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             let header = header.expect("the attempt event was queued");
-            assert_eq!(state.event_kind(header.id), Some(EVENT_AUTH_NONE));
+            assert_eq!(
+                state.outstanding_kind(header.id),
+                Outstanding::Kind(EVENT_AUTH_NONE)
+            );
             assert_eq!(
                 state.field(header.id, FIELD_AUTH_ATTEMPTS),
                 Some(1u64.to_le_bytes().to_vec()),
@@ -2604,7 +2690,9 @@ mod tests {
             .unwrap();
         let header = state.next().expect("the cert event was queued");
         assert_eq!(header.id, id);
-        let kind = state.event_kind(id).expect("the cert event is outstanding");
+        let Outstanding::Kind(kind) = state.outstanding_kind(id) else {
+            panic!("the cert event is outstanding");
+        };
         assert_eq!(kind, EVENT_AUTH_OPENSSH_CERT);
         // Accept, reject and partial are all valid on a cert event: russh has
         // validated its structure and signatures, while the guest owns CA
@@ -2656,8 +2744,8 @@ mod tests {
         let header = state.next().expect("the cert event was queued");
         assert_eq!(header.id, id);
         assert_eq!(
-            state.event_kind(id),
-            Some(EVENT_AUTH_OPENSSH_CERT),
+            state.outstanding_kind(id),
+            Outstanding::Kind(EVENT_AUTH_OPENSSH_CERT),
             "the cert event keeps its kind"
         );
         assert_eq!(

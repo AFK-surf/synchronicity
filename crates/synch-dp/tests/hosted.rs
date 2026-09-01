@@ -43,8 +43,26 @@ struct Cp {
     statuses: Vec<synch_dp::control::Status>,
     /// Networks this control plane says are due for collection.
     collect: Vec<synch_dp::control::Collectable>,
-    /// Networks whose storage the data plane has reported deleted.
-    collected: Vec<String>,
+    /// Networks whose storage the data plane has reported deleted, each with
+    /// whether the bytes were *already* gone when the report arrived.
+    ///
+    /// The second half is the whole assertion: the order is the safety, and a
+    /// test that only counted reports would pass an implementation that told
+    /// the control plane first and deleted afterwards — the one ordering that
+    /// leaves a customer billed for storage the control plane believes is
+    /// gone.
+    collected: Vec<(String, bool)>,
+    /// The bucket, and the exact keys that must already be gone when a
+    /// collection is reported.
+    ///
+    /// Named keys rather than a prefix listing: `ObjectStore::list` is
+    /// delimited, so a key one level down shows up only as a synthesized
+    /// directory the helper filters out — a "the prefix is empty" check built
+    /// on it would answer `true` before anything was deleted, and the
+    /// assertion would pass for every implementation.
+    witness: Option<(synch_dp::store::ObjectStore, Vec<String>)>,
+    /// Whether hosting has been turned off, so the document lists no networks.
+    offboarded: bool,
 }
 
 type Shared = Arc<Mutex<Cp>>;
@@ -56,9 +74,10 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
             "/dp/v1/networks",
             get(|State(state): State<Shared>| async move {
                 let cp = state.lock().expect("the stub's lock");
-                Json(serde_json::json!({
-                    "generation": 1,
-                    "networks": [{
+                let networks = if cp.offboarded {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{
                         "org": ORG,
                         "network": NETWORK,
                         "domain": APEX,
@@ -69,7 +88,11 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
                             nk: nk.clone(),
                             state: "active".into(),
                         }),
-                    }],
+                    }])
+                };
+                Json(serde_json::json!({
+                    "generation": 1,
+                    "networks": networks,
                     "collect": cp.collect,
                 }))
             }),
@@ -102,8 +125,24 @@ async fn control_plane(state: Shared) -> (String, tokio::task::JoinHandle<()>) {
             axum::routing::delete(
                 |State(state): State<Shared>,
                  Path((org, network)): Path<(String, String)>| async move {
+                    // Taken out of the lock before any await, so the guard is
+                    // not held across one.
+                    let witness = state.lock().expect("the stub's lock").witness.clone();
+                    let mut emptied = true;
+                    if let Some((bucket, keys)) = witness {
+                        for key in keys {
+                            if bucket
+                                .get_if_present(&key)
+                                .await
+                                .expect("reading the bucket")
+                                .is_some()
+                            {
+                                emptied = false;
+                            }
+                        }
+                    }
                     let mut cp = state.lock().expect("the stub's lock");
-                    cp.collected.push(format!("{org}/{network}"));
+                    cp.collected.push((format!("{org}/{network}"), emptied));
                     cp.collect.clear();
                     Json(serde_json::json!({"ok": true}))
                 },
@@ -462,4 +501,182 @@ fn futures_lite_block<T>(future: impl std::future::Future<Output = T>) -> T {
 fn hosted_teardown(cp: tokio::task::JoinHandle<()>, zone: tokio::task::JoinHandle<()>) {
     cp.abort();
     zone.abort();
+}
+
+/// An offboarded tenant's stored bytes are deleted, and only then reported
+/// (§6).
+///
+/// The end of the lifecycle, driven through the reconciler rather than by
+/// calling the sweep directly: the control plane stops listing the network and
+/// starts listing it as collectable, and one pass has to turn that into an
+/// empty prefix *and* a `DELETE …/storage`. Both halves are asserted, in that
+/// order, because the order is the safety — bytes first, record second, so a
+/// crash between them re-deletes an empty prefix rather than leaving the
+/// control plane believing storage is gone while the bill continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offboarded_tenants_storage_is_collected_and_reported() {
+    let base = tempfile::tempdir().expect("a base dir");
+    let cp_state: Shared = Arc::default();
+    {
+        let mut cp = cp_state.lock().expect("the stub's lock");
+        cp.offboarded = true;
+        cp.collect = vec![synch_dp::control::Collectable {
+            org: ORG.into(),
+            network: NETWORK.into(),
+        }];
+    }
+    let (cp_url, cp_server) = control_plane(cp_state.clone()).await;
+    let control = ControlPlane::new(&cp_url, "synchdp_test").expect("the client");
+    let config = DpConfig::for_test(base.path(), &cp_url);
+
+    // One operator, two handles: the sweep's and the test's, so what the
+    // reconciler deletes is what this test can look for afterwards.
+    let operator = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+        .expect("an in-memory operator");
+    let bucket = synch_dp::store::ObjectStore::new(operator.clone());
+
+    // The tenant's two prefixes, and a neighbouring network whose *name*
+    // starts the same way. `cas_root` ends in a slash and `collect` appends
+    // one to `db_prefix`, so `acme/production` is already out of reach — this
+    // pins that, since a sweep built from the bare names would take a second
+    // customer's bytes with the first's, and prefix deletion is the one
+    // operation here that destroys customer data.
+    let cas = config.cas_root(ORG, NETWORK);
+    let cas_key = format!("{}blobs/one", cas.trim_start_matches('/'));
+    let db_key = format!("{}/ltx/0000", config.db_prefix(ORG, NETWORK));
+    let cas_neighbour = format!(
+        "{}blobs/one",
+        config.cas_root(ORG, "production").trim_start_matches('/')
+    );
+    let db_neighbour = format!("{}/ltx/0000", config.db_prefix(ORG, "production"));
+    for key in [&cas_key, &db_key, &cas_neighbour, &db_neighbour] {
+        bucket
+            .put(key, b"bytes".to_vec())
+            .await
+            .expect("seeding the bucket");
+    }
+    cp_state.lock().expect("the stub's lock").witness = Some((
+        synch_dp::store::ObjectStore::new(operator.clone()),
+        vec![cas_key.clone(), db_key.clone()],
+    ));
+
+    let mut reconciler = synch_dp::reconciler::Reconciler::new(
+        config.clone(),
+        control,
+        synch_dp::store::ObjectStore::new(operator),
+        None,
+        Arc::new(synch_dp::metrics::Metrics::default()),
+    );
+    reconciler.tick().await.expect("one reconcile pass");
+
+    // The bytes, first.
+    assert!(
+        bucket
+            .get_if_present(&cas_key)
+            .await
+            .expect("reading the bucket")
+            .is_none(),
+        "the tenant's content prefix should be empty"
+    );
+    assert!(
+        bucket
+            .get_if_present(&db_key)
+            .await
+            .expect("reading the bucket")
+            .is_none(),
+        "and so should its database stream"
+    );
+    for neighbour in [&cas_neighbour, &db_neighbour] {
+        assert!(
+            bucket
+                .get_if_present(neighbour)
+                .await
+                .expect("reading the bucket")
+                .is_some(),
+            "a network whose name merely starts the same way must be untouched"
+        );
+    }
+
+    // The record of it, second — and the stub looked at the bucket when the
+    // report arrived, so "second" is asserted rather than assumed.
+    assert_eq!(
+        cp_state.lock().expect("the stub's lock").collected,
+        vec![(format!("{ORG}/{NETWORK}"), true)],
+        "the control plane should be told exactly once, and only after the \
+         bytes are actually gone"
+    );
+
+    cp_server.abort();
+}
+
+/// The fail-static cache keeps tenants alive; it never authorizes a delete.
+///
+/// A shard partitioned from the control plane goes on serving what it last
+/// heard (§4.2) — and if that were allowed to drive collection too, a shard
+/// that lost its uplink could delete a prefix for an org that had since
+/// changed its mind, and never know. So a collection runs only on a document
+/// the control plane answered *this pass*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_cache_never_authorizes_a_collection() {
+    let base = tempfile::tempdir().expect("a base dir");
+    // A port with nothing behind it: the control plane is unreachable, which
+    // is the whole premise.
+    let dead = {
+        let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        drop(listener);
+        format!("http://{addr}")
+    };
+    let control = ControlPlane::new(&dead, "synchdp_test").expect("the client");
+    let config = DpConfig::for_test(base.path(), &dead);
+
+    let operator = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+        .expect("an in-memory operator");
+    let bucket = synch_dp::store::ObjectStore::new(operator.clone());
+
+    // The cache says this network is due for collection — the strongest thing
+    // a stale document can say, and the one it must not be believed about.
+    let cached = serde_json::json!({
+        "generation": 9,
+        "networks": [],
+        "collect": [{ "org": ORG, "network": NETWORK }],
+    });
+    bucket
+        .put(
+            &config.desired_key(),
+            serde_json::to_vec(&cached).expect("encoding the cache"),
+        )
+        .await
+        .expect("seeding the cache");
+    let cas_key = format!(
+        "{}blobs/one",
+        config.cas_root(ORG, NETWORK).trim_start_matches('/')
+    );
+    bucket
+        .put(&cas_key, b"bytes".to_vec())
+        .await
+        .expect("seeding the bucket");
+
+    let mut reconciler = synch_dp::reconciler::Reconciler::new(
+        config,
+        control,
+        synch_dp::store::ObjectStore::new(operator),
+        None,
+        Arc::new(synch_dp::metrics::Metrics::default()),
+    );
+    reconciler
+        .tick()
+        .await
+        .expect("a pass on the cache is not a failure");
+
+    assert!(
+        bucket
+            .get_if_present(&cas_key)
+            .await
+            .expect("reading the bucket")
+            .is_some(),
+        "an unreachable control plane must never authorize a delete"
+    );
 }

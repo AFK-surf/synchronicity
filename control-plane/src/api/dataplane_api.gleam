@@ -715,6 +715,10 @@ fn registered(
 /// it is allowed, because "this key is compromised" outranks "this tenant
 /// keeps working", and the recovery is the replacement `PUT` above.
 ///
+/// Re-standing-down a key that is already `retiring` is a no-op that
+/// publishes nothing, for the same reason a repeat registration is: the serial
+/// this route would bump is the desired document's `generation`.
+///
 /// Confined to `cloud-<n>` devices of the named network, so this route can
 /// never touch a customer's key however the path is spelled.
 pub fn retire_key(
@@ -740,6 +744,23 @@ pub fn retire_key(
           Error(refusal) -> refusal
           Ok(#(device_id, key_id, state)) ->
             case revoking, state, sole_active(conn, device_id) {
+              // Already stood down, and asked to stand down again. The write
+              // would change no row, so the only things it would do are the
+              // two nobody wants: `register_device` routes a repeat
+              // registration to `unchanged` for exactly this reason, and the
+              // reason is the same here. This serial is also the desired
+              // document's `generation` and the first half of its `ETag`, so a
+              // republish per pass turns every shard's 304 into a full
+              // document and re-signs the whole zone for nothing — and the
+              // audit trail fills with retirements that did not happen.
+              False, "retiring", _ ->
+                unchanged(
+                  conn,
+                  json.object([
+                    #("nk", json.string(nk)),
+                    #("state", json.string("retiring")),
+                  ]),
+                )
               False, "active", True ->
                 error_json(
                   409,

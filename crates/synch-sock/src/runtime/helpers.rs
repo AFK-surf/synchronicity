@@ -1431,8 +1431,14 @@ fn h_ssh_auth_reply(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    let Some(kind) = state.event_kind(event_id) else {
-        return ret(errno::ESTATE);
+    // A teardown is not the guest's mistake: it answered correctly and the
+    // connection went away underneath it. Reporting `ESTATE` here is what the
+    // `Replied::Abandoned` branch in `reply` exists to stop — and this
+    // precheck used to reach it first, so the guest still saw a failure.
+    let kind = match state.outstanding_kind(event_id) {
+        crate::runtime::ssh::Outstanding::Kind(kind) => kind,
+        crate::runtime::ssh::Outstanding::Abandoned => return ret(0),
+        crate::runtime::ssh::Outstanding::Unknown => return ret(errno::ESTATE),
     };
     let result = match auth_reply_result(kind, result) {
         Ok(result) => result,
@@ -1466,14 +1472,15 @@ fn h_ssh_authorized_keys_match(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    if !matches!(
-        state.event_kind(event_id),
-        Some(
+    match state.outstanding_kind(event_id) {
+        crate::runtime::ssh::Outstanding::Kind(
             crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_OFFER
-                | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED
-        )
-    ) {
-        return ret(errno::ESTATE);
+            | crate::runtime::ssh::EVENT_AUTH_PUBLICKEY_VERIFIED,
+        ) => {}
+        // Nothing to compare against on a dead connection, and no answer to
+        // give: not a match, and not the guest's fault either.
+        crate::runtime::ssh::Outstanding::Abandoned => return ret(0),
+        _ => return ret(errno::ESTATE),
     }
     let Some(wanted) = state.field(event_id, crate::runtime::ssh::FIELD_PUBLIC_KEY_BLOB) else {
         return ret(errno::ESTATE);
@@ -1579,7 +1586,13 @@ fn h_ssh_channel_accept(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_OPEN) {
+    // The one helper for which a teardown really is a failure, and it is the
+    // same reason the reply below treats it as one: the guest is asking for a
+    // channel, and on a dead connection there is no channel to hand it.
+    if !matches!(
+        state.outstanding_kind(event_id),
+        crate::runtime::ssh::Outstanding::Kind(crate::runtime::ssh::EVENT_CHANNEL_OPEN)
+    ) {
         return ret(errno::ESTATE);
     }
     if !state.reserve_channel() {
@@ -1670,8 +1683,12 @@ fn h_ssh_channel_reject(
     // Only a channel-open token can be answered with a rejection; consuming
     // an auth or request token here would deliver the wrong decision type and
     // end the connection instead of failing this one call (§5).
-    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_OPEN) {
-        return ret(errno::ESTATE);
+    match state.outstanding_kind(event_id) {
+        crate::runtime::ssh::Outstanding::Kind(crate::runtime::ssh::EVENT_CHANNEL_OPEN) => {}
+        // Refusing a channel on a connection that is already gone is a wish
+        // the teardown granted.
+        crate::runtime::ssh::Outstanding::Abandoned => return ret(0),
+        _ => return ret(errno::ESTATE),
     }
     match state.reply(
         event_id,
@@ -1877,8 +1894,10 @@ fn h_ssh_request_reply(
         Ok(state) => state,
         Err(error) => return ret(error),
     };
-    if state.event_kind(event_id) != Some(crate::runtime::ssh::EVENT_CHANNEL_REQUEST) {
-        return ret(errno::ESTATE);
+    match state.outstanding_kind(event_id) {
+        crate::runtime::ssh::Outstanding::Kind(crate::runtime::ssh::EVENT_CHANNEL_REQUEST) => {}
+        crate::runtime::ssh::Outstanding::Abandoned => return ret(0),
+        _ => return ret(errno::ESTATE),
     }
     match state.reply(
         event_id,
