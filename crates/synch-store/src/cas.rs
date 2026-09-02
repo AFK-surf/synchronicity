@@ -75,7 +75,7 @@ impl Txn<'_> {
         )?;
         // Held is not wanted. A source want exists only as a repair intent
         // left by a heal, and the durable row just verified is that repair;
-        // `SystemSafety.SourcePublish` retires the want in the same step.
+        // `Cas.SourcePublish` retires the want in the same step.
         self.conn().execute(
             "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder],
@@ -801,8 +801,10 @@ impl Store {
         now: i64,
     ) -> Result<()> {
         // LEAN-MODEL: cas-write-complete-commit
-        // `CasGc.CommitComplete` abstracts this complete-row commit. File
-        // callers hold the write lease; inline callers have no unlink window.
+        // `Cas.CommitComplete` abstracts this complete-row commit, its staged
+        // branch being the `durable = 0` row a cloud backend leaves until
+        // `finalize`. File callers hold the write lease; inline callers have
+        // no unlink window.
         let durable = self.complete_is_durable();
         upsert_blob_row(
             &self.conn(),
@@ -880,7 +882,7 @@ impl Store {
         now: i64,
     ) -> Result<Commit> {
         // LEAN-MODEL: cas-write-groups-commit
-        // `CasGc.CommitGroups` abstracts both partial and completing bitmap
+        // `Cas.CommitGroups` abstracts both partial and completing bitmap
         // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
@@ -1045,7 +1047,7 @@ impl Store {
     /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
         // LEAN-MODEL: cas-adopt-durable
-        // `SystemSafety.AdoptRemote` is this row creation from a remote pair
+        // `Cas.AdoptRemote` is this row creation from a remote pair
         // the backend has just confirmed; it only ever adds availability.
         self.with_immediate_tx(|tx| {
             let existing: Option<i64> = tx
@@ -1250,7 +1252,7 @@ impl Store {
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
         // LEAN-MODEL: cas-cache-evict
-        // `SystemSafety.CacheEvict` retains remote durability when local cache
+        // `Cas.CacheEvict` retains remote durability when local cache
         // bytes disappear; callers select durable cache rows.
         let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
@@ -1258,12 +1260,13 @@ impl Store {
             return Ok(false);
         }
         // LEAN-MODEL: cas-drop-staged-row
-        // `SystemSafety.DropStaged` is this row removal of a non-durable cache
+        // `Cas.DropStaged` is this row removal of a non-durable cache
         // claim, and the same transition behind `reconcile_scratch_generation`
         // and the `commit_cas_migration` discard. None of the three consults
-        // `pins`: `staged_row_drop_is_unpinned` is why they need not, and
-        // `Store::pin`'s `durable` predicate is what makes that theorem true
-        // of the store.
+        // `pins`: `SystemSafety.staged_row_drop_is_unpinned` is why they
+        // need not (`Cas.NoLoss`: a pin is only ever granted over available
+        // content), and `Store::pin`'s `durable` predicate is what makes
+        // that theorem true of the store.
         conn.execute(
             "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
             params![root.as_bytes().to_vec()],
@@ -1407,14 +1410,14 @@ impl Store {
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
         // LEAN-MODEL: cas-pin
-        // `SystemSafety.Pin` includes the held-object check and pin insertion
+        // `Cas.Pin` includes the held-object check and pin insertion
         // in this immediate transaction.
         self.with_immediate_tx(|tx| {
             // Held *durably*, not merely known or cached: a `blobs` row exists
             // for a partial fetch too, and on a cloud backend a complete row
             // is only a scratch copy until the backend has taken it
             // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `SystemSafety.Available`
+            // predicate is `durable` alone, which is `Cas.Available`
             // and the fact the whole GC argument rests on: every path that
             // drops a staged row without consulting `pins` — cache eviction,
             // a scratch-generation reset, a backend migration — is safe only
@@ -1450,7 +1453,7 @@ impl Store {
     /// unconditionally.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
         // LEAN-MODEL: cas-unpin
-        // `SystemSafety.Unpin` requires this holder's live role to have ended;
+        // `Cas.Unpin` requires this holder's live role to have ended;
         // for a role holder that guard is the entry check in this DELETE.
         let dropped = match holder.space() {
             None => self.conn().execute(
@@ -1500,7 +1503,7 @@ impl Store {
     /// claims that were scheduled before it went.
     pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
         // LEAN-MODEL: cas-expire-pin
-        // `SystemSafety.ExpirePin` covers this holder-specific path and the
+        // `Cas.ExpirePin` covers this holder-specific path and the
         // node-wide variant below. Both re-check that no live entry returned.
         Ok(self.conn().execute(
             "DELETE FROM pins
@@ -1629,7 +1632,7 @@ impl Store {
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // LEAN-MODEL: cas-gc-row-commit
-        // `CasGc.GcCommit` is this conditional row transition. Its guard is
+        // `Cas.GcCommit` is this conditional row transition. Its guard is
         // intentionally re-read here, not inherited from the candidate scan.
         let rows = tx.execute(
             "DELETE FROM blobs
@@ -1645,7 +1648,7 @@ impl Store {
         let deleted = rows > 0;
         if deleted {
             // LEAN-MODEL: cas-gc-unlink
-            // `CasGc.GcUnlink` is separate from the row commit because the
+            // `Cas.GcUnlink` is separate from the row commit because the
             // filesystem cannot join SQLite; `conn` remains held between them.
             let _ = std::fs::remove_file(self.blob_path(root));
             let _ = std::fs::remove_file(self.outboard_path(root));
@@ -1670,7 +1673,7 @@ impl Store {
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // LEAN-MODEL: cas-protected-delete
-        // `SystemSafety.ProtectedDelete` is this no-entry/no-pin/no-writer
+        // `Cas.ProtectedDelete` is this no-entry/no-pin/no-writer
         // transition. The checks and row deletion are one write transaction.
         let protected: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1)
@@ -2290,7 +2293,7 @@ mod tests {
 
     /// A role's pin is what its live leaf stands on, so the role cannot let
     /// go while an entry in its space still names the root
-    /// (`SystemSafety.Unpin`). The operator's claim has no leaf behind it.
+    /// (`Cas.Unpin`). The operator's claim has no leaf behind it.
     #[test]
     fn a_role_holder_cannot_unpin_content_its_space_still_names() {
         let (_d, store) = store();

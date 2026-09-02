@@ -599,7 +599,7 @@ impl Syncer {
         // `Safety` pairs `MptGc.Promote` with content materialization: the
         // completeness check, slot flip and derived views share this commit.
         // LEAN-MODEL: cas-remote-promotion
-        // `CasGc.OrdinaryPromote`/`ReplicaPromote` model the entry plus the
+        // `Cas.OrdinaryPromote`/`ReplicaPromote` model the entry plus the
         // pin-or-want decision made by `materialize_diff` below.
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {

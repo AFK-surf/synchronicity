@@ -1338,7 +1338,7 @@ fn content_wants(
     // Held is not wanted. A want staged while the root was still on its way
     // — an earlier promotion of the same bytes, say — is retired by the pin
     // that supersedes it, in the same transaction, so a replica is never held
-    // and wanted at once (`SystemSafety.ReplicaPromote`). The sweep's
+    // and wanted at once (`Cas.ReplicaPromote`). The sweep's
     // `stage_space_wants` does the same for anything that got here before this
     // line existed.
     tx.execute(
@@ -2253,7 +2253,7 @@ mod tests {
 
     /// A replica leaf whose content is already durable takes a pin and
     /// retires any want staged for it in the same transaction, so held and
-    /// wanted never coexist (`SystemSafety.ReplicaPromote`).
+    /// wanted never coexist (`Cas.ReplicaPromote`).
     #[test]
     fn a_replica_pin_retires_the_want_it_supersedes() {
         let (_d, store) = store();

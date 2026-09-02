@@ -140,7 +140,7 @@ impl Store {
     /// is all this needs.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         // LEAN-MODEL: cas-retention-elapses
-        // `CasGc.Age` abstracts crossing this `before` horizon; it grants no
+        // `Cas.Age` abstracts crossing this `before` horizon; it grants no
         // permission by itself, only removes the freshness guard.
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
