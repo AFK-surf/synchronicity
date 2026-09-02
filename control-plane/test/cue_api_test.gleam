@@ -94,6 +94,8 @@ fn setup_full(
     browse_api.Browse(
       process.new_name("cue_test_agents_" <> id.new()),
       "https://cp.test/agent/v1/attach",
+      process.new_name("cue_test_writers_" <> id.new()),
+      "https://cp.test/dp/v1/attach",
     )
   let ctx =
     router.Context(

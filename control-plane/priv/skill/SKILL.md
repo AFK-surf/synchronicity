@@ -825,10 +825,27 @@ switch:
 | `GET` | `…/browse/ls?space=&path=&origin=&cursor=&all=1` | member | one directory of the unified tree |
 | `GET` | `…/browse/stat?space=&path=&origin=` | member | every version of one path, with attestors |
 | `GET` | `…/browse/file?space=&path=&from=&origin=` | member | the bytes, streamed; `Range` honoured, plain-text refusals |
+| `PUT` | `…/browse/file?space=&path=` | member | the body becomes the hosted replica's version of the path; `Content-Length` required, `If-Match: "<root>"` / `If-None-Match: *` honoured |
+| `DELETE` | `…/browse/file?space=&path=` | member | withdraws the hosted replica's version of the path — never a customer node's |
 | `GET` | `…/networks/<net>/delegations` | member | the delegated keys an attached daemon reports |
 
 Space and path are query parameters and never path segments — a file path may
 contain anything, separators included.
+
+**The two writes exist exactly for cloud-hosted networks**, and there is no
+second switch: hosting on is writes on. A write is published by the hosted
+device `cloud-1` as *its* version — a customer node's version of the same path
+is never altered, and where one exists both versions show, which is divergence
+and is expected. A `DELETE` answers `{"withdrawn": bool, "still_published":
+bool}`: `withdrawn: false` means the cloud had no version to retire, and
+`still_published: true` means a customer node still asserts the path and only
+that node can retract it — neither is a failure, and a program that retries on
+either will retry forever. Any node of the deployment takes a write, replicas
+included; nothing is recorded in the audit trail for one (the hosted node's
+own signed history is the record). Refusals are plain text, `<code>:
+<message>`: `409 hosting-disabled`, `411 length-required`, `412
+precondition`, `413 too-large`, `429 too-many-writes`, `503
+no-cloud-attached`, `507 over-budget`.
 
 **Cloud hosting** is a second, independent per-network switch, and the same
 shape:
@@ -967,6 +984,9 @@ method is a route that does not exist, so it is a 404 like any other.
 | `500` | `internal` | this service's fault, not the request's — a storage failure, or a publish that could not complete. The detail is in its log, never in the body |
 | `502` | `internal`, or a code relayed verbatim | the attached daemon answered wrongly, or with something this build does not know |
 | `503` | `no-device-attached`, `unavailable` | no daemon is attached to answer this browse call, or the one that is went away |
+| `409` | `hosting-disabled` | plain text from a `PUT`/`DELETE …/browse/file`: the network is not cloud-hosted, so nothing of the control plane's can publish into it |
+| `412` | `precondition` | plain text from a write: `If-Match` / `If-None-Match` did not hold; nothing was published |
+| `503` | `no-cloud-attached` | plain text from a write: the hosted replica's write tunnel is not attached to this node — hosting may still be provisioning |
 
 **Codes come in both shapes, and the shape means nothing.** Most are
 `snake_case`, but `browse-disabled`, `no-device-attached` and
@@ -992,7 +1012,9 @@ still says it after the key has been revoked.
 
 Reads are not recorded, browse reads included: they are an org reading its own
 files through a tunnel its own daemon opened, and a row per download would be
-a log of ordinary use.
+a log of ordinary use. File writes through `…/browse/file` are not recorded
+either — they are relayed to the hosted replica and land in its own signed,
+sequenced history, which `synch log` on any member walks.
 
 ## Global flags
 

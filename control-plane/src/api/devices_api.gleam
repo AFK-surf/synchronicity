@@ -5,6 +5,7 @@
 import api/agent
 import api/auth_api.{type AuthContext, with_db}
 import api/browse_api.{type Browse}
+import api/cloud_writer
 import api/common.{
   Admin, Member, audit, body_decoder, constraint_response, db_error,
   find_customer_device, require_org, text_at, zone_mutation,
@@ -365,7 +366,13 @@ pub fn revoke_key(
 ) -> Response {
   let outcome = key_state_change(ctx, who, slug, device_id, key_id, Revoke)
   case outcome.status {
-    200 -> agent.drop_key(browse_api.registry(browse), key_id)
+    200 -> {
+      agent.drop_key(browse_api.registry(browse), key_id)
+      // The write tunnel stands on the same key: a hosted device whose key
+      // was revoked must stop publishing as cloud-1 now, not at its next
+      // reconnect (docs/CLOUD-WRITES.md §5.2).
+      cloud_writer.drop_key(browse_api.writers(browse), key_id)
+    }
     _ -> Nil
   }
   outcome

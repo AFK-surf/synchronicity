@@ -258,15 +258,24 @@ pub trait SocketWriter: Send + 'static {
     async fn delete_if(&mut self, expected: PutCondition) -> Result<(), HostError> {
         match expected {
             PutCondition::Any => self.delete().await,
-            PutCondition::Absent | PutCondition::Root(_) => Err(HostError::Unavailable(
-                "conditional tree deletes are not supported by this host".into(),
-            )),
+            PutCondition::Absent | PutCondition::Root(_) | PutCondition::Selected { .. } => {
+                Err(HostError::Unavailable(
+                    "conditional tree deletes are not supported by this host".into(),
+                ))
+            }
         }
     }
 }
 
 /// What a [`SocketWriter::commit`] requires of the path's current state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The first three are conditions on *this node's own* live entry — the thing
+/// the write replaces — which is the read-modify-write primitive a program
+/// wants (`docs/TREE-WRITES.md` §5.3). [`PutCondition::Selected`] is a
+/// condition on the version the *unified tree* selects, for a caller who read
+/// the path through a selecting surface and may never have seen this node's
+/// own entry at all (`docs/CLOUD-WRITES.md` §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutCondition {
     /// Commit whatever is there: last write wins, like an S3 `PUT`.
     Any,
@@ -274,6 +283,16 @@ pub enum PutCondition {
     Absent,
     /// This node's own live version must have exactly this content root.
     Root(Hash),
+    /// The version the unified tree selects for the path — `newest`, or the
+    /// origin `from` names — must have content root `root`, or must not exist
+    /// when `root` is `None`.
+    Selected {
+        /// Pin one origin's version; unset selects the newest.
+        from: Option<synch_core::OriginId>,
+        /// The root the selected version must have, or `None` for "no live
+        /// version anywhere".
+        root: Option<Hash>,
+    },
 }
 
 /// What a successful commit published.

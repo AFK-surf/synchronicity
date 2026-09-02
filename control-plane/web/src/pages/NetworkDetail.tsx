@@ -546,9 +546,12 @@ function CloudHosting({
         network as an ordinary device (
         <code className="text-neutral-300">cloud-1</code>) and durably keeps a
         copy of everything published on this network. It is a member like any
-        other, and reads what any member reads. Turning it off removes that
-        device and starts a retention hold — 30 days by default — before the
-        stored copy is deleted.
+        other: it reads what any member reads, and files can be put into the
+        network from here — uploaded from the Files page or the API — which
+        it publishes as its own versions, never over anyone else&apos;s.
+        Turning it off removes that device, stops uploads with it, and starts
+        a retention hold — 30 days by default — before the stored copy is
+        deleted.
       </p>
       {isAdmin ? (
         <div className="mt-4">
@@ -557,7 +560,7 @@ function CloudHosting({
               onClick={() => {
                 if (
                   window.confirm(
-                    `Turn cloud hosting off for ${network}? The hosted device leaves the network on the next publish, and the stored copy is deleted after the retention hold.`,
+                    `Turn cloud hosting off for ${network}? The hosted device leaves the network on the next publish, uploads through the control plane stop, and the stored copy is deleted after the retention hold.`,
                   )
                 )
                   set.mutate(false)

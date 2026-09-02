@@ -1776,6 +1776,7 @@ mod tests {
             blocking_threads: 512,
             max_inflight_per_tenant: 8,
             metrics_addr: None,
+            write_staging: crate::writes::StagingBudget::new(1024),
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
             rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,

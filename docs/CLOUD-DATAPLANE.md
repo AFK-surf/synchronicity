@@ -484,9 +484,10 @@ that a source-less, checkout-less, socket-less member needs:
 | `run_publisher` | yes | publishes this node's own trie: blob ads, `m:self`, replica claims — cheap when idle |
 | `run_dns` | yes | membership *is* the tenant boundary; a lapsed zone partitions the tenant |
 | `run_cloud` | yes | the browse/replication tunnel — this is what puts the hosted node in the org's replication panel (§2, once browse is enabled) |
+| `run_cloud_writes` | yes | the write tunnel (docs/CLOUD-WRITES.md): the control plane's file writes, published as this node's own versions. Not the engine's loop — the data plane's, because the frames live where no daemon links them |
 | `run_scanner`, `run_watcher` | no | no filesystem sources exist (cloud CAS refuses them anyway) |
 | `run_checkouts` | no | nothing is materialized |
-| uploads sweeper | no | v1 has no write surface at all — no control socket, no gateway, no sockets — so no upload can ever exist to sweep or reopen |
+| uploads sweeper | no | no multipart surface — no control socket, no gateway, no sockets — so no upload can ever exist to sweep or reopen. A control-plane write stages in the tenant's scratch under a `TreeWriter` and is gone with it if abandoned |
 
 Plus, of the daemon's one-shot startup helpers, `readopt_self_on_startup`
 and then `scan_publish_push` per tenant (`reopen_interrupted_uploads` goes
@@ -608,7 +609,7 @@ Every tenant's `CloudConfig` names the same bucket with a distinct OpenDAL
 tenants/<org>/<network>/        ← OpenDAL root for this tenant
   cas/<hh>/<hex>                ← payload   (append-only, SERVERLESS §6.5)
   cas/<hh>/<hex>.obao           ← outboard
-  uploads/<id>/<n>              ← multipart staging (unused in v1: no write
+  uploads/<id>/<n>              ← multipart staging (unused: no multipart
                                    surface exists, §4.4)
 db/<org>/<network>/             ← tenant DB replica stream (§5.3)
 dp/<fingerprint>/desired.json   ← fail-static desired-state cache (§4.2)
@@ -1159,10 +1160,13 @@ None of the engine's replication, storage, or membership code changes.
   revocable only at the operator CLI.
 - **The hosted node writes nothing customer-visible but its own trie.** A
   replica publishes no file entries (REPLICATION, by construction); the
-  hosted origin's trie carries blob ads, `m:self`, and replica claims. No
-  socket admission (§4.4) means no code execution surface. The browse
-  tunnel it attaches is read-only by wire construction (no write opcode
-  decodes).
+  hosted origin's trie carries blob ads, `m:self`, and replica claims —
+  and, since docs/CLOUD-WRITES.md, the file entries an org member asked it
+  to publish through the control plane's file API, which are its own
+  versions and never another origin's. No socket admission (§4.4) means no
+  code execution surface. The browse tunnel it attaches is read-only by wire
+  construction (no write opcode decodes); writes reach it over a second
+  tunnel whose frames no daemon links.
 - **In-process isolation is by ownership, not sandboxing.** Tenants share
   an address space; the guarantee against cross-tenant data flow is that
   no code path holds two tenants' stores (enforced in practice by the
@@ -1384,6 +1388,11 @@ crates/synch-dp/
 - **Redundant hosting** — a second slot (`cloud-2`) on a different data
   plane. The slot model (§3.4) and the assignment are built for it; what is
   missing is billing and a status API that assume one row per network.
+- ~~**Writes through the control plane's file API**~~ — built:
+  [docs/CLOUD-WRITES.md](CLOUD-WRITES.md). Published by the hosted node as
+  `cloud-1`'s own assertions, reaching it over a second tunnel that only the
+  data plane opens — never the customer's daemons, whose browse tunnel keeps
+  encoding no write.
 - **Delegate-scoped hosting** (§9): the hosted node admitted for named
   spaces only, so the fleet never sees the rest. A different product tier,
   not a fix.

@@ -1,6 +1,7 @@
 import api/agent
 import api/auth_api
 import api/browse_api
+import api/cloud_writer
 import api/reads
 import api/router
 import api/skill
@@ -81,13 +82,20 @@ fn harness_sized(pool_size: Int) -> Harness {
     )
   let agents = process.new_name("cp_agents_test_" <> id.new())
   let assert Ok(_) = agent.start(agents)
+  let writers = process.new_name("cp_writers_test_" <> id.new())
+  let assert Ok(_) = cloud_writer.start(writers)
   Harness(
     router.Context(
       "anchor",
       "ds",
       router.Writable(auth),
       router.ServingZone(serve.Serving(dns_pool, apex)),
-      browse_api.Browse(agents, "https://cp.test/agent/v1/attach"),
+      browse_api.Browse(
+        agents,
+        "https://cp.test/agent/v1/attach",
+        writers,
+        "https://cp.test/dp/v1/attach",
+      ),
     ),
     db_path,
     token,
@@ -1665,12 +1673,19 @@ pub fn a_read_only_node_serves_the_browse_surface_test() {
   let h = harness()
   let name = process.new_name("cp_agents_replica_test")
   let assert Ok(_) = agent.start(name)
+  let writers = process.new_name("cp_writers_replica_test")
+  let assert Ok(_) = cloud_writer.start(writers)
   let browsing =
     Harness(
       ..h,
       ctx: router.Context(
         ..h.ctx,
-        browse: browse_api.Browse(name, "https://cp1.test/agent/v1/attach"),
+        browse: browse_api.Browse(
+          name,
+          "https://cp1.test/agent/v1/attach",
+          writers,
+          "https://cp1.test/dp/v1/attach",
+        ),
       ),
     )
   let assert 200 =
@@ -4351,4 +4366,149 @@ pub fn re_enabling_clears_the_retention_clock_test() {
     )
   sqlite.close(conn)
   assert rows == [[sqlite.Int(0)]]
+}
+
+// ---- the write tunnel -------------------------------------------------------
+
+/// The write-tunnel attach lookup (docs/CLOUD-WRITES.md §5.2): a hosted
+/// device's active key, on the data plane the network is assigned to, in a
+/// hosted network, attaches; a wrong data plane is "not there", a customer's
+/// device is unrecognised, and a network whose hosting has gone off is refused
+/// by name.
+pub fn the_write_tunnel_attaches_only_the_assigned_hosted_device_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  // A customer's own device, enrolled the ordinary way.
+  let customer = nk()
+  let enrolled =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks/prod/devices",
+      json.object([
+        #("label", json.string("nas")),
+        #("nk", json.string(customer)),
+        #("relay", json.string("")),
+        #("addr", json.string("")),
+      ]),
+    ).status
+  assert enrolled == 200 || enrolled == 201
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint_dataplane(h, "fleet")
+  let hosted = nk()
+  let assert 200 =
+    call(
+      h,
+      keyed(token, Put, "/dp/v1/networks/acme/prod/device")
+        |> simulate.json_body(
+          json.object([
+            #("label", json.string("cloud-1")),
+            #("nk", json.string(hosted)),
+          ]),
+        ),
+    ).status
+
+  let claim =
+    cloud_writer.Claim(
+      network: "prod.acme.sync.test",
+      origin: "cloud-1@prod.acme.sync.test",
+      device: hosted,
+      slot: 1,
+      version: cloud_writer.protocol_version,
+    )
+  let inbox = process.new_subject()
+  let conn = read_db(h)
+  let assert Ok(session) =
+    cloud_writer.lookup(conn, "dp-1", inbox, claim, hosted, now_unix())
+  assert session.label == "cloud-1"
+  assert session.slot == 1
+  assert session.dp == "dp-1"
+  // Not this pod's tenant: "not yours" is "not there".
+  let assert Error(#("not_found", _)) =
+    cloud_writer.lookup(conn, "dp-2", inbox, claim, hosted, now_unix())
+  // A customer's key never attaches a write tunnel, whatever it claims.
+  let assert Error(#("unauthorized", _)) =
+    cloud_writer.lookup(
+      conn,
+      "dp-1",
+      inbox,
+      cloud_writer.Claim(..claim, device: customer),
+      customer,
+      now_unix(),
+    )
+  sqlite.close(conn)
+
+  // Hosting off with the device row still present — the window inside a
+  // teardown — is refused by name rather than as an unknown key.
+  let assert Ok(rw) = db.open_primary(h.db_path)
+  let assert Ok(_) = sqlite.exec(rw, "UPDATE networks SET cloud_hosted = 0", [])
+  let assert Error(#("hosting-disabled", _)) =
+    cloud_writer.lookup(rw, "dp-1", inbox, claim, hosted, now_unix())
+  sqlite.close(rw)
+}
+
+/// The browse status reports the write half apart from the read half, and
+/// turning hosting off drops the network's write sessions in the same
+/// request.
+pub fn hosting_decides_writes_and_hosting_off_drops_the_sessions_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let before =
+    simulate.read_body(call(
+      h,
+      authed(h, Get, "/api/orgs/acme/networks/prod/browse"),
+    ))
+  assert string.contains(before, "\"writes\":{\"enabled\":false")
+
+  assert host_network(h, "acme", "prod", True) == 200
+  let after =
+    simulate.read_body(call(
+      h,
+      authed(h, Get, "/api/orgs/acme/networks/prod/browse"),
+    ))
+  assert string.contains(
+    after,
+    "\"writes\":{\"enabled\":true,\"attached\":false",
+  )
+
+  // A hosted replica attached for the network, as the registry would hold it.
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(network_id)]]) =
+    sqlite.query(conn, "SELECT id FROM networks WHERE name = 'prod'", [])
+  sqlite.close(conn)
+  let writers = browse_api.writers(h.ctx.browse)
+  process.send(
+    writers,
+    cloud_writer.Join(cloud_writer.Session(
+      id: "s1",
+      network_id: network_id,
+      org_id: "acme",
+      label: "cloud-1",
+      origin: "cloud-1@prod.acme.sync.test",
+      key_id: "k1",
+      dp: "dp-1",
+      slot: 1,
+      version: cloud_writer.protocol_version,
+      attached_at: now_unix(),
+      inbox: process.new_subject(),
+    )),
+  )
+  let attached =
+    simulate.read_body(call(
+      h,
+      authed(h, Get, "/api/orgs/acme/networks/prod/browse"),
+    ))
+  assert string.contains(
+    attached,
+    "\"writes\":{\"enabled\":true,\"attached\":true,\"device\":\"cloud-1\"",
+  )
+
+  assert host_network(h, "acme", "prod", False) == 200
+  assert cloud_writer.sessions_for(writers, network_id) == []
+  let off =
+    simulate.read_body(call(
+      h,
+      authed(h, Get, "/api/orgs/acme/networks/prod/browse"),
+    ))
+  assert string.contains(off, "\"writes\":{\"enabled\":false")
 }

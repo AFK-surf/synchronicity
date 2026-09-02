@@ -214,10 +214,71 @@ export interface BrowseDevice {
   attached_at: number
 }
 
+// The write half of the browse surface (`docs/CLOUD-WRITES.md` §4.2):
+// on while the network is cloud-hosted, and served once the hosted
+// replica's write tunnel is attached to this node. Reported apart so the
+// file browser can tell "writes are off" from "the tenant is mid-restart".
+export interface BrowseWrites {
+  enabled: boolean
+  attached: boolean
+  device: string
+}
+
 export interface BrowseStatus {
   enabled: boolean
   devices: BrowseDevice[]
   attach_url: string
+  writes: BrowseWrites
+}
+
+// What a `PUT …/browse/file` answers: the version that now exists, as
+// `cloud-1`'s own assertion.
+export interface WrittenFile {
+  device: string
+  origin: string
+  space: string
+  path: string
+  root: string
+  size: number
+  seq: number
+  mtime_ns: number
+}
+
+// What a `DELETE …/browse/file` answers. `withdrawn` says whether the cloud
+// had a version to retire; `still_published` says whether a customer origin
+// still asserts the path — the control plane cannot delete a customer's
+// file, only withdraw the cloud's version of it.
+export interface WithdrawnFile {
+  device: string
+  origin: string
+  space: string
+  path: string
+  withdrawn: boolean
+  still_published: boolean
+}
+
+// A write on the file API. The body is the file itself and the answer is
+// JSON, but a refusal is plain text (the route sits below the JSON API's
+// layer), so this reads the body either way.
+export async function writeFile(
+  url: string,
+  method: 'PUT' | 'DELETE',
+  body?: Blob,
+): Promise<WrittenFile | WithdrawnFile> {
+  const response = await fetch(url, {
+    method,
+    credentials: 'same-origin',
+    headers: {
+      'x-csrf': csrfToken,
+      ...(body !== undefined ? { 'content-length': String(body.size) } : {}),
+    },
+    body,
+  })
+  if (!response.ok) {
+    const text = (await response.text()).trim()
+    throw new Error(text === '' ? `HTTP ${response.status}` : text)
+  }
+  return (await response.json()) as WrittenFile | WithdrawnFile
 }
 
 /// One delegated device key, as an attached daemon reports it.

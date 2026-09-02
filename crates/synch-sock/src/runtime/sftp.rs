@@ -1217,6 +1217,11 @@ mod tests {
                     current.is_some_and(|bytes| Hash::new(bytes) == root)
                         && self.modes & synch_core::TREE_WRITE_REPLACE != 0
                 }
+                // The test host has one origin, so the selected version is
+                // its own.
+                PutCondition::Selected { root, .. } => {
+                    current.map(|bytes| Hash::new(bytes)) == root
+                }
             };
             if !allowed {
                 return Err(HostError::Conflict("condition changed".into()));
@@ -1258,6 +1263,9 @@ mod tests {
                 PutCondition::Any => true,
                 PutCondition::Absent => current.is_none(),
                 PutCondition::Root(root) => current.is_some_and(|bytes| Hash::new(bytes) == root),
+                PutCondition::Selected { root, .. } => {
+                    current.map(|bytes| Hash::new(bytes)) == root
+                }
             };
             if !allowed {
                 return Err(HostError::Conflict("delete condition changed".into()));

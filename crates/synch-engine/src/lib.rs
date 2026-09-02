@@ -52,6 +52,8 @@ pub use reference::EntryRef;
 pub use rotation::PeerBindings;
 pub use scanner::Adoption;
 pub(crate) use scanner::CloneKind;
+pub use sockets::TreeWriter;
 pub use synch_net::dns::RekorPolicy;
+pub use synch_sock::{HostError, PutCondition, PutReceipt, SocketWriter};
 pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
 pub use uploads::{CompletedUpload, Deleted, PartStaging, DEFAULT_UPLOAD_TTL};

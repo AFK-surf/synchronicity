@@ -78,10 +78,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   `_synchronicity-cp.<apex>` in the zone it already DNSSEC-validates, dials
   out over WSS, and proves itself with the device key this service already
   publishes — no command needed, for the tunnel is on unless a node's
-  operator opted it out with `synch control-plane disable`. It is read-only by
-  construction — the tunnel encodes no write opcode and the API is GET-only —
-  and fail-closed on the org's choice: an org admin must enable browsing for
-  the network, and until then nothing is readable however many daemons are
+  operator opted it out with `synch control-plane disable`. The tunnel is
+  read-only by construction — it encodes no write opcode — and the browse
+  routes are GET-only; the file API's one pair of writes goes down a
+  different tunnel, to the hosted replica alone (below). Browsing is
+  fail-closed on the org's choice: an org admin must enable it for the
+  network, and until then nothing is readable however many daemons are
   attached. Which spaces are browsable is decided here, not on the node: an
   attached daemon serves whatever this service requests, for every space it
   holds. File bytes pass through this service's memory in bounded chunks and
@@ -129,7 +131,11 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   (`cloud-1`) and durably replicates everything published on it. This service
   is the authority and the API; the fleet is cattle that polls it. See
   [The cloud data plane](#the-cloud-data-plane) below and
-  [docs/CLOUD-DATAPLANE.md](../docs/CLOUD-DATAPLANE.md).
+  [docs/CLOUD-DATAPLANE.md](../docs/CLOUD-DATAPLANE.md). A write surface on
+  the file API — `PUT`/`DELETE …/browse/file`, on every hosted network and
+  no other, only ever taken by the hosted replica, served by any node of the
+  deployment and recorded nowhere here — is
+  [docs/CLOUD-WRITES.md](../docs/CLOUD-WRITES.md).
 
 ## API keys
 
@@ -248,7 +254,10 @@ carries `key_name` and `key_minted_by` beside it, so a row says which key and
 whose without a second lookup, and goes on saying it after the key is revoked
 and its row is gone. Reads are not recorded, browse reads included: that is a
 deliberate choice about logging ordinary use, and it means the trail says what
-a key *did*, never what it saw.
+a key *did*, never what it saw. Neither are file writes through
+`PUT`/`DELETE …/browse/file`: those are the hosted node's to record, in its
+own signed history, and the control plane keeps no row for them
+(docs/CLOUD-WRITES.md §4.4).
 
 ## The cloud data plane
 

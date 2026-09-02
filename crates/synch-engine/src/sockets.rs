@@ -745,9 +745,10 @@ impl SocketHost for TreeHost {
             staging_lost: false,
             unix_mode: None,
             mtime_ns: None,
-            socket: self.socket.clone(),
-            invocation: self.invocation,
-            peer: self.peer.clone(),
+            via: format!(
+                "socket {} invocation {} peer {}",
+                self.socket, self.invocation, self.peer
+            ),
         }))
     }
 }
@@ -849,8 +850,64 @@ fn evaluate_put_condition(
                 }
             }
         }
+        // A condition on the unified tree's selection rather than on this
+        // node's own entry (`docs/CLOUD-WRITES.md` §4.3). The mode gate is the
+        // same as `Any`'s: what this node is about to do is create or replace
+        // *its own* version, whichever version the caller read.
+        PutCondition::Selected { from, root } => {
+            if live.is_some() && !replace {
+                return Err(HostError::Denied(format!(
+                    "{space}/{path} already has a live version here and the grant cannot replace"
+                )));
+            }
+            if live.is_none() && !create {
+                return Err(HostError::Denied(format!(
+                    "{space}/{path} has no live version here and the grant cannot create"
+                )));
+            }
+            expect_selected(node, space, path, from, root)?;
+        }
     }
     Ok(())
+}
+
+/// Whether the version the unified tree selects for a path has the expected
+/// root — or, for `None`, whether the tree selects nothing at all.
+///
+/// Best-effort against the rest of the cluster in the way DESIGN §8 already
+/// states: this node's view lags anti-entropy, so a version published
+/// elsewhere a moment ago may not be in it yet. What is closed is the window
+/// against other writers *on this node*, which is what the tree-write lock
+/// around the caller is for.
+fn expect_selected(
+    node: &Node,
+    space: &str,
+    path: &str,
+    from: Option<synch_core::OriginId>,
+    expected: Option<Hash>,
+) -> std::result::Result<(), HostError> {
+    let policy = match from {
+        Some(origin) => synch_store::VersionPolicy::Origin(origin),
+        None => synch_store::VersionPolicy::Newest,
+    };
+    let found = match node.resolve(space, path, &policy) {
+        Ok(row) if row.kind == EntryKind::Tombstone => None,
+        Ok(row) => row.content,
+        Err(EngineError::NotFound(_)) => None,
+        // A divergent path under `strict` cannot happen here — the two
+        // policies above always select — so anything else is a store fault.
+        Err(e) => return Err(HostError::Io(e.to_string())),
+    };
+    if found == expected {
+        return Ok(());
+    }
+    Err(HostError::Conflict(match (found, expected) {
+        (Some(found), Some(_)) => {
+            format!("{space}/{path} now selects {found}, not the expected version")
+        }
+        (Some(found), None) => format!("{space}/{path} now has a live version, {found}"),
+        (None, _) => format!("{space}/{path} no longer has a live version"),
+    }))
 }
 
 /// The delete counterpart to `evaluate_put_condition`. This is evaluated
@@ -879,11 +936,16 @@ fn evaluate_delete_condition(
         PutCondition::Root(_) => Err(HostError::Conflict(format!(
             "{space}/{path} no longer has the expected version here"
         ))),
+        PutCondition::Selected { from, root } => expect_selected(node, space, path, from, root),
     }
 }
 
-/// A single socket write into this node's own tree, behind a `sy_put_*`
-/// writer handle (`docs/TREE-WRITES.md` §6).
+/// A single write into this node's own tree (`docs/TREE-WRITES.md` §6).
+///
+/// The engine's one tree-write seam, driven by three callers: a `sy_put_*`
+/// writer handle in the socket runtime, the SFTP adapter's file handles, and
+/// the cloud data plane's write tunnel (`docs/CLOUD-WRITES.md` §6.3), which
+/// opens one through [`Node::open_tree_write`].
 ///
 /// A re-composition of what the control-service `Put` handler does, gate for
 /// gate: bytes stream into an [`Adoption`](crate::Adoption) beside the target
@@ -892,7 +954,7 @@ fn evaluate_delete_condition(
 /// a filesystem source, `commit_api_file` plus a flush for an API-source
 /// one). Dropping it uncommitted drops the adoption, whose own `Drop` removes
 /// the staging file.
-struct TreeWriter {
+pub struct TreeWriter {
     node: Node,
     space: String,
     path: String,
@@ -907,9 +969,54 @@ struct TreeWriter {
     /// Host-originated metadata to carry into an API-source record.
     unix_mode: Option<u32>,
     mtime_ns: Option<i64>,
-    socket: String,
-    invocation: u64,
-    peer: String,
+    /// Who is writing, for the log line a commit leaves: the socket, its
+    /// invocation and the peer for a program; the relaying session for an
+    /// embedder.
+    via: String,
+}
+
+impl std::fmt::Debug for TreeWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeWriter")
+            .field("space", &self.space)
+            .field("path", &self.path)
+            .field("via", &self.via)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Node {
+    /// Opens a write of `space/path` as this node's own new version, for an
+    /// embedder (`docs/CLOUD-WRITES.md` §7 (e)).
+    ///
+    /// The same gates the socket runtime's writer takes at open — the space
+    /// must be a source of this node's, the path normalizes, an activated
+    /// socket path is refused, and the node must be able to publish — with
+    /// every mode granted: the caller is the host, not a program under a
+    /// manifest. `via` names the caller in the commit's log line.
+    pub fn open_tree_write(&self, space: &str, path: &str, via: &str) -> Result<TreeWriter> {
+        let rest = crate::scanner::normalized_adoption_path(path)?;
+        if self.store().source(space)?.is_none() {
+            return Err(EngineError::not_found(format!(
+                "space {space} is not a source here"
+            )));
+        }
+        refuse_socket_path(self, space, &rest).map_err(|e| EngineError::invalid(e.to_string()))?;
+        self.ensure_adoptable(space, &rest)?;
+        Ok(TreeWriter {
+            node: self.clone(),
+            space: space.to_string(),
+            path: rest,
+            modes: synch_core::TREE_WRITE_CREATE
+                | synch_core::TREE_WRITE_REPLACE
+                | synch_core::TREE_WRITE_DELETE,
+            staged: None,
+            staging_lost: false,
+            unix_mode: None,
+            mtime_ns: None,
+            via: via.to_string(),
+        })
+    }
 }
 
 impl TreeWriter {
@@ -1150,13 +1257,11 @@ impl SocketWriter for TreeWriter {
             (root, size)
         };
         tracing::info!(
-            socket = %self.socket,
-            invocation = self.invocation,
-            peer = %self.peer,
+            via = %self.via,
             path = format!("{}/{}", self.space, self.path),
             root = %root,
             size,
-            "socket published a tree write"
+            "published a tree write"
         );
         Ok(PutReceipt { root, size })
     }
@@ -1191,12 +1296,10 @@ impl SocketWriter for TreeWriter {
             .await
             .map_err(write_refusal)?;
         tracing::info!(
-            socket = %self.socket,
-            invocation = self.invocation,
-            peer = %self.peer,
+            via = %self.via,
             path = format!("{}/{}", self.space, self.path),
             still_published = deleted.still_published,
-            "socket published a tree delete"
+            "published a tree delete"
         );
         Ok(())
     }

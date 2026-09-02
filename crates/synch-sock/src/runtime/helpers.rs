@@ -3151,7 +3151,7 @@ fn writer_not_accepting(writer: &WriterSlot) -> Option<i64> {
     }
     if writer.delivered.get()
         || writer.op_pending.get()
-        || writer.command.get().is_some()
+        || writer.command.borrow().is_some()
         || writer.result.borrow().is_some()
     {
         return Some(errno::ESTATE);
@@ -3230,7 +3230,7 @@ fn h_put_open(
         capability,
         buf: std::cell::RefCell::new(std::collections::VecDeque::new()),
         work: Rc::new(tokio::sync::Notify::new()),
-        command: std::cell::Cell::new(None),
+        command: std::cell::RefCell::new(None),
         dispatched: std::cell::Cell::new(None),
         op_pending: std::cell::Cell::new(false),
         result: std::cell::RefCell::new(None),
@@ -3413,7 +3413,7 @@ fn put_op(
             }
         }
     }
-    if writer.op_pending.get() || writer.command.get().is_some() {
+    if writer.op_pending.get() || writer.command.borrow().is_some() {
         return ret(errno::EAGAIN);
     }
     if writer.delivered.get() {
@@ -3458,7 +3458,7 @@ fn put_op(
     {
         return ret(errno::ELIMIT);
     }
-    writer.command.set(Some(command));
+    *writer.command.borrow_mut() = Some(command);
     writer.dispatched.set(Some(kind));
     writer.op_pending.set(true);
     writer.work.notify_one();

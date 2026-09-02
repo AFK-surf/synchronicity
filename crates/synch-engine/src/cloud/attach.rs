@@ -473,6 +473,18 @@ impl Node {
     pub(crate) fn sign_attach(&self, url: &str, nonce: &[u8]) -> iroh_base::Signature {
         self.secret().sign(&attach_signing_input(url, nonce))
     }
+
+    /// Signs a *write-tunnel* attach challenge with the active device key
+    /// (`docs/CLOUD-WRITES.md` §5.2).
+    ///
+    /// Public, because the write tunnel is opened by an embedder — the cloud
+    /// data plane — and the secret never leaves the engine. What is exposed is
+    /// one signature under one fixed tag, never the key: a caller cannot make
+    /// this sign a head, a browse proof, or anything of its own choosing.
+    pub fn sign_write_attach(&self, url: &str, nonce: &[u8]) -> iroh_base::Signature {
+        self.secret()
+            .sign(&crate::cloud::frame::write_attach_signing_input(url, nonce))
+    }
 }
 
 /// The endpoints this domain's base attaches to, and how long the answer

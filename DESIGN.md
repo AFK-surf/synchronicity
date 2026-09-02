@@ -2105,7 +2105,12 @@ CI (GitHub Actions):
   and such a program may, within prefixes its own manifest declares, cause the callee
   to *publish* new versions of its own view (docs/TREE-WRITES.md). Every such write
   is the callee's own assertion, so the version model bounds it — divergence stays
-  first-class and visible, and no other origin's assertion can be touched.
+  first-class and visible, and no other origin's assertion can be touched. An org
+  that hosts a network on a control plane (docs/CLOUD-DATAPLANE.md) extends the same
+  grant once more: that control plane's hosted member may publish versions on the
+  org's members' behalf, through the control plane's file API, attributed to that
+  member and bounded by the version model as every publish is
+  (docs/CLOUD-WRITES.md).
 - **Protocol integrity**: trie nodes are verified against requested hashes, heads
   against origin signatures, and content received from peers against object roots per
   16 KiB group. A compromised peer can withhold, but never inject bytes. LocalFs and

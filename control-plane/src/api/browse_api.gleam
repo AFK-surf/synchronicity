@@ -17,6 +17,7 @@
 
 import api/agent.{type Session}
 import api/auth_api.{type AuthContext}
+import api/cloud_writer
 import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
 import api/middleware.{error_json}
 import api/reads.{type Reads}
@@ -31,14 +32,23 @@ import store/sqlite.{type Connection, Int as VInt, Text}
 import wisp.{type Request, type Response}
 
 /// What a browse route needs beyond the ordinary API context: where the live
-/// sessions are.
+/// sessions are — the daemons attached to be read from, and the hosted
+/// replicas attached to be written to (docs/CLOUD-WRITES.md §4.5).
 pub type Browse {
-  Browse(registry: Name(agent.Msg), attach_url: String)
+  Browse(
+    registry: Name(agent.Msg),
+    attach_url: String,
+    writers: Name(cloud_writer.Msg),
+    write_attach_url: String,
+  )
 }
 
 /// The durable facts a browse call turns on.
+///
+/// `hosted` is the whole of the write gate: a hosted network takes writes,
+/// and no other does (docs/CLOUD-WRITES.md §4.1).
 type Network {
-  Network(org_id: String, network_id: String, enabled: Bool)
+  Network(org_id: String, network_id: String, enabled: Bool, hosted: Bool)
 }
 
 // -- status ------------------------------------------------------------------
@@ -56,11 +66,32 @@ pub fn status(
 ) -> Response {
   use net <- with_network(reads, who, slug, network, Member)
   let sessions = attached(browse, net)
+  // The write half: on while the network is hosted, and served once the
+  // hosted replica's write tunnel is attached to this node. Reported so the
+  // file browser can tell "writes are off" from "the tenant is mid-restart".
+  let writers = case net.hosted {
+    True -> cloud_writer.sessions_for(writers(browse), net.network_id)
+    False -> []
+  }
   ok_json(
     json.object([
       #("enabled", json.bool(net.enabled)),
       #("devices", json.array(sessions, agent.session_json)),
       #("attach_url", json.string(browse.attach_url)),
+      #(
+        "writes",
+        json.object([
+          #("enabled", json.bool(net.hosted)),
+          #("attached", json.bool(writers != [])),
+          #(
+            "device",
+            json.string(case cloud_writer.pick(writers) {
+              Ok(session) -> session.label
+              Error(Nil) -> ""
+            }),
+          ),
+        ]),
+      ),
     ]),
   )
 }
@@ -513,12 +544,13 @@ fn resolve(
   case
     sqlite.query(
       conn,
-      "SELECT id, browse_enabled FROM networks WHERE org_id = ? AND name = ?",
+      "SELECT id, browse_enabled, cloud_hosted FROM networks
+        WHERE org_id = ? AND name = ?",
       [Text(org_id), Text(network)],
     )
   {
-    Ok([[Text(network_id), VInt(enabled)]]) ->
-      Ok(Network(org_id, network_id, enabled != 0))
+    Ok([[Text(network_id), VInt(enabled), VInt(hosted)]]) ->
+      Ok(Network(org_id, network_id, enabled != 0, hosted != 0))
     Ok(_) -> Error(error_json(404, "not_found", "no such network"))
     Error(_) -> Error(db_error())
   }
@@ -604,13 +636,13 @@ pub fn for_download(
   who: Principal,
   slug: String,
   network: String,
-) -> Result(#(String, String, Bool), Nil) {
+) -> Result(#(String, String, Bool, Bool), Nil) {
   case
     pool.with_connection(db, fn(conn) {
       resolve(conn, slug, network, who, Member)
     })
   {
-    Ok(Ok(net)) -> Ok(#(net.org_id, net.network_id, net.enabled))
+    Ok(Ok(net)) -> Ok(#(net.org_id, net.network_id, net.enabled, net.hosted))
     _ -> Error(Nil)
   }
 }
@@ -618,6 +650,11 @@ pub fn for_download(
 /// The registry a browse context addresses.
 pub fn registry(browse: Browse) -> process.Subject(agent.Msg) {
   process.named_subject(browse.registry)
+}
+
+/// The write registry a browse context addresses.
+pub fn writers(browse: Browse) -> process.Subject(cloud_writer.Msg) {
+  process.named_subject(browse.writers)
 }
 
 /// A daemon's coded refusal, as an HTTP status a browser can act on.

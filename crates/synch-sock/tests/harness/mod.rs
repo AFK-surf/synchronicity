@@ -205,6 +205,14 @@ impl synch_sock::SocketWriter for FakeWriter {
                     ));
                 }
             }
+            // One origin in the fake, so the selected version is its own.
+            synch_sock::PutCondition::Selected { root, .. } => {
+                if current.map(|bytes| Hash::new(bytes)) != root {
+                    return Err(HostError::Conflict(
+                        "the selected version is not the expected one".into(),
+                    ));
+                }
+            }
         }
         let bytes = std::mem::take(&mut self.staged);
         let receipt = synch_sock::PutReceipt {
@@ -245,6 +253,9 @@ impl synch_sock::SocketWriter for FakeWriter {
             synch_sock::PutCondition::Absent => current.is_none(),
             synch_sock::PutCondition::Root(root) => {
                 current.is_some_and(|bytes| Hash::new(bytes) == root)
+            }
+            synch_sock::PutCondition::Selected { root, .. } => {
+                current.map(|bytes| Hash::new(bytes)) == root
             }
         };
         if !allowed {
