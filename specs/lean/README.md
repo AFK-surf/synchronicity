@@ -20,28 +20,49 @@ The proof boundary is explicit:
 - production deletion of durable content re-checks entry, pin, and writer
   protection; the only unconditional deletion helper is compiled for tests and
   lies outside the safety transition system;
-- a *staged* row (`durable = 0`) may be dropped without consulting pins — by
-  cache eviction, a scratch-generation reset, or a backend migration — and
-  `SystemSafety.DropStaged` models that. It is safe because `Pin` and
-  `TakePossession` require `Available`, which requires `durable`, and
-  `Store::pin`/`take_possession` enforce exactly that predicate
-  (`staged_row_drop_is_unpinned`);
+- a *staged* row (`durable = 0`) — the complete commit of a backend whose
+  completion is not durable until `finalize` — may be dropped without
+  consulting pins, by cache eviction, a scratch-generation reset, or a backend
+  migration. `Cas.CommitComplete`'s second branch creates it and
+  `Cas.DropStaged` removes it; `SystemSafety.staged_row_is_reachable` is the
+  witness that both are live. It is safe because a pin is only ever granted
+  over available content (`Cas.NoLoss`), which `Store::pin`/`take_possession`
+  enforce (`staged_row_drop_is_unpinned`);
 - verified content hashes identify the bytes, and — in `SystemSafety` — the
   configured durable backend satisfies its write contract. `FaultTolerant`
   drops that last assumption: it adds unguarded loss steps and the two
   `heal_missing_*` transitions, and proves the weaker invariant that survives
   them (below).
 
-There are four layers:
+The CAS transitions are stated once, in `Cas`, over a cell indexed by a holder
+type `H` with a `Roles` instance saying which holders are sources or replicas
+rather than the operator. Every other CAS file is that model read at a holder
+type or closed over a step set:
 
-- `CasGc` and `MptGc` are the compact, single-root protocol explanation;
-- `SystemSafety` indexes content by root and claims by holder, and treats the
-  materialized leaves of active tries as `sourceLive`, `replicaLive`, or
-  metadata-only `ordinaryLive` relations;
+- `Cas` is the twenty-three cell transitions, their Rust anchors, and the two
+  invariants: `Invariant`, what every transition preserves (a role's pin stands
+  on a durable claim; a live leaf's holder is a role with a pin or a want
+  behind it), and `NoLoss`, what only the fault-free transitions preserve
+  (every pin stands on available content; a source leaf is pinned, never
+  merely wanted). `invariant_step` and `noLoss_step` are the only
+  case-by-case preservation proofs in the package;
+- `SystemSafety` is the fault-free closure over a store of cells indexed by
+  content root, with invariant `Invariant ∧ NoLoss`. It fixes `Holder := Nat`
+  with the operator at `0`;
+- `CasGc` is `SystemSafety` at `H := Unit`: one pin, one want, one leaf, and
+  the theorems as the protocol is usually explained. It proves nothing of its
+  own and carries no anchors;
+- `FaultTolerant` adds `LoseRemote`, `LoseBytes`, `HealRemote` and `HealLocal`
+  over the same cells and proves that `Invariant` alone survives them, reusing
+  `Cas.invariant_step` for the cell transitions;
+- `Safety` is the CAS/trie bridge: publication and promotion pair the cell
+  transition with the `MptGc` head flip they share a transaction with, across
+  every content root the transaction touches (`Across`), on top of
+  `SystemSafety`'s invariant;
+- `MptGc` is the compact per-trie-root abstraction of pending-head promotion
+  and trie GC;
 - `TrieGraph` states GC's graph obligation over every node reachable from every
   retained trie root;
-- `FaultTolerant` re-proves the system invariant with the backend allowed to
-  lose what it acknowledged;
 - `Scope` and `ScopedSync` open the `complete` bit of `MptGc` for a node that
   reads under a delegation scope (§5.5): the scoped fetch walk over a partial
   trie, its pruning against a reference root, the responder's authorization by
@@ -61,21 +82,21 @@ The principal system theorems are
 `SystemSafety.replica_live_content_is_pin_or_want`. They quantify over the
 actual holder and content root, so a claim for one root cannot discharge a leaf
 for another. The reachable transition closure includes writes and aborts,
-cache eviction, staged-row removal, remote adoption, publication/promotion,
-materialized-leaf and entry removal, pin/unpin/expiry, want
-removal/take-possession, protected deletion, and both GC phases.
-`TrieGraph.gc_preserves_complete_retained_root` supplies the analogous
-node-graph property.
+durable and staged commits, cache eviction, staged-row removal, remote
+adoption, publication/promotion, materialized-leaf and entry removal,
+pin/unpin/expiry, want removal/take-possession, protected deletion, and both
+GC phases. `TrieGraph.gc_preserves_complete_retained_root` supplies the
+analogous node-graph property.
 
-`FaultTolerant` is the same cell and the same twenty-two transitions with two
+`FaultTolerant` is the same cells and the same transitions with two
 environment steps added — `LoseRemote` and `LoseBytes`, with no guard — and the
 two heals Rust runs when a read discovers the loss. `HealRemote` and `HealLocal`
 mirror `heal_missing_durable_blob` and `heal_missing_local_blob`: withdraw the
 durable claim, turn every role holder's pin into a repair want, leave the
 operator's pin alone. Live holders are roles (`IsRole`), which is why
 `SourcePublish` and `ReplicaPromote` carry that guard. The invariant that
-survives replaces `Available` with `Durable` (row present, backend claim
-standing) and gives the operator no clause. Its theorems:
+survives is `Cas.Invariant`: `Available` replaced by `Durable` (row present,
+backend claim standing) and no clause for the operator. Its theorems:
 `role_pin_stands_on_durable_row`, or equivalently `role_pin_is_available_or_lost`
 — a source's or replica's pin stands on content that is available or that the
 backend has lost and the heal has not yet run; `no_role_pin_over_withdrawn_claim`;

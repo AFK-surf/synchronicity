@@ -111,7 +111,7 @@ impl Store {
     /// Drops one want, whether it was satisfied or has stopped being wanted.
     pub fn drop_want(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
         // LEAN-MODEL: cas-drop-want
-        // `SystemSafety.DropWant` requires the replica leaf to have left the
+        // `Cas.DropWant` requires the replica leaf to have left the
         // materialized active view before its unsatisfied intent is retired;
         // the entry guard makes that requirement local to this DELETE.
         Ok(self.conn().execute(
@@ -133,7 +133,7 @@ impl Store {
     /// window is entitled to take it.
     pub fn take_possession(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
         // LEAN-MODEL: cas-take-possession
-        // `CasGc.TakePossession` is this immediate want-to-pin transaction;
+        // `Cas.TakePossession` is this immediate want-to-pin transaction;
         // its availability check is part of the transition, not a caller fact.
         self.with_immediate_tx(|tx| {
             // Held durably, not merely known or cached. A `blobs` row exists

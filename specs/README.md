@@ -57,11 +57,13 @@ proof.
 
 ## Lean — CAS / mptsync / ingest safety
 
-[`lean/`](lean/) contains unbounded inductive proofs at five resolutions: the
-small per-root protocol, a root/holder-indexed system model whose live relations
-are the content leaves materialized from active tries, a graph model of trie
-mark/sweep, a fault-tolerant re-proof of the system model with the durable
-backend allowed to lose what it acknowledged, and a positional model of mptsync
+[`lean/`](lean/) contains unbounded inductive proofs at five resolutions, all
+over one statement of the CAS transitions (`Cas`, generic in the holder type):
+the small per-root protocol (`CasGc`, the holder collapsed to `Unit`), the
+root/holder-indexed system model whose live relations are the content leaves
+materialized from active tries, a graph model of trie mark/sweep, the same
+system model with the durable backend allowed to lose what it acknowledged
+(`FaultTolerant`, four added steps over the shared invariant), and a positional model of mptsync
 over partial tries — the scoped fetch walk a delegate runs, its pruning against
 a reference root, the responder's authorization by position, and the privacy
 theorem that a delegate holds nothing that spells a key outside its scope
@@ -76,8 +78,10 @@ state, with the graft of #115 as the witness that they exclude it
 live source leaf names available content and every live replica leaf names
 either pinned available content or a want for that same holder and root. It
 covers protection removal as well as acquisition, protected explicit deletion,
-writer abort, cache eviction, the unprotected removal of staged (non-durable)
-rows, and the two GC phases. Under backend loss, the surviving theorem is that
+writer abort, cache eviction, the staged (non-durable) commit and the
+unprotected removal of such rows, and the two GC phases. The CAS/trie bridge
+(`Safety`) pairs each publication and promotion with its head flip across every
+content root the transaction touches, on that same system model. Under backend loss, the surviving theorem is that
 a role's pin stands on content that is available or that the backend lost and
 the heal has not yet converted into a want. Rust and Lean carry matching checked
 anchors at their linearization points; run `lean/check-anchors.sh` after

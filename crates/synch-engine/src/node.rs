@@ -1502,7 +1502,7 @@ impl Node {
         let head = self
             .store()
             // LEAN-MODEL: cas-source-publish
-            // `Safety.sourcePublish` pairs `CasGc.SourcePublish` with the trie
+            // `Safety.sourcePublish` pairs `Cas.SourcePublish` with the trie
             // transition below: durable check, pin, entry and head share commit.
             // LEAN-MODEL: mpt-own-publish
             // `MptGc.OwnPublish` models the trie/head/materialized side of this

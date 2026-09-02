@@ -1,3 +1,4 @@
+import Synchronicity.Cas
 import Synchronicity.CasGc
 import Synchronicity.Convergence
 import Synchronicity.FaultTolerant
