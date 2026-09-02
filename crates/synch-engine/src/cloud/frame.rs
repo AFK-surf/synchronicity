@@ -64,7 +64,7 @@ pub(crate) const ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-attach-v1";
 /// The write tunnel is the data plane's, not this module's — its frames live
 /// in `synch-dp`, so that no daemon links a decoder for them — but the proof
 /// is minted by the engine, because the device secret never leaves it. A
-/// distinct tag from [`ATTACH_SIGNING_DOMAIN`] is what makes "a browse proof
+/// distinct tag from `ATTACH_SIGNING_DOMAIN` is what makes "a browse proof
 /// cannot be replayed at the write endpoint" a statement about the signature
 /// rather than about two URLs happening to differ.
 pub const WRITE_ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-write-v1";
@@ -100,7 +100,7 @@ pub(crate) fn attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
 /// "synch-cloud-write-v1" || url || nonce
 /// ```
 ///
-/// The same shape as [`attach_signing_input`] under its own tag, for the same
+/// The same shape as `attach_signing_input` under its own tag, for the same
 /// reasons: fixed-width nonce last, URL bound.
 pub fn write_attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
     signing_input(WRITE_ATTACH_SIGNING_DOMAIN, url, nonce)
