@@ -1,6 +1,14 @@
 # Cloud writes — write support on the control-plane file API
 
-Status: **proposal** · 2026-09-02
+Status: **implemented** · 2026-09-02
+
+The engine half is `Node::open_tree_write` and `PutCondition::Selected`
+(`crates/synch-engine/src/sockets.rs`, `crates/synch-sock/src/lib.rs`), the
+data-plane half is `crates/synch-dp/src/writes.rs`, the control-plane half is
+`control-plane/src/api/cloud_writer.gleam` with the routes in
+`api/browse_file.gleam` and `api/edge.gleam`, and the dashboard's upload and
+withdraw controls are on the Files page. Where the built thing settled a
+detail differently from the draft, the text below says so at that point.
 
 This document designs **write support for the control plane's file API**: a
 `PUT` and a `DELETE` beside the `GET` that `…/browse/file` already answers, so
@@ -649,11 +657,17 @@ across every replica **plus** its own published bytes plus `size` fit under
 concurrent writes by at most one in-flight write per session, and convergent,
 the same posture the replica budget takes.
 
-The heartbeat gains `published_roots` and `published_bytes` — `cloud-1`'s
-own assertions — beside `held_*`. Billing already falls out of the prefix
-inventory (CLOUD-DATAPLANE §5.1); this is so the invoice's line items and the
-status panel can say which bytes the org *put there* as against which it
-*kept*.
+As built, the check counts the bytes the tenant's replicas hold: a written
+object is named by `cloud-1`'s own entry and therefore acquired by the
+replica of its space on the next pass, so it enters `held_bytes` there and
+is counted from then on. What the check does not yet see is a write that
+landed in the last pass's window, which is the same one-acquisition
+overshoot the replica budget accepts.
+
+The heartbeat does not yet carry `published_roots` / `published_bytes` —
+`cloud-1`'s own assertions apart from what it kept. Billing already falls out
+of the prefix inventory (CLOUD-DATAPLANE §5.1), and the field is the next
+thing to add when an invoice wants to say which bytes the org *put there*.
 
 ### 6.5 The database stream and the ack window
 
@@ -721,13 +735,17 @@ Two, both of independent value and both small:
   `pub(crate)`. `Node::open_tree_write(space, path) -> TreeWriter` exposes the
   writer that already exists, so SFTP, sockets and the data plane commit
   through one seam.
-- **(f) A second condition kind.** `PutCondition` gains `Selected { policy,
-  expected: Option<Hash> }`: hold if the version `VersionPolicy` selects for
-  the path has root `expected` (`None` meaning no live version). Evaluated
-  in the same place and under the same lock as `Absent` and `Root`, against
+- **(f) A second condition kind.** `PutCondition` gains `Selected { from:
+  Option<OriginId>, root: Option<Hash> }`: hold if the version the unified
+  tree selects for the path — `newest`, or the origin `from` names — has
+  root `root` (`None` meaning no live version). Spelled with an origin
+  rather than a `VersionPolicy` because the type lives in `synch-sock`,
+  which knows the core's types and not the store's. Evaluated in the same
+  place and under the same lock as `Absent` and `Root`, against
   `Node::resolve`. The existing kinds are untouched and keep TREE-WRITES
   §5.3's meaning; the `sy_put_*` ABI does not expose the new one until a
-  program needs it.
+  program needs it. `PutCondition` stops being `Copy`, which cost the socket
+  runtime one `Cell` becoming a `RefCell`.
 
 Nothing in `cloud/frame.rs`, `cloud/attach.rs`, the browse registry or the
 membership code changes. The daemon binary gains no write-capable frame
@@ -851,7 +869,7 @@ decoder.
 
 ---
 
-## 12. Implementation plan and tests
+## 12. What was built, and the tests that hold it
 
 1. **Engine** — (e) and (f) of §7, with a unit test that `Selected` holds and
    fails against `resolve` under the lock, and that the existing `Absent` and
@@ -875,12 +893,14 @@ decoder.
    path only `nas` publishes answers `still_published: true` and
    `withdrawn: false` and stages no tombstone, and two deletes of one
    `cloud-1` path publish one.
-4. **End to end** — `control-plane/e2e/cloud-dataplane.sh` grows one act:
-   after both customer files are durable, enable writes, `PUT` a third file
-   through the control plane, and assert that the third customer node — which
-   starts only afterwards — reads it with `cloud-1` as its origin; then
+4. **End to end** — not in this change. `control-plane/e2e/cloud-dataplane.sh`
+   should grow one act: after both customer files are durable, `PUT` a third
+   file through the control plane, and assert that the third customer node —
+   which starts only afterwards — reads it with `cloud-1` as its origin; then
    `DELETE` one of the customer files through the control plane and assert it
-   is still readable, its version list naming the customer origin only.
+   is still readable, its version list naming the customer origin only. The
+   script runs only against a live MinIO in CI, and a change to it that was
+   never run is not a test.
 5. **Docs** — §13.
 
 ---

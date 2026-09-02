@@ -10,11 +10,15 @@ import {
   browseQuery,
   get,
   send,
+  writeFile,
   type BrowseDevice,
   type BrowseEntry,
   type BrowseListing,
   type BrowseStatus,
   type BrowseVersion,
+  type BrowseWrites,
+  type WithdrawnFile,
+  type WrittenFile,
 } from '../lib/api'
 import { bytes } from '../lib/format'
 import {
@@ -91,6 +95,7 @@ export function NetworkFiles() {
               space={chosen}
               path={path}
               origin={pinned}
+              writes={status.data.writes}
               onNavigate={(next) =>
                 setParams({ space: chosen, origin: pinned, path: next })
               }
@@ -294,15 +299,72 @@ function Directory({
   space,
   path,
   origin,
+  writes,
   onNavigate,
 }: {
   base: string
   space: string
   path: string
   origin: string
+  writes: BrowseWrites
   onNavigate: (path: string) => void
 }) {
+  const queryClient = useQueryClient()
   const [open, setOpen] = useState('')
+  // What the last write did, in words: an upload is expected to make
+  // divergence where a customer already published the path, and a delete
+  // withdraws the cloud's version and never a customer's — both are worth
+  // saying rather than showing a green tick.
+  const [written, setWritten] = useState('')
+  const [writeError, setWriteError] = useState('')
+  const refresh = () =>
+    queryClient.invalidateQueries({ queryKey: ['browse-ls', base, space] })
+  const upload = useMutation({
+    mutationFn: (file: File) =>
+      writeFile(
+        `${base}/file${browseQuery({
+          space,
+          path: path === '' ? file.name : `${path}/${file.name}`,
+        })}`,
+        'PUT',
+        file,
+      ) as Promise<WrittenFile>,
+    onSuccess: (result) => {
+      setWriteError('')
+      setWritten(
+        `${result.path} published as ${result.device}'s version (${bytes(result.size)}, root ${result.root.slice(0, 12)}…). Where another node publishes this path, both versions now show.`,
+      )
+      refresh()
+    },
+    onError: (error: Error) => {
+      setWritten('')
+      setWriteError(error.message)
+    },
+  })
+  const remove = useMutation({
+    mutationFn: (entryPath: string) =>
+      writeFile(
+        `${base}/file${browseQuery({ space, path: entryPath })}`,
+        'DELETE',
+      ) as Promise<WithdrawnFile>,
+    onSuccess: (result) => {
+      setWriteError('')
+      setWritten(
+        result.withdrawn
+          ? result.still_published
+            ? `${result.device}'s version of ${result.path} is withdrawn; another node still publishes this file, and only that node can retract it.`
+            : `${result.device}'s version of ${result.path} is withdrawn.`
+          : result.still_published
+            ? `${result.device} had no version of ${result.path} to withdraw; the file is another node's, and only that node can retract it.`
+            : `${result.device} had no version of ${result.path} to withdraw.`,
+      )
+      refresh()
+    },
+    onError: (error: Error) => {
+      setWritten('')
+      setWriteError(error.message)
+    },
+  })
   // Which file's preview row is expanded — a second, independent drawer so
   // a divergent path can show its versions and a preview at once.
   const [preview, setPreview] = useState('')
@@ -370,6 +432,35 @@ function Directory({
         </div>
       )}
       <Breadcrumb space={space} path={path} onNavigate={onNavigate} />
+      {writes.enabled && (
+        <Uploader
+          writes={writes}
+          pending={upload.isPending}
+          onPick={(file) => upload.mutate(file)}
+        />
+      )}
+      {written !== '' && (
+        <div className="mb-3 flex items-start gap-3 rounded-md border border-teal-900 bg-teal-950/40 px-3 py-2 text-sm text-teal-200">
+          <span className="flex-1">{written}</span>
+          <button
+            onClick={() => setWritten('')}
+            className="text-teal-400 hover:text-teal-200"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+      {writeError !== '' && (
+        <div className="mb-3 flex items-start gap-3 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+          <span className="flex-1">Write failed: {writeError}</span>
+          <button
+            onClick={() => setWriteError('')}
+            className="text-red-400 hover:text-red-200"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
       <div className="overflow-x-auto rounded-lg border border-neutral-800">
         <table className="w-full text-sm">
           <thead className="bg-neutral-900 text-left text-neutral-400">
@@ -397,6 +488,15 @@ function Directory({
                 }
                 onNavigate={onNavigate}
                 onDownload={startDownload}
+                canDelete={writes.enabled && writes.attached}
+                onDelete={() => {
+                  if (
+                    window.confirm(
+                      `Withdraw the cloud's version of ${entry.path}? A version another node publishes stays; only that node can retract it.`,
+                    )
+                  )
+                    remove.mutate(entry.path)
+                }}
               />
             ))}
             {entries.length === 0 && (
@@ -423,6 +523,50 @@ function Directory({
         the cluster converges — that is anti-entropy, not an error, and nothing
         is merged here.
       </p>
+    </div>
+  )
+}
+
+// The upload control: a file picker, present exactly while the network is
+// hosted, and grayed with its reason while the hosted replica's write tunnel
+// is not attached to this node. One file per pick; the path is the directory
+// being shown plus the file's own name.
+function Uploader({
+  writes,
+  pending,
+  onPick,
+}: {
+  writes: BrowseWrites
+  pending: boolean
+  onPick: (file: File) => void
+}) {
+  const ready = writes.attached && !pending
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-3 text-sm">
+      <label
+        className={
+          ready
+            ? 'cursor-pointer rounded-md bg-white px-3 py-1.5 font-medium text-neutral-950'
+            : 'rounded-md border border-neutral-800 px-3 py-1.5 text-neutral-500'
+        }
+      >
+        {pending ? 'Uploading…' : 'Upload a file'}
+        <input
+          type="file"
+          className="hidden"
+          disabled={!ready}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (file) onPick(file)
+          }}
+        />
+      </label>
+      <span className="text-xs text-neutral-500">
+        {writes.attached
+          ? `Published into this directory as ${writes.device}'s own version.`
+          : 'The hosted replica is not attached to this node yet; uploads wait for it.'}
+      </span>
     </div>
   )
 }
@@ -471,6 +615,8 @@ function Row({
   onPreview,
   onNavigate,
   onDownload,
+  canDelete,
+  onDelete,
 }: {
   base: string
   space: string
@@ -482,6 +628,8 @@ function Row({
   onPreview: () => void
   onNavigate: (path: string) => void
   onDownload: () => void
+  canDelete: boolean
+  onDelete: () => void
 }) {
   const divergent = entry.versions > 1
   // Only a plain file with a name the preview can render is clickable —
@@ -549,6 +697,15 @@ function Row({
             >
               download
             </a>
+          )}
+          {entry.kind !== 'dir' && canDelete && (
+            <button
+              onClick={onDelete}
+              title="withdraw the cloud's version of this path"
+              className="ml-3 text-sm font-medium text-neutral-500 hover:text-red-300 hover:underline"
+            >
+              withdraw
+            </button>
           )}
         </td>
       </tr>

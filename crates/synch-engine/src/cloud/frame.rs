@@ -58,8 +58,19 @@ pub(crate) fn settles_at(version: u32) -> bool {
 /// as a head signature, nor a head signature replayed as an attach proof.
 pub(crate) const ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-attach-v1";
 
+/// The domain-separation tag a *write-tunnel* attach proof signs under
+/// (`docs/CLOUD-WRITES.md` §5.2).
+///
+/// The write tunnel is the data plane's, not this module's — its frames live
+/// in `synch-dp`, so that no daemon links a decoder for them — but the proof
+/// is minted by the engine, because the device secret never leaves it. A
+/// distinct tag from [`ATTACH_SIGNING_DOMAIN`] is what makes "a browse proof
+/// cannot be replayed at the write endpoint" a statement about the signature
+/// rather than about two URLs happening to differ.
+pub const WRITE_ATTACH_SIGNING_DOMAIN: &[u8] = b"synch-cloud-write-v1";
+
 /// How many bytes an attach nonce carries.
-pub(crate) const NONCE_LEN: usize = 32;
+pub const NONCE_LEN: usize = 32;
 
 /// The largest payload one binary content frame carries.
 pub(crate) const MAX_CHUNK: usize = 64 * 1024;
@@ -80,8 +91,24 @@ pub(crate) const CHUNK_HEADER_LEN: usize = 8;
 /// for one control plane being replayed at another: the daemon signs the
 /// endpoint it actually dialed, and the endpoint checks against its own.
 pub(crate) fn attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(ATTACH_SIGNING_DOMAIN.len() + url.len() + nonce.len());
-    buf.extend_from_slice(ATTACH_SIGNING_DOMAIN);
+    signing_input(ATTACH_SIGNING_DOMAIN, url, nonce)
+}
+
+/// The exact bytes a write-tunnel attach proof covers:
+///
+/// ```text
+/// "synch-cloud-write-v1" || url || nonce
+/// ```
+///
+/// The same shape as [`attach_signing_input`] under its own tag, for the same
+/// reasons: fixed-width nonce last, URL bound.
+pub fn write_attach_signing_input(url: &str, nonce: &[u8]) -> Vec<u8> {
+    signing_input(WRITE_ATTACH_SIGNING_DOMAIN, url, nonce)
+}
+
+fn signing_input(domain: &[u8], url: &str, nonce: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(domain.len() + url.len() + nonce.len());
+    buf.extend_from_slice(domain);
     buf.extend_from_slice(url.as_bytes());
     buf.extend_from_slice(nonce);
     buf
@@ -680,6 +707,19 @@ mod tests {
         assert!(node_id.verify(&attach, &attach_sig).is_ok());
         assert!(node_id.verify(&head, &attach_sig).is_err());
         assert!(node_id.verify(&attach, &head_sig).is_err());
+    }
+
+    /// A browse proof and a write proof over the same URL and nonce differ,
+    /// so neither endpoint accepts the other's signature.
+    #[test]
+    fn a_write_attach_proof_is_not_a_browse_attach_proof() {
+        let nonce = [3u8; NONCE_LEN];
+        let url = "https://sync.example/dp/v1/attach";
+        assert_ne!(
+            attach_signing_input(url, &nonce),
+            write_attach_signing_input(url, &nonce)
+        );
+        assert!(write_attach_signing_input(url, &nonce).starts_with(WRITE_ATTACH_SIGNING_DOMAIN));
     }
 
     /// The URL is part of what is signed, so a proof cannot be forwarded to a

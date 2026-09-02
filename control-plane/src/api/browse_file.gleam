@@ -1,4 +1,5 @@
-//// Streamed downloads, below wisp because wisp has no streaming body.
+//// Streamed downloads and uploads, below wisp because wisp has no streaming
+//// body.
 ////
 //// A download ties an HTTP response to a tunnel stream. The registry grants
 //// the attached daemon a small credit window; each chunk relayed to the
@@ -14,17 +15,21 @@
 
 import api/agent.{type Session}
 import api/browse_api.{type Browse}
+import api/cloud_writer
 import api/middleware
 import auth/api_key
 import auth/principal.{type Principal, Cookie, Principal}
 import auth/session
+import envoy
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/crypto
 import gleam/erlang/process.{type Subject}
+import gleam/http.{Get, Head, Options, Put}
 import gleam/http/request.{type Request as HttpRequest}
 import gleam/http/response.{type Response as HttpResponse}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -68,7 +73,12 @@ pub fn handle(
   // behind it: a key gets its own budget rather than spending the budget of
   // whoever minted it.
   let holder = principal.actor(who)
-  use #(_org_id, network_id, enabled) <- require_network(db, who, slug, network)
+  use #(_org_id, network_id, enabled, _hosted) <- require_network(
+    db,
+    who,
+    slug,
+    network,
+  )
   use Nil <- require(enabled, 409, "file browsing is not enabled")
   use Nil <- require(
     space != "" && path != "",
@@ -150,6 +160,375 @@ pub fn handle(
 /// The plain-text refusal a download ends on.
 fn deny(status: Int, message: String) -> HttpResponse(mist.ResponseData) {
   refused(status, message)
+}
+
+// -- writes ------------------------------------------------------------------
+
+/// How many bytes one write may carry, unless `CP_WRITE_MAX_BYTES` says
+/// otherwise: 1 GiB (docs/CLOUD-WRITES.md §11). Enforced from
+/// `Content-Length` before the tunnel is touched.
+const default_write_max_bytes = 1_073_741_824
+
+/// The piece size the body is read in: the tunnel's content-frame ceiling.
+const chunk_bytes = 65_536
+
+fn write_max_bytes() -> Int {
+  case envoy.get("CP_WRITE_MAX_BYTES") {
+    Ok(text) ->
+      case int.parse(text) {
+        Ok(n) if n > 0 -> n
+        _ -> default_write_max_bytes
+      }
+    Error(Nil) -> default_write_max_bytes
+  }
+}
+
+/// `PUT`/`DELETE /api/orgs/:slug/networks/:net/browse/file?space=&path=&from=`
+/// (docs/CLOUD-WRITES.md §4.2, §4.3).
+///
+/// A write is relayed to the hosted replica's write tunnel and published
+/// there as `cloud-1`'s own version of the path; nothing is written here —
+/// no audit row, no status row — which is why a replica serves this as well
+/// as the primary (§4.4, §4.6). The gate is hosting: a hosted network takes
+/// writes, and no other does.
+pub fn write(
+  req: HttpRequest(mist.Connection),
+  browse: Browse,
+  db: Pool,
+  secret: String,
+  slug: String,
+  network: String,
+) -> HttpResponse(mist.ResponseData) {
+  let params =
+    uri.parse_query(req.query |> option.unwrap("")) |> result.unwrap([])
+  let space = param(params, "space")
+  let path = param(params, "path")
+  let from = param(params, "from")
+  let origin = param(params, "origin")
+
+  use who <- require_principal(req, db, secret)
+  let holder = principal.actor(who)
+  use #(_org_id, network_id, _enabled, hosted) <- require_network(
+    db,
+    who,
+    slug,
+    network,
+  )
+  use Nil <- require(
+    hosted,
+    409,
+    "hosting-disabled: cloud hosting is not enabled for this network, so "
+      <> "nothing of the control plane's can publish into it",
+  )
+  use Nil <- require(
+    origin == "",
+    400,
+    "invalid: origin= does not apply to a write; there is one writer",
+  )
+  use Nil <- require(
+    space != "" && path != "",
+    400,
+    "invalid: space= and path= are required",
+  )
+  let writers = browse_api.writers(browse)
+  case cloud_writer.pick(cloud_writer.sessions_for(writers, network_id)) {
+    Error(Nil) ->
+      deny(
+        503,
+        "no-cloud-attached: the hosted replica is not attached to this node; "
+          <> "hosting may still be provisioning",
+      )
+    Ok(session) ->
+      case req.method {
+        Put -> put(req, writers, session, holder, space, path, from)
+        _ -> delete(req, session, space, path, from)
+      }
+  }
+}
+
+/// The header conditions a write carries, as the tunnel spells them.
+fn conditions(req: HttpRequest(mist.Connection)) -> #(String, Bool) {
+  let if_match = case request.get_header(req, "if-match") {
+    Ok(value) -> string.trim(value) |> unquote
+    Error(Nil) -> ""
+  }
+  let if_none_match = case request.get_header(req, "if-none-match") {
+    Ok(value) -> string.trim(value) == "*"
+    Error(Nil) -> False
+  }
+  #(if_match, if_none_match)
+}
+
+fn unquote(value: String) -> String {
+  case string.starts_with(value, "\"") && string.ends_with(value, "\"") {
+    True -> string.drop_start(value, 1) |> string.drop_end(1)
+    False -> value
+  }
+}
+
+/// The body becomes `cloud-1`'s version of the path.
+fn put(
+  req: HttpRequest(mist.Connection),
+  writers: Subject(cloud_writer.Msg),
+  session: cloud_writer.Session,
+  holder: String,
+  space: String,
+  path: String,
+  from: String,
+) -> HttpResponse(mist.ResponseData) {
+  // The size travels in the tunnel's `put` frame before any byte does, so
+  // the node can refuse a write it has no room for before staging a byte
+  // of it, and verify at commit that the body was whole.
+  let size =
+    request.get_header(req, "content-length")
+    |> result.try(int.parse)
+  use size <- require_ok(
+    size,
+    411,
+    "length-required: a write carries a Content-Length",
+  )
+  use Nil <- require(size >= 0, 400, "invalid: a negative Content-Length")
+  let cap = write_max_bytes()
+  use Nil <- require(
+    size <= cap,
+    413,
+    "too-large: this deployment takes writes of up to "
+      <> int.to_string(cap)
+      <> " bytes",
+  )
+  let #(if_match, if_none_match) = conditions(req)
+  use Nil <- require(
+    !{ if_match != "" && if_none_match },
+    400,
+    "invalid: If-Match and If-None-Match cannot both be set",
+  )
+  // A write on a session cookie needs no more than the CSRF check already
+  // taken; the cap is what stops a page starting a hundred of them.
+  case cloud_writer.claim_slot(writers, holder) {
+    False ->
+      deny(
+        429,
+        "too-many-writes: too many uploads open at once (limit "
+          <> int.to_string(cloud_writer.writes_per_user())
+          <> ")",
+      )
+    True -> {
+      let response =
+        relay_write(
+          req,
+          session,
+          space,
+          path,
+          size,
+          from,
+          if_match,
+          if_none_match,
+        )
+      cloud_writer.release_slot(writers, holder)
+      response
+    }
+  }
+}
+
+/// Opens the write, streams the body under credit, commits.
+fn relay_write(
+  req: HttpRequest(mist.Connection),
+  session: cloud_writer.Session,
+  space: String,
+  path: String,
+  size: Int,
+  from: String,
+  if_match: String,
+  if_none_match: Bool,
+) -> HttpResponse(mist.ResponseData) {
+  let #(reply, opened) =
+    cloud_writer.open(session, space, path, size, from, if_match, if_none_match)
+  case opened {
+    Error(cloud_writer.Failed(code, message)) ->
+      deny(status_of_write(code), code <> ": " <> message)
+    Error(_) ->
+      deny(502, "internal: the hosted node answered the wrong question")
+    Ok(#(id, credit)) ->
+      case mist.stream(req) {
+        Error(_) -> {
+          process.send(session.inbox, cloud_writer.Cancel(id))
+          deny(400, "invalid: the request body could not be read")
+        }
+        Ok(reader) ->
+          case relay_body(reader, session, id, reply, credit, 0, 0) {
+            Error(message) -> {
+              process.send(session.inbox, cloud_writer.Cancel(id))
+              deny(400, message)
+            }
+            Ok(sent) if sent != size -> {
+              // A short body is an abort, never a truncated file published
+              // as complete: the node checks too, but nothing is gained by
+              // asking it to.
+              process.send(session.inbox, cloud_writer.Cancel(id))
+              deny(
+                400,
+                "invalid: the body carried "
+                  <> int.to_string(sent)
+                  <> " bytes of the "
+                  <> int.to_string(size)
+                  <> " Content-Length announced",
+              )
+            }
+            Ok(_) -> {
+              process.send(session.inbox, cloud_writer.Commit(id))
+              case cloud_writer.await_commit(reply) {
+                cloud_writer.Committed(root, size, seq, mtime_ns, origin) ->
+                  json_response(200, [
+                    #("device", json.string(session.label)),
+                    #("origin", json.string(origin)),
+                    #("space", json.string(space)),
+                    #("path", json.string(path)),
+                    #("root", json.string(root)),
+                    #("size", json.int(size)),
+                    #("seq", json.int(seq)),
+                    #("mtime_ns", json.int(mtime_ns)),
+                  ])
+                  |> response.set_header("etag", "\"" <> root <> "\"")
+                  |> response.set_header("x-synch-root", root)
+                  |> response.set_header("x-synch-device", session.label)
+                cloud_writer.Failed(code, message) ->
+                  deny(status_of_write(code), code <> ": " <> message)
+                _ ->
+                  deny(
+                    502,
+                    "internal: the hosted node answered the wrong question",
+                  )
+              }
+            }
+          }
+      }
+  }
+}
+
+/// Reads the body in pieces and sends each down the tunnel, waiting for
+/// credit when the window is spent — so a node slower than the browser
+/// stalls the read here, and this process never holds more than the window.
+fn relay_body(
+  reader: fn(Int) -> Result(mist.Chunk, mist.ReadError),
+  session: cloud_writer.Session,
+  id: Int,
+  reply: Subject(cloud_writer.Event),
+  credit: Int,
+  seq: Int,
+  sent: Int,
+) -> Result(Int, String) {
+  case reader(chunk_bytes) {
+    Error(_) -> Error("invalid: the request body could not be read")
+    Ok(mist.Done) -> Ok(sent)
+    Ok(mist.Chunk(data, next)) ->
+      case send_pieces(data, session, id, reply, credit, seq) {
+        Error(message) -> Error(message)
+        Ok(#(credit, seq)) ->
+          relay_body(
+            next,
+            session,
+            id,
+            reply,
+            credit,
+            seq,
+            sent + bit_array.byte_size(data),
+          )
+      }
+  }
+}
+
+/// Sends one read's bytes as as many frames as the chunk ceiling needs.
+fn send_pieces(
+  data: BitArray,
+  session: cloud_writer.Session,
+  id: Int,
+  reply: Subject(cloud_writer.Event),
+  credit: Int,
+  seq: Int,
+) -> Result(#(Int, Int), String) {
+  case bit_array.byte_size(data) {
+    0 -> Ok(#(credit, seq))
+    n -> {
+      let take = int.min(n, chunk_bytes)
+      let assert Ok(piece) = bit_array.slice(data, 0, take)
+      let assert Ok(rest) = bit_array.slice(data, take, n - take)
+      use credit <- result.try(case credit {
+        0 ->
+          case cloud_writer.await_credit(reply) {
+            Ok(n) -> Ok(n)
+            Error(cloud_writer.Failed(code, message)) ->
+              Error(code <> ": " <> message)
+            Error(_) ->
+              Error("internal: the hosted node answered the wrong question")
+          }
+        n -> Ok(n)
+      })
+      process.send(session.inbox, cloud_writer.Chunk(id, seq, piece))
+      send_pieces(rest, session, id, reply, credit - 1, seq + 1)
+    }
+  }
+}
+
+/// Withdraws `cloud-1`'s version of the path, where there is one.
+fn delete(
+  req: HttpRequest(mist.Connection),
+  session: cloud_writer.Session,
+  space: String,
+  path: String,
+  from: String,
+) -> HttpResponse(mist.ResponseData) {
+  let #(if_match, _) = conditions(req)
+  case cloud_writer.remove(session, space, path, from, if_match) {
+    cloud_writer.Deleted(still_published, withdrawn) ->
+      json_response(200, [
+        #("device", json.string(session.label)),
+        #("origin", json.string(session.origin)),
+        #("space", json.string(space)),
+        #("path", json.string(path)),
+        #("withdrawn", json.bool(withdrawn)),
+        #("still_published", json.bool(still_published)),
+      ])
+    cloud_writer.Failed(code, message) ->
+      deny(status_of_write(code), code <> ": " <> message)
+    _ -> deny(502, "internal: the hosted node answered the wrong question")
+  }
+}
+
+/// A write's coded refusal, as an HTTP status a client can branch on.
+fn status_of_write(code: String) -> Int {
+  case code {
+    "not-found" | "not_found" -> 404
+    "invalid" -> 400
+    "precondition" -> 412
+    "too-large" -> 413
+    "over-budget" -> 507
+    "unavailable" -> 503
+    _ -> 502
+  }
+}
+
+fn json_response(
+  status: Int,
+  fields: List(#(String, json.Json)),
+) -> HttpResponse(mist.ResponseData) {
+  response.new(status)
+  |> response.set_header("content-type", "application/json")
+  |> response.set_header("x-content-type-options", "nosniff")
+  |> response.set_body(
+    mist.Bytes(bytes_tree.from_string(json.to_string(json.object(fields)))),
+  )
+}
+
+fn require_ok(
+  value: Result(a, b),
+  status: Int,
+  message: String,
+  next: fn(a) -> HttpResponse(mist.ResponseData),
+) -> HttpResponse(mist.ResponseData) {
+  case value {
+    Ok(value) -> next(value)
+    Error(_) -> refused(status, message)
+  }
 }
 
 /// A 416 carries `Content-Range: bytes */<size>` (RFC 7233 §4.2), so a client
@@ -291,7 +670,10 @@ fn require_principal(
 /// The same signed value wisp writes and the same secret it signs with, so a
 /// cookie minted by the ordinary sign-in works unchanged; the database is then
 /// what says whether the session is live, exactly as `middleware.check_session`
-/// does. No CSRF: this is a GET, and a read needs none.
+/// does. A read needs no CSRF token; a write on a cookie needs the same
+/// double submit `middleware.check_session` demands above the wisp line —
+/// the rule is shared, the function cannot be, since it speaks wisp's
+/// request and this route sits below it.
 fn require_session(
   req: HttpRequest(mist.Connection),
   db: Pool,
@@ -313,7 +695,17 @@ fn require_session(
           session.get(conn, token, now_unix())
         })
       {
-        Ok(Ok(live)) -> next(Principal(live.user_id, Cookie(live.csrf)))
+        Ok(Ok(live)) ->
+          case req.method {
+            Get | Head | Options ->
+              next(Principal(live.user_id, Cookie(live.csrf)))
+            _ ->
+              case request.get_header(req, "x-csrf") {
+                Ok(header) if header == live.csrf ->
+                  next(Principal(live.user_id, Cookie(live.csrf)))
+                _ -> refused(403, "csrf: missing or wrong x-csrf header")
+              }
+          }
         Ok(Error(Nil)) -> refused(401, "session expired")
         Error(_) -> refused(500, "database unavailable")
       }
@@ -325,7 +717,7 @@ fn require_network(
   who: Principal,
   slug: String,
   network: String,
-  next: fn(#(String, String, Bool)) -> HttpResponse(mist.ResponseData),
+  next: fn(#(String, String, Bool, Bool)) -> HttpResponse(mist.ResponseData),
 ) -> HttpResponse(mist.ResponseData) {
   case browse_api.for_download(db, who, slug, network) {
     Ok(facts) -> next(facts)

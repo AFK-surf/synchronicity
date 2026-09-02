@@ -30,6 +30,13 @@ celld-ltx = { git = "https://github.com/denoland/celld", rev = "a52f9905425bc411
 axum = { workspace = true, features = ["json"] }
 blake3.workspace = true
 clap.workspace = true
+# The write tunnel (`docs/CLOUD-WRITES.md` §5): the data plane dials the
+# control plane over WebSocket, as the engine's browse tunnel does, and the
+# write frames live here rather than in the engine so that no daemon links a
+# decoder for them.
+futures-util.workspace = true
+hex.workspace = true
+tokio-tungstenite.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustls.workspace = true
 serde.workspace = true

@@ -21,6 +21,7 @@ pub mod rotation;
 pub mod spaces;
 pub mod store;
 pub mod tenant;
+pub mod writes;
 
 pub use config::{DpConfig, SLOT};
 pub use error::{DpError, Result};

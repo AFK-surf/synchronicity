@@ -307,7 +307,10 @@ runtime's half is the writer handle (`Slot::Writer`): a bounded staging
 buffer the guest fills, drained by a per-writer pump task that owns the
 `SocketWriter`, so closing the handle uncommitted drops it and the staging
 behind it. The engine's implementation (`TreeWriter`) is a re-composition of
-what the control-service `Put` handler already does, gate for gate:
+what the control-service `Put` handler already does, gate for gate — and it
+is the seam three callers now drive: this runtime, the SFTP adapter, and the
+cloud data plane's write tunnel, which opens one through the public
+`Node::open_tree_write` with every mode granted (docs/CLOUD-WRITES.md §6.3):
 
 - open: `ensure_adoptable` (publishable + `.syncignore`),
   `normalized_adoption_path`, the declared-socket refusal, then
@@ -500,5 +503,11 @@ Worth building next:
   `delete_if` for protocol adapters, but the `sy_put_*` ABI still exposes only
   the unconditional delete operation until a program needs tombstone CAS
   semantics directly.
+- **A guest-facing `Selected` condition.** `PutCondition::Selected` — hold
+  if the version the *unified tree* selects has a given root, rather than
+  this node's own entry — exists for the control plane's file API
+  (docs/CLOUD-WRITES.md §4.3), where the caller read the path through a
+  selecting surface. The `sy_put_*` ABI does not expose it until a program
+  needs it.
 - **A commit metadata object** (JSON) if modes or content-type-style operator
   config ever earn their place — the JSON-handle convention leaves room.

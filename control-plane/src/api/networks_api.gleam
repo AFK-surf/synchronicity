@@ -4,6 +4,8 @@
 //// api/devices_api.
 
 import api/auth_api.{type AuthContext, with_db}
+import api/browse_api.{type Browse}
+import api/cloud_writer
 import api/common.{
   Admin, Member, audit, body_decoder, constraint_response, db_error, find_device,
   find_network, ok_json, require_org, text_at, zone_mutation,
@@ -322,6 +324,7 @@ pub fn delete_network(
 pub fn set_cloud_hosting(
   req: Request,
   ctx: AuthContext,
+  browse: Browse,
   who: Principal,
   slug: String,
   network: String,
@@ -343,107 +346,91 @@ pub fn set_cloud_hosting(
           True -> #(publish.Widening, 1, "cloud-hosting.enable")
           False -> #(publish.Narrowing, 0, "cloud-hosting.disable")
         }
-        zone_mutation(conn, ctx, who, change, fn() {
-          let work = {
-            // Read before the write: whether this network was *actually*
-            // hosted a moment ago is what decides whether there is anything
-            // to collect. Disabling a network that was already off must not
-            // start a clock — a dashboard syncing its initial state, or an
-            // IaC provider writing `cloud_hosted = false` explicitly, would
-            // otherwise queue a deletion instruction for a prefix that never
-            // existed.
-            use was_hosted <- result.try(is_hosted(conn, network_id))
-            use _ <- result.try(
-              sqlite.exec(
-                conn,
-                "UPDATE networks SET cloud_hosted = ?1 WHERE id = ?2",
-                [VInt(flag), Text(network_id)],
-              ),
-            )
-            use _ <- result.try(case enabled, was_hosted {
-              // Back on inside the hold: the tenant is re-provisioned rather
-              // than collected, so the instruction to delete its bytes goes.
-              True, _ ->
+        let response =
+          zone_mutation(conn, ctx, who, change, fn() {
+            let work = {
+              // Read before the write: whether this network was *actually*
+              // hosted a moment ago is what decides whether there is anything
+              // to collect. Disabling a network that was already off must not
+              // start a clock — a dashboard syncing its initial state, or an
+              // IaC provider writing `cloud_hosted = false` explicitly, would
+              // otherwise queue a deletion instruction for a prefix that never
+              // existed.
+              use was_hosted <- result.try(is_hosted(conn, network_id))
+              use _ <- result.try(
                 sqlite.exec(
                   conn,
-                  "DELETE FROM cloud_collect_queue
+                  "UPDATE networks SET cloud_hosted = ?1 WHERE id = ?2",
+                  [VInt(flag), Text(network_id)],
+                ),
+              )
+              use _ <- result.try(case enabled, was_hosted {
+                // Back on inside the hold: the tenant is re-provisioned rather
+                // than collected, so the instruction to delete its bytes goes.
+                True, _ ->
+                  sqlite.exec(
+                    conn,
+                    "DELETE FROM cloud_collect_queue
                     WHERE org_slug = ? AND network_name = ?",
-                  [Text(slug), Text(network)],
-                )
-                |> result.replace(Nil)
-              // `DO NOTHING`, so a repeated disable does not restart the
-              // retention clock. A reconciler or a UI that re-sends
-              // `{enabled: false}` is ordinary, and each restamp would push
-              // the collection another 30 days out — storage retained, and
-              // billed, for ever.
-              False, True ->
-                // The owning data plane rides along, read from the row this
-                // statement is about: the queue outlives the network, so by
-                // the time the hold elapses there is nowhere to look it up,
-                // and an entry naming no owner is one no data plane sweeps
-                // (migration v14). It is part of the `INSERT` rather than a
-                // follow-up `UPDATE` so that `DO NOTHING` still means nothing
-                // — a repeated disable must leave the existing row entirely
-                // alone, stamp included.
-                sqlite.exec(
-                  conn,
-                  "INSERT INTO cloud_collect_queue
+                    [Text(slug), Text(network)],
+                  )
+                  |> result.replace(Nil)
+                // `DO NOTHING`, so a repeated disable does not restart the
+                // retention clock. A reconciler or a UI that re-sends
+                // `{enabled: false}` is ordinary, and each restamp would push
+                // the collection another 30 days out — storage retained, and
+                // billed, for ever.
+                False, True ->
+                  // The owning data plane rides along, read from the row this
+                  // statement is about: the queue outlives the network, so by
+                  // the time the hold elapses there is nowhere to look it up,
+                  // and an entry naming no owner is one no data plane sweeps
+                  // (migration v14). It is part of the `INSERT` rather than a
+                  // follow-up `UPDATE` so that `DO NOTHING` still means nothing
+                  // — a repeated disable must leave the existing row entirely
+                  // alone, stamp included.
+                  sqlite.exec(
+                    conn,
+                    "INSERT INTO cloud_collect_queue
                      (org_slug, network_name, disabled_at, dp_id)
                    SELECT ?1, ?2, ?3, n.cloud_dp_id
                    FROM networks n WHERE n.id = ?4
                    ON CONFLICT (org_slug, network_name) DO NOTHING",
-                  [
-                    Text(slug),
-                    Text(network),
-                    VInt(now_unix()),
-                    Text(network_id),
-                  ],
-                )
-                |> result.replace(Nil)
-              False, False -> Ok(Nil)
-            })
-            use removed <- result.try(case enabled {
-              True -> Ok(0)
-              False -> retire_hosted_devices(conn, network_id)
-            })
-            // Placement, in the transaction that switches hosting on. It runs
-            // *after* the flag is written so the least-loaded count includes
-            // this network, and it is a no-op for a network that already has
-            // a data plane: an assignment is made once and thereafter changed
-            // only by an operator (`cloud/dataplane`). That is what returns a
-            // network re-enabled inside its retention hold to the pod that
-            // still holds its database stream, rather than to whichever pod
-            // happens to be emptiest this minute.
-            //
-            // An empty fleet assigns nothing and is not an error. The network
-            // stays unhosted until a data plane is registered, which is the
-            // safe direction and is visible in `dataplane unassigned` — where
-            // refusing the toggle would fail an org-admin action for a reason
-            // an org admin can neither see nor fix.
-            use placed <- result.try(case enabled {
-              True -> dataplane.place(conn, network_id, now_unix())
-              False -> dataplane.assignment(conn, network_id)
-            })
-            use _ <- result.try(
-              audit(conn, who, org_id, action, [
-                #("network", json.string(network)),
-                #("devices_removed", json.int(removed)),
-                #("data_plane", case placed {
-                  Ok(dp_id) -> json.string(dp_id)
-                  Error(Nil) -> json.null()
-                }),
-              ]),
-            )
-            Ok(#(removed, placed))
-          }
-          case work {
-            // `data_plane: null` on an enable is the one answer a caller has
-            // to act on: hosting is on, and no data plane will pick the
-            // network up until the deployment registers one.
-            Ok(#(removed, placed)) ->
-              Ok(
-                json.object([
-                  #("enabled", json.bool(enabled)),
+                    [
+                      Text(slug),
+                      Text(network),
+                      VInt(now_unix()),
+                      Text(network_id),
+                    ],
+                  )
+                  |> result.replace(Nil)
+                False, False -> Ok(Nil)
+              })
+              use removed <- result.try(case enabled {
+                True -> Ok(0)
+                False -> retire_hosted_devices(conn, network_id)
+              })
+              // Placement, in the transaction that switches hosting on. It runs
+              // *after* the flag is written so the least-loaded count includes
+              // this network, and it is a no-op for a network that already has
+              // a data plane: an assignment is made once and thereafter changed
+              // only by an operator (`cloud/dataplane`). That is what returns a
+              // network re-enabled inside its retention hold to the pod that
+              // still holds its database stream, rather than to whichever pod
+              // happens to be emptiest this minute.
+              //
+              // An empty fleet assigns nothing and is not an error. The network
+              // stays unhosted until a data plane is registered, which is the
+              // safe direction and is visible in `dataplane unassigned` — where
+              // refusing the toggle would fail an org-admin action for a reason
+              // an org admin can neither see nor fix.
+              use placed <- result.try(case enabled {
+                True -> dataplane.place(conn, network_id, now_unix())
+                False -> dataplane.assignment(conn, network_id)
+              })
+              use _ <- result.try(
+                audit(conn, who, org_id, action, [
+                  #("network", json.string(network)),
                   #("devices_removed", json.int(removed)),
                   #("data_plane", case placed {
                     Ok(dp_id) -> json.string(dp_id)
@@ -451,9 +438,39 @@ pub fn set_cloud_hosting(
                   }),
                 ]),
               )
-            Error(e) -> Error(constraint_response(e))
-          }
-        })
+              Ok(#(removed, placed))
+            }
+            case work {
+              // `data_plane: null` on an enable is the one answer a caller has
+              // to act on: hosting is on, and no data plane will pick the
+              // network up until the deployment registers one.
+              Ok(#(removed, placed)) ->
+                Ok(
+                  json.object([
+                    #("enabled", json.bool(enabled)),
+                    #("devices_removed", json.int(removed)),
+                    #("data_plane", case placed {
+                      Ok(dp_id) -> json.string(dp_id)
+                      Error(Nil) -> json.null()
+                    }),
+                  ]),
+                )
+              Error(e) -> Error(constraint_response(e))
+            }
+          })
+        // After the commit, on the off path: a hosted network is a writable
+        // one (docs/CLOUD-WRITES.md §4.1), so the write tunnel its replica
+        // holds goes with the hosting — a session that outlived the switch
+        // would keep taking writes for a network the org has just withdrawn
+        // from hosting. Unconditional, like the browse switch's own drop:
+        // there is nothing to check before dropping the sessions of a
+        // network that has none.
+        case enabled {
+          False ->
+            cloud_writer.drop_network(browse_api.writers(browse), network_id)
+          True -> Nil
+        }
+        response
       }
     }
   })

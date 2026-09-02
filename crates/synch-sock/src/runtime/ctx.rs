@@ -69,7 +69,7 @@ impl ObjectSlot {
 }
 
 /// What a tree writer's one commit or delete will do, once dispatched.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum PutCommand {
     /// Publish the staged bytes, under a condition on the path's current
     /// state.
@@ -121,7 +121,7 @@ pub(crate) struct WriterSlot {
     /// than lost.
     pub(crate) work: Rc<tokio::sync::Notify>,
     /// The one commit or delete this writer will perform.
-    pub(crate) command: Cell<Option<PutCommand>>,
+    pub(crate) command: RefCell<Option<PutCommand>>,
     /// The dispatched operation's kind, from dispatch until its result is
     /// collected, so only the matching `sy_put_*` call can collect it.
     pub(crate) dispatched: Cell<Option<PutKind>>,

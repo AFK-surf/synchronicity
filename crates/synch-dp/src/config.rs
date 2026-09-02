@@ -70,6 +70,15 @@ pub struct DpConfig {
     pub max_inflight_per_tenant: usize,
     /// Where to serve Prometheus metrics, when asked to.
     pub metrics_addr: Option<String>,
+    /// How many bytes of write staging one tenant may have in flight at once
+    /// (`docs/CLOUD-WRITES.md` §5.4).
+    ///
+    /// Control-plane writes stage on this pod's shared ephemeral disk before
+    /// the CAS ingest uploads them, and a `put` whose announced size does not
+    /// fit under what is free of this is refused before any byte moves — so
+    /// one org's uploads cannot fill the volume out from under another's
+    /// tenant.
+    pub write_staging_bytes: u64,
     /// How each tenant's endpoint is bound.
     ///
     /// The default is an ephemeral port on every interface, which is what a
@@ -193,6 +202,7 @@ impl DpConfig {
             blocking_threads: default_blocking_threads(4),
             max_inflight_per_tenant: default_max_inflight(default_blocking_threads(4), 4),
             metrics_addr: None,
+            write_staging_bytes: 64 * 1024 * 1024,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
             rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,
@@ -261,6 +271,7 @@ impl DpConfig {
             blocking_threads,
             max_inflight_per_tenant,
             metrics_addr: std::env::var("SYNCH_DP_METRICS_ADDR").ok(),
+            write_staging_bytes: parse("SYNCH_DP_WRITE_STAGING_BYTES", 4 * 1024 * 1024 * 1024)?,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions {
                 doh_url: std::env::var("SYNCH_DP_DOH").ok(),
@@ -563,6 +574,7 @@ mod tests {
             blocking_threads: 512,
             max_inflight_per_tenant: 8,
             metrics_addr: None,
+            write_staging_bytes: 64 * 1024 * 1024,
             net: synch_net::NetOptions::default(),
             dns: synch_net::ResolverOptions::default(),
             rotate_after: crate::rotation::DEFAULT_ROTATE_AFTER,

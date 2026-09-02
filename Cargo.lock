@@ -5902,6 +5902,8 @@ dependencies = [
  "blake3",
  "celld-ltx",
  "clap",
+ "futures-util",
+ "hex",
  "iroh-base",
  "opendal",
  "reqwest 0.13.4",
@@ -5915,6 +5917,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

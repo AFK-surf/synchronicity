@@ -19,6 +19,12 @@
 //// `middleware.require_user`, and the one join route, which asks
 //// `api/common.check_join_target` instead.
 ////
+//// **One non-`GET` is mounted on a read-only node**, below this table:
+//// `PUT`/`DELETE …/browse/file`, the file API's writes. They mutate no row —
+//// a file write is relayed to the hosted replica and recorded nowhere here —
+//// so `api/edge` mounts them on every role, and `elsewhere`'s reasoning
+//// below stays about the wisp table (docs/CLOUD-WRITES.md §4.6).
+////
 //// **A fourth reaches `/dp/v1` and only `/dp/v1`** — the cloud data plane's
 //// key (docs/CLOUD-DATAPLANE.md §3.2). It is resolved by the same
 //// `with_principal`, because there must be exactly one place a bearer token
@@ -450,7 +456,7 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
     // browsing observes, and neither implies the other.
     ["api", "orgs", slug, "networks", net, "cloud-hosting", "enabled"], Put -> {
       use who <- with_principal(req, auth.reads)
-      networks_api.set_cloud_hosting(req, auth, who, slug, net)
+      networks_api.set_cloud_hosting(req, auth, browse, who, slug, net)
     }
 
     ["api", "orgs", slug, "devices"], Post -> {

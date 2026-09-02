@@ -320,7 +320,7 @@ impl Tenant {
         )
         .await?;
 
-        self.spawn_loops(&node, resolver);
+        self.spawn_loops(&node, config, resolver);
         self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL, metrics);
 
         // Publishes this node's own trie once, now that re-adoption has
@@ -382,7 +382,12 @@ impl Tenant {
     /// needs. `run_scanner`/`run_watcher` have no filesystem source to watch,
     /// `run_checkouts` has nothing to materialize, and the uploads sweeper has
     /// no write surface to sweep after — v1 exposes none.
-    fn spawn_loops(&mut self, node: &Node, resolver: Option<Arc<synch_net::DnssecResolver>>) {
+    fn spawn_loops(
+        &mut self,
+        node: &Node,
+        config: &DpConfig,
+        resolver: Option<Arc<synch_net::DnssecResolver>>,
+    ) {
         let tenant = self.network.key();
         self.spawn_loop("anti-entropy", node, |node, stop| async move {
             node.run_anti_entropy(stop).await
@@ -435,6 +440,37 @@ impl Tenant {
                 })
                 .await;
                 tracing::debug!(%tenant, loop_name = "cloud", "tenant loop stopped");
+            }));
+        }
+
+        // The write tunnel (`docs/CLOUD-WRITES.md` §6.1): the control plane's
+        // file writes, taken by this node as `cloud-1`'s own assertions. For
+        // every hosted tenant, because a hosted network is a writable one —
+        // there is no second switch to consult.
+        {
+            let node = node.clone();
+            let resolver = resolver.clone();
+            let mut stop = self.shutdown.subscribe();
+            let tenant = tenant.clone();
+            let domain = self.network.domain.clone();
+            let token = config.token.clone();
+            let limits = crate::writes::WriteLimits {
+                staging: crate::writes::StagingBudget::new(config.write_staging_bytes),
+                budget_bytes: self.network.budget_bytes,
+            };
+            self.loops.push(tokio::spawn(async move {
+                crate::writes::run_cloud_writes(
+                    node,
+                    resolver,
+                    domain,
+                    token,
+                    limits,
+                    async move {
+                        let _ = stop.recv().await;
+                    },
+                )
+                .await;
+                tracing::debug!(%tenant, loop_name = "writes", "tenant loop stopped");
             }));
         }
     }

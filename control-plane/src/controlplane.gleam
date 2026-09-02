@@ -27,6 +27,7 @@
 import api/agent
 import api/auth_api
 import api/browse_api
+import api/cloud_writer
 import api/edge
 import api/reads
 import api/router
@@ -340,8 +341,14 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
 fn browse_surface(
   cfg: Config,
   agents: process.Name(agent.Msg),
+  writers: process.Name(cloud_writer.Msg),
 ) -> browse_api.Browse {
-  browse_api.Browse(agents, agent.attach_url(cfg.public_url))
+  browse_api.Browse(
+    agents,
+    agent.attach_url(cfg.public_url),
+    writers,
+    cloud_writer.attach_url(cfg.public_url),
+  )
 }
 
 fn serve() -> Result(Nil, String) {
@@ -395,13 +402,14 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   let dns_name = process.new_name("cp_dns_pool")
   let udp_name = process.new_name("cp_udp_server")
   let agents_name = process.new_name("cp_agents")
+  let writers_name = process.new_name("cp_writers")
   let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, meta.apex)
   // The dashboard reads the same pool the nameserver does: both are
   // read-only against the same replicated file, and a second pool would only
   // double the workers competing for it.
   let api = router.ReadOnly(reads.Reads(dns_pool), cfg.primary_url)
-  let browse = browse_surface(cfg, agents_name)
+  let browse = browse_surface(cfg, agents_name, writers_name)
   let ctx =
     router.Context(
       keys.anchor_line(meta.apex, meta.dnskey_public),
@@ -448,6 +456,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   use _ <- result.try(
     tree
     |> sup.add(agent.supervised(agents_name))
+    |> sup.add(cloud_writer.supervised(writers_name))
     |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
@@ -493,10 +502,11 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let dns_name = process.new_name("cp_dns_pool")
   let udp_name = process.new_name("cp_udp_server")
   let agents_name = process.new_name("cp_agents")
+  let writers_name = process.new_name("cp_writers")
   let api_pool = pool.handle(api_name, db.primary_pragmas)
   let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, apex)
-  let browse = browse_surface(cfg, agents_name)
+  let browse = browse_surface(cfg, agents_name, writers_name)
   let auth =
     auth_api.AuthContext(
       reads.Reads(api_pool),
@@ -558,6 +568,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       serving,
     ))
     |> sup.add(agent.supervised(agents_name))
+    |> sup.add(cloud_writer.supervised(writers_name))
     |> sup.add(mist.supervised(http))
     |> sup.add(resign.supervised(cfg.db_path, csk))
     |> sup.start
@@ -620,8 +631,9 @@ fn serve_external(
   let api_name = process.new_name("cp_api_pool")
   let sync_name = process.new_name("cp_provider_sync")
   let agents_name = process.new_name("cp_agents")
+  let writers_name = process.new_name("cp_writers")
   let api_pool = pool.handle(api_name, db.primary_pragmas)
-  let browse = browse_surface(cfg, agents_name)
+  let browse = browse_surface(cfg, agents_name, writers_name)
   let auth =
     auth_api.AuthContext(
       reads.Reads(api_pool),
@@ -665,6 +677,7 @@ fn serve_external(
       4,
     ))
     |> sup.add(agent.supervised(agents_name))
+    |> sup.add(cloud_writer.supervised(writers_name))
     // The jobs before the listener, and the order is load-bearing: children
     // start in the order they are added, `provider_sync` registers its name
     // inside its own initialiser, and every mutating API request pokes that
