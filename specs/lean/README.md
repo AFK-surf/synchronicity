@@ -151,9 +151,13 @@ no-infinite-sequence corollary.
 store-level step is an `MptGc` step at every root, with one guard: its
 `LearnNode` takes a node no position ever refused. A node refused at one
 position and later held from another — Rust's `put_node` after a
-`note_redacted` of the same hash — has no step in the model; it is exactly the
-case in which the completeness memo Rust keeps can go stale, because holding
-the node dissolves the boundary the memo relied on.
+`note_redacted` of the same hash — has no step in the model: holding the node
+dissolves the boundary a completeness memo may rest on, so `MptGc`'s
+`active → complete` would not survive it. Rust's `put_node` drops every
+completeness memo when it holds such a hash
+(`db.rs::put_node_forgetting_memos`), so the memo is re-derived by a walk the
+next time it is asked, which is what keeps `complete` the walk's answer on
+both sides.
 
 ## Contributing
 
