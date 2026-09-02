@@ -23,20 +23,22 @@ authored, and for a node under a confined origin's head at an admitted position
 that every held node is legitimate for its holder and every provenance row is
 legitimate for the origin it names.
 
-- `step_sound`: the rule Rust now runs preserves `Sound`.  A responder vouches
-  for a node under a root only if the root's origin is rooted, or the responder
-  was itself served the node as that origin's, or the responder *is* that
-  origin and holds the node (`Vouched`, `Vouch::covers`); a member records what
-  it was served as the origin's (`owned`, `note_owned`); and a walk over a
-  confined origin's root reads presence through `view` (`load_owned_raw`).
-- `old_rule_leaks`: the rule Rust ran before — serve any held node at an
-  admitted position — does not preserve `Sound`.  The witness is the graft of
-  #115 in four nodes: a state satisfying `Sound`, one old-rule step, and a
-  delegate holding a record it was never granted (`Leak`).
+- `step_sound`: the vouching rule preserves `Sound`.  A responder vouches for
+  a node under a root only if the root's origin is rooted, or the responder was
+  itself served the node as that origin's, or the responder *is* that origin
+  and holds the node (`Vouched`, `Vouch::covers`); a member records what it was
+  served as the origin's (`owned`, `note_owned`); and a walk over a confined
+  origin's root reads presence through `view` (`load_owned_raw`).
 - `confined_head_vouched`: a member that finds a confined origin's root
-  complete through `view` has found only nodes that origin legitimately held,
-  and `grafted_root_incomplete` is that theorem on the witness: the grafted
-  root never completes.
+  complete through `view` has found only nodes that origin legitimately held.
+- `Graft` is the graft of #115 in four nodes, kept so the invariant is seen to
+  be strong enough: `before_sound` is a sound state in which a member holds the
+  grafted root, `finance_not_legit` shows `Legit` excludes the withheld leaf
+  for the photos scope, `new_rule_refuses` that no participant vouches for it
+  under the grafting root, and `grafted_root_incomplete` that the grafted root
+  never completes through `view`.  Before vouching, the responder served any
+  held node at an admitted position, which is one step from `before` to a
+  state `Sound` rejects; that rule is gone and is not modelled.
 
 Like `ScopedSync`, this is about nodes.  Values follow the node that carries
 them (`GetValues` serves a value only with a vouched holder), and heads are
@@ -97,11 +99,6 @@ def ServeNode (w : World) (p : Origin) (st : Store) (s : Scope) (o : Origin) (r 
   ScopedSync.ServeNode w.c s (w.headOf o) ⟨r, path, x⟩ x n ∧ st.base.held x ∧
     Vouched w p st o x
 
-/-- The rule before #115 was closed: the same, without vouching. -/
-def ServeNodeOld (w : World) (st : Store) (s : Scope) (o : Origin) (r : Hash) (path : Path)
-    (x : Hash) (n : Node) : Prop :=
-  ScopedSync.ServeNode w.c s (w.headOf o) ⟨r, path, x⟩ x n ∧ st.base.held x
-
 /-- The system: every participant's store, indexed by its origin. -/
 abbrev Sys := Origin → Store
 
@@ -126,14 +123,6 @@ inductive Step (w : World) : Sys → Sys → Prop where
       Step w sys (update sys q (learn w (sys q) o x))
   | author {sys : Sys} {o : Origin} {x : Hash} :
       w.authored o x → Step w sys (update sys o (author (sys o) x))
-
-/-- The old system, serving without vouching. -/
-inductive StepOld (w : World) : Sys → Sys → Prop where
-  | learn {sys : Sys} {q p o : Origin} {r : Hash} {path : Path} {x : Hash} {n : Node} :
-      ServeNodeOld w (sys p) (w.scopeOf q) o r path x n →
-      StepOld w sys (update sys q (learn w (sys q) o x))
-  | author {sys : Sys} {o : Origin} {x : Hash} :
-      w.authored o x → StepOld w sys (update sys o (author (sys o) x))
 
 /-- A node is legitimately a reader's, for the scope it reads under. -/
 inductive Legit (w : World) : Scope → Hash → Prop where
@@ -284,9 +273,6 @@ def before : Sys := fun q =>
     { base := { emptyBase with held := fun x => x = G }, owned := fun _ _ => False }
   else { base := emptyBase, owned := fun _ _ => False }
 
-/-- The reader holds the finance leaf. -/
-def Leak (sys : Sys) : Prop := (sys reader).base.held F
-
 theorem photos_not_full : ¬ photos.IsFull := by
   intro h
   simp [photos, Scope.IsFull] at h
@@ -387,52 +373,13 @@ theorem before_sound : Sound world before := by
       · exact hx.elim
       · exact hx.elim
 
-/-- One old-rule step: the reader fetches, from the issuer, position
-`[photosSlot]` under the grafter's root — and is served the finance leaf. -/
-def after : Sys := update before reader (learn world (before reader) grafter F)
-
-theorem old_step : StepOld world before after := by
-  refine StepOld.learn (p := issuer) (r := G) (path := [photosSlot]) (n := .leaf [] (.inline 2)) ?_
-  refine ⟨⟨?_, by simp [world, content], ?_⟩, ?_⟩
-  · -- `Admit`, for the reader's photos scope
-    show Admit content (world.scopeOf reader) (world.headOf grafter) ⟨G, [photosSlot], F⟩ F
-    have hs : (world.scopeOf reader).prefixes = some [[photosSlot]] := by
-      simp [world, photos]
-    unfold Admit
-    rw [hs]
-    refine ⟨Or.inr ⟨rfl, rfl⟩, ?_, ?_⟩
-    · exact Scope.admitsPath_of_containsSubtree ⟨[photosSlot], by simp, List.prefix_refl _⟩
-    · exact At.ofChild (by simp [content]) ChildOf.ext
-  · -- the leaf spells the key `[photosSlot]`, inside the grant
-    show AdmitsNode (world.scopeOf reader) [photosSlot] (.leaf [] (.inline 2))
-    have : world.scopeOf reader = photos := by simp [world]
-    rw [this]
-    exact Or.inl ⟨[photosSlot], by simp, List.prefix_refl _⟩
-  · -- the issuer holds the finance leaf
-    show (before issuer).base.held F
-    simp [before]
-
-theorem after_leaks : Leak after := by
-  show (update before reader (learn world (before reader) grafter F) reader).base.held F
-  simp [update, learn]
-
-theorem after_unsound : ¬ Sound world after := by
-  intro h
-  have hlegit := h.1 reader F after_leaks
-  exact finance_not_legit _ _ hlegit (by simp [world]) rfl
-
-/-- **The old rule leaks.**  A sound state, one step the old responder allows,
-and a delegate holding a record outside its grant. -/
-theorem old_rule_leaks :
-    ∃ (sys sys' : Sys), Sound world sys ∧ StepOld world sys sys' ∧ Leak sys' ∧ ¬ Sound world sys' :=
-  ⟨before, after, before_sound, old_step, after_leaks, after_unsound⟩
-
-/-- **The new rule does not.**  The same step is not available: no participant
-vouches for the finance leaf under the grafter's root. -/
-theorem new_rule_refuses {r : Hash} {path : Path} {n : Node} (hp : Sound world before) :
+/-- **Nobody vouches for the graft.**  The issuer holds the finance leaf and
+the grafter's root, and no participant serves the leaf to the reader under
+that root: vouching for it would need it to be legitimately the grafter's. -/
+theorem new_rule_refuses {r : Hash} {path : Path} {n : Node} :
     ¬ ServeNode world p (before p) (world.scopeOf reader) grafter r path F n := by
   intro ⟨_, _, hv⟩
-  exact finance_not_legit _ _ (vouched_legit hp confined_grafter hv) rfl rfl
+  exact finance_not_legit _ _ (vouched_legit before_sound confined_grafter hv) rfl rfl
 
 /-- **The grafted root never completes.**  Judged through `view`, the issuer's
 copy of the grafter's trie is missing the finance leaf, whatever the scope. -/

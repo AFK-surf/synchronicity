@@ -1157,8 +1157,8 @@ judged by presence alone, as before, and a node's own trie by construction. The
 cost is one row per node per confined origin, and one re-fetch of the nodes a
 confined origin's trie shares with another's. `specs/lean/Synchronicity/Provenance.lean`
 is the model: `Legit` is what "legitimately a reader's" means across every trie a
-node may be read through, `old_rule_leaks` exhibits this graft against the rule
-this section used to describe, and `step_sound` is the rule above preserving it.
+node may be read through, `step_sound` is the rule above preserving it, and
+`Graft` is this graft, shown to be excluded.
 
 ## 6. Content storage and transfer
 

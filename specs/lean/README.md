@@ -52,8 +52,8 @@ There are four layers:
   further step (below);
 - `Provenance` is the multi-party model that the single-store privacy theorem
   cannot state: whether a node is *legitimately* a reader's, across every trie
-  it might be read through. It exhibits the graft of issue #115 as a violation
-  of the old serving rule and proves the provenance rule sound (below).
+  it might be read through, with the graft of issue #115 as the witness that
+  the invariant is strong enough to exclude it (below).
 
 The principal system theorems are
 `SystemSafety.source_live_content_is_available` and
@@ -171,9 +171,9 @@ legitimately held it. `Sound` is the system invariant: every held node is
 legitimate for its holder, and every provenance row for a confined origin names
 a node legitimately that origin's.
 
-- `step_sound`: the rule Rust now runs preserves `Sound`. A responder vouches
-  for a node under a root only if the root's origin is rooted, or the responder
-  was served the node as that origin's, or the responder *is* that origin and
+- `step_sound`: the vouching rule preserves `Sound`. A responder vouches for a
+  node under a root only if the root's origin is rooted, or the responder was
+  served the node as that origin's, or the responder *is* that origin and
   holds the node (`Vouched`, `net/mpt.rs::Vouch::covers`, applied to every
   peer, scoped or not — a full member handed the node under the grafting root
   would otherwise record provenance for it and move the leak one hop). A member
@@ -182,24 +182,23 @@ a node legitimately that origin's.
   through `view` (`MissingWalk::for_origin`, `Trie::load_owned_raw`,
   `is_complete_scoped_for`). `provenance_owner` decides which origins are
   judged this way: every origin that is not rooted, except the node's own.
-- `old_rule_leaks`: the rule before — serve any held node at an admitted
-  position (`ServeNodeOld`) — does not preserve `Sound`. `Graft` is the witness
-  in four nodes: an issuer root over a photos leaf and a finance leaf, a grafter
-  root that is an extension placing the finance leaf under the photos slot; a
-  sound state in which the issuer holds everything and owns the grafter's root
-  as the grafter's; one old-rule step in which the reader, confined to photos,
-  is served the finance leaf at the photos slot of the grafter's root; and
-  `finance_not_legit`, an induction over `Legit` showing no derivation reaches
-  the finance leaf under the photos scope. `new_rule_refuses` is the same step
-  under the new rule: nobody vouches.
 - `confined_head_vouched`: a member that finds a confined origin's root
-  complete through `view` has found only nodes legitimately that origin's, and
-  `grafted_root_incomplete` is that theorem on the witness — judged through
-  `view`, the issuer's copy of the grafter's trie is missing the finance leaf
-  under any scope that admits the photos slot. Rust's fetch asks the grafter
-  for it, is told `missing`, and abandons the head;
+  complete through `view` has found only nodes legitimately that origin's.
+- `Graft` is the witness that `Sound` is strong enough, in four nodes: an
+  issuer root over a photos leaf and a finance leaf, and a grafter root that is
+  an extension placing the finance leaf under the photos slot. `before_sound`
+  is a sound state in which the issuer holds everything and owns the grafter's
+  root as the grafter's; `finance_not_legit` is an induction over `Legit`
+  showing no derivation makes the finance leaf a photos reader's;
+  `new_rule_refuses` that no participant vouches for it under the grafter's
+  root; and `grafted_root_incomplete` that, judged through `view`, the issuer's
+  copy of the grafter's trie is missing the finance leaf under any scope that
+  admits the photos slot. Rust's fetch asks the grafter for it, is told
+  `missing`, and abandons the head;
   `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie` runs the
-  whole shape over real endpoints.
+  whole shape over real endpoints. The rule before vouching — serve any held
+  node at an admitted position — is one step from `before` to a state `Sound`
+  rejects; it is gone from Rust and not modelled.
 
 This is the bug class the earlier model could not see: a property that holds
 at every single store while content crosses a boundary between stores. What it
