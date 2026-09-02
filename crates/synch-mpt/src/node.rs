@@ -136,6 +136,24 @@ impl TrieNode {
         Ok(hash_encoded(node.tag(), bytes))
     }
 
+    /// True if `bytes` hash to `expected` under any node kind's tag.
+    ///
+    /// The half of [`TrieNode::hash_of_encoded`] that decides *whose* fault a
+    /// refused node is (§12). A node hash covers the raw bytes exactly as
+    /// served, so bytes that hash to the hash they were requested by are the
+    /// origin's own — a relaying peer cannot have altered them — and a shape
+    /// this crate then refuses (non-canonical encoding, an oversized key run,
+    /// a broken invariant) is that origin's fault and nobody else's. Bytes
+    /// that hash to nothing wanted are the peer's.
+    ///
+    /// Tried under every tag rather than the decoded kind's, because the
+    /// bytes may not decode at all and the question is still answerable.
+    pub fn hashes_to(expected: &Hash, bytes: &[u8]) -> bool {
+        [LEAF_TAG, EXT_TAG, BRANCH_TAG]
+            .iter()
+            .any(|tag| &hash_encoded(tag, bytes) == expected)
+    }
+
     /// Checks the structural invariants the node kinds document (§4.3).
     ///
     /// The write path maintains all of these by construction — `collapse`,

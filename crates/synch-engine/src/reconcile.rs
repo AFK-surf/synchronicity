@@ -70,7 +70,9 @@ pub enum Promotion {
     Flipped,
     /// A pending head stands and its trie is not all here yet: it needs a fetch.
     Waiting,
-    /// This promotion is in the refusal memo, so the head was retired unjudged.
+    /// The head was retired without flipping because this node's own rules
+    /// refuse the promotion: the pair is in the refusal memo, or the origin
+    /// is delegated and its trie publishes outside its spaces (§3.5).
     Refused,
     /// Nothing is pending now: there was no pending head, or the complete slot
     /// had overtaken the one there and it was dropped.
@@ -134,11 +136,15 @@ pub enum FetchOutcome {
     /// this exchange.
     ///
     /// There was no pending head to fetch; or the fetch ran and the trie is
-    /// still incomplete; or the promotion declined for a reason the fetch
-    /// cannot act on — the verdict was already in the refusal memo, or the
-    /// slot had moved on. No caller has ever needed these apart: each means
-    /// this exchange is done with the origin, with nothing to report.
+    /// still incomplete; or the slot had moved on before the promotion looked.
+    /// No caller has ever needed these apart: each means this exchange is
+    /// done with the origin, with nothing to report.
     NoFlip,
+    /// The trie arrived whole and this node's own rules refused to promote it
+    /// — the pair was in the refusal memo, or a delegated origin publishes
+    /// outside its spaces — so the head was retired. The origin counts as
+    /// left behind (§12), which is why this is not `NoFlip`.
+    Refused,
     /// Every candidate persistently returned `missing`; the pending head was
     /// abandoned and head selection re-runs (§5.2).
     Abandoned,
@@ -667,19 +673,32 @@ impl Syncer {
             //
             // Cheap despite reading like a scan: the check descends only where
             // the boundary is unresolved, so it visits the spine and stops.
+            //
+            // Either refusal *retires* the head rather than leaving it to
+            // wait. Its trie is wholly here, so nothing else ever would: the
+            // sweep's staleness rule steps over a complete trie, and §5.2 is
+            // explicit that a head whose promotion this node's own rules
+            // refuse never keeps the slot — left in place it holds
+            // `head_floor` above every lesser head this node could serve, for
+            // as long as the origin does not publish past it. The verdict is
+            // not memoized: it is about the grant, which can move, and
+            // re-reaching it costs a spine walk, not a diff.
             match &publish_scope {
                 // An origin this node holds no live binding for publishes
                 // nothing it will promote. Not merely a scope question: were
                 // this to fall through as "unrestricted", revoking a
                 // delegation would *promote* the head its scope had been
                 // refusing, which is the opposite of what revoking is for.
+                // Nothing is lost by dropping it: a head re-offered once the
+                // binding is back is re-adopted over a trie already here.
                 PublishScope::Untrusted => {
                     tracing::debug!(
                         origin = %origin,
                         seq = pending.head.seq,
-                        "not promoting: no live binding for this origin"
+                        "retiring a pending head: no live binding for this origin"
                     );
-                    return Ok(Promotion::Waiting);
+                    txn.clear_head(origin, Slot::Pending)?;
+                    return Ok(Promotion::Idle);
                 }
                 PublishScope::Unrestricted => {}
                 PublishScope::Confined(spaces) => {
@@ -694,7 +713,8 @@ impl Syncer {
                                 .unwrap_or_else(|| "<partial>".to_string()),
                             "refusing a delegated origin's head: it publishes outside its spaces"
                         );
-                        return Ok(Promotion::Waiting);
+                        txn.clear_head(origin, Slot::Pending)?;
+                        return Ok(Promotion::Refused);
                     }
                 }
             }
@@ -827,36 +847,51 @@ impl Syncer {
                 // satisfied rather than absent, so the fetch converges instead
                 // of retrying to the §5.2 abandonment clause (§5.5).
                 //
-                // Only for hashes this round actually asked about, and each
-                // once — the same rule `take_served` applies to `nodes` and
-                // `values`, and for the same reason. Unfiltered, a peer that
-                // answers every request with one arbitrary hash in `redacted`
-                // resets `unproductive` every round, so the abandonment clause
-                // never fires and the fetch never ends; and `note_redacted` is
-                // durable and keyed by hash alone, so the same message poisons
-                // every later walk into reading a genuinely absent node as a
-                // boundary it may skip.
-                let asked: std::collections::HashSet<Hash> =
-                    missing.nodes.iter().map(|(_, hash)| *hash).collect();
-                let mut seen = std::collections::HashSet::new();
-                let boundary: Vec<Hash> = response
+                // Recorded against the *positions* this round asked the hash
+                // at, never against the bare hash — the same rule
+                // `take_served` applies to `nodes` and `values`, and for the
+                // same reason. Unfiltered, a peer that answers every request
+                // with one arbitrary hash in `redacted` resets `unproductive`
+                // every round, so the abandonment clause never fires and the
+                // fetch never ends. And a refusal is about where a node sits:
+                // one node can stand at two spine positions and be refused at
+                // only one of them, so the responder judges every position and
+                // a hash that came back served, or absent somewhere, was not
+                // refused outright and is not a boundary at all this round.
+                // Only spine positions are recorded, because those are the only
+                // ones the walk consults the memo for.
+                let served: std::collections::HashSet<Hash> =
+                    response.nodes.iter().map(|(hash, _)| *hash).collect();
+                let absent: std::collections::HashSet<Hash> =
+                    response.missing.iter().copied().collect();
+                let refused: std::collections::HashSet<Hash> = response
                     .redacted
                     .iter()
                     .copied()
-                    .filter(|hash| asked.contains(hash) && seen.insert(*hash))
+                    .filter(|hash| !served.contains(hash) && !absent.contains(hash))
                     .collect();
-                learned += boundary.len();
+                let boundary: Vec<(Vec<u8>, Hash)> = missing
+                    .nodes
+                    .iter()
+                    .filter(|(path, hash)| refused.contains(hash) && !scope.contains_subtree(path))
+                    .cloned()
+                    .collect();
+                learned += boundary
+                    .iter()
+                    .map(|(_, hash)| *hash)
+                    .collect::<std::collections::HashSet<Hash>>()
+                    .len();
                 {
                     let store = self.store.clone();
                     crate::blocking::offload(move || {
-                        for hash in &boundary {
-                            synch_mpt::NodeStore::note_redacted(store.as_ref(), hash)?;
+                        for (path, hash) in &boundary {
+                            synch_mpt::NodeStore::note_redacted(store.as_ref(), hash, path)?;
                         }
                         Ok(())
                     })
                     .await?;
                 }
-                learned += crate::blocking::offload(move || {
+                let stored = crate::blocking::offload(move || {
                     // One transaction per batch, not one per node. Written
                     // through the `Store`, each `put_node` is a bare `execute`
                     // in autocommit — its own transaction, its own acquisition
@@ -876,8 +911,7 @@ impl Syncer {
                             &requested,
                             &response.nodes,
                             "node",
-                            |bytes| TrieNode::hash_of_encoded(bytes).ok(),
-                            |expected| NetError::NodeHashMismatch { expected },
+                            verify_node,
                             |hash, bytes| {
                                 synch_mpt::NodeStore::put_node(txn, hash, bytes)?;
                                 Ok(true)
@@ -885,7 +919,34 @@ impl Syncer {
                         )
                     })
                 })
-                .await?;
+                .await;
+                learned += match stored {
+                    Ok(stored) => stored,
+                    // The origin published a node this build refuses (§12).
+                    // The batch rolled back, and the head is retired by name
+                    // here rather than left for the sweep: it holds
+                    // `head_floor` above everything this node can serve, and
+                    // its trie can never complete — the refused node is never
+                    // stored, so every later fetch would meet it again. The
+                    // fault propagates so the exchange counts the origin as
+                    // left behind and carries on with every other.
+                    Err(e) if is_origin_fault(&e) => {
+                        tracing::warn!(
+                            origin = %origin,
+                            seq = pending.seq,
+                            error = %e,
+                            "abandoning pending head: the origin published a trie node this node refuses"
+                        );
+                        let store = self.store.clone();
+                        let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
+                        crate::blocking::offload(move || {
+                            Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
+                        })
+                        .await?;
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                };
             }
             if !missing.values.is_empty() {
                 let response = client.get_values(pending.root, &missing.values).await?;
@@ -898,8 +959,7 @@ impl Syncer {
                             &requested,
                             &response.values,
                             "value",
-                            |bytes| Some(synch_core::Hash::new(bytes)),
-                            |expected| NetError::ValueHashMismatch { expected },
+                            verify_value,
                             |hash, bytes| {
                                 // Two bounds on what an origin may put in a
                                 // value, and both are refusals of *that origin's*
@@ -1034,11 +1094,11 @@ impl Syncer {
             syncer.try_promote(&origin, now_ns())
         })
         .await?;
-        if promoted == Promotion::Flipped {
-            Ok(FetchOutcome::Completed)
-        } else {
-            Ok(FetchOutcome::NoFlip)
-        }
+        Ok(match promoted {
+            Promotion::Flipped => FetchOutcome::Completed,
+            Promotion::Refused => FetchOutcome::Refused,
+            Promotion::Waiting | Promotion::Idle => FetchOutcome::NoFlip,
+        })
     }
 
     /// Runs a `Hello` exchange that pushes and pulls nothing, purely to read
@@ -1476,7 +1536,8 @@ impl Syncer {
                     match self.fetch_pending(client, &head.origin).await {
                         Ok(FetchOutcome::Completed) => report.tries_completed += 1,
                         Ok(FetchOutcome::Abandoned) => report.heads_abandoned += 1,
-                        Ok(_) => {}
+                        Ok(FetchOutcome::Refused) => report.left_behind(&head.origin),
+                        Ok(FetchOutcome::NoFlip) => {}
                         Err(e) if is_origin_fault(&e) => contain(&head.origin, &e, &mut report),
                         Err(e) => return Err(e),
                     }
@@ -1513,7 +1574,8 @@ impl Syncer {
             match self.fetch_pending(client, &pending.origin).await {
                 Ok(FetchOutcome::Completed) => report.tries_completed += 1,
                 Ok(FetchOutcome::Abandoned) => report.heads_abandoned += 1,
-                Ok(_) => {}
+                Ok(FetchOutcome::Refused) => report.left_behind(&pending.origin),
+                Ok(FetchOutcome::NoFlip) => {}
                 Err(e) if is_origin_fault(&e) => contain(&pending.origin, &e, &mut report),
                 Err(e) => return Err(e),
             }
@@ -1559,9 +1621,12 @@ fn serves_trie(
 /// defeat the [`MAX_UNPRODUCTIVE_ROUNDS`] escape, since a peer serving one real
 /// node and 10^5 copies of it makes progress forever.
 ///
-/// Nodes and values differ only in how a payload is hashed, where it is stored
-/// and which error names it, so the checks live here rather than in two loops
-/// that have to be kept in step.
+/// Nodes and values differ only in how a payload is verified, where it is
+/// stored and which error names it, so the checks live here rather than in two
+/// loops that have to be kept in step. `verify` says whether a payload is the
+/// one asked for and, when it is not acceptable, *whose* fault that is: a
+/// `NetError` is the peer's and ends the exchange, an origin fault is
+/// contained to the origin ([`is_origin_fault`]).
 ///
 /// The third check is now a backstop rather than the bound it was: `Nodes.nodes`
 /// and `Values.values` are capped at [`MAX_BATCH`] *while decoding*, so a
@@ -1574,8 +1639,7 @@ fn take_served(
     requested: &[synch_core::Hash],
     served: &[(synch_core::Hash, Vec<u8>)],
     what: &str,
-    hash_of: impl Fn(&[u8]) -> Option<synch_core::Hash>,
-    mismatch: impl Fn(synch_core::Hash) -> NetError,
+    verify: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
     put: impl Fn(&synch_core::Hash, &[u8]) -> Result<bool>,
 ) -> Result<usize> {
     // A wanted hash can be asked for once and so may be answered once. The set
@@ -1594,9 +1658,7 @@ fn take_served(
             ))));
         }
         // A malicious or corrupt peer can withhold, never inject.
-        if hash_of(bytes) != Some(*hash) {
-            return Err(EngineError::Net(mismatch(*hash)));
-        }
+        verify(hash, bytes)?;
         // `put` decides whether the payload is one this node will keep: a rule
         // about what the *origin* published — a value small enough to be inline,
         // or one past the size ceiling — refuses the payload without failing the
@@ -1608,6 +1670,43 @@ fn take_served(
         }
     }
     Ok(stored)
+}
+
+/// Whether served node bytes are the node they were requested as, and whose
+/// fault it is when they are not.
+///
+/// Two failures look alike and must not be treated alike. Bytes that hash to
+/// nothing wanted are the *peer's*: a corrupt or hostile relay, which ends the
+/// exchange. Bytes that hash to the requested hash under their own kind's tag
+/// but that this build refuses — a non-canonical encoding, a key run past
+/// `MAX_KEY_LEN`, a broken structural invariant — are the *origin's*: the hash
+/// covers the raw bytes, so no relay could have produced them, and §12 says a
+/// record this node cannot apply fails its own origin and no other. Reporting
+/// the second as the first aborted every exchange with every peer serving
+/// that origin, at whichever origin sorted after it, and left the head pending
+/// for the sweep to retire and the next exchange to re-adopt.
+fn verify_node(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
+    match TrieNode::hash_of_encoded(bytes) {
+        Ok(hash) if &hash == expected => Ok(()),
+        Err(refused) if TrieNode::hashes_to(expected, bytes) => Err(EngineError::Mpt(refused)),
+        Ok(_) | Err(_) => Err(EngineError::Net(NetError::NodeHashMismatch {
+            expected: *expected,
+        })),
+    }
+}
+
+/// Whether served value bytes are the payload they were requested as.
+///
+/// A value has no shape to refuse at this point: the bounds on what an origin
+/// may put in one are applied by the `put` that follows, which refuses the
+/// payload without failing the batch.
+fn verify_value(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
+    if &synch_core::Hash::new(bytes) == expected {
+        return Ok(());
+    }
+    Err(EngineError::Net(NetError::ValueHashMismatch {
+        expected: *expected,
+    }))
 }
 
 /// The serve side's view of the reconciler (§5.2).
@@ -1927,17 +2026,10 @@ mod tests {
         let unrequested = Hash::new(&junk);
         let stored = std::cell::RefCell::new(Vec::new());
         let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
-            take_served(
-                requested,
-                served,
-                "value",
-                |bytes| Some(Hash::new(bytes)),
-                |expected| NetError::ValueHashMismatch { expected },
-                |hash, _| {
-                    stored.borrow_mut().push(*hash);
-                    Ok(true)
-                },
-            )
+            take_served(requested, served, "value", verify_value, |hash, _| {
+                stored.borrow_mut().push(*hash);
+                Ok(true)
+            })
         };
 
         let err = take(&[wanted], &[(unrequested, junk.clone())])
@@ -1986,6 +2078,42 @@ mod tests {
             .unwrap(),
             2
         );
+    }
+
+    /// §12: served bytes that hash to what was asked for but break a
+    /// structural invariant are the origin's fault; bytes that hash to
+    /// nothing wanted are the peer's. The two must classify apart, because one
+    /// is contained to an origin and the other ends the exchange.
+    #[test]
+    fn a_refused_node_shape_is_the_origins_fault_and_wrong_bytes_are_the_peers() {
+        let (value, _) = synch_mpt::ValueRef::for_value(b"x");
+        let leaf = synch_mpt::TrieNode::Leaf {
+            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
+            value,
+        };
+        let mut children = [None; 16];
+        children[6] = Some(leaf.hash());
+        let lonely = synch_mpt::TrieNode::Branch {
+            children,
+            value: None,
+        };
+        let (bytes, hash) = (lonely.encode(), lonely.hash());
+        assert!(synch_mpt::TrieNode::hash_of_encoded(&bytes).is_err());
+
+        let err = verify_node(&hash, &bytes).expect_err("an under-occupied branch is refused");
+        assert!(is_origin_fault(&err), "{err}");
+        let err = verify_node(&Hash::new(b"something else"), &bytes)
+            .expect_err("bytes that hash to nothing wanted are refused");
+        assert!(!is_origin_fault(&err), "{err}");
+        assert!(matches!(
+            err,
+            EngineError::Net(NetError::NodeHashMismatch { .. })
+        ));
+        let good = leaf.encode();
+        verify_node(&leaf.hash(), &good).expect("a canonical node verifies");
+        assert!(!is_origin_fault(
+            &verify_node(&hash, &good).expect_err("the wrong node is the peer's")
+        ));
     }
 
     #[test]

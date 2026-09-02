@@ -303,15 +303,16 @@ impl MptProtocol {
                     let scope = store.scope_for_key(&peer, now_ns())?;
                     let admitted = admit(&store, peer, root, &wants)?;
                     let mut answer = Answer::new();
-                    let mut missing = Vec::new();
-                    let mut redacted = Vec::new();
-                    // Deduplicated after `admit`, never instead of it: the
-                    // request is authorized by position and only then
-                    // deduplicated by what those positions resolved to.
+                    let mut missing = Distinct::default();
+                    let mut redacted = Distinct::default();
+                    // Every position is judged, and only the *payload* is
+                    // deduplicated: a scoped peer may name one node at two
+                    // spine positions and be entitled to it at just one of
+                    // them, so a verdict reached about the first position
+                    // must not be the answer for the second. `admit` ran
+                    // first — the request is authorized by position and only
+                    // then deduplicated by what those positions resolved to.
                     for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
-                        if !answer.wants(*claimed) {
-                            continue;
-                        }
                         // A position holding nothing is reported against the
                         // hash the caller named, so an honest walk sees the
                         // ordinary `missing` it already handles.
@@ -319,6 +320,9 @@ impl MptProtocol {
                             missing.push(*claimed);
                             continue;
                         };
+                        if answer.served(&hash) {
+                            continue;
+                        }
                         let Some(data) = store.get_node(&hash)? else {
                             missing.push(hash);
                             continue;
@@ -343,7 +347,11 @@ impl MptProtocol {
                             break;
                         }
                     }
-                    Ok((answer.into_payloads(), missing, redacted))
+                    Ok((
+                        answer.into_payloads(),
+                        missing.into_vec(),
+                        redacted.into_vec(),
+                    ))
                 })
                 .await?;
                 write_frame(
@@ -381,9 +389,9 @@ impl MptProtocol {
                         false => Some(admit(&store, peer, root, &wants)?),
                     };
                     let mut answer = Answer::new();
-                    let mut missing = Vec::new();
+                    let mut missing = Distinct::default();
                     for (i, wanted) in wants.iter().enumerate() {
-                        if !answer.wants(wanted.1) {
+                        if answer.served(&wanted.1) {
                             continue;
                         }
                         if let Some(holders) = &holders {
@@ -424,7 +432,7 @@ impl MptProtocol {
                             None => missing.push(wanted.1),
                         }
                     }
-                    Ok((answer.into_payloads(), missing))
+                    Ok((answer.into_payloads(), missing.into_vec()))
                 })
                 .await?;
                 write_frame(send, &MptMessage::Values { values, missing }).await?;
@@ -501,12 +509,15 @@ const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
 /// must share, because each is a §12 bound the other restating is a second
 /// place to lose it:
 ///
-/// - **One answer per distinct hash.** A requester may only ask once —
+/// - **One payload per distinct hash.** A requester may only take one —
 ///   `take_served` refuses a repeated payload as a protocol violation and ends
-///   the exchange — so answering a duplicated request literally would make
-///   this node look hostile for a fault on the asking side. Deduplicating also
+///   the exchange — so serving a hash named twice literally would make this
+///   node look hostile for a fault on the asking side. Deduplicating also
 ///   stops a repeated hash from turning one bounded batch into [`MAX_BATCH`]
-///   copies of the same payload.
+///   copies of the same payload. Only the payload is deduplicated, not the
+///   judgement: a scoped walk legitimately names one node at two spine
+///   positions (§5.5), and the position refused must not answer for the
+///   position admitted.
 /// - **One payload always goes, whatever its size.** A stored payload larger
 ///   than the whole budget predates the ceiling, and answering nothing would
 ///   stall the requester's walk forever. It is the whole answer, though:
@@ -528,14 +539,15 @@ impl Answer {
         }
     }
 
-    /// Whether `hash` still needs an answer — `false` from its second naming.
-    fn wants(&mut self, hash: Hash) -> bool {
-        self.answered.insert(hash)
+    /// Whether `hash`'s payload is already in the answer.
+    fn served(&self, hash: &Hash) -> bool {
+        self.answered.contains(hash)
     }
 
     /// Adds one payload under the budget; `false` once the answer is full and
     /// the assembling loop should stop.
     fn push(&mut self, hash: Hash, data: Vec<u8>) -> bool {
+        self.answered.insert(hash);
         match self.budget.checked_sub(data.len()) {
             Some(left) => {
                 self.budget = left;
@@ -552,6 +564,26 @@ impl Answer {
 
     fn into_payloads(self) -> Vec<(Hash, Vec<u8>)> {
         self.payloads
+    }
+}
+
+/// A `missing` or `redacted` list that names each hash once, in first-seen
+/// order, however many positions resolved to it.
+#[derive(Default)]
+struct Distinct {
+    seen: std::collections::HashSet<Hash>,
+    order: Vec<Hash>,
+}
+
+impl Distinct {
+    fn push(&mut self, hash: Hash) {
+        if self.seen.insert(hash) {
+            self.order.push(hash);
+        }
+    }
+
+    fn into_vec(self) -> Vec<Hash> {
+        self.order
     }
 }
 

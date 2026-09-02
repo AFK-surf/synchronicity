@@ -220,6 +220,16 @@ pub type Entry = (Vec<u8>, Vec<u8>);
 /// and what stands at the same position in the reference trie.
 type Position = (Option<Hash>, Hash, Vec<u8>);
 
+/// What identifies a visit for deduplication: the node, and — only where the
+/// scope admits a position partially — the position too.
+///
+/// Under a full scope, or inside a granted prefix, a node's hash determines
+/// its whole subtree and the position adds nothing. On the spine it does: a
+/// node standing at two spine positions has children admitted under one and
+/// refused under the other, so a visit at the first cannot stand in for the
+/// second (§5.5).
+type Visit = (Hash, Option<Vec<u8>>);
+
 /// The §5.2 frontier, as a walk that keeps its place.
 ///
 /// **It resumes.** Restarting at the root for every batch makes a cold fetch
@@ -238,7 +248,7 @@ pub struct MissingWalk {
     /// `(the hash at this position in the reference trie, the hash wanted,
     /// the nibble path of the position)`.
     frontier: Vec<Position>,
-    seen: HashSet<Hash>,
+    seen: HashSet<Visit>,
     /// Reported absent and awaiting the caller's fetch, so they can be
     /// revisited — and their children discovered — once they land.
     deferred: Vec<Position>,
@@ -298,8 +308,10 @@ impl MissingWalk {
     /// are reported again, which is what lets a caller notice it is making no
     /// progress.
     pub fn resume(&mut self) {
-        for (reference, hash, path) in self.deferred.drain(..) {
-            self.seen.remove(&hash);
+        let deferred = std::mem::take(&mut self.deferred);
+        for (reference, hash, path) in deferred {
+            let visit = visit(&self.scope, hash, &path);
+            self.seen.remove(&visit);
             self.frontier.push((reference, hash, path));
         }
     }
@@ -353,7 +365,7 @@ impl MissingWalk {
             if reference == Some(hash) {
                 continue;
             }
-            if !self.seen.insert(hash) {
+            if !self.seen.insert(visit(&self.scope, hash, &path)) {
                 continue;
             }
             // A position a peer has refused holds nothing this node may see,
@@ -362,13 +374,13 @@ impl MissingWalk {
             // such a trie complete would vouch for what is not held.
             // It cannot be tightened to `admits_path`: the child filter below
             // drops every unadmitted position, so the memo would never fire.
-            // That is the shape of the problem — a refusal arrives as a bare
-            // hash, and an honest one (`Ext`/`Leaf` running out of scope) is
-            // indistinguishable here from a branch leading back into the
-            // grant. The distinction lives where the node is:
+            // The refusal is looked up for *this* position: an honest one
+            // (`Ext`/`Leaf` running out of scope) is about where the node
+            // sits, and the same node at another spine position may lead back
+            // into the grant. The distinction lives where the node is:
             // `Scope::admits_node`, which no longer refuses a branch it can
             // serve.
-            if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash)? {
+            if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash, Some(&path))? {
                 continue;
             }
             let Some(data) = trie.load_raw(&hash)? else {
@@ -465,6 +477,14 @@ impl MissingWalk {
     }
 }
 
+/// The deduplication key for a node at a position ([`Visit`]).
+fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
+    match scope.contains_subtree(path) {
+        true => (hash, None),
+        false => (hash, Some(path.to_vec())),
+    }
+}
+
 /// Pairs a node's children with the ones at the same positions in the
 /// reference trie, so the walk can prune where the two agree.
 ///
@@ -554,9 +574,14 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Self::wrap(self.store.get_node(hash))
     }
 
-    /// Whether a peer has refused to show this node (§5.5).
-    pub(crate) fn is_redacted_raw(&self, hash: &Hash) -> Result<bool, MptError> {
-        Self::wrap(self.store.is_redacted(hash))
+    /// Whether a peer has refused to show this node at `path`, or at any
+    /// position for `None` (§5.5).
+    pub(crate) fn is_redacted_raw(
+        &self,
+        hash: &Hash,
+        path: Option<&[u8]>,
+    ) -> Result<bool, MptError> {
+        Self::wrap(self.store.is_redacted(hash, path))
     }
 
     pub(crate) fn has_value_raw(&self, hash: &Hash) -> Result<bool, MptError> {
@@ -1015,7 +1040,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 // (§5.5). Both roots of a diff redact the same positions, so no
                 // spurious change is emitted; otherwise promotion's
                 // materialization would fail on a subtree withheld on purpose.
-                Err(MptError::MissingNode(_)) if self.is_redacted_raw(&h)? => Ok(Cursor::Empty),
+                // Asked of the hash at any position: a node that is missing
+                // here and was refused somewhere was refused at every spine
+                // position the scoped fetch walked, and the diff skips the
+                // unadmitted positions before it cursors them.
+                Err(MptError::MissingNode(_)) if self.is_redacted_raw(&h, None)? => {
+                    Ok(Cursor::Empty)
+                }
                 Err(e) => Err(e),
             },
         }
@@ -1521,6 +1552,62 @@ mod tests {
         // while plainly not holding the trie whole.
         assert!(scoped.is_complete_scoped(root, &scope).unwrap());
         assert!(!scoped.is_complete(root).unwrap());
+    }
+
+    /// A scoped walk deduplicates spine visits by position, not by hash. The
+    /// same node can stand at two positions the scope admits — here an
+    /// extension spelling `photos/`, under `f:` where it leads into the grant
+    /// and under `m:space/` where it leads out of it (§5.5). Whichever is
+    /// walked first must not stand in for the other, or the children admitted
+    /// under only the second are never asked for and the walk calls a trie
+    /// complete that is missing part of the grant.
+    #[test]
+    fn a_node_at_two_spine_positions_is_visited_at_both() {
+        let source = MemStore::new();
+        let trie = Trie::new(&source);
+        let mut root = Hash::EMPTY;
+        // The subtree under `photos/` is byte-identical in both places, so
+        // the extension above it is one node with two positions; `finance`
+        // beside each makes both parents branches, so both positions exist.
+        for key in [
+            b"f:photos/a".as_slice(),
+            b"f:photos/b".as_slice(),
+            b"f:finance/x".as_slice(),
+            b"m:space/photos/a".as_slice(),
+            b"m:space/photos/b".as_slice(),
+            b"m:space/finance".as_slice(),
+        ] {
+            let value = key.rsplit(|b| *b == b'/').next().unwrap();
+            root = trie.insert(root, key, value).unwrap();
+        }
+        let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+        let f_side = Nibbles::from_bytes(b"f:p").as_slice()[..5].to_vec();
+        let m_side = Nibbles::from_bytes(b"m:space/p").as_slice()[..17].to_vec();
+        let positions = trie
+            .resolve_paths(root, &[f_side.clone(), m_side.clone()])
+            .unwrap();
+        assert_eq!(positions[0], positions[1], "the shape is not self-similar");
+        assert!(scope.admits_path(&f_side) && scope.admits_path(&m_side));
+        // Walked first, because the frontier is a stack and `m:` sorts after
+        // `f:` in the root branch.
+        let empty = MemStore::new();
+        let mut walk = MissingWalk::scoped(None, root, scope.clone());
+        let asked = drain(&mut walk, &source, &empty);
+        assert!(asked.iter().any(|(path, _)| path == &f_side));
+        assert!(asked.iter().any(|(path, _)| path == &m_side));
+
+        let scoped = Trie::new(&empty);
+        assert_eq!(
+            scoped.get(root, b"f:photos/a").unwrap().as_deref(),
+            Some(b"a".as_slice()),
+            "the grant was not fetched: the spine visit under `m:` stood in for the one under `f:`"
+        );
+        assert!(scoped.is_complete_scoped(root, &scope).unwrap());
+        // The subtree the `m:` position leads to was never asked for at that
+        // position — every request was admitted — though being the same
+        // nodes, it is of course readable there too.
+        assert!(asked.iter().all(|(path, _)| scope.admits_path(path)));
+        assert!(scoped.get(root, b"m:space/finance").is_err());
     }
 
     /// Position, not hash, is what a scoped fetch may be authorized on: a path

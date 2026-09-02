@@ -93,7 +93,28 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         run: v24_socket_activations,
     },
     Migration::Sql(V25_ENTRIES_BY_SPACE_CONTENT),
+    Migration::Sql(V26_REDACTIONS_BY_POSITION),
 ];
+
+/// v26 — a refusal is remembered by position, not by hash alone (§5.5).
+///
+/// A peer refuses to show a node because of *where* it sits: the same node
+/// can stand at two spine positions the scope admits and reveal an
+/// out-of-scope range at only one of them. Recorded against the hash alone,
+/// the refusal at one position had the fetch walk skip the other, so a
+/// delegate could call a trie complete while missing part of its grant.
+///
+/// The old rows are dropped rather than carried over as "refused
+/// everywhere": that is exactly the reading being retired, and one round
+/// re-learns every boundary that still stands.
+const V26_REDACTIONS_BY_POSITION: &str = r#"
+DROP TABLE redacted_nodes;
+CREATE TABLE redacted_nodes (
+  hash BLOB NOT NULL,
+  path BLOB NOT NULL,
+  PRIMARY KEY (hash, path)
+);
+"#;
 
 /// v24 — path-based socket activation replaces declaration-and-approval.
 ///
@@ -913,7 +934,11 @@ CREATE TABLE head_history (
 );
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
-CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
+CREATE TABLE redacted_nodes (
+  hash BLOB NOT NULL,
+  path BLOB NOT NULL,
+  PRIMARY KEY (hash, path)
+);
 CREATE TABLE entries (
   origin_id   TEXT NOT NULL,
   space       TEXT NOT NULL,

@@ -89,7 +89,7 @@ impl Scope {
     /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
-    pub(crate) fn contains_subtree(&self, path: &[u8]) -> bool {
+    pub fn contains_subtree(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
             Some(prefixes) => prefixes.iter().any(|p| path.starts_with(p.as_slice())),

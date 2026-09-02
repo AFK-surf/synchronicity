@@ -1840,8 +1840,14 @@ CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 -- Positions a peer serving a scoped view refused to show (§5.5). A boundary,
 -- not an absence: without it a scoped node could not tell "the peer does not
 -- have this" from "the peer will not show me this", and its completeness walk
--- would never settle.
-CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
+-- would never settle. Keyed by position as well as hash: a refusal is about
+-- where a node sits, and the same node can stand at two spine positions and
+-- be refused at only one of them.
+CREATE TABLE redacted_nodes (
+  hash BLOB NOT NULL,
+  path BLOB NOT NULL,
+  PRIMARY KEY (hash, path)
+);
 
 -- materialized views of trie leaves (rebuilt incrementally from diffs)
 CREATE TABLE entries (

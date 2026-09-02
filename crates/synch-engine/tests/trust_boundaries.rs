@@ -1,6 +1,6 @@
-//! Reproductions for the mptsync correctness audit. Each test states the
-//! property the design promises and is expected to FAIL on the current code;
-//! the ones that fail are `#[ignore]`d so the suite stays green until fixed.
+//! Containment at the trust boundaries of mptsync (§5.5, §12), over real
+//! endpoints. Each test states a property the design promises; one that the
+//! code does not yet meet is `#[ignore]`d, with the gap named in the reason.
 
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
@@ -47,15 +47,19 @@ fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
     all
 }
 
-/// FINDING 1. A delegate can graft a withheld subtree of the issuer's trie
-/// into its own trie at an in-scope position. It knows the subtree's hash
-/// (the hash sits in the branch node the signed root recomputes through) and
-/// need not hold a single node of it: the full member fetching the delegate's
-/// head already holds those nodes from the issuer's trie, so the walk finds
-/// them present, promotes the head, and from then on serves the withheld
-/// subtree to *every* delegate under the grafting origin's in-scope positions.
+/// A delegate can graft a withheld subtree of the issuer's trie into its own
+/// trie at an in-scope position. It knows the subtree's hash (the hash sits
+/// in the branch node the signed root recomputes through) and need not hold a
+/// single node of it: the full member fetching the delegate's head already
+/// holds those nodes from the issuer's trie, so the walk finds them present,
+/// promotes the head, and from then on serves the withheld subtree to *every*
+/// delegate under the grafting origin's in-scope positions.
+///
+/// Open: structural sharing crosses the delegation boundary in a member's
+/// shared node store, and closing it needs per-origin provenance for the
+/// nodes of a confined origin's trie rather than a local patch.
 #[tokio::test]
-#[ignore = "audit finding 1: structural sharing crosses the delegation boundary"]
+#[ignore = "open: structural sharing crosses the delegation boundary"]
 async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let issuer = WireNode::spawn(Some("nas")).await;
     let grafter = WireNode::spawn(None).await;
@@ -193,13 +197,13 @@ async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
-/// FINDING 2. A node that hashes correctly but breaks a structural invariant
-/// is the *origin's* fault (§12) and must be contained to that origin. At the
-/// ingest boundary it is reported as a hash mismatch — a peer fault — which
-/// aborts the whole exchange, leaves the head pending, and repeats on every
-/// exchange with every peer that serves it.
+/// A node that hashes correctly but breaks a structural invariant is the
+/// *origin's* fault (§12) and is contained to that origin: the exchange goes
+/// on, the origin is reported as left behind, and the head does not keep the
+/// pending slot. Reported as a hash mismatch — a peer fault — it aborted the
+/// whole exchange, left the head pending, and repeated on every exchange with
+/// every peer that served it.
 #[tokio::test]
-#[ignore = "audit finding 2: a non-canonical node aborts the exchange instead of failing its origin"]
 async fn a_non_canonical_node_fails_its_origin_and_not_the_exchange() {
     let a = WireNode::spawn(Some("a")).await;
     let b = WireNode::spawn(Some("b")).await;
