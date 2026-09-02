@@ -31,14 +31,18 @@ legitimate for the origin it names.
   origin's root reads presence through `view` (`load_owned_raw`).
 - `confined_head_vouched`: a member that finds a confined origin's root
   complete through `view` has found only nodes that origin legitimately held.
-- `Graft` is the graft of #115 in four nodes, kept so the invariant is seen to
-  be strong enough: `before_sound` is a sound state in which a member holds the
-  grafted root, `finance_not_legit` shows `Legit` excludes the withheld leaf
-  for the photos scope, `new_rule_refuses` that no participant vouches for it
-  under the grafting root, and `grafted_root_incomplete` that the grafted root
-  never completes through `view`.  Before vouching, the responder served any
-  held node at an admitted position, which is one step from `before` to a
-  state `Sound` rejects; that rule is gone and is not modelled.
+- `Withheld` is content no rooted trie exposes to a scope and no origin of
+  that scope authored.  `withheld_not_legit`, `withheld_not_served`, and
+  `withheld_root_incomplete` say that, in any sound system, such content is
+  never legitimately a confined reader's, is never served under a confined
+  origin's root, and keeps every confined root that reaches it from
+  completing — whatever trie it is grafted into.
+- `Graft` is the graft of #115 in four nodes, instantiating those theorems so
+  the invariant is seen to be strong enough: the finance leaf is `Withheld`
+  from every confined scope, so the reader cannot be served it and the grafted
+  root never completes.  Before vouching, the responder served any held node
+  at an admitted position, one step from `Graft.before` to a state `Sound`
+  rejects; that rule is gone and is not modelled.
 
 Like `ScopedSync`, this is about nodes.  Values follow the node that carries
 them (`GetValues` serves a value only with a vouched holder), and heads are
@@ -222,6 +226,100 @@ theorem confined_head_vouched {sys : Sys} (hsound : Sound w sys) (hc : w.Confine
   · exact hsound.2 q o x hc (view_owned hc held)
   · exact absurd hb hnb
 
+/-! ## The theorem: privacy and integrity of confined tries -/
+
+/-- Every participant starts holding nothing. -/
+def Initial : Sys := fun _ =>
+  { base := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩, owned := fun _ _ => False }
+
+inductive Reachable (w : World) : Sys → Prop where
+  | initial : Reachable w Initial
+  | next {sys sys' : Sys} : Reachable w sys → Step w sys sys' → Reachable w sys'
+
+theorem initial_sound : Sound w Initial :=
+  ⟨fun _ _ h => h.elim, fun _ _ _ _ h => h.elim⟩
+
+theorem reachable_sound {sys : Sys} (h : Reachable w sys) : Sound w sys := by
+  induction h with
+  | initial => exact initial_sound
+  | next _ step ih => exact step_sound ih step
+
+/-- **Privacy.**  In every reachable state, a confined participant holds only
+nodes that are legitimately its: exposed to its scope by a rooted origin's
+trie at an admitted position, authored by it, or published by a confined origin
+that legitimately held them. -/
+theorem privacy {sys : Sys} (h : Reachable w sys) (hx : (sys q).base.held x) :
+    Legit w (w.scopeOf q) x :=
+  (reachable_sound h).1 q x hx
+
+/-- **Integrity.**  In every reachable state, a member that finds a confined
+origin's root complete through `view` — the premise on which it promotes the
+head, materializes its records, and advertises it — has found only nodes
+legitimately that origin's. -/
+theorem integrity {sys : Sys} {r : Hash} {path : Path} (h : Reachable w sys) (hc : w.Confined o)
+    (hcomplete : CompleteWithin w.c (view w (sys q) o) s r)
+    (hr : Reach w.c (view w (sys q) o) s r path x) (hnb : ¬ Boundary s (view w (sys q) o) path x) :
+    Legit w (w.scopeOf o) x :=
+  confined_head_vouched (reachable_sound h) hc hcomplete hr hnb
+
+/-! ## Withheld content stays withheld -/
+
+/-- No rooted origin's trie exposes `x` to scope `s` — wherever `x` sits under a
+rooted head at a position `s` admits, its node reveals something `s` does not
+— and no origin reading under `s` authored it. -/
+def Withheld (w : World) (s : Scope) (x : Hash) : Prop :=
+  (∀ o r path n, w.headOf o r → ¬ w.Confined o → At w.c r path x → w.c x = some n →
+    s.AdmitsPath path → ¬ AdmitsNode s path n) ∧
+  (∀ o, w.authored o x → w.scopeOf o ≠ s)
+
+/-- Content withheld from every confined scope is legitimately no confined
+reader's: every `Legit` derivation bottoms out in a rooted exposure or an
+authoring, and passes only through confined scopes on the way.  With
+`privacy`, this is the negative form of the theorem: such content never
+reaches a confined participant (`privacy_withheld`). -/
+theorem withheld_not_legit (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o) x) :
+    ∀ s, Legit w s x → (∃ o, w.Confined o ∧ s = w.scopeOf o) → False := by
+  intro s h
+  induction h with
+  | full hfull =>
+    rintro ⟨o, hc, rfl⟩
+    exact hc hfull
+  | @rooted s o r path x n hhead hnc hadm hat hcn hnode =>
+    rintro ⟨o', hc', rfl⟩
+    exact (hw o' hc').1 o r path n hhead hnc hat hcn hadm hnode
+  | @confined s o r path x n _ hc _ _ _ _ _ ih =>
+    intro _
+    exact ih hw ⟨o, hc, rfl⟩
+  | @authored o x hauth =>
+    rintro ⟨o', hc', heq⟩
+    exact (hw o' hc').2 o hauth heq
+
+/-- Withheld content never reaches a confined participant, in any reachable
+state. -/
+theorem privacy_withheld {sys : Sys} (h : Reachable w sys) (hq : w.Confined q)
+    (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o) x) : ¬ (sys q).base.held x :=
+  fun hx => withheld_not_legit hw _ (privacy h hx) ⟨q, hq, rfl⟩
+
+/-- Nobody in a sound system vouches for withheld content under a confined
+origin's root, so no reader is served it there — wherever the origin placed
+its hash. -/
+theorem withheld_not_served {sys : Sys} {r : Hash} {path : Path} {n : Node}
+    (hsound : Sound w sys) (hc : w.Confined o)
+    (hw : ∀ o', w.Confined o' → Withheld w (w.scopeOf o') x) :
+    ¬ ServeNode w p (sys p) s o r path x n :=
+  fun h => withheld_not_legit hw _ (vouched_legit hsound hc h.2.2) ⟨o, hc, rfl⟩
+
+/-- A confined origin's root that reaches withheld content never completes
+through `view` on any sound member: the member never comes to own the node as
+that origin's, and Rust's fetch abandons the head. -/
+theorem withheld_root_incomplete {sys : Sys} {r : Hash} {path : Path}
+    (hsound : Sound w sys) (hc : w.Confined o)
+    (hw : ∀ o', w.Confined o' → Withheld w (w.scopeOf o') x)
+    (hr : Reach w.c (view w (sys q) o) s r path x) (hnb : ¬ Boundary s (view w (sys q) o) path x) :
+    ¬ CompleteWithin w.c (view w (sys q) o) s r :=
+  fun hcomplete =>
+    withheld_not_legit hw _ (confined_head_vouched hsound hc hcomplete hr hnb) ⟨o, hc, rfl⟩
+
 /-! ## The witness: the graft of #115 -/
 
 namespace Graft
@@ -324,32 +422,30 @@ theorem photos_rejects_finance : ¬ photos.AdmitsPath [financeSlot] := by
   unfold Scope.AdmitsPath at h
   simp [photos, List.cons_prefix_cons] at h
 
-/-- The finance leaf is nobody's to hold under the photos grant. -/
-theorem finance_not_legit : ∀ s x, Legit world s x → s = photos → x = F → False := by
-  intro s x h
-  induction h with
-  | full hfull =>
-    rintro rfl _
-    exact photos_not_full hfull
-  | @rooted s o r path x n hhead hnc hadm hat _ _ =>
-    rintro rfl rfl
-    rcases hhead with ⟨_, rfl⟩ | ⟨rfl, _⟩
+/-- Every confined origin here reads under `photos`. -/
+theorem confined_scope (hc : world.Confined o) : world.scopeOf o = photos := by
+  by_cases ho : o = issuer
+  · subst ho
+    exact absurd hc not_confined_issuer
+  · simp [world, show o ≠ 0 from ho]
+
+/-- The finance leaf is withheld from every confined scope: under the one
+rooted head it sits only at the finance slot, and only the issuer authored it. -/
+theorem finance_withheld : ∀ o, world.Confined o → Withheld world (world.scopeOf o) F := by
+  intro o hc
+  rw [confined_scope hc]
+  refine ⟨fun o' r path n hhead hnc hat _ hadm => ?_, fun o' hauth heq => ?_⟩
+  · rcases hhead with ⟨_, rfl⟩ | ⟨rfl, _⟩
     · rw [finance_position hat] at hadm
-      exact photos_rejects_finance hadm
-    · exact hnc confined_grafter
-  | @confined s o r path x n hhead hconf _ _ _ _ _ ih =>
-    rintro rfl rfl
-    rcases hhead with ⟨rfl, _⟩ | ⟨rfl, _⟩
-    · exact absurd hconf not_confined_issuer
-    · exact ih (by simp [world]) rfl
-  | @authored o x hauth =>
-    intro hs rfl
-    have ho : o ≠ issuer := by
-      intro rfl
-      exact full_ne_photos (by simpa [world] using hs)
-    rcases hauth with ⟨rfl, _⟩ | ⟨_, hG⟩
-    · exact ho rfl
+      exact absurd hadm photos_rejects_finance
+    · exact absurd confined_grafter hnc
+  · rcases hauth with ⟨rfl, _⟩ | ⟨_, hG⟩
+    · exact full_ne_photos (by simpa [world] using heq)
     · exact absurd hG (by decide)
+
+/-- The finance leaf is nobody's to hold under the photos grant. -/
+theorem finance_not_legit : ¬ Legit world photos F :=
+  fun h => withheld_not_legit finance_withheld _ h ⟨grafter, confined_grafter, by simp [world]⟩
 
 theorem before_sound : Sound world before := by
   refine ⟨fun q x hx => ?_, fun q o x hc hx => ?_⟩
@@ -374,18 +470,17 @@ theorem before_sound : Sound world before := by
       · exact hx.elim
 
 /-- **Nobody vouches for the graft.**  The issuer holds the finance leaf and
-the grafter's root, and no participant serves the leaf to the reader under
-that root: vouching for it would need it to be legitimately the grafter's. -/
+the grafter's root, and no participant serves the leaf to any reader under
+that root. -/
 theorem new_rule_refuses {r : Hash} {path : Path} {n : Node} :
-    ¬ ServeNode world p (before p) (world.scopeOf reader) grafter r path F n := by
-  intro ⟨_, _, hv⟩
-  exact finance_not_legit _ _ (vouched_legit before_sound confined_grafter hv) rfl rfl
+    ¬ ServeNode world p (before p) s grafter r path F n :=
+  withheld_not_served before_sound confined_grafter finance_withheld
 
 /-- **The grafted root never completes.**  Judged through `view`, the issuer's
-copy of the grafter's trie is missing the finance leaf, whatever the scope. -/
+copy of the grafter's trie is missing the finance leaf, under any scope that
+admits the photos slot. -/
 theorem grafted_root_incomplete (s : Scope) (hs : s.AdmitsPath [photosSlot]) :
     ¬ CompleteWithin content (view world (before issuer) grafter) s G := by
-  intro hcomplete
   have hroot : Reach content (view world (before issuer) grafter) s G [] G :=
     Reach.root (Scope.admitsPath_of_prefix hs List.nil_prefix)
   have hheldG : (view world (before issuer) grafter).held G := by
@@ -394,10 +489,8 @@ theorem grafted_root_incomplete (s : Scope) (hs : s.AdmitsPath [photosSlot]) :
   have hF : Reach content (view world (before issuer) grafter) s G [photosSlot] F :=
     Reach.child hroot hheldG (held_not_boundary hheldG) (by simp [content]) ChildOf.ext
       (by simpa using hs)
-  rcases (hcomplete _ _ hF).1 with held | ⟨_, _, hred⟩
-  · have := view_owned confined_grafter held
-    simp [before] at this
-  · exact hred
+  exact withheld_root_incomplete before_sound confined_grafter finance_withheld hF
+    (fun hb => hb.2.2)
 
 end Graft
 

@@ -70,8 +70,9 @@ head selection is an order-independent join, the derived view is a function of
 root and scope, and a fetch terminates and is complete when it can take no
 further step — under stated delivery and finiteness assumptions
 (`Convergence`); and a multi-party model of provenance across the delegation
-boundary, proving the vouching rule sound with the graft of #115 as the
-witness that the invariant excludes it (`Provenance`). The system theorem says every
+boundary, whose `privacy` and `integrity` theorems hold in every reachable
+state, with the graft of #115 as the witness that they exclude it
+(`Provenance`). The system theorem says every
 live source leaf names available content and every live replica leaf names
 either pinned available content or a want for that same holder and root. It
 covers protection removal as well as acquisition, protected explicit deletion,

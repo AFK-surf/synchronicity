@@ -52,8 +52,9 @@ There are four layers:
   further step (below);
 - `Provenance` is the multi-party model that the single-store privacy theorem
   cannot state: whether a node is *legitimately* a reader's, across every trie
-  it might be read through, with the graft of issue #115 as the witness that
-  the invariant is strong enough to exclude it (below).
+  it might be read through. Its theorem is `privacy` and `integrity` over every
+  reachable system state, with the graft of issue #115 as the witness that the
+  invariant is strong enough to exclude it (below).
 
 The principal system theorems are
 `SystemSafety.source_live_content_is_available` and
@@ -182,23 +183,30 @@ a node legitimately that origin's.
   through `view` (`MissingWalk::for_origin`, `Trie::load_owned_raw`,
   `is_complete_scoped_for`). `provenance_owner` decides which origins are
   judged this way: every origin that is not rooted, except the node's own.
-- `confined_head_vouched`: a member that finds a confined origin's root
-  complete through `view` has found only nodes legitimately that origin's.
-- `Graft` is the witness that `Sound` is strong enough, in four nodes: an
-  issuer root over a photos leaf and a finance leaf, and a grafter root that is
-  an extension placing the finance leaf under the photos slot. `before_sound`
-  is a sound state in which the issuer holds everything and owns the grafter's
-  root as the grafter's; `finance_not_legit` is an induction over `Legit`
-  showing no derivation makes the finance leaf a photos reader's;
-  `new_rule_refuses` that no participant vouches for it under the grafter's
-  root; and `grafted_root_incomplete` that, judged through `view`, the issuer's
-  copy of the grafter's trie is missing the finance leaf under any scope that
-  admits the photos slot. Rust's fetch asks the grafter for it, is told
-  `missing`, and abandons the head;
+- **The theorem**, over every state `Reachable` from participants holding
+  nothing: `privacy` — a confined participant holds only nodes legitimately
+  its; `integrity` — a member that finds a confined origin's root complete
+  through `view`, which is the premise on which it promotes, materializes and
+  advertises the head, has found only nodes legitimately that origin's.
+- The negative forms make the theorem checkable against an attack. `Withheld`
+  is content no rooted trie exposes to a scope and no origin of that scope
+  authored; `withheld_not_legit` shows a `Legit` derivation can never reach it
+  for a confined scope, so `privacy_withheld` (it never reaches a confined
+  participant), `withheld_not_served` (nobody serves it under a confined
+  origin's root), and `withheld_root_incomplete` (a confined root that reaches
+  it never completes) follow for any world, whatever trie it is grafted into.
+- `Graft` instantiates them on issue #115 in four nodes: an issuer root over a
+  photos leaf and a finance leaf, and a grafter root that is an extension
+  placing the finance leaf under the photos slot. `finance_withheld` is the
+  only concrete work — the leaf sits under the one rooted head at the finance
+  slot alone, and only the issuer authored it — and `finance_not_legit`,
+  `new_rule_refuses` and `grafted_root_incomplete` are the general theorems
+  applied. Rust's fetch asks the grafter for it, is told `missing`, and
+  abandons the head;
   `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie` runs the
   whole shape over real endpoints. The rule before vouching — serve any held
-  node at an admitted position — is one step from `before` to a state `Sound`
-  rejects; it is gone from Rust and not modelled.
+  node at an admitted position — is one step from `Graft.before` to a state
+  `Sound` rejects; it is gone from Rust and not modelled.
 
 This is the bug class the earlier model could not see: a property that holds
 at every single store while content crosses a boundary between stores. What it
