@@ -13,7 +13,7 @@ lake build --wfail
 ```
 
 The package depends on Mathlib (pinned to the toolchain's tag; `lake exe
-cache get` fetches the compiled oleans) for `Function.update`, the
+cache get` fetches the compiled oleans) for `Set`, `Function.update`, the
 lexicographic linear order on heads, `List.maximum`, `Set.Finite`/`Set.ncard`,
 and the well-foundedness lemmas. The proofs themselves are `grind`, `omega`
 and `simp`. Every module ends in `#lint`, so a public declaration without a
@@ -22,25 +22,30 @@ docstring or with an unused argument fails the build.
 ## Module map
 
 Every model is an instance of `Prelude.System` — an initial state and a step
-relation — and every safety theorem is `System.Reachable.invariant` applied
-to an inductive invariant. `Prelude.Lift` is a store of cells in which one
-cell steps and the rest stay; `subst_step` is the tactic that opens a
-transition hypothesis and substitutes the successor state, so that
-preservation proofs are `cases k <;> … <;> subst_step h <;> grind`.
+relation — and every safety theorem is a `System.Invariant` (true initially,
+preserved by every step) read at a reachable state. Every transition is a
+`Prelude.Transition`: a guard and a successor function. Where the code has
+two outcomes, the outcome is a parameter of the transition and of its `Kind`,
+so a preservation proof is `cases k <;> simp only [transition] at h <;>
+obtain ⟨hg, rfl⟩ := h <;> constructor <;> grind`. `Lift` is a store of cells
+in which one cell steps and the rest stay, `Across` one in which every cell
+steps or stays; `Reachable.simulate` is the simulation argument between two
+systems under a projection. Every set — pins, held nodes, retained roots — is
+a Mathlib `Set`.
 
 | Module | What it states | What it proves |
 |---|---|---|
-| `Prelude` | `System`, `Reachable`, `Lift`, `add`/`drop`, `subst_step` | the generic induction and simulation lemmas |
-| `Anchors` | the `rust_impl` attribute | — |
-| `Cas` | the twenty-three cell transitions (`Kind`, `Trans`, `CellStep`) over a cell indexed by holder `H` with a `Roles` instance; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, five lines each; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf` |
-| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder := Nat` instance with the operator at `0` | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, and the GC/delete/staged-row corollaries |
+| `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
+| `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, and the GC/delete/staged-row corollaries |
 | `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
-| `Safety` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `Local` guard on free CAS steps is what this rests on |
+| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on |
 | `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
-| `ScopedSync` | the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
-| `TrieGraph` | the multi-root trie store with reachability derived from `At`; `GcSweep`, `DropRoot`, `RetainRoot`, `LearnNode`; `proj` to `MptGc` | `gc_preserves_complete_retained_root`, `complete_iff_reach_held`, and that every transition projects to the `MptGc` transition it abstracts (`gcSweep_projects`, `dropRoot_projects`, …) |
-| `Convergence` | head selection (`select`), the derived view (`HasValue`, `ScopedView`), the fetch (`FetchStep`, `Bounded`, `Whole`) | `select_eq_of_mem_iff`, `scoped_view_deterministic`, `admitted_key_readable`, `fetchStep_wf`, `stuck_complete`, and `converge`, which puts the three together |
+| `ScopedSync` | `Hash`, the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
+| `TrieGraph` | the multi-root trie store under a read scope, with `Complete` read as `CompleteWithin`; every `MptGc` transition at store level, `GcSweep` as mark/sweep over held nodes and their values | `gcSweep_complete_iff` — a sweep keeps a retained root exactly as complete as it was; `step_projects` and `simulates` — `MptGc` simulates the store at every root |
+| `Convergence` | head selection (`select`, `offer` over a node's heard heads and per-root slots), the derived view (`HasValue`, `ScopedView`, `Readable`), the fetch (`FetchStep`, `Bounded`, `Whole`, `Productive`) | `select_eq_of_mem_iff`, `offer_step`, `scoped_view_deterministic`, `admitted_key_readable`, `fetchStep_wf`, `stuck_complete`, and `converge`, which puts the three together |
 | `Provenance` | the multi-party model: `Legit`, `Sound`, `Vouched`, `view`; `LegitVia` chains; `Withheld` | `privacy`, `integrity`, `privacy_chain`, `withheld_not_legit` and its corollaries |
 
 Each theorem's docstring says what it means for the code; this file says how
@@ -56,7 +61,7 @@ behind it — and `NoLoss` is what only the fault-free transitions preserve —
 every pin stands on available content; a source leaf is pinned, never merely
 wanted. `SystemSafety` is the fault-free closure with invariant
 `Invariant ∧ NoLoss`; `FaultTolerant` adds two unguarded loss steps and the
-two heals and proves `Invariant` alone survives them; `Safety` pairs the CAS
+two heals and proves `Invariant` alone survives them; `Bridge` pairs the CAS
 cells with the `MptGc` head flip.
 
 The principal theorems are `SystemSafety.source_live_content_is_available` and
@@ -111,14 +116,17 @@ concrete instance lives in the Rust test
 ## Convergence
 
 `Convergence.converge` is the statement: two nodes that heard the same heads
-select the same head; if each fetched its root under the same scope until no
-step was left, each holds a trie complete within the scope, every admitted key
-has the same value on both, and each can read it or finds it under a boundary
-its peer refused. It assumes, as hypotheses, that heads reach every node, that
-a peer holding the root's head answers, that the origin's trie is whole and
-finite, and — for out-of-line values only — that a held node is admitted where
-the walk meets it. Not proved: that the gossip schedule delivers heads, or how
-long any of this takes.
+select the same head; if each fetched its root under the same scope, from
+peers that heard the same heads, until no step was left, each holds a trie
+complete within the scope, every admitted key has the same value on both, and
+each can read it (`Readable`: it holds the carrying node, or the key lies
+under a boundary its peer refused). It assumes, as hypotheses, that a peer
+holding the root's head answers, that the origin's trie is whole and finite,
+and — for out-of-line values only — `Productive`: that a held node is admitted
+where the walk meets it. Not proved: that the gossip schedule delivers heads,
+or how long any of this takes. `offer` is `offer_head` at the node: the heard
+list and every root's `MptGc` bits, and `offer_step` is the fact that hearing
+a head is `OfferPending` or `Retain` at its root.
 
 `fetchStep_wf` is termination as well-foundedness; `fetch_terminates` is the
 no-infinite-sequence corollary.
@@ -137,21 +145,26 @@ no-infinite-sequence corollary.
 - crash/power-loss recovery is outside this model (see `specs/Recovery.tla`);
   the theorems describe executions between successful durable commits.
 
-`MptGc.State.complete` is the memo the drained walk writes, not a live
-predicate over the store: `Convergence.stuck_fetch_promotes` reads it as
-`CompleteWithin` at the moment the fetch drains, and `TrieGraph.proj` reads
-it as `Complete` for a whole trie. A later `Learn` can extend what a root's
-walk reaches without invalidating the memo Rust keeps; the model does not
-relate the two after the drain.
+`MptGc.State.complete` is `ScopedSync.CompleteWithin` everywhere it is read:
+`Convergence.stuck_fetch_promotes` establishes it when the fetch drains, and
+`TrieGraph.proj` reads it off the store. `TrieGraph.simulates` says every
+store-level step is an `MptGc` step at every root, with one guard: its
+`LearnNode` takes a node no position ever refused. A node refused at one
+position and later held from another — Rust's `put_node` after a
+`note_redacted` of the same hash — has no step in the model; it is exactly the
+case in which the completeness memo Rust keeps can go stale, because holding
+the node dissolves the boundary the memo relied on.
 
 ## Contributing
 
-**Anchors.** A declaration that models a Rust linearization point carries
-`@[rust_impl "anchor-name"]`; the Rust site carries
-`// LEAN-MODEL: anchor-name (Module.Decl)`. `lake exe anchors` prints every
-pair the attribute recorded and `check-anchors.sh` diffs it against the Rust
-sources, so a rename on either side fails CI. An anchor sits on exactly one
-declaration; a declaration may carry several anchors.
+**Anchors.** A definition that models a Rust linearization point carries
+`@[rust_impl "anchor-name"]`; a theorem that justifies a Rust site — a memo
+that may be written, a check that may be skipped — carries
+`@[rust_justifies "anchor-name"]`. The Rust site carries
+`// LEAN-MODEL: anchor-name (Module.Decl)` either way. `lake exe anchors`
+prints every pair the attributes recorded and `check-anchors.sh` diffs it
+against the Rust sources, so a rename on either side fails CI. An anchor sits
+on exactly one declaration; a declaration may carry several anchors.
 
 **Naming.** A theorem about what one transition commits is
 `<transition>_<effect>` (`gc_respects_protection`,
@@ -161,12 +174,18 @@ declaration; a declaration may carry several anchors.
 `<transition>_projects`. Renames keep the old name as an `abbrev` or a
 one-line theorem for one release.
 
-**Proofs.** State transitions as guards around successor equations, name them
-in a `Kind`, and prove preservation with `cases k <;> unfold … at h <;>
-subst_step h <;> constructor <;> grind`. If a case needs a hand-written
-argument, that is a fact the invariant should probably carry. Reach for a
-Mathlib structure before a hand-rolled one: an order is a `LinearOrder`, a
-finite set is `Set.Finite`, a measure is `Set.ncard`.
+**Proofs.** State a transition as a `Transition` — a guard and a successor —
+tagged `@[transition]`, name it in a `Kind`, and prove preservation with
+`cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;>
+constructor <;> grind`. Where the code has two outcomes, make the outcome a
+parameter of the transition and of its `Kind` rather than a disjunction in
+the relation. If a case needs a hand-written argument, that is a fact the
+invariant should probably carry. Guards with several clauses are `Prop`
+structures with named fields (`Collectable`, `Deletable`), never anonymous
+conjunctions read by `.2.2.1`. Reach for a Mathlib structure before a
+hand-rolled one: a set is a `Set`, an order is a `LinearOrder`, a finite set
+is `Set.Finite`, a measure is `Set.ncard`. Identifiers (`Hash`, `Root`,
+`Holder`, `Origin`) are one-field structures, so they cannot be confused.
 
 **Lint.** `#lint` at the end of every module runs the Batteries linters over
 that file. Give every definition and structure a docstring; drop arguments

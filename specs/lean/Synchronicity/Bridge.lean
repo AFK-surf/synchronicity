@@ -15,7 +15,7 @@ this system stands a new source or replica leaf without committing an active,
 materialized head in the same transaction.
 -/
 
-namespace Synchronicity.Safety
+namespace Synchronicity.Bridge
 
 open Cas
 
@@ -28,112 +28,98 @@ structure State (H : Type) where
   /-- The trie root's five bits. -/
   mpt : MptGc.State := {}
 
-/-- One transaction over several content roots: every root either takes the
-transition or is left as it was. -/
-def Across (P : Cell H → Cell H → Prop) (s s' : Cas.State H) : Prop :=
-  ∀ root, P (s root) (s' root) ∨ s' root = s root
-
-/-- A root the transaction changed took the transition. -/
-theorem across_changed {P : Cell H → Cell H → Prop} {s s' : Cas.State H} {root : Root}
-    (h : Across P s s') (changed : s' root ≠ s root) : P (s root) (s' root) :=
-  (h root).resolve_right changed
-
 variable [Roles H]
 
 /-- Both halves keep their own invariant. -/
 def Invariant (s : State H) : Prop :=
   SystemSafety.SystemInvariant s.cas ∧ MptGc.Invariant s.mpt
 
-/-- A free CAS step, a free trie step, or a paired publication or promotion. -/
+/-- A free CAS step that flips no head, a free trie step that flips no head,
+or a paired publication or promotion: the CAS transition of kind `k` across
+every root the transaction touches, together with the head flip. -/
 inductive Step : State H → State H → Prop where
-  | cas {s : State H} {root : Root} {cell' : Cell H} :
-      CellStep (s.cas root) cell' → Local (s.cas root) cell' →
-      Step s { s with cas := update s.cas root cell' }
+  | cas {s : State H} {cas' : Cas.State H} :
+      Lift LocalStep s.cas cas' → Step s { s with cas := cas' }
   | mpt {s : State H} {mpt' : MptGc.State} :
       MptGc.SyncStep s.mpt mpt' → Step s { s with mpt := mpt' }
   | sourcePublish {s : State H} {holder : H} {cas' : Cas.State H} {mpt' : MptGc.State} :
-      Across (SourcePublish holder) s.cas cas' →
-      MptGc.OwnPublish s.mpt mpt' →
+      Across (SourcePublish holder).rel s.cas cas' →
+      MptGc.OwnPublish.rel s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
   | ordinaryPromote {s : State H} {holder : H} {cas' : Cas.State H} {mpt' : MptGc.State} :
-      Across (OrdinaryPromote holder) s.cas cas' →
-      MptGc.Promote s.mpt mpt' →
+      Across (OrdinaryPromote holder).rel s.cas cas' →
+      MptGc.Promote.rel s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
-  | replicaPromote {s : State H} {holder : H} {cas' : Cas.State H} {mpt' : MptGc.State} :
-      Across (ReplicaPromote holder) s.cas cas' →
-      MptGc.Promote s.mpt mpt' →
+  | replicaPromote {s : State H} {holder : H} {pinned : Bool} {cas' : Cas.State H}
+      {mpt' : MptGc.State} :
+      Across (ReplicaPromote holder pinned).rel s.cas cas' →
+      MptGc.Promote.rel s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
 
-/-- The empty store and an unheard-of root. -/
-def Initial : State H := {}
-
-/-- The bridge system. -/
-def system (H : Type) [Roles H] : System (State H) := ⟨Initial, Step⟩
+/-- The bridge system, from the empty store and an unheard-of root. -/
+def system (H : Type) [Roles H] : System (State H) := ⟨{}, Step⟩
 
 /-- The states the bridge reaches. -/
 abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
-theorem across_safe {P : Cell H → Cell H → Prop} {s s' : Cas.State H}
-    (step : ∀ {c c'}, P c c' → CellStep c c')
-    (hinv : SystemSafety.SystemInvariant s) (h : Across P s s') :
-    SystemSafety.SystemInvariant s' := by
-  intro root
-  rcases h root with changed | same
-  · exact SystemSafety.safe_step (hinv root) (step changed)
-  · rw [same]
-    exact hinv root
-
-theorem initial_invariant : Invariant (Initial : State H) :=
-  ⟨SystemSafety.initial_invariant, MptGc.initial_invariant⟩
+theorem across_safe {k : Kind H} {s s' : Cas.State H}
+    (hinv : SystemSafety.SystemInvariant s) (h : Across (Trans k).rel s s') :
+    SystemSafety.SystemInvariant s' :=
+  Across.forall (fun safe step => SystemSafety.safe_step safe ⟨k, step⟩) hinv h
 
 theorem invariant_step {s s' : State H} (hinv : Invariant s) (hstep : Step s s') :
     Invariant s' := by
   obtain ⟨casInv, mptInv⟩ := hinv
   cases hstep with
-  | cas step _ => exact ⟨SystemSafety.invariant_step casInv (Lift.intro step), mptInv⟩
-  | mpt step => exact ⟨casInv, MptGc.sync_invariant_step mptInv step⟩
+  | cas step => exact ⟨SystemSafety.invariant.step casInv (step.mono LocalStep.step), mptInv⟩
+  | mpt step => exact ⟨casInv, MptGc.invariant_step mptInv step.step⟩
   | sourcePublish casStep mptStep =>
-      exact ⟨across_safe (fun h => ⟨.sourcePublish _, h⟩) casInv casStep,
+      exact ⟨across_safe (k := .sourcePublish _) casInv casStep,
         MptGc.invariant_step mptInv ⟨.ownPublish, mptStep⟩⟩
   | ordinaryPromote casStep mptStep =>
-      exact ⟨across_safe (fun h => ⟨.ordinaryPromote _, h⟩) casInv casStep,
+      exact ⟨across_safe (k := .ordinaryPromote _) casInv casStep,
         MptGc.invariant_step mptInv ⟨.promote, mptStep⟩⟩
   | replicaPromote casStep mptStep =>
-      exact ⟨across_safe (fun h => ⟨.replicaPromote _, h⟩) casInv casStep,
+      exact ⟨across_safe (k := .replicaPromote _ _) casInv casStep,
         MptGc.invariant_step mptInv ⟨.promote, mptStep⟩⟩
 
+theorem invariant : (system H).Invariant Invariant where
+  init := ⟨SystemSafety.invariant.init, MptGc.invariant.init⟩
+  step := invariant_step
+
 theorem reachable_invariant {s : State H} (h : Reachable s) : Invariant s :=
-  h.invariant initial_invariant invariant_step
+  invariant.reachable h
 
 /-! ## What the paired transactions commit -/
 
 variable {s : State H} {root : Root} {holder : H}
 
 theorem gc_cannot_create_promised_missing
-    (reachable : Reachable s) (pinned : (s.cas root).pin holder) : Available (s.cas root) :=
+    (reachable : Reachable s) (pinned : holder ∈ (s.cas root).pin) : Available (s.cas root) :=
   ((reachable_invariant reachable).1 root).2.pin_available holder pinned
 
 /-- Publication commits, for every root it changes, an entry, the publisher's
 pin and available content, together with an active, materialized head. -/
 theorem source_publish_commits_one_closed_state {cas' : Cas.State H} {mpt' : MptGc.State}
-    (casStep : Across (SourcePublish holder) s.cas cas') (mptStep : MptGc.OwnPublish s.mpt mpt')
-    (changed : cas' root ≠ s.cas root) :
-    (cas' root).entry ∧ (cas' root).pin holder ∧ Available (cas' root) ∧
+    (casStep : Across (SourcePublish holder).rel s.cas cas')
+    (mptStep : MptGc.OwnPublish.rel s.mpt mpt') (changed : cas' root ≠ s.cas root) :
+    (cas' root).entry ∧ holder ∈ (cas' root).pin ∧ Available (cas' root) ∧
       mpt'.active ∧ mpt'.materialized :=
-  let casClosed := Cas.source_publish_is_closed (across_changed casStep changed)
+  let casClosed := Cas.source_publish_is_closed (casStep.changed changed)
   let mptClosed := MptGc.own_publish_is_atomic mptStep
   ⟨casClosed.1, casClosed.2.1, casClosed.2.2, mptClosed.1, mptClosed.2.2.2⟩
 
 /-- Promotion commits, for every root it changes, an entry and either the
 replica's pin over available content or its want, together with an active,
 materialized head. -/
-theorem replica_promotion_commits_pin_or_want {cas' : Cas.State H} {mpt' : MptGc.State}
-    (casStep : Across (ReplicaPromote holder) s.cas cas') (mptStep : MptGc.Promote s.mpt mpt')
-    (changed : cas' root ≠ s.cas root) :
+theorem replica_promotion_commits_pin_or_want {pinned : Bool} {cas' : Cas.State H}
+    {mpt' : MptGc.State}
+    (casStep : Across (ReplicaPromote holder pinned).rel s.cas cas')
+    (mptStep : MptGc.Promote.rel s.mpt mpt') (changed : cas' root ≠ s.cas root) :
     (cas' root).entry ∧
-      (((cas' root).pin holder ∧ Available (cas' root)) ∨ (cas' root).want holder) ∧
+      ((holder ∈ (cas' root).pin ∧ Available (cas' root)) ∨ holder ∈ (cas' root).want) ∧
       mpt'.active ∧ mpt'.materialized :=
-  let casClosed := Cas.replica_promotion_is_total (across_changed casStep changed)
+  let casClosed := Cas.replica_promotion_is_total (casStep.changed changed)
   let mptClosed := MptGc.promotion_is_atomic mptStep
   ⟨casClosed.1, casClosed.2, mptClosed.1, mptClosed.2.2.2⟩
 
@@ -142,22 +128,20 @@ theorem replica_promotion_commits_pin_or_want {cas' : Cas.State H} {mpt' : MptGc
 /-- **A new leaf is always paired with a head flip.**  No step of the bridge
 stands a source or replica leaf that was not standing before without
 committing an active, materialized head in the same transaction.  This is
-what `Cas.Local` on the free `cas` step is for: a bare publication or
+what `Cas.LocalStep` on the free `cas` step is for: a bare publication or
 promotion is not a step of this system. -/
 theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
-    (new : (s'.cas root).sourceLive holder ∨ (s'.cas root).replicaLive holder)
-    (old : ¬(s.cas root).sourceLive holder ∧ ¬(s.cas root).replicaLive holder) :
+    (new : holder ∈ (s'.cas root).sourceLive ∨ holder ∈ (s'.cas root).replicaLive)
+    (old : holder ∉ (s.cas root).sourceLive ∧ holder ∉ (s.cas root).replicaLive) :
     s'.mpt.active ∧ s'.mpt.materialized := by
   cases hstep with
-  | @cas r cell' step hlocal =>
+  | @cas cas' step =>
     exfalso
-    by_cases hr : root = r
-    · subst hr
-      simp only [Function.update_self] at new
-      rcases new with source | replica
-      · exact hlocal ⟨holder, Or.inl (sourcePublish_of_new_leaf step source old.1)⟩
-      · exact hlocal ⟨holder, Or.inr (Or.inl (replicaPromote_of_new_leaf step replica old.2))⟩
-    · simp only [Function.update_of_ne hr] at new
+    change holder ∈ (cas' root).sourceLive ∨ holder ∈ (cas' root).replicaLive at new
+    rcases step.across root with hk | same
+    · obtain ⟨k, hlocal, hk⟩ := hk
+      exact Bool.false_ne_true (hlocal.symm.trans (flipsHead_of_new_leaf hk new old))
+    · rw [same] at new
       exact new.elim old.1 old.2
   | mpt _ => exact absurd new (fun h => h.elim old.1 old.2)
   | sourcePublish _ mptStep =>
@@ -167,6 +151,6 @@ theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
   | replicaPromote _ mptStep =>
     exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
 
-end Synchronicity.Safety
+end Synchronicity.Bridge
 
 #lint

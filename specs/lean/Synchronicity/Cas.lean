@@ -1,18 +1,21 @@
 import Synchronicity.Prelude
-import Synchronicity.Anchors
 
 /-!
 The CAS transition system, stated once.
 
 `Cell H` is one content root as the store sees it: its row, bytes and durable
 claim, the entry that names it, and the pins, wants and live leaves indexed by
-holder `H`.  Every transition is a named Rust linearization point, carried by
-the `rust_impl` attribute on its definition.  `Kind` names the transitions,
-`Trans` gives each its relation, and `CellStep` is their union.  The models
-that read this file differ only in `H` and in which steps they close over:
+holder `H`.  Every transition is a `Transition`, a guard and a successor, and
+a named Rust linearization point carried by the `rust_impl` attribute on its
+definition.  Where the code has two outcomes — a complete commit that is or is
+not durable, a promotion that pins or wants, — the outcome is a parameter of
+the transition, so that each is still one guarded deterministic step.  `Kind`
+names the transitions with their parameters, `Trans` gives each its
+`Transition`, and `CellStep` is their union.  The models that read this file
+differ only in `H` and in which steps they close over:
 
-- `SystemSafety` is the fault-free closure, with holders indexed by `Nat` and
-  the operator distinguished from the roles a space configures;
+- `SystemSafety` is the fault-free closure, with the operator distinguished
+  from the roles a space configures;
 - `FaultTolerant` adds backend loss and the heals, over the same cells.
 
 Two invariants live here.  `Invariant` is what every transition preserves, the
@@ -34,8 +37,11 @@ class Roles (H : Type) where
 
 export Roles (IsRole)
 
-/-- A content root. -/
-abbrev Root := Nat
+/-- A content root, as the index of a cell in the store. -/
+structure Root where
+  /-- The root's identity. -/
+  id : Nat
+  deriving DecidableEq
 
 variable {H : Type}
 
@@ -44,15 +50,15 @@ structure Cell (H : Type) where
   /-- An `entries` row names the content. -/
   entry : Prop := False
   /-- The holders pinning the content. -/
-  pin : H → Prop := fun _ => False
+  pin : Set H := ∅
   /-- The holders wanting the content. -/
-  want : H → Prop := fun _ => False
+  want : Set H := ∅
   /-- The holders whose source leaf names the content. -/
-  sourceLive : H → Prop := fun _ => False
+  sourceLive : Set H := ∅
   /-- The holders whose replica leaf names the content. -/
-  replicaLive : H → Prop := fun _ => False
+  replicaLive : Set H := ∅
   /-- The holders whose metadata-only leaf names the content. -/
-  ordinaryLive : H → Prop := fun _ => False
+  ordinaryLive : Set H := ∅
   /-- The `blobs` row exists. -/
   row : Prop := False
   /-- The bytes are on local disk. -/
@@ -80,260 +86,289 @@ def Durable (c : Cell H) : Prop := c.row ∧ c.durable
 theorem Available.durable {c : Cell H} (h : Available c) : Durable c := ⟨h.1, h.2.1⟩
 
 /-- Someone pins the content. -/
-def AnyPin (c : Cell H) : Prop := ∃ holder, c.pin holder
+def AnyPin (c : Cell H) : Prop := ∃ holder, holder ∈ c.pin
 
 /-- Some leaf names the content. -/
 def AnyLive (c : Cell H) : Prop :=
-  ∃ holder, c.sourceLive holder ∨ c.replicaLive holder ∨ c.ordinaryLive holder
+  ∃ holder, holder ∈ c.sourceLive ∨ holder ∈ c.replicaLive ∨ holder ∈ c.ordinaryLive
 
 /-- What `delete_blob_if_collectable` checks: a row nothing protects, outside
 the retention window. -/
-def Collectable (c : Cell H) : Prop :=
-  c.row ∧ ¬c.entry ∧ ¬AnyPin c ∧ ¬c.writing ∧ ¬c.sweeping ∧ ¬c.fresh
+structure Collectable (c : Cell H) : Prop where
+  /-- The row exists. -/
+  row : c.row
+  /-- No entry names it. -/
+  no_entry : ¬c.entry
+  /-- Nobody pins it. -/
+  no_pin : ¬AnyPin c
+  /-- No write lease is held. -/
+  not_writing : ¬c.writing
+  /-- No sweep is in flight. -/
+  not_sweeping : ¬c.sweeping
+  /-- The retention window has elapsed. -/
+  not_fresh : ¬c.fresh
 
 /-- What `delete_blob` checks: nothing protects the content. -/
-def Deletable (c : Cell H) : Prop :=
-  ¬c.entry ∧ ¬AnyPin c ∧ ¬c.writing ∧ ¬c.sweeping
+structure Deletable (c : Cell H) : Prop where
+  /-- No entry names it. -/
+  no_entry : ¬c.entry
+  /-- Nobody pins it. -/
+  no_pin : ¬AnyPin c
+  /-- No write lease is held. -/
+  not_writing : ¬c.writing
+  /-- No sweep is in flight. -/
+  not_sweeping : ¬c.sweeping
+
+attribute [grind cases] Collectable Deletable
 
 /-! ## Transitions that do not ask who the holder is -/
 
 /-- `db.rs::Store::lease_write`. -/
-@[rust_impl "cas-write-lease-begin"]
-def BeginWrite (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ c' = { c with writing := True }
+@[transition, rust_impl "cas-write-lease-begin"]
+def BeginWrite : Transition (Cell H) where
+  guard c := ¬c.sweeping
+  post c := { c with writing := True }
 
 /-- `db.rs::WriteLease::drop`. -/
-@[rust_impl "cas-write-lease-end"]
-def WriteAbort (c c' : Cell H) : Prop :=
-  c' = { c with writing := False }
+@[transition, rust_impl "cas-write-lease-end"]
+def WriteAbort : Transition (Cell H) where
+  guard _ := True
+  post c := { c with writing := False }
 
 /-- `cas.rs::write_blob_row`.  A complete row lands with its bytes.  Whether it
 is also durable is `complete_is_durable`: a local backend says yes, a cloud
 backend says not until `finalize`, and `upsert_blob_row` keeps `durable` at
-`max(old, new)`.  The second branch is the staged row that `DropStaged` may
-later discard. -/
-@[rust_impl "cas-write-complete-commit"]
-def CommitComplete (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧
-  (c' = { c with
-      row := True
-      bytes := True
-      durable := True
-      writing := False
-      fresh := True } ∨
-    c' = { c with
-      row := True
-      bytes := True
-      writing := False
-      fresh := True })
+`max(old, new)`.  With `durable = false` this is the staged row that
+`DropStaged` may later discard. -/
+@[transition, rust_impl "cas-write-complete-commit"]
+def CommitComplete (durable : Bool) : Transition (Cell H) where
+  guard c := ¬c.sweeping
+  post c := { c with
+    row := True
+    bytes := True
+    durable := durable ∨ c.durable
+    writing := False
+    fresh := True }
 
 /-- `cas.rs::commit_groups`.  The completing bitmap commit is the same
 transition; partial commits change nothing this model sees. -/
-@[rust_impl "cas-write-groups-commit"]
-def CommitGroups (c c' : Cell H) : Prop := CommitComplete c c'
+@[transition, rust_impl "cas-write-groups-commit"]
+def CommitGroups (durable : Bool) : Transition (Cell H) := CommitComplete durable
 
 /-- `backend.rs::Cloud::finalize`. -/
-@[rust_impl "cas-cloud-finalize"]
-def FinalizeRemote (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ c.row ∧ c' = { c with remote := True, durable := True }
+@[transition, rust_impl "cas-cloud-finalize"]
+def FinalizeRemote : Transition (Cell H) where
+  guard c := ¬c.sweeping ∧ c.row
+  post c := { c with remote := True, durable := True }
 
 /-- `gc.rs::gc_content(before)`: the retention window elapses. -/
-@[rust_impl "cas-retention-elapses"]
-def Age (c c' : Cell H) : Prop :=
-  c' = { c with fresh := False }
+@[transition, rust_impl "cas-retention-elapses"]
+def Age : Transition (Cell H) where
+  guard _ := True
+  post c := { c with fresh := False }
 
 /-- `cas.rs::Store::adopt_durable_blob`.  A cold durable row reconstructed
 after the remote backend confirmed the final pair exists. -/
-@[rust_impl "cas-adopt-durable"]
-def AdoptRemote (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ c' = { c with row := True, remote := True, durable := True }
+@[transition, rust_impl "cas-adopt-durable"]
+def AdoptRemote : Transition (Cell H) where
+  guard c := ¬c.sweeping
+  post c := { c with row := True, remote := True, durable := True }
 
 /-- `cas.rs::clear_blob_cache`, the durable branch. -/
-@[rust_impl "cas-cache-evict"]
-def CacheEvict (c c' : Cell H) : Prop :=
-  c.remote ∧ c.durable ∧ c' = { c with bytes := False }
+@[transition, rust_impl "cas-cache-evict"]
+def CacheEvict : Transition (Cell H) where
+  guard c := c.remote ∧ c.durable
+  post c := { c with bytes := False }
 
 /-- The non-durable branch of `cas.rs::clear_blob_cache`,
 `reconcile_scratch_generation`, and the `commit_cas_migration` discard.  None
 of them consult `pins`; `NoLoss` is what makes that safe
 (`SystemSafety.staged_row_drop_is_unpinned`). -/
-@[rust_impl "cas-drop-staged-row"]
-def DropStaged (c c' : Cell H) : Prop :=
-  ¬c.durable ∧ ¬c.writing ∧ c' = { c with row := False, bytes := False }
+@[transition, rust_impl "cas-drop-staged-row"]
+def DropStaged : Transition (Cell H) where
+  guard c := ¬c.durable ∧ ¬c.writing
+  post c := { c with row := False, bytes := False }
 
 /-- The same promotion as `ReplicaPromote` on a metadata-only node: an entry
 and nothing else (`reconcile.rs::try_promote`). -/
-@[rust_impl "cas-ordinary-promotion"]
-def OrdinaryPromote (holder : H) (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ c' = { c with
-    entry := True
-    ordinaryLive := add c.ordinaryLive holder }
+@[transition, rust_impl "cas-ordinary-promotion"]
+def OrdinaryPromote (holder : H) : Transition (Cell H) where
+  guard c := ¬c.sweeping
+  post c := { c with entry := True, ordinaryLive := insert holder c.ordinaryLive }
 
 /-- `views.rs::apply_change`, the `Deleted` arm under `materialize_diff`: a
 source leaf leaves the derived views. -/
-@[rust_impl "mpt-materialize-remove-source"]
-def RemoveSource (holder : H) (c c' : Cell H) : Prop :=
-  c' = { c with sourceLive := drop c.sourceLive holder }
+@[transition, rust_impl "mpt-materialize-remove-source"]
+def RemoveSource (holder : H) : Transition (Cell H) where
+  guard _ := True
+  post c := { c with sourceLive := c.sourceLive \ {holder} }
 
 /-- The same arm for a replica leaf. -/
-@[rust_impl "mpt-materialize-remove-replica"]
-def RemoveReplica (holder : H) (c c' : Cell H) : Prop :=
-  c' = { c with replicaLive := drop c.replicaLive holder }
+@[transition, rust_impl "mpt-materialize-remove-replica"]
+def RemoveReplica (holder : H) : Transition (Cell H) where
+  guard _ := True
+  post c := { c with replicaLive := c.replicaLive \ {holder} }
 
 /-- The same arm for a metadata-only leaf. -/
-@[rust_impl "mpt-materialize-remove-ordinary"]
-def RemoveOrdinary (holder : H) (c c' : Cell H) : Prop :=
-  c' = { c with ordinaryLive := drop c.ordinaryLive holder }
+@[transition, rust_impl "mpt-materialize-remove-ordinary"]
+def RemoveOrdinary (holder : H) : Transition (Cell H) where
+  guard _ := True
+  post c := { c with ordinaryLive := c.ordinaryLive \ {holder} }
 
 /-- The entry row goes once no leaf of any kind names the content
 (`views.rs::apply_change`, the `Deleted` arm). -/
-@[rust_impl "mpt-materialize-drop-entry"]
-def DropEntry (c c' : Cell H) : Prop :=
-  (∀ holder, ¬c.sourceLive holder ∧ ¬c.replicaLive holder ∧
-    ¬c.ordinaryLive holder) ∧
-  c' = { c with entry := False }
+@[transition, rust_impl "mpt-materialize-drop-entry"]
+def DropEntry : Transition (Cell H) where
+  guard c := ¬AnyLive c
+  post c := { c with entry := False }
 
 /-- `cas.rs::Store::pin`. -/
-@[rust_impl "cas-pin"]
-def Pin (holder : H) (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ Available c ∧
-  c' = { c with pin := add c.pin holder }
+@[transition, rust_impl "cas-pin"]
+def Pin (holder : H) : Transition (Cell H) where
+  guard c := ¬c.sweeping ∧ Available c
+  post c := { c with pin := insert holder c.pin }
 
 /-- `cas.rs::Store::unpin`. -/
-@[rust_impl "cas-unpin"]
-def Unpin (holder : H) (c c' : Cell H) : Prop :=
-  ¬c.sourceLive holder ∧ ¬c.replicaLive holder ∧
-  c' = { c with pin := drop c.pin holder }
+@[transition, rust_impl "cas-unpin"]
+def Unpin (holder : H) : Transition (Cell H) where
+  guard c := holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive
+  post c := { c with pin := c.pin \ {holder} }
 
 /-- `cas.rs::Store::expire_pins_of` / `expire_pins`. -/
-@[rust_impl "cas-expire-pin"]
-def ExpirePin (holder : H) (c c' : Cell H) : Prop := Unpin holder c c'
+@[transition, rust_impl "cas-expire-pin"]
+def ExpirePin (holder : H) : Transition (Cell H) := Unpin holder
 
 /-- `replica.rs::Store::drop_want`. -/
-@[rust_impl "cas-drop-want"]
-def DropWant (holder : H) (c c' : Cell H) : Prop :=
-  ¬c.sourceLive holder ∧ ¬c.replicaLive holder ∧
-  c' = { c with want := drop c.want holder }
+@[transition, rust_impl "cas-drop-want"]
+def DropWant (holder : H) : Transition (Cell H) where
+  guard c := holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive
+  post c := { c with want := c.want \ {holder} }
 
 /-- `replica.rs::take_possession`. -/
-@[rust_impl "cas-take-possession"]
-def TakePossession (holder : H) (c c' : Cell H) : Prop :=
-  ¬c.sweeping ∧ c.want holder ∧ Available c ∧
-  c' = { c with pin := add c.pin holder, want := drop c.want holder }
+@[transition, rust_impl "cas-take-possession"]
+def TakePossession (holder : H) : Transition (Cell H) where
+  guard c := ¬c.sweeping ∧ holder ∈ c.want ∧ Available c
+  post c := { c with pin := insert holder c.pin, want := c.want \ {holder} }
 
 /-- `cas.rs::delete_blob_if_collectable`, the row commit. -/
-@[rust_impl "cas-gc-row-commit"]
-def GcCommit (c c' : Cell H) : Prop :=
-  Collectable c ∧
-  c' = { c with row := False, durable := False, sweeping := True }
+@[transition, rust_impl "cas-gc-row-commit"]
+def GcCommit : Transition (Cell H) where
+  guard := Collectable
+  post c := { c with row := False, durable := False, sweeping := True }
 
 /-- The unlink half of `delete_blob_if_collectable`. -/
-@[rust_impl "cas-gc-unlink"]
-def GcUnlink (c c' : Cell H) : Prop :=
-  c.sweeping ∧ c' = { c with bytes := False, sweeping := False }
+@[transition, rust_impl "cas-gc-unlink"]
+def GcUnlink : Transition (Cell H) where
+  guard c := c.sweeping
+  post c := { c with bytes := False, sweeping := False }
 
 /-- `cas.rs::Store::delete_blob`. -/
-@[rust_impl "cas-protected-delete"]
-def ProtectedDelete (c c' : Cell H) : Prop :=
-  Deletable c ∧
-  c' = { c with row := False, durable := False, sweeping := True }
+@[transition, rust_impl "cas-protected-delete"]
+def ProtectedDelete : Transition (Cell H) where
+  guard := Deletable
+  post c := { c with row := False, durable := False, sweeping := True }
 
 /-! ### Facts a single transition commits, whoever the holders are -/
 
 variable {c c' : Cell H} {holder : H}
 
-theorem gc_respects_protection (hgc : GcCommit c c')
+theorem gc_respects_protection (hgc : GcCommit.rel c c')
     (guarded : c.entry ∨ AnyPin c ∨ c.writing) : False := by
-  obtain ⟨⟨_, noEntry, noPin, noWrite, _, _⟩, _⟩ := hgc
   rcases guarded with entry | pin | writing
-  · exact noEntry entry
-  · exact noPin pin
-  · exact noWrite writing
+  · exact hgc.1.no_entry entry
+  · exact hgc.1.no_pin pin
+  · exact hgc.1.not_writing writing
 
-theorem write_lease_excludes_gc (writing : c.writing) (hgc : GcCommit c c') : False :=
+theorem write_lease_excludes_gc (writing : c.writing) (hgc : GcCommit.rel c c') : False :=
   gc_respects_protection hgc (Or.inr (Or.inr writing))
 
-theorem possession_is_atomic (h : TakePossession holder c c') :
-    c'.pin holder ∧ ¬c'.want holder ∧ Available c' := by
-  obtain ⟨_, _, available, rfl⟩ := h
-  exact ⟨Or.inl rfl, fun w => w.2 rfl, available⟩
+theorem possession_is_atomic (h : (TakePossession holder).rel c c') :
+    holder ∈ c'.pin ∧ holder ∉ c'.want ∧ Available c' := by
+  simp only [transition] at h
+  obtain ⟨⟨_, _, available⟩, rfl⟩ := h
+  exact ⟨Set.mem_insert _ _, fun w => w.2 rfl, available⟩
 
 /-- What a fault breaks and the fault-free transitions keep: every pin, the
 operator's included, stands on available content, and a source's leaf is
 pinned, never merely wanted. -/
 structure NoLoss (c : Cell H) : Prop where
-  pin_available : ∀ holder, c.pin holder → Available c
-  source_pinned : ∀ holder, c.sourceLive holder → c.pin holder
+  /-- Every pin stands on available content. -/
+  pin_available : ∀ holder ∈ c.pin, Available c
+  /-- A source's leaf is pinned. -/
+  source_pinned : ∀ holder ∈ c.sourceLive, holder ∈ c.pin
 
 theorem initial_noLoss : NoLoss ({} : Cell H) :=
-  ⟨fun _ p => False.elim p, fun _ l => False.elim l⟩
+  ⟨fun _ p => p.elim, fun _ l => l.elim⟩
 
 /-! ## Transitions that stand a role behind a leaf -/
 
 variable [Roles H]
 
 /-- `node.rs::Node::publish`. -/
-@[rust_impl "cas-source-publish"]
-def SourcePublish (holder : H) (c c' : Cell H) : Prop :=
-  IsRole holder ∧ ¬c.sweeping ∧ Available c ∧
-  c' = { c with
+@[transition, rust_impl "cas-source-publish"]
+def SourcePublish (holder : H) : Transition (Cell H) where
+  guard c := IsRole holder ∧ ¬c.sweeping ∧ Available c
+  post c := { c with
     entry := True
-    pin := add c.pin holder
-    want := drop c.want holder
-    sourceLive := add c.sourceLive holder }
+    pin := insert holder c.pin
+    want := c.want \ {holder}
+    sourceLive := insert holder c.sourceLive }
 
 /-- `reconcile.rs::try_promote`: a replica leaf takes a pin over available
-content, or records a want. -/
-@[rust_impl "cas-remote-promotion"]
-def ReplicaPromote (holder : H) (c c' : Cell H) : Prop :=
-  IsRole holder ∧ ¬c.sweeping ∧
-  ((Available c ∧ c' = { c with
-      entry := True
-      pin := add c.pin holder
-      want := drop c.want holder
-      replicaLive := add c.replicaLive holder }) ∨
-   (¬Available c ∧ c' = { c with
-      entry := True
-      want := add c.want holder
-      replicaLive := add c.replicaLive holder }))
+content (`pinned`), or records a want when the content is not available. -/
+@[transition, rust_impl "cas-remote-promotion"]
+def ReplicaPromote (holder : H) (pinned : Bool) : Transition (Cell H) where
+  guard c := IsRole holder ∧ ¬c.sweeping ∧ (pinned ↔ Available c)
+  post c := { c with
+    entry := True
+    pin := if pinned then insert holder c.pin else c.pin
+    want := if pinned then c.want \ {holder} else insert holder c.want
+    replicaLive := insert holder c.replicaLive }
 
-theorem source_publish_is_closed (h : SourcePublish holder c c') :
-    c'.entry ∧ c'.pin holder ∧ Available c' := by
-  obtain ⟨_, _, available, rfl⟩ := h
-  exact ⟨trivial, Or.inl rfl, available⟩
+theorem source_publish_is_closed (h : (SourcePublish holder).rel c c') :
+    c'.entry ∧ holder ∈ c'.pin ∧ Available c' := by
+  simp only [transition] at h
+  obtain ⟨⟨_, _, available⟩, rfl⟩ := h
+  exact ⟨trivial, Set.mem_insert _ _, available⟩
 
-theorem replica_promotion_is_total (h : ReplicaPromote holder c c') :
-    c'.entry ∧ ((c'.pin holder ∧ Available c') ∨ c'.want holder) := by
-  obtain ⟨_, _, ⟨available, rfl⟩ | ⟨_, rfl⟩⟩ := h
-  · exact ⟨trivial, Or.inl ⟨Or.inl rfl, available⟩⟩
-  · exact ⟨trivial, Or.inr (Or.inl rfl)⟩
+theorem replica_promotion_is_total {pinned : Bool} (h : (ReplicaPromote holder pinned).rel c c') :
+    c'.entry ∧ ((holder ∈ c'.pin ∧ Available c') ∨ holder ∈ c'.want) := by
+  simp only [transition] at h
+  obtain ⟨⟨_, _, hpinned⟩, rfl⟩ := h
+  cases pinned with
+  | true => exact ⟨trivial, Or.inl ⟨by simp, hpinned.mp rfl⟩⟩
+  | false => exact ⟨trivial, Or.inr (by simp)⟩
 
 /-! ## The transitions, named -/
 
-/-- The twenty-three cell transitions.  A `Kind` is a review anchor's target
-and the case a preservation proof splits on. -/
+/-- The cell transitions with their parameters.  A `Kind` is a review anchor's
+target and the case a preservation proof splits on. -/
 inductive Kind (H : Type) where
-  | beginWrite | writeAbort | commitComplete | finalizeRemote | age | adoptRemote
-  | cacheEvict | dropStaged
-  | sourcePublish (holder : H) | replicaPromote (holder : H) | ordinaryPromote (holder : H)
+  | beginWrite | writeAbort
+  | commitComplete (durable : Bool) | commitGroups (durable : Bool)
+  | finalizeRemote | age | adoptRemote | cacheEvict | dropStaged
+  | sourcePublish (holder : H) | replicaPromote (holder : H) (pinned : Bool)
+  | ordinaryPromote (holder : H)
   | removeSource (holder : H) | removeReplica (holder : H) | removeOrdinary (holder : H)
   | dropEntry
   | pin (holder : H) | unpin (holder : H) | expirePin (holder : H) | dropWant (holder : H)
   | takePossession (holder : H)
   | gcCommit | gcUnlink | protectedDelete
 
-/-- The relation each transition names. -/
-def Trans : Kind H → Cell H → Cell H → Prop
+/-- The transition each kind names. -/
+@[transition]
+def Trans : Kind H → Transition (Cell H)
   | .beginWrite => BeginWrite
   | .writeAbort => WriteAbort
-  | .commitComplete => CommitComplete
+  | .commitComplete durable => CommitComplete durable
+  | .commitGroups durable => CommitGroups durable
   | .finalizeRemote => FinalizeRemote
   | .age => Age
   | .adoptRemote => AdoptRemote
   | .cacheEvict => CacheEvict
   | .dropStaged => DropStaged
   | .sourcePublish holder => SourcePublish holder
-  | .replicaPromote holder => ReplicaPromote holder
+  | .replicaPromote holder pinned => ReplicaPromote holder pinned
   | .ordinaryPromote holder => OrdinaryPromote holder
   | .removeSource holder => RemoveSource holder
   | .removeReplica holder => RemoveReplica holder
@@ -348,77 +383,90 @@ def Trans : Kind H → Cell H → Cell H → Prop
   | .gcUnlink => GcUnlink
   | .protectedDelete => ProtectedDelete
 
-/-- Some transition took the cell from `c` to `c'`. -/
-def CellStep (c c' : Cell H) : Prop := ∃ k : Kind H, Trans k c c'
+/-- Which transitions stand a leaf and so share a transaction with a trie head
+flip.  `Bridge` pairs these with the `MptGc` transition they commit alongside;
+every other transition interleaves freely
+(`Bridge.live_leaf_flips_head`). -/
+def Kind.flipsHead : Kind H → Bool
+  | .sourcePublish _ | .replicaPromote _ _ | .ordinaryPromote _ => true
+  | _ => false
 
-/-- The cell changes that interleave freely with a trie transaction rather than
-share one.  Publication and promotion are the exceptions: `Safety` pairs them
-with the head flip they commit alongside, and `Safety.live_leaf_flips_head` is
-the theorem this guard exists for. -/
-def Local (c c' : Cell H) : Prop :=
-  ¬ ∃ holder, SourcePublish holder c c' ∨ ReplicaPromote holder c c' ∨ OrdinaryPromote holder c c'
+/-- Some transition took the cell from `c` to `c'`. -/
+def CellStep (c c' : Cell H) : Prop := ∃ k : Kind H, (Trans k).rel c c'
+
+/-- A transition that does not flip a head took the cell from `c` to `c'`. -/
+def LocalStep (c c' : Cell H) : Prop := ∃ k : Kind H, k.flipsHead = false ∧ (Trans k).rel c c'
+
+theorem LocalStep.step (h : LocalStep c c') : CellStep c c' :=
+  let ⟨k, _, t⟩ := h
+  ⟨k, t⟩
 
 /-! ## What every transition preserves -/
 
 /-- The claim behind a live leaf: its holder is a role, the content has an
 entry, and the holder either pins a durable claim or has a want recorded. -/
 def LiveClaim (c : Cell H) (holder : H) : Prop :=
-  IsRole holder ∧ c.entry ∧ ((c.pin holder ∧ Durable c) ∨ c.want holder)
+  IsRole holder ∧ c.entry ∧ ((holder ∈ c.pin ∧ Durable c) ∨ holder ∈ c.want)
 
 /-- What survives everything, backend loss included.  Compared with `NoLoss`
-below: `Available` is `Durable`, the pin clause covers only roles, and a
+above: `Available` is `Durable`, the pin clause covers only roles, and a
 source leaf may be wanted rather than pinned. -/
 structure Invariant (c : Cell H) : Prop where
-  role_pin_durable : ∀ holder, IsRole holder → c.pin holder → Durable c
-  source_live : ∀ holder, c.sourceLive holder → LiveClaim c holder
-  replica_live : ∀ holder, c.replicaLive holder → LiveClaim c holder
-  ordinary_live : ∀ holder, c.ordinaryLive holder → c.entry
-  sweeping : c.sweeping → ¬c.entry ∧ (∀ holder, ¬c.pin holder) ∧ ¬c.writing ∧ ¬c.row
+  /-- A role's pin stands on a durable claim. -/
+  role_pin_durable : ∀ holder, IsRole holder → holder ∈ c.pin → Durable c
+  /-- A source leaf has a claim behind it. -/
+  source_live : ∀ holder ∈ c.sourceLive, LiveClaim c holder
+  /-- A replica leaf has a claim behind it. -/
+  replica_live : ∀ holder ∈ c.replicaLive, LiveClaim c holder
+  /-- A metadata-only leaf has an entry. -/
+  ordinary_live : ∀ holder ∈ c.ordinaryLive, c.entry
+  /-- A sweep in flight protects nothing and has no row. -/
+  sweeping : c.sweeping → ¬c.entry ∧ (∀ holder, holder ∉ c.pin) ∧ ¬c.writing ∧ ¬c.row
 
 theorem initial_invariant : Invariant ({} : Cell H) :=
-  ⟨fun _ _ p => False.elim p, fun _ l => False.elim l, fun _ l => False.elim l,
-    fun _ l => False.elim l, fun s => False.elim s⟩
+  ⟨fun _ _ p => p.elim, fun _ l => l.elim, fun _ l => l.elim, fun _ l => l.elim,
+    fun s => s.elim⟩
 
 /-- Every preservation proof below is the same three moves: split on the
-transition, substitute the successor cell, let `grind` read the fields.
-`unfold_trans at h` opens the transition `h` names down to its guards and
-successor equations. -/
-syntax "unfold_trans" (Lean.Parser.Tactic.location)? : tactic
-macro_rules
-  | `(tactic| unfold_trans $[$loc]?) =>
-    `(tactic| simp only [Trans, BeginWrite, WriteAbort, CommitComplete, CommitGroups,
-        FinalizeRemote, Age, AdoptRemote, CacheEvict, DropStaged, SourcePublish, ReplicaPromote,
-        OrdinaryPromote, RemoveSource, RemoveReplica, RemoveOrdinary, DropEntry, Pin, Unpin,
-        ExpirePin, DropWant, TakePossession, GcCommit, GcUnlink, ProtectedDelete,
-        Collectable, Deletable] $[$loc]?)
-
+transition, substitute the successor cell, let `grind` read the fields. -/
 theorem invariant_step (hinv : Invariant c) (hstep : CellStep c c') : Invariant c' := by
   obtain ⟨k, h⟩ := hstep
   obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
-  cases k <;> unfold_trans at h <;> subst_step h <;> constructor <;>
-    grind [LiveClaim, Durable, Available, AnyPin, add, drop]
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;>
+    grind [LiveClaim, Durable, Available, AnyPin, AnyLive]
 
 theorem noLoss_step (hinv : Invariant c) (hnl : NoLoss c) (hstep : CellStep c c') :
     NoLoss c' := by
   obtain ⟨k, h⟩ := hstep
   obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
   obtain ⟨pinsAvailable, sourcePinned⟩ := hnl
-  cases k <;> unfold_trans at h <;> subst_step h <;> constructor <;>
-    grind [LiveClaim, Durable, Available, AnyPin, add, drop]
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;>
+    grind [LiveClaim, Durable, Available, AnyPin, AnyLive]
 
 /-! ## Which transition a change betrays -/
 
+variable {k : Kind H}
+
 /-- A step that stands a new source leaf is a publication. -/
-theorem sourcePublish_of_new_leaf (h : CellStep c c')
-    (new : c'.sourceLive holder) (old : ¬c.sourceLive holder) : SourcePublish holder c c' := by
-  obtain ⟨k, h⟩ := h
-  cases k <;> unfold_trans at h <;> subst_step h <;> grind [SourcePublish, Available, add, drop]
+theorem sourcePublish_of_new_leaf (h : (Trans k).rel c c')
+    (new : holder ∈ c'.sourceLive) (old : holder ∉ c.sourceLive) : k = .sourcePublish holder := by
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> grind
 
 /-- A step that stands a new replica leaf is a promotion. -/
-theorem replicaPromote_of_new_leaf (h : CellStep c c')
-    (new : c'.replicaLive holder) (old : ¬c.replicaLive holder) : ReplicaPromote holder c c' := by
-  obtain ⟨k, h⟩ := h
-  cases k <;> unfold_trans at h <;> subst_step h <;> grind [ReplicaPromote, Available, add, drop]
+theorem replicaPromote_of_new_leaf (h : (Trans k).rel c c')
+    (new : holder ∈ c'.replicaLive) (old : holder ∉ c.replicaLive) :
+    ∃ pinned, k = .replicaPromote holder pinned := by
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h
+  case replicaPromote _ pinned => exact ⟨pinned, by grind⟩
+  all_goals grind
+
+/-- A step that stands a new leaf of either kind flips a head. -/
+theorem flipsHead_of_new_leaf (h : (Trans k).rel c c')
+    (new : holder ∈ c'.sourceLive ∨ holder ∈ c'.replicaLive)
+    (old : holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive) : k.flipsHead = true := by
+  rcases new with source | replica
+  · rw [sourcePublish_of_new_leaf h source old.1]; rfl
+  · obtain ⟨_, rfl⟩ := replicaPromote_of_new_leaf h replica old.2; rfl
 
 /-! ## The store: one cell per content root -/
 

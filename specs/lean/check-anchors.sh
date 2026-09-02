@@ -18,16 +18,20 @@ rust_src="$root/crates/synch-store/src $root/crates/synch-engine/src \
 
 # A Rust anchor that names no declaration is a stale spelling.
 # shellcheck disable=SC2086
-if rg -n 'LEAN-MODEL: [a-z0-9-]+\s*$' $rust_src; then
+if grep -rnE 'LEAN-MODEL: [a-z0-9-]+[[:space:]]*$' $rust_src; then
   echo "LEAN-MODEL anchor without its Lean declaration; write 'LEAN-MODEL: anchor (Decl)'" >&2
   exit 1
 fi
 
 # shellcheck disable=SC2086
-rg -o --no-filename 'LEAN-MODEL: [a-z0-9-]+ \([A-Za-z0-9_.]+\)' $rust_src \
+grep -rhoE 'LEAN-MODEL: [a-z0-9-]+ \([A-Za-z0-9_.]+\)' $rust_src \
   | sed 's/LEAN-MODEL: //; s/ (\(.*\))$/ \1/' | LC_ALL=C sort > "$rust_anchors"
 
-(cd "$root/specs/lean" && lake exe anchors) | LC_ALL=C sort > "$lean_anchors"
+lean_dump=$(cd "$root/specs/lean" && lake exe anchors) || {
+  echo "lake exe anchors failed" >&2
+  exit 1
+}
+printf '%s\n' "$lean_dump" | LC_ALL=C sort > "$lean_anchors"
 
 if [ "$(wc -l < "$rust_anchors")" -ne "$(sort -u "$rust_anchors" | wc -l)" ]; then
   echo "duplicate LEAN-MODEL anchor in Rust" >&2

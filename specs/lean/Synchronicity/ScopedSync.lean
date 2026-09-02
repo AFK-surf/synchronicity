@@ -1,3 +1,4 @@
+import Mathlib.Order.Basic
 import Synchronicity.Prelude
 import Synchronicity.Scope
 
@@ -44,8 +45,20 @@ namespace Synchronicity.ScopedSync
 
 open Synchronicity (Path Scope)
 
-/-- A content hash. -/
-abbrev Hash := Nat
+/-- A content hash.  A structure rather than a synonym, so that a hash is
+never a holder, a root index or an origin by accident. -/
+structure Hash where
+  /-- The hash's value. -/
+  val : Nat
+  deriving DecidableEq
+
+theorem Hash.val_injective : Function.Injective Hash.val := fun a b h => by
+  cases a; cases b; simpa using h
+
+/-- The order `SignedHead::supersedes` breaks `seq` ties with: Rust compares
+the root's bytes, which for fixed-width hashes is the order of the number
+they spell.  The one assumption made about hashes beyond identity. -/
+instance : LinearOrder Hash := LinearOrder.lift' Hash.val Hash.val_injective
 
 /-- A trie value: inline bytes, or the hash of an out-of-line value. -/
 inductive ValueRef where
@@ -256,7 +269,7 @@ theorem revealsRecord_admitted (hnode : AdmitsNode s path n) (hrev : RevealsReco
 /-- `trie.rs::Trie::first_key_outside` skips every position already inside a
 granted prefix.  Sound because no key spelled at or below such a position can
 leave the grant. -/
-@[rust_impl "mpt-first-key-outside"]
+@[rust_justifies "mpt-first-key-outside"]
 theorem keys_below_grant_admitted (h : s.ContainsSubtree path)
     (hkey : SpellsKey (path ++ q) n key) : s.AdmitsKey key := by
   cases hkey with
@@ -266,14 +279,14 @@ theorem keys_below_grant_admitted (h : s.ContainsSubtree path)
 /-! ## The scoped walk -/
 
 /-- A local store: nodes, out-of-line values, and the positions peers refused
-a hash at (`redacted_nodes`, keyed by hash and path). -/
+a hash at (`redacted_nodes`, keyed by hash and path).  Empty by default. -/
 structure Store where
   /-- The nodes held. -/
-  held : Hash → Prop
+  held : Set Hash := ∅
   /-- The out-of-line values held. -/
-  heldValue : Hash → Prop
-  /-- The hashes a peer refused, at the position it refused them. -/
-  redacted : Path → Hash → Prop
+  heldValue : Set Hash := ∅
+  /-- The hashes a peer refused, with the position it refused them at. -/
+  redacted : Set (Path × Hash) := ∅
 
 variable {st : Store}
 
@@ -284,16 +297,16 @@ boundary: a node refused at one position may be held from another it shares
 by structure, and holding it is what the walk is establishing. -/
 @[rust_impl "mpt-walk-boundary"]
 def Boundary (s : Scope) (st : Store) (path : Path) (x : Hash) : Prop :=
-  ¬ st.held x ∧ ¬ s.ContainsSubtree path ∧ st.redacted path x
+  x ∉ st.held ∧ ¬ s.ContainsSubtree path ∧ (path, x) ∈ st.redacted
 
-theorem held_not_boundary (h : st.held x) : ¬ Boundary s st path x :=
+theorem held_not_boundary (h : x ∈ st.held) : ¬ Boundary s st path x :=
   fun hb => hb.1 h
 
 /-- `trie.rs::MissingWalk::seen_key`.  Inside the grant every child position
 is admitted, so expanding a node there does not depend on which of its
 positions the walk met it at; one expansion per hash is one per subtree.
 Above the grant the key carries the position. -/
-@[rust_impl "mpt-walk-seen"]
+@[rust_justifies "mpt-walk-seen"]
 theorem children_inside_grant_admitted (h : s.ContainsSubtree path) (stp : Path) :
     s.AdmitsPath (path ++ stp) :=
   Scope.admitsPath_of_containsSubtree (Scope.containsSubtree_append h stp)
@@ -306,7 +319,7 @@ inductive Walk (c : Content) (st : Store) (s : Scope) (G : Path → Hash → Pro
     Path → Hash → Prop where
   | root : s.AdmitsPath [] → G [] root → Walk c st s G root [] root
   | child {path : Path} {hash : Hash} {node : Node} {stp : Path} {k : Hash} :
-      Walk c st s G root path hash → st.held hash →
+      Walk c st s G root path hash → hash ∈ st.held →
       c hash = some node → ChildOf node stp k → s.AdmitsPath (path ++ stp) → G (path ++ stp) k →
       Walk c st s G root (path ++ stp) k
 
@@ -331,6 +344,20 @@ theorem Walk.mono {G' : Path → Hash → Prop} (hG : ∀ p x, G p x → G' p x)
   | root hadm hG₀ => exact .root hadm (hG _ _ hG₀)
   | child _ hheld hc hchild hadm hGk ih => exact .child ih hheld hc hchild hadm (hG _ _ hGk)
 
+/-- A walk under a narrower scope visits a subset of the positions. -/
+theorem Walk.mono_scope {s' : Scope} (hs : ∀ p, s.AdmitsPath p → s'.AdmitsPath p)
+    (h : Walk c st s G r path x) : Walk c st s' G r path x := by
+  induction h with
+  | root hadm hG₀ => exact .root (hs _ hadm) hG₀
+  | child _ hheld hc hchild hadm hGk ih => exact .child ih hheld hc hchild (hs _ hadm) hGk
+
+/-- A walk over a store holding fewer nodes visits a subset of the positions. -/
+theorem Walk.mono_store {st' : Store} (hst : st'.held ⊆ st.held)
+    (h : Walk c st' s G r path x) : Walk c st s G r path x := by
+  induction h with
+  | root hadm hG₀ => exact .root hadm hG₀
+  | child _ hheld hc hchild hadm hGk ih => exact .child ih (hst hheld) hc hchild hadm hGk
+
 /-- `trie.rs::MissingWalk::scoped` with no reference, and the child filter in
 `next_batch`.  The unguarded walk.  A visited node that is held is never a
 `Boundary`, so the boundary check the code performs on a failed load needs
@@ -341,7 +368,7 @@ abbrev Reach (c : Content) (st : Store) (s : Scope) (root : Hash) : Path → Has
 
 theorem Reach.root (h : s.AdmitsPath []) : Reach c st s r [] r := Walk.root h trivial
 
-theorem Reach.child {hash : Hash} (h : Reach c st s r path hash) (hheld : st.held hash)
+theorem Reach.child {hash : Hash} (h : Reach c st s r path hash) (hheld : hash ∈ st.held)
     (hc : c hash = some n) (hchild : ChildOf n stp k) (hadm : s.AdmitsPath (path ++ stp)) :
     Reach c st s r (path ++ stp) k :=
   Walk.child h hheld hc hchild hadm trivial
@@ -352,12 +379,17 @@ theorem Reach.admits (h : Reach c st s r path x) : s.AdmitsPath path := Walk.adm
 
 theorem Reach.at (h : Reach c st s r path x) : At c r path x := Walk.at h
 
+/-- Whatever a scoped walk reaches, the unscoped walk over the same store
+reaches: this is `gc_trie`'s mark descent seen from a scoped reader. -/
+theorem Reach.full (h : Reach c st s r path x) : Reach c st Scope.full r path x :=
+  Walk.mono_scope (fun p _ => Scope.admitsPath_of_full Scope.full_isFull p) h
+
 /-- A walk finishing with nothing missing: every position it reaches is held or
 a boundary, and every node it expands has its out-of-line value. -/
 def Drained (c : Content) (st : Store) (s : Scope) (W : Path → Hash → Prop) : Prop :=
   ∀ path x, W path x →
-    (st.held x ∨ Boundary s st path x) ∧
-    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → st.heldValue v)
+    (x ∈ st.held ∨ Boundary s st path x) ∧
+    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → v ∈ st.heldValue)
 
 /-- `trie.rs::Trie::is_complete_scoped`.  The unguarded walk drains with
 nothing missing — the fact the memo records. -/
@@ -410,7 +442,7 @@ held whole within the scope is sound because every boundary the walk stops at
 is a scope edge — here, because everything pruned lies under a position the
 reference root's own scoped walk reached, and that walk found nothing
 missing. -/
-@[rust_impl "mpt-complete-memo"]
+@[rust_justifies "mpt-complete-memo"]
 theorem prune_sound {R H : Hash}
     (hR : CompleteWithin c st s R)
     (hprune : ∀ path x, prune path x → Reach c st s R path x)
@@ -435,7 +467,7 @@ abbrev Paired (c : Content) (st : Store) (s : Scope) (R : Hash) : Path → Hash 
 /-- `reconcile.rs::fetch_pending`, the reference chosen only when
 `is_complete_scoped(head.root, scope)`.  With the pairing Rust computes, the
 memo written after the pruned walk is true. -/
-@[rust_impl "mpt-fetch-reference"]
+@[rust_justifies "mpt-fetch-reference"]
 theorem prune_sound_paired {R H : Hash}
     (hR : CompleteWithin c st s R)
     (hH : DrainedWithin c st s (Paired c st s R) H) :
@@ -446,7 +478,7 @@ theorem prune_sound_paired {R H : Hash}
 admitted position under the root is held or under a boundary, so a scoped
 reader finds nothing missing (`MptGc.State.complete` for a scoped node). -/
 theorem complete_position_held (hc : CompleteWithin c st s r) (h : Reach c st s r path x) :
-    st.held x ∨ Boundary s st path x :=
+    x ∈ st.held ∨ Boundary s st path x :=
   (hc _ _ h).1
 
 /-- Under a complete root, every position that resolves under the root along
@@ -488,7 +520,7 @@ working: over a root complete within the scope, every position the scoped diff
 reads is held, or is an absent hash refused at some position, which `cursor_at`
 asks about (`is_redacted(hash, None)`) and reads as empty. -/
 theorem diff_never_misses (hcomplete : CompleteWithin c st s r)
-    (h : DiffReach c st s r path x) : st.held x ∨ (¬ st.held x ∧ ∃ p, st.redacted p x) := by
+    (h : DiffReach c st s r path x) : x ∈ st.held ∨ (x ∉ st.held ∧ ∃ p, (p, x) ∈ st.redacted) := by
   rcases (hcomplete _ _ h).1 with held | ⟨absent, _, redacted⟩
   · exact Or.inl held
   · exact Or.inr ⟨absent, _, redacted⟩
@@ -513,9 +545,8 @@ this node holds a head for, the position must be admitted, and what is served
 is what the descent finds there. -/
 @[rust_impl "mpt-serve-admit"]
 def Admit (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (x : Hash) : Prop :=
-  match s.prefixes with
-  | none => x = w.claimed
-  | some _ => heads w.root ∧ s.AdmitsPath w.path ∧ At c w.root w.path x
+  if s.IsFull then x = w.claimed
+  else heads w.root ∧ s.AdmitsPath w.path ∧ At c w.root w.path x
 
 /-- `net/mpt.rs`, the `GetNodes` arm: an admitted position's node travels only
 if what it reveals is in scope. -/
@@ -535,10 +566,8 @@ carries it, resolved at the claimed position and judged by what it reveals. -/
 @[rust_impl "mpt-serve-value"]
 def ServeValue (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (v : Hash) : Prop :=
   v = w.claimed ∧
-    match s.prefixes with
-    | none => True
-    | some _ => ∃ x n, Admit c s heads w x ∧ c x = some n ∧ n.valueHash = some v ∧
-        AdmitsNode s w.path n
+    (¬ s.IsFull → ∃ x n, Admit c s heads w x ∧ c x = some n ∧ n.valueHash = some v ∧
+      AdmitsNode s w.path n)
 
 theorem Redacts.not_full (h : Redacts c s heads w x) : ¬ s.IsFull :=
   fun full => let ⟨_, n, _, refused⟩ := h; refused (admitsNode_of_full full _ n)
@@ -547,19 +576,16 @@ theorem Redacts.not_full (h : Redacts c s heads w x) : ¬ s.IsFull :=
 does not depend on the hash it claimed. -/
 theorem admit_ignores_claim (h : ¬ s.IsFull) :
     Admit c s heads ⟨r, path, a⟩ x ↔ Admit c s heads ⟨r, path, b⟩ x := by
-  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
-  unfold Admit; rw [hp]
+  simp [Admit, h]
 
 /-- The root a request names must be one this node holds a head for. -/
 theorem admit_requires_head (h : ¬ s.IsFull) (ha : Admit c s heads w x) : heads w.root := by
-  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
-  unfold Admit at ha; rw [hp] at ha; exact ha.1
+  simp only [Admit, if_neg h] at ha; exact ha.1
 
 /-- What is served sits at the claimed position of a head root. -/
 theorem admit_resolves (h : ¬ s.IsFull) (ha : Admit c s heads w x) :
     s.AdmitsPath w.path ∧ At c w.root w.path x := by
-  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
-  unfold Admit at ha; rw [hp] at ha; exact ha.2
+  simp only [Admit, if_neg h] at ha; exact ha.2
 
 /-- A lie about the position resolves to whatever genuinely sits there, and to
 nothing else. -/
@@ -608,35 +634,30 @@ foreign nodes come from nowhere else. -/
 @[rust_impl "mpt-learn-scoped"]
 inductive Learn (c : Content) (s : Scope) (heads : Hash → Prop) : Store → Store → Prop where
   | node {st : Store} {w : Want} {x : Hash} {n : Node} :
-      ServeNode c s heads w x n →
-      Learn c s heads st { st with held := fun y => y = x ∨ st.held y }
+      ServeNode c s heads w x n → Learn c s heads st { st with held := insert x st.held }
   | value {st : Store} {w : Want} {v : Hash} :
-      ServeValue c s heads w v →
-      Learn c s heads st { st with heldValue := fun y => y = v ∨ st.heldValue y }
+      ServeValue c s heads w v → Learn c s heads st { st with heldValue := insert v st.heldValue }
   | redacted {st : Store} {w : Want} {x : Hash} :
       Redacts c s heads w x →
-      Learn c s heads st
-        { st with redacted := fun p y => (p = w.path ∧ y = x) ∨ st.redacted p y }
+      Learn c s heads st { st with redacted := insert (w.path, x) st.redacted }
 
-/-- The empty store. -/
-def Initial : Store := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩
-
-/-- A delegate under scope `s`, fetching from responders holding `heads`. -/
+/-- A delegate under scope `s`, fetching from responders holding `heads`,
+starting empty. -/
 def system (c : Content) (s : Scope) (heads : Hash → Prop) : System Store :=
-  ⟨Initial, Learn c s heads⟩
+  ⟨{}, Learn c s heads⟩
 
 /-- The stores a delegate can end up with. -/
 abbrev Reachable (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop :=
   (system c s heads).Reachable st
 
 /-- Everything a delegate holds was served or refused by the rules above. -/
-def Confined (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop :=
-  (∀ x, st.held x → ∃ w n, ServeNode c s heads w x n) ∧
-  (∀ v, st.heldValue v → ∃ w, ServeValue c s heads w v) ∧
-  (∀ p x, st.redacted p x → ∃ w, w.path = p ∧ Redacts c s heads w x)
-
-theorem initial_confined : Confined c s heads Initial :=
-  ⟨fun _ h => h.elim, fun _ h => h.elim, fun _ _ h => h.elim⟩
+structure Confined (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop where
+  /-- Every node held was served. -/
+  held : ∀ x ∈ st.held, ∃ w n, ServeNode c s heads w x n
+  /-- Every value held was served. -/
+  values : ∀ v ∈ st.heldValue, ∃ w, ServeValue c s heads w v
+  /-- Every refusal remembered was a refusal at that position. -/
+  redacted : ∀ p x, (p, x) ∈ st.redacted → ∃ w, w.path = p ∧ Redacts c s heads w x
 
 theorem confined_step {st' : Store} (hinv : Confined c s heads st) (hstep : Learn c s heads st st') :
     Confined c s heads st' := by
@@ -644,31 +665,36 @@ theorem confined_step {st' : Store} (hinv : Confined c s heads st) (hstep : Lear
   cases hstep with
   | node served =>
     refine ⟨fun y h => ?_, values, refusals⟩
-    rcases h with rfl | old
+    rcases Set.mem_insert_iff.mp h with rfl | old
     · exact ⟨_, _, served⟩
     · exact nodes _ old
   | value served =>
     refine ⟨nodes, fun y h => ?_, refusals⟩
-    rcases h with rfl | old
+    rcases Set.mem_insert_iff.mp h with rfl | old
     · exact ⟨_, served⟩
     · exact values _ old
   | redacted refused =>
     refine ⟨nodes, values, fun p y h => ?_⟩
+    simp only [Set.mem_insert_iff, Prod.mk.injEq] at h
     rcases h with ⟨rfl, rfl⟩ | old
     · exact ⟨_, rfl, refused⟩
     · exact refusals _ _ old
 
+theorem confined_invariant : (system c s heads).Invariant (Confined c s heads) where
+  init := ⟨fun _ h => h.elim, fun _ h => h.elim, fun _ _ h => h.elim⟩
+  step := confined_step
+
 theorem reachable_confined (h : Reachable c s heads st) : Confined c s heads st :=
-  h.invariant initial_confined confined_step
+  confined_invariant.reachable h
 
 /-- The privacy theorem.  Every node a scoped delegate holds sits at an admitted
 position of a root the server holds a head for, and spells no key material
 outside the delegate's scope. -/
-theorem held_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) (hheld : st.held x) :
+theorem held_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) (hheld : x ∈ st.held) :
     ∃ root path n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
       (∀ q, Reveals path n q → s.AdmitsPath q) ∧
       (∀ key, RevealsRecord path n key → s.AdmitsKey key) := by
-  obtain ⟨w, n, served⟩ := (reachable_confined h).1 x hheld
+  obtain ⟨w, n, served⟩ := (reachable_confined h).held x hheld
   obtain ⟨hadm, hat⟩ := admit_resolves hs served.1
   exact ⟨w.root, w.path, n, admit_requires_head hs served.1, hadm, hat, served.2.1,
     fun _ hrev => served_reveals_within_scope served hrev,
@@ -677,22 +703,19 @@ theorem held_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) (hheld
 /-- Every out-of-line value a scoped delegate holds belongs to a node it was
 served, at an admitted position. -/
 theorem held_value_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) {v : Hash}
-    (hheld : st.heldValue v) :
+    (hheld : v ∈ st.heldValue) :
     ∃ root path x n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
       n.valueHash = some v ∧ AdmitsNode s path n := by
-  obtain ⟨w, served⟩ := (reachable_confined h).2.1 v hheld
-  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full hs
-  have carried := served.2
-  rw [hp] at carried
-  obtain ⟨x, n, hadmit, hc, hv, hnode⟩ := carried
+  obtain ⟨w, served⟩ := (reachable_confined h).values v hheld
+  obtain ⟨x, n, hadmit, hc, hv, hnode⟩ := served.2 hs
   obtain ⟨hadm, hat⟩ := admit_resolves hs hadmit
   exact ⟨w.root, w.path, x, n, admit_requires_head hs hadmit, hadm, hat, hc, hv, hnode⟩
 
 /-- Every redaction a delegate remembers was a refusal at an above-grant
 position, which is the only place the walk consults it. -/
-theorem redacted_is_refusal (h : Reachable c s heads st) (hred : st.redacted path x) :
+theorem redacted_is_refusal (h : Reachable c s heads st) (hred : (path, x) ∈ st.redacted) :
     ∃ w, w.path = path ∧ Redacts c s heads w x ∧ ¬ s.ContainsSubtree path := by
-  obtain ⟨w, rfl, refused⟩ := (reachable_confined h).2.2 path x hred
+  obtain ⟨w, rfl, refused⟩ := (reachable_confined h).redacted path x hred
   exact ⟨w, rfl, refused, redacts_only_above_grant refused⟩
 
 end Synchronicity.ScopedSync

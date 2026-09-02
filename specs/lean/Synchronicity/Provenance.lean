@@ -62,7 +62,10 @@ open Synchronicity (Path Scope)
 open Synchronicity.ScopedSync
 
 /-- A participant, named by its origin. -/
-abbrev Origin := Nat
+structure Origin where
+  /-- The origin's identity. -/
+  id : Nat
+  deriving DecidableEq
 
 /-- The cluster as this model sees it: one content addressing, each origin's
 read scope, each origin's verified heads, and what each origin built itself. -/
@@ -86,23 +89,23 @@ def World.Confined (w : World) (o : Origin) : Prop := ¬ (w.scopeOf o).IsFull
 /-- A participant's store: the shared node store, and the provenance rows. -/
 structure Store where
   /-- The shared node store. -/
-  base : ScopedSync.Store
+  base : ScopedSync.Store := {}
   /-- The provenance rows: which nodes were served as which origin's. -/
-  owned : Origin → Hash → Prop
+  owned : Set (Origin × Hash) := ∅
 
 /-- `trie.rs::MissingWalk::for_origin` and `Trie::load_owned_raw`: the store a
 walk over a confined origin's root reads presence from is the shared store cut
 down to what was served as that origin's. -/
 @[rust_impl "mpt-walk-owned"]
 def view (w : World) (st : Store) (o : Origin) : ScopedSync.Store :=
-  { st.base with held := fun x => st.base.held x ∧ (¬ w.Confined o ∨ st.owned o x) }
+  { st.base with held := {x ∈ st.base.held | ¬ w.Confined o ∨ (o, x) ∈ st.owned} }
 
 variable {w : World} {st : Store} {o p q : Origin} {x : Hash} {s : Scope}
 
 /-- `NodeStore::owns_node`/`note_owned`: a provenance row is what presence
 through `view` adds to holding the node. -/
-@[rust_impl "mpt-owned-node"]
-theorem view_owned (hc : w.Confined o) (h : (view w st o).held x) : st.owned o x :=
+@[rust_justifies "mpt-owned-node"]
+theorem view_owned (hc : w.Confined o) (h : x ∈ (view w st o).held) : (o, x) ∈ st.owned :=
   h.2.resolve_left (fun h' => h' hc)
 
 /-- `net/mpt.rs::Vouch::covers`.  Participant `p` vouches for `x` under `o`'s
@@ -110,36 +113,38 @@ root if `o` is rooted, or `p` was served `x` as `o`'s, or `p` is `o` and holds
 `x`. -/
 @[rust_impl "mpt-serve-vouched"]
 def Vouched (w : World) (p : Origin) (st : Store) (o : Origin) (x : Hash) : Prop :=
-  ¬ w.Confined o ∨ st.owned o x ∨ (p = o ∧ st.base.held x)
+  ¬ w.Confined o ∨ (o, x) ∈ st.owned ∨ (p = o ∧ x ∈ st.base.held)
 
 /-- What participant `p` may serve a reader of scope `s` under `o`'s root `r`
 at `path`: the `ScopedSync` responder for `o`'s heads, over a node `p` holds
 and vouches for. -/
 def ServeNode (w : World) (p : Origin) (st : Store) (s : Scope) (o : Origin) (r : Hash)
     (path : Path) (x : Hash) (n : Node) : Prop :=
-  ScopedSync.ServeNode w.c s (w.headOf o) ⟨r, path, x⟩ x n ∧ st.base.held x ∧
+  ScopedSync.ServeNode w.c s (w.headOf o) ⟨r, path, x⟩ x n ∧ x ∈ st.base.held ∧
     Vouched w p st o x
 
 /-- The system: every participant's store, indexed by its origin. -/
 abbrev Sys := Origin → Store
 
-/-- `reconcile.rs::fetch_pending`, the node batch: `put_node` and, for a
-confined origin, `note_owned` in one transaction. -/
+/-- `reconcile.rs::fetch_pending`, the node batch: `put_node` and `note_owned`
+in one transaction.  Rust writes the row only for a confined origin; the row
+for a rooted one is inert here — `view` ignores it and `Vouched` never needs
+it — so the model writes it unconditionally. -/
 @[rust_impl "mpt-learn-owned"]
-def learn (w : World) (st : Store) (o : Origin) (x : Hash) : Store :=
-  { base := { st.base with held := fun y => y = x ∨ st.base.held y }
-    owned := fun o' y => (o' = o ∧ y = x ∧ w.Confined o) ∨ st.owned o' y }
+def learn (st : Store) (o : Origin) (x : Hash) : Store where
+  base := { st.base with held := insert x st.base.held }
+  owned := insert (o, x) st.owned
 
 /-- An origin building a node of its own trie. -/
 def author (st : Store) (x : Hash) : Store :=
-  { st with base := { st.base with held := fun y => y = x ∨ st.base.held y } }
+  { st with base := { st.base with held := insert x st.base.held } }
 
 /-- The system's steps: a participant learns a node the responder serves it
 under some origin's root, or an origin authors a node. -/
 inductive Step (w : World) : Sys → Sys → Prop where
   | learn {sys : Sys} {q p o : Origin} {r : Hash} {path : Path} {x : Hash} {n : Node} :
       ServeNode w p (sys p) (w.scopeOf q) o r path x n →
-      Step w sys (update sys q (learn w (sys q) o x))
+      Step w sys (update sys q (learn (sys q) o x))
   | author {sys : Sys} {o : Origin} {x : Hash} :
       w.authored o x → Step w sys (update sys o (author (sys o) x))
 
@@ -155,11 +160,12 @@ inductive Legit (w : World) : Scope → Hash → Prop where
   | authored {o : Origin} {x : Hash} : w.authored o x → Legit w (w.scopeOf o) x
 
 /-- The invariant: every node a participant holds is legitimately its, and
-every provenance row it keeps for a confined origin names a node legitimately
-that origin's. -/
-def Sound (w : World) (sys : Sys) : Prop :=
-  (∀ q x, (sys q).base.held x → Legit w (w.scopeOf q) x) ∧
-  (∀ q o x, w.Confined o → (sys q).owned o x → Legit w (w.scopeOf o) x)
+every provenance row it keeps names a node legitimately the origin's. -/
+structure Sound (w : World) (sys : Sys) : Prop where
+  /-- Every held node is legitimately its holder's. -/
+  held : ∀ q x, x ∈ (sys q).base.held → Legit w (w.scopeOf q) x
+  /-- Every provenance row names a node legitimately the origin's. -/
+  owned : ∀ q o x, (o, x) ∈ (sys q).owned → Legit w (w.scopeOf o) x
 
 /-- What vouching buys: a vouched node under a confined origin's root is
 legitimately that origin's, given the responder is sound. -/
@@ -167,10 +173,18 @@ theorem vouched_legit {sys : Sys} (hsound : Sound w sys) (hc : w.Confined o)
     (hv : Vouched w p (sys p) o x) : Legit w (w.scopeOf o) x := by
   rcases hv with rooted | owned | ⟨rfl, held⟩
   · exact absurd hc rooted
-  · exact hsound.2 p o x hc owned
-  · exact hsound.1 p x held
+  · exact hsound.owned p o x owned
+  · exact hsound.held p x held
 
-/-- A served node is legitimately the reader's. -/
+/-- A served node is legitimately the origin's, whether the origin is rooted or
+confined … -/
+theorem serve_legit_origin {sys : Sys} (hsound : Sound w sys) {r : Hash} {path : Path} {n : Node}
+    (h : ServeNode w p (sys p) (w.scopeOf q) o r path x n) : Legit w (w.scopeOf o) x := by
+  by_cases hc : w.Confined o
+  · exact vouched_legit hsound hc h.2.2
+  · exact Legit.full (not_not.mp hc)
+
+/-- … and legitimately the reader's. -/
 theorem serve_legit {sys : Sys} (hsound : Sound w sys) {r : Hash} {path : Path} {n : Node}
     (h : ServeNode w p (sys p) (w.scopeOf q) o r path x n) : Legit w (w.scopeOf q) x := by
   obtain ⟨⟨hadmit, hcn, hnode⟩, _, hv⟩ := h
@@ -186,82 +200,67 @@ theorem serve_legit {sys : Sys} (hsound : Sound w sys) {r : Hash} {path : Path} 
 (`mpt-complete-owned-promote`): what a member establishes about a confined
 origin's root, through `view`, is that every node it vouches for is
 legitimately that origin's. -/
-@[rust_impl "mpt-complete-owned"]
+@[rust_justifies "mpt-complete-owned"]
 theorem step_sound {sys sys' : Sys} (hsound : Sound w sys) (hstep : Step w sys sys') :
     Sound w sys' := by
   cases hstep with
   | @learn q p o r path x n served =>
-    refine ⟨fun q' y hy => ?_, fun q' o' y hc' hy => ?_⟩
-    · by_cases hq : q' = q
-      · subst hq
-        simp only [Function.update_self] at hy
-        rcases hy with rfl | old
-        · exact serve_legit hsound served
-        · exact hsound.1 q' y old
-      · simp only [Function.update_of_ne hq] at hy
-        exact hsound.1 q' y hy
-    · by_cases hq : q' = q
-      · subst hq
-        simp only [Function.update_self] at hy
-        rcases hy with ⟨rfl, rfl, hc⟩ | old
-        · exact vouched_legit hsound hc served.2.2
-        · exact hsound.2 q' o' y hc' old
-      · simp only [Function.update_of_ne hq] at hy
-        exact hsound.2 q' o' y hc' hy
+    refine ⟨(Function.forall_update_iff sys fun q' st =>
+        ∀ y, y ∈ st.base.held → Legit w (w.scopeOf q') y).mpr ⟨fun y hy => ?_, fun q' _ => hsound.held q'⟩,
+      (Function.forall_update_iff sys fun q' st =>
+        ∀ o' y, (o', y) ∈ st.owned → Legit w (w.scopeOf o') y).mpr
+        ⟨fun o' y hy => ?_, fun q' _ => hsound.owned q'⟩⟩
+    · rcases Set.mem_insert_iff.mp hy with rfl | old
+      · exact serve_legit hsound served
+      · exact hsound.held q y old
+    · simp only [learn, Set.mem_insert_iff, Prod.mk.injEq] at hy
+      rcases hy with ⟨rfl, rfl⟩ | old
+      · exact serve_legit_origin hsound served
+      · exact hsound.owned q o' y old
   | @author o x hauth =>
-    refine ⟨fun q' y hy => ?_, fun q' o' y hc' hy => ?_⟩
-    · by_cases hq : q' = o
-      · subst hq
-        simp only [Function.update_self] at hy
-        rcases hy with rfl | old
-        · exact Legit.authored hauth
-        · exact hsound.1 q' y old
-      · simp only [Function.update_of_ne hq] at hy
-        exact hsound.1 q' y hy
-    · by_cases hq : q' = o
-      · subst hq
-        simp only [Function.update_self] at hy
-        exact hsound.2 q' o' y hc' hy
-      · simp only [Function.update_of_ne hq] at hy
-        exact hsound.2 q' o' y hc' hy
+    refine ⟨(Function.forall_update_iff sys fun q' st =>
+        ∀ y, y ∈ st.base.held → Legit w (w.scopeOf q') y).mpr ⟨fun y hy => ?_, fun q' _ => hsound.held q'⟩,
+      (Function.forall_update_iff sys fun q' st =>
+        ∀ o' y, (o', y) ∈ st.owned → Legit w (w.scopeOf o') y).mpr
+        ⟨fun o' y hy => hsound.owned o o' y hy, fun q' _ => hsound.owned q'⟩⟩
+    rcases Set.mem_insert_iff.mp hy with rfl | old
+    · exact Legit.authored hauth
+    · exact hsound.held o y old
 
 /-- `reconcile.rs::try_promote`: the completeness a member requires of a
 confined origin's head is completeness through `view`, so every node it then
 vouches for is legitimately that origin's. -/
-@[rust_impl "mpt-complete-owned-promote"]
+@[rust_justifies "mpt-complete-owned-promote"]
 theorem confined_head_vouched {sys : Sys} (hsound : Sound w sys) (hc : w.Confined o) {r : Hash}
     (hcomplete : CompleteWithin w.c (view w (sys q) o) s r) {path : Path}
     (hr : Reach w.c (view w (sys q) o) s r path x) (hnb : ¬ Boundary s (view w (sys q) o) path x) :
     Legit w (w.scopeOf o) x := by
   rcases (hcomplete _ _ hr).1 with held | hb
-  · exact hsound.2 q o x hc (view_owned hc held)
+  · exact hsound.owned q o x (view_owned hc held)
   · exact absurd hb hnb
 
 /-! ## The theorem: privacy and integrity of confined tries -/
 
-/-- Every participant starts holding nothing. -/
-def Initial : Sys := fun _ =>
-  { base := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩, owned := fun _ _ => False }
-
-/-- The multi-party system. -/
-def system (w : World) : System Sys := ⟨Initial, Step w⟩
+/-- The multi-party system: every participant starts holding nothing. -/
+def system (w : World) : System Sys := ⟨fun _ => {}, Step w⟩
 
 /-- The states the cluster reaches. -/
 abbrev Reachable (w : World) (sys : Sys) : Prop := (system w).Reachable sys
 
-theorem initial_sound : Sound w Initial :=
-  ⟨fun _ _ h => h.elim, fun _ _ _ _ h => h.elim⟩
+theorem sound_invariant : (system w).Invariant (Sound w) where
+  init := ⟨fun _ _ h => h.elim, fun _ _ _ h => h.elim⟩
+  step := step_sound
 
 theorem reachable_sound {sys : Sys} (h : Reachable w sys) : Sound w sys :=
-  h.invariant initial_sound step_sound
+  sound_invariant.reachable h
 
 /-- **Privacy.**  In every reachable state, a confined participant holds only
 nodes that are legitimately its: exposed to its scope by a rooted origin's
 trie at an admitted position, authored by it, or published by a confined origin
 that legitimately held them. -/
-theorem privacy {sys : Sys} (h : Reachable w sys) (hx : (sys q).base.held x) :
+theorem privacy {sys : Sys} (h : Reachable w sys) (hx : x ∈ (sys q).base.held) :
     Legit w (w.scopeOf q) x :=
-  (reachable_sound h).1 q x hx
+  (reachable_sound h).held q x hx
 
 /-- **Integrity.**  In every reachable state, a member that finds a confined
 origin's root complete through `view` — the premise on which it promotes the
@@ -319,7 +318,7 @@ theorem LegitVia.links {chain : List Origin} (h : LegitVia w chain s x) :
 /-- **Privacy, with the chain in hand.**  Every node a participant holds came
 to it along a chain of confined origins each of which legitimately held it,
 from a rooted exposure or an authoring at the far end. -/
-theorem privacy_chain {sys : Sys} (h : Reachable w sys) (hx : (sys q).base.held x) :
+theorem privacy_chain {sys : Sys} (h : Reachable w sys) (hx : x ∈ (sys q).base.held) :
     ∃ chain, LegitVia w chain (w.scopeOf q) x ∧
       ∀ o ∈ chain, w.Confined o ∧ Legit w (w.scopeOf o) x :=
   let ⟨chain, hchain⟩ := (privacy h hx).via
@@ -330,10 +329,12 @@ theorem privacy_chain {sys : Sys} (h : Reachable w sys) (hx : (sys q).base.held 
 /-- No rooted origin's trie exposes `x` to scope `s` — wherever `x` sits under a
 rooted head at a position `s` admits, its node reveals something `s` does not
 — and no origin reading under `s` authored it. -/
-def Withheld (w : World) (s : Scope) (x : Hash) : Prop :=
-  (∀ o r path n, w.headOf o r → ¬ w.Confined o → At w.c r path x → w.c x = some n →
-    s.AdmitsPath path → ¬ AdmitsNode s path n) ∧
-  (∀ o, w.authored o x → w.scopeOf o ≠ s)
+structure Withheld (w : World) (s : Scope) (x : Hash) : Prop where
+  /-- No rooted trie exposes it to the scope. -/
+  not_exposed : ∀ o r path n, w.headOf o r → ¬ w.Confined o → At w.c r path x → w.c x = some n →
+    s.AdmitsPath path → ¬ AdmitsNode s path n
+  /-- No origin of the scope authored it. -/
+  not_authored : ∀ o, w.authored o x → w.scopeOf o ≠ s
 
 /-- Content withheld from every confined scope is legitimately no confined
 reader's: every `Legit` derivation bottoms out in a rooted exposure or an
@@ -347,18 +348,18 @@ theorem withheld_not_legit (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o
     exact hc hfull
   | @rooted s o r path x n hhead hnc hadm hat hcn hnode =>
     rintro ⟨o', hc', rfl⟩
-    exact (hw o' hc').1 o r path n hhead hnc hat hcn hadm hnode
+    exact (hw o' hc').not_exposed o r path n hhead hnc hat hcn hadm hnode
   | @confined s o r path x n _ hc _ _ _ _ _ ih =>
     intro _
     exact ih hw ⟨o, hc, rfl⟩
   | @authored o x hauth =>
     rintro ⟨o', hc', heq⟩
-    exact (hw o' hc').2 o hauth heq
+    exact (hw o' hc').not_authored o hauth heq
 
 /-- Withheld content never reaches a confined participant, in any reachable
 state. -/
 theorem privacy_withheld {sys : Sys} (h : Reachable w sys) (hq : w.Confined q)
-    (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o) x) : ¬ (sys q).base.held x :=
+    (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o) x) : x ∉ (sys q).base.held :=
   fun hx => withheld_not_legit hw _ (privacy h hx) ⟨q, hq, rfl⟩
 
 /-- Nobody in a sound system vouches for withheld content under a confined

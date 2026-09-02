@@ -81,7 +81,7 @@ either pinned available content or a want for that same holder and root. It
 covers protection removal as well as acquisition, protected explicit deletion,
 writer abort, cache eviction, the staged (non-durable) commit and the
 unprotected removal of such rows, and the two GC phases. The CAS/trie bridge
-(`Safety`) pairs each publication and promotion with its head flip across every
+(`Bridge`) pairs each publication and promotion with its head flip across every
 content root the transaction touches, on that same system model. Under backend loss, the surviving theorem is that
 a role's pin stands on content that is available or that the backend lost and
 the heal has not yet converted into a want. Rust and Lean carry matching checked
