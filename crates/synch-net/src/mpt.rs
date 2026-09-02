@@ -309,9 +309,12 @@ impl MptProtocol {
                     // deduplicated: a scoped peer may name one node at two
                     // spine positions and be entitled to it at just one of
                     // them, so a verdict reached about the first position
-                    // must not be the answer for the second. `admit` ran
-                    // first — the request is authorized by position and only
-                    // then deduplicated by what those positions resolved to.
+                    // must not be the answer for the second — in either
+                    // order, which is why the payload check comes *after* the
+                    // scope judgement and a node can come back both served
+                    // and redacted. `admit` ran first — the request is
+                    // authorized by position and only then deduplicated by
+                    // what those positions resolved to.
                     for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
                         // A position holding nothing is reported against the
                         // hash the caller named, so an honest walk sees the
@@ -320,9 +323,6 @@ impl MptProtocol {
                             missing.push(*claimed);
                             continue;
                         };
-                        if answer.served(&hash) {
-                            continue;
-                        }
                         let Some(data) = store.get_node(&hash)? else {
                             missing.push(hash);
                             continue;
@@ -338,6 +338,9 @@ impl MptProtocol {
                                 .unwrap_or(false)
                         {
                             redacted.push(hash);
+                            continue;
+                        }
+                        if answer.served(&hash) {
                             continue;
                         }
                         // A short answer is an ordinary answer: the requester's

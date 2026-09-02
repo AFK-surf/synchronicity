@@ -104,16 +104,25 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 /// the refusal at one position had the fetch walk skip the other, so a
 /// delegate could call a trie complete while missing part of its grant.
 ///
-/// The old rows are dropped rather than carried over as "refused
-/// everywhere": that is exactly the reading being retired, and one round
-/// re-learns every boundary that still stands.
+/// The old rows are carried over under the one path no position can have —
+/// a path is a nibble string, so the byte `0xFF` names nowhere — rather than
+/// dropped. They still answer the question the promotion diff asks, "was this
+/// hash refused at *any* position", and that question is asked about the
+/// root already held: the diff from it to the next root resolves its every
+/// spine child, and a refused child it no longer remembered would read as a
+/// missing node, an origin fault, and a permanent refusal of every later head
+/// from that root. The walk asks by position and never matches the marker, so
+/// each boundary that still stands is re-learned at its position on the next
+/// fetch; the markers go with the rest of the memo on a scope change.
 const V26_REDACTIONS_BY_POSITION: &str = r#"
-DROP TABLE redacted_nodes;
+ALTER TABLE redacted_nodes RENAME TO redacted_nodes_v25;
 CREATE TABLE redacted_nodes (
   hash BLOB NOT NULL,
   path BLOB NOT NULL,
   PRIMARY KEY (hash, path)
 );
+INSERT INTO redacted_nodes (hash, path) SELECT hash, X'FF' FROM redacted_nodes_v25;
+DROP TABLE redacted_nodes_v25;
 "#;
 
 /// v24 — path-based socket activation replaces declaration-and-approval.

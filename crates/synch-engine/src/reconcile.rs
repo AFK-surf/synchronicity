@@ -71,8 +71,9 @@ pub enum Promotion {
     /// A pending head stands and its trie is not all here yet: it needs a fetch.
     Waiting,
     /// The head was retired without flipping because this node's own rules
-    /// refuse the promotion: the pair is in the refusal memo, or the origin
-    /// is delegated and its trie publishes outside its spaces (§3.5).
+    /// refuse the promotion: the pair is in the refusal memo, the origin has
+    /// no live binding here, or it is delegated and its trie publishes
+    /// outside its spaces (§3.5).
     Refused,
     /// Nothing is pending now: there was no pending head, or the complete slot
     /// had overtaken the one there and it was dropped.
@@ -140,10 +141,11 @@ pub enum FetchOutcome {
     /// No caller has ever needed these apart: each means this exchange is
     /// done with the origin, with nothing to report.
     NoFlip,
-    /// The trie arrived whole and this node's own rules refused to promote it
-    /// — the pair was in the refusal memo, or a delegated origin publishes
-    /// outside its spaces — so the head was retired. The origin counts as
-    /// left behind (§12), which is why this is not `NoFlip`.
+    /// This node's own rules refused the head, and it was retired: the pair
+    /// was already in the refusal memo, so no fetch was made; or the trie
+    /// arrived whole and the promotion refused it — no live binding for the
+    /// origin, or a delegated origin publishing outside its spaces. The
+    /// origin counts as left behind (§12), which is why this is not `NoFlip`.
     Refused,
     /// Every candidate persistently returned `missing`; the pending head was
     /// abandoned and head selection re-runs (§5.2).
@@ -698,7 +700,7 @@ impl Syncer {
                         "retiring a pending head: no live binding for this origin"
                     );
                     txn.clear_head(origin, Slot::Pending)?;
-                    return Ok(Promotion::Idle);
+                    return Ok(Promotion::Refused);
                 }
                 PublishScope::Unrestricted => {}
                 PublishScope::Confined(spaces) => {
@@ -795,13 +797,14 @@ impl Syncer {
         // and the walk is unchanged, for a delegated one a stop at the boundary
         // rather than a request it would be refused — and reading it is a store
         // read, which belongs on the same hop rather than on the runtime.
-        let (reference, scope) = {
+        let (reference, scope, held) = {
             let store = self.store.clone();
             let origin = origin.clone();
             crate::blocking::offload(move || {
                 let trie = Trie::new(store.as_ref());
                 let scope = store.local_trie_scope()?;
-                let reference = match store.complete_head(&origin)? {
+                let held = store.complete_head(&origin)?;
+                let reference = match &held {
                     // "Held whole" means held whole *within this scope*: the
                     // walk never commits part of a subtree it is inside, so
                     // every boundary it holds is a scope edge and pruning
@@ -809,10 +812,35 @@ impl Syncer {
                     Some(head) if trie.is_complete_scoped(head.root, &scope)? => Some(head.root),
                     _ => None,
                 };
-                Ok((reference, scope))
+                Ok((reference, scope, held))
             })
             .await?
         };
+        // The same memo `try_promote` keeps, consulted before the walk. A
+        // trie this build has refused a node of is refused again on every
+        // fetch, so retrying costs the walk and the batch each exchange, from
+        // every peer, forever, with nothing ever banked — while the head is
+        // re-adopted each time because retiring it drops the floor back to
+        // what this node can serve. Keyed with the complete root like a
+        // promotion verdict, which is conservative: the refusal is about the
+        // trie, and re-trying it once the held root moves costs one fetch.
+        let verdict: Verdict = (
+            origin.clone(),
+            pending.seq,
+            pending.root,
+            held.as_ref()
+                .map(|h| h.root)
+                .unwrap_or(synch_core::Hash::EMPTY),
+        );
+        if self.is_refused(&verdict) {
+            let store = self.store.clone();
+            let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
+            crate::blocking::offload(move || {
+                Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
+            })
+            .await?;
+            return Ok(FetchOutcome::Refused);
+        }
         let mut walk = synch_mpt::MissingWalk::scoped(reference, pending.root, scope.clone());
         let mut unproductive = 0u32;
         loop {
@@ -881,13 +909,18 @@ impl Syncer {
                     .map(|(_, hash)| *hash)
                     .collect::<std::collections::HashSet<Hash>>()
                     .len();
-                {
+                if !boundary.is_empty() {
                     let store = self.store.clone();
                     crate::blocking::offload(move || {
-                        for (path, hash) in &boundary {
-                            synch_mpt::NodeStore::note_redacted(store.as_ref(), hash, path)?;
-                        }
-                        Ok(())
+                        // One transaction, for the reason the node batch below
+                        // is one: a row per autocommit statement is a write
+                        // connection and a WAL frame per boundary.
+                        store.transaction(|txn| -> Result<()> {
+                            for (path, hash) in &boundary {
+                                synch_mpt::NodeStore::note_redacted(txn, hash, path)?;
+                            }
+                            Ok(())
+                        })
                     })
                     .await?;
                 }
@@ -928,8 +961,10 @@ impl Syncer {
                     // `head_floor` above everything this node can serve, and
                     // its trie can never complete — the refused node is never
                     // stored, so every later fetch would meet it again. The
-                    // fault propagates so the exchange counts the origin as
-                    // left behind and carries on with every other.
+                    // verdict is remembered so the next exchange does not
+                    // re-adopt and re-fetch it, and the fault propagates so
+                    // this exchange counts the origin as left behind and
+                    // carries on with every other.
                     Err(e) if is_origin_fault(&e) => {
                         tracing::warn!(
                             origin = %origin,
@@ -937,6 +972,7 @@ impl Syncer {
                             error = %e,
                             "abandoning pending head: the origin published a trie node this node refuses"
                         );
+                        self.refuse(verdict.clone());
                         let store = self.store.clone();
                         let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
                         crate::blocking::offload(move || {

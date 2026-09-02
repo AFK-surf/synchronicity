@@ -1780,6 +1780,34 @@ mod tests {
         assert_eq!(wants[0].size, 7);
     }
 
+    /// v26 keeps what a v25 node knew was refused: the row still answers "refused at any position", which the promotion diff asks of the root already held, and never answers for a real position, which the walk re-learns.
+    #[test]
+    fn v26_carries_a_refusal_forward_as_refused_somewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let withheld = Hash::new(b"withheld");
+        {
+            let conn = database_at(dir.path(), 25);
+            conn.execute(
+                "INSERT INTO redacted_nodes (hash) VALUES (?1)",
+                params![withheld.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.is_redacted(&withheld, None).unwrap());
+        let at: &[u8] = &[0, 1];
+        assert!(
+            !store.is_redacted(&withheld, Some(at)).unwrap(),
+            "a legacy row must not stand in for a position it was never judged at"
+        );
+        assert!(
+            !store.is_redacted(&withheld, Some(&[])).unwrap(),
+            "not even the root"
+        );
+        store.note_redacted(&withheld, at).unwrap();
+        assert!(store.is_redacted(&withheld, Some(at)).unwrap());
+    }
+
     /// v6 rebuilds `entries` to carry a symlink's target (§8 version identity), and every existing row comes through it, indexes included.
     #[test]
     fn a_v5_database_upgrades_with_its_entries() {
