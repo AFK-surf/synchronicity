@@ -462,13 +462,12 @@ pub fn set_cloud_hosting(
         // one (docs/CLOUD-WRITES.md §4.1), so the write tunnel its replica
         // holds goes with the hosting — a session that outlived the switch
         // would keep taking writes for a network the org has just withdrawn
-        // from hosting. Unconditional, like the browse switch's own drop:
-        // there is nothing to check before dropping the sessions of a
-        // network that has none.
-        case enabled {
-          False ->
+        // from hosting. Only on a commit that happened: a refused disable
+        // has withdrawn nothing.
+        case enabled, response.status {
+          False, 200 ->
             cloud_writer.drop_network(browse_api.writers(browse), network_id)
-          True -> Nil
+          _, _ -> Nil
         }
         response
       }

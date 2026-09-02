@@ -65,10 +65,15 @@ pub const credit_window = 4
 /// answered.
 const query_timeout = 15_000
 
-/// How long a write waits for credit, or for the commit to land. Long,
-/// because a commit uploads the object to the tenant's prefix and pushes a
-/// head, and a client that has streamed a gigabyte is owed the wait.
+/// How long a write waits for the commit to land. Long, because a commit
+/// uploads the object to the tenant's prefix and pushes a head, and a client
+/// that has streamed a gigabyte is owed the wait.
 const commit_timeout = 600_000
+
+/// How long a write waits for the next credit. The node abandons a write
+/// idle for a minute on its own side; a node that has returned no credit for
+/// as long is a dead tunnel dressed as a slow one.
+const credit_timeout = 60_000
 
 /// How many writes one credential may have open at once. Its own pool beside
 /// the download cap, because an upload is longer.
@@ -140,6 +145,10 @@ pub type Ask {
 
 /// What a caller receives from the session serving its request.
 pub type Event {
+  /// The id the session gave a write, before the node has answered — so a
+  /// caller that gives up waiting for `Opened` can cancel it by id rather
+  /// than leave the node holding a reservation nobody will end.
+  Assigned(id: Int)
   /// The write may begin: its id on the tunnel, and how many frames may be
   /// sent before the first credit.
   Opened(id: Int, credit: Int)
@@ -322,21 +331,32 @@ pub fn open(
     session.inbox,
     Open(space, path, size, from, if_match, if_none_match, reply),
   )
-  let answer = case process.receive(reply, query_timeout) {
-    Ok(Opened(id, credit)) -> Ok(#(id, credit))
+  // The id comes back at once from the session; the node's answer follows.
+  // Giving up on the second still cancels by the first, so a slow open is a
+  // refused request and not a reservation the node holds until its own
+  // watchdog notices.
+  let answer = case process.receive(reply, 2000) {
+    Ok(Assigned(id)) ->
+      case process.receive(reply, query_timeout) {
+        Ok(Opened(_, credit)) -> Ok(#(id, credit))
+        Ok(other) -> Error(other)
+        Error(Nil) -> {
+          process.send(session.inbox, Cancel(id))
+          Error(Failed(
+            "unavailable",
+            "the hosted node did not open the write in time",
+          ))
+        }
+      }
     Ok(other) -> Error(other)
-    Error(Nil) ->
-      Error(Failed(
-        "unavailable",
-        "the hosted node did not open the write in time",
-      ))
+    Error(Nil) -> Error(Failed("unavailable", "the session is not answering"))
   }
   #(reply, answer)
 }
 
 /// Waits for the next credit on a write.
 pub fn await_credit(reply: Subject(Event)) -> Result(Int, Event) {
-  case process.receive(reply, commit_timeout) {
+  case process.receive(reply, credit_timeout) {
     Ok(Credit(_, n)) -> Ok(n)
     Ok(other) -> Error(other)
     Error(Nil) ->
@@ -567,7 +587,19 @@ fn incoming(
     Ok("credit"), Live(_) -> forward(state, body, credit_decoder(), False)
     Ok("committed"), Live(_) -> forward(state, body, committed_decoder(), True)
     Ok("deleted"), Live(_) -> forward(state, body, deleted_decoder(), True)
-    Ok("err"), Live(_) -> forward(state, body, error_decoder(), True)
+    Ok("err"), Live(_) ->
+      case json.parse(body, error_decoder()) {
+        // No id names the connection itself: every caller waiting on it is
+        // told, and the session ends rather than leaving them to time out.
+        Ok(#(0, event)) -> {
+          list.each(state.waiting, fn(entry) {
+            let Waiting(reply, _) = entry.1
+            process.send(reply, event)
+          })
+          mist.stop()
+        }
+        _ -> forward(state, body, error_decoder(), True)
+      }
     _, _ -> refuse(conn, "invalid", "unexpected frame for this phase")
   }
 }
@@ -885,6 +917,7 @@ fn outgoing(
             #("if_none_match", json.bool(if_none_match)),
           ]),
         )
+      process.send(reply, Assigned(id))
       mist.continue(
         Conn(..state, next_id: id + 1, waiting: [
           #(id, Waiting(reply, None)),
@@ -1010,7 +1043,13 @@ fn deleted_decoder() -> Decoder(#(Int, Event)) {
 }
 
 fn error_decoder() -> Decoder(#(Int, Event)) {
-  use id <- decode.field("id", decode.int)
+  // Absent or null means the connection, not a request: read as 0, which
+  // no request ever carries (ids start at 1).
+  use id <- decode.optional_field(
+    "id",
+    0,
+    decode.one_of(decode.int, [decode.success(0)]),
+  )
   use code <- decode.field("code", decode.string)
   use message <- decode.field("message", decode.string)
   decode.success(#(id, Failed(code, message)))

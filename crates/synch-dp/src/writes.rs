@@ -67,6 +67,14 @@ const MAX_INFLIGHT: usize = 64;
 /// frames are bounded separately by the chunk ceiling.
 const MAX_DOWN_FRAME: usize = MAX_CHUNK + CHUNK_HEADER_LEN + 1024;
 
+/// How long an open write may go without a frame or a commit before the node
+/// abandons it and gives its staging back (`docs/CLOUD-WRITES.md` §5.4).
+///
+/// The control plane cancels a write it gives up on, but a control plane that
+/// died mid-upload cancels nothing, and a reservation nobody ends is a
+/// staging budget that only ever shrinks.
+const WRITE_IDLE: Duration = Duration::from_secs(60);
+
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const HEARTBEAT_MISSES: u32 = 2;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -697,7 +705,6 @@ where
                     Some(Internal::Consumed(id)) => {
                         if let Some(write) = in_flight.get_mut(&id) {
                             write.outstanding = write.outstanding.saturating_sub(1);
-                            let _ = writes.try_send(text(&Up::Credit { id, n: 1 })?);
                         }
                     }
                     Some(Internal::WriteDone(id)) => { in_flight.remove(&id); }
@@ -763,11 +770,12 @@ fn content(
     if write.outstanding >= CREDIT_WINDOW {
         // Past its credit: the control plane is not honouring the window,
         // and buffering for it would be buffering without bound.
-        let _ = writes.try_send(text(&Up::Err {
-            id: Some(id),
-            code: "invalid".into(),
-            message: format!("write {id} sent a frame it had no credit for"),
-        })?);
+        refuse(
+            writes,
+            id,
+            "invalid",
+            format!("write {id} sent a frame it had no credit for"),
+        );
         in_flight.remove(&id);
         return Ok(());
     }
@@ -827,24 +835,21 @@ fn handle(
             if_none_match,
         } => {
             if in_flight.contains_key(&id) {
-                let _ = writes.try_send(text(&Up::Err {
-                    id: Some(id),
-                    code: "invalid".into(),
-                    message: format!("request {id} is already in flight"),
-                })?);
+                refuse(
+                    writes,
+                    id,
+                    "invalid",
+                    format!("request {id} is already in flight"),
+                );
                 return Ok(());
             }
-            if over_capacity(writes, in_flight, *requests, id)? {
+            if over_capacity(writes, in_flight, *requests, id) {
                 return Ok(());
             }
             let condition = match condition(from, if_match, if_none_match) {
                 Ok(condition) => condition,
                 Err(message) => {
-                    let _ = writes.try_send(text(&Up::Err {
-                        id: Some(id),
-                        code: "invalid".into(),
-                        message,
-                    })?);
+                    refuse(writes, id, "invalid", message);
                     return Ok(());
                 }
             };
@@ -862,14 +867,13 @@ fn handle(
                     )
                     .await;
                     if let Err(refusal) = outcome {
-                        let _ = writes.try_send(Message::text(
-                            serde_json::to_string(&Up::Err {
-                                id: Some(id),
-                                code: refusal.code.into(),
-                                message: refusal.message,
-                            })
-                            .unwrap_or_default(),
-                        ));
+                        if let Ok(message) = text(&Up::Err {
+                            id: Some(id),
+                            code: refusal.code.into(),
+                            message: refusal.message,
+                        }) {
+                            let _ = writes.send(message).await;
+                        }
                     }
                     let _ = internal.send(Internal::WriteDone(id)).await;
                 })
@@ -890,17 +894,13 @@ fn handle(
             from,
             if_match,
         } => {
-            if over_capacity(writes, in_flight, *requests, id)? {
+            if over_capacity(writes, in_flight, *requests, id) {
                 return Ok(());
             }
             let condition = match condition(from, if_match, false) {
                 Ok(condition) => condition,
                 Err(message) => {
-                    let _ = writes.try_send(text(&Up::Err {
-                        id: Some(id),
-                        code: "invalid".into(),
-                        message,
-                    })?);
+                    refuse(writes, id, "invalid", message);
                     return Ok(());
                 }
             };
@@ -936,16 +936,36 @@ fn over_capacity(
     in_flight: &HashMap<u32, Write>,
     requests: usize,
     id: u32,
-) -> crate::Result<bool> {
+) -> bool {
     if in_flight.len() + requests < MAX_INFLIGHT {
-        return Ok(false);
+        return false;
     }
-    let _ = writes.try_send(text(&Up::Err {
-        id: Some(id),
-        code: "unavailable".into(),
-        message: format!("this session already has {MAX_INFLIGHT} requests in flight"),
-    })?);
-    Ok(true)
+    refuse(
+        writes,
+        id,
+        "unavailable",
+        format!("this session already has {MAX_INFLIGHT} requests in flight"),
+    );
+    true
+}
+
+/// Sends one request's refusal from the session loop without blocking it.
+///
+/// Never `try_send`: a refusal dropped under writer backpressure leaves the
+/// control plane waiting out its timeout for an answer that will not come.
+/// The send is awaited in a task of its own, so the loop keeps polling the
+/// heartbeat and the writer's own timeout still bounds a stalled peer.
+fn refuse(writes: &Writer, id: u32, code: &'static str, message: String) {
+    let writes = writes.clone();
+    tokio::spawn(async move {
+        if let Ok(frame) = text(&Up::Err {
+            id: Some(id),
+            code: code.into(),
+            message,
+        }) {
+            let _ = writes.send(frame).await;
+        }
+    });
 }
 
 /// The condition a request's headers spell, in the engine's terms.
@@ -1088,7 +1108,12 @@ async fn run_write(
         let node = node.clone();
         let (space, path, via) = (space.to_string(), path.to_string(), via.to_string());
         synch_core::offload(move || {
+            // Everything that can refuse at open is asked *before* the space
+            // becomes a source of ours: a write refused here has left no
+            // trace (§6.2). What a later refusal — a lost condition at
+            // commit — cannot undo is the source row the staging needed.
             admit_space(&node, &space).map_err(offload_err)?;
+            synch_core::normalize_path(&path).map_err(|e| EngineError::invalid(e.to_string()))?;
             // Lazily, on the first write into a space: from here on cloud-1
             // both replicates the space and publishes into it (§6.2).
             node.add_api_source(&space)?;
@@ -1106,7 +1131,19 @@ async fn run_write(
 
     let mut received: u64 = 0;
     loop {
-        let Some(cmd) = cmds.recv().await else {
+        // A write that goes quiet is abandoned, and its staging with it:
+        // the control plane cancels what it gives up on, but a control plane
+        // that died mid-upload cancels nothing.
+        let Ok(cmd) = tokio::time::timeout(WRITE_IDLE, cmds.recv()).await else {
+            return Err(Refusal::new(
+                "unavailable",
+                format!(
+                    "the write was idle for {}s and was abandoned",
+                    WRITE_IDLE.as_secs()
+                ),
+            ));
+        };
+        let Some(cmd) = cmd else {
             // Cancelled: the writer drops here and its staging with it.
             return Ok(());
         };
@@ -1120,6 +1157,11 @@ async fn run_write(
                     ));
                 }
                 writer.write(data).await?;
+                // The credit goes back from here, awaited, so backpressure on
+                // the writer delays it rather than drops it: a lost credit
+                // would leave the control plane waiting for a frame that
+                // never comes.
+                let _ = writes.send(text(&Up::Credit { id, n: 1 })?).await;
                 let _ = internal.send(Internal::Consumed(id)).await;
             }
             WriteCmd::Commit => {
@@ -1129,32 +1171,43 @@ async fn run_write(
                         format!("the write announced {size} bytes and sent {received}"),
                     ));
                 }
-                let receipt = writer.commit(condition).await?;
-                let (seq, mtime_ns) = {
-                    let node = node.clone();
-                    let (space, path) = (space.to_string(), path.to_string());
-                    synch_core::offload(move || {
-                        let normalized = synch_core::normalize_path(&path)
-                            .map_err(|e| EngineError::invalid(e.to_string()))?;
-                        Ok::<_, EngineError>(
-                            node.store()
-                                .entry(node.origin(), &space, &normalized)?
-                                .map(|entry| (entry.seq, entry.mtime_ns))
-                                .unwrap_or((0, 0)),
-                        )
-                    })
-                    .await?
-                };
-                let _ = writes
-                    .send(text(&Up::Committed {
+                // In a task of its own, so a cancellation landing now — the
+                // session ending, hosting switched off — does not abort a
+                // commit half way through the seam. The commit runs to its
+                // end and publishes or fails whole; only the report of it
+                // is lost (`docs/TREE-WRITES.md` §5.1 makes the same promise
+                // for a killed invocation).
+                let node = node.clone();
+                let (space, path) = (space.to_string(), path.to_string());
+                let committed = tokio::spawn(async move {
+                    let receipt = writer.commit(condition).await?;
+                    let (seq, mtime_ns) = {
+                        let node = node.clone();
+                        let (space, path) = (space.clone(), path.clone());
+                        synch_core::offload(move || {
+                            let normalized = synch_core::normalize_path(&path)
+                                .map_err(|e| EngineError::invalid(e.to_string()))?;
+                            Ok::<_, EngineError>(
+                                node.store()
+                                    .entry(node.origin(), &space, &normalized)?
+                                    .map(|entry| (entry.seq, entry.mtime_ns))
+                                    .unwrap_or((0, 0)),
+                            )
+                        })
+                        .await?
+                    };
+                    Ok::<_, Refusal>(Up::Committed {
                         id,
                         root: receipt.root.to_hex().to_string(),
                         size: receipt.size,
                         seq,
                         mtime_ns,
                         origin: node.origin().canonical(),
-                    })?)
-                    .await;
+                    })
+                })
+                .await
+                .map_err(|e| Refusal::new("internal", format!("the commit task failed: {e}")))??;
+                let _ = writes.send(text(&committed)?).await;
                 return Ok(());
             }
         }
@@ -1196,7 +1249,35 @@ async fn run_delete(
         .map_err(unwrap_offload)?
     };
     let withdrawn = match own {
-        None => false,
+        None => {
+            // Nothing to withdraw, but a stated condition is still the
+            // caller's question, and "the cloud never asserted this" must not
+            // read as "your precondition held" (§4.3).
+            if let PutCondition::Selected { from, root } = &condition {
+                let policy = match from {
+                    Some(origin) => synch_store::VersionPolicy::Origin(origin.clone()),
+                    None => synch_store::VersionPolicy::Newest,
+                };
+                let node = node.clone();
+                let (in_space, at_path) = (space.to_string(), normalized.clone());
+                let found = synch_core::offload(move || {
+                    Ok::<_, EngineError>(match node.resolve(&in_space, &at_path, &policy) {
+                        Ok(row) if row.kind == EntryKind::Tombstone => None,
+                        Ok(row) => row.content,
+                        Err(EngineError::NotFound(_)) => None,
+                        Err(e) => return Err(e),
+                    })
+                })
+                .await?;
+                if found != *root {
+                    return Err(Refusal::new(
+                        "precondition",
+                        format!("{space}/{path} does not select the expected version"),
+                    ));
+                }
+            }
+            false
+        }
         Some(own_root) => {
             let mut writer = {
                 let node = node.clone();
@@ -1391,6 +1472,17 @@ mod tests {
         Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
     > {
         futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|m| m.map(Ok)))
+    }
+
+    /// The next answer that is not a credit: a commit's or a delete's, with
+    /// the credits still arriving for the frames before it skipped.
+    async fn settled(rx: &mut mpsc::UnboundedReceiver<Message>) -> Up {
+        loop {
+            match next_up(rx).await {
+                Up::Credit { .. } => continue,
+                other => break other,
+            }
+        }
     }
 
     fn limits() -> WriteLimits {
@@ -1642,6 +1734,125 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.kind == EntryKind::Tombstone));
+        node.shutdown().await.unwrap();
+    }
+
+    /// What a customer's version does to a write: a delete of a path only
+    /// `nas` publishes withdraws nothing and says so; `If-None-Match: *`
+    /// fails against `nas`'s version even though cloud-1 has none, as does an
+    /// `If-Match` that names the wrong root on a delete; `If-Match` with
+    /// `from=nas` pins the comparison to `nas`'s version and wins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conditions_and_deletes_see_the_customers_versions() {
+        let _scope = synch_core::BlockingScope::enter();
+        let (_dir, node) = tenant().await;
+        let nas = OriginId::named("nas", "x.example").unwrap();
+        let theirs = b"theirs".to_vec();
+        let their_root = {
+            let (n, theirs, nas) = (node.clone(), theirs.clone(), nas.clone());
+            synch_core::offload(move || {
+                let root = n.store().ingest_bytes(&theirs, synch_core::now_ns())?;
+                n.store().put_entry(
+                    &nas,
+                    "docs",
+                    "shared.txt",
+                    &synch_core::FileEntry::file(theirs.len() as u64, 1, root, 1),
+                )?;
+                Ok::<_, synch_store::StoreError>(root)
+            })
+            .await
+            .unwrap()
+        };
+        let (down, mut up, _task) = session(&node, limits());
+
+        // Only nas publishes it: nothing to withdraw, and the path stays.
+        down.send(down_msg(&Down::Delete {
+            id: 1,
+            space: "docs".into(),
+            path: "shared.txt".into(),
+            from: None,
+            if_match: None,
+        }))
+        .unwrap();
+        assert!(matches!(
+            next_up(&mut up).await,
+            Up::Deleted {
+                id: 1,
+                still_published: true,
+                withdrawn: false
+            }
+        ));
+        // A stated condition is still answered when there is nothing to
+        // withdraw.
+        down.send(down_msg(&Down::Delete {
+            id: 2,
+            space: "docs".into(),
+            path: "shared.txt".into(),
+            from: None,
+            if_match: Some(Hash::new(b"wrong").to_hex().to_string()),
+        }))
+        .unwrap();
+        assert!(
+            matches!(next_up(&mut up).await, Up::Err { id: Some(2), ref code, .. } if code == "precondition")
+        );
+
+        // Create-only loses to nas's version.
+        let mine = b"mine".to_vec();
+        down.send(down_msg(&Down::Put {
+            id: 3,
+            space: "docs".into(),
+            path: "shared.txt".into(),
+            size: mine.len() as u64,
+            from: None,
+            if_match: None,
+            if_none_match: true,
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Opened { id: 3, .. }));
+        down.send(Message::binary(encode_chunk(3, 0, &mine)))
+            .unwrap();
+        down.send(down_msg(&Down::Commit { id: 3 })).unwrap();
+        assert!(
+            matches!(settled(&mut up).await, Up::Err { id: Some(3), ref code, .. } if code == "precondition")
+        );
+
+        // Pinned to nas's version by `from`, the caller's root holds.
+        down.send(down_msg(&Down::Put {
+            id: 4,
+            space: "docs".into(),
+            path: "shared.txt".into(),
+            size: mine.len() as u64,
+            from: Some(nas.canonical()),
+            if_match: Some(their_root.to_hex().to_string()),
+            if_none_match: false,
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Opened { id: 4, .. }));
+        down.send(Message::binary(encode_chunk(4, 0, &mine)))
+            .unwrap();
+        down.send(down_msg(&Down::Commit { id: 4 })).unwrap();
+        assert!(matches!(
+            settled(&mut up).await,
+            Up::Committed { id: 4, .. }
+        ));
+
+        // Now both publish it: the cloud's version is withdrawn, nas's stays.
+        down.send(down_msg(&Down::Delete {
+            id: 5,
+            space: "docs".into(),
+            path: "shared.txt".into(),
+            from: None,
+            if_match: None,
+        }))
+        .unwrap();
+        assert!(matches!(
+            settled(&mut up).await,
+            Up::Deleted {
+                id: 5,
+                still_published: true,
+                withdrawn: true
+            }
+        ));
         node.shutdown().await.unwrap();
     }
 

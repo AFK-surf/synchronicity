@@ -455,7 +455,7 @@ impl Tenant {
             let domain = self.network.domain.clone();
             let token = config.token.clone();
             let limits = crate::writes::WriteLimits {
-                staging: crate::writes::StagingBudget::new(config.write_staging_bytes),
+                staging: config.write_staging.clone(),
                 budget_bytes: self.network.budget_bytes,
             };
             self.loops.push(tokio::spawn(async move {

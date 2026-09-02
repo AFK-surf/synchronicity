@@ -115,10 +115,13 @@ control-plane/README.md.
 5. `DELETE` withdraws the cloud's version. If `nas` still publishes the path,
    the answer says `"still_published": true` and the file browser says so in
    words: *the cloud's copy is withdrawn; nas still publishes this file.*
-6. Turning hosting off drops the write tunnel in the same request, and
-   `cloud-1` leaves the zone at the same commit; its assertions cease to be
-   part of the trusted view when its binding expires, as any removed member's
-   do. That is the whole of turning writes off.
+6. Turning hosting off drops the write tunnel on the node that took the
+   switch in the same request, and `cloud-1` leaves the zone at the same
+   commit; its assertions cease to be part of the trusted view when its
+   binding expires, as any removed member's do. The other nodes' tunnels end
+   when the data plane sees the network gone from its next poll and drains
+   the tenant, and each of them refuses a write in the meantime from its own
+   copy of the flag. That is the whole of turning writes off.
 
 **Why this adds no new trust.** The control plane already signs the membership
 zone and can already put any device key into any network it serves — which is
@@ -195,10 +198,15 @@ the write tunnel's attach lookup (§5.2) and the route's own resolution
 (§4.2). Turning hosting off already does everything turning writes off would
 need to do — it deletes the `cloud-*` devices in the same commit — and it
 gains one more consequence after that commit: the network's write sessions
-are dropped (`agent.drop_network` on the write registry, §4.5), for the
-reason the browse switch gives when *it* drops sessions: a session that
-outlived the switch would keep taking writes for a network the org has just
-withdrawn from hosting.
+are dropped (`cloud_writer.drop_network`, §4.5), for the reason the browse
+switch gives when *it* drops sessions: a session that outlived the switch
+would keep taking writes for a network the org has just withdrawn from
+hosting. The switch is a write and runs on the primary, so it is the
+primary's registry that is emptied at once; a replica's session ends when
+the data plane, seeing the network gone from its next desired-state poll,
+drains the tenant and closes every tunnel it held — one poll interval at
+most — and until then the replica's own route refuses the write from its
+own copy of `cloud_hosted`, which is as current as its database is.
 
 **Why not a third switch.** An earlier draft of this document had one —
 `cloud_writes`, admin-gated, off by default, with a schema `CHECK` that it
@@ -260,7 +268,9 @@ whatever its operator likes; a member therefore already holds publish rights
 in every network they can see. Gating the write at admin would protect nothing
 and would make a CI key that uploads artifacts an admin key, which is the
 wrong direction for a credential that gets baked into a pipeline. A join key
-is refused as it is everywhere (`403 join_key_forbidden`).
+is refused as it is everywhere — as `404`, since the below-wisp routes
+collapse every `check_org` refusal to "no such network", the same answer the
+download gives.
 
 `origin=` on a write is `400 invalid`: there is one writer. `from=` is
 accepted on both verbs, and it means what it means on a read — which version
@@ -324,7 +334,10 @@ version to retire**, and publishes nothing otherwise. Idempotent: a path
 `cloud-1` does not currently assert answers `200` with `"withdrawn": false`
 — the assertion being made is "the cloud has no version here", and it
 already holds, so no record is written to say so (§6.6 says why not).
-`If-Match` applies as above. The answer carries `still_published`, straight
+`If-Match` applies as above, and is answered even where the cloud has no
+version to withdraw — "the cloud never asserted this" must not read as "your
+precondition held". The answer carries `still_published`, read after the
+tombstone lands rather than under the lock that placed it,
 from the engine's `Deleted`, and the dashboard reads it aloud.
 
 **Errors**, in the vocabulary the browse routes already use, plus the ones a
@@ -562,15 +575,24 @@ arriving past `size`, is `err invalid` and the staging goes: a short body is
 never published as a whole file.
 
 Per session: the browse tunnel's `MAX_INFLIGHT` (64) across writes in flight.
-Per tenant: a **staging budget** (`SYNCH_DP_WRITE_STAGING_BYTES`, default 4
-GiB), because staging lands on the pod's shared ephemeral disk before the
-CAS ingest uploads it, and a pod is many tenants; a `put` whose `size` would
-exceed what is free under the budget is refused `unavailable` before any byte
-moves, which is why `size` is in the frame. Per write: the control plane's
-cap (`CP_WRITE_MAX_BYTES`, default 1 GiB) is enforced at the HTTP layer from
-`Content-Length`, before the tunnel sees the request. A write idle for the
-relay watchdog's 60 s — no chunk, no commit — is cancelled at the source,
-exactly as a stalled download is.
+Per pod: a **staging budget** (`SYNCH_DP_WRITE_STAGING_BYTES`, default 4
+GiB, shared by every tenant on the pod), because staging lands on the pod's
+one ephemeral disk before the CAS ingest uploads it, and a pod is many
+tenants — a per-tenant share would let N tenants reserve N shares of one
+volume; a `put` whose `size` would exceed what is free under the budget is
+refused `unavailable` before any byte moves, which is why `size` is in the
+frame. Per write: the control plane's cap (`CP_WRITE_MAX_BYTES`, default 1
+GiB) is enforced at the HTTP layer from `Content-Length`, before the tunnel
+sees the request.
+
+Two clocks end a write that stops. On the node, a write that sees no frame
+and no commit for 60 s is abandoned and its reservation returned — this is
+the clock that matters, because a control plane that died mid-upload cancels
+nothing. On the control plane, a write waits at most 60 s for the next
+credit and at most 15 s for the node to open it; giving up on either
+cancels the write by id (the session assigns the id before the node
+answers, so a slow open is cancellable too), and the commit itself is given
+ten minutes, since it uploads the object to the tenant's prefix.
 
 ---
 
@@ -609,6 +631,13 @@ provisioning: a source row has consequences a replica row does not — removing
 one unpublishes this origin's entries, and the space's `m:space` record
 starts describing this node as a publisher — and a network with writes
 enabled and never used should look, to every peer, exactly as it did before.
+The source is added only after everything that can refuse at open has been
+asked — the space is replicated, the path normalizes, the node can publish —
+so a write refused there leaves no trace. A write that reached staging and
+was then refused at commit (a lost condition) has made the space a source,
+and that is left as it is: the row publishes nothing by itself, and undoing
+it is `source_removal`, the one operation on a node that can publish a mass
+deletion, which no refused upload should be able to trigger.
 
 **The space must exist.** A `put` naming a space the tenant does not
 replicate is `not-found`. Writes go into the network's existing namespaces;
@@ -758,8 +787,9 @@ decoder.
 - **`NetworkFiles`** gains an upload control (a file picker and drop target)
   and a per-entry delete, shown only when `status.writes.enabled` and
   grayed with the reason when `!status.writes.attached`. Upload is one
-  `fetch` with the `File` as body and `Content-Length` from its size; the SPA's
-  `send` helper already carries `x-csrf`. The result row names `cloud-1` as
+  `fetch` with the `File` as body — the browser sets `Content-Length` from
+  the blob itself, and refuses a script that tries to — with `x-csrf` as the
+  SPA's `send` helper carries it. The result row names `cloud-1` as
   the origin, and where the path was already published by a customer node
   the version drawer opens on it — divergence is the expected outcome of an
   upload over an existing file, and the UI should show it rather than a
@@ -863,36 +893,47 @@ decoder.
 | Credit window | 4 chunks | tunnel |
 | Writes in flight per credential | 4 | control-plane registry |
 | Requests in flight per session | 64 | data plane |
-| Staging in flight per tenant | 4 GiB (`SYNCH_DP_WRITE_STAGING_BYTES`) | data plane |
-| Idle before cancel | 60 s | control-plane watchdog |
+| Staging in flight per pod, all tenants | 4 GiB (`SYNCH_DP_WRITE_STAGING_BYTES`) | data plane |
+| Idle before a write is abandoned | 60 s | data plane |
+| Wait for the next credit before giving up | 60 s | control plane |
 | Spaces writable | those the tenant replicates | data plane |
 
 ---
 
 ## 12. What was built, and the tests that hold it
 
-1. **Engine** — (e) and (f) of §7, with a unit test that `Selected` holds and
-   fails against `resolve` under the lock, and that the existing `Absent` and
-   `Root` are unchanged.
+1. **Engine** — (e) and (f) of §7. `Selected` has no unit test of its own
+   in the engine; it is exercised end to end through the data plane's seam
+   tests below (`root: None` against a customer's version, `from` pinned to
+   a customer origin), and the existing `Absent` and `Root` tests in the
+   socket runtime are unchanged.
 2. **Control plane** — no migration. The `cp_writers` registry name; the
-   write connection actor (`api/cloud_writer.gleam`); the attach route in
-   the read table; `PUT`/`DELETE` in `browse_file.gleam` with CSRF and the
+   write connection actor (`api/cloud_writer.gleam`); the attach route on
+   every role; `PUT`/`DELETE` in `browse_file.gleam` with CSRF and the
    write slots, mounted by the edge on every role; `writes` on the browse
    status; `set_cloud_hosting`'s disable path dropping write sessions after
-   its commit. Gleam tests in the shape of `browse_test.gleam`: the attach
-   lookup refuses a wrong data plane, a customer-created device, and an
-   unhosted network; a `PUT` on a cookie without `x-csrf` is `403`; a
-   replica-role edge serves a `PUT` rather than answering `409`; a `PUT`
-   leaves `audit_log` unchanged.
+   its commit; key revocation dropping the write session with the browse
+   one. Gleam tests: the attach lookup attaches the assigned hosted device
+   and refuses a wrong data plane, a customer's device, and an unhosted
+   network; the browse status reports the write half and hosting off empties
+   the registry; the proof is domain-separated from the browse tunnel's; the
+   slot cap and slot-1 routing. **Not tested:** `browse_file.write` itself —
+   the CSRF double submit, the relay loop, the status mapping — which sits
+   below wisp and has no request harness in the suite, as the download route
+   beside it has none either.
 3. **Data plane** — `writes.rs`: the frame types, the attach loop, the
    handler over the public seam, the lazy API source, the budget check, the
-   staging budget; `spawn_loops` gated on `writes`; the heartbeat fields. A
-   unit test drives `serve` over in-process channels as `attach.rs`'s tests
-   do: a whole write round-trips to a readable version, a short body publishes
-   nothing, `If-Match` against a stale root is `precondition`, a delete of a
-   path only `nas` publishes answers `still_published: true` and
-   `withdrawn: false` and stages no tombstone, and two deletes of one
-   `cloud-1` path publish one.
+   pod-wide staging budget, the idle watchdog, the uncancellable commit. Unit
+   tests drive `serve` over in-process channels as `attach.rs`'s tests do: a
+   whole write round-trips to a readable version and `If-Match` behaves; a
+   short body and an unknown space publish nothing; a delete of a path only
+   cloud-1 publishes withdraws it once; a delete of a path only `nas`
+   publishes withdraws nothing and answers `still_published: true`, a stated
+   condition on such a delete is still answered, `If-None-Match: *` loses to
+   `nas`'s version, and `If-Match` with `from=nas` wins; the staging bound
+   refuses before a byte moves and is returned on cancel; the wire layout is
+   pinned. **Not tested:** the credit-overrun refusal, the in-flight ceiling,
+   and the idle watchdog's firing.
 4. **End to end** — not in this change. `control-plane/e2e/cloud-dataplane.sh`
    should grow one act: after both customer files are durable, `PUT` a third
    file through the control plane, and assert that the third customer node —

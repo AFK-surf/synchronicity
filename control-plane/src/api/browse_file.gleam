@@ -241,8 +241,36 @@ pub fn write(
     Ok(session) ->
       case req.method {
         Put -> put(req, writers, session, holder, space, path, from)
-        _ -> delete(req, session, space, path, from)
+        _ -> {
+          // A delete holds a slot too: it is one request in flight at the
+          // node per call, and the cap is on what one credential may have
+          // open, not on what kind.
+          use Nil <- with_slot(writers, holder)
+          delete(req, session, space, path, from)
+        }
       }
+  }
+}
+
+/// Runs `next` under one of the credential's write slots, or refuses.
+fn with_slot(
+  writers: Subject(cloud_writer.Msg),
+  holder: String,
+  next: fn(Nil) -> HttpResponse(mist.ResponseData),
+) -> HttpResponse(mist.ResponseData) {
+  case cloud_writer.claim_slot(writers, holder) {
+    False ->
+      deny(
+        429,
+        "too-many-writes: too many writes open at once (limit "
+          <> int.to_string(cloud_writer.writes_per_user())
+          <> ")",
+      )
+    True -> {
+      let response = next(Nil)
+      cloud_writer.release_slot(writers, holder)
+      response
+    }
   }
 }
 
@@ -304,30 +332,8 @@ fn put(
   )
   // A write on a session cookie needs no more than the CSRF check already
   // taken; the cap is what stops a page starting a hundred of them.
-  case cloud_writer.claim_slot(writers, holder) {
-    False ->
-      deny(
-        429,
-        "too-many-writes: too many uploads open at once (limit "
-          <> int.to_string(cloud_writer.writes_per_user())
-          <> ")",
-      )
-    True -> {
-      let response =
-        relay_write(
-          req,
-          session,
-          space,
-          path,
-          size,
-          from,
-          if_match,
-          if_none_match,
-        )
-      cloud_writer.release_slot(writers, holder)
-      response
-    }
-  }
+  use Nil <- with_slot(writers, holder)
+  relay_write(req, session, space, path, size, from, if_match, if_none_match)
 }
 
 /// Opens the write, streams the body under credit, commits.
@@ -356,9 +362,9 @@ fn relay_write(
         }
         Ok(reader) ->
           case relay_body(reader, session, id, reply, credit, 0, 0) {
-            Error(message) -> {
+            Error(#(code, message)) -> {
               process.send(session.inbox, cloud_writer.Cancel(id))
-              deny(400, message)
+              deny(status_of_write(code), code <> ": " <> message)
             }
             Ok(sent) if sent != size -> {
               // A short body is an abort, never a truncated file published
@@ -416,9 +422,9 @@ fn relay_body(
   credit: Int,
   seq: Int,
   sent: Int,
-) -> Result(Int, String) {
+) -> Result(Int, #(String, String)) {
   case reader(chunk_bytes) {
-    Error(_) -> Error("invalid: the request body could not be read")
+    Error(_) -> Error(#("invalid", "the request body could not be read"))
     Ok(mist.Done) -> Ok(sent)
     Ok(mist.Chunk(data, next)) ->
       case send_pieces(data, session, id, reply, credit, seq) {
@@ -445,7 +451,7 @@ fn send_pieces(
   reply: Subject(cloud_writer.Event),
   credit: Int,
   seq: Int,
-) -> Result(#(Int, Int), String) {
+) -> Result(#(Int, Int), #(String, String)) {
   case bit_array.byte_size(data) {
     0 -> Ok(#(credit, seq))
     n -> {
@@ -456,10 +462,9 @@ fn send_pieces(
         0 ->
           case cloud_writer.await_credit(reply) {
             Ok(n) -> Ok(n)
-            Error(cloud_writer.Failed(code, message)) ->
-              Error(code <> ": " <> message)
+            Error(cloud_writer.Failed(code, message)) -> Error(#(code, message))
             Error(_) ->
-              Error("internal: the hosted node answered the wrong question")
+              Error(#("internal", "the hosted node answered the wrong question"))
           }
         n -> Ok(n)
       })
