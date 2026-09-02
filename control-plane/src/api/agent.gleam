@@ -45,12 +45,16 @@ fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 
 /// The newest tunnel protocol version this build speaks.
 ///
-/// v2 added the delegations query, v3 the replication one. Each is additive on
-/// the wire, and the number exists because additive is not the same as safe: a
+/// v2 added the delegations query, v3 the replication one, and v4 live space
+/// claims. Each is additive on the wire, and the number exists because
+/// additive is not the same as safe: a
 /// daemon that meets a frame it has not learnt cannot decode it, and drops the
 /// connection rather than answering. What the version buys is knowing which
 /// questions a given daemon can be asked at all.
-pub const protocol_version = 3
+pub const protocol_version = 4
+
+/// The first version whose daemon can replace a live session's routing claim.
+const space_updates_version = 4
 
 /// The oldest version this build still serves.
 ///
@@ -84,6 +88,11 @@ pub fn introduced_in(question: Question) -> Int {
 /// Whether an attached daemon is new enough to be asked this.
 pub fn speaks(session: Session, question: Question) -> Bool {
   session.version >= introduced_in(question)
+}
+
+/// Whether this session negotiated replacement routing claims.
+pub fn accepts_space_updates(session: Session) -> Bool {
+  session.version >= space_updates_version
 }
 
 /// The version an attach settles on, given what the daemon claimed.
@@ -164,8 +173,8 @@ pub type Session {
     origin: String,
     /// The `device_keys` row the proof verified against.
     key_id: String,
-    /// The spaces the daemon holds, as it claimed them at attach — a routing
-    /// fact, not a boundary: the daemon serves whatever it is asked.
+    /// The spaces the daemon currently holds — a routing fact, not a boundary:
+    /// the daemon serves whatever it is asked.
     spaces: List(String),
     version: Int,
     attached_at: Int,
@@ -351,6 +360,8 @@ pub type Msg {
   DropNetwork(network_id: String)
   /// A device key was revoked: any session standing on it goes with it.
   DropKey(key_id: String)
+  /// A live daemon's sources or replicas changed.
+  UpdateSpaces(id: String, spaces: List(String))
   /// One user is opening a download; answered `False` at the cap.
   ClaimStream(user_id: String, reply: Subject(Bool))
   /// One user's download ended, however it ended.
@@ -447,6 +458,18 @@ fn handle_registry(state: Registry, message: Msg) -> actor.Next(Registry, Msg) {
       list.each(going, close)
       actor.continue(Registry(..state, sessions: staying))
     }
+    UpdateSpaces(id, spaces) ->
+      actor.continue(
+        Registry(
+          ..state,
+          sessions: list.map(state.sessions, fn(session) {
+            case session.id == id {
+              True -> Session(..session, spaces: spaces)
+              False -> session
+            }
+          }),
+        ),
+      )
     ClaimStream(user_id, reply) -> {
       let held =
         list.filter(state.streams, fn(pair) { pair.1 + stream_lease > now })
@@ -826,6 +849,11 @@ fn incoming(
       mist.continue(state)
     }
     Ok("pong"), _ -> mist.continue(state)
+    Ok("spaces"), Live(session) ->
+      case accepts_space_updates(session) {
+        True -> updated_spaces(state, body, session, conn)
+        False -> refuse(conn, "invalid", "unexpected frame for this version")
+      }
     Ok("page"), Live(_) -> answered(state, body, page_decoder())
     Ok("versions"), Live(_) -> answered(state, body, versions_decoder())
     Ok("resolved"), Live(_) -> answered(state, body, resolved_decoder())
@@ -839,6 +867,30 @@ fn incoming(
     // guessing what a daemon meant by it.
     _, _ -> refuse(conn, "invalid", "unexpected frame for this phase")
   }
+}
+
+/// Replaces the routing claim in both copies that outlive this callback: the
+/// connection phase used by `on_close`, and the registry read by browse calls.
+fn updated_spaces(
+  state: Conn,
+  body: String,
+  session: Session,
+  conn: mist.WebsocketConnection,
+) -> mist.Next(Conn, Ask) {
+  case decode_space_update(body) {
+    Error(_) -> refuse(conn, "invalid", "malformed spaces")
+    Ok(spaces) -> {
+      let updated = Session(..session, spaces: spaces)
+      process.send(state.attach.registry, UpdateSpaces(session.id, spaces))
+      mist.continue(Conn(..state, phase: Live(updated)))
+    }
+  }
+}
+
+/// Decodes a live replacement claim; exposed so the other end's wire fixture
+/// is pinned independently of the WebSocket transport.
+pub fn decode_space_update(body: String) -> Result(List(String), Nil) {
+  json.parse(body, spaces_decoder()) |> result.replace_error(Nil)
 }
 
 fn hello(
@@ -1346,6 +1398,11 @@ fn proof_decoder() -> Decoder(#(String, String)) {
   use signature <- decode.field("sig", decode.string)
   use key <- decode.field("key", decode.string)
   decode.success(#(signature, key))
+}
+
+fn spaces_decoder() -> Decoder(List(String)) {
+  use spaces <- decode.field("spaces", decode.list(decode.string))
+  decode.success(spaces)
 }
 
 fn version_decoder() -> Decoder(Version) {

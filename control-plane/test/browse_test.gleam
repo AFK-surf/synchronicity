@@ -427,6 +427,39 @@ pub fn a_session_holds_only_the_spaces_it_claimed_test() {
   assert !agent.holds(nas, "private")
 }
 
+/// Sources and replicas change without taking the long-lived tunnel down. A
+/// replacement claim must become the registry's routing answer immediately,
+/// including removals.
+pub fn a_live_session_refreshes_its_spaces_test() {
+  let name = process.new_name("cp_agents_spaces_test")
+  let assert Ok(started) = agent.start(name)
+  let registry = started.data
+  let nas = session("nas", "nas@x.example")
+  process.send(registry, agent.Join(nas))
+
+  process.send(registry, agent.UpdateSpaces(nas.id, ["docs", "photos"]))
+  let assert [updated] = agent.sessions_for(registry, "n1")
+  assert updated.spaces == ["docs", "photos"]
+
+  process.send(registry, agent.UpdateSpaces(nas.id, []))
+  let assert [updated] = agent.sessions_for(registry, "n1")
+  assert updated.spaces == []
+}
+
+/// v4 is the first version allowed to send the replacement frame, and its
+/// JSON shape matches the independently serialized Rust frame.
+pub fn a_space_refresh_is_versioned_and_decoded_test() {
+  let nas = session("nas", "nas@x.example")
+  assert agent.accepts_space_updates(nas)
+  assert !agent.accepts_space_updates(agent.Session(..nas, version: 3))
+  assert agent.decode_space_update(
+      "{\"t\":\"spaces\",\"spaces\":[\"docs\",\"photos\"]}",
+    )
+    == Ok(["docs", "photos"])
+  assert agent.decode_space_update("{\"t\":\"spaces\",\"spaces\":42}")
+    == Error(Nil)
+}
+
 /// A request may name the node that serves it. Unnamed, any holder; named,
 /// that node and no other — and a node that is not attached, and one that is
 /// attached but does not hold the space, are different facts with different

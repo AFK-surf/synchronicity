@@ -85,7 +85,10 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   attached. Which spaces are browsable is decided here, not on the node: an
   attached daemon serves whatever this service requests, for every space it
   holds. File bytes pass through this service's memory in bounded chunks and
-  are never stored.
+  are never stored. A v4 daemon replaces that routing claim on the live tunnel
+  when its sources or replicas change; against an older control plane it
+  reconnects so the next hello carries the replacement instead of leaving a
+  newly added space unroutable.
 
   The same tunnel carries two questions that are not about files: who the
   cluster admits on a delegation, and **what each node replicates**
@@ -99,7 +102,9 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 
   **The tunnel version is negotiated, not required to match.** An attach
   settles on the daemon's version, clamped to the newest this build speaks, and
-  only a daemon below the floor (v2 today) is refused. Each question records
+  only a daemon below the floor (v2 today) is refused. v4 adds replacement
+  space claims; v3 added replication reporting and v2 delegations. Each
+  question records
   the version it appeared in, so a node whose operator has not upgraded keeps
   its tunnel and everything its own version defines, and is never sent a frame
   it could not decode — a frame that fails to decode ends a connection, which

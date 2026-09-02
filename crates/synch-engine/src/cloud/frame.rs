@@ -16,12 +16,17 @@ use serde::{Deserialize, Serialize};
 
 /// The newest tunnel protocol version this daemon speaks, carried in the hello.
 ///
-/// v2 added the delegations query, v3 the replication one. Each is additive on
-/// the wire, and the number exists because additive is not the same as safe:
+/// v2 added the delegations query, v3 the replication one, and v4 live space
+/// claims. Each is additive on the wire, and the number exists because
+/// additive is not the same as safe:
 /// a frame an end has not learnt fails to decode, and a failed decode ends the
 /// connection rather than answering. The version is how the control plane
 /// knows which questions this daemon can be asked at all.
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
+
+/// The first version in which a daemon may refresh its routing claim without
+/// reconnecting.
+pub(crate) const SPACE_UPDATES_VERSION: u32 = 4;
 
 /// The oldest settled version this daemon will serve under.
 ///
@@ -256,6 +261,15 @@ pub(crate) enum Up {
         /// The device key that produced it, z-base-32.
         key: String,
     },
+    /// A replacement for the session's routing claim.
+    ///
+    /// Sources and replicas can be added or removed while this tunnel is
+    /// alive. This frame makes those changes routable without waiting for a
+    /// network failure to force another hello.
+    Spaces {
+        /// Every space this node currently publishes or replicates.
+        spaces: Vec<String>,
+    },
     /// One page of a listing.
     Page {
         /// The request id.
@@ -453,6 +467,19 @@ pub(crate) struct ReplicaSpaceJson {
 mod tests {
     use super::*;
     use synch_core::head_signing_input;
+
+    /// A routing refresh is a replacement, not a delta: the control plane can
+    /// update one session atomically and removals need no second opcode.
+    #[test]
+    fn the_live_space_claim_wire_layout_is_pinned() {
+        let frame = Up::Spaces {
+            spaces: vec!["docs".into(), "media".into()],
+        };
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["t"], "spaces");
+        assert_eq!(json["spaces"], serde_json::json!(["docs", "media"]));
+        assert_eq!(SPACE_UPDATES_VERSION, PROTOCOL_VERSION);
+    }
 
     /// The delegations answer's field names are the contract: the other side
     /// is written in another language, which decodes them by name — a rename

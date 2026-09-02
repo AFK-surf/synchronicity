@@ -21,7 +21,7 @@ use crate::{
     cloud::frame::{
         attach_signing_input, encode_chunk, settles_at, DelegationJson, Down, EntryJson,
         ReplicaSpaceJson, Up, VersionJson, MAX_CHUNK, MIN_PROTOCOL_VERSION, NONCE_LEN,
-        PROTOCOL_VERSION,
+        PROTOCOL_VERSION, SPACE_UPDATES_VERSION,
     },
     error::{EngineError, Result},
     node::Node,
@@ -315,10 +315,7 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
         let (mut sink, mut stream) = socket.split();
 
         // Two store reads, so they go over together (§10).
-        let held = {
-            let node = node.clone();
-            crate::blocking::offload(move || held_spaces(&node)).await?
-        };
+        let held = current_held_spaces(node).await?;
         send(
             &mut sink,
             &Up::Hello {
@@ -326,7 +323,7 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
                 network: domain.to_string(),
                 origin: node.origin().canonical(),
                 device: node.node_id().to_z32(),
-                spaces: held,
+                spaces: held.clone(),
             },
         )
         .await?;
@@ -354,7 +351,7 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
         )
         .await?;
 
-        match receive(&mut stream).await? {
+        let settled = match receive(&mut stream).await? {
             // A range rather than equality. The control plane settles on this
             // daemon's version when it can, so the ordinary echo is ours; a
             // lower one means an older control plane, and serving under it
@@ -372,6 +369,7 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
                 } else {
                     tracing::info!(domain, session, url, "cloud attach established");
                 }
+                v
             }
             Down::Attached { v, .. } => {
                 return Err(EngineError::invalid(format!(
@@ -387,17 +385,17 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
                     "expected an attach, got {other:?}"
                 ))))
             }
-        }
-        Ok((sink, stream))
+        };
+        Ok((sink, stream, held, settled))
     };
-    let (sink, stream) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+    let (sink, stream, held, settled) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| {
-            EngineError::invalid(format!("{url}: the handshake did not finish in time"))
-        })??;
+        EngineError::invalid(format!("{url}: the handshake did not finish in time"))
+    })??;
     node.set_cloud_status(domain, Some(base.clone()), true, None);
 
-    let outcome = serve(node, sink, stream).await;
+    let outcome = serve(node, sink, stream, held, settled).await;
     node.set_cloud_status(
         domain,
         Some(base),
@@ -407,13 +405,11 @@ async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
     outcome
 }
 
-/// The spaces this node claims to hold, as they stood when the session opened.
+/// The spaces this node currently claims to hold.
 ///
 /// A source or replica is explicit local participation, so either makes the
-/// namespace routable. The claim is taken once
-/// per session: a space added after attach is not routable until the next
-/// reconnect, which is the same grain the whole tunnel works at — the control
-/// plane may ask for anything, and this says what it will find.
+/// namespace routable. The session refreshes this claim when it changes; the
+/// control plane may ask for anything, and this says where it will find it.
 fn held_spaces(node: &Node) -> Result<Vec<String>> {
     let mut held: Vec<String> = node
         .store()
@@ -430,6 +426,42 @@ fn held_spaces(node: &Node) -> Result<Vec<String>> {
     held.sort_unstable();
     held.dedup();
     Ok(held)
+}
+
+/// Reads the routing claim away from an async runtime worker.
+async fn current_held_spaces(node: &Node) -> Result<Vec<String>> {
+    let node = node.clone();
+    Ok(crate::blocking::offload(move || held_spaces(&node)).await?)
+}
+
+/// Publishes a replacement routing claim when local participation changed.
+///
+/// A full writer queue leaves `advertised` untouched so the next heartbeat
+/// retries. Against a pre-v4 control plane the only compatible replacement is
+/// a fresh hello, so returning an error deliberately drives the reconnect loop.
+fn refresh_space_claim(
+    writes: &Writer,
+    advertised: &mut Vec<String>,
+    settled_version: u32,
+    spaces: Vec<String>,
+) -> Result<()> {
+    if spaces == *advertised {
+        return Ok(());
+    }
+    if settled_version < SPACE_UPDATES_VERSION {
+        return Err(EngineError::invalid(
+            "the routing claim changed; reconnecting to refresh an older control plane",
+        ));
+    }
+    if writes
+        .try_send(text(&Up::Spaces {
+            spaces: spaces.clone(),
+        })?)
+        .is_ok()
+    {
+        *advertised = spaces;
+    }
+    Ok(())
 }
 
 impl Node {
@@ -559,6 +591,8 @@ enum Internal {
     ReadDone(u32),
     /// A one-shot LS/STAT/RESOLVE task finished, so the in-flight count drops.
     RequestDone,
+    /// The latest source/replica routing claim, read away from this loop.
+    SpaceClaim(Result<Vec<String>>),
     /// The writer task gave up on the socket — a failed or stalled write — so
     /// the session is over.
     WriterFailed(String),
@@ -583,7 +617,13 @@ impl Drop for AbortOnDrop {
 /// half, the streams, and their blob handles. With the writer split off, the
 /// loop keeps polling the heartbeat and the read half no matter how wedged the
 /// write direction is, and the writer's own timeout tears the session down.
-async fn serve<S, R>(node: &Node, sink: S, mut stream: R) -> Result<()>
+async fn serve<S, R>(
+    node: &Node,
+    sink: S,
+    mut stream: R,
+    mut advertised_spaces: Vec<String>,
+    settled_version: u32,
+) -> Result<()>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin
@@ -640,6 +680,10 @@ where
     let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unanswered = 0u32;
+    // At most one store read is outstanding for this session. Its guard drops
+    // the async waiter when the session ends; an already-running blocking
+    // closure may finish, but can no longer publish a claim into this loop.
+    let mut space_refresh: Option<AbortOnDrop> = None;
 
     loop {
         tokio::select! {
@@ -650,6 +694,15 @@ where
                     // the id is free to be reused.
                     Some(Internal::ReadDone(id)) => { streams.remove(&id); }
                     Some(Internal::RequestDone) => requests = requests.saturating_sub(1),
+                    Some(Internal::SpaceClaim(spaces)) => {
+                        space_refresh = None;
+                        refresh_space_claim(
+                            &writes,
+                            &mut advertised_spaces,
+                            settled_version,
+                            spaces?,
+                        )?;
+                    }
                     // The loop holds a sender, so this only happens at shutdown.
                     None => return Ok(()),
                 }
@@ -659,6 +712,15 @@ where
                     return Err(EngineError::invalid(format!(
                         "the control plane missed {unanswered} heartbeats; the session is dead"
                     )));
+                }
+
+                if space_refresh.is_none() {
+                    let node = node.clone();
+                    let internal = internal.clone();
+                    space_refresh = Some(AbortOnDrop(tokio::spawn(async move {
+                        let spaces = current_held_spaces(&node).await;
+                        let _ = internal.send(Internal::SpaceClaim(spaces)).await;
+                    })));
                 }
                 unanswered += 1;
                 // `try_send`, never `await`: a full channel means the writer is
@@ -1481,7 +1543,7 @@ mod tests {
         ));
         let node = node.clone();
         let served = tokio::spawn(async move {
-            let _ = serve(&node, sink, stream).await;
+            let _ = serve(&node, sink, stream, Vec::new(), PROTOCOL_VERSION).await;
         });
         (to_node, from_node, served)
     }
@@ -1814,6 +1876,64 @@ mod tests {
         node.add_filesystem_source("media", dir.path().join("media"))
             .unwrap();
         assert_eq!(held_spaces(&node).unwrap(), ["docs", "media"]);
+        node.shutdown().await.unwrap();
+    }
+
+    /// The hosted-data-plane startup order opens the tunnel before its first
+    /// convergence pass adds replicas. That must update the live claim rather
+    /// than leave the new space unroutable for the life of the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_session_refreshes_its_routing_claim() {
+        let (_blocking, _dir, node) = scoped_node().await;
+        let (writes, mut outgoing) = mpsc::channel(2);
+        let mut advertised = held_spaces(&node).unwrap();
+        assert!(advertised.is_empty());
+
+        node.add_replica(
+            "media",
+            synch_store::ReplicaPolicy::Current,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        refresh_space_claim(
+            &writes,
+            &mut advertised,
+            PROTOCOL_VERSION,
+            held_spaces(&node).unwrap(),
+        )
+        .unwrap();
+
+        let Message::Text(body) = outgoing.recv().await.unwrap() else {
+            panic!("the routing update is a text frame")
+        };
+        let Up::Spaces { spaces } = serde_json::from_str(&body).unwrap() else {
+            panic!("expected a replacement routing claim")
+        };
+        assert_eq!(spaces, ["media"]);
+        assert_eq!(advertised, ["media"]);
+
+        // A new daemon rolling out before its control plane cannot send the
+        // v4 frame. It ends this session so its next v2/v3 hello still carries
+        // the current replacement claim.
+        node.add_replica(
+            "docs",
+            synch_store::ReplicaPolicy::Current,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let error = refresh_space_claim(
+            &writes,
+            &mut advertised,
+            SPACE_UPDATES_VERSION - 1,
+            held_spaces(&node).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reconnecting"), "{error}");
+        assert_eq!(advertised, ["media"]);
         node.shutdown().await.unwrap();
     }
 
