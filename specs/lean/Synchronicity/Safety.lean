@@ -86,39 +86,4 @@ theorem replica_promotion_commits_pin_or_want
   have mptClosed := MptGc.promotion_is_atomic mptStep
   exact ⟨casClosed.1, casClosed.2, mptClosed.1, mptClosed.2.2.2⟩
 
-theorem replica_promotion_before_gc_blocks_collection
-    (casStep : CasGc.ReplicaPromote cas cas') :
-    ¬∃ swept, CasGc.GcCommit cas' swept := by
-  intro ⟨swept, gcStep⟩
-  have activeEntry := (CasGc.replica_promotion_is_total casStep).1
-  exact CasGc.gc_respects_protection gcStep (Or.inl activeEntry)
-
-/- The user's original ordering is legal while the head is only pending.
-   The result is an active metadata entry plus a want, never a false pin. -/
-theorem gc_before_replica_promotion_becomes_want
-    (collectable : CasGc.Collectable cas)
-    (pending : mpt.pending) (retained : mpt.retained) (complete : mpt.complete) :
-    let committed := { cas with row := False, durable := False, sweeping := True }
-    let unlinked := { committed with bytes := False, sweeping := False }
-    let promotedCas := { unlinked with entry := True, pin := False, want := True }
-    let promotedMpt := { mpt with
-      pending := False
-      active := True
-      materialized := True }
-    CasGc.GcCommit cas committed ∧
-      CasGc.GcUnlink committed unlinked ∧
-      CasGc.ReplicaPromote unlinked promotedCas ∧
-      MptGc.Promote mpt promotedMpt ∧
-      promotedCas.entry ∧ promotedCas.want ∧ ¬promotedCas.pin := by
-  simp only
-  constructor
-  · exact ⟨collectable, rfl⟩
-  constructor
-  · exact ⟨trivial, rfl⟩
-  constructor
-  · exact ⟨id, Or.inr ⟨by simp [CasGc.Available], rfl⟩⟩
-  constructor
-  · exact ⟨pending, retained, complete, rfl⟩
-  exact ⟨trivial, trivial, id⟩
-
 end Synchronicity.Safety

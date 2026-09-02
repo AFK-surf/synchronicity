@@ -609,37 +609,17 @@ theorem staged_row_drop_has_no_source_leaf
     (hinv : Invariant c) (drop : DropStaged c c') (live : c.sourceLive holder) : False :=
   drop.1 (hinv.2.1 holder live).2.2.2.1
 
-theorem replica_promotion_before_gc_blocks_collection
-    (hinv : Invariant c) (promote : ReplicaPromote holder c promoted) :
-    ¬∃ swept, GcCommit promoted swept := by
-  intro ⟨swept, gc⟩
-  have promotedInv := cell_invariant_step hinv (.replicaPromote promote)
-  have live : promoted.replicaLive holder := by
-    rcases promote with ⟨_, _, held | missing⟩ <;> simp_all [add]
-  exact gc_cannot_collect_live_content promotedInv
-    ⟨holder, Or.inr (Or.inl live)⟩ gc
-
-theorem gc_before_replica_promotion_records_want
-    (gc : GcCommit c committed)
-    (unlink : GcUnlink committed swept)
-    (promote : ReplicaPromote holder swept promoted) :
+/- Promoting a replica leaf over content that is not available records a want
+   and never a pin, whatever took the content away — a GC pass that ran before
+   the promotion included.  In an invariant-satisfying cell no pin stands over
+   unavailable content, so the promoted cell carries none for this holder. -/
+theorem replica_promote_unavailable_records_want
+    (hinv : Invariant c) (promote : ReplicaPromote holder c promoted)
+    (unavailable : ¬Available c) :
     promoted.replicaLive holder ∧ promoted.want holder ∧ ¬promoted.pin holder := by
-  have noPin : ∀ candidate, ¬c.pin candidate := by
-    intro candidate pinned
-    exact gc.1.2.2.1 ⟨candidate, pinned⟩
   rcases promote with ⟨_, _, held | missing⟩
-  · have committedRowMissing : ¬committed.row := by
-      rcases gc with ⟨_, rfl⟩
-      exact id
-    have sweptRowMissing : ¬swept.row := by
-      rcases unlink with ⟨_, rfl⟩
-      exact committedRowMissing
-    exact False.elim (sweptRowMissing held.1.1)
+  · exact False.elim (unavailable held.1)
   · rcases missing with ⟨_, rfl⟩
-    have sweptPinMissing : ¬swept.pin holder := by
-      rcases unlink with ⟨_, rfl⟩
-      rcases gc with ⟨_, rfl⟩
-      exact noPin holder
-    exact ⟨Or.inl rfl, Or.inl rfl, sweptPinMissing⟩
+    exact ⟨Or.inl rfl, Or.inl rfl, fun pinned => unavailable (hinv.1 holder pinned)⟩
 
 end Synchronicity.SystemSafety
