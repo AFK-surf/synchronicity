@@ -117,11 +117,9 @@ leaves it), and `admitsPath_of_admitsKey`.
   never a `Boundary` (`held_not_boundary`): a refusal is remembered by hash
   and position (`redacted_nodes`), a node refused at one position may be held
   from another it shares by structure, and `next_batch` consults the memo only
-  on a failed load. An earlier version consulted it before loading, and the
-  model then needed an assumption Rust did not enforce; `trie.rs`'s
-  `a_held_node_is_never_a_boundary` is the regression. `diff_never_misses` is
-  the same fact for the promotion diff, whose `cursor_at` reads an absent hash
-  refused at any position as empty and loads a held one.
+  on a failed load. `diff_never_misses` is the same fact for the promotion
+  diff, whose `cursor_at` reads an absent hash refused at any position as empty
+  and loads a held one.
 - `Admit`, `ServeNode`, `ServeValue`, and `Redacts` are the responder. For a
   scoped peer the claimed hash is not consulted (`admit_ignores_claim`), the
   root must be a head root (`admit_requires_head`), what is served is what sits
@@ -145,10 +143,7 @@ would not be sound. `MissingWalk::seen` deduplicates expansions by hash inside
 the grant — `children_inside_grant_admitted` is why expansion there does not
 depend on position — and by hash *and position* above it, where a branch shared
 between a spine position and an in-grant position leads into the grant along
-one slot at the first and along all of them at the second
-(`a_node_at_two_spine_positions_is_visited_at_both` is the regression; an
-earlier version keyed by hash alone and could leave an in-grant child
-unfetched while reporting nothing missing). Not modelled: batches, `resume`,
+one slot at the first and along all of them at the second. Not modelled: batches, `resume`,
 the unproductive-round abandonment, the depth ceiling, and the promotion
 refusal memo — none of them bears on what the theorems say.
 
@@ -188,25 +183,16 @@ a node legitimately that origin's.
   its; `integrity` — a member that finds a confined origin's root complete
   through `view`, which is the premise on which it promotes, materializes and
   advertises the head, has found only nodes legitimately that origin's.
-- The negative forms make the theorem checkable against an attack. `Withheld`
-  is content no rooted trie exposes to a scope and no origin of that scope
-  authored; `withheld_not_legit` shows a `Legit` derivation can never reach it
-  for a confined scope, so `privacy_withheld` (it never reaches a confined
+- The negative form is what #115 violated. `Withheld` is content no rooted
+  trie exposes to a scope and no origin of that scope authored;
+  `withheld_not_legit` shows a `Legit` derivation can never reach it for a
+  confined scope, so `privacy_withheld` (it never reaches a confined
   participant), `withheld_not_served` (nobody serves it under a confined
   origin's root), and `withheld_root_incomplete` (a confined root that reaches
-  it never completes) follow for any world, whatever trie it is grafted into.
-- `Graft` instantiates them on issue #115 in four nodes: an issuer root over a
-  photos leaf and a finance leaf, and a grafter root that is an extension
-  placing the finance leaf under the photos slot. `finance_withheld` is the
-  only concrete work — the leaf sits under the one rooted head at the finance
-  slot alone, and only the issuer authored it — and `finance_not_legit`,
-  `new_rule_refuses` and `grafted_root_incomplete` are the general theorems
-  applied. Rust's fetch asks the grafter for it, is told `missing`, and
-  abandons the head;
-  `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie` runs the
-  whole shape over real endpoints. The rule before vouching — serve any held
-  node at an admitted position — is one step from `Graft.before` to a state
-  `Sound` rejects; it is gone from Rust and not modelled.
+  it never completes) hold for any world, wherever a confined origin places its
+  hash. The concrete instance — a delegate grafting a withheld subtree into its
+  own trie — lives where instances belong, in the Rust test
+  `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie`.
 
 This is the bug class the earlier model could not see: a property that holds
 at every single store while content crosses a boundary between stores. What it
@@ -226,10 +212,9 @@ the same view from it" decomposes into, and names what it assumes.
   heads a node has heard. `select_max` says the result is a maximum,
   `select_eq_of_max` that a maximum is the result, and `select_eq_of_mem_iff`
   — the convergence theorem — that two nodes that have heard the same heads, in
-  any order and any multiplicity, hold the same head (`select_perm` is the
-  permutation special case; `select_mono` that the floor never moves down).
-  `seq_only_diverges` is §5.2's note made concrete: the same fold on `seq`
-  alone gives different answers for `[(1,0),(1,1)]` and `[(1,1),(1,0)]`.
+  any order and any multiplicity, hold the same head; `select_mono` that the
+  floor never moves down. The proof rests on `(seq, root)` being a total
+  order, which is §5.2's note: ties in `seq` need `root` to break them.
 - **The view is a function of root and scope.** `HasValue` is `Trie::get`;
   `view_deterministic` says a key has one value under a root, which needs
   `At.split` and the non-empty extension prefix `check_invariants` enforces.

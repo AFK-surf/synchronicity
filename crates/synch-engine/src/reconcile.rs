@@ -510,7 +510,7 @@ impl Syncer {
             // LEAN-MODEL: mpt-head-adopt
             // `Convergence.adopt`; `select_eq_of_mem_iff` is why the head a
             // node ends up with depends on which heads it heard, not their
-            // order, and `seq_only_diverges` is the NB above made concrete.
+            // order — it needs the total order the NB above insists on.
             let outcome = if head.supersedes(floor.as_ref()) {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending

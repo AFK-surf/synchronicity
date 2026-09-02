@@ -9,8 +9,8 @@ Convergence of mptsync, in the three pieces it decomposes into (§5.2, §5.3).
    lexicographic `(seq, root)` order.  `select_eq_of_mem_iff` says the head a
    node ends up with depends only on *which* heads it has heard, not on their
    order or multiplicity: two nodes that have heard the same heads hold the
-   same one.  `seq_only_diverges` is the design's own warning made concrete —
-   the same rule on `seq` alone is order-dependent.
+   same one.  The proof rests on the order being total, which is what §5.2's
+   note about `seq` alone is about: ties in `seq` need `root` to break them.
 
 2. **The derived view is a function of root and scope.**  `HasValue` is
    `Trie::get`; `view_deterministic` says a key has one value under a root, and
@@ -207,25 +207,10 @@ theorem select_eq_of_mem_iff (h : ∀ x, x ∈ l ↔ x ∈ l') : select l = sele
     obtain ⟨hmem, hmax⟩ := select_max hsel
     exact (select_eq_of_max ((h m).mp hmem) fun h' hh' => hmax h' ((h h').mpr hh')).symm
 
-theorem select_perm (h : l.Perm l') : select l = select l' :=
-  select_eq_of_mem_iff fun _ => h.mem_iff
-
 /-- The floor never moves down: hearing more heads never selects a lesser one. -/
 theorem select_mono (h : select l = some m) (h' : select (l ++ l₂) = some m') : ¬ Head.Lt m' m := by
   obtain ⟨hmem, _⟩ := select_max h
   exact (select_max h').2 m (List.mem_append_left l₂ hmem)
-
-/-- The design's warning (§5.2): the same fold on `seq` alone is
-order-dependent, so two peers hearing equal-`seq` heads in different orders
-would diverge permanently. -/
-def adoptSeq (floor : Option Head) (h : Head) : Option Head :=
-  match floor with
-  | none => some h
-  | some f => if f.seq < h.seq then some h else some f
-
-theorem seq_only_diverges :
-    [Head.mk 1 0, Head.mk 1 1].foldl adoptSeq none ≠ [Head.mk 1 1, Head.mk 1 0].foldl adoptSeq none := by
-  decide
 
 /-! ## The derived view is a function of root and scope -/
 

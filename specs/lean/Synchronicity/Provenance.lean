@@ -32,17 +32,15 @@ legitimate for the origin it names.
 - `confined_head_vouched`: a member that finds a confined origin's root
   complete through `view` has found only nodes that origin legitimately held.
 - `Withheld` is content no rooted trie exposes to a scope and no origin of
-  that scope authored.  `withheld_not_legit`, `withheld_not_served`, and
-  `withheld_root_incomplete` say that, in any sound system, such content is
-  never legitimately a confined reader's, is never served under a confined
-  origin's root, and keeps every confined root that reaches it from
-  completing — whatever trie it is grafted into.
-- `Graft` is the graft of #115 in four nodes, instantiating those theorems so
-  the invariant is seen to be strong enough: the finance leaf is `Withheld`
-  from every confined scope, so the reader cannot be served it and the grafted
-  root never completes.  Before vouching, the responder served any held node
-  at an admitted position, one step from `Graft.before` to a state `Sound`
-  rejects; that rule is gone and is not modelled.
+  that scope authored.  `privacy_withheld`, `withheld_not_served`, and
+  `withheld_root_incomplete` say that such content never reaches a confined
+  participant, is never served under a confined origin's root, and keeps every
+  confined root that reaches it from completing — whatever trie its hash is
+  placed in.  This is the negative form of the theorem, and the one #115
+  violated: a subtree withheld from a delegate was reachable through the
+  delegate's own trie.  The Rust test
+  `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie` is that
+  instance over real endpoints; here it is a corollary.
 
 Like `ScopedSync`, this is about nodes.  Values follow the node that carries
 them (`GetValues` serves a value only with a vouched holder), and heads are
@@ -274,9 +272,7 @@ def Withheld (w : World) (s : Scope) (x : Hash) : Prop :=
 
 /-- Content withheld from every confined scope is legitimately no confined
 reader's: every `Legit` derivation bottoms out in a rooted exposure or an
-authoring, and passes only through confined scopes on the way.  With
-`privacy`, this is the negative form of the theorem: such content never
-reaches a confined participant (`privacy_withheld`). -/
+authoring, and passes only through confined scopes on the way. -/
 theorem withheld_not_legit (hw : ∀ o, w.Confined o → Withheld w (w.scopeOf o) x) :
     ∀ s, Legit w s x → (∃ o, w.Confined o ∧ s = w.scopeOf o) → False := by
   intro s h
@@ -310,8 +306,9 @@ theorem withheld_not_served {sys : Sys} {r : Hash} {path : Path} {n : Node}
   fun h => withheld_not_legit hw _ (vouched_legit hsound hc h.2.2) ⟨o, hc, rfl⟩
 
 /-- A confined origin's root that reaches withheld content never completes
-through `view` on any sound member: the member never comes to own the node as
-that origin's, and Rust's fetch abandons the head. -/
+through `view` on any sound member — wherever the origin placed the hash: the
+member never comes to own the node as that origin's, and Rust's fetch abandons
+the head. -/
 theorem withheld_root_incomplete {sys : Sys} {r : Hash} {path : Path}
     (hsound : Sound w sys) (hc : w.Confined o)
     (hw : ∀ o', w.Confined o' → Withheld w (w.scopeOf o') x)
@@ -319,179 +316,5 @@ theorem withheld_root_incomplete {sys : Sys} {r : Hash} {path : Path}
     ¬ CompleteWithin w.c (view w (sys q) o) s r :=
   fun hcomplete =>
     withheld_not_legit hw _ (confined_head_vouched hsound hc hcomplete hr hnb) ⟨o, hc, rfl⟩
-
-/-! ## The witness: the graft of #115 -/
-
-namespace Graft
-
-/-- Nodes: the issuer's root, its photos leaf, its finance leaf, and the
-grafter's root — an extension placing the finance leaf at an in-scope
-position. -/
-@[simp] def R : Hash := 1
-@[simp] def P : Hash := 2
-@[simp] def F : Hash := 3
-@[simp] def G : Hash := 4
-
-@[simp] def photosSlot : Nat := 6
-@[simp] def financeSlot : Nat := 7
-
-def content : Content := fun x =>
-  if x = R then some (.branch (fun i => if i = photosSlot then some P
-                                         else if i = financeSlot then some F else none) none)
-  else if x = P then some (.leaf [] (.inline 1))
-  else if x = F then some (.leaf [] (.inline 2))
-  else if x = G then some (.ext [photosSlot] F)
-  else none
-
-/-- The delegates' grant: everything under the photos slot. -/
-def photos : Scope := ⟨some [[photosSlot]], []⟩
-
-/-- Origins: the issuer (rooted), the grafter and the reader (both confined to
-photos). -/
-@[simp] def issuer : Origin := 0
-@[simp] def grafter : Origin := 1
-@[simp] def reader : Origin := 2
-
-def world : World :=
-  { c := content
-    scopeOf := fun o => if o = issuer then Scope.full else photos
-    headOf := fun o r => (o = issuer ∧ r = R) ∨ (o = grafter ∧ r = G)
-    authored := fun o x => (o = issuer ∧ (x = R ∨ x = P ∨ x = F)) ∨ (o = grafter ∧ x = G) }
-
-def emptyBase : ScopedSync.Store := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩
-
-/-- Before the step: the issuer holds its own trie and the grafter's root,
-served by the grafter and owned as the grafter's; the grafter holds its root;
-the reader holds nothing. -/
-def before : Sys := fun q =>
-  if q = issuer then
-    { base := { emptyBase with held := fun x => x = R ∨ x = P ∨ x = F ∨ x = G }
-      owned := fun o x => o = grafter ∧ x = G }
-  else if q = grafter then
-    { base := { emptyBase with held := fun x => x = G }, owned := fun _ _ => False }
-  else { base := emptyBase, owned := fun _ _ => False }
-
-theorem photos_not_full : ¬ photos.IsFull := by
-  intro h
-  simp [photos, Scope.IsFull] at h
-
-theorem full_ne_photos : Scope.full ≠ photos := by
-  intro h
-  simp [Scope.full, photos] at h
-
-theorem confined_grafter : world.Confined grafter := by
-  show ¬ (if grafter = issuer then Scope.full else photos).IsFull
-  simp
-  exact photos_not_full
-
-theorem not_confined_issuer : ¬ world.Confined issuer := by
-  show ¬ ¬ (if issuer = issuer then Scope.full else photos).IsFull
-  simp [Scope.IsFull, Scope.full]
-
-/-- Where the finance leaf sits under the issuer's root: the finance slot. -/
-theorem finance_position {path : Path} (h : At content R path F) : path = [financeSlot] := by
-  rcases h.inv with ⟨_, hF⟩ | ⟨n, stp, k, rest, hc, hchild, rfl, hrest⟩
-  · exact absurd hF (by decide)
-  · have hn : n = .branch (fun i => if i = photosSlot then some P
-        else if i = financeSlot then some F else none) none := by
-      simp [content] at hc
-      exact hc.symm
-    subst hn
-    cases hchild with
-    | branch hi =>
-      rename_i i
-      by_cases h6 : i = photosSlot
-      · subst h6
-        have hk : k = P := by simpa using hi.symm
-        subst hk
-        obtain ⟨_, hPF⟩ :=
-          At.leaf_nil (rest := []) (value := .inline 1) hrest (by simp [content])
-        exact absurd hPF (by decide)
-      · by_cases h7 : i = financeSlot
-        · subst h7
-          have hk : k = F := by simpa [h6] using hi.symm
-          subst hk
-          obtain ⟨rfl, _⟩ :=
-            At.leaf_nil (rest := []) (value := .inline 2) hrest (by simp [content])
-          rfl
-        · simp at h6 h7
-          simp [h6, h7] at hi
-
-theorem photos_rejects_finance : ¬ photos.AdmitsPath [financeSlot] := by
-  intro h
-  unfold Scope.AdmitsPath at h
-  simp [photos, List.cons_prefix_cons] at h
-
-/-- Every confined origin here reads under `photos`. -/
-theorem confined_scope (hc : world.Confined o) : world.scopeOf o = photos := by
-  by_cases ho : o = issuer
-  · subst ho
-    exact absurd hc not_confined_issuer
-  · simp [world, show o ≠ 0 from ho]
-
-/-- The finance leaf is withheld from every confined scope: under the one
-rooted head it sits only at the finance slot, and only the issuer authored it. -/
-theorem finance_withheld : ∀ o, world.Confined o → Withheld world (world.scopeOf o) F := by
-  intro o hc
-  rw [confined_scope hc]
-  refine ⟨fun o' r path n hhead hnc hat _ hadm => ?_, fun o' hauth heq => ?_⟩
-  · rcases hhead with ⟨_, rfl⟩ | ⟨rfl, _⟩
-    · rw [finance_position hat] at hadm
-      exact absurd hadm photos_rejects_finance
-    · exact absurd confined_grafter hnc
-  · rcases hauth with ⟨rfl, _⟩ | ⟨_, hG⟩
-    · exact full_ne_photos (by simpa [world] using heq)
-    · exact absurd hG (by decide)
-
-/-- The finance leaf is nobody's to hold under the photos grant. -/
-theorem finance_not_legit : ¬ Legit world photos F :=
-  fun h => withheld_not_legit finance_withheld _ h ⟨grafter, confined_grafter, by simp [world]⟩
-
-theorem before_sound : Sound world before := by
-  refine ⟨fun q x hx => ?_, fun q o x hc hx => ?_⟩
-  · unfold before at hx
-    split at hx
-    · rename_i hq
-      subst hq
-      exact Legit.full (by simp [world, Scope.IsFull, Scope.full])
-    · split at hx
-      · rename_i _ hq
-        subst hq
-        have hxG : x = G := hx
-        subst hxG
-        exact Legit.authored (o := grafter) (Or.inr ⟨rfl, rfl⟩)
-      · exact hx.elim
-  · unfold before at hx
-    split at hx
-    · obtain ⟨rfl, rfl⟩ := hx
-      exact Legit.authored (o := grafter) (Or.inr ⟨rfl, rfl⟩)
-    · split at hx
-      · exact hx.elim
-      · exact hx.elim
-
-/-- **Nobody vouches for the graft.**  The issuer holds the finance leaf and
-the grafter's root, and no participant serves the leaf to any reader under
-that root. -/
-theorem new_rule_refuses {r : Hash} {path : Path} {n : Node} :
-    ¬ ServeNode world p (before p) s grafter r path F n :=
-  withheld_not_served before_sound confined_grafter finance_withheld
-
-/-- **The grafted root never completes.**  Judged through `view`, the issuer's
-copy of the grafter's trie is missing the finance leaf, under any scope that
-admits the photos slot. -/
-theorem grafted_root_incomplete (s : Scope) (hs : s.AdmitsPath [photosSlot]) :
-    ¬ CompleteWithin content (view world (before issuer) grafter) s G := by
-  have hroot : Reach content (view world (before issuer) grafter) s G [] G :=
-    Reach.root (Scope.admitsPath_of_prefix hs List.nil_prefix)
-  have hheldG : (view world (before issuer) grafter).held G := by
-    refine ⟨by simp [before], Or.inr ?_⟩
-    simp [before]
-  have hF : Reach content (view world (before issuer) grafter) s G [photosSlot] F :=
-    Reach.child hroot hheldG (held_not_boundary hheldG) (by simp [content]) ChildOf.ext
-      (by simpa using hs)
-  exact withheld_root_incomplete before_sound confined_grafter finance_withheld hF
-    (fun hb => hb.2.2)
-
-end Graft
 
 end Synchronicity.Provenance

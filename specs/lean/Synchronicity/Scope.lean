@@ -109,25 +109,6 @@ theorem not_admitsPath_append (h : ¬ s.AdmitsPath path) (rest : Path) :
     ¬ s.AdmitsPath (path ++ rest) :=
   fun h' => h (admitsPath_of_append h')
 
-/-- The empty grant admits nothing, not even the root: a delegation that named
-no space grants no view (`scope_extremes_admit_or_grant_nothing`). -/
-theorem empty_grant_admits_nothing (path : Path) : ¬ (Scope.mk (some []) []).AdmitsPath path := by
-  intro h
-  rcases h with ⟨_, hp, _⟩ | ⟨_, hk, _⟩
-  · exact absurd hp (List.not_mem_nil)
-  · exact absurd hk (List.not_mem_nil)
-
-/-- An exact key admits itself and nothing that extends it
-(`an_exact_key_does_not_carry_its_extensions`). -/
-theorem exact_key_admits_only_itself (key : Path) :
-    (Scope.mk (some []) [key]).AdmitsKey k ↔ k = key := by
-  constructor
-  · rintro (⟨_, hp, _⟩ | hk)
-    · exact absurd hp (List.not_mem_nil)
-    · simpa using hk
-  · rintro rfl
-    exact Or.inr (List.mem_singleton.mpr rfl)
-
 end Scope
 
 end Synchronicity

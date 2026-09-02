@@ -1157,10 +1157,10 @@ judged by presence alone, as before, and a node's own trie by construction. The
 cost is one row per node per confined origin, and one re-fetch of the nodes a
 confined origin's trie shares with another's. `specs/lean/Synchronicity/Provenance.lean`
 is the model: `Legit` is what "legitimately a reader's" means across every trie a
-node may be read through, `privacy` and `integrity` are the theorem — a confined
-participant holds only what is legitimately its, and a member vouches for a
-confined origin's head only if every node under it is legitimately that origin's
-— and `Graft` is this graft, shown to be excluded.
+node may be read through, and `privacy` and `integrity` are the theorem — a
+confined participant holds only what is legitimately its, and a member vouches
+for a confined origin's head only if every node under it is legitimately that
+origin's; `withheld_root_incomplete` is this graft excluded, for any trie.
 
 ## 6. Content storage and transfer
 

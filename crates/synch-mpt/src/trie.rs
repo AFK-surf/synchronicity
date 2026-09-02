@@ -1346,7 +1346,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Memoized under a key of its own, since it is a stricter question than
     /// either of the other two.
     // LEAN-MODEL: mpt-complete-owned
-    // `Provenance.grafted_root_incomplete`: a confined origin's root that
+    // `Provenance.withheld_root_incomplete`: a confined origin's root that
     // reaches a node the origin could not legitimately hold never completes.
     pub fn is_complete_scoped_for(
         &self,

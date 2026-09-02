@@ -104,7 +104,7 @@ pub trait NodeStore {
     /// store that never records provenance.
     // LEAN-MODEL: mpt-owned-node
     // `Provenance.Store.owned`; `Provenance.view` is the presence a walk with
-    // an owner reads, and `owned_is_legit` is what provenance buys.
+    // an owner reads, and `privacy`/`integrity` are what provenance buys.
     fn owns_node(&self, _origin: &OriginId, _hash: &Hash) -> Result<bool, Self::Error> {
         Ok(false)
     }
