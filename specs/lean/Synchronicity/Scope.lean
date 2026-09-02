@@ -18,19 +18,24 @@ so with `¬ s.IsFull`.
 
 namespace Synchronicity
 
+/-- A position in the trie: a list of nibbles. -/
 abbrev Path := List Nat
 
 /-- `Scope::prefixes` and `Scope::exact`: `none` is the whole keyspace. -/
 structure Scope where
+  /-- The granted prefixes, or `none` for the whole keyspace. -/
   prefixes : Option (List Path)
+  /-- The exact keys granted on their own. -/
   exact : List Path
 
 namespace Scope
 
 variable {s : Scope} {path rest p q key k : Path}
 
+/-- The whole keyspace. -/
 def full : Scope := ⟨none, []⟩
 
+/-- A scope that grants the whole keyspace. -/
 def IsFull (s : Scope) : Prop := s.prefixes = none
 
 theorem full_isFull : full.IsFull := rfl
@@ -129,3 +134,5 @@ theorem not_admitsPath_append (h : ¬ s.AdmitsPath path) (rest : Path) :
 end Scope
 
 end Synchronicity
+
+#lint

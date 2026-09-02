@@ -22,6 +22,7 @@ open Cas
 other holder is a role a space configures, a source or a replica. -/
 abbrev Holder := Nat
 
+/-- The operator's holder, `synch pin add`. -/
 def operator : Holder := 0
 
 instance : Roles Holder := ⟨fun holder => holder ≠ operator⟩
@@ -57,6 +58,7 @@ def Safe (c : Cell H) : Prop := Cas.Invariant c ∧ NoLoss c
 theorem safe_step (h : Safe c) (step : CellStep c c') : Safe c' :=
   ⟨invariant_step h.1 step, noLoss_step h.1 h.2 step⟩
 
+/-- Every cell is `Safe`. -/
 def SystemInvariant (s : State H) : Prop := ∀ root, Safe (s root)
 
 /-- One cell takes a `CellStep`; every other root is left as it was. -/
@@ -65,6 +67,7 @@ abbrev Step : State H → State H → Prop := Lift CellStep
 /-- The fault-free system. -/
 def system (H : Type) [Roles H] : System (State H) := ⟨Initial, Step⟩
 
+/-- The states the fault-free system reaches. -/
 abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
 theorem initial_invariant : SystemInvariant (Initial : State H) :=
@@ -155,3 +158,5 @@ theorem staged_row_is_reachable (root : Root) :
   · simp
 
 end Synchronicity.SystemSafety
+
+#lint

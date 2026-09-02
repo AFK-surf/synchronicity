@@ -21,8 +21,11 @@ open Cas
 
 variable {H : Type}
 
+/-- The CAS store and one trie root's head slots, together. -/
 structure State (H : Type) where
+  /-- The content cells. -/
   cas : Cas.State H := Initial
+  /-- The trie root's five bits. -/
   mpt : MptGc.State := {}
 
 /-- One transaction over several content roots: every root either takes the
@@ -37,9 +40,11 @@ theorem across_changed {P : Cell H → Cell H → Prop} {s s' : Cas.State H} {ro
 
 variable [Roles H]
 
+/-- Both halves keep their own invariant. -/
 def Invariant (s : State H) : Prop :=
   SystemSafety.SystemInvariant s.cas ∧ MptGc.Invariant s.mpt
 
+/-- A free CAS step, a free trie step, or a paired publication or promotion. -/
 inductive Step : State H → State H → Prop where
   | cas {s : State H} {root : Root} {cell' : Cell H} :
       CellStep (s.cas root) cell' → Local (s.cas root) cell' →
@@ -59,10 +64,13 @@ inductive Step : State H → State H → Prop where
       MptGc.Promote s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
 
+/-- The empty store and an unheard-of root. -/
 def Initial : State H := {}
 
+/-- The bridge system. -/
 def system (H : Type) [Roles H] : System (State H) := ⟨Initial, Step⟩
 
+/-- The states the bridge reaches. -/
 abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
 theorem across_safe {P : Cell H → Cell H → Prop} {s s' : Cas.State H}
@@ -145,11 +153,11 @@ theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
     exfalso
     by_cases hr : root = r
     · subst hr
-      simp only [update_self] at new
+      simp only [Function.update_self] at new
       rcases new with source | replica
       · exact hlocal ⟨holder, Or.inl (sourcePublish_of_new_leaf step source old.1)⟩
       · exact hlocal ⟨holder, Or.inr (Or.inl (replicaPromote_of_new_leaf step replica old.2))⟩
-    · simp only [update_of_ne _ _ hr] at new
+    · simp only [Function.update_of_ne hr] at new
       exact new.elim old.1 old.2
   | mpt _ => exact absurd new (fun h => h.elim old.1 old.2)
   | sourcePublish _ mptStep =>
@@ -160,3 +168,5 @@ theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
     exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
 
 end Synchronicity.Safety
+
+#lint

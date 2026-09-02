@@ -61,14 +61,19 @@ namespace Synchronicity.Provenance
 open Synchronicity (Path Scope)
 open Synchronicity.ScopedSync
 
+/-- A participant, named by its origin. -/
 abbrev Origin := Nat
 
 /-- The cluster as this model sees it: one content addressing, each origin's
 read scope, each origin's verified heads, and what each origin built itself. -/
 structure World where
+  /-- Content addressing. -/
   c : Content
+  /-- Each origin's read scope. -/
   scopeOf : Origin → Scope
+  /-- Each origin's verified head roots. -/
   headOf : Origin → Hash → Prop
+  /-- The nodes each origin built itself. -/
   authored : Origin → Hash → Prop
 
 /-- `bindings.rs::Store::provenance_owner`: an origin whose tries are judged
@@ -80,7 +85,9 @@ def World.Confined (w : World) (o : Origin) : Prop := ¬ (w.scopeOf o).IsFull
 
 /-- A participant's store: the shared node store, and the provenance rows. -/
 structure Store where
+  /-- The shared node store. -/
   base : ScopedSync.Store
+  /-- The provenance rows: which nodes were served as which origin's. -/
   owned : Origin → Hash → Prop
 
 /-- `trie.rs::MissingWalk::for_origin` and `Trie::load_owned_raw`: the store a
@@ -187,35 +194,35 @@ theorem step_sound {sys sys' : Sys} (hsound : Sound w sys) (hstep : Step w sys s
     refine ⟨fun q' y hy => ?_, fun q' o' y hc' hy => ?_⟩
     · by_cases hq : q' = q
       · subst hq
-        simp only [update_self] at hy
+        simp only [Function.update_self] at hy
         rcases hy with rfl | old
         · exact serve_legit hsound served
         · exact hsound.1 q' y old
-      · simp only [update_of_ne _ _ hq] at hy
+      · simp only [Function.update_of_ne hq] at hy
         exact hsound.1 q' y hy
     · by_cases hq : q' = q
       · subst hq
-        simp only [update_self] at hy
+        simp only [Function.update_self] at hy
         rcases hy with ⟨rfl, rfl, hc⟩ | old
         · exact vouched_legit hsound hc served.2.2
         · exact hsound.2 q' o' y hc' old
-      · simp only [update_of_ne _ _ hq] at hy
+      · simp only [Function.update_of_ne hq] at hy
         exact hsound.2 q' o' y hc' hy
   | @author o x hauth =>
     refine ⟨fun q' y hy => ?_, fun q' o' y hc' hy => ?_⟩
     · by_cases hq : q' = o
       · subst hq
-        simp only [update_self] at hy
+        simp only [Function.update_self] at hy
         rcases hy with rfl | old
         · exact Legit.authored hauth
         · exact hsound.1 q' y old
-      · simp only [update_of_ne _ _ hq] at hy
+      · simp only [Function.update_of_ne hq] at hy
         exact hsound.1 q' y hy
     · by_cases hq : q' = o
       · subst hq
-        simp only [update_self] at hy
+        simp only [Function.update_self] at hy
         exact hsound.2 q' o' y hc' hy
-      · simp only [update_of_ne _ _ hq] at hy
+      · simp only [Function.update_of_ne hq] at hy
         exact hsound.2 q' o' y hc' hy
 
 /-- `reconcile.rs::try_promote`: the completeness a member requires of a
@@ -236,8 +243,10 @@ theorem confined_head_vouched {sys : Sys} (hsound : Sound w sys) (hc : w.Confine
 def Initial : Sys := fun _ =>
   { base := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩, owned := fun _ _ => False }
 
+/-- The multi-party system. -/
 def system (w : World) : System Sys := ⟨Initial, Step w⟩
 
+/-- The states the cluster reaches. -/
 abbrev Reachable (w : World) (sys : Sys) : Prop := (system w).Reachable sys
 
 theorem initial_sound : Sound w Initial :=
@@ -374,3 +383,5 @@ theorem withheld_root_incomplete {sys : Sys} {r : Hash} {path : Path}
     withheld_not_legit hw _ (confined_head_vouched hsound hc hcomplete hr hnb) ⟨o, hc, rfl⟩
 
 end Synchronicity.Provenance
+
+#lint

@@ -12,9 +12,12 @@ lake build --wfail
 ./check-anchors.sh
 ```
 
-No dependencies beyond the Lean core library: the proofs use `grind`, `omega`
-and `simp`, and the few list and well-foundedness lemmas they need are in
-`Init`.
+The package depends on Mathlib (pinned to the toolchain's tag; `lake exe
+cache get` fetches the compiled oleans) for `Function.update`, the
+lexicographic linear order on heads, `List.maximum`, `Set.Finite`/`Set.ncard`,
+and the well-foundedness lemmas. The proofs themselves are `grind`, `omega`
+and `simp`. Every module ends in `#lint`, so a public declaration without a
+docstring or with an unused argument fails the build.
 
 ## Module map
 
@@ -161,4 +164,10 @@ one-line theorem for one release.
 **Proofs.** State transitions as guards around successor equations, name them
 in a `Kind`, and prove preservation with `cases k <;> unfold … at h <;>
 subst_step h <;> constructor <;> grind`. If a case needs a hand-written
-argument, that is a fact the invariant should probably carry.
+argument, that is a fact the invariant should probably carry. Reach for a
+Mathlib structure before a hand-rolled one: an order is a `LinearOrder`, a
+finite set is `Set.Finite`, a measure is `Set.ncard`.
+
+**Lint.** `#lint` at the end of every module runs the Batteries linters over
+that file. Give every definition and structure a docstring; drop arguments
+the statement does not use.

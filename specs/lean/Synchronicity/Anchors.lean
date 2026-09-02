@@ -1,4 +1,5 @@
 import Lean
+import Batteries.Tactic.Lint
 
 /-!
 The Rust/Lean anchor attribute.
@@ -16,8 +17,11 @@ namespace Synchronicity.Anchors
 
 open Lean
 
+/-- `@[rust_impl "anchor" …]`: the Rust linearization points a declaration
+models. -/
 syntax (name := rust_impl) "rust_impl " str+ : attr
 
+/-- The attribute's registry: each tagged declaration with its anchors. -/
 initialize rustImplAttr : ParametricAttribute (Array String) ←
   registerParametricAttribute {
     name := `rust_impl
@@ -42,3 +46,5 @@ def anchors (env : Environment) : Array (String × Name) := Id.run do
   return out
 
 end Synchronicity.Anchors
+
+#lint

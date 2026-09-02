@@ -44,8 +44,10 @@ namespace Synchronicity.ScopedSync
 
 open Synchronicity (Path Scope)
 
+/-- A content hash. -/
 abbrev Hash := Nat
 
+/-- A trie value: inline bytes, or the hash of an out-of-line value. -/
 inductive ValueRef where
   | inline (bytes : Nat)
   | outOfLine (hash : Hash)
@@ -266,8 +268,11 @@ theorem keys_below_grant_admitted (h : s.ContainsSubtree path)
 /-- A local store: nodes, out-of-line values, and the positions peers refused
 a hash at (`redacted_nodes`, keyed by hash and path). -/
 structure Store where
+  /-- The nodes held. -/
   held : Hash → Prop
+  /-- The out-of-line values held. -/
   heldValue : Hash → Prop
+  /-- The hashes a peer refused, at the position it refused them. -/
   redacted : Path → Hash → Prop
 
 variable {st : Store}
@@ -493,8 +498,11 @@ theorem diff_never_misses (hcomplete : CompleteWithin c st s r)
 /-- One want of `GetNodes`/`GetValues`: the root, the position claimed, and the
 hash claimed to sit there. -/
 structure Want where
+  /-- The root the request is about. -/
   root : Hash
+  /-- The position claimed. -/
   path : Path
+  /-- The hash claimed to sit there. -/
   claimed : Hash
 
 variable {heads : Hash → Prop} {w : Want}
@@ -610,12 +618,14 @@ inductive Learn (c : Content) (s : Scope) (heads : Hash → Prop) : Store → St
       Learn c s heads st
         { st with redacted := fun p y => (p = w.path ∧ y = x) ∨ st.redacted p y }
 
+/-- The empty store. -/
 def Initial : Store := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩
 
 /-- A delegate under scope `s`, fetching from responders holding `heads`. -/
 def system (c : Content) (s : Scope) (heads : Hash → Prop) : System Store :=
   ⟨Initial, Learn c s heads⟩
 
+/-- The stores a delegate can end up with. -/
 abbrev Reachable (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop :=
   (system c s heads).Reachable st
 
@@ -686,3 +696,5 @@ theorem redacted_is_refusal (h : Reachable c s heads st) (hred : st.redacted pat
   exact ⟨w, rfl, refused, redacts_only_above_grant refused⟩
 
 end Synchronicity.ScopedSync
+
+#lint

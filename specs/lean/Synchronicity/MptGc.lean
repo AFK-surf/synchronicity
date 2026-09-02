@@ -18,11 +18,17 @@ keep its nodes when another retained root shares them (`TrieGc`).
 
 namespace Synchronicity.MptGc
 
+/-- One trie root, as five bits. -/
 structure State where
+  /-- The root is a GC mark root (a slot or `head_history` names it). -/
   retained : Prop := False
+  /-- The pending slot names the root. -/
   pending : Prop := False
+  /-- The root is complete within the node's read scope. -/
   complete : Prop := False
+  /-- The complete slot names the root: it is what the node serves. -/
   active : Prop := False
+  /-- The derived views were rebuilt from the root. -/
   materialized : Prop := False
 
 /-- What promotion needs and what the slots imply: an active head is retained,
@@ -95,8 +101,9 @@ def Promote (s s' : State) : Prop :=
     active := True
     materialized := True }
 
-/-- `node.rs::Node::publish`: this node's own head, whole by construction. -/
-@[rust_impl "mpt-own-publish"]
+/-- `node.rs::Node::publish`: this node's own head, whole by construction.
+Every bit is written, so the prior state is deliberately unused. -/
+@[rust_impl "mpt-own-publish", nolint unusedArguments]
 def OwnPublish (s s' : State) : Prop :=
   s' = { s with
     retained := True
@@ -111,6 +118,7 @@ inductive Kind where
   | promote | ownPublish
   deriving DecidableEq
 
+/-- The relation each transition names. -/
 def Trans : Kind → State → State → Prop
   | .offerPending => OfferPending
   | .retain => Retain
@@ -128,6 +136,7 @@ def Kind.flipsHead : Kind → Bool
   | .promote | .ownPublish => true
   | _ => false
 
+/-- Some transition took the root from `s` to `s'`. -/
 def Step (s s' : State) : Prop := ∃ k, Trans k s s'
 
 /-- mptsync/GC work that does not flip or mint a head. -/
@@ -137,10 +146,13 @@ theorem SyncStep.step {s s' : State} (h : SyncStep s s') : Step s s' :=
   let ⟨k, _, t⟩ := h
   ⟨k, t⟩
 
+/-- A root nothing has heard of. -/
 def Initial : State := {}
 
+/-- The per-root system. -/
 def system : System State := ⟨Initial, Step⟩
 
+/-- The states a root can be in. -/
 abbrev Reachable (s : State) : Prop := system.Reachable s
 
 theorem initial_invariant : Invariant Initial where
@@ -190,3 +202,5 @@ theorem prune_takes_no_live_root (h : Prune s s') : ¬s.pending ∧ ¬s.active :
   ⟨h.1, h.2.1⟩
 
 end Synchronicity.MptGc
+
+#lint

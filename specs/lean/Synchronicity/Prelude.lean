@@ -1,4 +1,6 @@
 import Lean
+import Mathlib.Logic.Function.Basic
+import Batteries.Tactic.Lint
 
 /-!
 What every model in this package shares.
@@ -18,13 +20,16 @@ namespace Synchronicity
 
 /-- A transition system. -/
 structure System (σ : Type) where
+  /-- The initial state. -/
   init : σ
+  /-- The step relation. -/
   step : σ → σ → Prop
 
 namespace System
 
 variable {σ : Type} (S : System σ)
 
+/-- The states reachable from `S.init` by `S.step`. -/
 inductive Reachable : σ → Prop where
   | initial : Reachable S.init
   | next {s s' : σ} : Reachable s → S.step s s' → Reachable s'
@@ -54,15 +59,8 @@ section Store
 
 variable {ι α : Type} [DecidableEq ι]
 
-/-- Pointwise update of a store. -/
-def update (s : ι → α) (i : ι) (a : α) : ι → α :=
-  fun j => if j = i then a else s j
-
-@[simp] theorem update_self (s : ι → α) (i : ι) (a : α) : update s i a i = a := by
-  simp [update]
-
-@[simp] theorem update_of_ne (s : ι → α) {i j : ι} (a : α) (h : j ≠ i) : update s i a j = s j := by
-  simp [update, h]
+-- Pointwise update of a store is `Function.update`.
+export Function (update)
 
 /-- One cell takes the transition `R`; every other cell stays. -/
 def Lift (R : α → α → Prop) (s s' : ι → α) : Prop :=
@@ -80,7 +78,7 @@ theorem Lift.forall {P : α → Prop} (hP : ∀ {a a'}, P a → R a a' → P a')
   intro j
   by_cases hj : j = i
   · subst hj; simpa using hP (h j) step
-  · simpa [hj] using h j
+  · simpa [Function.update_of_ne hj] using h j
 
 theorem Lift.mono (hRT : ∀ {a a'}, R a a' → T a a') (hl : Lift R s s') : Lift T s s' := by
   obtain ⟨i, a', step, rfl⟩ := hl
@@ -138,9 +136,11 @@ section Sets
 
 variable {α : Type}
 
+/-- The set `p` with `x` added. -/
 def add (p : α → Prop) (x : α) : α → Prop :=
   fun y => y = x ∨ p y
 
+/-- The set `p` with `x` removed. -/
 def drop (p : α → Prop) (x : α) : α → Prop :=
   fun y => p y ∧ y ≠ x
 
@@ -150,3 +150,5 @@ def drop (p : α → Prop) (x : α) : α → Prop :=
 end Sets
 
 end Synchronicity
+
+#lint

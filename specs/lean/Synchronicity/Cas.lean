@@ -29,27 +29,43 @@ namespace Synchronicity.Cas
 opposed to the operator's `synch pin add`.  Only roles stand behind live
 leaves, and the heal paths treat the two differently. -/
 class Roles (H : Type) where
+  /-- The holder is a source or a replica a space configures. -/
   IsRole : H → Prop
 
 export Roles (IsRole)
 
+/-- A content root. -/
 abbrev Root := Nat
 
 variable {H : Type}
 
+/-- One content root as the store sees it. -/
 structure Cell (H : Type) where
+  /-- An `entries` row names the content. -/
   entry : Prop := False
+  /-- The holders pinning the content. -/
   pin : H → Prop := fun _ => False
+  /-- The holders wanting the content. -/
   want : H → Prop := fun _ => False
+  /-- The holders whose source leaf names the content. -/
   sourceLive : H → Prop := fun _ => False
+  /-- The holders whose replica leaf names the content. -/
   replicaLive : H → Prop := fun _ => False
+  /-- The holders whose metadata-only leaf names the content. -/
   ordinaryLive : H → Prop := fun _ => False
+  /-- The `blobs` row exists. -/
   row : Prop := False
+  /-- The bytes are on local disk. -/
   bytes : Prop := False
+  /-- The remote backend holds a copy. -/
   remote : Prop := False
+  /-- The backend has acknowledged the bytes durably. -/
   durable : Prop := False
+  /-- A write lease is held. -/
   writing : Prop := False
+  /-- A GC row commit has run and its unlink has not. -/
   sweeping : Prop := False
+  /-- Inside the retention window. -/
   fresh : Prop := False
 
 /-- The row is present, the backend has acknowledged the bytes, and a copy is
@@ -63,14 +79,19 @@ def Durable (c : Cell H) : Prop := c.row ∧ c.durable
 
 theorem Available.durable {c : Cell H} (h : Available c) : Durable c := ⟨h.1, h.2.1⟩
 
+/-- Someone pins the content. -/
 def AnyPin (c : Cell H) : Prop := ∃ holder, c.pin holder
 
+/-- Some leaf names the content. -/
 def AnyLive (c : Cell H) : Prop :=
   ∃ holder, c.sourceLive holder ∨ c.replicaLive holder ∨ c.ordinaryLive holder
 
+/-- What `delete_blob_if_collectable` checks: a row nothing protects, outside
+the retention window. -/
 def Collectable (c : Cell H) : Prop :=
   c.row ∧ ¬c.entry ∧ ¬AnyPin c ∧ ¬c.writing ∧ ¬c.sweeping ∧ ¬c.fresh
 
+/-- What `delete_blob` checks: nothing protects the content. -/
 def Deletable (c : Cell H) : Prop :=
   ¬c.entry ∧ ¬AnyPin c ∧ ¬c.writing ∧ ¬c.sweeping
 
@@ -401,8 +422,12 @@ theorem replicaPromote_of_new_leaf (h : CellStep c c')
 
 /-! ## The store: one cell per content root -/
 
+/-- The store: one cell per content root. -/
 abbrev State (H : Type) := Root → Cell H
 
+/-- The empty store. -/
 def Initial : State H := fun _ => {}
 
 end Synchronicity.Cas
+
+#lint

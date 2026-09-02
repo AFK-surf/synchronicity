@@ -79,13 +79,16 @@ theorem fault_invariant_step (hinv : Cas.Invariant c) (hstep : FaultStep c c') :
     simp only [LoseRemote, LoseBytes, HealRemote, HealLocal] at h
     subst_step h <;> constructor <;> grind [LiveClaim, Durable]
 
+/-- Every cell satisfies `Cas.Invariant`. -/
 def SystemInvariant (s : State H) : Prop := ∀ root, Cas.Invariant (s root)
 
+/-- One cell takes a `FaultStep`; every other root is left as it was. -/
 abbrev Step : State H → State H → Prop := Lift FaultStep
 
 /-- The fault-tolerant system. -/
 def system (H : Type) [Roles H] : System (State H) := ⟨Initial, Step⟩
 
+/-- The states the fault-tolerant system reaches. -/
 abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
 theorem initial_invariant : SystemInvariant (Initial : State H) :=
@@ -195,3 +198,5 @@ theorem operator_holds_no_leaf {s : State Holder} {root : Root} (reachable : Rea
 end Holder
 
 end Synchronicity.FaultTolerant
+
+#lint

@@ -26,10 +26,15 @@ open ScopedSync
 
 /-- The trie store with its head slots, over every root at once. -/
 structure State where
+  /-- The GC mark roots. -/
   retained : Hash → Prop := fun _ => False
+  /-- The roots a pending slot names. -/
   pending : Hash → Prop := fun _ => False
+  /-- The roots a complete slot names. -/
   active : Hash → Prop := fun _ => False
+  /-- The roots the derived views were rebuilt from. -/
   materialized : Hash → Prop := fun _ => False
+  /-- The nodes held. -/
   held : Hash → Prop := fun _ => False
 
 variable {c : Content} {s s' : State} {root node : Hash}
@@ -45,9 +50,11 @@ def Marked (c : Content) (s : State) (node : Hash) : Prop :=
 def Complete (c : Content) (s : State) (root : Hash) : Prop :=
   ∀ node, Reaches c root node → s.held node
 
+/-- A node lands in the store. -/
 def LearnNode (node : Hash) (s s' : State) : Prop :=
   s' = { s with held := add s.held node }
 
+/-- A root enters retention. -/
 def RetainRoot (root : Hash) (s s' : State) : Prop :=
   s' = { s with retained := add s.retained root }
 
@@ -172,3 +179,5 @@ theorem learnNode_projects (step : LearnNode node s s') (root : Hash) :
     simp only [proj, eq_false complete, eq_false this]
 
 end Synchronicity.TrieGraph
+
+#lint
