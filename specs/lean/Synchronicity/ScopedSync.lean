@@ -1,3 +1,4 @@
+import Synchronicity.Prelude
 import Synchronicity.Scope
 
 /-!
@@ -11,16 +12,17 @@ means for a node reading under a scope, and why it may be believed:
 - `At c root path hash` is the verified trie: content addressing (`c`) gives
   every hash one meaning, and a position is a descent through branch slots and
   extension prefixes exactly as `Trie::resolve_paths` performs it.
-- `Reach` is the scoped `MissingWalk`, positionally: a child position is
-  visited when its parent was visited, held, not a redaction boundary, and the
-  child's position is admitted.  `CompleteWithin` is the walk draining with
-  nothing missing — the fact `is_complete_scoped` memoizes.
-- `ReachRef` is the same walk pruning against a reference root, and
-  `prune_sound` is the §5.5 claim that the pruned walk may still write the
+- `Walk` is the scoped `MissingWalk`, positionally, under a guard `G` on the
+  positions it may enter: a child position is visited when its parent was
+  visited and held, the child's position is admitted, and `G` allows it.
+  `Reach` is the walk with no guard; `ReachRef` the walk pruning against a
+  reference root.  `Drained` is a walk finishing with nothing missing, and
+  `CompleteWithin` is `Drained` over `Reach` — the fact `is_complete_scoped`
+  memoizes.
+- `prune_sound` is the §5.5 claim that the pruned walk may still write the
   completeness memo.  Its premise is that pruning happens only at positions
-  the reference root's own scoped walk reached; `paired_reaches` discharges it
-  for the pairing `paired_children` computes, because a held node is never a
-  boundary (`held_not_boundary`).
+  the reference root's own scoped walk reached; `paired_children` computes
+  exactly such a pairing (`Paired`).
 - `Admit`/`ServeNode`/`ServeValue`/`Redacts` are the responder.  A scoped
   peer's claimed hash is never consulted (`admit_ignores_claim`); what is served
   sits at the claimed position of a root this node holds a head for, and reveals
@@ -80,9 +82,9 @@ inductive ChildOf : Node → Path → Hash → Prop where
       children i = some child → ChildOf (.branch children value) [i] child
   | ext {pre : Path} {child : Hash} : ChildOf (.ext pre child) pre child
 
-/- RUST-IMPL: mpt-resolve-position — `trie.rs::Trie::resolve_paths`.  What
-   stands at a position under a root, by descending the store and nothing
-   else. -/
+/-- `trie.rs::Trie::resolve_paths`.  What stands at a position under a root,
+by descending the store and nothing else. -/
+@[rust_impl "mpt-resolve-position"]
 inductive At (c : Content) : Hash → Path → Hash → Prop where
   | here {root : Hash} : At c root [] root
   | step {root : Hash} {node : Node} {stp : Path} {child : Hash} {rest : Path} {hash : Hash} :
@@ -104,53 +106,26 @@ theorem At.inv (h : At c r path x) :
   | here => exact Or.inl ⟨rfl, rfl⟩
   | step hc hchild hrest => exact Or.inr ⟨_, _, _, _, hc, hchild, rfl, hrest⟩
 
-/-- A position names one hash.  This is why a responder can answer "what sits
-here" rather than "is this hash yours", and why a lie about a position resolves
-to whatever genuinely sits there. -/
-theorem At.unique (canon : Canonical c) (h₁ : At c r path a) (h₂ : At c r path b) : a = b := by
-  induction h₁ generalizing b with
-  | here =>
-    rcases h₂.inv with ⟨_, rfl⟩ | ⟨n, stp, k, rest, hc, hchild, heq, _⟩
-    · rfl
-    · obtain ⟨hstp, _⟩ := List.append_eq_nil_iff.mp heq.symm
-      subst hstp
-      cases hchild with
-      | ext => exact absurd rfl (canon _ _ _ hc)
-  | step hc hchild _ ih =>
-    rcases h₂.inv with ⟨heq, rfl⟩ | ⟨n', stp', k', rest', hc', hchild', heq, hrest'⟩
-    · obtain ⟨hstp, _⟩ := List.append_eq_nil_iff.mp heq
-      subst hstp
-      cases hchild with
-      | ext => exact absurd rfl (canon _ _ _ hc)
-    · rw [hc] at hc'
-      injection hc' with hnode
-      subst hnode
-      cases hchild with
-      | branch hi =>
-        cases hchild' with
-        | branch hi' =>
-          simp only [List.singleton_append, List.cons.injEq] at heq
-          obtain ⟨rfl, rfl⟩ := heq
-          rw [hi] at hi'
-          injection hi' with hk
-          subst hk
-          exact ih hrest'
-      | ext =>
-        cases hchild' with
-        | ext =>
-          have := List.append_cancel_left heq
-          subst this
-          exact ih hrest'
+/-- A child hangs off a non-empty step: a branch slot is one nibble, and a
+canonical extension prefix is non-empty. -/
+theorem ChildOf.ne_nil (canon : Canonical c) (hc : c r = some n) (hchild : ChildOf n stp k) :
+    stp ≠ [] := by
+  cases hchild with
+  | branch _ => exact List.cons_ne_nil _ _
+  | ext => exact canon _ _ _ hc
+
+/-- Nothing but the root sits at the empty position. -/
+theorem At.nil (canon : Canonical c) (h : At c r [] x) : x = r := by
+  rcases h.inv with ⟨_, rfl⟩ | ⟨n, stp, k, rest, hc, hchild, heq, _⟩
+  · rfl
+  · exact absurd (List.append_eq_nil_iff.mp heq.symm).1 (ChildOf.ne_nil canon hc hchild)
 
 /-- Descending one step is deterministic: what lies below `k` along `t` is what
 lies below `r` along `stp ++ t`. -/
 theorem At.step_inv (canon : Canonical c) (hc : c r = some n) (hchild : ChildOf n stp k)
     (h : At c r (stp ++ t) y) : At c k t y := by
   rcases h.inv with ⟨heq, rfl⟩ | ⟨n', stp', k', rest', hc', hchild', heq, hrest'⟩
-  · obtain ⟨hstp, _⟩ := List.append_eq_nil_iff.mp heq
-    subst hstp
-    cases hchild with
-    | ext => exact absurd rfl (canon _ _ _ hc)
+  · exact absurd (List.append_eq_nil_iff.mp heq).1 (ChildOf.ne_nil canon hc hchild)
   · rw [hc] at hc'
     injection hc' with hnode
     subst hnode
@@ -170,6 +145,14 @@ theorem At.step_inv (canon : Canonical c) (hc : c r = some n) (hchild : ChildOf 
         have := List.append_cancel_left heq
         subst this
         exact hrest'
+
+/-- A position names one hash.  This is why a responder can answer "what sits
+here" rather than "is this hash yours", and why a lie about a position resolves
+to whatever genuinely sits there. -/
+theorem At.unique (canon : Canonical c) (h₁ : At c r path a) (h₂ : At c r path b) : a = b := by
+  induction h₁ generalizing b with
+  | here => exact (h₂.nil canon).symm
+  | step hc hchild _ ih => exact ih (At.step_inv canon hc hchild h₂)
 
 /-- A position below another is reached through it. -/
 theorem At.split (canon : Canonical c) (h₂ : At c r p x) :
@@ -217,10 +200,11 @@ inductive SpellsKey : Path → Node → Path → Prop where
   | branchValue {path : Path} {children : Nat → Option Hash} {value : ValueRef} :
       SpellsKey path (.branch children (some value)) path
 
-/- RUST-IMPL: mpt-scope-admits-node — `scope.rs::Scope::admits_node`.  A node
-   is judged by what it reveals, not only by where it sits: a branch's child
-   hashes are the spine itself and travel; an inline value, an extension
-   prefix, and a leaf's key are key material and must be in scope. -/
+/-- `scope.rs::Scope::admits_node`.  A node is judged by what it reveals, not
+only by where it sits: a branch's child hashes are the spine itself and
+travel; an inline value, an extension prefix, and a leaf's key are key
+material and must be in scope. -/
+@[rust_impl "mpt-scope-admits-node"]
 def AdmitsNode (s : Scope) (path : Path) : Node → Prop
   | .branch _ none => True
   | .branch _ (some (.outOfLine _)) => True
@@ -267,9 +251,10 @@ theorem revealsRecord_admitted (hnode : AdmitsNode s path n) (hrev : RevealsReco
   | leaf => exact hnode
   | branchValue => exact hnode
 
-/- RUST-IMPL: mpt-first-key-outside — `trie.rs::Trie::first_key_outside`
-   skips every position already inside a granted prefix.  Sound because no key
-   spelled at or below such a position can leave the grant. -/
+/-- `trie.rs::Trie::first_key_outside` skips every position already inside a
+granted prefix.  Sound because no key spelled at or below such a position can
+leave the grant. -/
+@[rust_impl "mpt-first-key-outside"]
 theorem keys_below_grant_admitted (h : s.ContainsSubtree path)
     (hkey : SpellsKey (path ++ q) n key) : s.AdmitsKey key := by
   cases hkey with
@@ -287,88 +272,114 @@ structure Store where
 
 variable {st : Store}
 
-/- RUST-IMPL: mpt-walk-boundary — `trie.rs::MissingWalk::next_batch`, the
-   `contains_subtree`/`is_redacted` skip on a failed load.  An absent hash
-   refused at this position is satisfied rather than missing, but only above
-   the grant.  A held node is never a boundary: a node refused at one position
-   may be held from another it shares by structure, and holding it is what the
-   walk is establishing. -/
+/-- `trie.rs::MissingWalk::next_batch`, the `contains_subtree`/`is_redacted`
+skip on a failed load.  An absent hash refused at this position is satisfied
+rather than missing, but only above the grant.  A held node is never a
+boundary: a node refused at one position may be held from another it shares
+by structure, and holding it is what the walk is establishing. -/
+@[rust_impl "mpt-walk-boundary"]
 def Boundary (s : Scope) (st : Store) (path : Path) (x : Hash) : Prop :=
   ¬ st.held x ∧ ¬ s.ContainsSubtree path ∧ st.redacted path x
 
 theorem held_not_boundary (h : st.held x) : ¬ Boundary s st path x :=
   fun hb => hb.1 h
 
-/- RUST-IMPL: mpt-walk-seen — `trie.rs::MissingWalk::seen_key`.  Inside the
-   grant every child position is admitted, so expanding a node there does not
-   depend on which of its positions the walk met it at; one expansion per hash
-   is one per subtree.  Above the grant the key carries the position. -/
+/-- `trie.rs::MissingWalk::seen_key`.  Inside the grant every child position
+is admitted, so expanding a node there does not depend on which of its
+positions the walk met it at; one expansion per hash is one per subtree.
+Above the grant the key carries the position. -/
+@[rust_impl "mpt-walk-seen"]
 theorem children_inside_grant_admitted (h : s.ContainsSubtree path) (stp : Path) :
     s.AdmitsPath (path ++ stp) :=
   Scope.admitsPath_of_containsSubtree (Scope.containsSubtree_append h stp)
 
-/- RUST-IMPL: mpt-walk-scoped — `trie.rs::MissingWalk::scoped` with no
-   reference, and the child filter in `next_batch`: the root is on the frontier
-   when its position is admitted, and a child is pushed when its position is.
-   Stated positionally; see the module comment for `seen`. -/
-inductive Reach (c : Content) (st : Store) (s : Scope) (root : Hash) : Path → Hash → Prop where
-  | root : s.AdmitsPath [] → Reach c st s root [] root
+/-- The scoped walk under a guard `G` on the positions it may enter: the root
+is on the frontier when its position is admitted, and a child is pushed when
+its parent was reached and held and the child's position is admitted.  The
+guard is what distinguishes the walks below; every other rule is shared. -/
+inductive Walk (c : Content) (st : Store) (s : Scope) (G : Path → Hash → Prop) (root : Hash) :
+    Path → Hash → Prop where
+  | root : s.AdmitsPath [] → G [] root → Walk c st s G root [] root
   | child {path : Path} {hash : Hash} {node : Node} {stp : Path} {k : Hash} :
-      Reach c st s root path hash → st.held hash → ¬ Boundary s st path hash →
-      c hash = some node → ChildOf node stp k → s.AdmitsPath (path ++ stp) →
-      Reach c st s root (path ++ stp) k
+      Walk c st s G root path hash → st.held hash →
+      c hash = some node → ChildOf node stp k → s.AdmitsPath (path ++ stp) → G (path ++ stp) k →
+      Walk c st s G root (path ++ stp) k
+
+variable {G : Path → Hash → Prop}
+
+theorem Walk.admits (h : Walk c st s G r path x) : s.AdmitsPath path := by
+  cases h with
+  | root h _ => exact h
+  | child _ _ _ _ h _ => exact h
+
+/-- Every position a walk claims is real: it resolves under the root to the
+hash claimed for it (`a_claimed_position_resolves_to_what_is_really_there`). -/
+theorem Walk.at (h : Walk c st s G r path x) : At c r path x := by
+  induction h with
+  | root => exact At.here
+  | child _ _ hc hchild _ _ ih => exact ih.append (At.ofChild hc hchild)
+
+/-- A walk under a stricter guard visits a subset of the positions. -/
+theorem Walk.mono {G' : Path → Hash → Prop} (hG : ∀ p x, G p x → G' p x)
+    (h : Walk c st s G r path x) : Walk c st s G' r path x := by
+  induction h with
+  | root hadm hG₀ => exact .root hadm (hG _ _ hG₀)
+  | child _ hheld hc hchild hadm hGk ih => exact .child ih hheld hc hchild hadm (hG _ _ hGk)
+
+/-- `trie.rs::MissingWalk::scoped` with no reference, and the child filter in
+`next_batch`.  The unguarded walk.  A visited node that is held is never a
+`Boundary`, so the boundary check the code performs on a failed load needs
+no separate premise here. -/
+@[rust_impl "mpt-walk-scoped"]
+abbrev Reach (c : Content) (st : Store) (s : Scope) (root : Hash) : Path → Hash → Prop :=
+  Walk c st s (fun _ _ => True) root
+
+theorem Reach.root (h : s.AdmitsPath []) : Reach c st s r [] r := Walk.root h trivial
+
+theorem Reach.child {hash : Hash} (h : Reach c st s r path hash) (hheld : st.held hash)
+    (hc : c hash = some n) (hchild : ChildOf n stp k) (hadm : s.AdmitsPath (path ++ stp)) :
+    Reach c st s r (path ++ stp) k :=
+  Walk.child h hheld hc hchild hadm trivial
 
 /-- An honest walk never asks for a position its scope does not admit, so an
 out-of-scope request is a probe and not a race. -/
-theorem Reach.admits (h : Reach c st s r path x) : s.AdmitsPath path := by
-  cases h with
-  | root h => exact h
-  | child _ _ _ _ _ h => exact h
+theorem Reach.admits (h : Reach c st s r path x) : s.AdmitsPath path := Walk.admits h
 
-/-- Every position the walk claims is real: it resolves under the root to the
-hash claimed for it (`a_claimed_position_resolves_to_what_is_really_there`). -/
-theorem Reach.at (h : Reach c st s r path x) : At c r path x := by
-  induction h with
-  | root => exact At.here
-  | child _ _ _ hc hchild _ ih => exact ih.append (At.ofChild hc hchild)
+theorem Reach.at (h : Reach c st s r path x) : At c r path x := Walk.at h
 
-/- RUST-IMPL: mpt-complete-scoped — `trie.rs::Trie::is_complete_scoped`.  The
-   walk drains with nothing missing: every position it reaches is held or a
-   boundary, and every node it expands has its out-of-line value. -/
-def CompleteWithin (c : Content) (st : Store) (s : Scope) (root : Hash) : Prop :=
-  ∀ path x, Reach c st s root path x →
+/-- A walk finishing with nothing missing: every position it reaches is held or
+a boundary, and every node it expands has its out-of-line value. -/
+def Drained (c : Content) (st : Store) (s : Scope) (W : Path → Hash → Prop) : Prop :=
+  ∀ path x, W path x →
     (st.held x ∨ Boundary s st path x) ∧
     (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → st.heldValue v)
 
-/- RUST-IMPL: mpt-walk-prune-reference — `trie.rs::MissingWalk::next_batch`,
-   `reference == Some(hash)`.  The walk with a reference: a position whose
-   wanted hash the reference pairing also names is skipped, and nothing below
-   it is visited. -/
-inductive ReachRef (c : Content) (st : Store) (s : Scope) (prune : Path → Hash → Prop)
-    (root : Hash) : Path → Hash → Prop where
-  | root : s.AdmitsPath [] → ¬ prune [] root → ReachRef c st s prune root [] root
-  | child {path : Path} {hash : Hash} {node : Node} {stp : Path} {k : Hash} :
-      ReachRef c st s prune root path hash → st.held hash → ¬ Boundary s st path hash →
-      c hash = some node → ChildOf node stp k → s.AdmitsPath (path ++ stp) →
-      ¬ prune (path ++ stp) k →
-      ReachRef c st s prune root (path ++ stp) k
+/-- `trie.rs::Trie::is_complete_scoped`.  The unguarded walk drains with
+nothing missing — the fact the memo records. -/
+@[rust_impl "mpt-complete-scoped"]
+def CompleteWithin (c : Content) (st : Store) (s : Scope) (root : Hash) : Prop :=
+  Drained c st s (Reach c st s root)
+
+/-- `trie.rs::MissingWalk::next_batch`, `reference == Some(hash)`.  The walk
+with a reference: a position whose wanted hash the reference pairing also
+names is skipped, and nothing below it is visited. -/
+@[rust_impl "mpt-walk-prune-reference"]
+abbrev ReachRef (c : Content) (st : Store) (s : Scope) (prune : Path → Hash → Prop) (root : Hash) :
+    Path → Hash → Prop :=
+  Walk c st s (fun p x => ¬ prune p x) root
 
 variable {prune : Path → Hash → Prop}
 
 /-- The pruned walk visits a subset of the unpruned one, so its requests are
 honest too. -/
-theorem ReachRef.reach (h : ReachRef c st s prune r path x) : Reach c st s r path x := by
-  induction h with
-  | root h _ => exact Reach.root h
-  | child _ hheld hb hc hchild hadm _ ih => exact Reach.child ih hheld hb hc hchild hadm
+theorem ReachRef.reach (h : ReachRef c st s prune r path x) : Reach c st s r path x :=
+  Walk.mono (fun _ _ _ => trivial) h
 
 /-- `fetch_pending`'s walk drained: nothing missing among the positions the
 pruned walk visited. -/
 def DrainedWithin (c : Content) (st : Store) (s : Scope) (prune : Path → Hash → Prop)
     (root : Hash) : Prop :=
-  ∀ path x, ReachRef c st s prune root path x →
-    (st.held x ∨ Boundary s st path x) ∧
-    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → st.heldValue v)
+  Drained c st s (ReachRef c st s prune root)
 
 /-- Every position the unpruned walk over `H` reaches is either reached by the
 pruned walk, or reached by the reference root's own walk. -/
@@ -377,23 +388,24 @@ theorem reach_of_pruned_or_reference {R H : Hash}
     (h : Reach c st s H path x) :
     ReachRef c st s prune H path x ∨ Reach c st s R path x := by
   induction h with
-  | root hadm =>
+  | root hadm _ =>
     by_cases hp : prune [] H
     · exact Or.inr (hprune _ _ hp)
-    · exact Or.inl (ReachRef.root hadm hp)
-  | @child path _ _ stp k _ hheld hb hc hchild hadm ih =>
+    · exact Or.inl (Walk.root hadm hp)
+  | @child path _ _ stp k _ hheld hc hchild hadm _ ih =>
     rcases ih with viaH | viaR
     · by_cases hp : prune (path ++ stp) k
       · exact Or.inr (hprune _ _ hp)
-      · exact Or.inl (ReachRef.child viaH hheld hb hc hchild hadm hp)
-    · exact Or.inr (Reach.child viaR hheld hb hc hchild hadm)
+      · exact Or.inl (Walk.child viaH hheld hc hchild hadm hp)
+    · exact Or.inr (Reach.child viaR hheld hc hchild hadm)
 
-/- RUST-IMPL: mpt-complete-memo — `reconcile.rs::fetch_pending`, the
-   `note_complete(scope.memo_key(pending.root))` after a pruned walk drains.
-   The §5.5 soundness claim: pruning against a root held whole within the scope
-   is sound because every boundary the walk stops at is a scope edge — here,
-   because everything pruned lies under a position the reference root's own
-   scoped walk reached, and that walk found nothing missing. -/
+/-- `reconcile.rs::fetch_pending`, the `note_complete(scope.memo_key(pending.root))`
+after a pruned walk drains.  The §5.5 soundness claim: pruning against a root
+held whole within the scope is sound because every boundary the walk stops at
+is a scope edge — here, because everything pruned lies under a position the
+reference root's own scoped walk reached, and that walk found nothing
+missing. -/
+@[rust_impl "mpt-complete-memo"]
 theorem prune_sound {R H : Hash}
     (hR : CompleteWithin c st s R)
     (hprune : ∀ path x, prune path x → Reach c st s R path x)
@@ -404,38 +416,26 @@ theorem prune_sound {R H : Hash}
   · exact hH _ _ viaH
   · exact hR _ _ viaR
 
-/- RUST-IMPL: mpt-walk-paired-children — `trie.rs::paired_children`, and the
-   `reference_node` load in `next_batch`.  The reference hash carried for a
-   position: the reference root descended through *held* nodes along the same
-   steps (same branch slot, equal extension prefix); a shape mismatch or an
-   absent node ends the pairing. -/
-inductive Paired (c : Content) (st : Store) (s : Scope) (R : Hash) : Path → Hash → Prop where
-  | root : s.AdmitsPath [] → Paired c st s R [] R
-  | child {path : Path} {ref : Hash} {node : Node} {stp : Path} {k : Hash} :
-      Paired c st s R path ref → st.held ref → c ref = some node → ChildOf node stp k →
-      s.AdmitsPath (path ++ stp) → Paired c st s R (path ++ stp) k
+/-- `trie.rs::paired_children`, and the `reference_node` load in `next_batch`.
+The reference hash carried for a position: the reference root descended
+through *held* nodes along the same steps (same branch slot, equal extension
+prefix); a shape mismatch or an absent node ends the pairing.  That is
+exactly the reference root's own scoped walk, so `Paired` *is* `Reach` — and a
+held node is never a boundary, which is why the code's boundary check on the
+reference side is not a separate premise. -/
+@[rust_impl "mpt-walk-paired-children"]
+abbrev Paired (c : Content) (st : Store) (s : Scope) (R : Hash) : Path → Hash → Prop :=
+  Reach c st s R
 
-theorem Paired.at (h : Paired c st s r path x) : At c r path x := by
-  induction h with
-  | root => exact At.here
-  | child _ _ hc hchild _ ih => exact ih.append (At.ofChild hc hchild)
-
-/-- Rust's pairing walks positions the reference root's scoped walk reached:
-the pairing loads each reference node, and a held node is never a boundary. -/
-theorem paired_reaches (h : Paired c st s r path x) : Reach c st s r path x := by
-  induction h with
-  | root hadm => exact Reach.root hadm
-  | child _ hheld hc hchild hadm ih =>
-    exact Reach.child ih hheld (held_not_boundary hheld) hc hchild hadm
-
-/- RUST-IMPL: mpt-fetch-reference — `reconcile.rs::fetch_pending`, the
-   reference chosen only when `is_complete_scoped(head.root, scope)`.  With the
-   pairing Rust computes, the memo written after the pruned walk is true. -/
+/-- `reconcile.rs::fetch_pending`, the reference chosen only when
+`is_complete_scoped(head.root, scope)`.  With the pairing Rust computes, the
+memo written after the pruned walk is true. -/
+@[rust_impl "mpt-fetch-reference"]
 theorem prune_sound_paired {R H : Hash}
     (hR : CompleteWithin c st s R)
     (hH : DrainedWithin c st s (Paired c st s R) H) :
     CompleteWithin c st s H :=
-  prune_sound hR (fun _ _ hp => paired_reaches hp) hH
+  prune_sound hR (fun _ _ hp => hp) hH
 
 /-- The completeness the memo records is exactly what promotion needs: every
 admitted position under the root is held or under a boundary, so a scoped
@@ -444,24 +444,39 @@ theorem complete_position_held (hc : CompleteWithin c st s r) (h : Reach c st s 
     st.held x ∨ Boundary s st path x :=
   (hc _ _ h).1
 
+/-- Under a complete root, every position that resolves under the root along
+an admitted path is reached by the walk, or lies under a boundary the walk
+stopped at.  The bridge from the trie's own structure (`At`) to what the walk
+saw (`Reach`). -/
+theorem reach_or_boundary (hc : CompleteWithin c st s r) (h : At c y q x) :
+    ∀ p, Reach c st s r p y → s.AdmitsPath (p ++ q) →
+      Reach c st s r (p ++ q) x ∨
+        ∃ p' x', p' <+: p ++ q ∧ Reach c st s r p' x' ∧ Boundary s st p' x' := by
+  induction h with
+  | here =>
+    intro p hr _
+    exact Or.inl (by simpa using hr)
+  | @step y n stp k rest x hcn hchild _ ih =>
+    intro p hr hadm
+    rcases (hc _ _ hr).1 with hheld | hb
+    · have hadm' : s.AdmitsPath (p ++ stp) := by
+        rw [← List.append_assoc] at hadm
+        exact Scope.admitsPath_of_append hadm
+      have hr' : Reach c st s r (p ++ stp) k := Reach.child hr hheld hcn hchild hadm'
+      have := ih (p ++ stp) hr' (by rw [List.append_assoc]; exact hadm)
+      rwa [List.append_assoc] at this
+    · exact Or.inr ⟨p, y, List.prefix_append _ _, hr, hb⟩
+
 /-! ## The scoped diff -/
 
-/- RUST-IMPL: mpt-diff-scoped — `diff.rs::Trie::diff_walk`, the `admits_path`
-   skip, and `Trie::cursor_at` reading a redacted absence as empty.  The
-   positions the promotion diff reads under one root: children of admitted
-   positions whose node loaded.  Pruning at equal hashes only removes
-   positions, so this over-approximates what the diff touches. -/
-inductive DiffReach (c : Content) (st : Store) (s : Scope) (root : Hash) : Path → Hash → Prop where
-  | root : s.AdmitsPath [] → DiffReach c st s root [] root
-  | child {path : Path} {hash : Hash} {node : Node} {stp : Path} {k : Hash} :
-      DiffReach c st s root path hash → st.held hash → c hash = some node → ChildOf node stp k →
-      s.AdmitsPath (path ++ stp) → DiffReach c st s root (path ++ stp) k
-
-theorem diffReach_reaches (h : DiffReach c st s r path x) : Reach c st s r path x := by
-  induction h with
-  | root hadm => exact Reach.root hadm
-  | child _ hheld hc hchild hadm ih =>
-    exact Reach.child ih hheld (held_not_boundary hheld) hc hchild hadm
+/-- `diff.rs::Trie::diff_walk`, the `admits_path` skip, and `Trie::cursor_at`
+reading a redacted absence as empty.  The positions the promotion diff reads
+under one root: children of admitted positions whose node loaded.  That is
+the scoped walk again; pruning at equal hashes only removes positions, so
+`Reach` over-approximates what the diff touches. -/
+@[rust_impl "mpt-diff-scoped"]
+abbrev DiffReach (c : Content) (st : Store) (s : Scope) (root : Hash) : Path → Hash → Prop :=
+  Reach c st s root
 
 /-- Promotion's materialization never fails on an absence that is the design
 working: over a root complete within the scope, every position the scoped diff
@@ -469,7 +484,7 @@ reads is held, or is an absent hash refused at some position, which `cursor_at`
 asks about (`is_redacted(hash, None)`) and reads as empty. -/
 theorem diff_never_misses (hcomplete : CompleteWithin c st s r)
     (h : DiffReach c st s r path x) : st.held x ∨ (¬ st.held x ∧ ∃ p, st.redacted p x) := by
-  rcases (hcomplete _ _ (diffReach_reaches h)).1 with held | ⟨absent, _, redacted⟩
+  rcases (hcomplete _ _ h).1 with held | ⟨absent, _, redacted⟩
   · exact Or.inl held
   · exact Or.inr ⟨absent, _, redacted⟩
 
@@ -484,29 +499,32 @@ structure Want where
 
 variable {heads : Hash → Prop} {w : Want}
 
-/- RUST-IMPL: mpt-serve-admit — `net/mpt.rs::admit`.  For an unscoped peer the
-   claimed hash is the answer.  For a scoped peer the position is the only
-   authorization: the root must be one this node holds a head for, the position
-   must be admitted, and what is served is what the descent finds there. -/
+/-- `net/mpt.rs::admit`.  For an unscoped peer the claimed hash is the answer.
+For a scoped peer the position is the only authorization: the root must be one
+this node holds a head for, the position must be admitted, and what is served
+is what the descent finds there. -/
+@[rust_impl "mpt-serve-admit"]
 def Admit (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (x : Hash) : Prop :=
   match s.prefixes with
   | none => x = w.claimed
   | some _ => heads w.root ∧ s.AdmitsPath w.path ∧ At c w.root w.path x
 
-/- RUST-IMPL: mpt-serve-node — `net/mpt.rs`, the `GetNodes` arm: an admitted
-   position's node travels only if what it reveals is in scope. -/
+/-- `net/mpt.rs`, the `GetNodes` arm: an admitted position's node travels only
+if what it reveals is in scope. -/
+@[rust_impl "mpt-serve-node"]
 def ServeNode (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (x : Hash) (n : Node) :
     Prop :=
   Admit c s heads w x ∧ c x = some n ∧ AdmitsNode s w.path n
 
 /-- The `GetNodes` arm's `redacted`: an admitted position whose node reveals
-key material outside the scope. -/
+key material outside the scope.  Only a partial scope ever refuses
+(`Redacts.not_full`), so the scope's shape is not a separate premise. -/
 def Redacts (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (x : Hash) : Prop :=
-  ¬ s.IsFull ∧ Admit c s heads w x ∧ ∃ n, c x = some n ∧ ¬ AdmitsNode s w.path n
+  Admit c s heads w x ∧ ∃ n, c x = some n ∧ ¬ AdmitsNode s w.path n
 
-/- RUST-IMPL: mpt-serve-value — `net/mpt.rs`, the `GetValues` arm: a value is
-   authorized by the node that carries it, resolved at the claimed position and
-   judged by what it reveals. -/
+/-- `net/mpt.rs`, the `GetValues` arm: a value is authorized by the node that
+carries it, resolved at the claimed position and judged by what it reveals. -/
+@[rust_impl "mpt-serve-value"]
 def ServeValue (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (v : Hash) : Prop :=
   v = w.claimed ∧
     match s.prefixes with
@@ -514,32 +532,37 @@ def ServeValue (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (v :
     | some _ => ∃ x n, Admit c s heads w x ∧ c x = some n ∧ n.valueHash = some v ∧
         AdmitsNode s w.path n
 
+theorem Redacts.not_full (h : Redacts c s heads w x) : ¬ s.IsFull :=
+  fun full => let ⟨_, n, _, refused⟩ := h; refused (admitsNode_of_full full _ n)
+
 /-- A hash cannot be authorized; a position can.  For a scoped peer the answer
 does not depend on the hash it claimed. -/
-theorem admit_ignores_claim {prefixes : List Path} (h : s.prefixes = some prefixes) :
+theorem admit_ignores_claim (h : ¬ s.IsFull) :
     Admit c s heads ⟨r, path, a⟩ x ↔ Admit c s heads ⟨r, path, b⟩ x := by
-  unfold Admit; rw [h]
+  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
+  unfold Admit; rw [hp]
 
 /-- The root a request names must be one this node holds a head for. -/
-theorem admit_requires_head {prefixes : List Path} (h : s.prefixes = some prefixes)
-    (ha : Admit c s heads w x) : heads w.root := by
-  unfold Admit at ha; rw [h] at ha; exact ha.1
+theorem admit_requires_head (h : ¬ s.IsFull) (ha : Admit c s heads w x) : heads w.root := by
+  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
+  unfold Admit at ha; rw [hp] at ha; exact ha.1
 
 /-- What is served sits at the claimed position of a head root. -/
-theorem admit_resolves {prefixes : List Path} (h : s.prefixes = some prefixes)
-    (ha : Admit c s heads w x) : s.AdmitsPath w.path ∧ At c w.root w.path x := by
-  unfold Admit at ha; rw [h] at ha; exact ha.2
+theorem admit_resolves (h : ¬ s.IsFull) (ha : Admit c s heads w x) :
+    s.AdmitsPath w.path ∧ At c w.root w.path x := by
+  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full h
+  unfold Admit at ha; rw [hp] at ha; exact ha.2
 
 /-- A lie about the position resolves to whatever genuinely sits there, and to
 nothing else. -/
-theorem admit_unique {prefixes : List Path} (canon : Canonical c) (h : s.prefixes = some prefixes)
+theorem admit_unique (canon : Canonical c) (h : ¬ s.IsFull)
     (ha : Admit c s heads w a) (hb : Admit c s heads w b) : a = b :=
   At.unique canon (admit_resolves h ha).2 (admit_resolves h hb).2
 
 /-- Redaction is a boundary, never an absence inside the grant. -/
 theorem redacts_only_above_grant (h : Redacts c s heads w x) : ¬ s.ContainsSubtree w.path :=
   fun inside =>
-    let ⟨_, _, n, _, refused⟩ := h
+    let ⟨_, n, _, refused⟩ := h
     refused (no_redaction_inside_grant inside n)
 
 /-- Nothing served to a scoped peer spells a key or a position outside its
@@ -562,11 +585,19 @@ theorem honest_want_admitted (hhead : heads r) (h : Reach c st s r path x) :
   · rfl
   · exact ⟨hhead, h.admits, h.at⟩
 
+/-- For a scoped peer the claimed hash is not consulted, so the want a walk
+sends for a *value* — naming the value's hash at the node's position — is
+admitted at the node. -/
+theorem honest_value_want_admitted (hs : ¬ s.IsFull) (hhead : heads r)
+    (hr : Reach c st s r p x) (claimed : Hash) : Admit c s heads ⟨r, p, claimed⟩ x :=
+  (admit_ignores_claim hs).mp (honest_want_admitted hhead hr)
+
 /-! ## What a delegate can hold -/
 
-/- RUST-IMPL: mpt-learn-scoped — `reconcile.rs::fetch_pending`: `put_node`
-   and `put_value` of what the responder served, and `note_redacted` of what it
-   refused.  A delegate's foreign nodes come from nowhere else. -/
+/-- `reconcile.rs::fetch_pending`: `put_node` and `put_value` of what the
+responder served, and `note_redacted` of what it refused.  A delegate's
+foreign nodes come from nowhere else. -/
+@[rust_impl "mpt-learn-scoped"]
 inductive Learn (c : Content) (s : Scope) (heads : Hash → Prop) : Store → Store → Prop where
   | node {st : Store} {w : Want} {x : Hash} {n : Node} :
       ServeNode c s heads w x n →
@@ -581,9 +612,12 @@ inductive Learn (c : Content) (s : Scope) (heads : Hash → Prop) : Store → St
 
 def Initial : Store := ⟨fun _ => False, fun _ => False, fun _ _ => False⟩
 
-inductive Reachable (c : Content) (s : Scope) (heads : Hash → Prop) : Store → Prop where
-  | initial : Reachable c s heads Initial
-  | next {st st' : Store} : Reachable c s heads st → Learn c s heads st st' → Reachable c s heads st'
+/-- A delegate under scope `s`, fetching from responders holding `heads`. -/
+def system (c : Content) (s : Scope) (heads : Hash → Prop) : System Store :=
+  ⟨Initial, Learn c s heads⟩
+
+abbrev Reachable (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop :=
+  (system c s heads).Reachable st
 
 /-- Everything a delegate holds was served or refused by the rules above. -/
 def Confined (c : Content) (s : Scope) (heads : Hash → Prop) (st : Store) : Prop :=
@@ -614,16 +648,13 @@ theorem confined_step {st' : Store} (hinv : Confined c s heads st) (hstep : Lear
     · exact ⟨_, rfl, refused⟩
     · exact refusals _ _ old
 
-theorem reachable_confined (h : Reachable c s heads st) : Confined c s heads st := by
-  induction h with
-  | initial => exact initial_confined
-  | next _ step ih => exact confined_step ih step
+theorem reachable_confined (h : Reachable c s heads st) : Confined c s heads st :=
+  h.invariant initial_confined confined_step
 
 /-- The privacy theorem.  Every node a scoped delegate holds sits at an admitted
 position of a root the server holds a head for, and spells no key material
 outside the delegate's scope. -/
-theorem held_within_scope {prefixes : List Path} (hs : s.prefixes = some prefixes)
-    (h : Reachable c s heads st) (hheld : st.held x) :
+theorem held_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) (hheld : st.held x) :
     ∃ root path n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
       (∀ q, Reveals path n q → s.AdmitsPath q) ∧
       (∀ key, RevealsRecord path n key → s.AdmitsKey key) := by
@@ -635,13 +666,14 @@ theorem held_within_scope {prefixes : List Path} (hs : s.prefixes = some prefixe
 
 /-- Every out-of-line value a scoped delegate holds belongs to a node it was
 served, at an admitted position. -/
-theorem held_value_within_scope {prefixes : List Path} (hs : s.prefixes = some prefixes)
-    (h : Reachable c s heads st) {v : Hash} (hheld : st.heldValue v) :
+theorem held_value_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) {v : Hash}
+    (hheld : st.heldValue v) :
     ∃ root path x n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
       n.valueHash = some v ∧ AdmitsNode s path n := by
   obtain ⟨w, served⟩ := (reachable_confined h).2.1 v hheld
+  obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full hs
   have carried := served.2
-  rw [hs] at carried
+  rw [hp] at carried
   obtain ⟨x, n, hadmit, hc, hv, hnode⟩ := carried
   obtain ⟨hadm, hat⟩ := admit_resolves hs hadmit
   exact ⟨w.root, w.path, x, n, admit_requires_head hs hadmit, hadm, hat, hc, hv, hnode⟩

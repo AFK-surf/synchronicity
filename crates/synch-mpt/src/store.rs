@@ -102,7 +102,7 @@ pub trait NodeStore {
     /// out in the origin itself — and the origin cannot serve what it never
     /// held. The default owns nothing, which is the conservative answer for a
     /// store that never records provenance.
-    // LEAN-MODEL: mpt-owned-node
+    // LEAN-MODEL: mpt-owned-node (Provenance.view_owned)
     // `Provenance.Store.owned`; `Provenance.view` is the presence a walk with
     // an owner reads, and `privacy`/`integrity` are what provenance buys.
     fn owns_node(&self, _origin: &OriginId, _hash: &Hash) -> Result<bool, Self::Error> {

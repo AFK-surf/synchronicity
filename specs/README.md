@@ -57,13 +57,14 @@ proof.
 
 ## Lean — CAS / mptsync / ingest safety
 
-[`lean/`](lean/) contains unbounded inductive proofs at five resolutions, all
-over one statement of the CAS transitions (`Cas`, generic in the holder type):
-the small per-root protocol (`CasGc`, the holder collapsed to `Unit`), the
-root/holder-indexed system model whose live relations are the content leaves
-materialized from active tries, a graph model of trie mark/sweep, the same
-system model with the durable backend allowed to lose what it acknowledged
-(`FaultTolerant`, four added steps over the shared invariant), and a positional model of mptsync
+[`lean/`](lean/) contains unbounded inductive proofs, all instances of one
+generic transition system (`Prelude.System`) and all over one statement of the
+CAS transitions (`Cas`, generic in the holder type): the root/holder-indexed
+system model whose live relations are the content leaves materialized from
+active tries (`SystemSafety`), a multi-root model of trie mark/sweep that
+projects onto the per-root head-slot abstraction (`TrieGraph` onto `MptGc`),
+the same system model with the durable backend allowed to lose what it
+acknowledged (`FaultTolerant`, four added steps over the shared invariant), and a positional model of mptsync
 over partial tries — the scoped fetch walk a delegate runs, its pruning against
 a reference root, the responder's authorization by position, and the privacy
 theorem that a delegate holds nothing that spells a key outside its scope

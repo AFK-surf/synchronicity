@@ -697,6 +697,9 @@ impl Store {
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
+        // LEAN-MODEL: mpt-prune-history (MptGc.Prune)
+        // A root leaves retention only when neither slot points at it; the
+        // exemptions below are how that guard is kept.
         // Reads and deletes in one immediate transaction, over one snapshot:
         // deciding what is doomed outside it lets a writer on the blocking pool
         // make a row current in between, and the row `heads` points at would go

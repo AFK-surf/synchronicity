@@ -2,7 +2,8 @@ import Synchronicity.MptGc
 import Synchronicity.ScopedSync
 
 /-!
-Convergence of mptsync, in the three pieces it decomposes into (§5.2, §5.3).
+Convergence of mptsync, in the three pieces it decomposes into (§5.2, §5.3),
+and the theorem that puts them back together (`converge`).
 
 1. **Head selection is a join.**  `offer_head` adopts a head into the pending
    slot when it supersedes the greatest head recorded so far, under the
@@ -11,6 +12,8 @@ Convergence of mptsync, in the three pieces it decomposes into (§5.2, §5.3).
    order or multiplicity: two nodes that have heard the same heads hold the
    same one.  The proof rests on the order being total, which is what §5.2's
    note about `seq` alone is about: ties in `seq` need `root` to break them.
+   `adopt_supersedes`/`adopt_retains` are the two `MptGc` transitions the
+   comparison chooses between.
 
 2. **The derived view is a function of root and scope.**  `HasValue` is
    `Trie::get`; `view_deterministic` says a key has one value under a root, and
@@ -23,8 +26,8 @@ Convergence of mptsync, in the three pieces it decomposes into (§5.2, §5.3).
 3. **The fetch terminates, and a fetch that can take no step is complete.**
    `FetchStep` is one learned item — a node, a refusal, or a value — for a
    position the scoped walk is asking about, served by a peer holding the
-   root.  `fetch_terminates` bounds every fetch by the size of the origin's
-   trie; `stuck_complete` says a fetch with no step left has established
+   root.  `fetchStep_wf` bounds every fetch by the size of the origin's trie;
+   `stuck_complete` says a fetch with no step left has established
    `CompleteWithin`, which is the premise `try_promote` flips on
    (`stuck_fetch_promotes`).
 
@@ -97,9 +100,10 @@ theorem not_lt_trans (h₁ : ¬ Lt a b) (h₂ : ¬ Lt b d) : ¬ Lt a d := by
 
 end Head
 
-/- RUST-IMPL: mpt-head-adopt — `reconcile.rs::offer_head`, `supersedes(floor)`:
-   a head takes the slot when it strictly beats the greatest head recorded,
-   and is otherwise only retained. -/
+/-- `reconcile.rs::offer_head`, `supersedes(floor)`: a head takes the slot
+when it strictly beats the greatest head recorded, and is otherwise only
+retained. -/
+@[rust_impl "mpt-head-adopt"]
 def adopt (floor : Option Head) (h : Head) : Option Head :=
   match floor with
   | none => some h
@@ -107,6 +111,18 @@ def adopt (floor : Option Head) (h : Head) : Option Head :=
 
 /-- The head a node holds after hearing `heads` in that order. -/
 def select (heads : List Head) : Option Head := heads.foldl adopt none
+
+/-- A head that supersedes the floor is adopted: this is the offer that takes
+the pending slot, `MptGc.OfferPending` at the new head's root. -/
+theorem adopt_supersedes {f h : Head} (hlt : Head.Lt f h) (m : MptGc.State) :
+    adopt (some f) h = some h ∧ MptGc.OfferPending m { m with retained := True, pending := True } :=
+  ⟨by simp [adopt, hlt], rfl⟩
+
+/-- A head that does not supersede the floor leaves it standing: the `NotNewer`
+arm, `MptGc.Retain` at the offered head's root. -/
+theorem adopt_retains {f h : Head} (hlt : ¬ Head.Lt f h) (m : MptGc.State) :
+    adopt (some f) h = some f ∧ MptGc.Retain m { m with retained := True } :=
+  ⟨by simp [adopt, hlt], rfl⟩
 
 theorem adopt_spec (floor : Option Head) (h : Head) :
     ∃ a, adopt floor h = some a ∧ (a = h ∨ floor = some a) ∧ ¬ Head.Lt a h ∧
@@ -166,6 +182,8 @@ theorem foldl_adopt_isSome (l : List Head) (a : Head) :
     rw [List.foldl_cons, hb]
     exact ih b
 
+variable {l l' l₂ : List Head} {m m' : Head}
+
 /-- The head selected is a maximum of the heads heard. -/
 theorem select_max (h : select l = some m) : m ∈ l ∧ ∀ h' ∈ l, ¬ Head.Lt m h' := by
   obtain ⟨hmem, hl, _⟩ := foldl_adopt_some l none m h
@@ -222,8 +240,9 @@ def CarriesKey (c : Content) (x : Hash) (p key : Path) (v : ValueRef) : Prop :=
   (∃ rest, c x = some (.leaf rest v) ∧ key = p ++ rest) ∨
   (∃ children, c x = some (.branch children (some v)) ∧ key = p)
 
-/- RUST-IMPL: mpt-trie-get — `trie.rs::Trie::get`: the value of a key under a
-   root is what the descent finds at the key's position. -/
+/-- `trie.rs::Trie::get`: the value of a key under a root is what the descent
+finds at the key's position. -/
+@[rust_impl "mpt-trie-get"]
 def HasValue (c : Content) (root : Hash) (key : Path) (v : ValueRef) : Prop :=
   ∃ p x, At c root p x ∧ CarriesKey c x p key v
 
@@ -272,10 +291,11 @@ theorem view_deterministic {v₁ v₂ : ValueRef} (canon : Canonical c)
   · exact carries_unique_of_below canon hat₁ hk₁ hat₂ hk₂
   · exact (carries_unique_of_below canon hat₂ hk₂ hat₁ hk₁).symm
 
-/- RUST-IMPL: mpt-materialize-scoped — `reconcile.rs::try_promote`, the
-   `materialize_diff` under the read scope.  What a node reading under `s`
-   derives from a root: a function of the content, the root and the scope, and
-   of nothing about the node — not which peers served it, nor in what order. -/
+/-- `reconcile.rs::try_promote`, the `materialize_diff` under the read scope.
+What a node reading under `s` derives from a root: a function of the content,
+the root and the scope, and of nothing about the node — not which peers served
+it, nor in what order. -/
+@[rust_impl "mpt-materialize-scoped"]
 def ScopedView (c : Content) (s : Scope) (root : Hash) (key : Path) (v : ValueRef) : Prop :=
   s.AdmitsKey key ∧ HasValue c root key v
 
@@ -284,26 +304,6 @@ scope derives the same value for every key. -/
 theorem scoped_view_deterministic {v₁ v₂ : ValueRef} (canon : Canonical c)
     (h₁ : ScopedView c s r key v₁) (h₂ : ScopedView c s r key v₂) : v₁ = v₂ :=
   view_deterministic canon h₁.2 h₂.2
-
-theorem reach_or_boundary_aux (hc : CompleteWithin c st s r) (h : At c y q x) :
-    ∀ p, Reach c st s r p y → s.AdmitsPath (p ++ q) →
-      Reach c st s r (p ++ q) x ∨
-        ∃ p' x', p' <+: p ++ q ∧ Reach c st s r p' x' ∧ Boundary s st p' x' := by
-  induction h with
-  | here =>
-    intro p hr _
-    exact Or.inl (by simpa using hr)
-  | @step y n stp k rest x hcn hchild _ ih =>
-    intro p hr hadm
-    rcases (hc _ _ hr).1 with hheld | hb
-    · have hadm' : s.AdmitsPath (p ++ stp) := by
-        rw [← List.append_assoc] at hadm
-        exact Scope.admitsPath_of_append hadm
-      have hr' : Reach c st s r (p ++ stp) k :=
-        Reach.child hr hheld (held_not_boundary hheld) hcn hchild hadm'
-      have := ih (p ++ stp) hr' (by rw [List.append_assoc]; exact hadm)
-      rwa [List.append_assoc] at this
-    · exact Or.inr ⟨p, y, List.prefix_append _ _, hr, hb⟩
 
 /-- **A complete scoped node can read its view.**  Under a root complete within
 the scope, every admitted key with a value has its value-carrying node held —
@@ -318,7 +318,7 @@ theorem admitted_key_readable {v : ValueRef} (hc : CompleteWithin c st s r)
   have hadm : s.AdmitsPath p :=
     Scope.admitsPath_of_prefix (Scope.admitsPath_of_admitsKey hkey) hp
   have hroot : Reach c st s r [] r := Reach.root (Scope.admitsPath_of_prefix hadm List.nil_prefix)
-  rcases reach_or_boundary_aux hc hat [] hroot (by simpa using hadm) with hr | ⟨p', x', hpre, hr', hb⟩
+  rcases reach_or_boundary hc hat [] hroot (by simpa using hadm) with hr | ⟨p', x', hpre, hr', hb⟩
   · simp only [List.nil_append] at hr
     rcases (hc _ _ hr).1 with hheld | hb
     · exact Or.inl ⟨p, x, hat, hk, hheld⟩
@@ -330,11 +330,11 @@ theorem admitted_key_readable {v : ValueRef} (hc : CompleteWithin c st s r)
 
 variable {heads : Hash → Prop}
 
-/- RUST-IMPL: mpt-fetch-progress — `reconcile.rs::fetch_pending`, `learned`:
-   one round commits what the responder served for the positions the walk
-   asked about.  Each step is one such item — a node, a refusal, or a value —
-   and is a `ScopedSync.Learn` step, so everything `reachable_confined` says
-   holds of a fetching delegate. -/
+/-- `reconcile.rs::fetch_pending`, `learned`: one round commits what the
+responder served for the positions the walk asked about.  Each step is one
+such item — a node, a refusal, or a value — and is a `ScopedSync.Learn` step,
+so everything `reachable_confined` says holds of a fetching delegate. -/
+@[rust_impl "mpt-fetch-progress"]
 inductive FetchStep (c : Content) (s : Scope) (heads : Hash → Prop) (root : Hash) :
     Store → Store → Prop where
   | node {st : Store} {p : Path} {x : Hash} {n : Node} :
@@ -365,94 +365,59 @@ structure Bounded (c : Content) (root : Hash) where
   position_mem : ∀ p x, At c root p x → (p, x) ∈ positions
   value_mem : ∀ p x n v, At c root p x → c x = some n → n.valueHash = some v → v ∈ values
 
-section Measure
-
-variable {α : Type} {P Q : α → Prop} [DecidablePred P] [DecidablePred Q]
-
-theorem filter_length_le_of_imp {l : List α} (hpq : ∀ a, Q a → P a) :
-    (l.filter fun a => decide (Q a)).length ≤ (l.filter fun a => decide (P a)).length := by
-  induction l with
-  | nil => exact Nat.le_refl _
-  | cons b l ih =>
-    by_cases hq : Q b
-    · have hp := hpq b hq
-      simp only [List.filter_cons, hq, hp, decide_true, List.length_cons, ↓reduceIte]
-      omega
-    · by_cases hp : P b
-      · simp only [List.filter_cons, hq, hp, decide_true, decide_false, List.length_cons,
-          ↓reduceIte, Bool.false_eq_true]
-        omega
-      · simp only [List.filter_cons, hq, hp, decide_false, ↓reduceIte, Bool.false_eq_true]
-        exact ih
-
-theorem filter_length_lt_of_imp {l : List α} (hpq : ∀ a, Q a → P a) (a : α) (ha : a ∈ l)
-    (hp : P a) (hq : ¬ Q a) :
-    (l.filter fun a => decide (Q a)).length < (l.filter fun a => decide (P a)).length := by
-  induction l with
-  | nil => exact absurd ha (List.not_mem_nil)
-  | cons b l ih =>
-    rcases List.mem_cons.mp ha with rfl | hmem
-    · simp only [List.filter_cons, hq, hp, decide_true, decide_false, List.length_cons,
-        ↓reduceIte, Bool.false_eq_true]
-      exact Nat.lt_succ_of_le (filter_length_le_of_imp hpq)
-    · have := ih hmem
-      by_cases hqb : Q b
-      · have hpb := hpq b hqb
-        simp only [List.filter_cons, hqb, hpb, decide_true, List.length_cons, ↓reduceIte]
-        omega
-      · by_cases hpb : P b
-        · simp only [List.filter_cons, hqb, hpb, decide_true, decide_false, List.length_cons,
-            ↓reduceIte, Bool.false_eq_true]
-          omega
-        · simp only [List.filter_cons, hqb, hpb, decide_false, ↓reduceIte, Bool.false_eq_true]
-          exact this
-
-end Measure
+/-- Strictly fewer elements satisfy a predicate that one of them stops
+satisfying. -/
+theorem countP_lt_countP {α : Type} {l : List α} {p q : α → Bool}
+    (hpq : ∀ x ∈ l, p x → q x) {a : α} (ha : a ∈ l) (hq : q a) (hp : ¬ p a) :
+    l.countP p < l.countP q := by
+  obtain ⟨s, t, rfl⟩ := List.append_of_mem ha
+  have hs := List.countP_mono_left (fun x hx => hpq x (List.mem_append_left _ hx)) (l := s)
+  have ht := List.countP_mono_left
+    (fun x hx => hpq x (List.mem_append_right _ (List.mem_cons_of_mem _ hx))) (l := t)
+  simp [List.countP_append, hq, hp]
+  omega
 
 open Classical in
-/-- How many elements of `l` satisfy `P`. -/
-noncomputable def count {α : Type} (l : List α) (P : α → Prop) : Nat :=
-  (l.filter fun a => decide (P a)).length
-
-theorem count_lt_of_imp {α : Type} {l : List α} {P Q : α → Prop} (hpq : ∀ a, Q a → P a) (a : α)
-    (ha : a ∈ l) (hp : P a) (hq : ¬ Q a) : count l Q < count l P := by
-  unfold count
-  exact @filter_length_lt_of_imp _ _ _ (fun a => Classical.propDecidable (P a))
-    (fun a => Classical.propDecidable (Q a)) l hpq a ha hp hq
-
-/-- What a fetch has left to learn: the bounded nodes not yet held, not yet
-refused, and the bounded values not yet held. -/
+/-- What a fetch has left to learn: the bounded nodes not yet held, the bounded
+positions not yet refused, and the bounded values not yet held. -/
 noncomputable def remaining (b : Bounded c r) (st : Store) : Nat :=
-  count b.nodes (fun x => ¬ st.held x) + count b.positions (fun px => ¬ st.redacted px.1 px.2) +
-    count b.values (fun v => ¬ st.heldValue v)
+  b.nodes.countP (fun x => decide (¬ st.held x)) +
+    b.positions.countP (fun px => decide (¬ st.redacted px.1 px.2)) +
+    b.values.countP (fun v => decide (¬ st.heldValue v))
 
+open Classical in
 theorem remaining_lt {st st' : Store} (b : Bounded c r) (hstep : FetchStep c s heads r st st') :
     remaining b st' < remaining b st := by
   cases hstep with
-  | @node p x n hr _ _ =>
-    have hx : x ∈ b.nodes := b.node_mem p x hr.at
-    have hlt : count b.nodes (fun y => ¬ (y = x ∨ st.held y)) < count b.nodes (fun y => ¬ st.held y) :=
-      count_lt_of_imp (fun _ h hy => h (Or.inr hy)) x hx (by assumption) (fun h => h (Or.inl rfl))
+  | @node p x n hr hheld _ =>
+    have hx := b.node_mem p x hr.at
     simp only [remaining]
-    omega
-  | @redact p x hr _ _ _ =>
-    have hpx : (p, x) ∈ b.positions := b.position_mem p x hr.at
-    have hlt : count b.positions (fun qy => ¬ ((qy.1 = p ∧ qy.2 = x) ∨ st.redacted qy.1 qy.2)) <
-        count b.positions (fun qy => ¬ st.redacted qy.1 qy.2) :=
-      count_lt_of_imp (fun _ h hy => h (Or.inr hy)) (p, x) hpx (by assumption)
-        (fun h => h (Or.inl ⟨rfl, rfl⟩))
+    refine Nat.add_lt_add_right (Nat.add_lt_add_right (countP_lt_countP ?_ hx ?_ ?_) _) _
+    · intro y _ hy; simp_all
+    · simp_all
+    · simp
+  | @redact p x hr _ hred _ =>
+    have hpx := b.position_mem p x hr.at
     simp only [remaining]
-    omega
-  | @value p x n v hr _ hcn hv _ _ =>
-    have hv' : v ∈ b.values := b.value_mem p x n v hr.at hcn hv
-    have hlt : count b.values (fun y => ¬ (y = v ∨ st.heldValue y)) <
-        count b.values (fun y => ¬ st.heldValue y) :=
-      count_lt_of_imp (fun _ h hy => h (Or.inr hy)) v hv' (by assumption) (fun h => h (Or.inl rfl))
+    refine Nat.add_lt_add_right (Nat.add_lt_add_left (countP_lt_countP ?_ hpx ?_ ?_) _) _
+    · intro y _ hy; simp_all
+    · simp_all
+    · simp
+  | @value p x n v hr _ hcn hv hval _ =>
+    have hv' := b.value_mem p x n v hr.at hcn hv
     simp only [remaining]
-    omega
+    refine Nat.add_lt_add_left (countP_lt_countP ?_ hv' ?_ ?_) _
+    · intro y _ hy; simp_all
+    · simp_all
+    · simp
 
-/-- **The fetch terminates.**  No infinite sequence of fetch steps exists over a
-finite trie: every step learns something the bound counts. -/
+/-- **The fetch terminates.**  Over a finite trie, the fetch relation is
+well-founded: every step learns something the bound counts. -/
+theorem fetchStep_wf (b : Bounded c r) :
+    WellFounded (fun st' st : Store => FetchStep c s heads r st st') :=
+  Subrelation.wf (fun h => remaining_lt b h) (InvImage.wf (remaining b) Nat.lt_wfRel.wf)
+
+/-- No infinite sequence of fetch steps exists over a finite trie. -/
 theorem fetch_terminates (b : Bounded c r) :
     ¬ ∃ f : Nat → Store, ∀ i, FetchStep c s heads r (f i) (f (i + 1)) := by
   rintro ⟨f, hf⟩
@@ -469,16 +434,6 @@ theorem fetch_terminates (b : Bounded c r) :
 /-- The origin's trie is whole: every position under the root names a node. -/
 def Whole (c : Content) (root : Hash) : Prop := ∀ p x, At c root p x → ∃ n, c x = some n
 
-/-- For a scoped peer the claimed hash is not consulted, so the want a walk
-sends for a *value* — naming the value's hash at the node's position — is
-admitted at the node. -/
-theorem honest_value_want_admitted {prefixes : List Path} (hs : s.prefixes = some prefixes)
-    (hhead : heads r) (hr : Reach c st s r p x) (claimed : Hash) :
-    Admit c s heads ⟨r, p, claimed⟩ x := by
-  unfold Admit
-  rw [hs]
-  exact ⟨hhead, hr.admits, hr.at⟩
-
 /-- **A stuck fetch is complete.**  When a peer holding the root's head would
 serve anything the walk still asks for, a store with no fetch step left is
 complete within the scope.  `hadm` is the value-side assumption discussed in
@@ -492,11 +447,10 @@ theorem stuck_complete (hhead : heads r) (hwhole : Whole c r)
     obtain ⟨n, hcn⟩ := hwhole _ _ hr.at
     by_cases hn : AdmitsNode s p n
     · exact absurd (FetchStep.node hr hheld ⟨honest_want_admitted hhead hr, hcn, hn⟩) (hstuck _)
-    · have hfull : ¬ s.IsFull := fun full => hn (admitsNode_of_full full p n)
-      by_cases hred : st.redacted p x
+    · by_cases hred : st.redacted p x
       · exact ⟨hheld, fun inside => hn (no_redaction_inside_grant inside n), hred⟩
       · exact absurd
-          (FetchStep.redact hr hheld hred ⟨hfull, honest_want_admitted hhead hr, n, hcn, hn⟩)
+          (FetchStep.redact hr hheld hred ⟨honest_want_admitted hhead hr, n, hcn, hn⟩)
           (hstuck _)
   refine ⟨?_, fun hnb n v hcn hv => ?_⟩
   · by_cases hheld : st.held x
@@ -510,14 +464,16 @@ theorem stuck_complete (hhead : heads r) (hwhole : Whole c r)
     · exact hval
     exfalso
     refine hstuck _ (FetchStep.value hr hheld hcn hv hval ⟨rfl, ?_⟩)
-    cases hs : s.prefixes with
-    | none => trivial
-    | some _ => exact ⟨x, n, honest_value_want_admitted hs hhead hr v, hcn, hv,
-        hadm _ _ _ hr hheld hcn⟩
+    by_cases hs : s.IsFull
+    · unfold Scope.IsFull at hs; rw [hs]; trivial
+    · obtain ⟨_, hp⟩ := Scope.prefixes_of_not_full hs
+      rw [hp]
+      exact ⟨x, n, honest_value_want_admitted hs hhead hr v, hcn, hv, hadm _ _ _ hr hheld hcn⟩
 
 /-- The promotion `try_promote` performs once the fetch has nothing left: with
-`MptGc.State.complete` read as `CompleteWithin`, a stuck fetch enables
-`MptGc.Promote`, whose other premises are the slot state `offer_head` wrote. -/
+the root's `complete` bit read as `CompleteWithin` — the memo the drained walk
+writes — a stuck fetch enables `MptGc.Promote`, whose other premises are the
+slot state `offer_head` wrote. -/
 theorem stuck_fetch_promotes (m : MptGc.State) (hp : m.pending) (hret : m.retained)
     (hhead : heads r) (hwhole : Whole c r)
     (hadm : ∀ p x n, Reach c st s r p x → st.held x → c x = some n → AdmitsNode s p n)
@@ -529,5 +485,35 @@ theorem stuck_fetch_promotes (m : MptGc.State) (hp : m.pending) (hret : m.retain
         active := True
         materialized := True } :=
   ⟨hp, hret, stuck_complete hhead hwhole hadm hstuck, rfl⟩
+
+/-! ## The three pieces together -/
+
+/-- **Convergence.**  Two nodes that have heard the same heads select the same
+head; if each has fetched that head's root under the same scope until no step
+is left, each holds a trie complete within the scope, every admitted key has
+the same value on both, and each can read it or finds it under a boundary its
+peer refused.  The hypotheses are the assumptions listed in the module
+comment, and nothing else. -/
+theorem converge {l₁ l₂ : List Head} {h : Head} {st₁ st₂ : Store}
+    (canon : Canonical c)
+    (heard : ∀ x, x ∈ l₁ ↔ x ∈ l₂) (hsel : select l₁ = some h)
+    (hhead : heads h.root) (hwhole : Whole c h.root)
+    (hadm₁ : ∀ p x n, Reach c st₁ s h.root p x → st₁.held x → c x = some n → AdmitsNode s p n)
+    (hadm₂ : ∀ p x n, Reach c st₂ s h.root p x → st₂.held x → c x = some n → AdmitsNode s p n)
+    (hstuck₁ : ∀ st', ¬ FetchStep c s heads h.root st₁ st')
+    (hstuck₂ : ∀ st', ¬ FetchStep c s heads h.root st₂ st') :
+    select l₂ = some h ∧
+    CompleteWithin c st₁ s h.root ∧ CompleteWithin c st₂ s h.root ∧
+    (∀ key v₁ v₂, ScopedView c s h.root key v₁ → ScopedView c s h.root key v₂ → v₁ = v₂) ∧
+    (∀ key v, ScopedView c s h.root key v →
+      ((∃ p x, At c h.root p x ∧ CarriesKey c x p key v ∧ st₁.held x) ∨
+        ∃ p' x', p' <+: key ∧ Reach c st₁ s h.root p' x' ∧ Boundary s st₁ p' x') ∧
+      ((∃ p x, At c h.root p x ∧ CarriesKey c x p key v ∧ st₂.held x) ∨
+        ∃ p' x', p' <+: key ∧ Reach c st₂ s h.root p' x' ∧ Boundary s st₂ p' x')) :=
+  have hc₁ := stuck_complete hhead hwhole hadm₁ hstuck₁
+  have hc₂ := stuck_complete hhead hwhole hadm₂ hstuck₂
+  ⟨(select_eq_of_mem_iff heard).symm.trans hsel, hc₁, hc₂,
+    fun _ _ _ h₁ h₂ => scoped_view_deterministic canon h₁ h₂,
+    fun _ _ hv => ⟨admitted_key_readable hc₁ hv.1 hv.2, admitted_key_readable hc₂ hv.1 hv.2⟩⟩
 
 end Synchronicity.Convergence

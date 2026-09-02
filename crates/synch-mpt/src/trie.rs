@@ -290,7 +290,7 @@ impl MissingWalk {
     /// matching one in a trie held whole *within this scope* is a subtree held
     /// whole within this scope, since every boundary the walk stops at is a
     /// scope edge.
-    // LEAN-MODEL: mpt-walk-scoped
+    // LEAN-MODEL: mpt-walk-scoped (ScopedSync.Reach)
     // `ScopedSync.Reach`: the root is on the frontier when its position is
     // admitted, and (in `next_batch`) a child is pushed when its position is.
     pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
@@ -302,7 +302,7 @@ impl MissingWalk {
     /// The reference root, when given, must be complete *with the same
     /// provenance*: pruning a shared subtree stands in for having fetched it
     /// as `owner`'s, which a reference merely held whole cannot vouch for.
-    // LEAN-MODEL: mpt-walk-owned
+    // LEAN-MODEL: mpt-walk-owned (Provenance.view)
     // `Provenance.view`: the store a walk with an owner sees is the shared
     // store cut down to what was served as that origin's.
     pub fn for_origin(
@@ -392,7 +392,7 @@ impl MissingWalk {
             }
             // The same hash in a trie held whole: this subtree is already here,
             // values and all.
-            // LEAN-MODEL: mpt-walk-prune-reference
+            // LEAN-MODEL: mpt-walk-prune-reference (ScopedSync.ReachRef)
             // `ScopedSync.ReachRef`; `prune_sound` is why the memo written
             // after a pruned walk is true, given `mpt-walk-paired-children`.
             if reference == Some(hash) {
@@ -422,7 +422,7 @@ impl MissingWalk {
                 // subtree it never fetched, and `paired_children`, which
                 // follows held reference nodes, would prune against that
                 // subtree under the next root.
-                // LEAN-MODEL: mpt-walk-boundary
+                // LEAN-MODEL: mpt-walk-boundary (ScopedSync.Boundary)
                 // `ScopedSync.Boundary`: an absent hash refused at this
                 // position is satisfied, not missing, only above the grant.
                 if !self.scope.contains_subtree(&path)
@@ -524,7 +524,7 @@ impl MissingWalk {
 }
 
 /// The deduplication key for a node at a position ([`Visit`]).
-// LEAN-MODEL: mpt-walk-seen
+// LEAN-MODEL: mpt-walk-seen (ScopedSync.children_inside_grant_admitted)
 // `ScopedSync.children_inside_grant_admitted`: inside the grant expansion is
 // position-independent, which is what makes the hash alone a sound key there.
 // `Reach` is stated per position.
@@ -544,7 +544,7 @@ fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
 /// to it (one for a branch slot, the whole prefix for an extension), the
 /// position a scoped fetch is authorized on (§5.5), which costs the walk
 /// nothing to keep.
-// LEAN-MODEL: mpt-walk-paired-children
+// LEAN-MODEL: mpt-walk-paired-children (ScopedSync.Paired)
 // `ScopedSync.Paired`: the reference descended through held nodes along the
 // same steps. `paired_reaches` shows those are positions the reference root's
 // own scoped walk reached, because a held node is never a boundary.
@@ -686,7 +686,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// must agree about which keys exist — the whole of what
     /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
     /// the ingest bound are for.
-    // LEAN-MODEL: mpt-trie-get
+    // LEAN-MODEL: mpt-trie-get (Convergence.HasValue)
     // `Convergence.HasValue`; `view_deterministic` is why a key has one value
     // under a root, given `check_invariants`' non-empty extension prefix.
     pub fn get(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
@@ -1329,7 +1329,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Completeness is a property of a root *and* a scope: a trie held whole
     /// within one grant is not held whole within a wider one. The memo is keyed
     /// by both, so widening a scope re-derives rather than inheriting.
-    // LEAN-MODEL: mpt-complete-scoped
+    // LEAN-MODEL: mpt-complete-scoped (ScopedSync.CompleteWithin)
     // `ScopedSync.CompleteWithin`: every position the scoped walk reaches is
     // held or a boundary, and every expanded node has its value.
     pub fn is_complete_scoped(&self, root: Hash, scope: &Scope) -> Result<bool, MptError> {
@@ -1345,7 +1345,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// never shown is not complete however many of them this store holds.
     /// Memoized under a key of its own, since it is a stricter question than
     /// either of the other two.
-    // LEAN-MODEL: mpt-complete-owned
+    // LEAN-MODEL: mpt-complete-owned (Provenance.step_sound)
     // `Provenance.withheld_root_incomplete`: a confined origin's root that
     // reaches a node the origin could not legitimately hold never completes.
     pub fn is_complete_scoped_for(
@@ -1379,7 +1379,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// One merged descent over the sorted paths shares every prefix two wants
     /// have in common: a batch is the frontier of a single walk, so the cost is
     /// close to trie depth plus batch size, not their product.
-    // LEAN-MODEL: mpt-resolve-position
+    // LEAN-MODEL: mpt-resolve-position (ScopedSync.At)
     // `ScopedSync.At`; `At.unique` is why a position names one hash, given
     // `check_invariants`' non-empty extension prefix.
     pub fn resolve_paths(
@@ -1465,7 +1465,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     ///
     /// An absent node stops that branch rather than raising: this is asked of
     /// a trie about to be promoted, where absence was already settled by fetch.
-    // LEAN-MODEL: mpt-first-key-outside
+    // LEAN-MODEL: mpt-first-key-outside (ScopedSync.keys_below_grant_admitted)
     // `ScopedSync.keys_below_grant_admitted`: skipping a position inside a
     // granted prefix loses no key outside the grant.
     pub fn first_key_outside(

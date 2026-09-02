@@ -25,19 +25,21 @@ variable {H : Type} [Roles H]
 between a loss and its heal. -/
 def Lost (c : Cell H) : Prop := c.durable ∧ ¬(c.bytes ∨ c.remote)
 
-/- The backend loses an object it acknowledged.  No Rust site: this is the
-   environment breaking its contract. -/
+/-- The backend loses an object it acknowledged.  No Rust site: this is the
+environment breaking its contract. -/
 def LoseRemote (c c' : Cell H) : Prop := c' = { c with remote := False }
 
-/- The local payload or outboard goes missing or is truncated.  No Rust site. -/
+/-- The local payload or outboard goes missing or is truncated.  No Rust
+site. -/
 def LoseBytes (c c' : Cell H) : Prop := c' = { c with bytes := False }
 
-/- RUST-IMPL: cas-heal-missing-durable — `cas.rs::Store::heal_missing_durable_blob`.
-   The backend answered `NotFound` for a durable root.  The durable claim is
-   withdrawn, a row with nothing cached goes with it, every role's pin becomes
-   a repair want, and the operator's pin is left standing.  Unguarded on the
-   loss itself: the heal believes the backend, and a spurious answer costs a
-   refetch rather than a promise. -/
+/-- `cas.rs::Store::heal_missing_durable_blob`.  The backend answered
+`NotFound` for a durable root.  The durable claim is withdrawn, a row with
+nothing cached goes with it, every role's pin becomes a repair want, and the
+operator's pin is left standing.  Unguarded on the loss itself: the heal
+believes the backend, and a spurious answer costs a refetch rather than a
+promise. -/
+@[rust_impl "cas-heal-missing-durable"]
 def HealRemote (c c' : Cell H) : Prop :=
   c.durable ∧
   c' = { c with
@@ -46,9 +48,10 @@ def HealRemote (c c' : Cell H) : Prop :=
     pin := fun holder => c.pin holder ∧ ¬IsRole holder
     want := fun holder => c.want holder ∨ (IsRole holder ∧ c.pin holder) }
 
-/- RUST-IMPL: cas-heal-missing-local — `cas.rs::Store::heal_missing_local_blob`.
-   A local read found the payload missing or short.  The complete and durable
-   claims are withdrawn, the row stays, and pins convert as above. -/
+/-- `cas.rs::Store::heal_missing_local_blob`.  A local read found the payload
+missing or short.  The complete and durable claims are withdrawn, the row
+stays, and pins convert as above. -/
+@[rust_impl "cas-heal-missing-local"]
 def HealLocal (c c' : Cell H) : Prop :=
   c.row ∧
   c' = { c with
@@ -57,6 +60,7 @@ def HealLocal (c c' : Cell H) : Prop :=
     pin := fun holder => c.pin holder ∧ ¬IsRole holder
     want := fun holder => c.want holder ∨ (IsRole holder ∧ c.pin holder) }
 
+/-- A cell transition, a loss, or a heal. -/
 inductive FaultStep : Cell H → Cell H → Prop where
   | cell : CellStep c c' → FaultStep c c'
   | loseRemote : LoseRemote c c' → FaultStep c c'
@@ -66,74 +70,39 @@ inductive FaultStep : Cell H → Cell H → Prop where
 
 variable {c c' : Cell H} {holder : H}
 
-/-- A heal turns every role's live claim from a pin into a want. -/
-theorem LiveClaim.heal (h : LiveClaim c holder)
-    (entry : c.entry → c'.entry)
-    (want : c.want holder ∨ (IsRole holder ∧ c.pin holder) → c'.want holder) :
-    LiveClaim c' holder :=
-  ⟨h.1, entry h.2.1,
-    Or.inr (want (h.2.2.elim (fun p => Or.inr ⟨h.1, p.1⟩) Or.inl))⟩
-
 theorem fault_invariant_step (hinv : Cas.Invariant c) (hstep : FaultStep c c') :
     Cas.Invariant c' := by
-  obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
   cases hstep with
-  | cell step => exact invariant_step ⟨pins, sources, replicas, ordinary, sweepInv⟩ step
-  | loseRemote h =>
-      obtain ⟨rfl⟩ := h
-      exact ⟨pins, sources, replicas, ordinary, sweepInv⟩
-  | loseBytes h =>
-      obtain ⟨rfl⟩ := h
-      exact ⟨pins, sources, replicas, ordinary, sweepInv⟩
-  | healRemote h =>
-      obtain ⟨_, rfl⟩ := h
-      exact ⟨fun _ role pinned => absurd role pinned.2,
-        fun h l => LiveClaim.heal (sources h l) id id,
-        fun h l => LiveClaim.heal (replicas h l) id id,
-        ordinary,
-        fun sw => ⟨(sweepInv sw).1, fun h p => (sweepInv sw).2.1 h p.1, (sweepInv sw).2.2.1,
-          fun row => (sweepInv sw).2.2.2 row.1⟩⟩
-  | healLocal h =>
-      obtain ⟨_, rfl⟩ := h
-      exact ⟨fun _ role pinned => absurd role pinned.2,
-        fun h l => LiveClaim.heal (sources h l) id id,
-        fun h l => LiveClaim.heal (replicas h l) id id,
-        ordinary,
-        fun sw => ⟨(sweepInv sw).1, fun h p => (sweepInv sw).2.1 h p.1, (sweepInv sw).2.2⟩⟩
+  | cell step => exact invariant_step hinv step
+  | _ h =>
+    obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
+    simp only [LoseRemote, LoseBytes, HealRemote, HealLocal] at h
+    subst_step h <;> constructor <;> grind [LiveClaim, Durable]
 
 def SystemInvariant (s : State H) : Prop := ∀ root, Cas.Invariant (s root)
 
-inductive Step : State H → State H → Prop where
-  | root {s : State H} {root : Root} {cell' : Cell H} :
-      FaultStep (s root) cell' → Step s (Replace s root cell')
+abbrev Step : State H → State H → Prop := Lift FaultStep
 
-inductive Reachable : State H → Prop where
-  | initial : Reachable Initial
-  | next {s s' : State H} : Reachable s → Step s s' → Reachable s'
+/-- The fault-tolerant system. -/
+def system (H : Type) [Roles H] : System (State H) := ⟨Initial, Step⟩
+
+abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
 theorem initial_invariant : SystemInvariant (Initial : State H) :=
   fun _ => Cas.initial_invariant
 
 theorem invariant_step {s s' : State H} (hinv : SystemInvariant s) (hstep : Step s s') :
-    SystemInvariant s' := by
-  cases hstep with
-  | root step => exact replace_forall hinv (fault_invariant_step (hinv _) step)
+    SystemInvariant s' :=
+  Lift.forall (fun inv step => fault_invariant_step inv step) hinv hstep
 
-theorem reachable_invariant {s : State H} (h : Reachable s) : SystemInvariant s := by
-  induction h with
-  | initial => exact initial_invariant
-  | next _ step ih => exact invariant_step ih step
+theorem reachable_invariant {s : State H} (h : Reachable s) : SystemInvariant s :=
+  h.invariant initial_invariant invariant_step
 
-/- Every fault-free execution is an execution here, so the `SystemSafety`
-   theorems are this model's fault-free specialization. -/
-theorem fault_free_step {s s' : State H} (h : SystemSafety.Step s s') : Step s s' := by
-  cases h with
-  | root step => exact .root (.cell step)
-
-theorem fault_free_is_reachable {s : State H} (h : SystemSafety.Reachable s) : Reachable s := by
-  induction h with
-  | initial => exact .initial
-  | next _ step ih => exact .next ih (fault_free_step step)
+/-- Every fault-free execution is an execution here, so the `SystemSafety`
+theorems are this model's fault-free specialization. -/
+theorem fault_free_is_reachable {s : State H} (h : SystemSafety.Reachable s) : Reachable s :=
+  System.Reachable.mono (S := SystemSafety.system H) (T := system H) rfl
+    (fun step => Lift.mono (fun cell => FaultStep.cell cell) step) h
 
 /-! ## What survives a loss -/
 
@@ -188,12 +157,41 @@ theorem local_heal_converts_role_pins (heal : HealLocal c c') (role : IsRole hol
   obtain ⟨_, rfl⟩ := heal
   exact ⟨fun pinned => pinned.2 role, fun pinned => Or.inr ⟨role, pinned⟩⟩
 
-/- The operator's pin is a person's promise the node reports rather than
-   rewrites: it survives the heal, standing over a claim the node has just
-   withdrawn.  Nothing in this model says anything stronger about it. -/
+/-- The operator's pin is a person's promise the node reports rather than
+rewrites: it survives the heal, standing over a claim the node has just
+withdrawn.  Nothing in this model says anything stronger about it. -/
 theorem heal_keeps_operator_pin (heal : HealRemote c c') (operator : ¬IsRole holder)
     (pinned : c.pin holder) : c'.pin holder ∧ ¬c'.durable := by
   obtain ⟨_, rfl⟩ := heal
   exact ⟨⟨pinned, operator⟩, id⟩
+
+/-! ## At the system's own holders
+
+`SystemSafety.Holder` is `Nat` with the operator at `0`.  The theorems above
+are stated for any `Roles` instance; these are the two the design document
+quotes, read at the instance the system runs. -/
+
+section Holder
+
+open SystemSafety (Holder operator)
+
+/-- `synch pin add`'s pin survives a heal over the claim it withdrew. -/
+theorem operator_pin_survives_heal {c c' : Cell Holder} (heal : HealRemote c c')
+    (pinned : c.pin operator) : c'.pin operator ∧ ¬c'.durable :=
+  heal_keeps_operator_pin heal SystemSafety.operator_not_role pinned
+
+/-- Every holder but the operator has its pin converted to a want by a heal. -/
+theorem configured_pin_becomes_want {c c' : Cell Holder} (heal : HealRemote c c')
+    {holder : Holder} (configured : holder ≠ operator) :
+    ¬c'.pin holder ∧ (c.pin holder → c'.want holder) :=
+  heal_converts_role_pins heal configured
+
+/-- No live leaf of the system is the operator's. -/
+theorem operator_holds_no_leaf {s : State Holder} {root : Root} (reachable : Reachable s) :
+    ¬(s root).sourceLive operator ∧ ¬(s root).replicaLive operator :=
+  ⟨fun live => live_holders_are_roles reachable (Or.inl live) rfl,
+    fun live => live_holders_are_roles reachable (Or.inr live) rfl⟩
+
+end Holder
 
 end Synchronicity.FaultTolerant

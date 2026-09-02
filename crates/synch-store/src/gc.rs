@@ -51,7 +51,7 @@ impl Store {
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub(crate) fn gc_trie(&self) -> Result<GcStats> {
-        // LEAN-MODEL: mpt-trie-gc
+        // LEAN-MODEL: mpt-trie-gc (MptGc.TrieGc)
         // `MptGc.TrieGc` models this whole immediate transaction, not its
         // individual reads and deletes; splitting it invalidates the theorem.
         let mut stats = GcStats::default();
@@ -68,7 +68,7 @@ impl Store {
                 // multiplier is in the thousands for a node that publishes
                 // steadily. All of it inside the immediate transaction below,
                 // which holds the one write connection.
-                // LEAN-MODEL: mpt-trie-mark-sweep
+                // LEAN-MODEL: mpt-trie-mark-sweep (TrieGraph.GcSweep)
                 // `TrieGraph.GcSweep` states the graph-level obligation: every
                 // stored node reachable from any retained root is in the mark set.
                 let trie = Trie::new(txn);
@@ -139,7 +139,7 @@ impl Store {
     /// collected, without it it is. Every write path stamps the column, which
     /// is all this needs.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
-        // LEAN-MODEL: cas-retention-elapses
+        // LEAN-MODEL: cas-retention-elapses (Cas.Age)
         // `Cas.Age` abstracts crossing this `before` horizon; it grants no
         // permission by itself, only removes the freshness guard.
         let referenced = self.referenced_content()?;

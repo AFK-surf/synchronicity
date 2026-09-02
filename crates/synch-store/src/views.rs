@@ -1127,9 +1127,10 @@ impl Txn<'_> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<usize> {
-        // LEAN-MODEL: mpt-materialize-live-diff
         // `SystemSafety` models each changed leaf by its add/remove and entry
-        // transitions. Rust commits the entire collection with the head flip.
+        // transitions (the `mpt-materialize-*` anchors in `apply_change`, and
+        // `cas-remote-promotion`/`cas-ordinary-promotion` in `try_promote`).
+        // Rust commits the entire collection with the head flip.
         // Scoped exactly as the fetch that filled this trie was: a node
         // reading under a scope holds only that part, and materializing what
         // it does not hold is not a thing it could do (§5.5). For this node's
@@ -1463,6 +1464,13 @@ fn apply_change(
         };
         match change.kind {
             ChangeKind::Deleted => {
+                // LEAN-MODEL: mpt-materialize-remove-source (Cas.RemoveSource)
+                // LEAN-MODEL: mpt-materialize-remove-replica (Cas.RemoveReplica)
+                // LEAN-MODEL: mpt-materialize-remove-ordinary (Cas.RemoveOrdinary)
+                // LEAN-MODEL: mpt-materialize-drop-entry (Cas.DropEntry)
+                // A deleted leaf leaves the derived views: the leaf of whatever
+                // kind this origin held, and the entry row once no leaf names
+                // the content.
                 tx.execute(
                     "DELETE FROM entries WHERE origin_id = ?1 AND space = ?2 AND path = ?3",
                     params![origin.canonical(), space, path],

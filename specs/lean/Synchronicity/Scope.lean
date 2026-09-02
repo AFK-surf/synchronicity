@@ -1,3 +1,5 @@
+import Synchronicity.Anchors
+
 /-!
 The positional scope predicates of §5.5, as `synch-mpt/src/scope.rs` states them.
 
@@ -7,6 +9,11 @@ irrelevant to anything proved — and the lemmas are the facts both sides of a
 scoped fetch rely on: the spine above an admitted position is admitted, nothing
 below a granted prefix can leave it, and a node sitting inside the grant is
 never refused.
+
+The whole keyspace is `prefixes = none`.  That is the one place the `Option`
+is load-bearing — an unscoped peer is served by hash rather than by position
+(`ScopedSync.Admit`) — and every theorem that needs a scope to be partial says
+so with `¬ s.IsFull`.
 -/
 
 namespace Synchronicity
@@ -26,18 +33,28 @@ def full : Scope := ⟨none, []⟩
 
 def IsFull (s : Scope) : Prop := s.prefixes = none
 
-/- RUST-IMPL: mpt-scope-admits-path — `scope.rs::Scope::admits_path`.  A node at
-   `path` commits to every key beginning with `path`, so it is in scope as an
-   ancestor of a granted prefix or inside one; an exact key admits the spine
-   down to it and the key itself, never a position below it. -/
+theorem full_isFull : full.IsFull := rfl
+
+/-- A partial scope has a prefix list. -/
+theorem prefixes_of_not_full (h : ¬ s.IsFull) : ∃ prefixes, s.prefixes = some prefixes := by
+  cases hp : s.prefixes with
+  | none => exact absurd hp h
+  | some prefixes => exact ⟨prefixes, rfl⟩
+
+/-- `scope.rs::Scope::admits_path`.  A node at `path` commits to every key
+beginning with `path`, so it is in scope as an ancestor of a granted prefix or
+inside one; an exact key admits the spine down to it and the key itself, never
+a position below it. -/
+@[rust_impl "mpt-scope-admits-path"]
 def AdmitsPath (s : Scope) (path : Path) : Prop :=
   match s.prefixes with
   | none => True
   | some prefixes =>
       (∃ p ∈ prefixes, path <+: p ∨ p <+: path) ∨ ∃ k ∈ s.exact, path <+: k
 
-/- RUST-IMPL: mpt-scope-contains-subtree — `scope.rs::Scope::contains_subtree`.
-   Everything below `path` is inside the grant. -/
+/-- `scope.rs::Scope::contains_subtree`.  Everything below `path` is inside
+the grant. -/
+@[rust_impl "mpt-scope-contains-subtree"]
 def ContainsSubtree (s : Scope) (path : Path) : Prop :=
   match s.prefixes with
   | none => True

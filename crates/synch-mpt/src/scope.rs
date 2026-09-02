@@ -68,7 +68,7 @@ impl Scope {
     /// in scope as an ancestor of an allowed prefix or inside one. Both
     /// directions matter: the ancestors are the spine that makes the signed
     /// root recompute.
-    // LEAN-MODEL: mpt-scope-admits-path
+    // LEAN-MODEL: mpt-scope-admits-path (Scope.AdmitsPath)
     // `Scope.AdmitsPath`; `admitsPath_of_append` is the spine property.
     pub fn admits_path(&self, path: &[u8]) -> bool {
         match &self.prefixes {
@@ -91,7 +91,7 @@ impl Scope {
     /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
-    // LEAN-MODEL: mpt-scope-contains-subtree
+    // LEAN-MODEL: mpt-scope-contains-subtree (Scope.ContainsSubtree)
     // `Scope.ContainsSubtree`; `containsSubtree_append` is the stop-at-the-
     // boundary property.
     pub fn contains_subtree(&self, path: &[u8]) -> bool {
@@ -118,7 +118,7 @@ impl Scope {
     /// record too.
     ///
     /// What is tested here is the node's *coverage*, not its position.
-    // LEAN-MODEL: mpt-scope-admits-node
+    // LEAN-MODEL: mpt-scope-admits-node (ScopedSync.AdmitsNode)
     // `ScopedSync.AdmitsNode`; `no_redaction_inside_grant` is why a position
     // inside a granted prefix is never refused.
     pub fn admits_node(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {

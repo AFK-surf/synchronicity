@@ -1,5 +1,6 @@
+import Synchronicity.Prelude
+import Synchronicity.Anchors
 import Synchronicity.Cas
-import Synchronicity.CasGc
 import Synchronicity.Convergence
 import Synchronicity.FaultTolerant
 import Synchronicity.MptGc

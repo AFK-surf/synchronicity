@@ -103,7 +103,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             // holds nothing this node was sent, so descending it would fail on
             // an absence that is the design working. Tested before the cursors
             // are taken, since taking them reads the absent node (§5.5).
-            // LEAN-MODEL: mpt-diff-scoped
+            // LEAN-MODEL: mpt-diff-scoped (ScopedSync.DiffReach)
             // `ScopedSync.DiffReach`; `diff_never_misses` is why, over a root
             // complete within the scope, this walk reads no absent node.
             if !scope.admits_path(path) {

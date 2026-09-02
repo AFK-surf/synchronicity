@@ -340,7 +340,7 @@ impl MptProtocol {
                         // material of its own — an extension's prefix, a leaf's
                         // remaining key and value — and one sitting on the spine
                         // can describe a key range the peer was never granted.
-                        // LEAN-MODEL: mpt-serve-node
+                        // LEAN-MODEL: mpt-serve-node (ScopedSync.ServeNode)
                         // `ScopedSync.ServeNode`/`Redacts`;
                         // `served_reveals_within_scope` is the privacy claim.
                         if !scope.is_full()
@@ -434,7 +434,7 @@ impl MptProtocol {
                                             // other served the contents of, for
                                             // the price of knowing its value
                                             // hash.
-                                            // LEAN-MODEL: mpt-serve-value
+                                            // LEAN-MODEL: mpt-serve-value (ScopedSync.ServeValue)
                                             // `ScopedSync.ServeValue`.
                                             node.value_hashes().contains(&wanted.1)
                                                 && scope.admits_node(&wanted.0, &node)
@@ -625,7 +625,7 @@ impl Distinct {
 /// one hop. A root this store holds no head for demands nothing: `admit` has
 /// already refused it for a scoped peer, and an unscoped peer may have any
 /// node this store holds.
-// LEAN-MODEL: mpt-serve-vouched
+// LEAN-MODEL: mpt-serve-vouched (Provenance.Vouched)
 // `Provenance.Vouched`; `Provenance.serve_legit` is why what a responder hands
 // out under any root is legitimately the reader's to hold.
 struct Vouch {
@@ -673,7 +673,7 @@ impl Vouch {
 /// it is not a race: an honest peer prunes its own frontier at the boundary
 /// and never asks. A request that crosses it is a probe, and saying so is
 /// worth more than quietly returning nothing.
-// LEAN-MODEL: mpt-serve-admit
+// LEAN-MODEL: mpt-serve-admit (ScopedSync.Admit)
 // `ScopedSync.Admit`; `admit_ignores_claim` and `admit_unique` are "a hash
 // cannot be authorized; a position can".
 fn admit(
