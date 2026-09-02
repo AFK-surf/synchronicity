@@ -431,7 +431,7 @@ fn held_spaces(node: &Node) -> Result<Vec<String>> {
 /// Reads the routing claim away from an async runtime worker.
 async fn current_held_spaces(node: &Node) -> Result<Vec<String>> {
     let node = node.clone();
-    Ok(crate::blocking::offload(move || held_spaces(&node)).await?)
+    crate::blocking::offload(move || held_spaces(&node)).await
 }
 
 /// Publishes a replacement routing claim when local participation changed.
