@@ -129,7 +129,10 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   (`cloud-1`) and durably replicates everything published on it. This service
   is the authority and the API; the fleet is cattle that polls it. See
   [The cloud data plane](#the-cloud-data-plane) below and
-  [docs/CLOUD-DATAPLANE.md](../docs/CLOUD-DATAPLANE.md).
+  [docs/CLOUD-DATAPLANE.md](../docs/CLOUD-DATAPLANE.md). A write surface on
+  the file API — `PUT`/`DELETE …/browse/file`, only for hosted networks and
+  only ever taken by the hosted replica, behind a third per-network switch —
+  is designed in [docs/CLOUD-WRITES.md](../docs/CLOUD-WRITES.md).
 
 ## API keys
 

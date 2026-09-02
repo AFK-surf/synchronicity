@@ -1384,6 +1384,12 @@ crates/synch-dp/
 - **Redundant hosting** — a second slot (`cloud-2`) on a different data
   plane. The slot model (§3.4) and the assignment are built for it; what is
   missing is billing and a status API that assume one row per network.
+- **Writes through the control plane's file API**, published by the hosted
+  node as `cloud-1`'s own assertions and reaching it over a second tunnel
+  that only the data plane opens — never the customer's daemons, whose browse
+  tunnel keeps encoding no write. Designed in
+  [docs/CLOUD-WRITES.md](CLOUD-WRITES.md); it is what "v1 has no write
+  surface at all" (§4.4) gives way to.
 - **Delegate-scoped hosting** (§9): the hosted node admitted for named
   spaces only, so the fleet never sees the rest. A different product tier,
   not a fix.
