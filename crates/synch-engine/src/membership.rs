@@ -988,8 +988,11 @@ impl Node {
             // whole; judging it by the grant would call a genuinely partial
             // local trie servable.
             let servable = match &complete {
-                Some(head) => trie
-                    .is_complete_scoped(head.root, &self.store().materialization_scope(&origin)?)?,
+                Some(head) => trie.is_complete_scoped_for(
+                    self.store().provenance_owner(&origin, now)?.as_ref(),
+                    head.root,
+                    &self.store().materialization_scope(&origin)?,
+                )?,
                 None => false,
             };
             let bound = !self.store().keys_for_origin(&origin, now)?.is_empty();

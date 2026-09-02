@@ -517,6 +517,27 @@ impl Store {
         rows.try_fold(false, |seen, row| Ok(seen || !excluded.contains(&row?)))
     }
 
+    /// The origins this node holds `root` as a verified head of, in any slot
+    /// or in the retained history.
+    ///
+    /// What a responder needs to decide whose trie a request is walking: a
+    /// confined origin's root is served only with provenance
+    /// (`NodeStore::owns_node`), and the same root may in principle stand in
+    /// more than one origin's history.
+    pub fn head_root_origins(&self, root: &Hash) -> Result<Vec<OriginId>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT origin_id FROM head_history WHERE root = ?1")?;
+        let rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(origin_column(row?, "head_history.origin_id")?);
+        }
+        Ok(out)
+    }
+
     /// The retained history for an origin, newest first.
     pub fn head_history(&self, origin: &OriginId) -> Result<Vec<SignedHead>> {
         let conn = self.conn();

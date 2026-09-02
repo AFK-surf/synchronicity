@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use synch_core::{Hash, MAX_KEY_LEN};
+use synch_core::{Hash, OriginId, MAX_KEY_LEN};
 
 use crate::{
     error::MptError,
@@ -261,6 +261,15 @@ pub struct MissingWalk {
     /// would be refused — the serving peer applies the same predicate, so an
     /// out-of-scope request is a probe, never a race.
     scope: Scope,
+    /// The origin whose trie this is, when presence must carry provenance.
+    ///
+    /// `Some` for a confined origin's root: a node counts as present only if
+    /// this store was served it as that origin's ([`NodeStore::owns_node`]),
+    /// so a node merely held from another origin's trie is asked for again —
+    /// and an origin that never held it cannot supply it. `None` reads
+    /// presence off the shared store, which is right for a rooted origin and
+    /// for this node's own trie.
+    owner: Option<OriginId>,
 }
 
 impl MissingWalk {
@@ -281,7 +290,27 @@ impl MissingWalk {
     /// matching one in a trie held whole *within this scope* is a subtree held
     /// whole within this scope, since every boundary the walk stops at is a
     /// scope edge.
+    // LEAN-MODEL: mpt-walk-scoped
+    // `ScopedSync.Reach`: the root is on the frontier when its position is
+    // admitted, and (in `next_batch`) a child is pushed when its position is.
     pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
+        MissingWalk::for_origin(None, known_complete, root, scope)
+    }
+
+    /// A scoped walk whose presence carries provenance for `owner`.
+    ///
+    /// The reference root, when given, must be complete *with the same
+    /// provenance*: pruning a shared subtree stands in for having fetched it
+    /// as `owner`'s, which a reference merely held whole cannot vouch for.
+    // LEAN-MODEL: mpt-walk-owned
+    // `Provenance.view`: the store a walk with an owner sees is the shared
+    // store cut down to what was served as that origin's.
+    pub fn for_origin(
+        owner: Option<OriginId>,
+        known_complete: Option<Hash>,
+        root: Hash,
+        scope: Scope,
+    ) -> MissingWalk {
         let frontier = match root_opt(root) {
             None => Vec::new(),
             Some(root) if scope.admits_path(&[]) => {
@@ -295,6 +324,7 @@ impl MissingWalk {
             deferred: Vec::new(),
             must_be_branch: HashSet::new(),
             scope,
+            owner,
         }
     }
 
@@ -362,28 +392,44 @@ impl MissingWalk {
             }
             // The same hash in a trie held whole: this subtree is already here,
             // values and all.
+            // LEAN-MODEL: mpt-walk-prune-reference
+            // `ScopedSync.ReachRef`; `prune_sound` is why the memo written
+            // after a pruned walk is true, given `mpt-walk-paired-children`.
             if reference == Some(hash) {
                 continue;
             }
             if !self.seen.insert(visit(&self.scope, hash, &path)) {
                 continue;
             }
-            // A position a peer has refused holds nothing this node may see,
-            // so it is satisfied rather than missing (§5.5). Only above the
-            // grant: inside it nothing could rightly be refused, and calling
-            // such a trie complete would vouch for what is not held.
-            // It cannot be tightened to `admits_path`: the child filter below
-            // drops every unadmitted position, so the memo would never fire.
-            // The refusal is looked up for *this* position: an honest one
-            // (`Ext`/`Leaf` running out of scope) is about where the node
-            // sits, and the same node at another spine position may lead back
-            // into the grant. The distinction lives where the node is:
-            // `Scope::admits_node`, which no longer refuses a branch it can
-            // serve.
-            if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash, Some(&path))? {
-                continue;
-            }
-            let Some(data) = trie.load_raw(&hash)? else {
+            let Some(data) = trie.load_owned_raw(self.owner.as_ref(), &hash)? else {
+                // A position a peer has refused holds nothing this node may
+                // see, so it is satisfied rather than missing (§5.5). Only
+                // above the grant: inside it nothing could rightly be refused,
+                // and calling such a trie complete would vouch for what is not
+                // held. It cannot be tightened to `admits_path`: the child
+                // filter below drops every unadmitted position, so the memo
+                // would never fire. The refusal is looked up for *this*
+                // position: an honest one (`Ext`/`Leaf` running out of scope)
+                // is about where the node sits, and the same node at another
+                // spine position may lead back into the grant. The distinction
+                // lives where the node is: `Scope::admits_node`, which no
+                // longer refuses a branch it can serve.
+                //
+                // And only for an *absent* node. A node this store holds —
+                // served at another position it shares by structure, whatever
+                // a peer refused here — is expanded wherever the walk meets it.
+                // A held boundary would stop the walk above an in-grant
+                // subtree it never fetched, and `paired_children`, which
+                // follows held reference nodes, would prune against that
+                // subtree under the next root.
+                // LEAN-MODEL: mpt-walk-boundary
+                // `ScopedSync.Boundary`: an absent hash refused at this
+                // position is satisfied, not missing, only above the grant.
+                if !self.scope.contains_subtree(&path)
+                    && trie.is_redacted_raw(&hash, Some(&path))?
+                {
+                    continue;
+                }
                 missing.nodes.push((path.clone(), hash));
                 self.deferred.push((reference, hash, path));
                 continue;
@@ -478,6 +524,10 @@ impl MissingWalk {
 }
 
 /// The deduplication key for a node at a position ([`Visit`]).
+// LEAN-MODEL: mpt-walk-seen
+// `ScopedSync.children_inside_grant_admitted`: inside the grant expansion is
+// position-independent, which is what makes the hash alone a sound key there.
+// `Reach` is stated per position.
 fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
     match scope.contains_subtree(path) {
         true => (hash, None),
@@ -494,6 +544,10 @@ fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
 /// to it (one for a branch slot, the whole prefix for an extension), the
 /// position a scoped fetch is authorized on (§5.5), which costs the walk
 /// nothing to keep.
+// LEAN-MODEL: mpt-walk-paired-children
+// `ScopedSync.Paired`: the reference descended through held nodes along the
+// same steps. `paired_reaches` shows those are positions the reference root's
+// own scoped walk reached, because a held node is never a boundary.
 fn paired_children(
     reference: Option<&TrieNode>,
     node: &TrieNode,
@@ -576,6 +630,22 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// Whether a peer has refused to show this node at `path`, or at any
     /// position for `None` (§5.5).
+    /// [`Trie::load_raw`], with provenance when the walk carries an owner: a
+    /// node this store holds but was never served as `owner`'s reads as
+    /// absent, so the walk asks for it ([`MissingWalk::for_origin`]).
+    pub(crate) fn load_owned_raw(
+        &self,
+        owner: Option<&OriginId>,
+        hash: &Hash,
+    ) -> Result<Option<Vec<u8>>, MptError> {
+        if let Some(origin) = owner {
+            if !Self::wrap(self.store.owns_node(origin, hash))? {
+                return Ok(None);
+            }
+        }
+        self.load_raw(hash)
+    }
+
     pub(crate) fn is_redacted_raw(
         &self,
         hash: &Hash,
@@ -616,6 +686,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// must agree about which keys exist — the whole of what
     /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
     /// the ingest bound are for.
+    // LEAN-MODEL: mpt-trie-get
+    // `Convergence.HasValue`; `view_deterministic` is why a key has one value
+    // under a root, given `check_invariants`' non-empty extension prefix.
     pub fn get(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
         if key.len() > MAX_KEY_LEN {
             return Err(MptError::KeyTooLong(key.len()));
@@ -1256,12 +1329,36 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Completeness is a property of a root *and* a scope: a trie held whole
     /// within one grant is not held whole within a wider one. The memo is keyed
     /// by both, so widening a scope re-derives rather than inheriting.
+    // LEAN-MODEL: mpt-complete-scoped
+    // `ScopedSync.CompleteWithin`: every position the scoped walk reaches is
+    // held or a boundary, and every expanded node has its value.
     pub fn is_complete_scoped(&self, root: Hash, scope: &Scope) -> Result<bool, MptError> {
-        let memo = scope.memo_key(root);
+        self.is_complete_scoped_for(None, root, scope)
+    }
+
+    /// [`Trie::is_complete_scoped`] with provenance: for `Some(owner)`, every
+    /// admitted node under `root` must have been served as `owner`'s
+    /// ([`NodeStore::owns_node`]), not merely be present.
+    ///
+    /// This is the question a member asks of a confined origin's head before
+    /// it vouches for it (§5.5): a trie assembled out of nodes the origin was
+    /// never shown is not complete however many of them this store holds.
+    /// Memoized under a key of its own, since it is a stricter question than
+    /// either of the other two.
+    // LEAN-MODEL: mpt-complete-owned
+    // `Provenance.withheld_root_incomplete`: a confined origin's root that
+    // reaches a node the origin could not legitimately hold never completes.
+    pub fn is_complete_scoped_for(
+        &self,
+        owner: Option<&OriginId>,
+        root: Hash,
+        scope: &Scope,
+    ) -> Result<bool, MptError> {
+        let memo = scope.memo_key_for(owner, root);
         if Self::wrap(self.store.is_known_complete(&memo))? {
             return Ok(true);
         }
-        let complete = MissingWalk::scoped(None, root, scope.clone())
+        let complete = MissingWalk::for_origin(owner.cloned(), None, root, scope.clone())
             .next_batch(self, 1)?
             .is_empty();
         if complete {
@@ -1282,6 +1379,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// One merged descent over the sorted paths shares every prefix two wants
     /// have in common: a batch is the frontier of a single walk, so the cost is
     /// close to trie depth plus batch size, not their product.
+    // LEAN-MODEL: mpt-resolve-position
+    // `ScopedSync.At`; `At.unique` is why a position names one hash, given
+    // `check_invariants`' non-empty extension prefix.
     pub fn resolve_paths(
         &self,
         root: Hash,
@@ -1365,6 +1465,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     ///
     /// An absent node stops that branch rather than raising: this is asked of
     /// a trie about to be promoted, where absence was already settled by fetch.
+    // LEAN-MODEL: mpt-first-key-outside
+    // `ScopedSync.keys_below_grant_admitted`: skipping a position inside a
+    // granted prefix loses no key outside the grant.
     pub fn first_key_outside(
         &self,
         root: Hash,
@@ -1485,7 +1588,11 @@ mod tests {
 
     /// Fetches everything a walk asks for from `source` into `into`, and
     /// returns the requested positions, in order.
-    fn drain(walk: &mut MissingWalk, source: &MemStore, into: &MemStore) -> Vec<(Vec<u8>, Hash)> {
+    fn drain<S: NodeStore>(
+        walk: &mut MissingWalk,
+        source: &MemStore,
+        into: &S,
+    ) -> Vec<(Vec<u8>, Hash)> {
         let mut wanted = Vec::new();
         loop {
             let batch = MissingWalk::next_batch(walk, &Trie::new(into), 64).unwrap();
@@ -1608,6 +1715,192 @@ mod tests {
         // nodes, it is of course readable there too.
         assert!(asked.iter().all(|(path, _)| scope.admits_path(path)));
         assert!(scoped.get(root, b"m:space/finance").is_err());
+    }
+
+    /// With an owner, presence is provenance: a node this store holds from
+    /// another origin's trie is asked for again under a confined origin's
+    /// root, and only a node served as that origin's counts (§5.5). This is
+    /// the walk's half of closing the graft: a delegate that places a withheld
+    /// subtree's hash in its own trie cannot serve the subtree, so the head
+    /// never completes on any member.
+    #[test]
+    fn presence_with_an_owner_is_provenance() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let mut root = Hash::EMPTY;
+        for key in [b"f:photos/a.jpg".as_slice(), b"f:finance/q3.pdf".as_slice()] {
+            root = trie.insert(root, key, key).unwrap();
+        }
+        let owner = synch_core::OriginId::Named {
+            domain: "cluster.example".to_string(),
+            id: "grafter".to_string(),
+        };
+
+        // Held whole, but as nobody's: judged by presence the trie is complete,
+        // judged as `owner`'s nothing of it is.
+        assert!(trie.is_complete(root).unwrap());
+        assert!(!trie
+            .is_complete_scoped_for(Some(&owner), root, &Scope::full())
+            .unwrap());
+        let mut walk = MissingWalk::for_origin(Some(owner.clone()), None, root, Scope::full());
+        let missing = walk.next_batch(&trie, 64).unwrap();
+        assert_eq!(
+            missing.nodes,
+            vec![(Vec::new(), root)],
+            "the root is asked for again"
+        );
+
+        // Served as the owner's, node by node, the walk drains; what it asked
+        // for is exactly what it now owns.
+        let mut owned = vec![root];
+        store.note_owned(&owner, &root).unwrap();
+        walk.resume();
+        loop {
+            let batch = walk.next_batch(&trie, 64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (_, hash) in &batch.nodes {
+                store.note_owned(&owner, hash).unwrap();
+                owned.push(*hash);
+            }
+            walk.resume();
+        }
+        assert!(walk.is_exhausted());
+        assert!(trie
+            .is_complete_scoped_for(Some(&owner), root, &Scope::full())
+            .unwrap());
+        for (_, hash) in walk_positions(&store, root) {
+            assert!(owned.contains(&hash), "a node completed without provenance");
+        }
+        // The two memos are distinct questions.
+        assert_ne!(
+            Scope::full().memo_key_for(Some(&owner), root),
+            Scope::full().memo_key(root)
+        );
+    }
+
+    /// Every node of `root`'s trie by position, over a store holding it whole.
+    fn walk_positions(store: &MemStore, root: Hash) -> Vec<(Vec<u8>, Hash)> {
+        let empty = MemStore::new();
+        let mut walk = MissingWalk::new(root);
+        let mut all = Vec::new();
+        loop {
+            let batch = walk.next_batch(&Trie::new(&empty), 64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                all.push((path.clone(), *hash));
+                empty
+                    .put_node(hash, &store.get_node(hash).unwrap().unwrap())
+                    .unwrap();
+            }
+            walk.resume();
+        }
+        all
+    }
+
+    /// A node this store holds is expanded wherever the walk meets it, even if
+    /// a peer once refused the same hash at this position. Treating a *held*
+    /// node as a boundary would let the walk stop above an absent in-grant
+    /// subtree and call the trie complete — and would let `paired_children`
+    /// follow, as a reference, a node whose subtree the reference root's own
+    /// walk never fetched (`ScopedSync.paired_reaches`).
+    #[test]
+    fn a_held_node_is_never_a_boundary() {
+        let source = MemStore::new();
+        let trie = Trie::new(&source);
+        let mut root = Hash::EMPTY;
+        for key in [
+            b"f:photos/a.jpg".as_slice(),
+            b"f:photos/b.jpg".as_slice(),
+            b"f:finance/q3.pdf".as_slice(),
+        ] {
+            root = trie.insert(root, key, key).unwrap();
+        }
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"f:photos/".to_vec()],
+            exact: Vec::new(),
+        });
+        let local = RedactingStore::default();
+        drain(
+            &mut MissingWalk::scoped(None, root, scope.clone()),
+            &source,
+            &local,
+        );
+        let scoped = Trie::new(&local);
+        assert!(scoped.is_complete_scoped(root, &scope).unwrap());
+
+        // The spine branch at `f:` — above the grant — and the photos subtree
+        // hanging off its `p` slot.
+        let spine = Nibbles::from_bytes(b"f:").as_slice().to_vec();
+        let mut photos_at = spine.clone();
+        photos_at.push(0x7);
+        let resolved = trie
+            .resolve_paths(root, &[spine.clone(), photos_at.clone()])
+            .unwrap();
+        let (branch, photos) = (resolved[0].unwrap(), resolved[1].unwrap());
+
+        // A refusal of the spine branch at its own position arrives, and the
+        // photos subtree goes missing.
+        local.note_redacted(&branch, &spine).unwrap();
+        local.remove_node(&photos);
+        assert!(
+            !scoped.is_complete_scoped(root, &scope).unwrap(),
+            "a held node was treated as a boundary and hid an absent in-grant subtree"
+        );
+        let missing = MissingWalk::scoped(None, root, scope)
+            .next_batch(&scoped, 64)
+            .unwrap();
+        assert_eq!(missing.nodes, vec![(photos_at, photos)]);
+    }
+
+    /// A store that remembers refusals and can forget a node — what the
+    /// boundary test needs and `MemStore` does not do.
+    #[derive(Default)]
+    struct RedactingStore {
+        inner: MemStore,
+        redacted: std::sync::Mutex<HashSet<(Hash, Vec<u8>)>>,
+    }
+
+    impl RedactingStore {
+        fn remove_node(&self, hash: &Hash) {
+            self.inner.remove_node(hash);
+        }
+    }
+
+    impl NodeStore for RedactingStore {
+        type Error = std::convert::Infallible;
+
+        fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.inner.get_node(hash)
+        }
+
+        fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<(), Self::Error> {
+            self.inner.put_node(hash, data)
+        }
+
+        fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.inner.get_value(hash)
+        }
+
+        fn put_value(&self, hash: &Hash, data: &[u8]) -> Result<(), Self::Error> {
+            self.inner.put_value(hash, data)
+        }
+
+        fn is_redacted(&self, hash: &Hash, path: Option<&[u8]>) -> Result<bool, Self::Error> {
+            let redacted = self.redacted.lock().unwrap();
+            Ok(match path {
+                Some(path) => redacted.contains(&(*hash, path.to_vec())),
+                None => redacted.iter().any(|(h, _)| h == hash),
+            })
+        }
+
+        fn note_redacted(&self, hash: &Hash, path: &[u8]) -> Result<(), Self::Error> {
+            self.redacted.lock().unwrap().insert((*hash, path.to_vec()));
+            Ok(())
+        }
     }
 
     /// Position, not hash, is what a scoped fetch may be authorized on: a path

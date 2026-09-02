@@ -1,6 +1,5 @@
 //! Containment at the trust boundaries of mptsync (§5.5, §12), over real
-//! endpoints. Each test states a property the design promises; one that the
-//! code does not yet meet is `#[ignore]`d, with the gap named in the reason.
+//! endpoints. Each test states a property the design promises.
 
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
@@ -55,11 +54,13 @@ fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
 /// promotes the head, and from then on serves the withheld subtree to *every*
 /// delegate under the grafting origin's in-scope positions.
 ///
-/// Open: structural sharing crosses the delegation boundary in a member's
-/// shared node store, and closing it needs per-origin provenance for the
-/// nodes of a confined origin's trie rather than a local patch.
+/// Closed by provenance: for a confined origin's root, a node is present only
+/// if it was served as that origin's (`NodeStore::owns_node`), which bottoms
+/// out in the origin itself — and the grafter never held the subtree. The
+/// member's fetch asks the grafter for it, is told `missing`, and abandons the
+/// head; the responder serves nothing under a confined root it does not own
+/// for that origin. `Provenance.lean` is the model of both halves.
 #[tokio::test]
-#[ignore = "open: structural sharing crosses the delegation boundary"]
 async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let issuer = WireNode::spawn(Some("nas")).await;
     let grafter = WireNode::spawn(None).await;

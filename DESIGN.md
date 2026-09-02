@@ -1129,6 +1129,39 @@ delegation the cluster holds — including the ids of spaces it was not granted,
 
 ---
 
+**Structural sharing does not cross the delegation boundary: presence is with
+provenance.** The redaction above withholds a subtree's *nodes*, never its hash —
+the hash sits in the branch that makes the signed root recompute — so a delegate
+holds the hash of everything it was denied and may publish a trie of its own that
+places that hash at an in-scope position. A member fetching that head already
+holds the nodes, from the issuer's trie, in the one content-addressed store that
+lets identical nodes be stored once; judged by presence, the trie is complete, the
+head promotes, and the member then serves the withheld subtree to every delegate
+with the same grant, at a position each is entitled to. Every position is
+admitted; the content was never the grafting origin's to publish.
+
+So for an origin that is not rooted — a confined one, or one with no live binding
+— "present" means *present as that origin's*: served under one of its roots by a
+peer that vouches for the node, recorded per `(origin, hash)` in
+`trie_node_origins` in the same transaction as the node. The fetch walk for such an
+origin's head reads presence through that relation and asks again for a node it
+merely holds; `is_complete` is asked with the same provenance, and memoized under a
+key of its own; and a responder serves a node under any root only if the root's
+origin is rooted, or the responder was itself served the node as that origin's, or
+the responder *is* that origin and holds the node — for every peer, scoped or not,
+since a full member handed the node under the grafting root would record
+provenance for it and move the leak one hop. Vouching therefore bottoms out in the
+origin, and an origin cannot serve what it never held: the grafted head is asked
+for its subtree, told `missing`, and abandoned, on every member. Rooted origins are
+judged by presence alone, as before, and a node's own trie by construction. The
+cost is one row per node per confined origin, and one re-fetch of the nodes a
+confined origin's trie shares with another's. `specs/lean/Synchronicity/Provenance.lean`
+is the model: `Legit` is what "legitimately a reader's" means across every trie a
+node may be read through, and `privacy` and `integrity` are the theorem — a
+confined participant holds only what is legitimately its, and a member vouches
+for a confined origin's head only if every node under it is legitimately that
+origin's; `withheld_root_incomplete` is this graft excluded, for any trie.
+
 ## 6. Content storage and transfer
 
 ### 6.1 Hash trees (bao / BLAKE3)
@@ -1848,6 +1881,14 @@ CREATE TABLE redacted_nodes (
   path BLOB NOT NULL,
   PRIMARY KEY (hash, path)
 );
+-- which origin's trie a node was served as part of: presence with provenance
+-- for a confined origin's root (v27, §5.5)
+CREATE TABLE trie_node_origins (
+  origin_id TEXT NOT NULL,
+  hash      BLOB NOT NULL,
+  PRIMARY KEY (origin_id, hash)
+);
+CREATE INDEX trie_node_origins_by_hash ON trie_node_origins (hash);
 
 -- materialized views of trie leaves (rebuilt incrementally from diffs)
 CREATE TABLE entries (

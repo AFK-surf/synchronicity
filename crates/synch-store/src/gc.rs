@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
-use synch_mpt::Trie;
+use synch_mpt::{Scope, Trie};
 
 use crate::{db::hash_column, db::Store, error::Result};
 
@@ -82,6 +82,10 @@ impl Store {
                 // unreferenced row is, on a large store, millions of statements
                 // under the write lock.
                 let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
+                // Provenance rows name nodes; a row for a swept node would
+                // vouch, for the next trie to carry that hash, for a node this
+                // store no longer holds as anyone's.
+                sweep_unmarked(conn, "trie_node_origins", &nodes)?;
                 let v = sweep_unmarked(conn, "trie_values", &values)?;
                 Ok((n, v, roots))
             })?;
@@ -98,10 +102,18 @@ impl Store {
         // every pass — a delegate re-walked its whole in-scope trie after each
         // five-minute cycle, which is exactly the cost this retention exists
         // to avoid. Both spellings of a retained root are kept.
+        //
+        // The third spelling is the provenance one: a confined origin's root
+        // is memoized under `Scope::memo_key_for(Some(origin), root)`, and
+        // that answer is kept with the root too.
         let scope = self.local_trie_scope()?;
         let mut keep: std::collections::HashSet<Hash> = roots.iter().copied().collect();
         if !scope.is_full() {
             keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
+        }
+        for (origin, root) in self.retained_roots_with_origins()? {
+            keep.insert(scope.memo_key_for(Some(&origin), root));
+            keep.insert(Scope::full().memo_key_for(Some(&origin), root));
         }
         self.retain_complete_roots(&keep);
         Ok(stats)
@@ -434,6 +446,27 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
+impl Store {
+    /// Every `(origin, root)` pair in the retained history: the roots GC marks
+    /// from, with whose tries they are.
+    fn retained_roots_with_origins(&self) -> Result<Vec<(synch_core::OriginId, Hash)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT origin_id, root FROM head_history")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (origin, root) = row?;
+            out.push((
+                crate::db::origin_column(origin, "head_history.origin_id")?,
+                hash_column(root, "head_history.root")?,
+            ));
+        }
+        Ok(out)
+    }
+}
+
 pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;

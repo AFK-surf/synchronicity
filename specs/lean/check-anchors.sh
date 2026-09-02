@@ -8,6 +8,7 @@ trap 'rm -f "$rust_anchors" "$lean_anchors"' EXIT HUP INT TERM
 
 rg -o --no-filename 'LEAN-MODEL: [a-z0-9-]+' \
   "$root/crates/synch-store/src" "$root/crates/synch-engine/src" \
+  "$root/crates/synch-mpt/src" "$root/crates/synch-net/src" \
   | sed 's/LEAN-MODEL: //' | LC_ALL=C sort > "$rust_anchors"
 
 rg -o --no-filename 'RUST-IMPL: [a-z0-9-]+' \

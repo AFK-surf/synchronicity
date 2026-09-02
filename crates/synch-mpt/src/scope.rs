@@ -68,6 +68,8 @@ impl Scope {
     /// in scope as an ancestor of an allowed prefix or inside one. Both
     /// directions matter: the ancestors are the spine that makes the signed
     /// root recompute.
+    // LEAN-MODEL: mpt-scope-admits-path
+    // `Scope.AdmitsPath`; `admitsPath_of_append` is the spine property.
     pub fn admits_path(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
@@ -89,6 +91,9 @@ impl Scope {
     /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
+    // LEAN-MODEL: mpt-scope-contains-subtree
+    // `Scope.ContainsSubtree`; `containsSubtree_append` is the stop-at-the-
+    // boundary property.
     pub fn contains_subtree(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
@@ -113,6 +118,9 @@ impl Scope {
     /// record too.
     ///
     /// What is tested here is the node's *coverage*, not its position.
+    // LEAN-MODEL: mpt-scope-admits-node
+    // `ScopedSync.AdmitsNode`; `no_redaction_inside_grant` is why a position
+    // inside a granted prefix is never refused.
     pub fn admits_node(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
         if self.is_full() {
             return true;
@@ -163,6 +171,30 @@ impl Scope {
     /// memo keyed by the root alone would answer a wider scope with a narrower
     /// one's answer. Folding the scope in makes a widened scope re-derive
     /// rather than inherit.
+    pub fn memo_key_for(&self, owner: Option<&synch_core::OriginId>, root: Hash) -> Hash {
+        match owner {
+            None => self.memo_key(root),
+            Some(origin) => {
+                // "Do I hold all of this *as this origin's*?" is a third
+                // question, distinct from both the unscoped and the scoped
+                // one: a trie held whole is not held whole with provenance,
+                // and the answers must not be confused.
+                let mut bytes = Vec::with_capacity(96);
+                bytes.extend_from_slice(b"owned-root/1");
+                bytes.extend_from_slice(self.memo_key(root).as_bytes());
+                bytes.extend_from_slice(origin.canonical().as_bytes());
+                Hash::new(&bytes)
+            }
+        }
+    }
+
+    /// The key a completeness answer for `root` may be memoized under.
+    ///
+    /// "Do I hold all of this?" is a question about a root *and* a scope: a
+    /// memo keyed by the root alone would answer a wider scope with a narrower
+    /// one's answer. Folding the scope in makes a widened scope re-derive
+    /// rather than inherit. With provenance in the question as well, see
+    /// [`Scope::memo_key_for`].
     pub fn memo_key(&self, root: Hash) -> Hash {
         match &self.prefixes {
             None => root,

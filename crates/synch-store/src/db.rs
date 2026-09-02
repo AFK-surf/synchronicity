@@ -1013,6 +1013,14 @@ impl NodeStore for Txn<'_> {
     fn note_redacted(&self, hash: &Hash, path: &[u8]) -> Result<()> {
         note_redacted_in(self.conn(), hash, path)
     }
+
+    fn owns_node(&self, origin: &OriginId, hash: &Hash) -> Result<bool> {
+        owns_node_in(self.conn(), origin, hash)
+    }
+
+    fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
+        note_owned_in(self.conn(), origin, hash)
+    }
 }
 
 // ---- migrations ------------------------------------------------------------
@@ -1153,6 +1161,17 @@ impl NodeStore for Store {
 
     fn note_redacted(&self, hash: &Hash, path: &[u8]) -> Result<()> {
         note_redacted_in(&self.conn(), hash, path)
+    }
+
+    /// Provenance is durable like redaction: it is what a completeness answer
+    /// for a confined origin's root rests on, and forgetting it across a
+    /// restart would have every such trie re-fetched.
+    fn owns_node(&self, origin: &OriginId, hash: &Hash) -> Result<bool> {
+        owns_node_in(&self.conn(), origin, hash)
+    }
+
+    fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
+        note_owned_in(&self.conn(), origin, hash)
     }
 }
 
@@ -1334,6 +1353,26 @@ fn note_redacted_in(conn: &Connection, hash: &Hash, path: &[u8]) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO redacted_nodes (hash, path) VALUES (?1, ?2)",
         params![hash.as_bytes().to_vec(), path.to_vec()],
+    )?;
+    Ok(())
+}
+
+/// Whether `hash` was served to this store as part of `origin`'s trie (§5.5).
+fn owns_node_in(conn: &Connection, origin: &OriginId, hash: &Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM trie_node_origins WHERE origin_id = ?1 AND hash = ?2",
+            params![origin.canonical(), hash.as_bytes().to_vec()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn note_owned_in(conn: &Connection, origin: &OriginId, hash: &Hash) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO trie_node_origins (origin_id, hash) VALUES (?1, ?2)",
+        params![origin.canonical(), hash.as_bytes().to_vec()],
     )?;
     Ok(())
 }

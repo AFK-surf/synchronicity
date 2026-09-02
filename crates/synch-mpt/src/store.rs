@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-use synch_core::Hash;
+use synch_core::{Hash, OriginId};
 
 /// A content-addressed store for trie nodes and out-of-line values.
 ///
@@ -84,6 +84,35 @@ pub trait NodeStore {
     fn note_redacted(&self, _hash: &Hash, _path: &[u8]) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// True if this store was served node `hash` as part of `origin`'s own
+    /// trie — under one of that origin's roots, by a peer vouching for it —
+    /// rather than merely holding it because some other origin's trie carries
+    /// the same node.
+    ///
+    /// Provenance is what keeps structural sharing from crossing the
+    /// delegation boundary (§5.5). A confined origin holds the hash of every
+    /// subtree withheld from it, since the hash sits in the branch that makes
+    /// the signed root recompute, and can place that hash in its own trie; a
+    /// member fetching that trie already holds the nodes from the issuer's
+    /// trie, so presence alone would call the head complete and then serve the
+    /// withheld subtree back to every delegate at an in-scope position. For a
+    /// confined origin's root, "present" therefore means present *as that
+    /// origin's*: served under its root by a peer that owned it, which bottoms
+    /// out in the origin itself — and the origin cannot serve what it never
+    /// held. The default owns nothing, which is the conservative answer for a
+    /// store that never records provenance.
+    // LEAN-MODEL: mpt-owned-node
+    // `Provenance.Store.owned`; `Provenance.view` is the presence a walk with
+    // an owner reads, and `privacy`/`integrity` are what provenance buys.
+    fn owns_node(&self, _origin: &OriginId, _hash: &Hash) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Records that `hash` was served to this store as part of `origin`'s trie.
+    fn note_owned(&self, _origin: &OriginId, _hash: &Hash) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// An in-memory node store, for tests and for verifying a proof against a
@@ -92,6 +121,7 @@ pub trait NodeStore {
 pub struct MemStore {
     nodes: Mutex<HashMap<Hash, Vec<u8>>>,
     values: Mutex<HashMap<Hash, Vec<u8>>>,
+    owned: Mutex<std::collections::HashSet<(OriginId, Hash)>>,
 }
 
 impl MemStore {
@@ -106,6 +136,15 @@ impl MemStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    /// Forgets one node, for tests that need a held trie to go partial.
+    #[cfg(test)]
+    pub(crate) fn remove_node(&self, hash: &Hash) {
+        self.nodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(hash);
     }
 
     /// Drops every out-of-line value, keeping the nodes: a store that relayed
@@ -169,5 +208,21 @@ impl NodeStore for MemStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(hash))
+    }
+
+    fn owns_node(&self, origin: &OriginId, hash: &Hash) -> Result<bool, Infallible> {
+        Ok(self
+            .owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(origin.clone(), *hash)))
+    }
+
+    fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<(), Infallible> {
+        self.owned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((origin.clone(), *hash));
+        Ok(())
     }
 }

@@ -94,7 +94,30 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     },
     Migration::Sql(V25_ENTRIES_BY_SPACE_CONTENT),
     Migration::Sql(V26_REDACTIONS_BY_POSITION),
+    Migration::Sql(V27_TRIE_NODE_PROVENANCE),
 ];
+
+/// v27 — which origin's trie a node was served as part of (§5.5).
+///
+/// One shared, content-addressed `trie_nodes` is what lets identical nodes be
+/// stored once; it is also what let a confined origin's trie be completed out
+/// of nodes that origin was never shown. A delegate holds the hash of every
+/// subtree withheld from it and may publish a trie placing that hash at an
+/// in-scope position; a member fetching that head found every node present
+/// from the issuer's trie, promoted it, and served the withheld subtree back
+/// to every delegate. Presence for a confined origin's root now means "served
+/// to this store as that origin's", which these rows record. Rooted origins'
+/// tries are judged by presence alone, as before, and no row is written for
+/// them. Nodes already held gain no provenance: a confined origin's next head
+/// is fetched with it, one round, from any peer holding the head complete.
+const V27_TRIE_NODE_PROVENANCE: &str = r#"
+CREATE TABLE trie_node_origins (
+  origin_id TEXT NOT NULL,
+  hash      BLOB NOT NULL,
+  PRIMARY KEY (origin_id, hash)
+);
+CREATE INDEX trie_node_origins_by_hash ON trie_node_origins (hash);
+"#;
 
 /// v26 — a refusal is remembered by position, not by hash alone (§5.5).
 ///
@@ -948,6 +971,14 @@ CREATE TABLE redacted_nodes (
   path BLOB NOT NULL,
   PRIMARY KEY (hash, path)
 );
+-- which origin's trie a node was served as part of: presence with provenance
+-- for a confined origin's root (v27, §5.5)
+CREATE TABLE trie_node_origins (
+  origin_id TEXT NOT NULL,
+  hash      BLOB NOT NULL,
+  PRIMARY KEY (origin_id, hash)
+);
+CREATE INDEX trie_node_origins_by_hash ON trie_node_origins (hash);
 CREATE TABLE entries (
   origin_id   TEXT NOT NULL,
   space       TEXT NOT NULL,
