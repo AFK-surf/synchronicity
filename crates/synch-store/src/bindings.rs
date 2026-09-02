@@ -938,12 +938,26 @@ impl Store {
                 // exactly the claim that changed — this node no longer holds
                 // the trie under it, because "holds it whole" is a question
                 // about a scope and the scope just moved.
-                txn.put_head(
-                    crate::heads::Slot::Pending,
-                    &stored.head,
-                    stored.received_at,
-                    stored.verified_at,
-                )?;
+                //
+                // Unless the pending slot already holds something newer. A
+                // `put_head` replaces whatever is in the slot, so demoting
+                // over a newer pending head would drop that head to
+                // `head_history`, lower `head_floor` to the demoted one, and
+                // buy a fetch and a promotion for a root the next exchange
+                // re-adopts past. The newer head is the one this node wants
+                // to fill under the new scope; the demoted one is history.
+                let pending = txn.head(origin, crate::heads::Slot::Pending)?;
+                let outranked = pending
+                    .as_ref()
+                    .is_some_and(|p| !stored.head.supersedes(Some(&(p.head.seq, p.head.root))));
+                if !outranked {
+                    txn.put_head(
+                        crate::heads::Slot::Pending,
+                        &stored.head,
+                        stored.received_at,
+                        stored.verified_at,
+                    )?;
+                }
                 txn.clear_head(origin, crate::heads::Slot::Complete)?;
             }
             Ok(true)
@@ -1122,13 +1136,14 @@ mod tests {
 
         let (_dir, store) = store();
         let withheld = synch_core::Hash::new(b"a subtree the narrow grant withheld");
+        let at = [6u8, 6, 3, 10];
         store.set_read_scope(Some(&["photos".to_string()])).unwrap();
-        store.note_redacted(&withheld).unwrap();
-        assert!(store.is_redacted(&withheld).unwrap());
+        store.note_redacted(&withheld, &at).unwrap();
+        assert!(store.is_redacted(&withheld, Some(&at)).unwrap());
 
         // Re-declaring the same scope changes nothing, so the boundary stands.
         assert!(!store.set_read_scope(Some(&["photos".to_string()])).unwrap());
-        assert!(store.is_redacted(&withheld).unwrap());
+        assert!(store.is_redacted(&withheld, Some(&at)).unwrap());
 
         // Widening it does. The same node now sits at a position this node is
         // entitled to, and a boundary left over from the narrow grant would
@@ -1138,9 +1153,51 @@ mod tests {
             .set_read_scope(Some(&["photos".to_string(), "finance".to_string()]))
             .unwrap());
         assert!(
-            !store.is_redacted(&withheld).unwrap(),
+            !store.is_redacted(&withheld, None).unwrap(),
             "a boundary outlived the scope that drew it"
         );
+    }
+
+    /// Moving the scope demotes a foreign complete head to pending — but never
+    /// over a newer head already pending there. `put_head` replaces the slot,
+    /// so the demotion used to drop the newer head to history and lower the
+    /// floor to the older one.
+    #[test]
+    fn moving_the_scope_never_demotes_over_a_newer_pending_head() {
+        use crate::heads::Slot;
+        use crate::testutil::{origin, sign_head};
+        use synch_core::Hash;
+
+        let (_dir, store) = store();
+        let key = SecretKey::generate();
+        let complete = sign_head(&key, 5, 5);
+        let pending = sign_head(&key, 7, 7);
+        store.put_head(Slot::Complete, &complete, 100, 100).unwrap();
+        store.put_head(Slot::Pending, &pending, 200, 200).unwrap();
+
+        assert!(store.set_read_scope(Some(&["photos".to_string()])).unwrap());
+        assert_eq!(store.complete_head(&origin()).unwrap(), None);
+        assert_eq!(
+            store.pending_head(&origin()).unwrap(),
+            Some(pending),
+            "the newer pending head survived the demotion"
+        );
+        assert_eq!(
+            store.head_floor(&origin()).unwrap(),
+            Some((7, Hash([7u8; 32])))
+        );
+
+        // With nothing newer pending, the complete head is what gets demoted.
+        let later = sign_head(&key, 9, 9);
+        store.put_head(Slot::Complete, &later, 300, 300).unwrap();
+        store
+            .clear_head_at(&origin(), Slot::Pending, 7, &Hash([7u8; 32]))
+            .unwrap();
+        assert!(store
+            .set_read_scope(Some(&["photos".to_string(), "finance".to_string()]))
+            .unwrap());
+        assert_eq!(store.complete_head(&origin()).unwrap(), None);
+        assert_eq!(store.pending_head(&origin()).unwrap(), Some(later));
     }
 
     fn binding(origin: OriginId, key: NodeId, expires: Option<i64>) -> Binding {

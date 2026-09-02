@@ -197,8 +197,13 @@ async fn a_delegate_publishing_outside_its_spaces_is_refused() {
 
     // Out of scope: the head is refused whole, not materialized in part, so
     // the delegate stalls at the head that was legitimate.
+    let legitimate = issuer
+        .store
+        .complete_head(&delegate.origin)
+        .unwrap()
+        .unwrap();
     delegate.publish(2, &[("finance", "sneaky.pdf", b"out of scope")], &[]);
-    syncer.sync_with(&client).await.unwrap();
+    let report = syncer.sync_with(&client).await.unwrap();
     assert_eq!(
         issuer
             .store
@@ -207,6 +212,23 @@ async fn a_delegate_publishing_outside_its_spaces_is_refused() {
             .map(|h| h.seq),
         Some(1),
         "a delegate published outside its spaces and the head was promoted"
+    );
+    // And refused means retired, not parked: its trie is wholly here, so
+    // nothing else would ever clear it, and left in the pending slot it would
+    // hold `head_floor` above every head this node can actually serve (§5.2).
+    assert_eq!(
+        issuer.store.pending_head(&delegate.origin).unwrap(),
+        None,
+        "a refused head kept the pending slot"
+    );
+    assert_eq!(
+        issuer.store.head_floor(&delegate.origin).unwrap(),
+        Some((legitimate.seq, legitimate.root)),
+        "the floor is back at the head this node serves"
+    );
+    assert_eq!(
+        report.heads_failed, 1,
+        "the origin is reported as left behind"
     );
 }
 

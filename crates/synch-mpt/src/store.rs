@@ -62,19 +62,26 @@ pub trait NodeStore {
         Ok(())
     }
 
-    /// True if a peer has told this store it may not see the node `hash`.
+    /// True if a peer has told this store it may not see the node `hash` at
+    /// nibble position `path` — or, for `None`, at any position.
     ///
     /// A scoped node needs to tell "absent" from "refused" (§5.5), and needs
     /// to keep telling them apart across restarts: a completeness walk that
     /// re-read a refused position as merely missing would never settle, and a
     /// fetch would retry until its head was abandoned. The default remembers
     /// nothing, which is right for a store that never asks for a scoped view.
-    fn is_redacted(&self, _hash: &Hash) -> Result<bool, Self::Error> {
+    ///
+    /// Keyed by position as well as by hash, because a refusal is about
+    /// *where* a node sits: the same node can stand at two positions the
+    /// scope admits and reveal an out-of-scope range at only one of them.
+    /// A refusal recorded against the hash alone would have the walk skip the
+    /// position it was entitled to as well.
+    fn is_redacted(&self, _hash: &Hash, _path: Option<&[u8]>) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
-    /// Records that a peer refused to show the node `hash`.
-    fn note_redacted(&self, _hash: &Hash) -> Result<(), Self::Error> {
+    /// Records that a peer refused to show the node `hash` at `path`.
+    fn note_redacted(&self, _hash: &Hash, _path: &[u8]) -> Result<(), Self::Error> {
         Ok(())
     }
 }

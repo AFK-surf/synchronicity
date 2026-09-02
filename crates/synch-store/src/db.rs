@@ -1006,12 +1006,12 @@ impl NodeStore for Txn<'_> {
         has_value_in(self.conn(), hash)
     }
 
-    fn is_redacted(&self, hash: &Hash) -> Result<bool> {
-        is_redacted_in(self.conn(), hash)
+    fn is_redacted(&self, hash: &Hash, path: Option<&[u8]>) -> Result<bool> {
+        is_redacted_in(self.conn(), hash, path)
     }
 
-    fn note_redacted(&self, hash: &Hash) -> Result<()> {
-        note_redacted_in(self.conn(), hash)
+    fn note_redacted(&self, hash: &Hash, path: &[u8]) -> Result<()> {
+        note_redacted_in(self.conn(), hash, path)
     }
 }
 
@@ -1147,12 +1147,12 @@ impl NodeStore for Store {
     /// answer outlives the process: forgetting it across a restart puts the
     /// walk back to asking for what it will be refused, once per round, until
     /// §5.2's abandonment clause retires a head that was never incomplete.
-    fn is_redacted(&self, hash: &Hash) -> Result<bool> {
-        is_redacted_in(&self.conn(), hash)
+    fn is_redacted(&self, hash: &Hash, path: Option<&[u8]>) -> Result<bool> {
+        is_redacted_in(&self.conn(), hash, path)
     }
 
-    fn note_redacted(&self, hash: &Hash) -> Result<()> {
-        note_redacted_in(&self.conn(), hash)
+    fn note_redacted(&self, hash: &Hash, path: &[u8]) -> Result<()> {
+        note_redacted_in(&self.conn(), hash, path)
     }
 }
 
@@ -1316,21 +1316,24 @@ fn has_value_in(conn: &Connection, hash: &Hash) -> Result<bool> {
         .is_some())
 }
 
-fn is_redacted_in(conn: &Connection, hash: &Hash) -> Result<bool> {
+/// A refusal is keyed by `(hash, path)`; `None` asks whether the node was
+/// refused at any position, which is what a walk over what this node *holds*
+/// wants to know about a node that is missing.
+fn is_redacted_in(conn: &Connection, hash: &Hash, path: Option<&[u8]>) -> Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM redacted_nodes WHERE hash = ?1",
-            params![hash.as_bytes().to_vec()],
+            "SELECT 1 FROM redacted_nodes WHERE hash = ?1 AND (?2 IS NULL OR path = ?2)",
+            params![hash.as_bytes().to_vec(), path.map(<[u8]>::to_vec)],
             |_| Ok(()),
         )
         .optional()?
         .is_some())
 }
 
-fn note_redacted_in(conn: &Connection, hash: &Hash) -> Result<()> {
+fn note_redacted_in(conn: &Connection, hash: &Hash, path: &[u8]) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO redacted_nodes (hash) VALUES (?1)",
-        params![hash.as_bytes().to_vec()],
+        "INSERT OR IGNORE INTO redacted_nodes (hash, path) VALUES (?1, ?2)",
+        params![hash.as_bytes().to_vec(), path.to_vec()],
     )?;
     Ok(())
 }
@@ -1457,31 +1460,43 @@ mod tests {
         assert_eq!(trie.iter(root).unwrap().len(), 50);
     }
 
-    /// A refusal is remembered through either handle and across a reopen (§5.5): the fetch loop records through `Store` and the walk reads back through a `Txn`, and both must answer.
+    /// A refusal is remembered through either handle and across a reopen
+    /// (§5.5): the fetch loop records through `Store` and the walk reads back
+    /// through a `Txn`, and both must answer. It is remembered *by position*:
+    /// the same node refused at one spine position is not refused at another,
+    /// while a walk over what this node holds may ask about the hash alone.
     #[test]
     fn a_refusal_is_remembered_by_both_handles_and_across_a_reopen() {
         use synch_mpt::NodeStore;
         let dir = tempfile::tempdir().unwrap();
         let withheld = Hash::new(b"withheld");
         let other = Hash::new(b"other");
+        let (here, elsewhere) = ([6u8, 6, 3, 10].as_slice(), [13u8, 6].as_slice());
         {
             let store = Store::open(dir.path()).unwrap();
-            assert!(!store.is_redacted(&withheld).unwrap());
-            store.note_redacted(&withheld).unwrap();
-            assert!(store.is_redacted(&withheld).unwrap());
-            assert!(!store.is_redacted(&other).unwrap());
+            assert!(!store.is_redacted(&withheld, Some(here)).unwrap());
+            assert!(!store.is_redacted(&withheld, None).unwrap());
+            store.note_redacted(&withheld, here).unwrap();
+            assert!(store.is_redacted(&withheld, Some(here)).unwrap());
+            assert!(store.is_redacted(&withheld, None).unwrap());
+            assert!(
+                !store.is_redacted(&withheld, Some(elsewhere)).unwrap(),
+                "a refusal at one position is not a refusal at another"
+            );
+            assert!(!store.is_redacted(&other, None).unwrap());
             store
                 .transaction(|txn| {
-                    assert!(txn.is_redacted(&withheld).unwrap());
-                    txn.note_redacted(&other)
+                    assert!(txn.is_redacted(&withheld, Some(here)).unwrap());
+                    txn.note_redacted(&other, elsewhere)
                 })
                 .unwrap();
-            assert!(store.is_redacted(&other).unwrap());
-            store.note_redacted(&withheld).unwrap(); // noting twice is not an error
+            assert!(store.is_redacted(&other, Some(elsewhere)).unwrap());
+            store.note_redacted(&withheld, here).unwrap(); // noting twice is not an error
         }
         let store = Store::open(dir.path()).unwrap();
-        assert!(store.is_redacted(&withheld).unwrap());
-        assert!(store.is_redacted(&other).unwrap());
+        assert!(store.is_redacted(&withheld, Some(here)).unwrap());
+        assert!(store.is_redacted(&other, Some(elsewhere)).unwrap());
+        assert!(!store.is_redacted(&other, Some(here)).unwrap());
     }
 
     /// §10: trie writes, head, history and materialization commit together or not at all, through the public Txn surface.
@@ -1763,6 +1778,34 @@ mod tests {
         assert_eq!(wants.len(), 1);
         assert_eq!(wants[0].root, missing);
         assert_eq!(wants[0].size, 7);
+    }
+
+    /// v26 keeps what a v25 node knew was refused: the row still answers "refused at any position", which the promotion diff asks of the root already held, and never answers for a real position, which the walk re-learns.
+    #[test]
+    fn v26_carries_a_refusal_forward_as_refused_somewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let withheld = Hash::new(b"withheld");
+        {
+            let conn = database_at(dir.path(), 25);
+            conn.execute(
+                "INSERT INTO redacted_nodes (hash) VALUES (?1)",
+                params![withheld.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.is_redacted(&withheld, None).unwrap());
+        let at: &[u8] = &[0, 1];
+        assert!(
+            !store.is_redacted(&withheld, Some(at)).unwrap(),
+            "a legacy row must not stand in for a position it was never judged at"
+        );
+        assert!(
+            !store.is_redacted(&withheld, Some(&[])).unwrap(),
+            "not even the root"
+        );
+        store.note_redacted(&withheld, at).unwrap();
+        assert!(store.is_redacted(&withheld, Some(at)).unwrap());
     }
 
     /// v6 rebuilds `entries` to carry a symlink's target (§8 version identity), and every existing row comes through it, indexes included.
