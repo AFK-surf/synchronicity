@@ -1,6 +1,10 @@
 import Synchronicity.CasGc
+import Synchronicity.Convergence
 import Synchronicity.FaultTolerant
 import Synchronicity.MptGc
+import Synchronicity.Provenance
 import Synchronicity.Safety
+import Synchronicity.Scope
+import Synchronicity.ScopedSync
 import Synchronicity.SystemSafety
 import Synchronicity.TrieGraph

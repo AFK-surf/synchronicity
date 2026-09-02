@@ -692,6 +692,28 @@ impl Store {
         Ok(PublishScope::Confined(spaces))
     }
 
+    /// The origin whose provenance a walk over `origin`'s trie must carry, if
+    /// any (§5.5).
+    ///
+    /// `None` for this node's own origin, whose trie it built, and for an
+    /// origin holding a live rooted binding, which may reference any node it
+    /// likes: it can read everything, so nothing it publishes leaks. `Some`
+    /// for everything else — a confined origin, and an origin with no live
+    /// binding at all, which is judged as strictly as a confined one rather
+    /// than as an unrestricted one.
+    // LEAN-MODEL: mpt-provenance-owner
+    // `Provenance.Confined`: the origins whose tries are judged with
+    // provenance, which is every origin that is not rooted.
+    pub fn provenance_owner(&self, origin: &OriginId, now: i64) -> Result<Option<OriginId>> {
+        if self.self_origin()?.as_ref() == Some(origin) {
+            return Ok(None);
+        }
+        Ok(match self.publish_scope(origin, now)? {
+            PublishScope::Unrestricted => None,
+            PublishScope::Untrusted | PublishScope::Confined(_) => Some(origin.clone()),
+        })
+    }
+
     /// The scope this node itself may read, as last declared by a peer (§5.5).
     ///
     /// `None` — the default — is the whole keyspace. A delegated node cannot

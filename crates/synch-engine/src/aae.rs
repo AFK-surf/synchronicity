@@ -585,9 +585,15 @@ impl Node {
                 .store()
                 .local_trie_scope()
                 .unwrap_or_else(|_| synch_mpt::Scope::full());
+            // With the provenance promotion demands (§5.5), read
+            // conservatively on a store error for the same reason as the scope.
+            let owner = self
+                .store()
+                .provenance_owner(origin, now)
+                .unwrap_or_else(|_| Some(origin.clone()));
             let stale = !poisoned
                 && stored.received_at <= before
-                && !match trie.is_complete_scoped(stored.head.root, &scope) {
+                && !match trie.is_complete_scoped_for(owner.as_ref(), stored.head.root, &scope) {
                     Ok(complete) => complete,
                     Err(e) => {
                         tracing::warn!(

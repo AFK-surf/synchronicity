@@ -57,11 +57,21 @@ proof.
 
 ## Lean — CAS / mptsync / ingest safety
 
-[`lean/`](lean/) contains unbounded inductive proofs at four resolutions: the
+[`lean/`](lean/) contains unbounded inductive proofs at five resolutions: the
 small per-root protocol, a root/holder-indexed system model whose live relations
 are the content leaves materialized from active tries, a graph model of trie
-mark/sweep, and a fault-tolerant re-proof of the system model with the durable
-backend allowed to lose what it acknowledged. The system theorem says every
+mark/sweep, a fault-tolerant re-proof of the system model with the durable
+backend allowed to lose what it acknowledged, and a positional model of mptsync
+over partial tries — the scoped fetch walk a delegate runs, its pruning against
+a reference root, the responder's authorization by position, and the privacy
+theorem that a delegate holds nothing that spells a key outside its scope
+(`ScopedSync`), together with the three pieces convergence decomposes into —
+head selection is an order-independent join, the derived view is a function of
+root and scope, and a fetch terminates and is complete when it can take no
+further step — under stated delivery and finiteness assumptions
+(`Convergence`); and a multi-party model of provenance across the delegation
+boundary, which exhibits the graft of #115 against the old serving rule and
+proves the provenance rule sound (`Provenance`). The system theorem says every
 live source leaf names available content and every live replica leaf names
 either pinned available content or a want for that same holder and root. It
 covers protection removal as well as acquisition, protected explicit deletion,
@@ -85,7 +95,9 @@ heads), trie contents and fetch (a head stands atomically for its trie —
 pending-head promotion has interleavings of its own and belongs in a
 separate spec), and wall-clock time (the adversarial schedule already
 contains every early-timer interleaving). The Lean model now covers pending
-promotion and GC at the root/content level, and `TrieGraph` covers the retained
-node reachability obligation. SQLite, filesystem, and Rust operational
+promotion and GC at the root/content level, `TrieGraph` covers the retained
+node reachability obligation, and `ScopedSync` covers the fetch walk itself —
+which positions it asks for, when its "complete within scope" answer may be
+believed after pruning, and what a scoped peer is served. SQLite, filesystem, and Rust operational
 semantics remain trusted behind the named linearization points; the anchor
 checker is traceability, not a compiler-to-Lean refinement proof.

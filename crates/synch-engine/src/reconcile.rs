@@ -285,10 +285,16 @@ impl Syncer {
     /// computed from the local trie, never assumed.
     pub fn local_summaries(&self) -> Result<Vec<HeadSummary>> {
         let trie = Trie::new(self.store.as_ref());
+        let now = now_ns();
         let mut out = Vec::new();
         for stored in self.store.all_heads(Slot::Complete)? {
             let head = stored.head;
-            let complete = trie.is_complete(head.root)?;
+            // With provenance for a confined origin (§5.5): a trie of that
+            // origin's this node holds whole but was not served as its is not
+            // one it can vouch for, and `complete` is the vouching.
+            let owner = self.store.provenance_owner(&head.origin, now)?;
+            let complete =
+                trie.is_complete_scoped_for(owner.as_ref(), head.root, &Scope::full())?;
             out.push(HeadSummary {
                 origin: head.origin,
                 seq: head.seq,
@@ -440,12 +446,14 @@ impl Syncer {
     /// partial trie by construction. Memoized per root.
     pub fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>> {
         let trie = Trie::new(self.store.as_ref());
+        let now = now_ns();
         let mut out = Vec::new();
         for origin in origins {
             let Some(stored) = self.store.head(origin, Slot::Complete)? else {
                 continue;
             };
-            if !trie.is_complete(stored.head.root)? {
+            let owner = self.store.provenance_owner(origin, now)?;
+            if !trie.is_complete_scoped_for(owner.as_ref(), stored.head.root, &Scope::full())? {
                 tracing::debug!(
                     origin = %origin,
                     "not serving a head whose trie this node does not hold whole"
@@ -499,6 +507,10 @@ impl Syncer {
             // only `try_promote` knows both. A head this node has already
             // failed on is adopted here and retired there, which costs two
             // indexed writes rather than the diff.
+            // LEAN-MODEL: mpt-head-adopt
+            // `Convergence.adopt`; `select_eq_of_mem_iff` is why the head a
+            // node ends up with depends on which heads it heard, not their
+            // order, and `seq_only_diverges` is the NB above made concrete.
             let outcome = if head.supersedes(floor.as_ref()) {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
@@ -579,6 +591,7 @@ impl Syncer {
     pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
         let read_scope = self.store.local_trie_scope()?;
         let publish_scope = self.store.publish_scope(origin, now)?;
+        let owner = self.store.provenance_owner(origin, now)?;
         // What the transaction judged, for the fault arm: it rolls back, so the
         // head cannot be recovered from the slot afterwards.
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
@@ -658,7 +671,14 @@ impl Syncer {
             // Completeness is a property of a root *and* a scope: what has to
             // be present is what this node may read, not what the origin
             // published (§5.5).
-            if !trie.is_complete_scoped(pending.head.root, &read_scope)? {
+            // And with provenance for a confined origin: what has to be
+            // present is what this node was served as that origin's, not
+            // what it happens to hold from anyone's trie (§5.5).
+            // LEAN-MODEL: mpt-complete-owned-promote
+            // `Provenance.confined_head_vouched`: a member vouches for a
+            // confined origin's head only if every node under it is one that
+            // origin legitimately held.
+            if !trie.is_complete_scoped_for(owner.as_ref(), pending.head.root, &read_scope)? {
                 return Ok(Promotion::Waiting);
             }
             // A delegated origin's trie must hold nothing outside the spaces
@@ -726,6 +746,10 @@ impl Syncer {
             // `INSERT OR IGNORE` (§10, v11).
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
+            // LEAN-MODEL: mpt-materialize-scoped
+            // `Convergence.ScopedView`: what this derives is a function of the
+            // root and the read scope alone (`scoped_view_deterministic`), and
+            // every admitted key is readable here (`admitted_key_readable`).
             txn.materialize_diff(origin, old_root, pending.head.root)?;
             Ok(Promotion::Flipped)
         });
@@ -797,22 +821,35 @@ impl Syncer {
         // and the walk is unchanged, for a delegated one a stop at the boundary
         // rather than a request it would be refused — and reading it is a store
         // read, which belongs on the same hop rather than on the runtime.
-        let (reference, scope, held) = {
+        let (reference, scope, held, owner) = {
             let store = self.store.clone();
             let origin = origin.clone();
             crate::blocking::offload(move || {
                 let trie = Trie::new(store.as_ref());
                 let scope = store.local_trie_scope()?;
                 let held = store.complete_head(&origin)?;
+                // Whose provenance the walk carries: a confined origin's trie
+                // is fetched as *its*, so a node this store already holds from
+                // another origin's trie is asked for again, and the reference
+                // must be complete with the same provenance (§5.5).
+                let owner = store.provenance_owner(&origin, now_ns())?;
                 let reference = match &held {
                     // "Held whole" means held whole *within this scope*: the
                     // walk never commits part of a subtree it is inside, so
                     // every boundary it holds is a scope edge and pruning
                     // against it stays sound.
-                    Some(head) if trie.is_complete_scoped(head.root, &scope)? => Some(head.root),
+                    // LEAN-MODEL: mpt-fetch-reference
+                    // `ScopedSync.prune_sound_paired`: the reference's
+                    // `CompleteWithin` premise is established here, over the
+                    // same provenance the walk below reads presence with.
+                    Some(head)
+                        if trie.is_complete_scoped_for(owner.as_ref(), head.root, &scope)? =>
+                    {
+                        Some(head.root)
+                    }
                     _ => None,
                 };
-                Ok((reference, scope, held))
+                Ok((reference, scope, held, owner))
             })
             .await?
         };
@@ -841,7 +878,12 @@ impl Syncer {
             .await?;
             return Ok(FetchOutcome::Refused);
         }
-        let mut walk = synch_mpt::MissingWalk::scoped(reference, pending.root, scope.clone());
+        let mut walk = synch_mpt::MissingWalk::for_origin(
+            owner.clone(),
+            reference,
+            pending.root,
+            scope.clone(),
+        );
         let mut unproductive = 0u32;
         loop {
             // One walk across the whole fetch, resumed rather than restarted:
@@ -916,6 +958,10 @@ impl Syncer {
                         // is one: a row per autocommit statement is a write
                         // connection and a WAL frame per boundary.
                         store.transaction(|txn| -> Result<()> {
+                            // LEAN-MODEL: mpt-learn-scoped
+                            // `ScopedSync.Learn`: nodes, values and refusals
+                            // enter a delegate's store from the responder
+                            // alone; `reachable_confined` is what that buys.
                             for (path, hash) in &boundary {
                                 synch_mpt::NodeStore::note_redacted(txn, hash, path)?;
                             }
@@ -924,6 +970,7 @@ impl Syncer {
                     })
                     .await?;
                 }
+                let owner = owner.clone();
                 let stored = crate::blocking::offload(move || {
                     // One transaction per batch, not one per node. Written
                     // through the `Store`, each `put_node` is a bare `execute`
@@ -947,6 +994,16 @@ impl Syncer {
                             verify_node,
                             |hash, bytes| {
                                 synch_mpt::NodeStore::put_node(txn, hash, bytes)?;
+                                // Served under this origin's root by a peer
+                                // vouching for it: that is what provenance
+                                // records, in the same transaction as the
+                                // node (§5.5).
+                                // LEAN-MODEL: mpt-learn-owned
+                                // `Provenance.Step.learn` writes `held` and
+                                // `owned` together.
+                                if let Some(origin) = &owner {
+                                    synch_mpt::NodeStore::note_owned(txn, origin, hash)?;
+                                }
                                 Ok(true)
                             },
                         )
@@ -1063,6 +1120,11 @@ impl Syncer {
                 .await?;
             }
 
+            // LEAN-MODEL: mpt-fetch-progress
+            // `Convergence.FetchStep`: a productive round learns an item the
+            // finite trie bounds, so the fetch terminates
+            // (`fetch_terminates`); a round that can learn nothing more from a
+            // peer holding the head has a complete trie (`stuck_complete`).
             if learned == 0 {
                 unproductive += 1;
                 if unproductive >= MAX_UNPRODUCTIVE_ROUNDS {
@@ -1126,7 +1188,13 @@ impl Syncer {
         let syncer = self.clone();
         let origin = origin.clone();
         let promoted = crate::blocking::offload(move || {
-            synch_mpt::NodeStore::note_complete(store.as_ref(), &scope.memo_key(pending.root))?;
+            // LEAN-MODEL: mpt-complete-memo
+            // `ScopedSync.prune_sound`: a walk that pruned against the
+            // reference above still establishes `CompleteWithin` for this root.
+            synch_mpt::NodeStore::note_complete(
+                store.as_ref(),
+                &scope.memo_key_for(owner.as_ref(), pending.root),
+            )?;
             syncer.try_promote(&origin, now_ns())
         })
         .await?;

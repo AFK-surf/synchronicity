@@ -302,6 +302,7 @@ impl MptProtocol {
                 let (nodes, missing, redacted) = crate::blocking::offload(move || {
                     let scope = store.scope_for_key(&peer, now_ns())?;
                     let admitted = admit(&store, peer, root, &wants)?;
+                    let vouch = Vouch::for_root(&store, root)?;
                     let mut answer = Answer::new();
                     let mut missing = Distinct::default();
                     let mut redacted = Distinct::default();
@@ -327,11 +328,21 @@ impl MptProtocol {
                             missing.push(hash);
                             continue;
                         };
+                        // Held is not the same as vouched for: under a
+                        // confined origin's root only a node this store was
+                        // served as that origin's goes out, to any peer.
+                        if !vouch.covers(&store, &hash)? {
+                            missing.push(hash);
+                            continue;
+                        }
                         // Position admits the node; what the node *reveals* may
                         // still run out of scope. A compressed node carries key
                         // material of its own — an extension's prefix, a leaf's
                         // remaining key and value — and one sitting on the spine
                         // can describe a key range the peer was never granted.
+                        // LEAN-MODEL: mpt-serve-node
+                        // `ScopedSync.ServeNode`/`Redacts`;
+                        // `served_reveals_within_scope` is the privacy claim.
                         if !scope.is_full()
                             && !TrieNode::decode(&data)
                                 .map(|node| scope.admits_node(path, &node))
@@ -391,6 +402,7 @@ impl MptProtocol {
                         true => None,
                         false => Some(admit(&store, peer, root, &wants)?),
                     };
+                    let vouch = Vouch::for_root(&store, root)?;
                     let mut answer = Answer::new();
                     let mut missing = Distinct::default();
                     for (i, wanted) in wants.iter().enumerate() {
@@ -398,8 +410,15 @@ impl MptProtocol {
                             continue;
                         }
                         if let Some(holders) = &holders {
-                            let carried =
-                                match holders[i].map(|h| store.get_node(&h)).transpose()? {
+                            // The holder must be vouched for as well as
+                            // admitted: a value under a confined origin's root
+                            // travels only with the node that carries it.
+                            let vouched = match holders[i] {
+                                Some(h) => vouch.covers(&store, &h)?,
+                                None => false,
+                            };
+                            let carried = vouched
+                                && match holders[i].map(|h| store.get_node(&h)).transpose()? {
                                     Some(Some(data)) => TrieNode::decode(&data)
                                         .map(|node| {
                                             // Coverage, not just position — the
@@ -415,6 +434,8 @@ impl MptProtocol {
                                             // other served the contents of, for
                                             // the price of knowing its value
                                             // hash.
+                                            // LEAN-MODEL: mpt-serve-value
+                                            // `ScopedSync.ServeValue`.
                                             node.value_hashes().contains(&wanted.1)
                                                 && scope.admits_node(&wanted.0, &node)
                                         })
@@ -590,6 +611,55 @@ impl Distinct {
     }
 }
 
+/// Whose trie a request walks, and what each of those origins demands before
+/// this store vouches for a node under it (§5.5).
+///
+/// A root this store holds a head for belongs to one origin — in principle to
+/// several, if two origins signed identical tries — and for a confined one a
+/// node is served only if this store was served it as that origin's
+/// (`NodeStore::owns_node`). Holding the node is not enough: a member holds
+/// every node of the issuer's trie, and a delegate can place any withheld
+/// subtree's hash in its own trie. Enforced for every peer, scoped or not — a
+/// full member that was handed the node under the grafting root would record
+/// provenance for it and complete the head, and the leak would only have moved
+/// one hop. A root this store holds no head for demands nothing: `admit` has
+/// already refused it for a scoped peer, and an unscoped peer may have any
+/// node this store holds.
+// LEAN-MODEL: mpt-serve-vouched
+// `Provenance.Vouched`; `Provenance.serve_legit` is why what a responder hands
+// out under any root is legitimately the reader's to hold.
+struct Vouch {
+    owners: Vec<Option<OriginId>>,
+}
+
+impl Vouch {
+    fn for_root(store: &Store, root: Hash) -> Result<Vouch, NetError> {
+        let now = now_ns();
+        let mut owners = Vec::new();
+        for origin in store.head_root_origins(&root)? {
+            owners.push(store.provenance_owner(&origin, now)?);
+        }
+        Ok(Vouch { owners })
+    }
+
+    fn covers(&self, store: &Store, hash: &Hash) -> Result<bool, NetError> {
+        if self.owners.is_empty() {
+            return Ok(true);
+        }
+        for owner in &self.owners {
+            match owner {
+                None => return Ok(true),
+                Some(origin) => {
+                    if NodeStore::owns_node(store, origin, hash)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Resolves a batch of claimed positions and returns what stands at each,
 /// refusing the whole request if any position lies outside the peer's scope.
 ///
@@ -603,6 +673,9 @@ impl Distinct {
 /// it is not a race: an honest peer prunes its own frontier at the boundary
 /// and never asks. A request that crosses it is a probe, and saying so is
 /// worth more than quietly returning nothing.
+// LEAN-MODEL: mpt-serve-admit
+// `ScopedSync.Admit`; `admit_ignores_claim` and `admit_unique` are "a hash
+// cannot be authorized; a position can".
 fn admit(
     store: &Store,
     peer: NodeId,
