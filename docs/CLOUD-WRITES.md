@@ -10,10 +10,11 @@ and take one out of it through the same service that lets them browse it.
 Two constraints are given, and the whole design is what follows from taking
 them literally rather than approximately:
 
-1. **Only for networks whose cloud hosting is enabled.** Not merely gated on
-   the hosting switch — *impossible without it*, because the write has to be
-   *somebody's* assertion and the hosted replica is the only member of a
-   customer's network that this service operates (§3).
+1. **Only for networks whose cloud hosting is enabled, and always for
+   those.** There is no second switch: hosting on is writes on. Not merely
+   gated on the hosting switch — *impossible without it*, because the write
+   has to be *somebody's* assertion and the hosted replica is the only member
+   of a customer's network that this service operates (§3).
 2. **The write goes only to the cloud `synch-dp`.** The customer's own daemons
    receive nothing. The browse tunnel they open stays read-only *by wire
    construction* — no write frame is added to it, and the daemon binary gains
@@ -40,15 +41,17 @@ control-plane/README.md.
   version of a path: content root, size, host-stamped `mtime_ns`, `prev`. Every
   existing guarantee — single-writer tries, the version model, divergence as
   data, adoption — applies unchanged.
-- **Fail-closed enablement, three deep.** A third per-network switch,
-  `cloud_writes`, admin-gated and off by default, that cannot be turned on
-  unless hosting is, and is cleared in the same transaction that turns hosting
-  off.
+- **One gate, the one that already exists.** Writes are a property of a
+  hosted network: on while `cloud_hosted = 1`, off the instant it is not, with
+  no switch of their own to be left on, forgotten, or misread. §4.1 says why
+  a separate switch was considered and not taken.
 - **Nothing stored here.** Bytes pass through the control plane's memory in
   bounded chunks and land in the tenant's object-store prefix, exactly as
   downloads pass through the other way (CP README, *Cloud browse*).
-- **Every write audited.** Reads are deliberately unrecorded; a write is a
-  change and goes in the org's trail like every other change.
+- **Nothing written here either.** A file write is a data-plane operation
+  end to end: the control plane relays it and records nothing — no audit
+  row, no status row, no database write of any kind (§4.4). What that buys
+  is that any control-plane node takes a write, replicas included (§4.6).
 
 ### Non-goals
 
@@ -71,15 +74,13 @@ control-plane/README.md.
 
 ## 2. What the customer sees
 
-1. An org admin has hosting on for a network (CLOUD-DATAPLANE §2), so the
-   device `cloud-1` is in it. They turn on **cloud writes** for the network
-   in the dashboard, or `PUT /api/orgs/:slug/networks/:net/cloud-writes/enabled
-   {"enabled": true}`. Default off; refused with `409 hosting-disabled` while
-   hosting is off.
-2. Within a poll interval the data plane sees `writes: true` in the network's
-   desired-state entry and opens a **write tunnel** for that tenant to the
-   control plane's primary (§5). The network's browse status reports it
-   attached.
+1. An org admin turns hosting on for a network (CLOUD-DATAPLANE §2). The
+   dashboard's hosting control says, in the same sentence, that a hosted
+   network can be written to from here; there is nothing further to enable.
+2. Once the tenant is running and `cloud-1` is in the zone, the data plane
+   opens a **write tunnel** for that tenant to every node of the control
+   plane (§5), beside the browse tunnels it already opens. The network's
+   browse status reports it attached.
 3. A member uploads a file from the file browser, or runs
 
    ```sh
@@ -106,20 +107,21 @@ control-plane/README.md.
 5. `DELETE` withdraws the cloud's version. If `nas` still publishes the path,
    the answer says `"still_published": true` and the file browser says so in
    words: *the cloud's copy is withdrawn; nas still publishes this file.*
-6. Turning writes off drops the write tunnel in the same request. Turning
-   hosting off clears the writes switch too, and `cloud-1` leaves the zone at
-   the same commit; its assertions cease to be part of the trusted view when
-   its binding expires, as any removed member's do.
+6. Turning hosting off drops the write tunnel in the same request, and
+   `cloud-1` leaves the zone at the same commit; its assertions cease to be
+   part of the trusted view when its binding expires, as any removed member's
+   do. That is the whole of turning writes off.
 
 **Why this adds no new trust.** The control plane already signs the membership
 zone and can already put any device key into any network it serves — which is
 to say it could already, today, publish anything into any network under a key
 of its own choosing. Hosting narrowed that latent authority to one explicit,
-audited, org-controlled member, `cloud-1` (CLOUD-DATAPLANE §2). Writes are that
-member doing the one further thing a member does: publishing its own view. The
-switch narrows it again — to networks whose admin said yes, attributed to a
-named origin, one audit row per act. It widens nothing the deployment did not
-already hold.
+audited, org-controlled member, `cloud-1` (CLOUD-DATAPLANE §2). The write
+surface is that member doing the one further thing a member does: publishing
+its own view — in networks whose admin said yes to hosting, attributed to a
+named origin, signed under a key the zone names, recorded where every
+publish is recorded, in the origin's own signed history. It widens nothing
+the deployment did not already hold.
 
 ---
 
@@ -155,8 +157,9 @@ What the chosen shape settles, before any route is designed:
 
 - **The gate is structural.** With hosting off there is no `cloud-1`, so
   there is no origin of this service's in the network and nothing to write
-  *as*. `cloud_writes` cannot be on without `cloud_hosted`, and the schema
-  says so (§4.1) rather than a handler remembering to.
+  *as*. The gate is `cloud_hosted`, read where every other consequence of
+  hosting is read (§4.1), and there is no second flag for a handler to
+  forget.
 - **The destination is structural.** The hosted node is the only end of the
   write tunnel (§5) and the only origin that signs the head. The customer's
   daemons learn of the write the way they learn of any peer's publish.
@@ -167,63 +170,55 @@ What the chosen shape settles, before any route is designed:
   wins `newest`", which the cluster already knows how to display, adopt over
   and outrank — TREE-WRITES §1 makes exactly this argument for socket writes,
   and it holds here word for word.
-- **The org holds the kill switch.** Writes off drops the tunnel now; hosting
-  off removes `cloud-1` from the zone in the same commit, after which its
-  origin is no longer a trusted publisher on any member.
+- **The org holds the kill switch.** Hosting off drops the write tunnel in
+  the same request and removes `cloud-1` from the zone in the same commit,
+  after which its origin is no longer a trusted publisher on any member.
 
 ---
 
 ## 4. Control-plane additions
 
-### 4.1 The `cloud_writes` switch
+### 4.1 The gate is the hosting switch
 
-Migration v15, copying v12's shape:
+No new column, no new route, no new audit event. A network takes writes
+exactly while `networks.cloud_hosted = 1`, and every check this design
+makes reads that column where hosting's other consequences already read it:
+the write tunnel's attach lookup (§5.2) and the route's own resolution
+(§4.2). Turning hosting off already does everything turning writes off would
+need to do — it deletes the `cloud-*` devices in the same commit — and it
+gains one more consequence after that commit: the network's write sessions
+are dropped (`agent.drop_network` on the write registry, §4.5), for the
+reason the browse switch gives when *it* drops sessions: a session that
+outlived the switch would keep taking writes for a network the org has just
+withdrawn from hosting.
 
-```sql
-ALTER TABLE networks ADD COLUMN cloud_writes INTEGER NOT NULL DEFAULT 0
-  CHECK (cloud_writes = 0 OR cloud_hosted = 1);
-```
+**Why not a third switch.** An earlier draft of this document had one —
+`cloud_writes`, admin-gated, off by default, with a schema `CHECK` that it
+could not be on without `cloud_hosted` — on the argument that every
+capability this service exercises over an org's cluster is an explicit
+grant and a write is a larger act than a replica. The argument is right
+about the act and wrong about the grant. What hosting grants is *a member*:
+`cloud-1` is in the zone under the org's signature, admitted by every
+customer node as a peer that fetches, serves and publishes, and nothing in
+the protocol distinguishes a member that may publish from one that may not
+— a member publishes, that is what the word means. A switch that said
+"hosted but not writable" would describe a member the cluster cannot
+represent, enforced only on this side of the tunnel, and would be the one
+flag in the schema whose off state changed nothing a peer could observe.
+Hosting on is the grant; the dashboard's hosting control says what it
+grants, in words, at the moment it is asked for.
 
-- The `CHECK` is the whole of requirement 1 in one line: a row cannot say
-  "writes on" and "hosting off" at once, whichever handler wrote it and in
-  whichever order. SQLite evaluates the constraint per statement, so the
-  disable path below clears both in one `UPDATE` rather than two.
-- Exposed as `cloud_writes` on `list_networks` and `network_detail`, beside
-  `browse_enabled` and `cloud_hosted`.
-- Written by `PUT /api/orgs/:slug/networks/:net/cloud-writes/enabled`,
-  admin-gated, audited as `cloud-writes.enable` / `cloud-writes.disable`,
-  mirroring `browse_api.set_enabled`. Turning on a network with
-  `cloud_hosted = 0` answers `409 hosting-disabled` with the message naming
-  the switch to flip first — the `CHECK` would refuse it anyway, but a
-  constraint error is not an answer an admin can act on.
-- **Not a zone mutation.** Nothing in the zone changes: `cloud-1` is already
-  there. The data plane learns the new state from the desired-state document,
-  whose `ETag` hashes the body (CLOUD-DATAPLANE §3.3), so no serial bump is
-  needed for it to be noticed.
-- Turning writes *off* drops the network's write sessions in the same request
-  (`agent.drop_network` on the write registry, §4.5), for the reason the
-  browse switch gives: a session that outlived the switch would keep taking
-  writes for a network the org just said may not be written.
-- `networks_api.set_cloud_hosting` grows one clause: the disable path's
-  `UPDATE` becomes `SET cloud_hosted = 0, cloud_writes = 0`, and it drops the
-  network's write sessions after the commit. The audit row for
-  `cloud-hosting.disable` gains `"writes_cleared": true|false`.
+What the earlier draft was defending — an org that wants a replica and
+does not want this service publishing — is met by the version model rather
+than by a flag: a control-plane write is one origin's assertion, visible as
+such, adoptable over, and gone with the member when hosting goes (§3).
 
-**Why a third switch rather than "hosting implies writes".** Every capability
-this service exercises over an org's cluster is an explicit admin grant —
-browse, hosting — and each grant names what it grants. An org that turned on
-hosting consented to *a replica*: a member that fetches and keeps. It did not
-consent to this service publishing into its tree, and the difference is the
-difference between observing a cluster and asserting into it. A write is the
-larger act (TREE-WRITES §1), so it gets its own switch. What the switch does
-*not* get is independence from hosting, because §3 makes that meaningless.
-
-Browse and writes stay independent of each other, as browse and hosting are.
-Writes without browse is a blind drop-box — an org key uploading CI artifacts
-into a network nobody browses from here — and it is a legitimate shape; the
+Browse and writes stay independent, as browse and hosting are. Writes
+without browse is a blind drop-box — an org key uploading CI artifacts into
+a network nobody browses from here — and it is a legitimate shape; the
 route needs the write tunnel, not the browse one. The dashboard's file page
-lives under browse, so in practice a person enabling writes has browse on
-too, but nothing in the API requires it.
+lives under browse, so in practice a person uploading has browse on too,
+but nothing in the API requires it.
 
 ### 4.2 The routes
 
@@ -231,7 +226,6 @@ too, but nothing in the API requires it.
 | -------- | ------------------------------------------------ | ------ | ---- |
 | `PUT`    | `…/networks/:net/browse/file?space=&path=`       | member | publish the body as `cloud-1`'s version of the path |
 | `DELETE` | `…/networks/:net/browse/file?space=&path=`       | member | publish `cloud-1`'s tombstone for the path |
-| `PUT`    | `…/networks/:net/cloud-writes/enabled`           | admin  | `{"enabled": true}` — the switch |
 
 `GET …/networks/:net/browse` (status) gains
 
@@ -332,8 +326,7 @@ write needs:
 | --- | --- | --- |
 | `400` | `invalid` | `space=`/`path=` missing, `origin=` on a write, a path `normalize_path` refuses |
 | `404` | `not_found` | no such network, or a space the hosted node does not replicate (§6.2) |
-| `409` | `writes-disabled` | the switch is off |
-| `409` | `hosting-disabled` | turning the switch on while hosting is off |
+| `409` | `hosting-disabled` | the network is not cloud-hosted, so nothing of this service's can publish into it |
 | `411` | `length-required` | no `Content-Length` |
 | `412` | `precondition` | `If-Match` / `If-None-Match` did not hold |
 | `413` | `too-large` | above the deployment's per-write cap |
@@ -342,7 +335,7 @@ write needs:
 | `503` | `unavailable` | the hosted node refused: in recovery, or out of staging room |
 | `507` | `over-budget` | the write would carry the tenant past `budget_bytes` (§6.4) |
 
-### 4.4 Authorization, CSRF and audit
+### 4.4 Authorization, CSRF, and why nothing is recorded
 
 Credential resolution is the download's, byte for byte: `Authorization` wins
 and is terminal, the cookie is the fallback. What the download does *not* do
@@ -353,18 +346,37 @@ require_session` grows the check for non-`GET` methods, sharing the rule
 rather than the function (it speaks mist's request, not wisp's). A bearer
 key needs no token, for the reason `middleware.check_principal` spells out.
 
-Every write is audited, under the actor the credential resolves to:
+**No audit row, and no other database write.** A file write is a pure
+data-plane operation: the bytes, the entry and the head all land in the
+tenant, and the control plane is a relay that resolves a credential on a
+pooled read connection and then talks to a tunnel. An earlier draft audited
+every write as `file.put` / `file.delete`, on the reasoning that reads are
+ordinary use while a write is a change. That reasoning is right about what a
+write is and wrong about whose record it belongs in. The change is the
+hosted node's, and the hosted node already keeps the record that matters:
+the `f:` entry carries `prev`, the head is signed and sequenced, and
+`synch log` on any member walks `cloud-1`'s own publishes for the path —
+retained history, verifiable, not editable by this service. A row in
+`audit_log` would be a second, weaker copy of that, and it would make every
+upload a write transaction on the control plane's database — which is what
+decides that only the primary may serve it, and what puts a customer's
+upload rate on the same SQLite writer as the zone's re-signs and the
+dashboard's mutations.
 
-```
-file.put     { network, space, path, root, size, origin: "cloud-1@…", condition? }
-file.delete  { network, space, path, still_published, withdrawn, condition? }
-```
+What the control plane keeps instead is what it already keeps: the tunnel's
+session in actor memory, and the write slots below, both gone at restart and
+truthful within a backoff. What a deployment that wants a per-upload log
+does is what it does for downloads: read the hosted node's log line, which
+names the space, the path, the root, the size and the control-plane session
+that relayed it — the same line the socket runtime writes for a tree write.
 
-Reads stay unrecorded — that decision (browse_api.gleam's header) is about
-logging ordinary *use*, and a write is not use, it is a change. The row is
-written after the tunnel answers, on the primary, in the ordinary
-`common.audit` shape; a write that the hosted node refused is not a change
-and gets no row.
+The one row this surface does not write is also the one a *person* might
+want most: "who uploaded this". The answer is in the head — `cloud-1`,
+which is to say "somebody with member access to this org, through the
+control plane" — and no further. That is a real limit and it is stated as
+one: attributing a write to the individual member would mean either a
+control-plane database write per upload or the member's own key signing
+somewhere, and both are the things this design declines (§14).
 
 **The write slots.** Uploads take their own per-credential cap, the download's
 mechanism with its own pool: `claim_write`/`release_write` on the registry,
@@ -390,24 +402,29 @@ none. When redundant hosting arrives, a second slot is a second *origin*, and
 design answers it for one slot and says so rather than pretending the answer
 generalizes.
 
-### 4.6 Replicas and the primary
+### 4.6 Any node serves a write
 
-Writes are the primary's, like every write: the audit row is a database
-write, and the write tunnel attaches to the primary alone (§5.2). A `PUT` or
-`DELETE` reaching a read-only node gets the ordinary `409 read-only-replica`
-naming the primary, the answer `router.elsewhere` gives every other write.
-The below-wisp edge (`api/edge`) wraps the primary and the replica alike
-today and mounts `…/browse/file` for `GET` only; it learns which role it
-wraps (`Surface` gains the primary's URL, absent on the primary) and answers
-a non-`GET` on a replica with that same `409` body rather than passing it to
-a handler that has no write tunnel to reach. The SPA already turns the
-`primary` field into a link.
+The reads/writes split in `api/router` is about the *database*: a replica
+holds a read-only copy, so it mounts no route that mutates a row. A file
+write mutates no row (§4.4). What it needs is a credential lookup, which is a
+read, and a write tunnel for the network, which is a fact about the node's
+own memory — exactly the two things a download needs. So `PUT` and `DELETE`
+on `…/browse/file` are mounted where the `GET` is: in the below-wisp edge
+(`api/edge`), on every role, and the data plane opens a write tunnel to
+**every node of the deployment** (§5.2), for the reason the browse tunnel
+does: the registry of attached sessions is one process's memory, so a node
+with no tunnel could answer no write however current its copy of the
+database. Primary and replicas take writes alike, and a deployment whose
+primary is down keeps taking them.
 
-This is the one place the write surface is *narrower* than the read one: a
-daemon opens a browse tunnel to every node of the deployment because any of
-them may serve a read, while the data plane opens a write tunnel to one. A
-deployment whose primary is down takes no writes, which is already true of
-every other write it takes.
+Two things follow, and both are stated so they are not discovered. The
+edge's wrapper has to take the three methods rather than `GET`, which makes
+`…/browse/file` the first non-`GET` a read-only node mounts; `router.
+elsewhere`'s reasoning — "every route a read-only node mounts is a `GET`" —
+stays true of the *wisp* table it is about, and the edge's docstring says
+that this one route below it is the exception, and why. And a browser or
+script that reaches a replica for its write sees no `409 read-only-replica`
+and no redirect to a primary; it is served, and it is served identically.
 
 ---
 
@@ -436,8 +453,8 @@ a customer's daemon that could turn a write frame into a write. The test in
 `frame.rs` that no frame encodes a write keeps passing, and keeps meaning what
 it says.
 
-The cost is a second WebSocket per hosted tenant to the primary, and a second
-connection actor in the control plane. Both are small, and both are the price
+The cost is a second WebSocket per hosted tenant per control-plane node, and
+a second connection actor in the control plane. Both are small, and both are the price
 of the property being a fact rather than a promise.
 
 ### 5.2 Handshake
@@ -469,21 +486,28 @@ token alone attaches nothing here (§10).
 The lookup, on the pooled connection: an `active` key for a device whose
 `created_by` is `system-dataplane` (ownership, not the label —
 CLOUD-DATAPLANE §3.4), in the claimed network, with `cloud_hosted = 1`,
-`cloud_dp_id = dp` and `cloud_writes = 1`. Refusals: `unauthorized` for an
-unrecognised key, `not_found` for a network assigned elsewhere (the "not
-yours is not there" rule, CLOUD-DATAPLANE §3.3), `writes-disabled` where the
-switch is off. A key that names no data plane is `dataplane_unnamed`, as on
-every `/dp/v1` route.
+`cloud_dp_id = dp`. Refusals: `unauthorized` for an unrecognised key,
+`not_found` for a network assigned elsewhere (the "not yours is not there"
+rule, CLOUD-DATAPLANE §3.3), `hosting-disabled` for a network whose flag has
+gone off while its device rows are still being torn down. A key that names
+no data plane is `dataplane_unnamed`, as on every `/dp/v1` route. Every part
+of the lookup is a read, so a replica performs it as well as the primary.
 
 `hello` carries `{v: 1, network, origin, device, slot}` and no `spaces`
 claim: there is nothing to route on. The tunnel has its own version counter,
 starting at 1, negotiated by the same clamp-to-newest rule as the browse
 tunnel's; the two counters are unrelated.
 
-**Primary only.** The route is in `write_routes`. A replica answers the
-upgrade with the same `409 read-only-replica` body naming the primary, and
-the data plane dials the URL it names — the same answer it already gets from
-a replica for its four `/dp/v1` writes.
+**Every node.** The attach route is a read of the directory and a change to
+the answering node's memory, so it is mounted in `read_routes`' company —
+served by primary and replicas alike — and the data plane opens one tunnel
+per tenant **per endpoint** the deployment names. The endpoints come from the
+same place the browse tunnel gets them: the `_synchronicity-cp.<apex>`
+record in the zone the tenant already DNSSEC-validates, read through the
+tenant's resolver (`DnssecResolver::control_plane`) on the record's TTL.
+Not from `SYNCH_DP_CONTROL_URL`: that names where the fleet *polls*, which a
+load balancer may make one address for many nodes, and a tunnel has to
+reach each node by itself.
 
 ### 5.3 Frames
 
@@ -546,20 +570,21 @@ exactly as a stalled download is.
 
 ### 6.1 `run_cloud_writes`
 
-One more standing loop per tenant, spawned by `spawn_loops` **only while the
-desired-state entry says `writes: true`** — the document gains that field,
-read from `networks.cloud_writes`, and a change is coalesced into the tenant's
-next converge job like a budget change is. A tenant whose org has not
-enabled writes opens no write tunnel and costs nothing; the control plane
-would refuse it anyway (§5.2), so the field is a courtesy to the fleet's
-connection count rather than a gate.
+One more standing loop per tenant, spawned by `spawn_loops` beside
+`run_cloud`, for every hosted tenant: a hosted network takes writes (§4.1),
+so there is nothing in the desired-state document to consult and nothing
+for the document to gain.
 
-The loop is the browse attach loop's shape: dial the primary (following the
-`409` to it), handshake, serve to the end, back off with jitter, repeat. One
-connection per tenant, because the device proof is per tenant. A session
+The loop is the browse attach loop's shape, and deliberately so: discover
+the deployment's endpoints from the zone on the record's TTL, keep one child
+per endpoint with its own retry clock, handshake, serve to the end, back off
+with jitter, repeat. One connection per tenant per endpoint, because the
+device proof is per tenant and the session registry is per node. A session
 holds a per-write task each, spawned onto the runtime with the store work on
 the blocking pool, under the same inbound ceiling every other request handler
-on this pod runs under (CLOUD-DATAPLANE §9.1).
+on this pod runs under (CLOUD-DATAPLANE §9.1). Writes arriving on several
+tunnels at once for one tenant serialize where they must — at the node's
+tree-write lock (§6.3) — and nowhere else.
 
 ### 6.2 The API source, lazily
 
@@ -723,13 +748,15 @@ decoder.
   green tick. Delete confirms with the outcome in words: *withdraw the
   cloud's version*, and after the fact, *nas still publishes this file* when
   `still_published` is true.
-- **`NetworkDetail`** gains the writes switch beside the hosting one,
-  disabled with its reason while hosting is off, and the hosting-off
-  confirmation names that writes go with it.
-- **`priv/skill/SKILL.md`** gains the two rows and the switch in its route
-  table, the new error codes in its table, and one paragraph on what a delete
-  means. The skill is the API's contract for programs, and a program that
-  reads `still_published: true` as failure would retry forever.
+- **`NetworkDetail`**'s hosting control says what hosting now grants: a
+  replica that keeps everything published on the network, *and* a member of
+  the network that files can be put into from here. The hosting-off
+  confirmation says that uploads stop with it.
+- **`priv/skill/SKILL.md`** gains the two rows in its route table, the new
+  error codes in its table, one paragraph on what a delete means, and one
+  sentence that uploads leave no audit row. The skill is the API's contract
+  for programs, and a program that reads `still_published: true` as failure
+  would retry forever.
 
 ---
 
@@ -738,7 +765,8 @@ decoder.
 | failure | effect | recovery |
 | --- | --- | --- |
 | writes on, tenant not yet provisioned / restarting | `503 no-cloud-attached` | the tunnel attaches within a backoff of the tenant reaching `Running` |
-| primary down | no writes taken, as for every write | the primary returns; reads unaffected |
+| primary down | replicas keep taking writes; only database mutations wait | the primary returns |
+| one control-plane node has no tunnel yet | that node answers `503 no-cloud-attached`; its siblings serve | the tunnel attaches within a backoff |
 | body shorter than `Content-Length` | `err invalid` at commit, staging dropped, nothing published | client repeats |
 | browser stalls mid-upload | credit stops, the body read stalls; watchdog cancels at 60 s idle | client repeats |
 | pod dies after `committed`, before the DB ship | metadata of ≤ 1 s of writes lost locally; bytes durable | self-readoption from members that received the push (§6.5); else re-put |
@@ -748,10 +776,9 @@ decoder.
 | hosted node in recovery | `err unavailable` at open and again at commit | recovery completes |
 | tenant over budget | `507 over-budget` before any byte moves | org raises plan |
 | pod staging disk full | `err unavailable` at open (staging budget) | writes resume as in-flight ones finish |
-| writes switched off mid-upload | session dropped, the in-flight write is cancelled at the node, nothing published | the org's decision |
-| hosting switched off | `cloud_writes` cleared in the same commit, sessions dropped, `cloud-1` leaves the zone | re-enable both |
+| hosting switched off mid-upload | sessions dropped, the in-flight write is cancelled at the node, nothing published; `cloud-1` leaves the zone in the same commit | re-enable hosting |
 | **leaked data-plane key** | cannot attach a write tunnel: the device proof needs `cloud-1`'s secret | rotate the key (unchanged) |
-| **stolen member session or org key** | can publish versions into the network, audited under that actor; cannot alter or remove any customer version | revoke the credential; adopt over or outrank the published versions; disable writes |
+| **stolen member session or org key** | can publish versions into the network as `cloud-1`; cannot alter or remove any customer version; attributable to the credential only through the hosted node's log | revoke the credential; adopt over or outrank the published versions; disable hosting |
 
 ---
 
@@ -759,13 +786,16 @@ decoder.
 
 - **What is new, precisely.** Today a compromised session cookie, org key or
   control-plane node can *read* a browse-enabled network. After this, one can
-  also *publish into* a writes-enabled network, as `cloud-1`. That is the
-  whole delta, and it is bounded on every side: by the member floor (equal to
-  what a member does with any device they enroll); by attribution (the origin
-  is `cloud-1`, never a customer's, so a forged version is never mistaken for
-  a customer's assertion); by the audit row per write; by the version model
-  (nothing altered, nothing of another origin's removed); and by two org-held
-  switches that end it at the next request.
+  also *publish into* a hosted network, as `cloud-1`. That is the whole
+  delta, and it is bounded on every side: by the member floor (equal to what
+  a member does with any device they enroll); by attribution (the origin is
+  `cloud-1`, never a customer's, so a forged version is never mistaken for a
+  customer's assertion); by the signed, sequenced history every publish
+  leaves; by the version model (nothing altered, nothing of another origin's
+  removed); and by the hosting switch, which ends it at the next request.
+  What is *not* among the bounds is a per-write audit row (§4.4): a stolen
+  credential's uploads are attributable to it through the hosted node's log,
+  not through the org's trail.
 - **The customer's daemon is untouched.** No write frame decodes on the
   browse tunnel, and the daemon binary links no code that could decode one
   (§5.1). This design does not weaken the read design's central property; it
@@ -802,7 +832,7 @@ decoder.
   the volume out from under another's tenant.
 - **Rate.** Not limited beyond the caps above, and deliberately: a member
   abusing a write surface is a membership problem with the org's remedy
-  (DESIGN §12), and here the org holds a second one — the switch.
+  (DESIGN §12), and here the org holds a second one — hosting off.
 
 ---
 
@@ -826,16 +856,16 @@ decoder.
 1. **Engine** — (e) and (f) of §7, with a unit test that `Selected` holds and
    fails against `resolve` under the lock, and that the existing `Absent` and
    `Root` are unchanged.
-2. **Control plane** — migration v15; the switch with its audit events and
-   its dashboard control; `cloud_writes` on the two network reads and `writes`
-   on the desired-state document; the `cp_writers` registry name; the write
-   connection actor (`api/cloud_writer.gleam`); `PUT`/`DELETE` in
-   `browse_file.gleam` with CSRF and the write slots; the replica's `409` for
-   non-`GET` on the below-wisp mount. Gleam tests in the shape of
-   `browse_test.gleam`: the `CHECK` refuses writes without hosting; the
-   disable path clears both and drops sessions; the attach lookup refuses a
-   wrong data plane, a customer-created device, and a writes-off network; a
-   `PUT` on a cookie without `x-csrf` is `403`.
+2. **Control plane** — no migration. The `cp_writers` registry name; the
+   write connection actor (`api/cloud_writer.gleam`); the attach route in
+   the read table; `PUT`/`DELETE` in `browse_file.gleam` with CSRF and the
+   write slots, mounted by the edge on every role; `writes` on the browse
+   status; `set_cloud_hosting`'s disable path dropping write sessions after
+   its commit. Gleam tests in the shape of `browse_test.gleam`: the attach
+   lookup refuses a wrong data plane, a customer-created device, and an
+   unhosted network; a `PUT` on a cookie without `x-csrf` is `403`; a
+   replica-role edge serves a `PUT` rather than answering `409`; a `PUT`
+   leaves `audit_log` unchanged.
 3. **Data plane** — `writes.rs`: the frame types, the attach loop, the
    handler over the public seam, the lazy API source, the budget check, the
    staging budget; `spawn_loops` gated on `writes`; the heartbeat fields. A
@@ -870,7 +900,9 @@ To be applied in the change that builds this:
   tunnel encodes no write opcode and the API is GET-only" narrows to the
   tunnel: the *browse tunnel* encodes no write opcode; the file API takes
   writes, and they go down a different tunnel to the hosted replica only.
-  The cloud-hosting section gains the third switch.
+  The cloud-hosting section says that a hosted network is a writable one,
+  and the API-keys section's "reads are not recorded" sentence gains "and
+  neither are file writes, which are the hosted node's to record".
 - **TREE-WRITES §6** — the seam has three callers; **§10** — the guest-facing
   `Selected` condition is listed as available to sockets when a program
   needs it.
@@ -878,6 +910,8 @@ To be applied in the change that builds this:
   a network on a control plane may let that control plane's hosted member
   publish versions on the org's members' behalf, attributed to that member,
   bounded by the version model as every publish is.
+- **`api/router`'s header and `elsewhere`'s docstring** — the one
+  non-`GET` a read-only node mounts, below wisp, and why (§4.6).
 - **`priv/skill/SKILL.md`** — §8.
 
 ---
@@ -905,10 +939,14 @@ To be applied in the change that builds this:
 
 ## 15. Costs, stated
 
-- **A second tunnel per hosted tenant** to the primary, and a second
-  connection actor in the control plane, so that the read tunnel's wire fact
-  stays a wire fact (§5.1). The alternative was cheaper by exactly one
-  module and cost the property the read design is built on.
+- **A second tunnel per hosted tenant per control-plane node**, and a
+  second connection actor in the control plane, so that the read tunnel's
+  wire fact stays a wire fact (§5.1). The alternative was cheaper by exactly
+  one module and cost the property the read design is built on.
+- **No trail of who uploaded what**, beyond "a member, through the control
+  plane" (§4.4). The org's audit log stays a log of what credentials did to
+  the org's *configuration*; what they did to its *files* is in the files'
+  own history, attributed to `cloud-1`.
 - **`cloud-1` becomes a publisher.** With writes used, the hosted origin's
   trie carries file entries and its source holds pin content; disabling
   hosting now removes a member whose assertions were selected somewhere.
