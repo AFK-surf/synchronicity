@@ -389,13 +389,68 @@ impl Store {
             .collect())
     }
 
+    /// The live bindings naming one device key, cascade included.
+    ///
+    /// The same answer [`Store::live_bindings`] would give about this key,
+    /// reached through `bindings_by_key` instead of by materializing the table.
+    /// Every question below that is *about one key* goes through this, and the
+    /// hot ones are hot indeed: `is_trusted_key` is the connection-accept gate
+    /// and the per-dial trust check, `scope_for_key` runs per request and
+    /// `publish_scope_of_key` per slice. Answering any of them from a
+    /// whole-table read made each cost `O(bindings)` on a node that holds ten
+    /// thousand of them (`docs/CLOUD-DATAPLANE.md` §7.1a).
+    pub fn live_bindings_for_key(&self, node_id: &NodeId, now: i64) -> Result<Vec<Binding>> {
+        let now = self.trust_instant(now)?;
+        let rows = self.bindings_for_key(node_id)?;
+        self.live_among(rows, now)
+    }
+
+    /// The live bindings for one origin, cascade included.
+    ///
+    /// `origin_id` leads the primary key, so this is the same index seek
+    /// [`Self::live_bindings_for_key`] is, asked the other way round.
+    pub fn live_bindings_for_origin(&self, origin: &OriginId, now: i64) -> Result<Vec<Binding>> {
+        let now = self.trust_instant(now)?;
+        let rows = self.bindings_for_origin(origin)?;
+        self.live_among(rows, now)
+    }
+
+    /// Applies [`Store::live_bindings`]' liveness rule to a subset of rows.
+    ///
+    /// The cascade is the only part that cannot be decided from a row alone: a
+    /// delegated binding counts only while the origin that issued it still
+    /// holds a live rooted binding, and derived trust must not outlive its
+    /// source. `live_bindings` gets that from the whole table it already has;
+    /// here it is one index seek per delegated row, which is what makes the
+    /// narrow reads possible at all.
+    ///
+    /// `now` must already have been through [`Store::trust_instant`].
+    fn live_among(&self, rows: Vec<Binding>, now: i64) -> Result<Vec<Binding>> {
+        let mut live = Vec::with_capacity(rows.len());
+        for binding in rows {
+            if !binding.is_live(now) {
+                continue;
+            }
+            match (&binding.source, &binding.issuer) {
+                (BindingSource::Delegated, Some(issuer)) if self.vouched_for(issuer, now)? => {}
+                // A delegated row with no issuer names nothing that could have
+                // vouched for it, so nothing has — and one whose issuer is no
+                // longer rooted-live has been cut off with it.
+                (BindingSource::Delegated, _) => continue,
+                _ => {}
+            }
+            live.push(binding);
+        }
+        Ok(live)
+    }
+
     /// The origins a device key is currently bound to.
     ///
     /// A key may hold several origins only in malformed configurations; §3.2
     /// asks `synch doctor` to report exactly that, so this returns all of them.
     pub fn live_origins_for_key(&self, node_id: &NodeId, now: i64) -> Result<Vec<OriginId>> {
         Ok(self
-            .live_bindings(now)?
+            .live_bindings_for_key(node_id, now)?
             .into_iter()
             .filter(|b| &b.node_id == node_id)
             .map(|b| b.origin)
@@ -408,9 +463,9 @@ impl Store {
     /// verifies under an unbound key is not a valid head.
     pub fn is_bound(&self, origin: &OriginId, node_id: &NodeId, now: i64) -> Result<bool> {
         Ok(self
-            .live_bindings(now)?
+            .live_bindings_for_key(node_id, now)?
             .into_iter()
-            .any(|b| &b.origin == origin && &b.node_id == node_id))
+            .any(|b| &b.origin == origin))
     }
 
     /// True if a device key has *any* live binding.
@@ -423,34 +478,91 @@ impl Store {
 
     /// Every origin with at least one live binding.
     pub fn trusted_origins(&self, now: i64) -> Result<Vec<OriginId>> {
-        let mut out: Vec<OriginId> = self
-            .live_bindings(now)?
-            .into_iter()
-            .map(|b| b.origin)
-            .collect();
+        let mut out = Vec::new();
+        self.live_column("origin_id", now, |row| {
+            out.push(origin_column(row.get(0)?, "bindings.origin_id")?);
+            Ok(())
+        })?;
         out.sort();
         out.dedup();
         Ok(out)
     }
 
     /// Every device key with at least one live binding, for dialing.
+    ///
+    /// Read once per reactive push and once per anti-entropy round, so it is
+    /// the one whole-set question on a hot path. It answers in SQL rather than
+    /// by filtering [`Store::live_bindings`]: at ten thousand bindings that
+    /// built ten thousand `Binding` values — parsing an origin, a key and a
+    /// space list apiece — to return a column of keys
+    /// (`docs/CLOUD-DATAPLANE.md` §7.1a).
     pub fn trusted_keys(&self, now: i64) -> Result<Vec<NodeId>> {
-        let mut out: Vec<NodeId> = self
-            .live_bindings(now)?
-            .into_iter()
-            .map(|b| b.node_id)
-            .collect();
+        let mut out = Vec::new();
+        self.live_column("node_id", now, |row| {
+            out.push(key_column(row.get(0)?, "bindings.node_id")?);
+            Ok(())
+        })?;
         out.sort_by_key(|k| *k.as_bytes());
         out.dedup();
         Ok(out)
     }
 
+    /// Runs `take` over one column of every live binding.
+    ///
+    /// The liveness rule of [`Store::live_bindings`], expressed where the rows
+    /// are: an unexpired row, and — for a delegated one — an issuer that still
+    /// holds a live rooted binding of its own. The `EXISTS` clause is the
+    /// cascade, and it seeks on the primary key rather than scanning, so
+    /// derived trust still dies with its source without the whole table being
+    /// read to work that out.
+    ///
+    /// A clock that cannot date a trust decision honors no expiring binding at
+    /// all ([`Binding::is_live`]), which is a different query rather than a
+    /// different parameter: `now < expires_at` holds for every row in the table
+    /// when `now` is the epoch, so the comparison has to be absent, not false.
+    fn live_column(
+        &self,
+        column: &str,
+        now: i64,
+        mut take: impl FnMut(&rusqlite::Row<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let now = self.trust_instant(now)?;
+        let datable = synch_core::clock_is_trusted(now);
+        let unexpired = match datable {
+            true => "(%.expires_at IS NULL OR ?1 < %.expires_at)",
+            false => "%.expires_at IS NULL",
+        };
+        let sql = format!(
+            "SELECT DISTINCT b.{column} FROM bindings b
+             WHERE {outer}
+               AND (b.source <> 'delegated'
+                    OR (b.issuer <> '' AND EXISTS (
+                          SELECT 1 FROM bindings r
+                          WHERE r.origin_id = b.issuer
+                            AND r.source IN ('static', 'dns')
+                            AND {inner})))",
+            outer = unexpired.replace("%.", "b."),
+            inner = unexpired.replace("%.", "r."),
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        // The undatable query names no `?1`, and binding one to a statement
+        // that does not use it is an error rather than a spare argument.
+        let mut rows = match datable {
+            true => stmt.query(params![now])?,
+            false => stmt.query([])?,
+        };
+        while let Some(row) = rows.next()? {
+            take(row)?;
+        }
+        Ok(())
+    }
+
     /// The live device keys currently bound to an origin, for dialing (§3.3).
     pub fn keys_for_origin(&self, origin: &OriginId, now: i64) -> Result<Vec<NodeId>> {
         Ok(self
-            .live_bindings(now)?
+            .live_bindings_for_origin(origin, now)?
             .into_iter()
-            .filter(|b| &b.origin == origin)
             .map(|b| b.node_id)
             .collect())
     }
@@ -482,11 +594,7 @@ impl Store {
         node_id: &NodeId,
         now: i64,
     ) -> Result<(Scope, Vec<OriginId>)> {
-        let live: Vec<Binding> = self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| &b.node_id == node_id)
-            .collect();
+        let live = self.live_bindings_for_key(node_id, now)?;
         let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
         if live.iter().any(|b| b.is_rooted()) {
             return Ok((Scope::full(), origins));
@@ -517,11 +625,7 @@ impl Store {
         node_id: &NodeId,
         now: i64,
     ) -> Result<(PublishScope, Vec<OriginId>)> {
-        let live: Vec<Binding> = self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| &b.node_id == node_id)
-            .collect();
+        let live = self.live_bindings_for_key(node_id, now)?;
         let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
         // Three-valued for the same reason [`Store::publish_scope`] is. A key
         // with no live binding is distinct from a delegated peer whose grant
@@ -575,11 +679,7 @@ impl Store {
     /// This is the publish-scope question (§3.5), asked of the *origin* whose
     /// trie is being materialized rather than of a connection's peer key.
     pub fn publish_scope(&self, origin: &OriginId, now: i64) -> Result<PublishScope> {
-        let live: Vec<Binding> = self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| &b.origin == origin)
-            .collect();
+        let live = self.live_bindings_for_origin(origin, now)?;
         if live.is_empty() {
             return Ok(PublishScope::Untrusted);
         }
@@ -635,13 +735,19 @@ impl Store {
     /// declaration alone cannot, because any rooted binding produces the
     /// same `Unrestricted` wire value.
     pub fn own_rooted_in_foreign_origin(&self, now: i64) -> Result<bool> {
-        let own = self.own_keys()?;
         let self_origin = self.self_origin()?;
-        Ok(self.live_bindings(now)?.into_iter().any(|b| {
-            b.is_rooted()
-                && own.contains(&b.node_id)
-                && self_origin.as_ref().is_none_or(|o| o != &b.origin)
-        }))
+        // Per own key rather than over the table: this asks only about rows
+        // naming keys this node holds, of which there are a handful.
+        for key in self.own_keys()? {
+            let rooted_elsewhere = self
+                .live_bindings_for_key(&key, now)?
+                .into_iter()
+                .any(|b| b.is_rooted() && self_origin.as_ref().is_none_or(|o| o != &b.origin));
+            if rooted_elsewhere {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The origins that have delegated to *this* node (§3.5); empty if it is
@@ -651,13 +757,33 @@ impl Store {
     /// node's — its origin's, and every `device_keys` row, because a record
     /// naming a key mid-rotation still confines the node holding it.
     pub fn own_issuers(&self, now: i64) -> Result<Vec<OriginId>> {
-        let own = self.own_keys()?;
+        // Per own key rather than over the table. This sits on the path of
+        // every outgoing metadata dial through
+        // [`Store::refuse_metadata_sync`], so a whole-table read here made one
+        // reactive push cost `O(peers × bindings)` (`docs/CLOUD-DATAPLANE.md`
+        // §7.1a).
+        let mut issuers = Vec::new();
+        for key in self.own_keys()? {
+            issuers.extend(
+                self.live_bindings_for_key(&key, now)?
+                    .into_iter()
+                    .filter(|b| b.source == BindingSource::Delegated)
+                    .filter_map(|b| b.issuer),
+            );
+        }
+        Ok(issuers)
+    }
+
+    /// Whether `origin` holds a live rooted binding — the premise every
+    /// delegation it issued depends on.
+    ///
+    /// `origin_id` leads the `bindings` primary key, so this is an index seek
+    /// over that origin's own rows and nothing else.
+    fn vouched_for(&self, origin: &OriginId, now: i64) -> Result<bool> {
         Ok(self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
-            .filter_map(|b| b.issuer)
-            .collect())
+            .bindings_for_origin(origin)?
+            .iter()
+            .any(|b| b.is_rooted() && b.is_live(now)))
     }
 
     /// The spaces this node's own live delegations grant it, or `None` when
@@ -670,13 +796,15 @@ impl Store {
     /// widen it. `None` covers both the never-a-delegate and the revoked
     /// states; the caller tells them apart by what it already holds.
     pub fn own_grant(&self, now: i64) -> Result<Option<Vec<String>>> {
-        let own = self.own_keys()?;
-        let mut spaces: Vec<String> = self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
-            .flat_map(|b| b.spaces.clone())
-            .collect();
+        let mut spaces: Vec<String> = Vec::new();
+        for key in self.own_keys()? {
+            spaces.extend(
+                self.live_bindings_for_key(&key, now)?
+                    .into_iter()
+                    .filter(|b| b.source == BindingSource::Delegated)
+                    .flat_map(|b| b.spaces),
+            );
+        }
         if spaces.is_empty() {
             return Ok(None);
         }
@@ -699,8 +827,12 @@ impl Store {
     /// A node that is not a delegate is unrestricted. Content is unaffected:
     /// it is content-addressed and hash-verified, so bytes come from anyone
     /// (§6).
+    /// Asked once per outgoing metadata dial, so the "not a delegate" answer
+    /// is reached without reading a row that is not about this node: a hosted
+    /// replica holds ten thousand bindings and is nobody's delegate, and
+    /// deciding that from a whole-table scan is what made one reactive push
+    /// quadratic in the membership (`docs/CLOUD-DATAPLANE.md` §7.1a).
     pub fn refuse_metadata_sync(&self, peer: &NodeId, now: i64) -> Result<Option<String>> {
-        let live = self.live_bindings(now)?;
         // The clusters this node is a delegate of. Empty means it is not a
         // delegate at all, and none of this applies to it.
         let issuers = self.own_issuers(now)?;
@@ -710,10 +842,17 @@ impl Store {
         // A peer is a full member exactly where this node holds a *rooted*
         // binding for it: a delegate's binding is `Delegated` by construction,
         // so this one test is the whole of the delegate-to-delegate rule.
-        let member_origins: Vec<&OriginId> = live
-            .iter()
-            .filter(|b| &b.node_id == peer && b.is_rooted())
-            .map(|b| &b.origin)
+        //
+        // Read through `bindings_by_key` rather than filtered out of the live
+        // set. A rooted binding is `Static` or `Dns`, which no cascade can
+        // strike down, so "live" here is the dated check and nothing else —
+        // exactly what `live_bindings` would have concluded about these rows.
+        let now = self.trust_instant(now)?;
+        let member_origins: Vec<OriginId> = self
+            .bindings_for_key(peer)?
+            .into_iter()
+            .filter(|b| b.is_rooted() && b.is_live(now))
+            .map(|b| b.origin)
             .collect();
         if member_origins.is_empty() {
             return Ok(Some(
@@ -722,7 +861,7 @@ impl Store {
         }
         let same_cluster = member_origins.iter().any(|origin| {
             issuers.iter().any(|issuer| {
-                *origin == issuer
+                *origin == *issuer
                     || (origin.domain().is_some() && origin.domain() == issuer.domain())
             })
         });
@@ -1266,6 +1405,166 @@ mod tests {
         assert!(!store.is_trusted_key(&second, at(10)).unwrap());
     }
 
+    /// `trusted_keys` and `trusted_origins` answer in SQL what
+    /// `live_bindings` answers in Rust, so they are held to it directly.
+    ///
+    /// The table is built to exercise every branch the two implementations
+    /// could disagree on: a static binding that consults no clock, a live and
+    /// an expired DNS one, a delegation whose issuer is rooted and live, one
+    /// whose issuer's own binding has lapsed, and one naming no issuer at all.
+    /// Then both clocks, because an undatable reading honors no expiring
+    /// binding and that is the case a `now < expires_at` comparison gets
+    /// exactly backwards.
+    #[test]
+    fn the_sql_liveness_rule_agrees_with_the_rust_one() {
+        let (_d, store) = store();
+        let rooted = OriginId::named("nas", "x.example").unwrap();
+        let lapsing = OriginId::named("vps", "x.example").unwrap();
+        let rooted_key = SecretKey::generate().public();
+        let lapsing_key = SecretKey::generate().public();
+        let statically = SecretKey::generate().public();
+        let vouched = SecretKey::generate().public();
+        let orphaned = SecretKey::generate().public();
+        let issuerless = SecretKey::generate().public();
+
+        store
+            .put_binding(&binding(rooted.clone(), rooted_key, Some(at(1000))))
+            .unwrap();
+        store
+            .put_binding(&binding(lapsing.clone(), lapsing_key, Some(at(100))))
+            .unwrap();
+        store
+            .put_binding(&binding(
+                OriginId::named("box", "x.example").unwrap(),
+                statically,
+                None,
+            ))
+            .unwrap();
+        store
+            .put_binding(&delegation(vouched, rooted, &["photos"]))
+            .unwrap();
+        store
+            .put_binding(&delegation(orphaned, lapsing, &["docs"]))
+            .unwrap();
+        let mut no_issuer = delegation(issuerless, OriginId::Key(rooted_key), &["docs"]);
+        no_issuer.issuer = None;
+        store.put_binding(&no_issuer).unwrap();
+
+        // `at(500)`: `vps` has lapsed, so the delegation it issued is cut off
+        // with it while `nas`'s still stands. `at(5000)`: everything expiring
+        // has gone and only the static binding is left. `0`: an undatable
+        // clock, which honors no expiring binding and so leaves the same one.
+        for now in [at(50), at(500), at(5000), 0] {
+            let mut keys: Vec<NodeId> = store
+                .live_bindings(now)
+                .unwrap()
+                .into_iter()
+                .map(|b| b.node_id)
+                .collect();
+            keys.sort_by_key(|k| *k.as_bytes());
+            keys.dedup();
+            assert_eq!(store.trusted_keys(now).unwrap(), keys, "keys at {now}");
+
+            let mut origins: Vec<OriginId> = store
+                .live_bindings(now)
+                .unwrap()
+                .into_iter()
+                .map(|b| b.origin)
+                .collect();
+            origins.sort();
+            origins.dedup();
+            assert_eq!(
+                store.trusted_origins(now).unwrap(),
+                origins,
+                "origins at {now}"
+            );
+        }
+
+        // And the table really did exercise the branches: if every reading
+        // gave the same answer the loop above would prove nothing.
+        assert_eq!(store.trusted_keys(at(50)).unwrap().len(), 5);
+        assert_eq!(store.trusted_keys(at(500)).unwrap().len(), 3);
+        assert_eq!(store.trusted_keys(at(5000)).unwrap().len(), 1);
+        assert_eq!(store.trusted_keys(0).unwrap().len(), 1);
+    }
+
+    /// The delegate-to-delegate rule (§5.5), and the cascade under it.
+    ///
+    /// Untested until now, and the two reads it is built from were rewritten
+    /// from whole-table scans into index seeks to stop one reactive push
+    /// costing `O(peers × bindings)` (`docs/CLOUD-DATAPLANE.md` §7.1a). What
+    /// has to survive that is every answer, so all five are asserted here —
+    /// including the one the rewrite could most easily have lost, which is the
+    /// cascade: a delegation whose issuer's own binding has lapsed makes this
+    /// node nobody's delegate, and a node that is nobody's delegate refuses
+    /// nobody.
+    #[test]
+    fn a_delegate_syncs_metadata_only_within_its_own_cluster() {
+        let (_d, store) = store();
+        let own = SecretKey::generate().public();
+        store.set_self_origin(&OriginId::Key(own)).unwrap();
+
+        let issuer = OriginId::named("nas", "x.example").unwrap();
+        let issuer_key = SecretKey::generate().public();
+        let sibling = OriginId::named("vps", "x.example").unwrap();
+        let sibling_key = SecretKey::generate().public();
+        let stranger = OriginId::named("nas", "other.example").unwrap();
+        let stranger_key = SecretKey::generate().public();
+        let untrusted = SecretKey::generate().public();
+        for (origin, key) in [
+            (&issuer, issuer_key),
+            (&sibling, sibling_key),
+            (&stranger, stranger_key),
+        ] {
+            store
+                .put_binding(&binding(origin.clone(), key, Some(at(1000))))
+                .unwrap();
+        }
+
+        // A node that is nobody's delegate is unrestricted, whoever it dials.
+        // This is the case every hosted replica is in, and the one the dial
+        // path pays for on every push.
+        for peer in [&issuer_key, &stranger_key, &untrusted] {
+            assert_eq!(store.refuse_metadata_sync(peer, at(10)).unwrap(), None);
+        }
+
+        // Now this node is `nas`'s delegate.
+        store
+            .put_binding(&delegation(own, issuer.clone(), &["photos"]))
+            .unwrap();
+        assert_eq!(store.own_issuers(at(10)).unwrap(), vec![issuer.clone()]);
+
+        // Its own issuer, and a full member of the same cluster: both fine.
+        assert_eq!(
+            store.refuse_metadata_sync(&issuer_key, at(10)).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.refuse_metadata_sync(&sibling_key, at(10)).unwrap(),
+            None
+        );
+        // A full member of a *different* cluster, and a key bound to nothing:
+        // both refused, for different stated reasons.
+        assert!(store
+            .refuse_metadata_sync(&stranger_key, at(10))
+            .unwrap()
+            .is_some_and(|why| why.contains("different cluster")));
+        assert!(store
+            .refuse_metadata_sync(&untrusted, at(10))
+            .unwrap()
+            .is_some_and(|why| why.contains("not a full member")));
+
+        // The cascade: once `nas`'s own binding lapses, the delegation it
+        // issued names nothing that vouches for it, so this node is nobody's
+        // delegate again — and refuses nobody again, including the stranger it
+        // refused a moment ago.
+        assert!(store.own_issuers(at(2000)).unwrap().is_empty());
+        assert_eq!(
+            store.refuse_metadata_sync(&stranger_key, at(2000)).unwrap(),
+            None
+        );
+    }
+
     /// Two rooted origins may each delegate the same key, and each vouches
     /// independently.
     #[test]
@@ -1338,5 +1637,215 @@ mod tests {
 
         assert!(store.set_read_scope(None).unwrap());
         assert!(store.local_trie_scope().unwrap().is_full());
+    }
+
+    /// Every narrowed trust query gives the answer the whole-table read gave.
+    ///
+    /// The reads below were rewritten from [`Store::live_bindings`] — which
+    /// materializes the table — to index seeks and, for the whole-set ones, to
+    /// SQL (`docs/CLOUD-DATAPLANE.md` §7.1a). That is a rewrite of the one rule
+    /// the whole trust model rests on, in eight places at once, so it is held
+    /// against the original rather than argued: `live_bindings` is the oracle,
+    /// and each narrowed query must agree with it over tables built to contain
+    /// the cases that distinguish them — an origin bound by several sources, a
+    /// key bound to several origins, delegated rows with a live issuer, a
+    /// lapsed issuer and no issuer at all, and expiries on both sides of now.
+    ///
+    /// Both clocks, because the liveness rule differs between them: a node
+    /// whose clock cannot date a trust decision honors no expiring binding, and
+    /// the SQL half expresses that as a different statement rather than a
+    /// different parameter.
+    #[test]
+    fn the_narrowed_trust_queries_agree_with_the_whole_table_read() {
+        let sortkey = |b: &Binding| {
+            (
+                b.origin.canonical(),
+                *b.node_id.as_bytes(),
+                b.source.as_str().to_string(),
+                b.issuer.as_ref().map(|i| i.canonical()),
+            )
+        };
+        let datable = MIN_TRUSTED_NS + 86_400_000_000_000;
+        for seed in 0..120u64 {
+            let (_dir, store) = store();
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut next = || {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng >> 33) as u32
+            };
+            // Undatable on every third table, which is the clock a node has
+            // before NTP and after a dead RTC.
+            let now = match seed % 3 {
+                0 => 1,
+                _ => datable,
+            };
+
+            let origins: Vec<OriginId> = (0..5)
+                .map(|i| OriginId::named(&format!("o{i}"), "x.example").unwrap())
+                .collect();
+            let keys: Vec<SecretKey> = (0..5).map(|_| SecretKey::generate()).collect();
+            store
+                .add_device_key(&keys[0], crate::KeyState::Active, 0)
+                .unwrap();
+            if next() % 2 == 0 {
+                store
+                    .add_device_key(&keys[1], crate::KeyState::Active, 0)
+                    .unwrap();
+            }
+            if next() % 3 != 0 {
+                store.set_self_origin(&origins[0]).unwrap();
+            }
+            for _ in 0..12 {
+                let source = match next() % 3 {
+                    0 => BindingSource::Static,
+                    1 => BindingSource::Dns,
+                    _ => BindingSource::Delegated,
+                };
+                store
+                    .put_binding(&Binding {
+                        origin: origins[(next() as usize) % origins.len()].clone(),
+                        node_id: keys[(next() as usize) % keys.len()].public(),
+                        source,
+                        domain: Some("x.example".into()),
+                        // A quarter of the delegated rows name no issuer, which
+                        // is the row nothing can have vouched for.
+                        issuer: match source {
+                            BindingSource::Delegated => match next() % 4 {
+                                0 => None,
+                                n => Some(origins[(n as usize) % origins.len()].clone()),
+                            },
+                            _ => None,
+                        },
+                        spaces: vec!["media".into()],
+                        note: None,
+                        added_at: 0,
+                        expires_at: match next() % 3 {
+                            0 => None,
+                            1 => Some(datable + 3_600_000_000_000),
+                            _ => Some(datable - 3_600_000_000_000),
+                        },
+                    })
+                    .unwrap();
+            }
+
+            let live = store.live_bindings(now).unwrap();
+
+            let mut want: Vec<_> = live.iter().map(|b| b.node_id).collect();
+            want.sort_by_key(|k| *k.as_bytes());
+            want.dedup();
+            assert_eq!(
+                store.trusted_keys(now).unwrap(),
+                want,
+                "trusted_keys seed {seed}"
+            );
+
+            let mut want: Vec<_> = live.iter().map(|b| b.origin.clone()).collect();
+            want.sort();
+            want.dedup();
+            assert_eq!(
+                store.trusted_origins(now).unwrap(),
+                want,
+                "trusted_origins seed {seed}"
+            );
+
+            for key in keys.iter().map(|k| k.public()) {
+                let mut want: Vec<_> = live.iter().filter(|b| b.node_id == key).cloned().collect();
+                let mut got = store.live_bindings_for_key(&key, now).unwrap();
+                want.sort_by_key(sortkey);
+                got.sort_by_key(sortkey);
+                assert_eq!(got, want, "live_bindings_for_key seed {seed}");
+                assert_eq!(
+                    store.is_trusted_key(&key, now).unwrap(),
+                    !want.is_empty(),
+                    "is_trusted_key seed {seed}"
+                );
+                for origin in &origins {
+                    assert_eq!(
+                        store.is_bound(origin, &key, now).unwrap(),
+                        want.iter().any(|b| &b.origin == origin),
+                        "is_bound seed {seed}"
+                    );
+                }
+                // The delegate-to-delegate gate, which is the one on the path
+                // of every metadata dial.
+                let issuers = store.own_issuers(now).unwrap();
+                let members: Vec<&OriginId> = live
+                    .iter()
+                    .filter(|b| b.node_id == key && b.is_rooted())
+                    .map(|b| &b.origin)
+                    .collect();
+                let refused = !issuers.is_empty()
+                    && (members.is_empty()
+                        || !members.iter().any(|o| {
+                            issuers.iter().any(|i| {
+                                *o == i || (o.domain().is_some() && o.domain() == i.domain())
+                            })
+                        }));
+                assert_eq!(
+                    store.refuse_metadata_sync(&key, now).unwrap().is_some(),
+                    refused,
+                    "refuse_metadata_sync seed {seed}"
+                );
+            }
+
+            for origin in &origins {
+                let mut want: Vec<_> = live
+                    .iter()
+                    .filter(|b| &b.origin == origin)
+                    .map(|b| b.node_id)
+                    .collect();
+                let mut got = store.keys_for_origin(origin, now).unwrap();
+                want.sort_by_key(|k| *k.as_bytes());
+                got.sort_by_key(|k| *k.as_bytes());
+                assert_eq!(got, want, "keys_for_origin seed {seed}");
+
+                let mut want: Vec<_> = live
+                    .iter()
+                    .filter(|b| &b.origin == origin)
+                    .cloned()
+                    .collect();
+                let mut got = store.live_bindings_for_origin(origin, now).unwrap();
+                want.sort_by_key(sortkey);
+                got.sort_by_key(sortkey);
+                assert_eq!(got, want, "live_bindings_for_origin seed {seed}");
+            }
+
+            let own = store.own_keys().unwrap();
+            let mut want: Vec<OriginId> = live
+                .iter()
+                .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+                .filter_map(|b| b.issuer.clone())
+                .collect();
+            let mut got = store.own_issuers(now).unwrap();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "own_issuers seed {seed}");
+
+            let self_origin = store.self_origin().unwrap();
+            assert_eq!(
+                store.own_rooted_in_foreign_origin(now).unwrap(),
+                live.iter().any(|b| {
+                    b.is_rooted()
+                        && own.contains(&b.node_id)
+                        && self_origin.as_ref().is_none_or(|o| o != &b.origin)
+                }),
+                "own_rooted_in_foreign_origin seed {seed}"
+            );
+
+            let mut want: Vec<String> = live
+                .iter()
+                .filter(|b| b.source == BindingSource::Delegated && own.contains(&b.node_id))
+                .flat_map(|b| b.spaces.clone())
+                .collect();
+            want.sort();
+            want.dedup();
+            assert_eq!(
+                store.own_grant(now).unwrap(),
+                (!want.is_empty()).then_some(want),
+                "own_grant seed {seed}"
+            );
+        }
     }
 }

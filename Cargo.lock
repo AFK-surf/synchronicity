@@ -5902,6 +5902,7 @@ dependencies = [
  "blake3",
  "celld-ltx",
  "clap",
+ "iroh-base",
  "opendal",
  "reqwest 0.13.4",
  "rustls",

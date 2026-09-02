@@ -892,6 +892,124 @@ together, such that a pod's tenants collectively cannot ask for more
 than half the pool and the other half stays available for the reconcile
 pass, the replication tickers and the heartbeats. §9.1 is why.
 
+### 7.1a What a *node* costs
+
+The table above is per tenant, and the ceiling above is in tenants. Neither
+sizes the other axis: a tenant is one tenant whether the replica it runs
+serves three nodes or ten thousand, and several of the engine's standing
+costs are per node. `crates/synch-dp/examples/stress.rs` measures that axis
+against a real provisioned tenant, at a configurable node count:
+
+```sh
+cargo run --release -p synch-dp --example stress
+```
+
+What it found — shapes, not numbers, since the numbers belong to the
+machine. Most were **fixed**; they are recorded because the fix is all that
+stands between the shape and its return. CI runs the harness on every build
+and prints the whole report, which is a guard against the harness rotting
+rather than against a regression: the numbers a shared runner produces are
+not worth thresholding, and every shape below is one a run *completes*
+either way.
+
+- **The reactive push was quadratic in the membership.** `Node::push_head`
+  dials every trusted peer, and each dial asks
+  `Store::refuse_metadata_sync` whether this node is somebody's delegate.
+  That was answered from `Store::live_bindings`, which materializes the
+  whole table — so one publish cost `O(dialable × bindings)`: minutes of CPU
+  at 500 peers and ten thousand bindings, reached from the standing
+  `run_replicas` loop through `publish_material_claims` whenever coverage
+  moves. Every per-key and per-origin trust question now goes through
+  `live_bindings_for_key` / `live_bindings_for_origin`, which seek an index
+  and apply the delegation cascade one issuer at a time. The same question is
+  also the connection-accept gate, and runs per request and per slice, so
+  this was never only about pushing. At 100 peers and ten thousand bindings:
+  20.5 s → 0.14 s.
+- **The whole-membership queries materialized the table to return a
+  column.** `trusted_keys` is read once per push and once per anti-entropy
+  round, and it built ten thousand `Binding` values — an origin, a key and a
+  space list parsed apiece — to hand back keys. `live_column` expresses the
+  same liveness rule in SQL, cascade included as an `EXISTS` seek: 132 ms →
+  9 ms at ten thousand bindings. A cache was the alternative and was not
+  taken — bindings are written from the resolver, the promotion path, the
+  expiry sweep and the operator, and a missed invalidation here is a node
+  dialling a peer whose trust has lapsed.
+- **The maintenance pass took a write transaction per origin to prune
+  nothing.** Pruning history opens an immediate transaction — it must, to
+  decide and delete over one snapshot — and the pass asked every origin in
+  `head_history`, five minutely, in front of every other tenant's store work
+  on the shard. `history_origins_before` narrows it to the origins holding a
+  row old enough to take, which is exact rather than a heuristic: every
+  deletion in that pass requires `recorded_at < before`. ~48 s → ~0.2 s at
+  ten thousand origins.
+- **The replica sweep re-derived every want, every pass.** `sweep_replicas`
+  runs on the standing loop's every pass, and two things grew with the
+  membership. `Node::view_state` — which `replica ls` and every status poll
+  ask, and which the sweep gated releases on until releases were moved onto
+  the materialized view — listed every pending head and then asked
+  `complete_head` per binding, ten thousand point reads to establish that
+  nothing was missing; it is now two `EXISTS` seeks that stop at the first
+  origin that fails (`pending_head_origin`,
+  `bound_origin_without_complete_head`), 25 ms at ten thousand bindings. The
+  larger half was `stage_space_wants`, which re-derives the want set from
+  `entries` — two hundred thousand rows for ten thousand nodes publishing
+  twenty files each — to find it unchanged. Its `SELECT DISTINCT` ranged over
+  the whole projected row, so it could answer from no index and sorted every
+  entry into a temporary B-tree. Grouping by the column the uniqueness is
+  about, over a new `entries_by_space_content`, makes it an ordered scan:
+  measured alone, 1.96 s → 0.18 s, and the whole sweep — as it then stood,
+  with `view_state` still in it — 13.2 s → 0.32 s.
+- **The push fan-out is now bounded**, at 32 dials in flight rather than the
+  whole membership at once. Every peer is still pushed to and propagation is
+  unchanged; what is bounded is how many QUIC handshakes, buffers and
+  descriptors are resident at an instant — descriptors being the ceiling
+  §7.1 already names.
+- **The WAL is not a leak.** A tenant opens under
+  `Checkpointing::Embedder`, so only the replicator's post-ship checkpoint
+  truncates the log, and under a hard ingest burst it does run one to two
+  orders of magnitude larger than the database file it fronts. It drains on
+  its own once writes stop — measured across an idle window, 2.4 GiB down to
+  under 2 MiB. So it is bounded by write *rate* against the one-second
+  replication interval rather than by nothing, and
+  `synch_dp_tenant_db_bytes` (§7.1) is the right response to it rather than
+  a checkpoint knob.
+- **One zone cannot name a large network.** Membership is a single
+  `_synchronicity.<domain>` TXT RRset and a DNS message is bounded by a
+  16-bit length, so a zone tops out around 500 members — measured, by
+  bisection, in the harness's first section. Past that a signed RRset cannot
+  be produced. Nodes beyond one zone's worth belong to other networks and
+  reach a replica as delegations (§3.5), which is also why they are never
+  dialed: `dialable_peers` is `trusted_keys`, and a delegated origin is not
+  one. A property of the design, not a defect to fix here.
+
+What it adds up to for one tenant replicating ten thousand nodes across
+twenty networks, each publishing twenty entries — on a four-vCPU machine, so
+read the ratios and not the absolutes:
+
+| | before | after |
+|---|---|---|
+| one push to 500 peers | 127 s | 0.16 s |
+| maintenance pass | 48.6 s | 0.23 s |
+| replica sweep | 13.2 s | 0.32 s |
+
+Those three are per-operation timings taken at a known membership, and they
+reproduce. The harness's **steady-state** section does not, and its numbers
+should not be quoted: across runs that differ in nothing but when they
+started, that window has read anywhere from 157 % of a core and 219 MiB
+resident to 236 % and 1107 MiB. What varies is where the standing loops are
+in their own cycles when the window opens — above all whether the replica's
+two hundred thousand staged wants are mid-flight against peers that, in a
+harness, no one is answering for. It is a real cost and the harness is the
+wrong instrument for it; sizing a pod's CPU wants a tenant under real sync,
+not this.
+
+The same caveat applies, more weakly, to every per-tick line in the report:
+they are taken while the standing loops are live, so they contend for the one
+store connection and a line can read several times its isolated cost. The
+sweep above is quoted at 13.2 s → 0.32 s from that contended position, and
+`stage_space_wants` at 1.96 s → 0.18 s from an isolated one; both ratios
+hold, the absolutes do not travel.
+
 ### 7.2 Assignment: the control plane decides
 
 Each data plane has a **name**, and the control plane records which

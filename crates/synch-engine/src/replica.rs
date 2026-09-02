@@ -294,28 +294,28 @@ impl Node {
     ///
     /// This is synchronization health for reporting. Release sweeps use the
     /// complete heads already materialized in `entries` and do not gate on it.
+    ///
+    /// Both questions are asked as "is there one?" rather than by listing and
+    /// looking: this runs once per status poll and per `replica ls`, and a
+    /// replica serving ten thousand origins made each a whole-table read plus
+    /// a point read per binding (`docs/CLOUD-DATAPLANE.md` §7.1a).
     pub fn view_state(&self) -> Result<ViewState> {
         // A pending head is newer than the materialized view. The prior
         // complete entries, when any, remain the release sweep's GC roots.
-        let pending = self.store().all_heads(synch_store::heads::Slot::Pending)?;
-        if let Some(head) = pending.first() {
+        if let Some(origin) = self.store().pending_head_origin()? {
             return Ok(ViewState::Incomplete(format!(
-                "{} has a head this node cannot materialize yet",
-                head.head.origin
+                "{origin} has a head this node cannot materialize yet"
             )));
         }
         // A bound origin with no complete head has never been synced here, or
         // was reset. It contributes no GC roots until a head is materialized.
-        for binding in self.store().bindings()? {
-            if binding.origin == *self.origin() {
-                continue;
-            }
-            if self.store().complete_head(&binding.origin)?.is_none() {
-                return Ok(ViewState::Incomplete(format!(
-                    "{} is bound but has published nothing this node holds",
-                    binding.origin
-                )));
-            }
+        if let Some(origin) = self
+            .store()
+            .bound_origin_without_complete_head(self.origin())?
+        {
+            return Ok(ViewState::Incomplete(format!(
+                "{origin} is bound but has published nothing this node holds"
+            )));
         }
         Ok(ViewState::Complete)
     }

@@ -1861,6 +1861,7 @@ CREATE TABLE entries (
 );
 CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
+CREATE INDEX entries_by_space_content ON entries (space, content);
 
 CREATE TABLE blob_providers (
   object_root BLOB NOT NULL,
