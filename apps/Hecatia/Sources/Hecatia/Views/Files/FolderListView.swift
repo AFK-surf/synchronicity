@@ -30,6 +30,9 @@ struct FolderListView: NSViewRepresentable {
   let onSelect: (String) -> Void
   let onAddFolder: () -> Void
   let onRevealCheckout: (CheckoutEntry) -> Void
+  let onRevealSource: (Space) -> Void
+  let onRelink: (Space) -> Void
+  let onDetach: (Space) -> Void
   let onStopSharing: (Space) -> Void
   /// `synch adopt tree` — pull the cluster's content into this folder's own
   /// directory. Offered here because this is where someone is when they have
@@ -117,7 +120,7 @@ struct FolderListView: NSViewRepresentable {
         // on every five-second poll, reload the table, and drop the selection
         // under whoever is using it. What the rows are *built* from is the id,
         // the path, and whether there is a replication badge at all.
-        + view.spaces.map { "s:\($0.id):\($0.localPath ?? "—"):\($0.isReplicating)" }
+        + view.spaces.map { "s:\($0.id):\($0.localPath ?? "—"):\($0.isReplicating):\($0.isSourceUnavailable)" }
         + ["+"]
         + (view.checkouts.isEmpty ? [] : ["h:On This Mac"])
         + view.checkouts.map { "m:\($0.id):\($0.localPath):\($0.policy)" }
@@ -173,10 +176,15 @@ struct FolderListView: NSViewRepresentable {
       case .space(let space):
         // An API source or replica-only namespace has no source directory, so
         // it gets a symbol that does not imply a folder exists on this Mac.
+        let unavailable = space.isSourceUnavailable
         let cell = label(
-          space.id, symbol: space.hasFilesystemSource ? "folder" : "shippingbox",
-          tint: NSColor.controlAccentColor)
-        cell.toolTip = space.pathLabel
+          space.id,
+          symbol: unavailable
+            ? "exclamationmark.triangle.fill"
+            : (space.hasFilesystemSource ? "folder" : "shippingbox"),
+          tint: unavailable ? NSColor.systemOrange : NSColor.controlAccentColor)
+        cell.toolTip = space.sourceError ?? space.pathLabel
+        if unavailable { cell.detail = "Local folder unavailable — Locate Folder…" }
         cell.setAccessibilityLabel("\(space.id), \(space.hasFilesystemSource ? "at \(space.localPath ?? "")" : space.pathLabel)")
         return cell
       case .addFolder:
@@ -242,12 +250,18 @@ struct FolderListView: NSViewRepresentable {
 
     @objc private func revealClicked() {
       switch clickedRow()?.kind {
-      case .space(let space):
-        guard let path = space.localPath else { return }
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+      case .space(let space): view.onRevealSource(space)
       case .checkout(let checkout): view.onRevealCheckout(checkout)
       default: break
       }
+    }
+
+    @objc private func relinkClicked() {
+      if case .space(let space)? = clickedRow()?.kind { view.onRelink(space) }
+    }
+
+    @objc private func detachClicked() {
+      if case .space(let space)? = clickedRow()?.kind { view.onDetach(space) }
     }
 
     @objc private func copyPathClicked() {
@@ -289,11 +303,18 @@ extension FolderListView.Coordinator: NSMenuDelegate {
       menu.addItem(withTitle: "Open", action: #selector(openClicked), keyEquivalent: "")
       // Only a filesystem source has a directory for these actions.
       if space.hasFilesystemSource {
-        menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealClicked), keyEquivalent: "")
+        if space.isSourceUnavailable {
+          menu.addItem(withTitle: "Locate Folder…", action: #selector(relinkClicked), keyEquivalent: "")
+          menu.addItem(withTitle: "Disconnect Local Folder…", action: #selector(detachClicked), keyEquivalent: "")
+        } else {
+          menu.addItem(withTitle: "Reveal in Finder", action: #selector(revealClicked), keyEquivalent: "")
+        }
         menu.addItem(.separator())
-        menu.addItem(
-          withTitle: "Adopt From the Cluster\u{2026}", action: #selector(adoptClicked),
-          keyEquivalent: "")
+        if !space.isSourceUnavailable {
+          menu.addItem(
+            withTitle: "Adopt From the Cluster\u{2026}", action: #selector(adoptClicked),
+            keyEquivalent: "")
+        }
         menu.addItem(withTitle: "Copy Path", action: #selector(copyPathClicked), keyEquivalent: "")
       }
       if space.isSource {
@@ -349,6 +370,9 @@ private struct FolderListPreview: View {
       onSelect: { selected = $0 },
       onAddFolder: {},
       onRevealCheckout: { _ in },
+      onRevealSource: { _ in },
+      onRelink: { _ in },
+      onDetach: { _ in },
       onStopSharing: { _ in },
       onAdopt: { _ in })
   }

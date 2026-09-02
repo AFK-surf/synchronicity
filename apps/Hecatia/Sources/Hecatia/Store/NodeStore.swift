@@ -267,7 +267,7 @@ final class NodeStore {
         try? await Task.sleep(for: .seconds(self?.statusProbeFailures ?? 0 > 0 ? 1 : 5))
         guard let self, !Task.isCancelled else { return }
         if self.connection.isConnected {
-          await self.refresh([.status])
+          await self.refresh([.status, .spaces])
         } else if case .failed = self.connection {
           // A daemon that comes back should be noticed without being asked.
           // `.failed` is the state a daemon that *stopped* leaves behind;
@@ -566,7 +566,8 @@ final class NodeStore {
       // this, so it is not even asked.
       guard !isWaitingToBeNamed else { spaces = []; return }
       do {
-        spaces = try await client.listSpaces().map(Space.init)
+        let latest = try await client.listSpaces().map(Space.init)
+        if spaces != latest { spaces = latest }
         note(.spaces, [])
       } catch {
         lastFailure = DaemonFailure.classify(error, operation: "list spaces")
@@ -748,11 +749,48 @@ final class NodeStore {
     defer { houseworkRunning = false }
     var line = "synch source add \(Shell.quote(id))"
     line += " \(Shell.quote(path))"
-    await run(
+    guard await run(
       Operations.require("source.add"),
       Cmd.sourceAdd(id: id, path: path),
-      commandLine: line)
+      commandLine: line) != nil else { return }
     await run(Operations.require("source.scan"), Cmd.sourceScan(id: id), deadline: .long)
+  }
+
+  func relinkSource(id: String, path: String) async {
+    houseworkRunning = true
+    defer { houseworkRunning = false }
+    let line = "synch source relink \(Shell.quote(id)) \(Shell.quote(path))"
+    guard await run(
+      Operations.require("source.relink"), Cmd.sourceRelink(id: id, path: path),
+      commandLine: line) != nil else { return }
+    await run(
+      Operations.require("source.scan"), Cmd.sourceScan(id: id),
+      commandLine: "synch source scan \(Shell.quote(id))", deadline: .long)
+  }
+
+  func revealSource(_ space: Space) {
+    guard let path = space.localPath else { return }
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+          isDirectory.boolValue
+    else {
+      alert = DaemonFailure(
+        code: .notFound,
+        detail: "The local folder \(path) can no longer be found.",
+        operation: "reveal \(space.id) in Finder",
+        suggestion: "Use Locate Folder to reconnect the renamed or moved folder, or disconnect the local folder while keeping the cloud space.")
+      enqueue { await self.refresh([.spaces]) }
+      return
+    }
+    NSWorkspace.shared.activateFileViewerSelecting([
+      URL(fileURLWithPath: path, isDirectory: true)
+    ])
+  }
+
+  func detachSource(id: String) async {
+    await run(
+      Operations.require("source.detach"), Cmd.sourceDetach(id: id),
+      commandLine: "synch source detach \(Shell.quote(id))")
   }
 
   func removeReplica(id: String, pinHeld: Bool) async {

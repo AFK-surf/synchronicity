@@ -14,7 +14,7 @@ import Testing
 /// `key:<52-char>` origin that is longer than its `{:<32}` field.
 struct ParserTests {
 
-  @Test func typedSpacesKeepEditableReplicaConfiguration() {
+  @Test func typedSpacesKeepEditableReplicaConfiguration() throws {
     var info = Synch_Control_V1_SpaceInfo()
     info.id = "media"
     info.retention = "current"
@@ -24,9 +24,24 @@ struct ParserTests {
 
     let space = Space(info)
     #expect(space.replicate == .current)
-    #expect(space.graceSeconds == 30 * 86_400)
-    #expect(space.budgetBytes == 8 * (1 << 40))
+    let grace = try #require(space.graceSeconds)
+    let budget = try #require(space.budgetBytes)
+    #expect(grace == 2_592_000)
+    #expect(budget == 8_796_093_022_208)
     #expect(space.checkoutPath == "/srv/media")
+  }
+
+  @Test func typedSpacesCarryDaemonOwnedSourceAvailability() {
+    var info = Synch_Control_V1_SpaceInfo()
+    info.id = "media"
+    info.sourceKind = "filesystem"
+    info.sourcePath = "/Users/me/Media Before"
+    info.sourceState = .unavailable
+    info.sourceError = "/Users/me/Media Before is unavailable"
+
+    let space = Space(info)
+    #expect(space.isSourceUnavailable)
+    #expect(space.sourceError == "/Users/me/Media Before is unavailable")
   }
 
   @Test func replicaStatusFromALiveDaemon() {

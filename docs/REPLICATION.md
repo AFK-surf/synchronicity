@@ -18,12 +18,23 @@ synch source add media /srv/media
 synch source add uploads --api
 synch source ls [media]
 synch source scan [media]
+synch source relink media /srv/media-renamed
+synch source detach media
 synch source rm media
 ```
 
 A filesystem source is scanned and watched. An API source has no directory and
 is populated through typed writes such as the control API or a read-write S3
 bucket.
+
+If a filesystem source's directory is renamed, moved, or unmounted, the daemon
+reports it as unavailable and refuses scans and filesystem writes rather than
+publishing the missing tree as deleted. `source relink` reconnects that source
+to an existing directory; it is accepted only while the old root is
+unavailable. `source detach` removes only the filesystem binding and scanner
+state, leaving the source API-backed and its already-published entries intact.
+`source rm` is separate: it withdraws this node's published entries, and never
+requires the old directory to exist.
 
 Publishing a live file or socket is transactional with a durable source hold.
 Before the own head may move, the store must contain the complete object at the

@@ -1323,6 +1323,79 @@ impl Node {
         Ok(())
     }
 
+    /// Reconnects an unavailable filesystem source to a moved directory.
+    pub fn relink_filesystem_source(&self, id: &str, path: impl AsRef<Path>) -> Result<()> {
+        validate_space(id)?;
+        let source = self
+            .store()
+            .source(id)?
+            .ok_or_else(|| EngineError::not_found(format!("source {id}")))?;
+        let old_path = source.local_path.ok_or_else(|| {
+            EngineError::invalid(format!(
+                "source {id} is API-only and has no local folder to reconnect"
+            ))
+        })?;
+        let path = canonical_existing_dir(path.as_ref())?;
+        let old = PathBuf::from(&old_path);
+        if old.is_dir() {
+            let current = stored_root(&old_path);
+            if current == path {
+                return Ok(());
+            }
+            return Err(EngineError::invalid(format!(
+                "source {id} is still available at {}; it cannot be repointed while that folder exists",
+                old.display()
+            )));
+        }
+        for replica in self.store().replicas()? {
+            if let Some(checkout) = replica.checkout_path {
+                if paths_overlap(&path, &stored_root(&checkout)) {
+                    return Err(EngineError::invalid(format!(
+                        "source root {} overlaps replica checkout {}",
+                        path.display(),
+                        checkout
+                    )));
+                }
+            }
+        }
+        for other in self.store().sources()? {
+            if other.space == id {
+                continue;
+            }
+            if let Some(local_path) = other.local_path {
+                if paths_overlap(&path, &stored_root(&local_path)) {
+                    return Err(EngineError::invalid(format!(
+                        "source root {} overlaps source {}",
+                        path.display(),
+                        other.space
+                    )));
+                }
+            }
+        }
+        self.store()
+            .put_source(id, SourceKind::Filesystem, Some(&path.to_string_lossy()))?;
+        self.spaces_changed();
+        Ok(())
+    }
+
+    /// Disconnects a filesystem source without withdrawing its published entries.
+    pub fn detach_filesystem_source(&self, id: &str) -> Result<()> {
+        let source = self
+            .store()
+            .source(id)?
+            .ok_or_else(|| EngineError::not_found(format!("source {id}")))?;
+        if source.kind != SourceKind::Filesystem {
+            return Err(EngineError::invalid(format!(
+                "source {id} is already detached from the filesystem"
+            )));
+        }
+        if !self.store().detach_source(id)? {
+            return Err(EngineError::not_found(format!("source {id}")));
+        }
+        self.spaces_changed();
+        Ok(())
+    }
+
     /// Plans removal of a source's published entries.
     ///
     /// Staging the removal is half of a publish, so it takes the same recovery
@@ -1360,9 +1433,6 @@ impl Node {
     pub fn finish_source_removal(&self, id: &str) -> Result<()> {
         if !self.store().remove_source(id)? {
             return Err(EngineError::NotFound(format!("no source {id}")));
-        }
-        for path in self.store().local_files(id)? {
-            self.store().remove_local_file(id, &path)?;
         }
         self.spaces_changed();
         Ok(())
@@ -1841,6 +1911,17 @@ fn canonical_dir(path: &Path) -> Result<PathBuf> {
     // and the operation makes "Permission denied" point at the right thing.
     std::fs::create_dir_all(path)
         .map_err(|e| EngineError::invalid(format!("could not create {}: {e}", path.display())))?;
+    std::fs::canonicalize(path)
+        .map_err(|e| EngineError::invalid(format!("could not resolve {}: {e}", path.display())))
+}
+
+fn canonical_existing_dir(path: &Path) -> Result<PathBuf> {
+    if !path.is_dir() {
+        return Err(EngineError::invalid(format!(
+            "source folder {} is unavailable or is not a directory",
+            path.display()
+        )));
+    }
     std::fs::canonicalize(path)
         .map_err(|e| EngineError::invalid(format!("could not resolve {}: {e}", path.display())))
 }
@@ -2422,6 +2503,44 @@ mod tests {
             .is_err());
         node.add_filesystem_source("a", a.path()).unwrap();
 
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_source_can_be_relinked_or_detached() {
+        let (_d, node) = node().await;
+        let folders = tempfile::tempdir().unwrap();
+        let old = folders.path().join("before");
+        let renamed = folders.path().join("after");
+        std::fs::create_dir(&old).unwrap();
+        node.add_filesystem_source("media", &old).unwrap();
+
+        let other = folders.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let error = node.relink_filesystem_source("media", &other).unwrap_err();
+        assert!(error.to_string().contains("still available"), "{error}");
+
+        std::fs::rename(&old, &renamed).unwrap();
+        let error = node.scan_source_and_stage_async("media").await.unwrap_err();
+        assert!(error.to_string().contains("source relink media"), "{error}");
+        let error = node.adoption_target("media", "file.txt").unwrap_err();
+        assert!(error.to_string().contains("source relink media"), "{error}");
+
+        node.relink_filesystem_source("media", &renamed).unwrap();
+        assert_eq!(
+            node.store().source("media").unwrap().unwrap().local_path,
+            Some(
+                std::fs::canonicalize(&renamed)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+
+        node.detach_filesystem_source("media").unwrap();
+        let source = node.store().source("media").unwrap().unwrap();
+        assert_eq!(source.kind, SourceKind::Api);
+        assert_eq!(source.local_path, None);
         node.shutdown().await.unwrap();
     }
 

@@ -980,6 +980,28 @@ impl Control for ControlService {
             for name in names {
                 let source = sources.get(&name).cloned();
                 let replica = replicas.get(&name).cloned();
+                let (source_state, source_error) = match source.as_ref() {
+                    None => (pb::SourceState::Unspecified as i32, None),
+                    Some(row) if row.local_path.is_none() => {
+                        (pb::SourceState::Available as i32, None)
+                    }
+                    Some(row) => {
+                        let path = row.local_path.as_deref().expect("checked above");
+                        match std::fs::metadata(path) {
+                            Ok(metadata) if metadata.is_dir() => {
+                                (pb::SourceState::Available as i32, None)
+                            }
+                            Ok(_) => (
+                                pb::SourceState::Unavailable as i32,
+                                Some(format!("{path} is not a directory")),
+                            ),
+                            Err(error) => (
+                                pb::SourceState::Unavailable as i32,
+                                Some(format!("{path} is unavailable: {error}")),
+                            ),
+                        }
+                    }
+                };
                 let coverage = replica
                     .as_ref()
                     .map(|row| {
@@ -987,13 +1009,13 @@ impl Control for ControlService {
                             .replica_coverage(&row.holder(), UNREACHABLE_ATTEMPTS)
                     })
                     .transpose()?;
-                out.push((name, source, replica, coverage));
+                out.push((name, source, replica, coverage, source_state, source_error));
             }
             Ok(out)
         })
         .await?;
-        let stream =
-            tokio_stream::iter(spaces.into_iter().map(|(id, source, replica, coverage)| {
+        let stream = tokio_stream::iter(spaces.into_iter().map(
+            |(id, source, replica, coverage, source_state, source_error)| {
                 Ok(pb::SpaceInfo {
                     id,
                     source_path: source.as_ref().and_then(|row| row.local_path.clone()),
@@ -1004,8 +1026,11 @@ impl Control for ControlService {
                     held_bytes: coverage.as_ref().map(|c| c.held_bytes),
                     wanted: coverage.as_ref().map(|c| c.wanted),
                     checkout_path: replica.and_then(|row| row.checkout_path),
+                    source_state,
+                    source_error,
                 })
-            }));
+            },
+        ));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -2298,6 +2323,28 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 })
                 .await?;
             }
+        }
+
+        Command::SourceRelink(pb::SourceRelink { space: id, path }) => {
+            let relinking = node.clone();
+            let source = id.clone();
+            let new_path = path.clone();
+            offload(move || Ok(relinking.relink_filesystem_source(&source, &new_path)?)).await?;
+            out.line(format!("reconnected source {id} to {path}"))
+                .await?;
+            out.line(format!(
+                "next: `synch source scan {id}` verifies and publishes the current bytes"
+            ))
+            .await?;
+        }
+
+        Command::SourceDetach(pb::SourceDetach { space: id }) => {
+            let source = id.clone();
+            read(node, move |n| Ok(n.detach_filesystem_source(&source)?)).await?;
+            out.line(format!(
+                "disconnected source {id} from its local folder; published entries are unchanged"
+            ))
+            .await?;
         }
 
         Command::ReplicaSync(pb::ReplicaSync { space: id }) => {

@@ -349,6 +349,9 @@ fn source_scan() -> Command {
         space: String::new(),
     })
 }
+fn source_scan_one(id: &str) -> Command {
+    Command::SourceScan(pb::SourceScan { space: id.into() })
+}
 fn peer_sync() -> Command {
     Command::PeerSync(pb::PeerSync {})
 }
@@ -509,6 +512,15 @@ fn api_source_add(id: &str) -> Command {
 }
 fn source_rm(id: &str) -> Command {
     Command::SourceRm(pb::SourceRm { space: id.into() })
+}
+fn source_relink(id: &str, path: &str) -> Command {
+    Command::SourceRelink(pb::SourceRelink {
+        space: id.into(),
+        path: path.into(),
+    })
+}
+fn source_detach(id: &str) -> Command {
+    Command::SourceDetach(pb::SourceDetach { space: id.into() })
 }
 fn adopt_path(reference: &str) -> Command {
     Command::AdoptPath(pb::AdoptPath {
@@ -1393,6 +1405,74 @@ async fn a_dropped_write_publishes_nothing() {
         b"kept"
     );
 
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renamed_source_is_reported_and_can_be_relinked_or_detached() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let folders = tempfile::tempdir().unwrap();
+    let old = folders.path().join("before");
+    let renamed = folders.path().join("after");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::write(old.join("kept.txt"), b"kept").unwrap();
+    says(
+        dir.path(),
+        source_add("media", &old.to_string_lossy()),
+        "publishing",
+    )
+    .await;
+    lines(dir.path(), source_scan()).await;
+
+    let mut client = Client::connect(dir.path()).await.unwrap();
+    let available = client.list_spaces().await.unwrap();
+    assert_eq!(available[0].source_state, pb::SourceState::Available as i32);
+    assert_eq!(available[0].source_error, None);
+
+    std::fs::rename(&old, &renamed).unwrap();
+    let unavailable = client.list_spaces().await.unwrap();
+    assert_eq!(
+        unavailable[0].source_state,
+        pb::SourceState::Unavailable as i32
+    );
+    assert!(unavailable[0]
+        .source_error
+        .as_deref()
+        .is_some_and(|error| error.contains("before")));
+    drop(client);
+    let error = failure_message(dir.path(), source_scan_one("media")).await;
+    assert!(error.message.contains("source relink media"), "{error:?}");
+
+    let stop_old = folders.path().join("stop-before");
+    let stop_renamed = folders.path().join("stop-after");
+    std::fs::create_dir(&stop_old).unwrap();
+    std::fs::write(stop_old.join("many.txt"), b"indexed").unwrap();
+    lines(dir.path(), source_add("stop", &stop_old.to_string_lossy())).await;
+    lines(dir.path(), source_scan_one("stop")).await;
+    std::fs::rename(&stop_old, &stop_renamed).unwrap();
+    says(dir.path(), source_rm("stop"), "unpublished").await;
+
+    says(
+        dir.path(),
+        source_relink("media", &renamed.to_string_lossy()),
+        "reconnected",
+    )
+    .await;
+    lines(dir.path(), source_scan_one("media")).await;
+    says(
+        dir.path(),
+        source_detach("media"),
+        "published entries are unchanged",
+    )
+    .await;
+    let mut client = Client::connect(dir.path()).await.unwrap();
+    let detached = client.list_spaces().await.unwrap();
+    assert_eq!(detached[0].source_kind.as_deref(), Some("api"));
+    assert_eq!(detached[0].source_path, None);
+    assert_eq!(detached[0].source_state, pb::SourceState::Available as i32);
+
+    says(dir.path(), source_rm("media"), "unpublished").await;
     daemon.shutdown().await;
 }
 

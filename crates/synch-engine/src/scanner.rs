@@ -131,29 +131,14 @@ impl Node {
                 "source {space_id} is API-only and cannot be scanned"
             ))
         })?;
-        let root_dir = PathBuf::from(local_path);
+        let root_dir = available_source_root(space_id, local_path)?;
         let seq = self.next_seq()?;
 
         // A vanished space root — an unmounted drive, a renamed mount, a
         // directory momentarily gone — must not read as "every file deleted".
         // `walk` treats a missing directory as empty, so without this guard the
         // deletion sweep below would tombstone the whole space and publish that
-        // cluster-wide. Refuse to scan a root that is absent or not a directory.
-        match std::fs::metadata(&root_dir) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
-                return Err(EngineError::invalid(format!(
-                    "space {space_id} root {} is not a directory",
-                    root_dir.display()
-                )))
-            }
-            Err(e) => {
-                return Err(EngineError::invalid(format!(
-                    "space {space_id} root {} is unavailable: {e}",
-                    root_dir.display()
-                )))
-            }
-        }
+        // cluster-wide.
 
         // After the root guard, not before. `.syncignore` under a root that is a
         // regular file returns `ENOTDIR`, which is not `NotFound`, so reading it
@@ -1042,9 +1027,10 @@ impl Node {
         let Some(local_path) = space.local_path.as_deref() else {
             return Ok(());
         };
+        let root = available_source_root(space_id, local_path)?;
         let normalized =
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        if IgnoreSet::for_space(Path::new(local_path))?.excludes_path(&normalized) {
+        if IgnoreSet::for_space(&root)?.excludes_path(&normalized) {
             return Err(EngineError::invalid(format!(
                 "{space_id}/{path} matches an ignore rule, so it could never be published"
             )));
@@ -1079,9 +1065,24 @@ impl Node {
                 "source {space_id} is API-only and has no filesystem adoption target"
             ))
         })?;
-        let root = PathBuf::from(local_path);
+        let root = available_source_root(space_id, &local_path)?;
         let (target, normalized) = target_within_checked(&root, space_id, path)?;
         Ok((target, (root, normalized)))
+    }
+}
+
+fn available_source_root(space_id: &str, local_path: &str) -> Result<PathBuf> {
+    let root = PathBuf::from(local_path);
+    match std::fs::metadata(&root) {
+        Ok(meta) if meta.is_dir() => Ok(root),
+        Ok(_) => Err(EngineError::invalid(format!(
+            "source {space_id} local folder {} is not a directory; reconnect it with `synch source relink {space_id} <path>` or disconnect it with `synch source detach {space_id}`",
+            root.display()
+        ))),
+        Err(error) => Err(EngineError::invalid(format!(
+            "source {space_id} local folder {} is unavailable: {error}; reconnect it with `synch source relink {space_id} <path>` or disconnect it with `synch source detach {space_id}`",
+            root.display()
+        ))),
     }
 }
 

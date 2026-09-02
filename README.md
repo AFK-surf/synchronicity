@@ -113,6 +113,8 @@ synch init --domain cluster.example.com   # or plain `synch init` for a key iden
 synch daemon start                         # returns when the control socket is ready
 synch source add media /srv/media
 synch source scan media                    # hash, publish a signed root
+synch source relink media /srv/media-new
+synch source detach media
 synch id                                   # print the origin, device key, and address
 synch daemon status                        # what the running node is doing
 synch daemon stop                          # ask it to shut down
