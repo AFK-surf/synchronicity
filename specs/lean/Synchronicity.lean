@@ -6,6 +6,7 @@ import Synchronicity.FaultTolerant
 import Synchronicity.MptGc
 import Synchronicity.Provenance
 import Synchronicity.Bridge
+import Synchronicity.Publication
 import Synchronicity.Scope
 import Synchronicity.ScopedSync
 import Synchronicity.SystemSafety

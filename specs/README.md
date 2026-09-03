@@ -84,7 +84,11 @@ unprotected removal of such rows, partial rows — the groups a row holds, the
 size it records, and the settlement that lets a claimed size yield and a
 durable or attested one stand — and the two GC phases. The CAS/trie bridge
 (`Bridge`) pairs each publication and promotion with its head flip across every
-content root the transaction touches, on that same system model. Under backend loss, the surviving theorem is that
+content root the transaction touches, on that same system model, and
+`Publication` reads that bridge along whole executions: for as long as a
+source's tree names its content, the holder pins it, it is available, and its
+size is the one recorded when it was published, and the step that published
+it committed an active, materialized head. Under backend loss, the surviving theorem is that
 a role's pin stands on content that is available or that the backend lost and
 the heal has not yet converted into a want. Rust and Lean carry matching checked
 anchors at their linearization points; run `lean/check-anchors.sh` after

@@ -23,7 +23,9 @@ docstring or with an unused argument fails the build.
 
 Every model is an instance of `Prelude.System` — an initial state and a step
 relation — and every safety theorem is a `System.Invariant` (true initially,
-preserved by every step) read at a reachable state. Every transition is a
+preserved by every step) read at a reachable state, or a claim over a
+`System.Exec` — a state at every instant, each to the next a step — where the
+claim is temporal. Every transition is a
 `Prelude.Transition`: a guard and a successor function. Where the code has
 two outcomes, the outcome is a parameter of the transition and of its `Kind`,
 so a preservation proof is `cases k <;> simp only [transition] at h <;>
@@ -41,7 +43,8 @@ a Mathlib `Set`.
 | `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, `pin_never_stands_on_partial`, `pinned_size_is_settled`, and the GC/delete/staged-row/partial-row corollaries |
 | `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`, `settled_size_survives_faults`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
-| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on |
+| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on; `step_cells` — every cell steps or stays along any bridge step |
+| `Publication` | the bridge read along an execution (`System.Exec`): `Standing`, a source leaf that stands from one instant to another | `publication_contract` — for as long as the tree names a source's content, its holder pins it, it is available, and its size is the one recorded when it was published; `publication_flips_head`, the birth half; `published_content_keeps_its_size`, the two read together |
 | `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
 | `ScopedSync` | `Hash`, the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
 | `TrieGraph` | the multi-root trie store under a read scope, with `Complete` read as `CompleteWithin`; every `MptGc` transition at store level, `GcSweep` as mark/sweep over held nodes and their values | `gcSweep_complete_iff` — a sweep keeps a retained root exactly as complete as it was; `step_projects` and `simulates` — `MptGc` simulates the store at every root |
@@ -74,6 +77,23 @@ and `staged_row_drop_is_unpinned` why it is safe.
 `FaultTolerant` does not model that a heal ever runs, that a want is ever
 satisfied, or that the backend's `NotFound` is true — a spurious one triggers
 a heal that errs in the safe direction, a pin becoming a want and a refetch.
+
+### The publication contract
+
+The theorems above are read at one state or across one step. `Publication`
+reads the bridged system along an execution and states what the design
+promises of a publication: `publication_contract` says that from any instant
+a source leaf stands until any later instant it still stands, the holder pins
+the content, the content is available, and the size the row records is the
+size it recorded at the first instant — whatever a peer claims, whatever the
+cache evicts, whatever a sweep or another node's promotion does in between.
+`publication_flips_head` is the birth: the step that stood the leaf committed
+an active, materialized head. It is composed, not proved afresh, from
+`Bridge.source_leaf_flips_head`, the fault-free invariant, and
+`Cas.settled_size_is_stable` chained instant to instant; `Node::publish`
+carries the anchor. Under faults the leaf keeps a durable claim or a want and
+the row its size (`FaultTolerant.settled_size_survives_faults`); what a loss
+takes is availability, until the heal and the refetch.
 
 ### Partial rows and the size a row records
 

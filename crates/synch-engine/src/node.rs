@@ -1542,6 +1542,11 @@ impl Node {
                 // Publication owns the invariant: callers cannot accidentally
                 // publish an own live file without also advertising the
                 // complete durable content that the source hold just proved.
+                // LEAN-MODEL: cas-publication-contract (Publication.publication_contract)
+                // `Publication.publication_contract` is what this transaction
+                // promises along every execution: for as long as the tree
+                // names the content, its holder pins it, it is available, and
+                // its size is the one recorded here.
                 for (content, size) in source_ads {
                     let ad = synch_core::record::encode(&BlobAd::complete(size))?;
                     root = trie.insert(root, &blob_key(&content), &ad)?;

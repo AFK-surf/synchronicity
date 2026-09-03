@@ -151,6 +151,44 @@ theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
   | replicaPromote _ mptStep =>
     exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
 
+/-- The same for a source leaf on its own, without asking about the holder's
+replica leaf: only a publication stands one. -/
+theorem source_leaf_flips_head {s' : State H} (hstep : Step s s')
+    (new : holder ∈ (s'.cas root).sourceLive) (old : holder ∉ (s.cas root).sourceLive) :
+    s'.mpt.active ∧ s'.mpt.materialized := by
+  cases hstep with
+  | @cas cas' step =>
+    exfalso
+    change holder ∈ (cas' root).sourceLive at new
+    rcases step.across root with hk | same
+    · obtain ⟨k, hlocal, hk⟩ := hk
+      have flips : k.flipsHead = true := by rw [sourcePublish_of_new_leaf hk new old]; rfl
+      exact Bool.false_ne_true (hlocal.symm.trans flips)
+    · rw [same] at new
+      exact old new
+  | mpt _ => exact absurd new old
+  | sourcePublish _ mptStep =>
+    exact ⟨(MptGc.own_publish_is_atomic mptStep).1, (MptGc.own_publish_is_atomic mptStep).2.2.2⟩
+  | ordinaryPromote _ mptStep =>
+    exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
+  | replicaPromote _ mptStep =>
+    exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
+
+/-- Along any step of the bridge every content cell either takes a cell
+transition or stays: a free step lifts one cell, a paired publication or
+promotion runs one transition across the store. -/
+theorem step_cells {s s' : State H} (h : Step s s') (root : Root) :
+    CellStep (s.cas root) (s'.cas root) ∨ s'.cas root = s.cas root := by
+  cases h with
+  | cas step => exact (step.across root).imp_left LocalStep.step
+  | mpt _ => exact Or.inr rfl
+  | @sourcePublish holder _ _ step _ =>
+    exact (step root).imp_left fun h => ⟨.sourcePublish holder, h⟩
+  | @ordinaryPromote holder _ _ step _ =>
+    exact (step root).imp_left fun h => ⟨.ordinaryPromote holder, h⟩
+  | @replicaPromote holder pinned _ _ step _ =>
+    exact (step root).imp_left fun h => ⟨.replicaPromote holder pinned, h⟩
+
 end Synchronicity.Bridge
 
 #lint
