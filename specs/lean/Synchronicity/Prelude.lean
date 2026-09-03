@@ -47,7 +47,25 @@ structure Invariant (I : σ → Prop) : Prop where
   /-- Every step preserves it. -/
   step : ∀ {s s'}, I s → S.step s s' → I s'
 
+/-- An execution: a state at every instant, the initial state first, and a
+step from each instant to the next.  Where `Reachable` reads one state,
+an execution is what a temporal claim — something holds *from* one instant
+*until* another — is stated over. -/
+structure Exec where
+  /-- The state at each instant. -/
+  state : Nat → σ
+  /-- The first state is the initial one. -/
+  init : state 0 = S.init
+  /-- Each instant to the next is a step. -/
+  step : ∀ n, S.step (state n) (state (n + 1))
+
 variable {S}
+
+/-- Every instant of an execution is a reachable state. -/
+theorem Exec.reachable (e : S.Exec) (n : Nat) : S.Reachable (e.state n) := by
+  induction n with
+  | zero => exact e.init ▸ Reachable.initial (S := S)
+  | succ n ih => exact .next ih (e.step n)
 
 /-- An inductive invariant holds of every reachable state. -/
 theorem Invariant.reachable {I : σ → Prop} (hI : S.Invariant I) {s : σ} (h : S.Reachable s) :

@@ -381,6 +381,8 @@ impl BlobRow {
 /// Taken as three loose values rather than off a [`BlobRow`] so that the commit
 /// path can ask the question of a row it read *inside* its own transaction.
 fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
+    // LEAN-MODEL: cas-size-attested (Cas.Attested)
+    // `Cas.Attested` is this predicate: complete, or the final group held.
     complete || held.contains(group_count(size) - 1)
 }
 
@@ -437,6 +439,9 @@ pub(crate) fn settle_size(
     existing: Option<(u64, bool, bool, &ChunkRanges)>,
     claimed: u64,
 ) -> Result<Settlement> {
+    // LEAN-MODEL: cas-size-settlement (Cas.Settles)
+    // `Cas.Settles` is this decision as the guard on every groups commit: no
+    // row, or the recorded size, or a size neither durable nor attested.
     let settled = |size| {
         Ok(Settlement {
             size,
@@ -450,6 +455,10 @@ pub(crate) fn settle_size(
         return settled(recorded);
     }
     if durable || size_is_attested(recorded, complete, held) {
+        // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
+        // `Cas.settled_size_is_stable` is what this refusal buys: no step of
+        // the model leaves a row standing under a different size once its
+        // size is durable or attested.
         return Err(StoreError::Verification {
             root: *root,
             reason: format!("size mismatch: have {recorded}, offered {claimed}"),
@@ -620,6 +629,10 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         let size = size as u64;
         let total = group_count(size);
         let complete = complete != 0;
+        // LEAN-MODEL: cas-row-complete (Cas.Complete)
+        // `Cas.Complete` is what `complete` means when a row is read: every
+        // group of the row's own size is held. A bitmap row holds the groups
+        // it names and nothing more.
         let held = match (complete, &bitmap) {
             (true, _) => ChunkRanges::single(0, total),
             (false, Some(bytes)) => blob_to_ranges(bytes, total),
@@ -688,7 +701,7 @@ impl Store {
         let root = compute_outboard(data, tree, &mut outboard)?;
 
         if size <= INLINE_BLOB_MAX {
-            self.write_blob_row(&root, size, true, None, Some(data.to_vec()), now)?;
+            self.commit_complete(&root, size, Some(data.to_vec()), now)?;
         } else {
             // Held from the first byte on disk through the row that describes
             // it, exactly as `write_slice` does. An ingest re-creating content
@@ -697,7 +710,7 @@ impl Store {
             // does not cover it ([`Store::lease_write`]).
             let _lease = self.lease_write(&root);
             self.write_payload(&root, data, &outboard)?;
-            self.write_blob_row(&root, size, true, None, None, now)?;
+            self.commit_complete(&root, size, None, now)?;
         }
         Ok(root)
     }
@@ -780,7 +793,7 @@ impl Store {
         fsync_file(&OpenOptions::new().write(true).open(&target)?)?;
         fsync_parent(&target);
         write_and_sync(&self.staging_dir(), &self.outboard_path(&root), &outboard)?;
-        self.write_blob_row(&root, size, true, None, None, now)?;
+        self.commit_complete(&root, size, None, now)?;
         Ok((root, size))
     }
 
@@ -791,33 +804,32 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn write_blob_row(
+    /// Records an ingested object: every group of it, verified at once.
+    ///
+    /// The same row write as [`Store::commit_groups`], claiming the whole
+    /// object, so an ingest meets [`settle_size`] like every other writer of
+    /// the root. An ingest's size is the truth about its bytes, and so is a
+    /// size the disk attests to, so the two can only disagree on a root two
+    /// objects share — which verification rules out — and a row's settled
+    /// size is never rewritten by anyone, not even the writer that hashed the
+    /// bytes. A claim off an entry that a partial fetch left behind yields to
+    /// the ingest as it would to any writer, bitmap and all.
+    pub(crate) fn commit_complete(
         &self,
         root: &Hash,
         size: u64,
-        complete: bool,
-        bitmap: Option<Vec<u8>>,
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
         // LEAN-MODEL: cas-write-complete-commit (Cas.CommitComplete)
-        // `Cas.CommitComplete` abstracts this complete-row commit, its staged
-        // branch being the `durable = 0` row a cloud backend leaves until
-        // `finalize`. File callers hold the write lease; inline callers have
-        // no unlink window.
-        let durable = self.complete_is_durable();
-        upsert_blob_row(
-            &self.conn(),
-            BlobRowWrite {
-                root,
-                size,
-                complete,
-                bitmap,
-                inline,
-                now,
-                durable,
-            },
-        )
+        // `Cas.CommitComplete` is `Cas.CommitGroups` over every group, exactly
+        // as this is `commit_groups` over the full range. Its staged branch is
+        // the `durable = 0` row a cloud backend leaves until `finalize`. File
+        // callers hold the write lease; inline callers have no unlink window.
+        let all = ChunkRanges::single(0, group_count(size));
+        let commit = self.commit_groups(root, size, &all, inline, now)?;
+        debug_assert!(commit.complete, "a commit of every group is complete");
+        Ok(())
     }
 
     /// Records a complete object whose bytes were durably committed by a
@@ -900,6 +912,11 @@ impl Store {
             // the size that gave them that shape was only ever a claim. Start
             // the bitmap again rather than carry bits describing a tree nobody
             // is writing any more.
+            // LEAN-MODEL: cas-size-reset (Cas.dropped_bit_was_a_claim)
+            // `Cas.dropped_bit_was_a_claim` is why this loses nothing that was
+            // a fact: a bit goes only when the row's size was neither durable
+            // nor attested, and `Cas.Invariant.held_within_size` is what
+            // keeping the bits under an unchanged group count preserves.
             let held = match (settlement.reset_held, claim) {
                 (false, Some(claim)) => claim.held,
                 _ => ChunkRanges::empty(),
@@ -1417,7 +1434,7 @@ impl Store {
             // for a partial fetch too, and on a cloud backend a complete row
             // is only a scratch copy until the backend has taken it
             // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `Cas.Available`
+            // predicate is `durable` alone, which is `Cas.Durable`
             // and the fact the whole GC argument rests on: every path that
             // drops a staged row without consulting `pins` — cache eviction,
             // a scratch-generation reset, a backend migration — is safe only
@@ -2714,6 +2731,52 @@ mod tests {
             // And an honest writer arriving afterwards is still let in.
             store.commit_groups(&root, size, &all, None, 0).unwrap();
         }
+    }
+
+    /// An ingest is a writer like any other and meets `settle_size`: a claim
+    /// a partial fetch left behind under a size nothing attests to yields to
+    /// the ingest, bitmap and all, and the object is complete at the length
+    /// its bytes have. A size the disk attests to is never rewritten, not
+    /// even by the writer that hashed the bytes — the only way the two can
+    /// disagree is a root two objects share (`Cas.settled_size_is_stable`).
+    #[test]
+    fn an_ingest_settles_size_like_any_other_writer() {
+        let (_d1, provider) = store();
+        let bytes = data(4 * CHUNK_GROUP_SIZE as usize + 500);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+
+        // A claim a whole bracket over, with a group verified under it.
+        let (_d2, claimed) = store();
+        let lie = 9 * CHUNK_GROUP_SIZE;
+        claimed
+            .commit_groups(&root, lie, &ChunkRanges::single(0, 1), None, 0)
+            .unwrap();
+        let row = claimed.blob(&root).unwrap().unwrap();
+        assert_eq!(row.size, lie);
+        assert!(!row.complete);
+
+        assert_eq!(claimed.ingest_bytes(&bytes, 1).unwrap(), root);
+        let row = claimed.blob(&root).unwrap().unwrap();
+        assert_eq!(row.size, size, "the ingest's size settles the row");
+        assert!(row.complete);
+        assert!(row.durable);
+        assert_eq!(claimed.read_all(&root).unwrap(), bytes);
+
+        // A settled size stands against everyone, the ingest included.
+        let (_d3, attested) = store();
+        let settled = size + 100;
+        let all = ChunkRanges::single(0, group_count(settled));
+        attested
+            .commit_groups(&root, settled, &all, None, 0)
+            .unwrap();
+        assert!(matches!(
+            attested.ingest_bytes(&bytes, 1),
+            Err(StoreError::Verification { .. })
+        ));
+        let row = attested.blob(&root).unwrap().unwrap();
+        assert_eq!(row.size, settled, "a settled size is never rewritten");
+        assert!(row.complete);
     }
 
     /// The pre-v10 bitmap describes no more groups than it has bits for: the

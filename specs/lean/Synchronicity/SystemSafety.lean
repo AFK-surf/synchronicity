@@ -43,8 +43,8 @@ theorem protected_delete_cannot_delete_pinned
   delete.1.no_pin ⟨holder, pinned⟩
 
 /-- The paths that drop a staged row never consult `pins`.  They do not need
-to: a pin is only ever granted over available, hence durable, content, so a
-non-durable row is unpinned in every fault-free state. -/
+to: a pin is only ever granted over a durable claim, so a non-durable row is
+unpinned in every fault-free state. -/
 theorem staged_row_drop_is_unpinned
     (hnl : NoLoss c) (drop : DropStaged.rel c c') (pinned : holder ∈ c.pin) : False :=
   drop.1.1 (hnl.pin_available holder pinned).2.1
@@ -131,22 +131,22 @@ theorem protected_delete_cannot_delete_live_content
   · exact delete.1.no_entry (hinv.replica_live holder replica).2.1
   · exact delete.1.no_entry (hinv.ordinary_live holder ordinary)
 
-/-- Promoting a replica leaf over content that is not available records a want
-and never a pin, whatever took the content away — a GC pass that ran before
-the promotion included.  Under `NoLoss` no pin stands over unavailable
-content, so the promoted cell carries none for this holder. -/
+/-- Promoting a replica leaf over content with no durable claim records a want
+and never a pin, whatever took the claim away — a GC pass that ran before
+the promotion included.  Under `NoLoss` no pin stands without one, so the
+promoted cell carries none for this holder. -/
 theorem replica_promote_unavailable_records_want {pinned : Bool}
     (hnl : NoLoss c) (promote : (ReplicaPromote holder pinned).rel c c')
-    (unavailable : ¬Available c) :
+    (undurable : ¬Durable c) :
     holder ∈ c'.replicaLive ∧ holder ∈ c'.want ∧ holder ∉ c'.pin := by
   simp only [transition] at promote
   obtain ⟨⟨_, _, hpinned⟩, rfl⟩ := promote
   have : pinned = false := by
     cases pinned
     · rfl
-    · exact absurd (hpinned.mp rfl) unavailable
+    · exact absurd (hpinned.mp rfl) undurable
   subst this
-  exact ⟨by simp, by simp, fun pinned => unavailable (hnl.pin_available holder pinned)⟩
+  exact ⟨by simp, by simp, fun pinned => undurable (hnl.pin_available holder pinned).durable⟩
 
 /-- A staged row is a reachable state, not a dead branch: a complete commit
 under a backend that does not make completion durable leaves a row that
@@ -154,15 +154,59 @@ under a backend that does not make completion durable leaves a row that
 theorem staged_row_is_reachable (root : Root) :
     ∃ s : State H, Reachable s ∧ (s root).row ∧ ¬(s root).durable ∧
       ∃ s', Step s s' ∧ ¬(s' root).row := by
-  let staged : Cell H := { row := True, bytes := True, fresh := True }
-  refine ⟨update Initial root staged, ?_, ?_, ?_, update (update Initial root staged) root
-    { staged with row := False, bytes := False }, ?_, ?_⟩
-  · refine .next .initial (Lift.intro ⟨.commitComplete false, not_false, ?_⟩)
-    simp [transition, system, Initial, staged]
-  · simp [staged]
-  · simp [staged]
-  · exact Lift.intro ⟨.dropStaged, ⟨by simp [staged], by simp [staged]⟩, by simp [transition]⟩
-  · simp
+  let staged : Cell H := (Trans (H := H) (.commitComplete false 1)).post {}
+  refine ⟨update Initial root staged, ?_, ?_, ?_,
+    update (update Initial root staged) root ((Trans (H := H) .dropStaged).post staged), ?_, ?_⟩
+  · refine .next .initial (Lift.intro ⟨.commitComplete false 1, ?_, rfl⟩)
+    simp [transition, system, Initial, Settles]
+  · simp [staged, transition]
+  · simp [staged, transition]
+  · refine Lift.intro ?_
+    rw [Function.update_self]
+    exact ⟨.dropStaged, by simp [staged, transition], rfl⟩
+  · simp [transition]
+
+/-! ## What a partial row is and is not -/
+
+/-- A partial row is a reachable state too: committing one group of a
+two-group object leaves a row that is neither complete nor durable. -/
+theorem partial_row_is_reachable (root : Root) :
+    ∃ s : State H, Reachable s ∧ (s root).row ∧ ¬Complete (s root) ∧ ¬(s root).durable := by
+  let part : Cell H := (Trans (H := H) (.commitGroups true (2 * groupBytes) {0})).post {}
+  have two : 1 < groupCount (2 * groupBytes) := by decide
+  have missing : 1 ∉ part.held := by
+    simp [part, transition, settleHeld]
+  refine ⟨update Initial root part, ?_, ?_, ?_, ?_⟩
+  · refine .next .initial (Lift.intro ⟨.commitGroups true (2 * groupBytes) {0}, ?_, rfl⟩)
+    simp [transition, system, Initial, Settles]
+  · simp [part, transition]
+  · rw [Function.update_self]
+    exact fun complete => missing (complete 1 two)
+  · rw [Function.update_self]
+    simp only [part, transition]
+    rintro (⟨_, complete⟩ | absurd)
+    · exact missing (complete 1 two)
+    · exact absurd
+
+/-- A pinned row's size is settled: a pin stands on a durable claim, and a
+durable size is a fact.  With `Cas.settled_size_is_stable`, no writer's claim
+ever moves the size of what anyone pins. -/
+theorem pinned_size_is_settled (reachable : Reachable s) (pinned : holder ∈ (s root).pin) :
+    Settled (s root) :=
+  Or.inl ((reachable_invariant reachable root).2.pin_available holder pinned).2.1
+
+/-- `Store::pin`'s predicate is `durable` alone, and that is enough: a pin
+stands over a complete row or a remote copy, never over a partial fetch. -/
+theorem pin_never_stands_on_partial (reachable : Reachable s) (pinned : holder ∈ (s root).pin)
+    (cold : ¬(s root).remote) : Complete (s root) :=
+  let safe := reachable_invariant reachable root
+  (safe.2.durable_backed (safe.2.pin_available holder pinned).2.1).resolve_left cold
+
+/-- A live source leaf names a complete row or a remote copy, and its size is
+settled. -/
+theorem source_live_size_is_settled (reachable : Reachable s)
+    (live : holder ∈ (s root).sourceLive) : Settled (s root) :=
+  pinned_size_is_settled reachable ((reachable_invariant reachable root).2.source_pinned holder live)
 
 end Synchronicity.SystemSafety
 

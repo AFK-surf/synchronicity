@@ -816,6 +816,40 @@ mod tests {
         assert!(store.pins_for(&held).unwrap().is_empty());
     }
 
+    /// A hold or a repair intent behind an entry the tree still names
+    /// survives the source role's removal: the leaf stands, so what it stands
+    /// on stays (`Cas.RemoveRole`). Holds nothing names go as before.
+    #[test]
+    fn removing_a_source_keeps_the_holds_behind_live_entries() {
+        let (_dir, store) = store();
+        let origin = synch_core::OriginId::named("nas", "x.example").unwrap();
+        let named = store.ingest_bytes(b"named", 0).unwrap();
+        let orphan = store.ingest_bytes(b"orphan", 0).unwrap();
+        let wanted = synch_core::Hash::new(b"wanted");
+        let holder = PinHolder::Source("media".into());
+        store
+            .put_source("media", crate::SourceKind::Api, None)
+            .unwrap();
+        store.pin(&named, &holder, 1).unwrap();
+        store.pin(&orphan, &holder, 1).unwrap();
+        store.stage_want(&wanted, &holder, 7, None, 1).unwrap();
+        for (path, root, size) in [("a.txt", named, 5u64), ("b.txt", wanted, 7)] {
+            store
+                .put_entry(
+                    &origin,
+                    "media",
+                    path,
+                    &synch_core::FileEntry::file(size, 1, root, 1),
+                )
+                .unwrap();
+        }
+
+        assert!(store.remove_source("media").unwrap());
+        assert!(!store.pins_for(&named).unwrap().is_empty());
+        assert!(store.pins_for(&orphan).unwrap().is_empty());
+        assert_eq!(store.wants_of(&holder).unwrap().len(), 1);
+    }
+
     #[test]
     fn replica_removal_preserves_exactly_the_holds_committed_before_it() {
         let (_dir, store) = store();

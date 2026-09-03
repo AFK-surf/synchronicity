@@ -669,12 +669,32 @@ impl Store {
             txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             let holder = crate::PinHolder::Source(space.to_string()).render();
+            // LEAN-MODEL: cas-remove-source-role (Cas.RemoveRole)
+            // `Cas.RemoveRole` is this pair of deletes under `Unpin`'s and
+            // `DropWant`'s own guard: a hold or a repair intent behind an
+            // entry the tree still names survives the role. The engine
+            // publishes the space's tombstones before it gets here
+            // (`Node::source_removal`), so ordinarily nothing survives; the
+            // guard is what makes that an invariant of the store rather than
+            // a convention of its callers.
             txn.conn().execute(
-                "DELETE FROM content_want WHERE holder = ?1",
-                params![holder.clone()],
+                "DELETE FROM content_want
+                  WHERE holder = ?1
+                    AND NOT EXISTS (
+                      SELECT 1 FROM entries
+                       WHERE entries.space = ?2 AND entries.content = content_want.root
+                    )",
+                params![holder.clone(), space],
             )?;
-            txn.conn()
-                .execute("DELETE FROM pins WHERE holder = ?1", params![holder])?;
+            txn.conn().execute(
+                "DELETE FROM pins
+                  WHERE holder = ?1
+                    AND NOT EXISTS (
+                      SELECT 1 FROM entries
+                       WHERE entries.space = ?2 AND entries.content = pins.root
+                    )",
+                params![holder, space],
+            )?;
             Ok(true)
         })
     }
@@ -747,12 +767,21 @@ impl Store {
                 return Ok(false);
             }
             if pin_held {
+                // Each of these is `Cas.Pin` by the operator: a replica's pin
+                // stands on a durable claim, which is all `Store::pin` asks.
                 txn.conn().execute(
                     "INSERT OR IGNORE INTO pins (root, holder, created_at, release_after)
                      SELECT root, 'operator', ?2, NULL FROM pins WHERE holder = ?1",
                     params![holder.clone(), now],
                 )?;
             }
+            // LEAN-MODEL: cas-remove-replica-role (Cas.RetireRole)
+            // `Cas.RetireRole` is this transaction: the holder ceases, so the
+            // leaves it stood behind are no longer any role's and its pins
+            // and wants go whatever the tree still names. Unlike
+            // `remove_source` this is unguarded by design — `pin_held` is the
+            // operator's choice to keep the content — and the entry rows are
+            // what keep it from collection meanwhile.
             txn.conn().execute(
                 "DELETE FROM content_want WHERE holder = ?1",
                 params![holder.clone()],

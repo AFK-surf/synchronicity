@@ -23,7 +23,9 @@ docstring or with an unused argument fails the build.
 
 Every model is an instance of `Prelude.System` — an initial state and a step
 relation — and every safety theorem is a `System.Invariant` (true initially,
-preserved by every step) read at a reachable state. Every transition is a
+preserved by every step) read at a reachable state, or a claim over a
+`System.Exec` — a state at every instant, each to the next a step — where the
+claim is temporal. Every transition is a
 `Prelude.Transition`: a guard and a successor function. Where the code has
 two outcomes, the outcome is a parameter of the transition and of its `Kind`,
 so a preservation proof is `cases k <;> simp only [transition] at h <;>
@@ -37,11 +39,12 @@ a Mathlib `Set`.
 |---|---|---|
 | `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
 | `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
-| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
-| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, and the GC/delete/staged-row corollaries |
-| `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance, `RemoveRole` and `RetireRole` among them; the row's `size` and `held` groups, `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, `pin_never_stands_on_partial`, `pinned_size_is_settled`, and the GC/delete/staged-row/partial-row corollaries |
+| `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`, `settled_size_survives_faults`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
-| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on |
+| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on; `step_cells` — every cell steps or stays along any bridge step |
+| `Publication` | the bridge read along an execution (`System.Exec`): `Standing`, a source leaf that stands from one instant to another | `publication_contract` — for as long as the tree names a source's content, its holder pins it, it is available, and its size is the one recorded when it was published; `publication_flips_head`, the birth half; `published_content_keeps_its_size`, the two read together |
 | `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
 | `ScopedSync` | `Hash`, the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
 | `TrieGraph` | the multi-root trie store under a read scope, with `Complete` read as `CompleteWithin`; every `MptGc` transition at store level, `GcSweep` as mark/sweep over held nodes and their values | `gcSweep_complete_iff` — a sweep keeps a retained root exactly as complete as it was; `step_projects` and `simulates` — `MptGc` simulates the store at every root |
@@ -71,9 +74,74 @@ leaf for another. A *staged* row (`durable = 0`) may be dropped without
 consulting pins; `staged_row_is_reachable` witnesses that the branch is live
 and `staged_row_drop_is_unpinned` why it is safe.
 
+Every guard that grants a pin — `Pin`, `TakePossession`, `SourcePublish`,
+and the pinned arm of `ReplicaPromote` — is `Durable`, which is the
+`durable != 0` predicate Rust checks and nothing more. That a pin then stands
+on *available* content is `NoLoss`'s work (`durable_backed`,
+`complete_backed`), not the guard's, so the fault-tolerant model admits what
+Rust admits: a publish or a pin over a claim the backend has already lost.
+
+Two transitions retire a role. `RemoveRole` is `remove_source`: the holder's
+pins and wants go under `Unpin`'s and `DropWant`'s guard, so a hold behind an
+entry the tree still names survives — the engine tombstones the space first,
+and the guard makes that an invariant of the store rather than a convention
+of its callers. `RetireRole` is `remove_replica`: the holder ceases, the
+leaves it stood behind are no longer any role's, and its pins and wants go
+whatever the tree names, which is the operator's choice (`pin_held` is the
+choice to keep the content under operator pins). The entry rows stay either
+way, and `Collectable.no_entry` is what keeps the content from collection.
+
 `FaultTolerant` does not model that a heal ever runs, that a want is ever
 satisfied, or that the backend's `NotFound` is true — a spurious one triggers
 a heal that errs in the safe direction, a pin becoming a want and a refetch.
+
+### The publication contract
+
+The theorems above are read at one state or across one step. `Publication`
+reads the bridged system along an execution and states what the design
+promises of a publication: `publication_contract` says that from any instant
+a source leaf stands until any later instant it still stands, the holder pins
+the content, the content is available, and the size the row records is the
+size it recorded at the first instant — whatever a peer claims, whatever the
+cache evicts, whatever a sweep or another node's promotion does in between.
+`publication_flips_head` is the birth: the step that stood the leaf committed
+an active, materialized head. It is composed, not proved afresh, from
+`Bridge.source_leaf_flips_head`, the fault-free invariant, and
+`Cas.settled_size_is_stable` chained instant to instant; `Node::publish`
+carries the anchor. Under faults the leaf keeps a durable claim or a want and
+the row its size (`FaultTolerant.settled_size_survives_faults`); what a loss
+takes is availability, until the heal and the refetch.
+
+### Partial rows and the size a row records
+
+A row need not be complete. A cell carries the `size` its row records and
+the set of groups it `held`, and `Complete` reads the row as
+`cas.rs::read_claim` does: every group of the row's own size. Every writer of
+verified groups — a peer slice, a delta proof, a promotion, a cloud cache
+refill — is one `CommitGroups`, and an ingest is `CommitComplete`, the same
+commit of every group at once, which is why `Store::commit_complete` calls
+`commit_groups` over the full range rather than writing the row itself.
+
+Until the final group is held the size is a claim off an entry rather than a
+fact (`Attested` is `size_is_attested`), and `Settles` is `settle_size` as the
+guard on every commit: a durable or attested size must agree, an unsettled one
+yields, and `settleHeld` keeps the bits already held only when the group count
+did not move. Two theorems say what that buys. `settled_size_is_stable`: no
+step of the model leaves a row standing under a different size once its size
+is durable or attested — the refusal in `settle_size` — and
+`settled_size_survives_faults` extends it to the losses and heals.
+`dropped_bit_was_a_claim`: a bit a commit drops was verified under a size that
+was neither durable nor attested, so what the reset costs is a re-fetch of a
+claim, never a fact (`docs/DELTA-SYNC.md` §6). `Invariant.held_within_size`
+is the invariant the reset keeps — the bitmap always describes the tree of
+the size the row records — and `NoLoss.durable_backed` with
+`SystemSafety.pin_never_stands_on_partial` is `Store::pin`'s comment as a
+theorem: a pin stands over a complete row or a remote copy, never over a
+partial fetch. `partial_row_is_reachable` witnesses that the branch is live.
+
+Not modelled: what the groups contain. A group is verified or it is not; the
+bao tree, the bracket argument for why a proof can verify under an overstated
+size, and the inline representation of small objects are trusted.
 
 ## mptsync over partial tries
 
