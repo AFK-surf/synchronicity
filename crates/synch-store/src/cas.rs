@@ -101,6 +101,33 @@ impl Txn<'_> {
         )?;
         Ok(())
     }
+
+    /// Returns the durable size of `root` when this node's materialized view
+    /// still has a configured source entry naming it. Publication reads this
+    /// after applying a proposed trie diff so an independently staged `b:`
+    /// change cannot withdraw or weaken the ad behind a live source.
+    pub fn live_source_blob_size(
+        &self,
+        origin: &synch_core::OriginId,
+        root: &Hash,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT b.size
+                   FROM entries e
+                   JOIN sources s ON s.space = e.space
+                   JOIN blobs b ON b.root = e.content
+                  WHERE e.origin_id = ?1
+                    AND e.content = ?2
+                    AND e.size = b.size
+                    AND b.durable != 0
+                  LIMIT 1",
+                params![origin.canonical(), root.as_bytes().to_vec()],
+                |row| Ok(row.get::<_, i64>(0)? as u64),
+            )
+            .optional()?)
+    }
 }
 
 /// The bao block size synchronicity uses everywhere: 16 KiB chunk groups.

@@ -8,8 +8,9 @@ use std::{
 use iroh::EndpointAddr;
 use iroh_base::SecretKey;
 use synch_core::{
-    blob_key, file_key, manifest_key, now_ns, parse_file_key, validate_space, BlobAd, Delegation,
-    EntryKind, Hash, NodeId, NodeManifest, OriginId, SignedHead, SpaceInfo, SOFTWARE,
+    blob_key, file_key, manifest_key, now_ns, parse_blob_key, parse_file_key, validate_space,
+    BlobAd, Delegation, EntryKind, Hash, NodeId, NodeManifest, OriginId, SignedHead, SpaceInfo,
+    SOFTWARE,
 };
 use synch_mpt::Trie;
 use synch_net::Net;
@@ -1501,8 +1502,8 @@ impl Node {
 
         let head = self
             .store()
-            // LEAN-MODEL: cas-source-publish (Bridge.ViewTxn)
-            // `Bridge.ViewTxn` composes every source/view micro-step with the
+            // LEAN-MODEL: cas-source-publish (Bridge.PublishTxn)
+            // `Bridge.PublishTxn` composes every source/view micro-step with the
             // trie transition below: durable check, pins, entries, removals and
             // the head flip share one commit.
             // LEAN-MODEL: mpt-own-publish (MptGc.OwnPublish)
@@ -1519,6 +1520,10 @@ impl Node {
                 let mut root = old_root;
                 let mut changed_spaces = std::collections::HashSet::new();
                 let mut source_ads = std::collections::HashMap::new();
+                let staged_blob_roots: std::collections::HashSet<_> = staged
+                    .iter()
+                    .filter_map(|(key, _)| parse_blob_key(key).ok())
+                    .collect();
                 for (key, value) in staged {
                     if let Ok((space, _path)) = parse_file_key(key) {
                         changed_spaces.insert(space.to_string());
@@ -1552,6 +1557,23 @@ impl Node {
                     let ad = synch_core::record::encode(&BlobAd::complete(size))?;
                     root = trie.insert(root, &blob_key(&content), &ad)?;
                 }
+
+                // Materialize the proposed root before signing it so the
+                // source check below reads the final file-entry view. A `b:`
+                // update is independently staged by cache reconciliation, but
+                // it may not withdraw or weaken the complete advertisement of
+                // content a live source entry still names.
+                let proposed_root = root;
+                txn.materialize_diff(&origin, old_root, proposed_root)?;
+                for content in staged_blob_roots {
+                    if let Some(size) = txn.live_source_blob_size(&origin, &content)? {
+                        let ad = synch_core::record::encode(&BlobAd::complete(size))?;
+                        root = trie.insert(root, &blob_key(&content), &ad)?;
+                    }
+                }
+                if root != proposed_root {
+                    txn.materialize_diff(&origin, proposed_root, root)?;
+                }
                 if root == old_root {
                     return Ok(None);
                 }
@@ -1566,7 +1588,6 @@ impl Node {
                 // it is pointing at, and the head being displaced recorded its
                 // own when it took the slot (§10, v11).
                 txn.put_head(Slot::Complete, &head, now, now)?;
-                txn.materialize_diff(&origin, old_root, root)?;
                 for space in changed_spaces {
                     txn.reconcile_source_holds(&origin, &space)?;
                 }
@@ -2639,6 +2660,15 @@ mod tests {
         assert!(node.store().pins().unwrap().iter().any(|pin| {
             pin.root == root && pin.holder == synch_store::PinHolder::Source("media".into())
         }));
+
+        // `b:` updates are staged independently by cache reconciliation. A
+        // caller cannot use one to withdraw the complete ad while the source
+        // file entry — and its durable hold — still stand.
+        assert!(node.publish(&[(blob_key(&root), None)]).unwrap().is_none());
+        assert_eq!(
+            node.published_ad(&root).unwrap(),
+            Some(BlobAd::complete(13))
+        );
         node.shutdown().await.unwrap();
     }
 }

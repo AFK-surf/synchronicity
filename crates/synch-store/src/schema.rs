@@ -95,7 +95,28 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V25_ENTRIES_BY_SPACE_CONTENT),
     Migration::Sql(V26_REDACTIONS_BY_POSITION),
     Migration::Sql(V27_TRIE_NODE_PROVENANCE),
+    Migration::Rust {
+        name: "empty verified ranges as null",
+        run: v28_empty_ranges_as_null,
+    },
 ];
+
+/// v28 — `NULL` is the one spelling of an empty partial-cache bitmap.
+///
+/// Older `commit_groups(empty)` calls encoded an empty ranges vector as a
+/// non-NULL blob. Readers already interpreted that value as holding no groups,
+/// but the remote-loss heal deliberately uses `bitmap IS NULL` to decide that
+/// no partial cache is worth retaining. Canonicalizing the exact old encoding
+/// makes that SQL decision agree with the reader and with future writes without
+/// decoding every partial row during upgrade.
+fn v28_empty_ranges_as_null(tx: &Transaction<'_>) -> Result<()> {
+    let empty = crate::cas::ranges_to_blob(&synch_core::ChunkRanges::empty());
+    tx.execute(
+        "UPDATE blobs SET bitmap = NULL WHERE complete = 0 AND bitmap = ?1",
+        rusqlite::params![empty],
+    )?;
+    Ok(())
+}
 
 /// v27 — which origin's trie a node was served as part of (§5.5).
 ///

@@ -1,3 +1,4 @@
+import Mathlib.Data.Set.Finite.Basic
 import Synchronicity.SystemSafety
 import Synchronicity.MptGc
 
@@ -30,26 +31,48 @@ structure State (H : Type) where
 
 variable [Roles H]
 
-/-- The CAS operations which the Rust view transaction can compose.  Unlike
-`Across (Trans k).rel`, this lets one transaction remove the old root and add
-the new root, and lets different roots take different transition kinds.  The
-content-writing transitions are deliberately absent: materialization does not
-change an object's recorded size. -/
-def ViewCellStep (c c' : Cell H) : Prop :=
+/-- The CAS operations which own publication can compose: materializing both
+source and replica roles, then reconciling source holds.  Content-writing and
+independent maintenance transitions are deliberately absent. -/
+def PublishCellStep (c c' : Cell H) : Prop :=
   ∃ k : Kind H,
     (match k with
       | .sourcePublish _ _ | .replicaPromote _ _ | .ordinaryPromote _
       | .removeSource _ | .removeReplica _ | .removeOrdinary _ | .dropEntry
-      | .pin _ | .unpin _ | .expirePin _ | .dropWant _ | .takePossession _ => True
+      | .unpin _ | .dropWant _ => True
       | _ => False) ∧
     (Trans k).rel c c'
 
-/-- One cell's finite sequence inside an atomic Rust view transaction. -/
-def ViewCellTxn : Cell H → Cell H → Prop := Relation.ReflTransGen ViewCellStep
+/-- Remote promotion materializes replica or metadata-only roles.  It cannot
+stand a source leaf: Rust's `try_promote` never calls `hold_source_blob`. -/
+def PromotionCellStep (c c' : Cell H) : Prop :=
+  ∃ k : Kind H,
+    (match k with
+      | .replicaPromote _ _ | .ordinaryPromote _
+      | .removeReplica _ | .removeOrdinary _ | .dropEntry => True
+      | _ => False) ∧
+    (Trans k).rel c c'
 
-/-- The whole-store CAS half of publication and promotion. -/
-@[rust_impl "cas-source-publish" "cas-remote-promotion" "cas-ordinary-promotion"]
-def ViewTxn (s s' : Cas.State H) : Prop := Across ViewCellTxn s s'
+/-- One cell's finite sequence inside an atomic own-publication transaction. -/
+def PublishCellTxn : Cell H → Cell H → Prop := Relation.ReflTransGen PublishCellStep
+
+/-- One cell's finite sequence inside an atomic remote-promotion transaction. -/
+def PromotionCellTxn : Cell H → Cell H → Prop := Relation.ReflTransGen PromotionCellStep
+
+/-- Either transaction trace, used when projecting a bridge step to one cell. -/
+def ViewCellTxn (c c' : Cell H) : Prop := PublishCellTxn c c' ∨ PromotionCellTxn c c'
+
+/-- The whole-store CAS half of own publication.  Only finitely many content
+roots change, as the Rust transaction walks one finite trie diff. -/
+@[rust_impl "cas-source-publish"]
+def PublishTxn (s s' : Cas.State H) : Prop :=
+  Across PublishCellTxn s s' ∧ ({root | s' root ≠ s root} : Set Root).Finite
+
+/-- The whole-store CAS half of remote promotion, separately typed so it
+cannot stand source leaves. -/
+@[rust_impl "cas-remote-promotion" "cas-ordinary-promotion"]
+def PromotionTxn (s s' : Cas.State H) : Prop :=
+  Across PromotionCellTxn s s' ∧ ({root | s' root ≠ s root} : Set Root).Finite
 
 /-- Both halves keep their own invariant. -/
 def Invariant (s : State H) : Prop :=
@@ -64,11 +87,11 @@ inductive Step : State H → State H → Prop where
   | mpt {s : State H} {mpt' : MptGc.State} :
       MptGc.SyncStep s.mpt mpt' → Step s { s with mpt := mpt' }
   | ownPublish {s : State H} {cas' : Cas.State H} {mpt' : MptGc.State} :
-      ViewTxn s.cas cas' →
+      PublishTxn s.cas cas' →
       MptGc.OwnPublish.rel s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
   | promote {s : State H} {cas' : Cas.State H} {mpt' : MptGc.State} :
-      ViewTxn s.cas cas' →
+      PromotionTxn s.cas cas' →
       MptGc.Promote.rel s.mpt mpt' →
       Step s ⟨cas', mpt'⟩
 
@@ -78,21 +101,37 @@ def system (H : Type) [Roles H] : System (State H) := ⟨{}, Step⟩
 /-- The states the bridge reaches. -/
 abbrev Reachable (s : State H) : Prop := (system H).Reachable s
 
-theorem viewCellStep_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
-    (h : ViewCellStep c c') : SystemSafety.Safe c' :=
+theorem publishCellStep_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
+    (h : PublishCellStep c c') : SystemSafety.Safe c' :=
   let ⟨k, _, step⟩ := h
   SystemSafety.safe_step hinv ⟨k, step⟩
 
-theorem viewCellTxn_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
-    (h : ViewCellTxn c c') : SystemSafety.Safe c' := by
+theorem promotionCellStep_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
+    (h : PromotionCellStep c c') : SystemSafety.Safe c' :=
+  let ⟨k, _, step⟩ := h
+  SystemSafety.safe_step hinv ⟨k, step⟩
+
+theorem publishCellTxn_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
+    (h : PublishCellTxn c c') : SystemSafety.Safe c' := by
   induction h with
   | refl => exact hinv
-  | tail _ step ih => exact viewCellStep_safe ih step
+  | tail _ step ih => exact publishCellStep_safe ih step
 
-theorem viewTxn_safe {s s' : Cas.State H}
-    (hinv : SystemSafety.SystemInvariant s) (h : ViewTxn s s') :
+theorem promotionCellTxn_safe {c c' : Cell H} (hinv : SystemSafety.Safe c)
+    (h : PromotionCellTxn c c') : SystemSafety.Safe c' := by
+  induction h with
+  | refl => exact hinv
+  | tail _ step ih => exact promotionCellStep_safe ih step
+
+theorem publishTxn_safe {s s' : Cas.State H}
+    (hinv : SystemSafety.SystemInvariant s) (h : PublishTxn s s') :
     SystemSafety.SystemInvariant s' :=
-  Across.forall viewCellTxn_safe hinv h
+  Across.forall publishCellTxn_safe hinv h.1
+
+theorem promotionTxn_safe {s s' : Cas.State H}
+    (hinv : SystemSafety.SystemInvariant s) (h : PromotionTxn s s') :
+    SystemSafety.SystemInvariant s' :=
+  Across.forall promotionCellTxn_safe hinv h.1
 
 theorem invariant_step {s s' : State H} (hinv : Invariant s) (hstep : Step s s') :
     Invariant s' := by
@@ -101,10 +140,10 @@ theorem invariant_step {s s' : State H} (hinv : Invariant s) (hstep : Step s s')
   | cas step => exact ⟨SystemSafety.invariant.step casInv (step.mono LocalStep.step), mptInv⟩
   | mpt step => exact ⟨casInv, MptGc.invariant_step mptInv step.step⟩
   | ownPublish casStep mptStep =>
-      exact ⟨viewTxn_safe casInv casStep,
+      exact ⟨publishTxn_safe casInv casStep,
         MptGc.invariant_step mptInv ⟨.ownPublish, mptStep⟩⟩
   | promote casStep mptStep =>
-      exact ⟨viewTxn_safe casInv casStep,
+      exact ⟨promotionTxn_safe casInv casStep,
         MptGc.invariant_step mptInv ⟨.promote, mptStep⟩⟩
 
 theorem invariant : (system H).Invariant Invariant where
@@ -122,17 +161,45 @@ theorem gc_cannot_create_promised_missing
     (reachable : Reachable s) (pinned : holder ∈ (s.cas root).pin) : Available (s.cas root) :=
   ((reachable_invariant reachable).1 root).2.pin_available holder pinned
 
-/-- Every view-materialization micro-step preserves the CAS row's recorded
-size, hence so does the finite per-cell sequence committed atomically. -/
-theorem viewCellStep_size {c c' : Cell H} (h : ViewCellStep c c') : c'.size = c.size := by
+/-- Every own-publication micro-step preserves the CAS row's recorded size. -/
+theorem publishCellStep_size {c c' : Cell H} (h : PublishCellStep c c') : c'.size = c.size := by
   obtain ⟨k, allowed, step⟩ := h
   cases k <;> simp at allowed <;> simp only [transition] at step <;>
     obtain ⟨_, rfl⟩ := step <;> rfl
 
-theorem viewCellTxn_size {c c' : Cell H} (h : ViewCellTxn c c') : c'.size = c.size := by
+/-- Every remote-promotion micro-step preserves the CAS row's recorded size. -/
+theorem promotionCellStep_size {c c' : Cell H} (h : PromotionCellStep c c') :
+    c'.size = c.size := by
+  obtain ⟨k, allowed, step⟩ := h
+  cases k <;> simp at allowed <;> simp only [transition] at step <;>
+    obtain ⟨_, rfl⟩ := step <;> rfl
+
+theorem publishCellTxn_size {c c' : Cell H} (h : PublishCellTxn c c') : c'.size = c.size := by
   induction h with
   | refl => rfl
-  | tail _ step ih => exact (viewCellStep_size step).trans ih
+  | tail _ step ih => exact (publishCellStep_size step).trans ih
+
+theorem promotionCellTxn_size {c c' : Cell H} (h : PromotionCellTxn c c') :
+    c'.size = c.size := by
+  induction h with
+  | refl => rfl
+  | tail _ step ih => exact (promotionCellStep_size step).trans ih
+
+theorem viewCellTxn_size {c c' : Cell H} (h : ViewCellTxn c c') : c'.size = c.size :=
+  h.elim publishCellTxn_size promotionCellTxn_size
+
+/-- A remote-promotion micro-step cannot change which source leaves stand. -/
+theorem promotionCellStep_sourceLive {c c' : Cell H} (h : PromotionCellStep c c') :
+    c'.sourceLive = c.sourceLive := by
+  obtain ⟨k, allowed, step⟩ := h
+  cases k <;> simp at allowed <;> simp only [transition] at step <;>
+    obtain ⟨_, rfl⟩ := step <;> rfl
+
+theorem promotionCellTxn_sourceLive {c c' : Cell H} (h : PromotionCellTxn c c') :
+    c'.sourceLive = c.sourceLive := by
+  induction h with
+  | refl => rfl
+  | tail _ step ih => exact (promotionCellStep_sourceLive step).trans ih
 
 /-! ## Why the pairing is a guard and not a convention -/
 
@@ -160,11 +227,11 @@ theorem live_leaf_flips_head {s' : State H} (hstep : Step s s')
   | promote _ mptStep =>
     exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
 
-/-- The same for a source leaf on its own, without asking about the holder's
-replica leaf: only a publication stands one. -/
-theorem source_leaf_flips_head {s' : State H} (hstep : Step s s')
+/-- A step that stands a new source leaf is specifically an own-publication
+step, never a remote promotion or a free CAS/trie step. -/
+theorem source_leaf_is_own_publish {s' : State H} (hstep : Step s s')
     (new : holder ∈ (s'.cas root).sourceLive) (old : holder ∉ (s.cas root).sourceLive) :
-    s'.mpt.active ∧ s'.mpt.materialized := by
+    MptGc.OwnPublish.rel s.mpt s'.mpt := by
   cases hstep with
   | @cas cas' step =>
     exfalso
@@ -177,10 +244,22 @@ theorem source_leaf_flips_head {s' : State H} (hstep : Step s s')
     · rw [same] at new
       exact old new
   | mpt _ => exact absurd new old
-  | ownPublish _ mptStep =>
-    exact ⟨(MptGc.own_publish_is_atomic mptStep).1, (MptGc.own_publish_is_atomic mptStep).2.2.2⟩
-  | promote _ mptStep =>
-    exact ⟨(MptGc.promotion_is_atomic mptStep).1, (MptGc.promotion_is_atomic mptStep).2.2.2⟩
+  | ownPublish _ mptStep => exact mptStep
+  | @promote cas' _ casStep _ =>
+    exfalso
+    change holder ∈ (cas' root).sourceLive at new
+    rcases casStep.1 root with path | same
+    · rw [promotionCellTxn_sourceLive path] at new
+      exact old new
+    · rw [same] at new
+      exact old new
+
+/-- The same source-leaf classification read as the atomic head property. -/
+theorem source_leaf_flips_head {s' : State H} (hstep : Step s s')
+    (new : holder ∈ (s'.cas root).sourceLive) (old : holder ∉ (s.cas root).sourceLive) :
+    s'.mpt.active ∧ s'.mpt.materialized :=
+  let publish := source_leaf_is_own_publish hstep new old
+  ⟨(MptGc.own_publish_is_atomic publish).1, (MptGc.own_publish_is_atomic publish).2.2.2⟩
 
 /-- Along any step of the bridge every content cell either takes a free cell
 transition, follows a finite view-transaction trace, or stays unchanged. -/
@@ -190,8 +269,14 @@ theorem step_cells {s s' : State H} (h : Step s s') (root : Root) :
   cases h with
   | cas step => exact (step.across root).imp_left LocalStep.step |>.imp_right Or.inr
   | mpt _ => exact Or.inr (Or.inr rfl)
-  | ownPublish step _ => exact Or.inr (step root)
-  | promote step _ => exact Or.inr (step root)
+  | ownPublish step _ =>
+    rcases step.1 root with path | same
+    · exact Or.inr (Or.inl (Or.inl path))
+    · exact Or.inr (Or.inr same)
+  | promote step _ =>
+    rcases step.1 root with path | same
+    · exact Or.inr (Or.inl (Or.inr path))
+    · exact Or.inr (Or.inr same)
 
 end Synchronicity.Bridge
 

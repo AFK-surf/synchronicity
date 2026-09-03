@@ -598,9 +598,9 @@ impl Syncer {
         // LEAN-MODEL: mpt-promote (MptGc.Promote)
         // `Safety` pairs `MptGc.Promote` with content materialization: the
         // completeness check, slot flip and derived views share this commit.
-        // LEAN-MODEL: cas-remote-promotion (Bridge.ViewTxn)
-        // LEAN-MODEL: cas-ordinary-promotion (Bridge.ViewTxn)
-        // `Bridge.ViewTxn` composes the entry removals/additions and each
+        // LEAN-MODEL: cas-remote-promotion (Bridge.PromotionTxn)
+        // LEAN-MODEL: cas-ordinary-promotion (Bridge.PromotionTxn)
+        // `Bridge.PromotionTxn` composes the entry removals/additions and each
         // pin-or-want decision made by `materialize_diff` below.
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
