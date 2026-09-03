@@ -8,9 +8,8 @@ use std::{
 use iroh::EndpointAddr;
 use iroh_base::SecretKey;
 use synch_core::{
-    blob_key, file_key, manifest_key, now_ns, parse_blob_key, parse_file_key, validate_space,
-    BlobAd, Delegation, EntryKind, Hash, NodeId, NodeManifest, OriginId, SignedHead, SpaceInfo,
-    SOFTWARE,
+    blob_key, file_key, manifest_key, now_ns, parse_file_key, validate_space, BlobAd, Delegation,
+    EntryKind, Hash, NodeId, NodeManifest, OriginId, SignedHead, SpaceInfo, SOFTWARE,
 };
 use synch_mpt::Trie;
 use synch_net::Net;
@@ -42,8 +41,94 @@ fn self_binding(origin: &OriginId, node_id: NodeId, now: i64) -> Binding {
     }
 }
 
-/// A staged trie change: a key, and its new value or `None` to remove it.
-pub(crate) type StagedChange = (Vec<u8>, Option<Vec<u8>>);
+/// One intent waiting for this node's next publication.
+///
+/// Ordinary records carry their desired trie value. Blob advertisements are
+/// publisher-owned: their intents carry a root and a refresh or withdrawal,
+/// and the publication transaction derives every positive `b:` value from the
+/// CAS state it is about to commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedChange(StagedChangeKind);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StagedChangeKind {
+    Record {
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    Blob {
+        root: Hash,
+        intent: BlobIntent,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobIntent {
+    Refresh,
+    Withdraw,
+}
+
+impl StagedChange {
+    /// Stages an ordinary trie record insertion, replacement, or removal.
+    ///
+    /// The `b:` namespace uses the lifecycle-intent constructors
+    /// [`Self::refresh_blob`] and [`Self::withdraw_blob`].
+    pub fn record(key: Vec<u8>, value: Option<Vec<u8>>) -> Result<Self> {
+        if key.starts_with(&[synch_core::record::PREFIX_BLOB, b':']) {
+            return Err(EngineError::invalid(
+                "the b: namespace is publisher-owned; use a blob lifecycle intent",
+            ));
+        }
+        Ok(Self(StagedChangeKind::Record { key, value }))
+    }
+
+    /// Requests that publication derive this object's `b:` record from the
+    /// final source view and local CAS state.
+    pub fn refresh_blob(root: Hash) -> Self {
+        Self(StagedChangeKind::Blob {
+            root,
+            intent: BlobIntent::Refresh,
+        })
+    }
+
+    /// Requests removal of this object's `b:` record. A final live source
+    /// reference still wins and derives its required complete advertisement.
+    pub fn withdraw_blob(root: Hash) -> Self {
+        Self(StagedChangeKind::Blob {
+            root,
+            intent: BlobIntent::Withdraw,
+        })
+    }
+
+    pub(crate) fn key(&self) -> Vec<u8> {
+        match &self.0 {
+            StagedChangeKind::Record { key, .. } => key.clone(),
+            StagedChangeKind::Blob { root, .. } => blob_key(root),
+        }
+    }
+
+    pub(crate) fn as_record(&self) -> Option<(&[u8], Option<&[u8]>)> {
+        match &self.0 {
+            StagedChangeKind::Record { key, value } => Some((key.as_slice(), value.as_deref())),
+            StagedChangeKind::Blob { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blob_refresh(&self) -> Option<Hash> {
+        match &self.0 {
+            StagedChangeKind::Blob {
+                root,
+                intent: BlobIntent::Refresh,
+            } => Some(*root),
+            StagedChangeKind::Blob {
+                intent: BlobIntent::Withdraw,
+                ..
+            } => None,
+            StagedChangeKind::Record { .. } => None,
+        }
+    }
+}
 
 /// A running node.
 ///
@@ -1153,7 +1238,7 @@ impl Node {
             ));
         }
         let bytes = synch_core::record::encode(&delegation)?;
-        Ok((synch_core::delegation_key(&subject), Some(bytes)))
+        StagedChange::record(synch_core::delegation_key(&subject), Some(bytes))
     }
 
     /// Withdraws a delegation this node issued (§3.5).
@@ -1172,7 +1257,7 @@ impl Node {
                 subject.fmt_short()
             )));
         }
-        Ok((key, None))
+        StagedChange::record(key, None)
     }
 
     /// Every delegation this node currently honors, whoever issued it.
@@ -1349,7 +1434,7 @@ impl Node {
         let trie = Trie::new(self.store().as_ref());
         let prefix = synch_core::space_prefix(id)?;
         for (key, _) in trie.scan(root, &prefix, None, None)? {
-            staged.push((key, None));
+            staged.push(StagedChange::record(key, None)?);
         }
         staged.push(self.space_info_removal(id)?);
         Ok(staged)
@@ -1480,7 +1565,11 @@ impl Node {
         Ok(self.store().next_own_seq(self.origin())?)
     }
 
-    /// Applies staged changes as one new signed root (§7.1).
+    /// Applies staged publication intents as one new signed root (§7.1).
+    ///
+    /// Ordinary records carry a value. Blob-advertisement intents carry a root
+    /// and operation; this transaction derives every positive `b:` value from
+    /// its final source view and CAS snapshot.
     ///
     /// One save in an editor costs one head; a 100k-file initial index costs a
     /// handful, because the batch becomes a single root.
@@ -1499,6 +1588,7 @@ impl Node {
         let secret = self.secret();
         let origin = self.origin().clone();
         let now = now_ns();
+        let remote_upload_parts = self.cas_backend().remote_upload_parts();
 
         let head = self
             .store()
@@ -1519,12 +1609,18 @@ impl Node {
                 let trie = Trie::new(txn);
                 let mut root = old_root;
                 let mut changed_spaces = std::collections::HashSet::new();
-                let mut source_ads = std::collections::HashMap::new();
-                let staged_blob_roots: std::collections::HashSet<_> = staged
-                    .iter()
-                    .filter_map(|(key, _)| parse_blob_key(key).ok())
-                    .collect();
-                for (key, value) in staged {
+                let mut source_roots = std::collections::HashSet::new();
+                let mut blob_changes = std::collections::HashMap::new();
+                for change in staged {
+                    let (key, value) = match &change.0 {
+                        StagedChangeKind::Record { key, value } => {
+                            (key.as_slice(), value.as_deref())
+                        }
+                        StagedChangeKind::Blob { root, intent } => {
+                            blob_changes.insert(*root, *intent);
+                            continue;
+                        }
+                    };
                     if let Ok((space, _path)) = parse_file_key(key) {
                         changed_spaces.insert(space.to_string());
                         if let Some(bytes) = value {
@@ -1536,7 +1632,7 @@ impl Node {
                                     ))
                                 })?;
                                 txn.hold_source_blob(&space, &content, entry.size, now)?;
-                                source_ads.insert(content, entry.size);
+                                source_roots.insert(content);
                             }
                         }
                     }
@@ -1553,23 +1649,39 @@ impl Node {
                 // promises along every execution: for as long as the tree
                 // names the content, its holder pins it, it is available, and
                 // its size is the file-entry/BlobAd size recorded here.
-                for (content, size) in source_ads {
-                    let ad = synch_core::record::encode(&BlobAd::complete(size))?;
-                    root = trie.insert(root, &blob_key(&content), &ad)?;
-                }
-
-                // Materialize the proposed root before signing it so the
-                // source check below reads the final file-entry view. A `b:`
-                // update is independently staged by cache reconciliation, but
-                // it may not withdraw or weaken the complete advertisement of
-                // content a live source entry still names.
+                // Materialize before deriving ads so they read the final
+                // file-entry view. Source entries determine their ads without
+                // asking the scanner to stage a second record for the same
+                // root. Each blob intent carries a root and a refresh/withdraw
+                // operation; publication chooses a complete source ad, the
+                // current cache ad, or removal from this snapshot.
                 let proposed_root = root;
                 txn.materialize_diff(&origin, old_root, proposed_root)?;
-                for content in staged_blob_roots {
+                for space in changed_spaces {
+                    txn.reconcile_source_holds(&origin, &space)?;
+                }
+                for content in source_roots {
                     if let Some(size) = txn.live_source_blob_size(&origin, &content)? {
                         let ad = synch_core::record::encode(&BlobAd::complete(size))?;
                         root = trie.insert(root, &blob_key(&content), &ad)?;
                     }
+                }
+                for (content, intent) in blob_changes {
+                    let ad = match txn.live_source_blob_size(&origin, &content)? {
+                        Some(size) => Some(BlobAd::complete(size)),
+                        None if intent == BlobIntent::Withdraw => None,
+                        None => txn.blob(&content)?.and_then(|row| {
+                            (!remote_upload_parts || !row.complete || row.durable)
+                                .then(|| row.to_ad())
+                        }),
+                    };
+                    root = match ad {
+                        Some(ad) => {
+                            let bytes = synch_core::record::encode(&ad)?;
+                            trie.insert(root, &blob_key(&content), &bytes)?
+                        }
+                        None => trie.remove(root, &blob_key(&content))?,
+                    };
                 }
                 if root != proposed_root {
                     txn.materialize_diff(&origin, proposed_root, root)?;
@@ -1588,9 +1700,6 @@ impl Node {
                 // it is pointing at, and the head being displaced recorded its
                 // own when it took the slot (§10, v11).
                 txn.put_head(Slot::Complete, &head, now, now)?;
-                for space in changed_spaces {
-                    txn.reconcile_source_holds(&origin, &space)?;
-                }
                 Ok(Some(head))
             })?;
 
@@ -1622,7 +1731,7 @@ impl Node {
             software: SOFTWARE.to_string(),
         };
         let bytes = synch_core::record::encode(&manifest)?;
-        Ok((manifest_key(), Some(bytes)))
+        StagedChange::record(manifest_key(), Some(bytes))
     }
 
     /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §5.5).
@@ -1638,14 +1747,17 @@ impl Node {
                 entry_count,
             };
             let bytes = synch_core::record::encode(&info)?;
-            out.push((synch_core::space_info_key(&source.space)?, Some(bytes)));
+            out.push(StagedChange::record(
+                synch_core::space_info_key(&source.space)?,
+                Some(bytes),
+            )?);
         }
         Ok(out)
     }
 
     /// The tombstone that removes one space's advertised record.
     pub(crate) fn space_info_removal(&self, space: &str) -> Result<StagedChange> {
-        Ok((synch_core::space_info_key(space)?, None))
+        StagedChange::record(synch_core::space_info_key(space)?, None)
     }
 
     /// Reads what an origin publishes about one space (§4.2, §5.5).
@@ -1684,26 +1796,14 @@ impl Node {
 
     // ---- blob advertisements ---------------------------------------------
 
-    /// The `b:` record for a locally held object, if we hold any of it.
-    pub(crate) fn ad_change(&self, root: &Hash) -> Result<Option<StagedChange>> {
-        if self.cas_backend().remote_upload_parts()
-            && self
-                .store()
-                .blob(root)?
-                .is_some_and(|row| row.complete && !row.durable)
-        {
-            // A complete cloud ad survives in a signed head, so recovery must
-            // be able to treat it as a durability promise. Cache-only objects
-            // may advertise partial progress, but completion under `own` /
-            // `own+pinned` retires that transient ad instead of making an
-            // ambiguous promise the next SQLite restore cannot interpret.
-            return Ok(Some((blob_key(root), None)));
-        }
-        let Some(ad) = self.store().local_ad(root)? else {
-            return Ok(None);
-        };
-        let bytes = synch_core::record::encode(&ad)?;
-        Ok(Some((blob_key(root), Some(bytes))))
+    /// The ad policy used only to decide whether a refresh is needed. The
+    /// publication transaction reads the row again before deriving the value,
+    /// so this observation is never itself published.
+    pub(crate) fn publishable_local_ad(&self, root: &Hash) -> Result<Option<BlobAd>> {
+        Ok(self.store().blob(root)?.and_then(|row| {
+            (!self.cas_backend().remote_upload_parts() || !row.complete || row.durable)
+                .then(|| row.to_ad())
+        }))
     }
 
     /// Records what a checkout pass believes about the file at `target`, and
@@ -2557,10 +2657,11 @@ mod tests {
             .unwrap();
 
         // A well-formed `f:` key whose value no `FileEntry` decodes from.
-        let poison = vec![(
+        let poison = vec![StagedChange::record(
             file_key("media", "poisoned").unwrap(),
             Some(vec![0xffu8; 8]),
-        )];
+        )
+        .unwrap()];
         let err = node.publish(&poison).unwrap_err().to_string();
         assert!(err.contains("record:"), "{err}");
 
@@ -2623,10 +2724,11 @@ mod tests {
         node.add_api_source("media").unwrap();
         let absent = Hash::new(b"not in the cas");
         let entry = synch_core::FileEntry::file(14, now_ns(), absent, 1);
-        let staged = vec![(
+        let staged = vec![StagedChange::record(
             file_key("media", "a.txt").unwrap(),
             Some(synch_core::record::encode(&entry).unwrap()),
-        )];
+        )
+        .unwrap()];
         let error = node.publish(&staged).unwrap_err().to_string();
         assert!(
             error.contains("complete durable content is not present"),
@@ -2639,19 +2741,21 @@ mod tests {
             .ingest_bytes(b"durable bytes", now_ns())
             .unwrap();
         let wrong = synch_core::FileEntry::file(14, now_ns(), root, 1);
-        let staged = vec![(
+        let staged = vec![StagedChange::record(
             file_key("media", "a.txt").unwrap(),
             Some(synch_core::record::encode(&wrong).unwrap()),
-        )];
+        )
+        .unwrap()];
         let error = node.publish(&staged).unwrap_err().to_string();
         assert!(error.contains("durable storage records 13"), "{error}");
         assert!(node.own_head().unwrap().is_none());
 
         let entry = synch_core::FileEntry::file(13, now_ns(), root, 1);
-        let staged = vec![(
+        let staged = vec![StagedChange::record(
             file_key("media", "a.txt").unwrap(),
             Some(synch_core::record::encode(&entry).unwrap()),
-        )];
+        )
+        .unwrap()];
         node.publish(&staged).unwrap();
         assert_eq!(
             node.published_ad(&root).unwrap(),
@@ -2661,14 +2765,34 @@ mod tests {
             pin.root == root && pin.holder == synch_store::PinHolder::Source("media".into())
         }));
 
-        // `b:` updates are staged independently by cache reconciliation. A
-        // caller cannot use one to withdraw the complete ad while the source
-        // file entry — and its durable hold — still stand.
-        assert!(node.publish(&[(blob_key(&root), None)]).unwrap().is_none());
+        // A derived refresh preserves the complete ad required by the live
+        // source and its durable hold.
+        assert!(node
+            .publish(&[StagedChange::refresh_blob(root)])
+            .unwrap()
+            .is_none());
         assert_eq!(
             node.published_ad(&root).unwrap(),
             Some(BlobAd::complete(13))
         );
+
+        // Removing the last source reference and withdrawing in one batch
+        // reads the final materialized view: the source hold and ad both retire.
+        let tombstone = synch_core::FileEntry::tombstone(now_ns(), 2, Some(root));
+        node.publish(&[
+            StagedChange::record(
+                file_key("media", "a.txt").unwrap(),
+                Some(synch_core::record::encode(&tombstone).unwrap()),
+            )
+            .unwrap(),
+            StagedChange::withdraw_blob(root),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(node.published_ad(&root).unwrap().is_none());
+        assert!(!node.store().pins().unwrap().iter().any(|pin| {
+            pin.root == root && pin.holder == synch_store::PinHolder::Source("media".into())
+        }));
         node.shutdown().await.unwrap();
     }
 }

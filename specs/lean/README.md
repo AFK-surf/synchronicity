@@ -84,6 +84,13 @@ on *available* content is `NoLoss`'s work (`durable_backed`,
 `complete_backed`), not the guard's, so the fault-tolerant model admits what
 Rust admits: a publish or a pin over a claim the backend has already lost.
 
+Blob-ad publication has the same ownership boundary in code and model.
+`refresh_blob` and `withdraw_blob` are the `b:` publication intents, and
+`Node::publish` derives every positive value from the final source view and CAS
+snapshot. Either intent over an already-live source recomputes its required
+complete ad and stutters in `Cas`, while standing a new source is exactly
+`SourcePublish`; non-source provider ads are erased by this safety abstraction.
+
 Two transitions retire a role. `RemoveRole` is `remove_source`: the holder's
 pins and wants go under `Unpin`'s and `DropWant`'s guard, so a hold behind an
 entry the tree still names survives — the engine tombstones the space first,

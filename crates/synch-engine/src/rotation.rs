@@ -407,10 +407,11 @@ mod tests {
         let root = node.store().ingest_bytes(b"ccc", 0).unwrap();
         let entry = synch_core::FileEntry::file(3, 0, root, 1);
         let first = node
-            .publish(&[(
+            .publish(&[crate::node::StagedChange::record(
                 node.key_for("s", "a.txt").unwrap(),
                 Some(postcard::to_stdvec(&entry).unwrap()),
-            )])
+            )
+            .unwrap()])
             .unwrap()
             .unwrap();
         assert_eq!(first.signed_by, old_key);
@@ -446,7 +447,11 @@ mod tests {
         assert_eq!(retiring[0].id(), old_key);
 
         let next = node
-            .publish(&[(node.key_for("s", "a.txt").unwrap(), None)])
+            .publish(&[crate::node::StagedChange::record(
+                node.key_for("s", "a.txt").unwrap(),
+                None,
+            )
+            .unwrap()])
             .unwrap()
             .unwrap();
         assert_eq!(next.signed_by, new_key);

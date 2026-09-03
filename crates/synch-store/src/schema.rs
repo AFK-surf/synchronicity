@@ -103,12 +103,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 
 /// v28 — `NULL` is the one spelling of an empty partial-cache bitmap.
 ///
-/// Older `commit_groups(empty)` calls encoded an empty ranges vector as a
-/// non-NULL blob. Readers already interpreted that value as holding no groups,
-/// but the remote-loss heal deliberately uses `bitmap IS NULL` to decide that
-/// no partial cache is worth retaining. Canonicalizing the exact old encoding
-/// makes that SQL decision agree with the reader and with future writes without
-/// decoding every partial row during upgrade.
+/// An encoded empty ranges vector is semantically the same as `NULL`. The
+/// remote-loss heal uses `bitmap IS NULL` to decide that no partial cache is
+/// worth retaining, so canonicalizing it makes the SQL decision agree with the
+/// reader and with writes without decoding every partial row during upgrade.
 fn v28_empty_ranges_as_null(tx: &Transaction<'_>) -> Result<()> {
     let empty = crate::cas::ranges_to_blob(&synch_core::ChunkRanges::empty());
     tx.execute(

@@ -84,9 +84,9 @@ structure Cell (H : Type) where
   want : Set H := ∅
   /-- The holders whose source leaf names the content. -/
   sourceLive : Set H := ∅
-  /-- The object size the source published for this root.  Rust writes the
-  same value into the file entry and the complete `BlobAd`; keeping it
-  separate from the CAS row makes that cross-layer equality stateable. -/
+  /-- The object size the source publisher derived for this root.  Rust writes
+  the file entry's size into the complete `BlobAd`; keeping it separate from
+  the CAS row makes that cross-layer equality stateable. -/
   sourceAdvertised : H → Nat → Prop := fun _ _ => False
   /-- The holders whose replica leaf names the content. -/
   replicaLive : Set H := ∅
@@ -462,7 +462,9 @@ variable [Roles H]
 
 /-- The source-publication micro-step inside `Node::publish`:
 `hold_source_blob` checks that `publishedSize` is the durable row's size, and
-the transaction writes that same value into the complete `BlobAd`. -/
+the transaction derives the complete `BlobAd` from that value.  A typed Rust
+`refresh_blob` or `withdraw_blob` intent for an already-live source recomputes
+the same ad and is a stuttering step in this abstraction. -/
 @[transition]
 def SourcePublish (holder : H) (publishedSize : Nat) : Transition (Cell H) where
   guard c := IsRole holder ∧ ¬c.sweeping ∧ Durable c ∧ publishedSize = c.size

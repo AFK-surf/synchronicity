@@ -53,7 +53,11 @@ def PromotionCellStep (c c' : Cell H) : Prop :=
       | _ => False) ∧
     (Trans k).rel c c'
 
-/-- One cell's finite sequence inside an atomic own-publication transaction. -/
+/-- One cell's finite sequence inside an atomic own-publication transaction.
+Rust's publisher-owned `refresh_blob`/`withdraw_blob` intent either accompanies
+`SourcePublish`, or recomputes an existing source ad and stutters at this
+abstraction; non-source provider ads are deliberately outside the CAS safety
+state. -/
 def PublishCellTxn : Cell H → Cell H → Prop := Relation.ReflTransGen PublishCellStep
 
 /-- One cell's finite sequence inside an atomic remote-promotion transaction. -/

@@ -32,6 +32,19 @@ use crate::{
 };
 
 impl Txn<'_> {
+    /// Reads the local CAS row from this transaction's snapshot.
+    pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
+        let row = self
+            .conn()
+            .query_row(
+                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
+                params![root.as_bytes().to_vec()],
+                raw_blob_row,
+            )
+            .optional()?;
+        row.map(blob_row_from).transpose()
+    }
+
     /// Verifies durable possession and installs the source hold used by the
     /// publication transaction.
     pub fn hold_source_blob(&self, space: &str, root: &Hash, size: u64, now: i64) -> Result<()> {
@@ -104,8 +117,8 @@ impl Txn<'_> {
 
     /// Returns the durable size of `root` when this node's materialized view
     /// still has a configured source entry naming it. Publication reads this
-    /// after applying a proposed trie diff so an independently staged `b:`
-    /// change cannot withdraw or weaken the ad behind a live source.
+    /// after applying a proposed trie diff and derives the publisher-owned
+    /// `b:` value from that final view.
     pub fn live_source_blob_size(
         &self,
         origin: &synch_core::OriginId,
@@ -368,7 +381,7 @@ impl BlobRow {
     }
 
     /// The advertisement this holder should publish for the object (§6.3).
-    pub(crate) fn to_ad(&self) -> BlobAd {
+    pub fn to_ad(&self) -> BlobAd {
         if self.complete || self.durable {
             return BlobAd::complete(self.size);
         }

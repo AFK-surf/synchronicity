@@ -1772,7 +1772,7 @@ mod tests {
     #[test]
     fn v28_normalizes_encoded_empty_blob_ranges() {
         let dir = tempfile::tempdir().unwrap();
-        let root = Hash::new(b"old encoded empty ranges");
+        let root = Hash::new(b"encoded empty ranges");
         {
             let conn = database_at(dir.path(), 27);
             let encoded = crate::cas::ranges_to_blob(&synch_core::ChunkRanges::empty());

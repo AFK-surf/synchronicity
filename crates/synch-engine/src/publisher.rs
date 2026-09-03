@@ -81,7 +81,7 @@ impl Publisher {
     /// in the batch: `publish` folds in order and the last value for a key wins,
     /// which for a removal against a fresh entry means the path is erased.
     pub(crate) fn staged_keys(&self) -> std::collections::HashSet<Vec<u8>> {
-        self.buffer().iter().map(|(key, _)| key.clone()).collect()
+        self.buffer().iter().map(StagedChange::key).collect()
     }
 
     /// How many changes are waiting to be published.
@@ -252,7 +252,7 @@ mod tests {
     use super::*;
 
     fn change(key: &str) -> StagedChange {
-        (key.as_bytes().to_vec(), Some(b"v".to_vec()))
+        StagedChange::record(key.as_bytes().to_vec(), Some(b"v".to_vec())).unwrap()
     }
 
     #[test]
@@ -274,8 +274,8 @@ mod tests {
         publisher.restage(batch);
         let retried = publisher.take();
         assert_eq!(retried.len(), 4);
-        assert_eq!(retried[0].0, b"a".to_vec());
-        assert_eq!(retried[3].0, b"d".to_vec());
+        assert_eq!(retried[0].key(), b"a".to_vec());
+        assert_eq!(retried[3].key(), b"d".to_vec());
     }
 
     use crate::testkit::{eventually, node_with};
@@ -296,10 +296,11 @@ mod tests {
     fn entry(node: &Node, path: &str) -> StagedChange {
         let root = node.store().ingest_bytes(path.as_bytes(), 0).unwrap();
         let entry = synch_core::FileEntry::file(path.len() as u64, 0, root, 1);
-        (
+        StagedChange::record(
             node.key_for("s", path).unwrap(),
             Some(postcard::to_stdvec(&entry).unwrap()),
         )
+        .unwrap()
     }
 
     /// Runs the publisher loop until the returned sender fires.

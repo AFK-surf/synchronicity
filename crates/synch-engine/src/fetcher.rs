@@ -282,13 +282,8 @@ impl Node {
             )));
         }
         if self.config().cloud.is_some() {
-            let node = self.clone();
-            let root = *root;
-            let change = crate::blocking::offload(move || node.ad_change(&root)).await?;
-            if let Some(change) = change {
-                self.stage([change]);
-                self.flush_staged().await?;
-            }
+            self.stage([crate::node::StagedChange::refresh_blob(*root)]);
+            self.flush_staged().await?;
         }
         Ok(())
     }
@@ -308,7 +303,7 @@ impl Node {
                 crate::blocking::offload(move || Ok(store.content_is_referenced(&root_value)?))
                     .await?;
             if !referenced {
-                self.stage([(synch_core::blob_key(root), None)]);
+                self.stage([crate::node::StagedChange::withdraw_blob(*root)]);
                 self.flush_staged().await?;
             }
         }
@@ -1198,9 +1193,7 @@ impl Node {
         if !self.ad_update_due(root)? {
             return Ok(None);
         }
-        let Some(change) = self.ad_change(root)? else {
-            return Ok(None);
-        };
+        let change = crate::node::StagedChange::refresh_blob(*root);
         self.publish(&[change])
     }
 
@@ -1472,10 +1465,11 @@ mod tests {
         let before = node.store().blob(&root).unwrap().unwrap();
         assert!(before.complete);
         assert!(!before.durable);
-        assert_eq!(
-            node.ad_change(&root).unwrap(),
-            Some((synch_core::blob_key(&root), None))
-        );
+        assert!(node
+            .publish(&[crate::node::StagedChange::refresh_blob(root)])
+            .unwrap()
+            .is_none());
+        assert!(node.published_ad(&root).unwrap().is_none());
 
         node.pin_object(&root, Some(payload.len() as u64))
             .await
