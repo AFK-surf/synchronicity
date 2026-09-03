@@ -1,9 +1,10 @@
 # CAS / mptsync / ingest Lean model
 
-This package proves the transition systems behind the CAS safety claim. It is
-intentionally not a formal semantics of Rust, SQLite, or a filesystem. Instead,
-each transition corresponds to a named Rust linearization point, and
-`check-anchors.sh` makes those review anchors bidirectional.
+This package proves the transition systems behind the CAS safety claim, the
+scoped-sync privacy claims, and mptsync convergence. It is intentionally not a
+formal semantics of Rust, SQLite, or a filesystem. Instead, each transition
+corresponds to a named Rust linearization point, and the anchors are checked
+in both directions (below).
 
 ```sh
 cd specs/lean
@@ -11,269 +12,185 @@ lake build --wfail
 ./check-anchors.sh
 ```
 
-The proof boundary is explicit:
+The package depends on Mathlib (pinned to the toolchain's tag; `lake exe
+cache get` fetches the compiled oleans) for `Set`, `Function.update`, the
+lexicographic linear order on heads, `List.maximum`, `Set.Finite`/`Set.ncard`,
+and the well-foundedness lemmas. The proofs themselves are `grind`, `omega`
+and `simp`. Every module ends in `#lint`, so a public declaration without a
+docstring or with an unused argument fails the build.
+
+## Module map
+
+Every model is an instance of `Prelude.System` — an initial state and a step
+relation — and every safety theorem is a `System.Invariant` (true initially,
+preserved by every step) read at a reachable state. Every transition is a
+`Prelude.Transition`: a guard and a successor function. Where the code has
+two outcomes, the outcome is a parameter of the transition and of its `Kind`,
+so a preservation proof is `cases k <;> simp only [transition] at h <;>
+obtain ⟨hg, rfl⟩ := h <;> constructor <;> grind`. `Lift` is a store of cells
+in which one cell steps and the rest stay, `Across` one in which every cell
+steps or stays; `Reachable.simulate` is the simulation argument between two
+systems under a projection. Every set — pins, held nodes, retained roots — is
+a Mathlib `Set`.
+
+| Module | What it states | What it proves |
+|---|---|---|
+| `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
+| `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, and the GC/delete/staged-row corollaries |
+| `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
+| `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
+| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on |
+| `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
+| `ScopedSync` | `Hash`, the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
+| `TrieGraph` | the multi-root trie store under a read scope, with `Complete` read as `CompleteWithin`; every `MptGc` transition at store level, `GcSweep` as mark/sweep over held nodes and their values | `gcSweep_complete_iff` — a sweep keeps a retained root exactly as complete as it was; `step_projects` and `simulates` — `MptGc` simulates the store at every root |
+| `Convergence` | head selection (`select`, `offer` over a node's heard heads and per-root slots), the derived view (`HasValue`, `ScopedView`, `Readable`), the fetch (`FetchStep`, `Bounded`, `Whole`, `Productive`) | `select_eq_of_mem_iff`, `offer_step`, `scoped_view_deterministic`, `admitted_key_readable`, `fetchStep_wf`, `stuck_complete`, and `converge`, which puts the three together |
+| `Provenance` | the multi-party model: `Legit`, `Sound`, `Vouched`, `view`; `LegitVia` chains; `Withheld` | `privacy`, `integrity`, `privacy_chain`, `withheld_not_legit` and its corollaries |
+
+Each theorem's docstring says what it means for the code; this file says how
+the modules fit and what they do not cover.
+
+## The CAS models
+
+`Cas` states the cell transitions once, over a holder type `H` with a `Roles`
+instance saying which holders are sources or replicas rather than the
+operator. `Invariant` is what every transition preserves — a role's pin
+stands on a durable claim; a live leaf's holder is a role with a pin or a want
+behind it — and `NoLoss` is what only the fault-free transitions preserve —
+every pin stands on available content; a source leaf is pinned, never merely
+wanted. `SystemSafety` is the fault-free closure with invariant
+`Invariant ∧ NoLoss`; `FaultTolerant` adds two unguarded loss steps and the
+two heals and proves `Invariant` alone survives them; `Bridge` pairs the CAS
+cells with the `MptGc` head flip.
+
+The principal theorems are `SystemSafety.source_live_content_is_available` and
+`SystemSafety.replica_live_content_is_pin_or_want`. They quantify over the
+actual holder and content root, so a claim for one root cannot discharge a
+leaf for another. A *staged* row (`durable = 0`) may be dropped without
+consulting pins; `staged_row_is_reachable` witnesses that the branch is live
+and `staged_row_drop_is_unpinned` why it is safe.
+
+`FaultTolerant` does not model that a heal ever runs, that a want is ever
+satisfied, or that the backend's `NotFound` is true — a spurious one triggers
+a heal that errs in the safe direction, a pin becoming a want and a refetch.
+
+## mptsync over partial tries
+
+`ScopedSync.Walk` is the scoped `MissingWalk` under a guard on the positions
+it may enter. `Reach` is the walk with no guard; `ReachRef` prunes against a
+reference root; `Paired` and `DiffReach` are `Reach` by another name — the
+pairing `paired_children` computes descends through held nodes, and a held
+node is never a `Boundary`, so the code's boundary check on the reference side
+is not a separate premise. `prune_sound` is the §5.5 claim that a pruned walk
+may write the completeness memo.
+
+The responder authorizes by position, never by hash: for a scoped peer the
+claimed hash is not consulted (`admit_ignores_claim`), the root must be a head
+root, what is served is what sits at the claimed position, and a node travels
+only if what it reveals is in scope. `held_within_scope` is the single-store
+privacy theorem: every node a delegate holds sits at an admitted position of a
+head root and spells no key material outside its scope.
+
+Not modelled: batches, `resume`, the unproductive-round abandonment, the depth
+ceiling, and the promotion refusal memo.
+
+## Provenance
+
+`held_within_scope` is true and too weak: the graft of issue #115 satisfies
+it. `Provenance` has several participants and asks whether a node is
+*legitimately* a reader's, across every trie it might be read through.
+`privacy` and `integrity` hold in every reachable state; `privacy_chain`
+exhibits the chain of confined origins a node passed through, each of which
+legitimately held it.
+
+The `withheld_*` theorems quantify over every confined scope, and that is a
+design statement rather than a weakness of the proof: a confined origin may
+re-publish, under its own root, what it legitimately holds, and a wider
+confined origin's grant may legitimately carry a node to a narrower one.
+Re-publication along a delegation chain is the design working; what the
+theorems exclude is content that no chain can legitimately begin with. The
+concrete instance lives in the Rust test
+`a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie`.
+
+## Convergence
+
+`Convergence.converge` is the statement: two nodes that heard the same heads
+select the same head; if each fetched its root under the same scope, from
+peers that heard the same heads, until no step was left, each holds a trie
+complete within the scope, every admitted key has the same value on both, and
+each can read it (`Readable`: it holds the carrying node, or the key lies
+under a boundary its peer refused). It assumes, as hypotheses, that a peer
+holding the root's head answers, that the origin's trie is whole and finite,
+and — for out-of-line values only — `Productive`: that a held node is admitted
+where the walk meets it. Not proved: that the gossip schedule delivers heads,
+or how long any of this takes. `offer` is `offer_head` at the node: the heard
+list and every root's `MptGc` bits, and `offer_step` is the fact that hearing
+a head is `OfferPending` or `Retain` at its root.
+
+`fetchStep_wf` is termination as well-foundedness; `fetch_terminates` is the
+no-infinite-sequence corollary.
+
+## Trust boundary
 
 - one process owns the data directory through `LifecycleLock`; independently
   opened `Store` values in that process share one CAS writer/GC coordinator;
 - SQLite immediate transactions are atomic;
 - the shared CAS coordinator orders lease registration against every unlink;
-- production deletion of durable content re-checks entry, pin, and writer
-  protection; the only unconditional deletion helper is compiled for tests and
-  lies outside the safety transition system;
-- a *staged* row (`durable = 0`) — the complete commit of a backend whose
-  completion is not durable until `finalize` — may be dropped without
-  consulting pins, by cache eviction, a scratch-generation reset, or a backend
-  migration. `Cas.CommitComplete`'s second branch creates it and
-  `Cas.DropStaged` removes it; `SystemSafety.staged_row_is_reachable` is the
-  witness that both are live. It is safe because a pin is only ever granted
-  over available content (`Cas.NoLoss`), which `Store::pin`/`take_possession`
-  enforce (`staged_row_drop_is_unpinned`);
-- verified content hashes identify the bytes, and — in `SystemSafety` — the
-  configured durable backend satisfies its write contract. `FaultTolerant`
-  drops that last assumption: it adds unguarded loss steps and the two
-  `heal_missing_*` transitions, and proves the weaker invariant that survives
-  them (below).
+- verified content hashes identify the bytes;
+- in `SystemSafety`, the configured durable backend satisfies its write
+  contract (`FaultTolerant` drops this);
+- the refinement from Rust statements to Lean transitions. The anchors make
+  that obligation auditable but do not prove SQL or lock semantics;
+- crash/power-loss recovery is outside this model (see `specs/Recovery.tla`);
+  the theorems describe executions between successful durable commits.
 
-The CAS transitions are stated once, in `Cas`, over a cell indexed by a holder
-type `H` with a `Roles` instance saying which holders are sources or replicas
-rather than the operator. Every other CAS file is that model read at a holder
-type or closed over a step set:
+`MptGc.State.complete` is `ScopedSync.CompleteWithin` everywhere it is read:
+`Convergence.stuck_fetch_promotes` establishes it when the fetch drains, and
+`TrieGraph.proj` reads it off the store. `TrieGraph.simulates` says every
+store-level step is an `MptGc` step at every root, with one guard: its
+`LearnNode` takes a node no position ever refused. A node refused at one
+position and later held from another — Rust's `put_node` after a
+`note_redacted` of the same hash — has no step in the model: holding the node
+dissolves the boundary a completeness memo may rest on, so `MptGc`'s
+`active → complete` would not survive it. Rust's `put_node` drops every
+completeness memo when it holds such a hash
+(`db.rs::put_node_forgetting_memos`), so the memo is re-derived by a walk the
+next time it is asked, which is what keeps `complete` the walk's answer on
+both sides.
 
-- `Cas` is the twenty-three cell transitions, their Rust anchors, and the two
-  invariants: `Invariant`, what every transition preserves (a role's pin stands
-  on a durable claim; a live leaf's holder is a role with a pin or a want
-  behind it), and `NoLoss`, what only the fault-free transitions preserve
-  (every pin stands on available content; a source leaf is pinned, never
-  merely wanted). `invariant_step` and `noLoss_step` are the only
-  case-by-case preservation proofs in the package;
-- `SystemSafety` is the fault-free closure over a store of cells indexed by
-  content root, with invariant `Invariant ∧ NoLoss`. It fixes `Holder := Nat`
-  with the operator at `0`;
-- `CasGc` is `SystemSafety` at `H := Unit`: one pin, one want, one leaf, and
-  the theorems as the protocol is usually explained. It proves nothing of its
-  own and carries no anchors;
-- `FaultTolerant` adds `LoseRemote`, `LoseBytes`, `HealRemote` and `HealLocal`
-  over the same cells and proves that `Invariant` alone survives them, reusing
-  `Cas.invariant_step` for the cell transitions;
-- `Safety` is the CAS/trie bridge: publication and promotion pair the cell
-  transition with the `MptGc` head flip they share a transaction with, across
-  every content root the transaction touches (`Across`), on top of
-  `SystemSafety`'s invariant;
-- `MptGc` is the compact per-trie-root abstraction of pending-head promotion
-  and trie GC;
-- `TrieGraph` states GC's graph obligation over every node reachable from every
-  retained trie root;
-- `Scope` and `ScopedSync` open the `complete` bit of `MptGc` for a node that
-  reads under a delegation scope (§5.5): the scoped fetch walk over a partial
-  trie, its pruning against a reference root, the responder's authorization by
-  position, and what a delegate can end up holding (below);
-- `Convergence` proves the three pieces convergence decomposes into: head
-  selection is an order-independent join, the derived view is a function of
-  root and scope, and a fetch terminates and is complete when it can take no
-  further step (below);
-- `Provenance` is the multi-party model that the single-store privacy theorem
-  cannot state: whether a node is *legitimately* a reader's, across every trie
-  it might be read through. Its theorem is `privacy` and `integrity` over every
-  reachable system state, with the graft of issue #115 as the witness that the
-  invariant is strong enough to exclude it (below).
+## Contributing
 
-The principal system theorems are
-`SystemSafety.source_live_content_is_available` and
-`SystemSafety.replica_live_content_is_pin_or_want`. They quantify over the
-actual holder and content root, so a claim for one root cannot discharge a leaf
-for another. The reachable transition closure includes writes and aborts,
-durable and staged commits, cache eviction, staged-row removal, remote
-adoption, publication/promotion, materialized-leaf and entry removal,
-pin/unpin/expiry, want removal/take-possession, protected deletion, and both
-GC phases. `TrieGraph.gc_preserves_complete_retained_root` supplies the
-analogous node-graph property.
+**Anchors.** A definition that models a Rust linearization point carries
+`@[rust_impl "anchor-name"]`; a theorem that justifies a Rust site — a memo
+that may be written, a check that may be skipped — carries
+`@[rust_justifies "anchor-name"]`. The Rust site carries
+`// LEAN-MODEL: anchor-name (Module.Decl)` either way. `lake exe anchors`
+prints every pair the attributes recorded and `check-anchors.sh` diffs it
+against the Rust sources, so a rename on either side fails CI. An anchor sits
+on exactly one declaration; a declaration may carry several anchors.
 
-`FaultTolerant` is the same cells and the same transitions with two
-environment steps added — `LoseRemote` and `LoseBytes`, with no guard — and the
-two heals Rust runs when a read discovers the loss. `HealRemote` and `HealLocal`
-mirror `heal_missing_durable_blob` and `heal_missing_local_blob`: withdraw the
-durable claim, turn every role holder's pin into a repair want, leave the
-operator's pin alone. Live holders are roles (`IsRole`), which is why
-`SourcePublish` and `ReplicaPromote` carry that guard. The invariant that
-survives is `Cas.Invariant`: `Available` replaced by `Durable` (row present,
-backend claim standing) and no clause for the operator. Its theorems:
-`role_pin_stands_on_durable_row`, or equivalently `role_pin_is_available_or_lost`
-— a source's or replica's pin stands on content that is available or that the
-backend has lost and the heal has not yet run; `no_role_pin_over_withdrawn_claim`;
-`source_live_is_held_or_wanted` and `replica_live_is_held_or_wanted`;
-`heal_converts_role_pins`; and, stated so it is not mistaken for a guarantee,
-`heal_keeps_operator_pin`. `fault_free_is_reachable` embeds every `SystemSafety`
-execution, so the strong theorems remain the fault-free specialization. Not
-modelled: that a heal ever runs, that a want is ever satisfied, or that the
-backend's `NotFound` is true — a spurious one triggers a heal that errs in the
-safe direction, a pin becoming a want and a refetch.
+**Naming.** A theorem about what one transition commits is
+`<transition>_<effect>` (`gc_respects_protection`,
+`possession_is_atomic`); a theorem about every reachable state is
+`<subject>_is_<property>` or a sentence (`source_live_content_is_available`,
+`live_leaf_flips_head`); a lemma that projects one model onto another is
+`<transition>_projects`. Renames keep the old name as an `abbrev` or a
+one-line theorem for one release.
 
-## mptsync over partial tries
+**Proofs.** State a transition as a `Transition` — a guard and a successor —
+tagged `@[transition]`, name it in a `Kind`, and prove preservation with
+`cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;>
+constructor <;> grind`. Where the code has two outcomes, make the outcome a
+parameter of the transition and of its `Kind` rather than a disjunction in
+the relation. If a case needs a hand-written argument, that is a fact the
+invariant should probably carry. Guards with several clauses are `Prop`
+structures with named fields (`Collectable`, `Deletable`), never anonymous
+conjunctions read by `.2.2.1`. Reach for a Mathlib structure before a
+hand-rolled one: a set is a `Set`, an order is a `LinearOrder`, a finite set
+is `Set.Finite`, a measure is `Set.ncard`. Identifiers (`Hash`, `Root`,
+`Holder`, `Origin`) are one-field structures, so they cannot be confused.
 
-`Scope` is `scope.rs` restated over nibble paths: `AdmitsPath`,
-`ContainsSubtree`, `AdmitsKey`, and the facts both sides of a scoped fetch rely
-on — `admitsPath_of_append` (every ancestor of an admitted position is
-admitted, the spine), `containsSubtree_append` (nothing below a granted prefix
-leaves it), and `admitsPath_of_admitsKey`.
-
-`ScopedSync` builds the trie and the protocol on top:
-
-- `At c root path hash` is the verified trie under content addressing `c`,
-  descending branch slots and extension prefixes as `resolve_paths` does.
-  `At.unique` — a position names one hash — needs exactly the non-empty
-  extension prefix `check_invariants` enforces (`Canonical`).
-- `Reach` is the scoped `MissingWalk`: a child position is visited when its
-  parent was visited, held, not a redaction `Boundary`, and the child's position
-  is admitted. `Reach.admits` says an honest walk never asks for an out-of-scope
-  position, `Reach.at` that every position it claims resolves to the hash it
-  claims. `CompleteWithin` is the walk draining with nothing missing — the fact
-  `is_complete_scoped` memoizes.
-- `ReachRef` prunes against a reference root. `prune_sound` is the §5.5 claim
-  that the pruned walk may write the completeness memo: pruning is sound when
-  every pruned position is one the reference root's own scoped walk *reached*
-  (`Reach R`), because then everything under it was that walk's business, and
-  that walk found nothing missing. `Paired` is the pairing `paired_children`
-  computes — the reference descended through *held* nodes along the same steps
-  — and `paired_reaches` shows it satisfies the premise because a held node is
-  never a `Boundary` (`held_not_boundary`): a refusal is remembered by hash
-  and position (`redacted_nodes`), a node refused at one position may be held
-  from another it shares by structure, and `next_batch` consults the memo only
-  on a failed load. `diff_never_misses` is the same fact for the promotion
-  diff, whose `cursor_at` reads an absent hash refused at any position as empty
-  and loads a held one.
-- `Admit`, `ServeNode`, `ServeValue`, and `Redacts` are the responder. For a
-  scoped peer the claimed hash is not consulted (`admit_ignores_claim`), the
-  root must be a head root (`admit_requires_head`), what is served is what sits
-  at the claimed position (`admit_resolves`, `admit_unique`), and a node
-  travels only if what it reveals is in scope. `no_redaction_inside_grant` is
-  why a position under a granted prefix is never refused, which is what lets
-  the walk consult the redaction memo only above the grant.
-- `Learn`/`Reachable` is a delegate's store growing only by what scoped
-  responders hand it. `reachable_confined` is the invariant; `held_within_scope`
-  is the privacy theorem — every node a delegate holds sits at an admitted
-  position of a head root and spells no key material (`Reveals`) and carries no
-  record (`RevealsRecord`) outside its scope — with `held_value_within_scope`
-  and `redacted_is_boundary` for values and refusals. A branch's *out-of-line*
-  value travels as a hash, like every redacted child, and `Reveals` says so;
-  `SpellsKey`, used by `keys_below_grant_admitted` for `first_key_outside`,
-  counts it as a key because the publish-scope question is about the origin's
-  own trie.
-
-The model is positional, and Rust is positional where a hash-keyed shortcut
-would not be sound. `MissingWalk::seen` deduplicates expansions by hash inside
-the grant — `children_inside_grant_admitted` is why expansion there does not
-depend on position — and by hash *and position* above it, where a branch shared
-between a spine position and an in-grant position leads into the grant along
-one slot at the first and along all of them at the second. Not modelled: batches, `resume`,
-the unproductive-round abandonment, the depth ceiling, and the promotion
-refusal memo — none of them bears on what the theorems say.
-
-## Provenance
-
-`ScopedSync.held_within_scope` is true and too weak: it says every node a
-delegate holds sits at an admitted position of *some* head root, and the graft
-of issue #115 satisfies it. A confined origin holds the hash of every subtree
-withheld from it, publishes a trie placing that hash at an in-scope position,
-and a member that already holds the nodes from the issuer's trie completes the
-head and serves the subtree to every delegate under the grafting origin's root.
-The positions are admitted; the content was never that origin's.
-
-`Provenance` has several participants (`Sys`), each with the shared node store
-and provenance rows (`Store.owned`, the `trie_node_origins` table), and asks
-whether a node is **legitimately** a reader's for the scope it reads under.
-`Legit` says yes when the reader is rooted, for a node under a rooted origin's
-head at an admitted position, for a node an origin authored, and for a node
-under a *confined* origin's head at an admitted position provided that origin
-legitimately held it. `Sound` is the system invariant: every held node is
-legitimate for its holder, and every provenance row for a confined origin names
-a node legitimately that origin's.
-
-- `step_sound`: the vouching rule preserves `Sound`. A responder vouches for a
-  node under a root only if the root's origin is rooted, or the responder was
-  served the node as that origin's, or the responder *is* that origin and
-  holds the node (`Vouched`, `net/mpt.rs::Vouch::covers`, applied to every
-  peer, scoped or not — a full member handed the node under the grafting root
-  would otherwise record provenance for it and move the leak one hop). A member
-  records what it was served as the origin's (`learn`, `note_owned`, in the
-  batch transaction), and a walk over a confined origin's root reads presence
-  through `view` (`MissingWalk::for_origin`, `Trie::load_owned_raw`,
-  `is_complete_scoped_for`). `provenance_owner` decides which origins are
-  judged this way: every origin that is not rooted, except the node's own.
-- **The theorem**, over every state `Reachable` from participants holding
-  nothing: `privacy` — a confined participant holds only nodes legitimately
-  its; `integrity` — a member that finds a confined origin's root complete
-  through `view`, which is the premise on which it promotes, materializes and
-  advertises the head, has found only nodes legitimately that origin's.
-- The negative form is what #115 violated. `Withheld` is content no rooted
-  trie exposes to a scope and no origin of that scope authored;
-  `withheld_not_legit` shows a `Legit` derivation can never reach it for a
-  confined scope, so `privacy_withheld` (it never reaches a confined
-  participant), `withheld_not_served` (nobody serves it under a confined
-  origin's root), and `withheld_root_incomplete` (a confined root that reaches
-  it never completes) hold for any world, wherever a confined origin places its
-  hash. The concrete instance — a delegate grafting a withheld subtree into its
-  own trie — lives where instances belong, in the Rust test
-  `a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie`.
-
-This is the bug class the earlier model could not see: a property that holds
-at every single store while content crosses a boundary between stores. What it
-costs Rust is one row per node per confined origin, a re-fetch of nodes a
-confined origin's trie shares with another's, and a third completeness memo key.
-Values are not tracked: `GetValues` serves a value only with a vouched holder,
-and a head whose nodes lack provenance never completes, so a value cannot be
-laundered without the node that carries it.
-
-## Convergence
-
-`Convergence` proves what "every node ends up with the same head, and derives
-the same view from it" decomposes into, and names what it assumes.
-
-- **Head selection is a join.** `adopt` is `offer_head`'s `supersedes(floor)`
-  under the lexicographic `(seq, root)` order, `select` the fold of it over the
-  heads a node has heard. `select_max` says the result is a maximum,
-  `select_eq_of_max` that a maximum is the result, and `select_eq_of_mem_iff`
-  — the convergence theorem — that two nodes that have heard the same heads, in
-  any order and any multiplicity, hold the same head; `select_mono` that the
-  floor never moves down. The proof rests on `(seq, root)` being a total
-  order, which is §5.2's note: ties in `seq` need `root` to break them.
-- **The view is a function of root and scope.** `HasValue` is `Trie::get`;
-  `view_deterministic` says a key has one value under a root, which needs
-  `At.split` and the non-empty extension prefix `check_invariants` enforces.
-  `ScopedView` — what `materialize_diff` derives under a read scope — is defined
-  from the content, the root and the scope alone, so `scoped_view_deterministic`
-  is the statement that every node promoting the same head under the same scope
-  derives the same view. `admitted_key_readable` says such a node can read it:
-  under a root complete within the scope, every admitted key's value-carrying
-  node is held, or the key lies under a boundary the walk stopped at.
-- **The fetch terminates, and a stuck fetch is complete.** `FetchStep` is one
-  learned item — a node, a refusal, or a value — for a position the scoped walk
-  is asking about, served by a peer holding the root; each is a `Learn` step.
-  `Bounded` is a finite list naming every node and value under the root, and
-  `fetch_terminates` says no infinite fetch exists over one: `remaining`, the
-  bounded items not yet learned, strictly decreases. `stuck_complete` says a
-  store with no fetch step left is `CompleteWithin`, and `stuck_fetch_promotes`
-  that this is `MptGc.Promote`'s premise.
-
-What is assumed, as hypotheses: that heads reach every node (the same
-membership `select_eq_of_mem_iff` takes as given); that a peer holding the
-root's head stays reachable and answers, so a `FetchStep` exists whenever the
-responder would serve; that the origin's trie is whole (`Whole`) and finite
-(`Bounded`); and, for out-of-line values only, that a held node is admitted at
-the position the walk meets it (`hadm`) — a node held from a position where it
-revealed less may sit at one where it reveals more, the responder will not
-serve its value there, and Rust abandons that head after
-`MAX_UNPRODUCTIVE_ROUNDS` and retries once the other fetch has landed the
-value. Not proved: that the gossip schedule delivers heads, or how long any of
-this takes.
-
-`MptGc` is deliberately looser than the code where the code's own ordering is
-not what the invariant rests on: a fetch batch may commit after the pending
-slot was cleared (`LearnBatch` is unguarded), a head that loses the ordering
-comparison is retained without a slot (`Retain`), and the pending slot may be
-cleared without a flip (`DropPending`). Each is a transition Rust performs, and
-each preserves `active → retained ∧ complete ∧ materialized` trivially.
-
-What remains trusted rather than proved is the refinement from Rust statements
-to Lean transitions. Anchors make that obligation auditable but do not prove
-SQL or lock semantics. Crash/power-loss recovery is also outside this model;
-the theorems describe executions between successful durable commits.
+**Lint.** `#lint` at the end of every module runs the Batteries linters over
+that file. Give every definition and structure a docstring; drop arguments
+the statement does not use.

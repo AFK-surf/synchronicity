@@ -701,7 +701,7 @@ impl Store {
     /// for everything else — a confined origin, and an origin with no live
     /// binding at all, which is judged as strictly as a confined one rather
     /// than as an unrestricted one.
-    // LEAN-MODEL: mpt-provenance-owner
+    // LEAN-MODEL: mpt-provenance-owner (Provenance.World.Confined)
     // `Provenance.Confined`: the origins whose tries are judged with
     // provenance, which is every origin that is not rooted.
     pub fn provenance_owner(&self, origin: &OriginId, now: i64) -> Result<Option<OriginId>> {

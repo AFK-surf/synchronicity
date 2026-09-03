@@ -800,7 +800,7 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
-        // LEAN-MODEL: cas-write-complete-commit
+        // LEAN-MODEL: cas-write-complete-commit (Cas.CommitComplete)
         // `Cas.CommitComplete` abstracts this complete-row commit, its staged
         // branch being the `durable = 0` row a cloud backend leaves until
         // `finalize`. File callers hold the write lease; inline callers have
@@ -881,7 +881,7 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
-        // LEAN-MODEL: cas-write-groups-commit
+        // LEAN-MODEL: cas-write-groups-commit (Cas.CommitGroups)
         // `Cas.CommitGroups` abstracts both partial and completing bitmap
         // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
@@ -1046,7 +1046,7 @@ impl Store {
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
-        // LEAN-MODEL: cas-adopt-durable
+        // LEAN-MODEL: cas-adopt-durable (Cas.AdoptRemote)
         // `Cas.AdoptRemote` is this row creation from a remote pair
         // the backend has just confirmed; it only ever adds availability.
         self.with_immediate_tx(|tx| {
@@ -1084,7 +1084,7 @@ impl Store {
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-heal-missing-durable
+        // LEAN-MODEL: cas-heal-missing-durable (FaultTolerant.HealRemote)
         // `FaultTolerant.HealRemote` is this transaction: the durable claim is
         // withdrawn, role pins become wants, the operator's pin is left alone.
         // The backend losing the object is the environment step before it.
@@ -1159,7 +1159,7 @@ impl Store {
     /// Invalidates a local complete claim after the payload is missing or
     /// truncated, preserving every standing role as a repair intent.
     fn heal_missing_local_blob(&self, root: &Hash) -> Result<()> {
-        // LEAN-MODEL: cas-heal-missing-local
+        // LEAN-MODEL: cas-heal-missing-local (FaultTolerant.HealLocal)
         // `FaultTolerant.HealLocal` is this transaction, the local-bytes twin
         // of the one above.
         self.with_immediate_tx(|tx| {
@@ -1251,7 +1251,7 @@ impl Store {
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-cache-evict
+        // LEAN-MODEL: cas-cache-evict (Cas.CacheEvict)
         // `Cas.CacheEvict` retains remote durability when local cache
         // bytes disappear; callers select durable cache rows.
         let conn = self.conn();
@@ -1259,7 +1259,7 @@ impl Store {
         if self.is_being_written(root) {
             return Ok(false);
         }
-        // LEAN-MODEL: cas-drop-staged-row
+        // LEAN-MODEL: cas-drop-staged-row (Cas.DropStaged)
         // `Cas.DropStaged` is this row removal of a non-durable cache
         // claim, and the same transition behind `reconcile_scratch_generation`
         // and the `commit_cas_migration` discard. None of the three consults
@@ -1409,7 +1409,7 @@ impl Store {
     /// under a live entry is exactly the evidence that the release was decided
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
-        // LEAN-MODEL: cas-pin
+        // LEAN-MODEL: cas-pin (Cas.Pin)
         // `Cas.Pin` includes the held-object check and pin insertion
         // in this immediate transaction.
         self.with_immediate_tx(|tx| {
@@ -1452,7 +1452,7 @@ impl Store {
     /// model forbids. The operator's claim has no leaf behind it and goes
     /// unconditionally.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
-        // LEAN-MODEL: cas-unpin
+        // LEAN-MODEL: cas-unpin (Cas.Unpin)
         // `Cas.Unpin` requires this holder's live role to have ended;
         // for a role holder that guard is the entry check in this DELETE.
         let dropped = match holder.space() {
@@ -1502,7 +1502,7 @@ impl Store {
     /// sweep visits any more: a space removed with its pins kept still has
     /// claims that were scheduled before it went.
     pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
-        // LEAN-MODEL: cas-expire-pin
+        // LEAN-MODEL: cas-expire-pin (Cas.ExpirePin)
         // `Cas.ExpirePin` covers this holder-specific path and the
         // node-wide variant below. Both re-check that no live entry returned.
         Ok(self.conn().execute(
@@ -1631,7 +1631,7 @@ impl Store {
             return Ok(false);
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-gc-row-commit
+        // LEAN-MODEL: cas-gc-row-commit (Cas.GcCommit)
         // `Cas.GcCommit` is this conditional row transition. Its guard is
         // intentionally re-read here, not inherited from the candidate scan.
         let rows = tx.execute(
@@ -1647,7 +1647,7 @@ impl Store {
         tx.commit()?;
         let deleted = rows > 0;
         if deleted {
-            // LEAN-MODEL: cas-gc-unlink
+            // LEAN-MODEL: cas-gc-unlink (Cas.GcUnlink)
             // `Cas.GcUnlink` is separate from the row commit because the
             // filesystem cannot join SQLite; `conn` remains held between them.
             let _ = std::fs::remove_file(self.blob_path(root));
@@ -1672,7 +1672,7 @@ impl Store {
             )));
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-protected-delete
+        // LEAN-MODEL: cas-protected-delete (Cas.ProtectedDelete)
         // `Cas.ProtectedDelete` is this no-entry/no-pin/no-writer
         // transition. The checks and row deletion are one write transaction.
         let protected: bool = tx.query_row(

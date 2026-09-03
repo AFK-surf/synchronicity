@@ -338,7 +338,7 @@ pub(crate) struct WriteLease<'a> {
 
 impl Drop for WriteLease<'_> {
     fn drop(&mut self) {
-        // LEAN-MODEL: cas-write-lease-end
+        // LEAN-MODEL: cas-write-lease-end (Cas.WriteAbort)
         // `Cas.WriteAbort` also covers the successful lease end: the
         // protection disappears only after the writer has stopped touching bytes.
         let mut writing = self.store.writing();
@@ -987,7 +987,7 @@ impl NodeStore for Txn<'_> {
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_in(self.conn(), hash, data)
+        put_node_forgetting_memos(self.store, self.conn(), hash, data)
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1117,7 +1117,7 @@ impl NodeStore for Store {
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_in(&self.conn(), hash, data)
+        put_node_forgetting_memos(self, &self.conn(), hash, data)
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1211,7 +1211,7 @@ impl Store {
     /// a payload into place before that unlink, even when writer and sweep use
     /// independently opened Store values.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
-        // LEAN-MODEL: cas-write-lease-begin
+        // LEAN-MODEL: cas-write-lease-begin (Cas.BeginWrite)
         // `Cas.BeginWrite` models this ordered guard acquisition plus the
         // insertion into `writing`; neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
@@ -1287,11 +1287,39 @@ fn get_node_in(conn: &Connection, hash: &Hash) -> Result<Option<Vec<u8>>> {
         .optional()?)
 }
 
-fn put_node_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<()> {
-    conn.execute(
+/// Stores a node; true if it was not already held.
+fn put_node_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<bool> {
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO trie_nodes (hash, data) VALUES (?1, ?2)",
         params![hash.as_bytes().to_vec(), data],
     )?;
+    Ok(inserted > 0)
+}
+
+/// Stores a node and, if a peer ever refused that hash at some position,
+/// forgets every completeness memo.
+///
+/// A refused position is a boundary only while the node is absent
+/// (`MissingWalk::next_batch` expands a held node wherever it meets it, so a
+/// hash refused at one position and later served at another — the same
+/// subtree standing outside a grant in one trie and inside it in another —
+/// dissolves the boundary). A root memoized complete over that boundary may
+/// then reach positions below it that were never fetched, so the memo is no
+/// longer the walk's answer. The window is short (the second fetch drains the
+/// subtree) and the memo is process-local, but a stale answer picks a reference
+/// root that `prune_sound` does not cover, so it is dropped here rather than
+/// trusted. The Lean model has no step for this `put_node`
+/// (`TrieGraph.LearnNode` takes only a hash no position refused); dropping the
+/// memo is what keeps `MptGc.State.complete` the walk's answer either way.
+fn put_node_forgetting_memos(
+    store: &Store,
+    conn: &Connection,
+    hash: &Hash,
+    data: &[u8],
+) -> Result<()> {
+    if put_node_in(conn, hash, data)? && is_redacted_in(conn, hash, None)? {
+        store.complete_roots().clear();
+    }
     Ok(())
 }
 
@@ -1497,6 +1525,40 @@ mod tests {
         assert!(trie.is_complete(root).unwrap());
         assert_eq!(trie.get(root, &[7]).unwrap().unwrap(), [7u8; 200].to_vec());
         assert_eq!(trie.iter(root).unwrap().len(), 50);
+    }
+
+    /// A completeness memo may rest on a boundary — a hash a peer refused at
+    /// some position — and a boundary lasts only while the node is absent.
+    /// Holding such a node from another position dissolves it, so the memos
+    /// are dropped; holding a node nobody refused, or re-holding one already
+    /// held, keeps them.
+    #[test]
+    fn holding_a_refused_node_forgets_the_completeness_memos() {
+        let (_d, store) = testutil::store();
+        let memo = Hash::new(b"a scoped root, memoized complete");
+        let refused = Hash::new(b"a node refused above the grant");
+        let plain = Hash::new(b"a node nobody refused");
+
+        store.note_complete(&memo).unwrap();
+        store.put_node(&plain, b"node").unwrap();
+        assert!(
+            store.is_known_complete(&memo).unwrap(),
+            "a node no peer refused cannot dissolve a boundary"
+        );
+
+        store.note_redacted(&refused, &[0xa, 0xb]).unwrap();
+        store.put_node(&refused, b"node").unwrap();
+        assert!(
+            !store.is_known_complete(&memo).unwrap(),
+            "holding a refused node must forget the memos that may rest on its boundary"
+        );
+
+        store.note_complete(&memo).unwrap();
+        store.put_node(&refused, b"node").unwrap();
+        assert!(
+            store.is_known_complete(&memo).unwrap(),
+            "a node already held changes no walk"
+        );
     }
 
     /// A refusal is remembered through either handle and across a reopen
