@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use synch_core::{blob_key, file_key, normalize_native_path, now_ns, EntryKind, FileEntry, Hash};
+use synch_core::{file_key, normalize_native_path, now_ns, EntryKind, FileEntry, Hash};
 use synch_mpt::Trie;
 use synch_store::LocalFile;
 
@@ -47,7 +47,7 @@ pub struct ScanReport {
     pub expired: usize,
     /// Paths skipped because they could not be indexed, with the reason.
     pub skipped: Vec<(String, String)>,
-    /// The changes to publish.
+    /// The record changes and derived-ad refreshes to publish.
     pub staged: Vec<StagedChange>,
 }
 
@@ -252,10 +252,10 @@ impl Node {
                 .entry(self.origin(), space_id, &known)?
                 .and_then(|e| e.content);
             let tombstone = FileEntry::tombstone(now_ns(), seq, prev);
-            report.staged.push((
+            report.staged.push(StagedChange::record(
                 file_key(space_id, &known)?,
                 Some(synch_core::record::encode(&tombstone)?),
-            ));
+            )?);
             self.store().remove_local_file(space_id, &known)?;
             report.deleted += 1;
         }
@@ -310,10 +310,10 @@ impl Node {
         entry.kind = EntryKind::Symlink;
         entry.symlink_target = Some(target);
         entry.size = size;
-        report.staged.push((
+        report.staged.push(StagedChange::record(
             file_key(space_id, rel)?,
             Some(synch_core::record::encode(&entry)?),
-        ));
+        )?);
         report.hashed += 1;
 
         self.store().put_local_file(&LocalFile {
@@ -421,15 +421,10 @@ impl Node {
             self.socket_content_deployed(space_id, rel, &content);
         }
 
-        report.staged.push((
+        report.staged.push(StagedChange::record(
             file_key(space_id, rel)?,
             Some(synch_core::record::encode(&entry)?),
-        ));
-        if let Some(ad) = self.store().local_ad(&content)? {
-            report
-                .staged
-                .push((blob_key(&content), Some(synch_core::record::encode(&ad)?)));
-        }
+        )?);
 
         self.store().put_local_file(&LocalFile {
             space: space_id.to_string(),
@@ -504,14 +499,11 @@ impl Node {
         // tombstone row the expiry deleted no longer showed up to be retired.
         // Only a restart repaired it, through `reconcile_local_files`.
         let expired = self.expired_tombstone_changes()?;
-        let restated: std::collections::HashSet<&[u8]> = report
-            .staged
-            .iter()
-            .map(|(key, _)| key.as_slice())
-            .collect();
+        let restated: std::collections::HashSet<Vec<u8>> =
+            report.staged.iter().map(StagedChange::key).collect();
         let expired: Vec<StagedChange> = expired
             .into_iter()
-            .filter(|(key, _)| !restated.contains(key.as_slice()))
+            .filter(|change| !restated.contains(&change.key()))
             .collect();
         report.expired = expired.len();
         report.staged.extend(expired);
@@ -543,7 +535,10 @@ impl Node {
         let cutoff = now_ns().saturating_sub(ttl);
         let mut changes = Vec::new();
         for row in self.store().expired_tombstones(self.origin(), cutoff)? {
-            changes.push((file_key(&row.space, &row.path)?, None));
+            changes.push(StagedChange::record(
+                file_key(&row.space, &row.path)?,
+                None,
+            )?);
         }
         Ok(changes)
     }
@@ -551,9 +546,9 @@ impl Node {
     /// Reconciles published `b:` records with what this node actually holds
     /// (§6.3).
     ///
-    /// An availability ad has to be retired explicitly. The scanner stages
-    /// `blob_key(content) -> Some(ad)` on every hash and stages only `f:` keys
-    /// as `None`, so without this every content root this origin has ever
+    /// An availability ad has to be retired explicitly. Source publication
+    /// derives an ad for every live file, while deletion stages only an `f:`
+    /// change, so without this every content root this origin has ever
     /// published would stay a leaf in its trie for good — replicated to every
     /// member, pinned against trie GC by the head that reaches it, and
     /// accumulating one leaf per edit per file forever.
@@ -572,12 +567,12 @@ impl Node {
         let mut changes = Vec::new();
         for root in self.store().provider_roots_for_origin(self.origin())? {
             let published = self.store().provider_for_origin(&root, self.origin())?;
-            match self.store().local_ad(&root)? {
+            match self.publishable_local_ad(&root)? {
                 Some(local) if published.as_ref() != Some(&local) => {
-                    changes.push((blob_key(&root), Some(synch_core::record::encode(&local)?)))
+                    changes.push(StagedChange::refresh_blob(root))
                 }
                 Some(_) => {}
-                None => changes.push((blob_key(&root), None)),
+                None => changes.push(StagedChange::withdraw_blob(root)),
             }
         }
         Ok(changes)
@@ -611,7 +606,7 @@ impl Node {
         let changes: Vec<StagedChange> = self
             .expired_tombstone_changes()?
             .into_iter()
-            .filter(|(key, _)| !staged.contains(key))
+            .filter(|change| !staged.contains(&change.key()))
             .collect();
         let expired = changes.len();
         if expired > 0 {
@@ -851,7 +846,10 @@ impl Node {
                 .and_then(|entry| entry.content);
             let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
             let encoded = synch_core::record::encode(&tombstone)?;
-            self.stage([(file_key(space_id, &normalized)?, Some(encoded))]);
+            self.stage([StagedChange::record(
+                file_key(space_id, &normalized)?,
+                Some(encoded),
+            )?]);
             return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
         }
         let target = self.adoption_target(space_id, path)?;
@@ -992,16 +990,15 @@ impl Node {
         entry.unix_mode = unix_mode;
         entry.prev = previous.filter(|previous| *previous != root);
         let entry = synch_core::record::encode(&entry)?;
-        let ad = self.store().local_ad(&root)?.ok_or_else(|| {
+        self.store().local_ad(&root)?.ok_or_else(|| {
             EngineError::invalid(format!(
                 "the durable ingest of {root} produced no local advertisement"
             ))
         })?;
-        let ad = synch_core::record::encode(&ad)?;
-        self.stage([
-            (file_key(space_id, &normalized)?, Some(entry)),
-            (blob_key(&root), Some(ad)),
-        ]);
+        self.stage([StagedChange::record(
+            file_key(space_id, &normalized)?,
+            Some(entry),
+        )?]);
         Ok(())
     }
 
@@ -2549,10 +2546,7 @@ mod tests {
 
         let changes = node.ad_reconciliation_changes().unwrap();
         assert_eq!(changes.len(), 1);
-        let corrected: synch_core::BlobAd =
-            synch_core::record::decode(changes[0].1.as_ref().expect("the partial replacement ad"))
-                .unwrap();
-        assert!(!corrected.is_complete());
+        assert_eq!(changes[0].blob_refresh(), Some(root));
         node.publish(&changes).unwrap();
         assert!(!node
             .store()
@@ -2630,12 +2624,8 @@ mod tests {
             .ingest_bytes(b"b-only recovered pin".to_vec(), now_ns())
             .await
             .unwrap();
-        let ad = node.store().local_ad(&pinned.root).unwrap().unwrap();
-        node.publish(&[(
-            blob_key(&pinned.root),
-            Some(postcard::to_stdvec(&ad).unwrap()),
-        )])
-        .unwrap();
+        node.publish(&[StagedChange::refresh_blob(pinned.root)])
+            .unwrap();
         assert!(!node.store().content_is_referenced(&pinned.root).unwrap());
         node.store()
             .force_delete_blob_for_test(&pinned.root)
@@ -2881,7 +2871,7 @@ mod tests {
                 !report
                     .staged
                     .iter()
-                    .any(|(key, _)| String::from_utf8_lossy(key).contains(path)),
+                    .any(|change| String::from_utf8_lossy(&change.key()).contains(path)),
                 "no tombstone may be staged for {path}, which is still there"
             );
         }

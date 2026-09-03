@@ -39,12 +39,12 @@ a Mathlib `Set`.
 |---|---|---|
 | `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
 | `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
-| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance, `RemoveRole` and `RetireRole` among them; the row's `size` and `held` groups, `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance, `RemoveRole` and `RetireRole` among them; counted write leases; the row's `size` and `held` groups; the source's separately modelled advertised size; `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
 | `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, `pin_never_stands_on_partial`, `pinned_size_is_settled`, and the GC/delete/staged-row/partial-row corollaries |
 | `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`, `settled_size_survives_faults`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
-| `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on; `step_cells` — every cell steps or stays along any bridge step |
-| `Publication` | the bridge read along an execution (`System.Exec`): `Standing`, a source leaf that stands from one instant to another | `publication_contract` — for as long as the tree names a source's content, its holder pins it, it is available, and its size is the one recorded when it was published; `publication_flips_head`, the birth half; `published_content_keeps_its_size`, the two read together |
+| `Bridge` | the CAS/trie bridge: publication and promotion pair separately typed finite per-root traces (`PublishTxn`/`PromotionTxn`) with their head flip; only finitely many roots change | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; `source_leaf_is_own_publish` — only own publication stands a source leaf; `viewCellTxn_size` — materialization transactions do not change CAS size |
+| `Publication` | the bridge read along an execution (`System.Exec`): `Standing`, a source leaf that stands from one instant to another | `publication_contract` — for as long as the tree names a source's content, its holder pins it, it is available, and its CAS size equals the separately modelled file-entry/`BlobAd` size; `publication_flips_head`, the birth half; `published_content_keeps_its_size`, the two read together |
 | `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
 | `ScopedSync` | `Hash`, the verified trie `At`, the guarded walk `Walk` (`Reach`, `ReachRef`), `Drained`/`CompleteWithin`, the responder `Admit`/`ServeNode`/`ServeValue`/`Redacts`, a delegate's `Learn` | `At.unique`, `prune_sound`, `held_within_scope`, `held_value_within_scope`, `diff_never_misses`, `reach_or_boundary` |
 | `TrieGraph` | the multi-root trie store under a read scope, with `Complete` read as `CompleteWithin`; every `MptGc` transition at store level, `GcSweep` as mark/sweep over held nodes and their values | `gcSweep_complete_iff` — a sweep keeps a retained root exactly as complete as it was; `step_projects` and `simulates` — `MptGc` simulates the store at every root |
@@ -62,7 +62,10 @@ operator. `Invariant` is what every transition preserves — a role's pin
 stands on a durable claim; a live leaf's holder is a role with a pin or a want
 behind it — and `NoLoss` is what only the fault-free transitions preserve —
 every pin stands on available content; a source leaf is pinned, never merely
-wanted. `SystemSafety` is the fault-free closure with invariant
+wanted; and the size its source entry/`BlobAd` advertises is exactly the CAS
+row size. Write protection is a natural-number lease count, matching Rust's
+overlapping `WriteLease`s rather than treating the first drop as the end of
+every writer. `SystemSafety` is the fault-free closure with invariant
 `Invariant ∧ NoLoss`; `FaultTolerant` adds two unguarded loss steps and the
 two heals and proves `Invariant` alone survives them; `Bridge` pairs the CAS
 cells with the `MptGc` head flip.
@@ -80,6 +83,13 @@ and the pinned arm of `ReplicaPromote` — is `Durable`, which is the
 on *available* content is `NoLoss`'s work (`durable_backed`,
 `complete_backed`), not the guard's, so the fault-tolerant model admits what
 Rust admits: a publish or a pin over a claim the backend has already lost.
+
+Blob-ad publication has the same ownership boundary in code and model.
+`refresh_blob` and `withdraw_blob` are the `b:` publication intents, and
+`Node::publish` derives every positive value from the final source view and CAS
+snapshot. Either intent over an already-live source recomputes its required
+complete ad and stutters in `Cas`, while standing a new source is exactly
+`SourcePublish`; non-source provider ads are erased by this safety abstraction.
 
 Two transitions retire a role. `RemoveRole` is `remove_source`: the holder's
 pins and wants go under `Unpin`'s and `DropWant`'s guard, so a hold behind an
@@ -102,15 +112,17 @@ reads the bridged system along an execution and states what the design
 promises of a publication: `publication_contract` says that from any instant
 a source leaf stands until any later instant it still stands, the holder pins
 the content, the content is available, and the size the row records is the
-size it recorded at the first instant — whatever a peer claims, whatever the
-cache evicts, whatever a sweep or another node's promotion does in between.
+size written into the source file entry and complete `BlobAd` — whatever a
+peer claims, whatever the cache evicts, whatever a sweep or another node's
+promotion does in between.
 `publication_flips_head` is the birth: the step that stood the leaf committed
 an active, materialized head. It is composed, not proved afresh, from
-`Bridge.source_leaf_flips_head`, the fault-free invariant, and
-`Cas.settled_size_is_stable` chained instant to instant; `Node::publish`
-carries the anchor. Under faults the leaf keeps a durable claim or a want and
-the row its size (`FaultTolerant.settled_size_survives_faults`); what a loss
-takes is availability, until the heal and the refetch.
+`Bridge.source_leaf_flips_head`, the fault-free invariant,
+`Cas.settled_size_is_stable`, and `Bridge.viewCellTxn_size` chained instant to
+instant; `Node::publish` carries the anchor. Under faults the leaf keeps a
+durable claim or a want and the row its size
+(`FaultTolerant.settled_size_survives_faults`); what a loss takes is
+availability, until the heal and the refetch.
 
 ### Partial rows and the size a row records
 

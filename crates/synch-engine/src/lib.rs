@@ -44,7 +44,7 @@ pub use error::{EngineError, Result};
 pub use fetcher::{PreparedRange, Provider};
 pub use lifecycle::{LifecycleLock, LIFECYCLE_FILE};
 pub use membership::{DomainHealth, DomainRefresh, ResolverStatus};
-pub use node::Node;
+pub use node::{Node, StagedChange};
 pub use publisher::Publisher;
 pub use reconcile::{FetchOutcome, Promotion, Syncer};
 pub use recovery::RecoveryOptions;

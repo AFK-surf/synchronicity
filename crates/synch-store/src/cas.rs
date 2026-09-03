@@ -32,6 +32,19 @@ use crate::{
 };
 
 impl Txn<'_> {
+    /// Reads the local CAS row from this transaction's snapshot.
+    pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
+        let row = self
+            .conn()
+            .query_row(
+                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
+                params![root.as_bytes().to_vec()],
+                raw_blob_row,
+            )
+            .optional()?;
+        row.map(blob_row_from).transpose()
+    }
+
     /// Verifies durable possession and installs the source hold used by the
     /// publication transaction.
     pub fn hold_source_blob(&self, space: &str, root: &Hash, size: u64, now: i64) -> Result<()> {
@@ -100,6 +113,33 @@ impl Txn<'_> {
             ],
         )?;
         Ok(())
+    }
+
+    /// Returns the durable size of `root` when this node's materialized view
+    /// still has a configured source entry naming it. Publication reads this
+    /// after applying a proposed trie diff and derives the publisher-owned
+    /// `b:` value from that final view.
+    pub fn live_source_blob_size(
+        &self,
+        origin: &synch_core::OriginId,
+        root: &Hash,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT b.size
+                   FROM entries e
+                   JOIN sources s ON s.space = e.space
+                   JOIN blobs b ON b.root = e.content
+                  WHERE e.origin_id = ?1
+                    AND e.content = ?2
+                    AND e.size = b.size
+                    AND b.durable != 0
+                  LIMIT 1",
+                params![origin.canonical(), root.as_bytes().to_vec()],
+                |row| Ok(row.get::<_, i64>(0)? as u64),
+            )
+            .optional()?)
     }
 }
 
@@ -341,7 +381,7 @@ impl BlobRow {
     }
 
     /// The advertisement this holder should publish for the object (§6.3).
-    pub(crate) fn to_ad(&self) -> BlobAd {
+    pub fn to_ad(&self) -> BlobAd {
         if self.complete || self.durable {
             return BlobAd::complete(self.size);
         }
@@ -930,7 +970,12 @@ impl Store {
                     root,
                     size,
                     complete,
-                    bitmap: (!complete).then(|| ranges_to_blob(&verified)),
+                    // `NULL` is the canonical spelling of "no verified
+                    // groups".  Besides saving an allocation, the missing-
+                    // durable heal uses that spelling to distinguish a cold
+                    // row with no cache payload from a partial cache worth
+                    // retaining.
+                    bitmap: (!complete && !verified.is_empty()).then(|| ranges_to_blob(&verified)),
                     inline,
                     now,
                     durable,
@@ -2222,6 +2267,27 @@ mod tests {
         assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
         assert!(!store.reconcile_scratch_generation("first").unwrap());
 
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+        assert!(store.blob(&root).unwrap().is_none());
+    }
+
+    /// An empty verified set has one database spelling: `bitmap IS NULL`.
+    /// `HealRemote` reads that spelling as a cold row and removes it after the
+    /// backend withdraws durability, matching the Lean `held = ∅` branch.
+    #[test]
+    fn an_empty_group_commit_is_removed_by_the_remote_heal() {
+        let (_dir, store) = crate::testutil::store();
+        let root = Hash::new(b"proof-only row");
+        let size = 4 * CHUNK_GROUP_SIZE;
+
+        store
+            .commit_groups(&root, size, &ChunkRanges::empty(), None, 0)
+            .unwrap();
+        let cold = store.blob(&root).unwrap().unwrap();
+        assert!(cold.bitmap.is_none());
+        assert!(cold.verified_groups().is_empty());
+
+        store.adopt_durable_blob(&root, size, 1).unwrap();
         assert!(store.heal_missing_durable_blob(&root).unwrap());
         assert!(store.blob(&root).unwrap().is_none());
     }

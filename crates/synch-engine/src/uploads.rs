@@ -578,7 +578,10 @@ impl Node {
                 .await?
             };
             let encoded = synch_core::record::encode(&tombstone)?;
-            self.stage([(synch_core::file_key(space, path)?, Some(encoded))]);
+            self.stage([crate::node::StagedChange::record(
+                synch_core::file_key(space, path)?,
+                Some(encoded),
+            )?]);
             self.flush_staged().await?;
         }
 

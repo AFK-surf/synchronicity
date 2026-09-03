@@ -1767,6 +1767,44 @@ mod tests {
         conn
     }
 
+    /// v28 makes the remote-loss heal's SQL spelling agree with the semantic
+    /// empty set read from databases written by earlier versions.
+    #[test]
+    fn v28_normalizes_encoded_empty_blob_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Hash::new(b"encoded empty ranges");
+        {
+            let conn = database_at(dir.path(), 27);
+            let encoded = crate::cas::ranges_to_blob(&synch_core::ChunkRanges::empty());
+            conn.execute(
+                "INSERT INTO blobs
+                   (root, size, complete, bitmap, inline, last_access, durable)
+                 VALUES (?1, ?2, 0, ?3, NULL, 0, 1)",
+                params![
+                    root.as_bytes().to_vec(),
+                    4 * synch_core::CHUNK_GROUP_SIZE,
+                    encoded
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .conn()
+                .query_row(
+                    "SELECT bitmap FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert!(store.heal_missing_durable_blob(&root).unwrap());
+        assert!(store.blob(&root).unwrap().is_none());
+    }
+
     /// A v2 database — the oldest layout still real — upgrades with its durable
     /// data intact, moves gateway configuration, and preserves old observations
     /// without inventing claimants for them.

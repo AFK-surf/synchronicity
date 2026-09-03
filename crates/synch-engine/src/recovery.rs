@@ -616,10 +616,11 @@ mod tests {
             .unwrap();
         let root = node.store().ingest_bytes(b"payload", 0).unwrap();
         let entry = synch_core::FileEntry::file(7, 0, root, 1);
-        (
+        crate::node::StagedChange::record(
             synch_core::file_key("s", "a.txt").unwrap(),
             Some(postcard::to_stdvec(&entry).unwrap()),
         )
+        .unwrap()
     }
 
     fn nas() -> OriginId {

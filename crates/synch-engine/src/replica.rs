@@ -640,7 +640,10 @@ impl Node {
                 complete: coverage.wanted == 0 && coverage.held > 0,
             };
             let bytes = synch_core::record::encode(&claim)?;
-            out.push((synch_core::replica_claim_key(&space.space)?, Some(bytes)));
+            out.push(crate::node::StagedChange::record(
+                synch_core::replica_claim_key(&space.space)?,
+                Some(bytes),
+            )?);
             claimed.insert(space.space.clone());
         }
         // Withdraw a claim over a space this node has stopped replicating. The
@@ -648,7 +651,10 @@ impl Node {
         // configuration no longer remembers the space at all.
         for space in self.published_claim_spaces()? {
             if !claimed.contains(&space) {
-                out.push((synch_core::replica_claim_key(&space)?, None));
+                out.push(crate::node::StagedChange::record(
+                    synch_core::replica_claim_key(&space)?,
+                    None,
+                )?);
             }
         }
         Ok(out)
@@ -675,9 +681,12 @@ impl Node {
     pub(crate) fn material_claim_changes(&self) -> Result<Vec<crate::node::StagedChange>> {
         let mut out = Vec::new();
         for change in self.replica_claim_changes()? {
-            let space = synch_core::parse_replica_claim_key(&change.0)?;
+            let (key, value) = change
+                .as_record()
+                .expect("replica claims are ordinary records");
+            let space = synch_core::parse_replica_claim_key(key)?;
             let published = self.replica_claim_of(self.origin(), &space)?;
-            let material = match (&change.1, &published) {
+            let material = match (value, &published) {
                 // A claim appearing, or being withdrawn: always material.
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
