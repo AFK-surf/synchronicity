@@ -1556,12 +1556,15 @@ mod tests {
         assert_eq!(row.content, Some(Hash::new(&payload)));
         assert_eq!(&row.origin, node.origin());
 
-        // A second write with `if_match` on the stale root loses, and nothing
-        // is published; on the current root it wins.
-        for (expected, want_ok) in [(Hash::new(b"stale"), false), (Hash::new(&payload), true)] {
+        // A write with `if_match` on the stale root loses and publishes
+        // nothing; the next, with the next request id and current root, wins.
+        for (request_id, expected, want_ok) in [
+            (2, Hash::new(b"stale"), false),
+            (3, Hash::new(&payload), true),
+        ] {
             let body = b"v2".to_vec();
             down.send(down_msg(&Down::Put {
-                id: 2,
+                id: request_id,
                 space: "docs".into(),
                 path: "q3/report.pdf".into(),
                 size: body.len() as u64,
@@ -1570,10 +1573,11 @@ mod tests {
                 if_none_match: false,
             }))
             .unwrap();
-            assert!(matches!(next_up(&mut up).await, Up::Opened { id: 2, .. }));
-            down.send(Message::binary(encode_chunk(2, 0, &body)))
+            assert!(matches!(next_up(&mut up).await, Up::Opened { id, .. } if id == request_id));
+            down.send(Message::binary(encode_chunk(request_id, 0, &body)))
                 .unwrap();
-            down.send(down_msg(&Down::Commit { id: 2 })).unwrap();
+            down.send(down_msg(&Down::Commit { id: request_id }))
+                .unwrap();
             let answer = loop {
                 match next_up(&mut up).await {
                     Up::Credit { .. } => continue,
@@ -1584,10 +1588,10 @@ mod tests {
                 (
                     false,
                     Up::Err {
-                        id: Some(2), code, ..
+                        id: Some(id), code, ..
                     },
-                ) => assert_eq!(code, "precondition"),
-                (true, Up::Committed { id: 2, .. }) => {}
+                ) if id == request_id => assert_eq!(code, "precondition"),
+                (true, Up::Committed { id, .. }) if id == request_id => {}
                 (_, other) => panic!("unexpected answer {other:?}"),
             }
         }
