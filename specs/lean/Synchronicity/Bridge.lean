@@ -99,25 +99,25 @@ theorem gc_cannot_create_promised_missing
   ((reachable_invariant reachable).1 root).2.pin_available holder pinned
 
 /-- Publication commits, for every root it changes, an entry, the publisher's
-pin and available content, together with an active, materialized head. -/
+pin and a durable claim, together with an active, materialized head. -/
 theorem source_publish_commits_one_closed_state {cas' : Cas.State H} {mpt' : MptGc.State}
     (casStep : Across (SourcePublish holder).rel s.cas cas')
     (mptStep : MptGc.OwnPublish.rel s.mpt mpt') (changed : cas' root ≠ s.cas root) :
-    (cas' root).entry ∧ holder ∈ (cas' root).pin ∧ Available (cas' root) ∧
+    (cas' root).entry ∧ holder ∈ (cas' root).pin ∧ Durable (cas' root) ∧
       mpt'.active ∧ mpt'.materialized :=
   let casClosed := Cas.source_publish_is_closed (casStep.changed changed)
   let mptClosed := MptGc.own_publish_is_atomic mptStep
   ⟨casClosed.1, casClosed.2.1, casClosed.2.2, mptClosed.1, mptClosed.2.2.2⟩
 
 /-- Promotion commits, for every root it changes, an entry and either the
-replica's pin over available content or its want, together with an active,
+replica's pin over a durable claim or its want, together with an active,
 materialized head. -/
 theorem replica_promotion_commits_pin_or_want {pinned : Bool} {cas' : Cas.State H}
     {mpt' : MptGc.State}
     (casStep : Across (ReplicaPromote holder pinned).rel s.cas cas')
     (mptStep : MptGc.Promote.rel s.mpt mpt') (changed : cas' root ≠ s.cas root) :
     (cas' root).entry ∧
-      ((holder ∈ (cas' root).pin ∧ Available (cas' root)) ∨ holder ∈ (cas' root).want) ∧
+      ((holder ∈ (cas' root).pin ∧ Durable (cas' root)) ∨ holder ∈ (cas' root).want) ∧
       mpt'.active ∧ mpt'.materialized :=
   let casClosed := Cas.replica_promotion_is_total (casStep.changed changed)
   let mptClosed := MptGc.promotion_is_atomic mptStep

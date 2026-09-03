@@ -303,10 +303,12 @@ def DropEntry : Transition (Cell H) where
   guard c := ¬AnyLive c
   post c := { c with entry := False }
 
-/-- `cas.rs::Store::pin`. -/
+/-- `cas.rs::Store::pin`.  The predicate is `durable` alone: a pin is a
+promise about the durable tier, and under `NoLoss` a durable claim is backed
+by a remote copy or a complete row, so the pin stands on available content. -/
 @[transition, rust_impl "cas-pin"]
 def Pin (holder : H) : Transition (Cell H) where
-  guard c := ¬c.sweeping ∧ Available c
+  guard c := ¬c.sweeping ∧ Durable c
   post c := { c with pin := insert holder c.pin }
 
 /-- `cas.rs::Store::unpin`. -/
@@ -325,11 +327,36 @@ def DropWant (holder : H) : Transition (Cell H) where
   guard c := holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive
   post c := { c with want := c.want \ {holder} }
 
-/-- `replica.rs::take_possession`. -/
+/-- `replica.rs::take_possession`, with `Store::pin`'s predicate. -/
 @[transition, rust_impl "cas-take-possession"]
 def TakePossession (holder : H) : Transition (Cell H) where
-  guard c := ¬c.sweeping ∧ holder ∈ c.want ∧ Available c
+  guard c := ¬c.sweeping ∧ holder ∈ c.want ∧ Durable c
   post c := { c with pin := insert holder c.pin, want := c.want \ {holder} }
+
+/-- `views.rs::Store::remove_source`: a source role goes, and with it every
+pin and want of its holder that no live leaf stands on.  Per root this is
+`Unpin` and `DropWant` under their own guard, which the Rust carries as the
+entry check on both deletes: a hold behind an entry the tree still names
+survives the role. -/
+@[transition, rust_impl "cas-remove-source-role"]
+def RemoveRole (holder : H) : Transition (Cell H) where
+  guard c := holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive
+  post c := { c with pin := c.pin \ {holder}, want := c.want \ {holder} }
+
+/-- `views.rs::Store::remove_replica`: a replica role retires.  Its holder
+ceases to exist, so the leaves it stood behind are no longer any role's, and
+its pins and wants go with it, whatever the tree still names — the operator
+chose this, and `pin_held` is the choice to keep the content as the
+operator's own pins instead.  The entry rows stay, which is what keeps the
+content from collection (`Collectable.no_entry`). -/
+@[transition, rust_impl "cas-remove-replica-role"]
+def RetireRole (holder : H) : Transition (Cell H) where
+  guard _ := True
+  post c := { c with
+    pin := c.pin \ {holder}
+    want := c.want \ {holder}
+    sourceLive := c.sourceLive \ {holder}
+    replicaLive := c.replicaLive \ {holder} }
 
 /-- `cas.rs::delete_blob_if_collectable`, the row commit. -/
 @[transition, rust_impl "cas-gc-row-commit"]
@@ -364,10 +391,10 @@ theorem write_lease_excludes_gc (writing : c.writing) (hgc : GcCommit.rel c c') 
   gc_respects_protection hgc (Or.inr (Or.inr writing))
 
 theorem possession_is_atomic (h : (TakePossession holder).rel c c') :
-    holder ∈ c'.pin ∧ holder ∉ c'.want ∧ Available c' := by
+    holder ∈ c'.pin ∧ holder ∉ c'.want ∧ Durable c' := by
   simp only [transition] at h
-  obtain ⟨⟨_, _, available⟩, rfl⟩ := h
-  exact ⟨Set.mem_insert _ _, fun w => w.2 rfl, available⟩
+  obtain ⟨⟨_, _, durable⟩, rfl⟩ := h
+  exact ⟨Set.mem_insert _ _, fun w => w.2 rfl, durable⟩
 
 /-- An ingest leaves a complete row with its bytes on disk. -/
 theorem commit_complete_is_complete {durable : Bool} {size : Nat}
@@ -409,21 +436,23 @@ theorem initial_noLoss : NoLoss ({} : Cell H) :=
 
 variable [Roles H]
 
-/-- `node.rs::Node::publish`. -/
+/-- `node.rs::Node::publish`: `hold_source_blob` pins a durable row of the
+entry's size, in the transaction that stands the leaf. -/
 @[transition, rust_impl "cas-source-publish"]
 def SourcePublish (holder : H) : Transition (Cell H) where
-  guard c := IsRole holder ∧ ¬c.sweeping ∧ Available c
+  guard c := IsRole holder ∧ ¬c.sweeping ∧ Durable c
   post c := { c with
     entry := True
     pin := insert holder c.pin
     want := c.want \ {holder}
     sourceLive := insert holder c.sourceLive }
 
-/-- `reconcile.rs::try_promote`: a replica leaf takes a pin over available
-content (`pinned`), or records a want when the content is not available. -/
+/-- `reconcile.rs::try_promote`, the `content_wants` decision under
+`materialize_diff`: a replica leaf takes a pin over a durable row (`pinned`),
+or records a want when the row is not durable. -/
 @[transition, rust_impl "cas-remote-promotion"]
 def ReplicaPromote (holder : H) (pinned : Bool) : Transition (Cell H) where
-  guard c := IsRole holder ∧ ¬c.sweeping ∧ (pinned ↔ Available c)
+  guard c := IsRole holder ∧ ¬c.sweeping ∧ (pinned ↔ Durable c)
   post c := { c with
     entry := True
     pin := if pinned then insert holder c.pin else c.pin
@@ -431,13 +460,13 @@ def ReplicaPromote (holder : H) (pinned : Bool) : Transition (Cell H) where
     replicaLive := insert holder c.replicaLive }
 
 theorem source_publish_is_closed (h : (SourcePublish holder).rel c c') :
-    c'.entry ∧ holder ∈ c'.pin ∧ Available c' := by
+    c'.entry ∧ holder ∈ c'.pin ∧ Durable c' := by
   simp only [transition] at h
-  obtain ⟨⟨_, _, available⟩, rfl⟩ := h
-  exact ⟨trivial, Set.mem_insert _ _, available⟩
+  obtain ⟨⟨_, _, durable⟩, rfl⟩ := h
+  exact ⟨trivial, Set.mem_insert _ _, durable⟩
 
 theorem replica_promotion_is_total {pinned : Bool} (h : (ReplicaPromote holder pinned).rel c c') :
-    c'.entry ∧ ((holder ∈ c'.pin ∧ Available c') ∨ holder ∈ c'.want) := by
+    c'.entry ∧ ((holder ∈ c'.pin ∧ Durable c') ∨ holder ∈ c'.want) := by
   simp only [transition] at h
   obtain ⟨⟨_, _, hpinned⟩, rfl⟩ := h
   cases pinned with
@@ -458,7 +487,7 @@ inductive Kind (H : Type) where
   | removeSource (holder : H) | removeReplica (holder : H) | removeOrdinary (holder : H)
   | dropEntry
   | pin (holder : H) | unpin (holder : H) | expirePin (holder : H) | dropWant (holder : H)
-  | takePossession (holder : H)
+  | takePossession (holder : H) | removeRole (holder : H) | retireRole (holder : H)
   | gcCommit | gcUnlink | protectedDelete
 
 /-- The transition each kind names. -/
@@ -485,6 +514,8 @@ def Trans : Kind H → Transition (Cell H)
   | .expirePin holder => ExpirePin holder
   | .dropWant holder => DropWant holder
   | .takePossession holder => TakePossession holder
+  | .removeRole holder => RemoveRole holder
+  | .retireRole holder => RetireRole holder
   | .gcCommit => GcCommit
   | .gcUnlink => GcUnlink
   | .protectedDelete => ProtectedDelete
@@ -515,8 +546,9 @@ def LiveClaim (c : Cell H) (holder : H) : Prop :=
   IsRole holder ∧ c.entry ∧ ((holder ∈ c.pin ∧ Durable c) ∨ holder ∈ c.want)
 
 /-- What survives everything, backend loss included.  Compared with `NoLoss`
-above: `Available` is `Durable`, the pin clause covers only roles, and a
-source leaf may be wanted rather than pinned. -/
+above: a pin stands on a durable claim rather than available content, the pin
+clause covers only roles, and a source leaf may be wanted rather than
+pinned. -/
 structure Invariant (c : Cell H) : Prop where
   /-- A role's pin stands on a durable claim. -/
   role_pin_durable : ∀ holder, IsRole holder → holder ∈ c.pin → Durable c

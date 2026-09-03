@@ -1434,7 +1434,7 @@ impl Store {
             // for a partial fetch too, and on a cloud backend a complete row
             // is only a scratch copy until the backend has taken it
             // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `Cas.Available`
+            // predicate is `durable` alone, which is `Cas.Durable`
             // and the fact the whole GC argument rests on: every path that
             // drops a staged row without consulting `pins` — cache eviction,
             // a scratch-generation reset, a backend migration — is safe only

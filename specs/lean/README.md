@@ -39,7 +39,7 @@ a Mathlib `Set`.
 |---|---|---|
 | `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
 | `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
-| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; the row's `size` and `held` groups, `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance, `RemoveRole` and `RetireRole` among them; the row's `size` and `held` groups, `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
 | `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, `pin_never_stands_on_partial`, `pinned_size_is_settled`, and the GC/delete/staged-row/partial-row corollaries |
 | `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`, `settled_size_survives_faults`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
@@ -73,6 +73,23 @@ actual holder and content root, so a claim for one root cannot discharge a
 leaf for another. A *staged* row (`durable = 0`) may be dropped without
 consulting pins; `staged_row_is_reachable` witnesses that the branch is live
 and `staged_row_drop_is_unpinned` why it is safe.
+
+Every guard that grants a pin — `Pin`, `TakePossession`, `SourcePublish`,
+and the pinned arm of `ReplicaPromote` — is `Durable`, which is the
+`durable != 0` predicate Rust checks and nothing more. That a pin then stands
+on *available* content is `NoLoss`'s work (`durable_backed`,
+`complete_backed`), not the guard's, so the fault-tolerant model admits what
+Rust admits: a publish or a pin over a claim the backend has already lost.
+
+Two transitions retire a role. `RemoveRole` is `remove_source`: the holder's
+pins and wants go under `Unpin`'s and `DropWant`'s guard, so a hold behind an
+entry the tree still names survives — the engine tombstones the space first,
+and the guard makes that an invariant of the store rather than a convention
+of its callers. `RetireRole` is `remove_replica`: the holder ceases, the
+leaves it stood behind are no longer any role's, and its pins and wants go
+whatever the tree names, which is the operator's choice (`pin_held` is the
+choice to keep the content under operator pins). The entry rows stay either
+way, and `Collectable.no_entry` is what keeps the content from collection.
 
 `FaultTolerant` does not model that a heal ever runs, that a want is ever
 satisfied, or that the backend's `NotFound` is true — a spurious one triggers

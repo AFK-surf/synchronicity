@@ -43,8 +43,8 @@ theorem protected_delete_cannot_delete_pinned
   delete.1.no_pin ⟨holder, pinned⟩
 
 /-- The paths that drop a staged row never consult `pins`.  They do not need
-to: a pin is only ever granted over available, hence durable, content, so a
-non-durable row is unpinned in every fault-free state. -/
+to: a pin is only ever granted over a durable claim, so a non-durable row is
+unpinned in every fault-free state. -/
 theorem staged_row_drop_is_unpinned
     (hnl : NoLoss c) (drop : DropStaged.rel c c') (pinned : holder ∈ c.pin) : False :=
   drop.1.1 (hnl.pin_available holder pinned).2.1
@@ -131,22 +131,22 @@ theorem protected_delete_cannot_delete_live_content
   · exact delete.1.no_entry (hinv.replica_live holder replica).2.1
   · exact delete.1.no_entry (hinv.ordinary_live holder ordinary)
 
-/-- Promoting a replica leaf over content that is not available records a want
-and never a pin, whatever took the content away — a GC pass that ran before
-the promotion included.  Under `NoLoss` no pin stands over unavailable
-content, so the promoted cell carries none for this holder. -/
+/-- Promoting a replica leaf over content with no durable claim records a want
+and never a pin, whatever took the claim away — a GC pass that ran before
+the promotion included.  Under `NoLoss` no pin stands without one, so the
+promoted cell carries none for this holder. -/
 theorem replica_promote_unavailable_records_want {pinned : Bool}
     (hnl : NoLoss c) (promote : (ReplicaPromote holder pinned).rel c c')
-    (unavailable : ¬Available c) :
+    (undurable : ¬Durable c) :
     holder ∈ c'.replicaLive ∧ holder ∈ c'.want ∧ holder ∉ c'.pin := by
   simp only [transition] at promote
   obtain ⟨⟨_, _, hpinned⟩, rfl⟩ := promote
   have : pinned = false := by
     cases pinned
     · rfl
-    · exact absurd (hpinned.mp rfl) unavailable
+    · exact absurd (hpinned.mp rfl) undurable
   subst this
-  exact ⟨by simp, by simp, fun pinned => unavailable (hnl.pin_available holder pinned)⟩
+  exact ⟨by simp, by simp, fun pinned => undurable (hnl.pin_available holder pinned).durable⟩
 
 /-- A staged row is a reachable state, not a dead branch: a complete commit
 under a backend that does not make completion durable leaves a row that
