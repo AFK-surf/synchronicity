@@ -80,7 +80,9 @@ live source leaf names available content and every live replica leaf names
 either pinned available content or a want for that same holder and root. It
 covers protection removal as well as acquisition, protected explicit deletion,
 writer abort, cache eviction, the staged (non-durable) commit and the
-unprotected removal of such rows, and the two GC phases. The CAS/trie bridge
+unprotected removal of such rows, partial rows — the groups a row holds, the
+size it records, and the settlement that lets a claimed size yield and a
+durable or attested one stand — and the two GC phases. The CAS/trie bridge
 (`Bridge`) pairs each publication and promotion with its head flip across every
 content root the transaction touches, on that same system model. Under backend loss, the surviving theorem is that
 a role's pin stands on content that is available or that the backend lost and

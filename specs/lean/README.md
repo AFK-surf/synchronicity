@@ -37,9 +37,9 @@ a Mathlib `Set`.
 |---|---|---|
 | `Prelude` | `System`, `Reachable`, `Invariant`, `Transition`, `Lift`, `Across` | `Invariant.reachable`, `Reachable.simulate`, `Lift.forall`/`Across.forall` |
 | `Anchors` | the `rust_impl` and `rust_justifies` attributes; the `transition` simp set | — |
-| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
-| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, and the GC/delete/staged-row corollaries |
-| `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
+| `Cas` | the cell transitions (`Kind`, `Trans`, `CellStep`, `LocalStep`) over a cell indexed by holder `H` with a `Roles` instance; the row's `size` and `held` groups, `Complete`, `Attested`, `Settles` and `settleHeld`; `Invariant`, `NoLoss` | `invariant_step`, `noLoss_step` — the only case-by-case preservation proofs, four lines each; `settled_size_is_stable`, `dropped_bit_was_a_claim`, `carried_bit_shares_tree`; `sourcePublish_of_new_leaf`, `replicaPromote_of_new_leaf`, `flipsHead_of_new_leaf` |
+| `SystemSafety` | the fault-free closure over a store of cells, invariant `Invariant ∧ NoLoss`; the `Holder` instance with the operator distinguished | `source_live_content_is_available`, `replica_live_content_is_pin_or_want`, `pin_never_stands_on_partial`, `pinned_size_is_settled`, and the GC/delete/staged-row/partial-row corollaries |
+| `FaultTolerant` | `LoseRemote`, `LoseBytes`, `HealRemote`, `HealLocal` added to the same cells | `Invariant` alone survives: `role_pin_is_available_or_lost`, `heal_converts_role_pins`, `heal_keeps_operator_pin`, `settled_size_survives_faults`; `fault_free_is_reachable` embeds every `SystemSafety` execution; the operator theorems read at `Holder` |
 | `MptGc` | one trie root as five bits and nine transitions, `Prune` and `Supersede` included | `Invariant`: an active head is retained, complete and materialized, a pending head is retained, only an active head is materialized |
 | `Bridge` | the CAS/trie bridge: publication and promotion paired with the head flip they share a transaction with, across every root the transaction touches (`Across`) | `live_leaf_flips_head` — no step stands a new source or replica leaf without an active, materialized head; the `LocalStep` guard on free CAS steps is what this rests on |
 | `Scope` | `AdmitsPath`, `ContainsSubtree`, `AdmitsKey` over nibble paths | the spine lemma `admitsPath_of_append`, `containsSubtree_append`, `admitsPath_of_admitsKey` |
@@ -74,6 +74,37 @@ and `staged_row_drop_is_unpinned` why it is safe.
 `FaultTolerant` does not model that a heal ever runs, that a want is ever
 satisfied, or that the backend's `NotFound` is true — a spurious one triggers
 a heal that errs in the safe direction, a pin becoming a want and a refetch.
+
+### Partial rows and the size a row records
+
+A row need not be complete. A cell carries the `size` its row records and
+the set of groups it `held`, and `Complete` reads the row as
+`cas.rs::read_claim` does: every group of the row's own size. Every writer of
+verified groups — a peer slice, a delta proof, a promotion, a cloud cache
+refill — is one `CommitGroups`, and an ingest is `CommitComplete`, the same
+commit of every group at once, which is why `Store::commit_complete` calls
+`commit_groups` over the full range rather than writing the row itself.
+
+Until the final group is held the size is a claim off an entry rather than a
+fact (`Attested` is `size_is_attested`), and `Settles` is `settle_size` as the
+guard on every commit: a durable or attested size must agree, an unsettled one
+yields, and `settleHeld` keeps the bits already held only when the group count
+did not move. Two theorems say what that buys. `settled_size_is_stable`: no
+step of the model leaves a row standing under a different size once its size
+is durable or attested — the refusal in `settle_size` — and
+`settled_size_survives_faults` extends it to the losses and heals.
+`dropped_bit_was_a_claim`: a bit a commit drops was verified under a size that
+was neither durable nor attested, so what the reset costs is a re-fetch of a
+claim, never a fact (`docs/DELTA-SYNC.md` §6). `Invariant.held_within_size`
+is the invariant the reset keeps — the bitmap always describes the tree of
+the size the row records — and `NoLoss.durable_backed` with
+`SystemSafety.pin_never_stands_on_partial` is `Store::pin`'s comment as a
+theorem: a pin stands over a complete row or a remote copy, never over a
+partial fetch. `partial_row_is_reachable` witnesses that the branch is live.
+
+Not modelled: what the groups contain. A group is verified or it is not; the
+bao tree, the bracket argument for why a proof can verify under an overstated
+size, and the inline representation of small objects are trusted.
 
 ## mptsync over partial tries
 

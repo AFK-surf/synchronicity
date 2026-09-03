@@ -39,27 +39,28 @@ def LoseBytes : Transition (Cell H) where
   post c := { c with bytes := False }
 
 /-- `cas.rs::Store::heal_missing_durable_blob`.  The backend answered
-`NotFound` for a durable root.  The durable claim is withdrawn, a row with
-nothing cached goes with it, every role's pin becomes a repair want, and the
-operator's pin is left standing.  Unguarded on the loss itself: the heal
-believes the backend, and a spurious answer costs a refetch rather than a
-promise. -/
+`NotFound` for a durable root.  The durable claim is withdrawn, a row holding
+no group goes with it, a row holding some stays as the partial cache it is,
+every role's pin becomes a repair want, and the operator's pin is left
+standing.  Unguarded on the loss itself: the heal believes the backend, and a
+spurious answer costs a refetch rather than a promise. -/
 @[transition, rust_impl "cas-heal-missing-durable"]
 def HealRemote : Transition (Cell H) where
   guard c := c.durable
   post c := { c with
     durable := False
-    row := c.row ∧ c.bytes
+    row := c.row ∧ ∃ g, g ∈ c.held
     pin := {holder ∈ c.pin | ¬IsRole holder}
     want := c.want ∪ {holder ∈ c.pin | IsRole holder} }
 
 /-- `cas.rs::Store::heal_missing_local_blob`.  A local read found the payload
-missing or short.  The complete and durable claims are withdrawn, the row
-stays, and pins convert as above. -/
+missing or short.  The row stays and forgets what it held, the durable claim
+is withdrawn, and pins convert as above. -/
 @[transition, rust_impl "cas-heal-missing-local"]
 def HealLocal : Transition (Cell H) where
   guard c := c.row
   post c := { c with
+    held := ∅
     bytes := False
     durable := False
     pin := {holder ∈ c.pin | ¬IsRole holder}
@@ -80,10 +81,23 @@ theorem fault_invariant_step (hinv : Cas.Invariant c) (hstep : FaultStep c c') :
   cases hstep with
   | cell step => exact invariant_step hinv step
   | _ h =>
-    obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
+    obtain ⟨pins, sources, replicas, ordinary, sweepInv, heldRow, heldSize⟩ := hinv
     simp only [transition] at h
     obtain ⟨hg, rfl⟩ := h
     constructor <;> grind [LiveClaim, Durable]
+
+/-- Neither a loss nor a heal moves a row's size, so `Cas.settled_size_is_stable`
+holds of every step of this model too. -/
+theorem settled_size_survives_faults (h : FaultStep c c') (row : c.row) (settled : Settled c)
+    (row' : c'.row) : c'.size = c.size := by
+  cases h with
+  | cell step =>
+    obtain ⟨k, step⟩ := step
+    exact settled_size_is_stable step row settled row'
+  | _ h =>
+    simp only [transition] at h
+    obtain ⟨_, rfl⟩ := h
+    rfl
 
 /-- Every cell satisfies `Cas.Invariant`. -/
 def SystemInvariant (s : State H) : Prop := ∀ root, Cas.Invariant (s root)

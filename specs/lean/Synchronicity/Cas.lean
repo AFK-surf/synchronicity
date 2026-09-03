@@ -3,12 +3,13 @@ import Synchronicity.Prelude
 /-!
 The CAS transition system, stated once.
 
-`Cell H` is one content root as the store sees it: its row, bytes and durable
-claim, the entry that names it, and the pins, wants and live leaves indexed by
-holder `H`.  Every transition is a `Transition`, a guard and a successor, and
-a named Rust linearization point carried by the `rust_impl` attribute on its
+`Cell H` is one content root as the store sees it: its row — the size it
+records and the groups it claims verified — its bytes and durable claim, the
+entry that names it, and the pins, wants and live leaves indexed by holder
+`H`.  Every transition is a `Transition`, a guard and a successor, and a named
+Rust linearization point carried by the `rust_impl` attribute on its
 definition.  Where the code has two outcomes — a complete commit that is or is
-not durable, a promotion that pins or wants, — the outcome is a parameter of
+not durable, a promotion that pins or wants — the outcome is a parameter of
 the transition, so that each is still one guarded deterministic step.  `Kind`
 names the transitions with their parameters, `Trans` gives each its
 `Transition`, and `CellStep` is their union.  The models that read this file
@@ -18,11 +19,24 @@ differ only in `H` and in which steps they close over:
   from the roles a space configures;
 - `FaultTolerant` adds backend loss and the heals, over the same cells.
 
+A row need not be complete.  A peer slice, a delta proof or a cloud cache
+refill commits the groups it verified into the row's bitmap (`CommitGroups`),
+and an ingest is the same commit of every group at once (`CommitComplete`).
+Until the final group is held the size the row records is a claim off an
+entry rather than a fact (`Attested`), and `Settles` is the rule every commit's
+size claim meets: a durable or attested size stands and a claim yields, taking
+the held bits with it when it moves the group count.  `settled_size_is_stable`
+is what that buys — no step moves the size of a durable or attested row — and
+`held_within_size` is why the bits a settlement keeps still describe the tree
+being written.
+
 Two invariants live here.  `Invariant` is what every transition preserves, the
-heals included: a role's pin stands on a durable claim, and a live leaf's holder
-is a role with a pin or a want behind it.  `NoLoss` is what only the fault-free
-transitions preserve — every pin, the operator's included, stands on available
-content, and a source's leaf is pinned, never merely wanted.  `SystemSafety`'s
+heals included: a role's pin stands on a durable claim, a live leaf's holder is
+a role with a pin or a want behind it, and a row's held groups lie inside its
+own tree.  `NoLoss` is what only the fault-free transitions preserve — every
+pin, the operator's included, stands on available content, a source's leaf is
+pinned, never merely wanted, a durable claim is backed by a remote copy or a
+complete row, and a complete row is backed by bytes.  `SystemSafety`'s
 invariant is the conjunction; `FaultTolerant`'s is `Invariant` alone.
 -/
 
@@ -43,6 +57,21 @@ structure Root where
   id : Nat
   deriving DecidableEq
 
+/-! ## Groups and sizes -/
+
+/-- `synch_core::CHUNK_GROUP_SIZE`: the bytes in one chunk group, the store's
+unit of verification. -/
+def groupBytes : Nat := 16 * 1024
+
+/-- `synch_core::group_count`: the groups an object of `size` bytes has.  The
+empty object has one, so every object has a final group. -/
+def groupCount (size : Nat) : Nat :=
+  if size = 0 then 1 else (size + groupBytes - 1) / groupBytes
+
+theorem groupCount_pos (size : Nat) : 0 < groupCount size := by
+  unfold groupCount groupBytes
+  split <;> omega
+
 variable {H : Type}
 
 /-- One content root as the store sees it. -/
@@ -61,7 +90,12 @@ structure Cell (H : Type) where
   ordinaryLive : Set H := ∅
   /-- The `blobs` row exists. -/
   row : Prop := False
-  /-- The bytes are on local disk. -/
+  /-- The size the row records: a claim off an entry until `Attested`. -/
+  size : Nat := 0
+  /-- The groups the row claims verified — its bitmap, or every group of
+  `size` when it is complete. -/
+  held : Set Nat := ∅
+  /-- The complete payload and outboard are on local disk. -/
   bytes : Prop := False
   /-- The remote backend holds a copy. -/
   remote : Prop := False
@@ -73,6 +107,39 @@ structure Cell (H : Type) where
   sweeping : Prop := False
   /-- Inside the retention window. -/
   fresh : Prop := False
+
+/-- `cas.rs::read_claim`: what a row claims held.  A complete row is read as
+holding every group of its size; a bitmap row holds the groups it names. -/
+@[rust_impl "cas-row-complete"]
+def Complete (c : Cell H) : Prop := ∀ g, g < groupCount c.size → g ∈ c.held
+
+/-- `cas.rs::size_is_attested`.  Only the final group attests to a size: every
+other group's chaining value is the same whatever the object's length, so
+holding the first half says nothing about where the object ends. -/
+@[rust_impl "cas-size-attested"]
+def Attested (c : Cell H) : Prop := Complete c ∨ groupCount c.size - 1 ∈ c.held
+
+theorem complete_is_attested {c : Cell H} (h : Complete c) : Attested c := Or.inl h
+
+/-- A size that is a fact rather than a claim: the backend acknowledged it, or
+the disk attests to it. -/
+def Settled (c : Cell H) : Prop := c.durable ∨ Attested c
+
+/-- `cas.rs::settle_size`, as the guard on a commit claiming `claimed` bytes.
+With no row the claim stands; a settled size must agree, and a writer offering
+a different one is offering bytes for some other object; an unsettled size is
+a peer's claim off an entry and yields to this writer's. -/
+@[rust_impl "cas-size-settlement"]
+def Settles (c : Cell H) (claimed : Nat) : Prop := c.row → claimed = c.size ∨ ¬Settled c
+
+/-- What a commit of `groups` under a size settled to `size` leaves held: the
+groups just verified and, when the group count did not move, the groups the
+row already held — clipped to the tree of `size` either way.  Bits verified
+under one tree shape say nothing under another, which is `settle_size`'s
+`reset_held`. -/
+def settleHeld (c : Cell H) (size : Nat) (groups : Set Nat) : Set Nat :=
+  {g | g < groupCount size ∧
+    (g ∈ groups ∨ (c.row ∧ groupCount size = groupCount c.size ∧ g ∈ c.held))}
 
 /-- The row is present, the backend has acknowledged the bytes, and a copy is
 at hand locally or remotely. -/
@@ -135,30 +202,42 @@ def WriteAbort : Transition (Cell H) where
   guard _ := True
   post c := { c with writing := False }
 
-/-- `cas.rs::write_blob_row`.  A complete row lands with its bytes.  Whether it
-is also durable is `complete_is_durable`: a local backend says yes, a cloud
-backend says not until `finalize`, and `upsert_blob_row` keeps `durable` at
-`max(old, new)`.  With `durable = false` this is the staged row that
-`DropStaged` may later discard. -/
-@[transition, rust_impl "cas-write-complete-commit"]
-def CommitComplete (durable : Bool) : Transition (Cell H) where
-  guard c := ¬c.sweeping
-  post c := { c with
-    row := True
-    bytes := True
-    durable := durable ∨ c.durable
-    writing := False
-    fresh := True }
-
-/-- `cas.rs::commit_groups`.  The completing bitmap commit is the same
-transition; partial commits change nothing this model sees. -/
+/-- `cas.rs::commit_groups`: the one row write every writer of verified
+groups makes — a peer slice, a delta proof, a promotion, a cloud cache refill
+and, through `CommitComplete`, an ingest.  The size claim meets `Settles`
+inside the transaction; the row then records the claim and what is held under
+it, is complete when every group of that size is, and rises to durable only on
+a complete commit a local backend acknowledges (`durable`, from
+`complete_is_durable`).  `upsert_blob_row` keeps `durable` at
+`max(old, new)`.  With `durable = false` a complete commit is the staged row a
+cloud backend leaves until `finalize`, which `DropStaged` may later discard. -/
 @[transition, rust_impl "cas-write-groups-commit"]
-def CommitGroups (durable : Bool) : Transition (Cell H) := CommitComplete durable
+def CommitGroups (durable : Bool) (size : Nat) (groups : Set Nat) : Transition (Cell H) where
+  guard c := ¬c.sweeping ∧ Settles c size
+  post c :=
+    let held := settleHeld c size groups
+    let complete := ∀ g, g < groupCount size → g ∈ held
+    { c with
+      row := True
+      size := size
+      held := held
+      bytes := c.bytes ∨ complete
+      durable := (durable ∧ complete) ∨ c.durable
+      writing := False
+      fresh := True }
 
-/-- `backend.rs::Cloud::finalize`. -/
+/-- `cas.rs::Store::commit_complete`, the ingest's row: `CommitGroups` with
+every group of the object at once.  File callers hold the write lease; inline
+callers have no unlink window. -/
+@[transition, rust_impl "cas-write-complete-commit"]
+def CommitComplete (durable : Bool) (size : Nat) : Transition (Cell H) :=
+  CommitGroups durable size Set.univ
+
+/-- `backend.rs::Cloud::finalize`: a complete row's pair, written to the
+backend, is acknowledged. -/
 @[transition, rust_impl "cas-cloud-finalize"]
 def FinalizeRemote : Transition (Cell H) where
-  guard c := ¬c.sweeping ∧ c.row
+  guard c := ¬c.sweeping ∧ c.row ∧ Complete c
   post c := { c with remote := True, durable := True }
 
 /-- `gc.rs::gc_content(before)`: the retention window elapses. -/
@@ -168,17 +247,19 @@ def Age : Transition (Cell H) where
   post c := { c with fresh := False }
 
 /-- `cas.rs::Store::adopt_durable_blob`.  A cold durable row reconstructed
-after the remote backend confirmed the final pair exists. -/
+after the remote backend confirmed the final pair exists, holding nothing
+locally; a row already there must record the size storage reports. -/
 @[transition, rust_impl "cas-adopt-durable"]
-def AdoptRemote : Transition (Cell H) where
-  guard c := ¬c.sweeping
-  post c := { c with row := True, remote := True, durable := True }
+def AdoptRemote (size : Nat) : Transition (Cell H) where
+  guard c := ¬c.sweeping ∧ (c.row → size = c.size)
+  post c := { c with row := True, size := size, remote := True, durable := True }
 
-/-- `cas.rs::clear_blob_cache`, the durable branch. -/
+/-- `cas.rs::clear_blob_cache`, the durable branch: the row keeps its durable
+claim and forgets what it held. -/
 @[transition, rust_impl "cas-cache-evict"]
 def CacheEvict : Transition (Cell H) where
   guard c := c.remote ∧ c.durable
-  post c := { c with bytes := False }
+  post c := { c with held := ∅, bytes := False }
 
 /-- The non-durable branch of `cas.rs::clear_blob_cache`,
 `reconcile_scratch_generation`, and the `commit_cas_migration` discard.  None
@@ -187,7 +268,7 @@ of them consult `pins`; `NoLoss` is what makes that safe
 @[transition, rust_impl "cas-drop-staged-row"]
 def DropStaged : Transition (Cell H) where
   guard c := ¬c.durable ∧ ¬c.writing
-  post c := { c with row := False, bytes := False }
+  post c := { c with row := False, held := ∅, bytes := False }
 
 /-- The same promotion as `ReplicaPromote` on a metadata-only node: an entry
 and nothing else (`reconcile.rs::try_promote`). -/
@@ -254,7 +335,7 @@ def TakePossession (holder : H) : Transition (Cell H) where
 @[transition, rust_impl "cas-gc-row-commit"]
 def GcCommit : Transition (Cell H) where
   guard := Collectable
-  post c := { c with row := False, durable := False, sweeping := True }
+  post c := { c with row := False, held := ∅, durable := False, sweeping := True }
 
 /-- The unlink half of `delete_blob_if_collectable`. -/
 @[transition, rust_impl "cas-gc-unlink"]
@@ -266,7 +347,7 @@ def GcUnlink : Transition (Cell H) where
 @[transition, rust_impl "cas-protected-delete"]
 def ProtectedDelete : Transition (Cell H) where
   guard := Deletable
-  post c := { c with row := False, durable := False, sweeping := True }
+  post c := { c with row := False, held := ∅, durable := False, sweeping := True }
 
 /-! ### Facts a single transition commits, whoever the holders are -/
 
@@ -288,17 +369,41 @@ theorem possession_is_atomic (h : (TakePossession holder).rel c c') :
   obtain ⟨⟨_, _, available⟩, rfl⟩ := h
   exact ⟨Set.mem_insert _ _, fun w => w.2 rfl, available⟩
 
+/-- An ingest leaves a complete row with its bytes on disk. -/
+theorem commit_complete_is_complete {durable : Bool} {size : Nat}
+    (h : (CommitComplete durable size).rel c c') : Complete c' ∧ c'.bytes := by
+  simp only [transition] at h
+  obtain ⟨_, rfl⟩ := h
+  refine ⟨fun g hg => ⟨hg, Or.inl (Set.mem_univ g)⟩, Or.inr ?_⟩
+  exact fun g hg => ⟨hg, Or.inl (Set.mem_univ g)⟩
+
+/-- A commit carries a bit it did not verify only when the group count stayed,
+so the bit still describes the tree being written (`settle_size`, rule 3). -/
+theorem carried_bit_shares_tree {durable : Bool} {size : Nat} {groups : Set Nat} {g : Nat}
+    (h : (CommitGroups durable size groups).rel c c') (kept : g ∈ c'.held) (new : g ∉ groups) :
+    groupCount c'.size = groupCount c.size ∧ g ∈ c.held := by
+  simp only [transition] at h
+  obtain ⟨_, rfl⟩ := h
+  simp only [settleHeld, Set.mem_setOf_eq] at kept
+  exact ⟨kept.2.resolve_left new |>.2.1, kept.2.resolve_left new |>.2.2⟩
+
 /-- What a fault breaks and the fault-free transitions keep: every pin, the
-operator's included, stands on available content, and a source's leaf is
-pinned, never merely wanted. -/
+operator's included, stands on available content; a source's leaf is pinned,
+never merely wanted; a durable claim is backed by the remote copy or a
+complete row; and a complete row is backed by its bytes on disk. -/
 structure NoLoss (c : Cell H) : Prop where
   /-- Every pin stands on available content. -/
   pin_available : ∀ holder ∈ c.pin, Available c
   /-- A source's leaf is pinned. -/
   source_pinned : ∀ holder ∈ c.sourceLive, holder ∈ c.pin
+  /-- A durable claim has a remote copy or a complete row behind it. -/
+  durable_backed : c.durable → c.remote ∨ Complete c
+  /-- A complete row has its bytes on disk. -/
+  complete_backed : Complete c → c.bytes
 
 theorem initial_noLoss : NoLoss ({} : Cell H) :=
-  ⟨fun _ p => p.elim, fun _ l => l.elim⟩
+  ⟨fun _ p => p.elim, fun _ l => l.elim, fun d => d.elim,
+    fun complete => (complete 0 (groupCount_pos 0)).elim⟩
 
 /-! ## Transitions that stand a role behind a leaf -/
 
@@ -345,8 +450,9 @@ theorem replica_promotion_is_total {pinned : Bool} (h : (ReplicaPromote holder p
 target and the case a preservation proof splits on. -/
 inductive Kind (H : Type) where
   | beginWrite | writeAbort
-  | commitComplete (durable : Bool) | commitGroups (durable : Bool)
-  | finalizeRemote | age | adoptRemote | cacheEvict | dropStaged
+  | commitComplete (durable : Bool) (size : Nat)
+  | commitGroups (durable : Bool) (size : Nat) (groups : Set Nat)
+  | finalizeRemote | age | adoptRemote (size : Nat) | cacheEvict | dropStaged
   | sourcePublish (holder : H) | replicaPromote (holder : H) (pinned : Bool)
   | ordinaryPromote (holder : H)
   | removeSource (holder : H) | removeReplica (holder : H) | removeOrdinary (holder : H)
@@ -360,11 +466,11 @@ inductive Kind (H : Type) where
 def Trans : Kind H → Transition (Cell H)
   | .beginWrite => BeginWrite
   | .writeAbort => WriteAbort
-  | .commitComplete durable => CommitComplete durable
-  | .commitGroups durable => CommitGroups durable
+  | .commitComplete durable size => CommitComplete durable size
+  | .commitGroups durable size groups => CommitGroups durable size groups
   | .finalizeRemote => FinalizeRemote
   | .age => Age
-  | .adoptRemote => AdoptRemote
+  | .adoptRemote size => AdoptRemote size
   | .cacheEvict => CacheEvict
   | .dropStaged => DropStaged
   | .sourcePublish holder => SourcePublish holder
@@ -422,30 +528,66 @@ structure Invariant (c : Cell H) : Prop where
   ordinary_live : ∀ holder ∈ c.ordinaryLive, c.entry
   /-- A sweep in flight protects nothing and has no row. -/
   sweeping : c.sweeping → ¬c.entry ∧ (∀ holder, holder ∉ c.pin) ∧ ¬c.writing ∧ ¬c.row
+  /-- Only a row holds groups. -/
+  held_has_row : ∀ g ∈ c.held, c.row
+  /-- The bitmap is read against the row's own size: every held group lies
+  inside the tree of the size the row records. -/
+  held_within_size : ∀ g ∈ c.held, g < groupCount c.size
 
 theorem initial_invariant : Invariant ({} : Cell H) :=
   ⟨fun _ _ p => p.elim, fun _ l => l.elim, fun _ l => l.elim, fun _ l => l.elim,
-    fun s => s.elim⟩
+    fun s => s.elim, fun _ g => g.elim, fun _ g => g.elim⟩
 
 /-- Every preservation proof below is the same three moves: split on the
 transition, substitute the successor cell, let `grind` read the fields. -/
 theorem invariant_step (hinv : Invariant c) (hstep : CellStep c c') : Invariant c' := by
   obtain ⟨k, h⟩ := hstep
-  obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
+  obtain ⟨pins, sources, replicas, ordinary, sweepInv, heldRow, heldSize⟩ := hinv
   cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;>
-    grind [LiveClaim, Durable, Available, AnyPin, AnyLive]
+    grind [LiveClaim, Durable, Available, AnyPin, AnyLive, Settles, Settled, Attested, Complete,
+      settleHeld, groupCount_pos]
 
 theorem noLoss_step (hinv : Invariant c) (hnl : NoLoss c) (hstep : CellStep c c') :
     NoLoss c' := by
   obtain ⟨k, h⟩ := hstep
-  obtain ⟨pins, sources, replicas, ordinary, sweepInv⟩ := hinv
-  obtain ⟨pinsAvailable, sourcePinned⟩ := hnl
+  obtain ⟨pins, sources, replicas, ordinary, sweepInv, heldRow, heldSize⟩ := hinv
+  obtain ⟨pinsAvailable, sourcePinned, durableBacked, completeBacked⟩ := hnl
   cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;>
-    grind [LiveClaim, Durable, Available, AnyPin, AnyLive]
+    grind [LiveClaim, Durable, Available, AnyPin, AnyLive, Settles, Settled, Attested, Complete,
+      settleHeld, groupCount_pos]
 
-/-! ## Which transition a change betrays -/
+/-! ## What no transition does to a settled size -/
 
 variable {k : Kind H}
+
+/-- **A settled size never moves.**  Once a row's size is durable or attested,
+no step leaves the row standing under a different size: a commit claiming
+another size is refused (`settle_size`, rule 1), and an adoption must agree
+with what the row records. -/
+@[rust_justifies "cas-size-refusal"]
+theorem settled_size_is_stable (h : (Trans k).rel c c') (row : c.row) (settled : Settled c)
+    (row' : c'.row) : c'.size = c.size := by
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> grind [Settles]
+
+/-- A bit a commit dropped was only ever a claim: the row's size was neither
+durable nor attested, so the tree it was verified under was the claim's, and
+the claim has yielded (`settle_size`, rule 3). -/
+@[rust_justifies "cas-size-reset"]
+theorem dropped_bit_was_a_claim {durable : Bool} {size : Nat} {groups : Set Nat} {g : Nat}
+    (hinv : Invariant c) (h : (CommitGroups durable size groups).rel c c')
+    (was : g ∈ c.held) (gone : g ∉ c'.held) : ¬Settled c := by
+  have row := hinv.held_has_row g was
+  have within := hinv.held_within_size g was
+  simp only [transition] at h
+  obtain ⟨⟨_, settles⟩, rfl⟩ := h
+  intro settled
+  obtain rfl := (settles row).resolve_right (fun h => h settled)
+  refine gone ?_
+  show g < groupCount c.size ∧
+    (g ∈ groups ∨ (c.row ∧ groupCount c.size = groupCount c.size ∧ g ∈ c.held))
+  exact ⟨within, Or.inr ⟨row, rfl, was⟩⟩
+
+/-! ## Which transition a change betrays -/
 
 /-- A step that stands a new source leaf is a publication. -/
 theorem sourcePublish_of_new_leaf (h : (Trans k).rel c c')
