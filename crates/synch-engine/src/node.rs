@@ -1501,9 +1501,10 @@ impl Node {
 
         let head = self
             .store()
-            // LEAN-MODEL: cas-source-publish (Cas.SourcePublish)
-            // `Safety.sourcePublish` pairs `Cas.SourcePublish` with the trie
-            // transition below: durable check, pin, entry and head share commit.
+            // LEAN-MODEL: cas-source-publish (Bridge.ViewTxn)
+            // `Bridge.ViewTxn` composes every source/view micro-step with the
+            // trie transition below: durable check, pins, entries, removals and
+            // the head flip share one commit.
             // LEAN-MODEL: mpt-own-publish (MptGc.OwnPublish)
             // `MptGc.OwnPublish` models the trie/head/materialized side of this
             // same transaction; it is complete because this node built it.
@@ -1546,7 +1547,7 @@ impl Node {
                 // `Publication.publication_contract` is what this transaction
                 // promises along every execution: for as long as the tree
                 // names the content, its holder pins it, it is available, and
-                // its size is the one recorded here.
+                // its size is the file-entry/BlobAd size recorded here.
                 for (content, size) in source_ads {
                     let ad = synch_core::record::encode(&BlobAd::complete(size))?;
                     root = trie.insert(root, &blob_key(&content), &ad)?;
@@ -2616,6 +2617,15 @@ mod tests {
             .store()
             .ingest_bytes(b"durable bytes", now_ns())
             .unwrap();
+        let wrong = synch_core::FileEntry::file(14, now_ns(), root, 1);
+        let staged = vec![(
+            file_key("media", "a.txt").unwrap(),
+            Some(synch_core::record::encode(&wrong).unwrap()),
+        )];
+        let error = node.publish(&staged).unwrap_err().to_string();
+        assert!(error.contains("durable storage records 13"), "{error}");
+        assert!(node.own_head().unwrap().is_none());
+
         let entry = synch_core::FileEntry::file(13, now_ns(), root, 1);
         let staged = vec![(
             file_key("media", "a.txt").unwrap(),

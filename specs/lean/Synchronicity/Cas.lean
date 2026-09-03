@@ -84,6 +84,10 @@ structure Cell (H : Type) where
   want : Set H := ∅
   /-- The holders whose source leaf names the content. -/
   sourceLive : Set H := ∅
+  /-- The object size the source published for this root.  Rust writes the
+  same value into the file entry and the complete `BlobAd`; keeping it
+  separate from the CAS row makes that cross-layer equality stateable. -/
+  sourceAdvertised : H → Nat → Prop := fun _ _ => False
   /-- The holders whose replica leaf names the content. -/
   replicaLive : Set H := ∅
   /-- The holders whose metadata-only leaf names the content. -/
@@ -101,8 +105,10 @@ structure Cell (H : Type) where
   remote : Prop := False
   /-- The backend has acknowledged the bytes durably. -/
   durable : Prop := False
-  /-- A write lease is held. -/
-  writing : Prop := False
+  /-- The number of write leases held.  Rust counts rather than flags these:
+  overlapping fetches of one root are ordinary, and the first lease to end
+  must not clear the protection of the second. -/
+  writing : Nat := 0
   /-- A GC row commit has run and its unlink has not. -/
   sweeping : Prop := False
   /-- Inside the retention window. -/
@@ -169,7 +175,7 @@ structure Collectable (c : Cell H) : Prop where
   /-- Nobody pins it. -/
   no_pin : ¬AnyPin c
   /-- No write lease is held. -/
-  not_writing : ¬c.writing
+  not_writing : c.writing = 0
   /-- No sweep is in flight. -/
   not_sweeping : ¬c.sweeping
   /-- The retention window has elapsed. -/
@@ -182,7 +188,7 @@ structure Deletable (c : Cell H) : Prop where
   /-- Nobody pins it. -/
   no_pin : ¬AnyPin c
   /-- No write lease is held. -/
-  not_writing : ¬c.writing
+  not_writing : c.writing = 0
   /-- No sweep is in flight. -/
   not_sweeping : ¬c.sweeping
 
@@ -194,13 +200,13 @@ attribute [grind cases] Collectable Deletable
 @[transition, rust_impl "cas-write-lease-begin"]
 def BeginWrite : Transition (Cell H) where
   guard c := ¬c.sweeping
-  post c := { c with writing := True }
+  post c := { c with writing := c.writing + 1 }
 
 /-- `db.rs::WriteLease::drop`. -/
 @[transition, rust_impl "cas-write-lease-end"]
 def WriteAbort : Transition (Cell H) where
-  guard _ := True
-  post c := { c with writing := False }
+  guard c := 0 < c.writing
+  post c := { c with writing := c.writing - 1 }
 
 /-- `cas.rs::commit_groups`: the one row write every writer of verified
 groups makes — a peer slice, a delta proof, a promotion, a cloud cache refill
@@ -223,7 +229,6 @@ def CommitGroups (durable : Bool) (size : Nat) (groups : Set Nat) : Transition (
       held := held
       bytes := c.bytes ∨ complete
       durable := (durable ∧ complete) ∨ c.durable
-      writing := False
       fresh := True }
 
 /-- `cas.rs::Store::commit_complete`, the ingest's row: `CommitGroups` with
@@ -267,12 +272,12 @@ of them consult `pins`; `NoLoss` is what makes that safe
 (`SystemSafety.staged_row_drop_is_unpinned`). -/
 @[transition, rust_impl "cas-drop-staged-row"]
 def DropStaged : Transition (Cell H) where
-  guard c := ¬c.durable ∧ ¬c.writing
+  guard c := ¬c.durable ∧ c.writing = 0
   post c := { c with row := False, held := ∅, bytes := False }
 
 /-- The same promotion as `ReplicaPromote` on a metadata-only node: an entry
 and nothing else (`reconcile.rs::try_promote`). -/
-@[transition, rust_impl "cas-ordinary-promotion"]
+@[transition]
 def OrdinaryPromote (holder : H) : Transition (Cell H) where
   guard c := ¬c.sweeping
   post c := { c with entry := True, ordinaryLive := insert holder c.ordinaryLive }
@@ -282,7 +287,9 @@ source leaf leaves the derived views. -/
 @[transition, rust_impl "mpt-materialize-remove-source"]
 def RemoveSource (holder : H) : Transition (Cell H) where
   guard _ := True
-  post c := { c with sourceLive := c.sourceLive \ {holder} }
+  post c := { c with
+    sourceLive := c.sourceLive \ {holder}
+    sourceAdvertised := fun h size => h ≠ holder ∧ c.sourceAdvertised h size }
 
 /-- The same arm for a replica leaf. -/
 @[transition, rust_impl "mpt-materialize-remove-replica"]
@@ -356,6 +363,7 @@ def RetireRole (holder : H) : Transition (Cell H) where
     pin := c.pin \ {holder}
     want := c.want \ {holder}
     sourceLive := c.sourceLive \ {holder}
+    sourceAdvertised := fun h size => h ≠ holder ∧ c.sourceAdvertised h size
     replicaLive := c.replicaLive \ {holder} }
 
 /-- `cas.rs::delete_blob_if_collectable`, the row commit. -/
@@ -381,14 +389,26 @@ def ProtectedDelete : Transition (Cell H) where
 variable {c c' : Cell H} {holder : H}
 
 theorem gc_respects_protection (hgc : GcCommit.rel c c')
-    (guarded : c.entry ∨ AnyPin c ∨ c.writing) : False := by
+    (guarded : c.entry ∨ AnyPin c ∨ 0 < c.writing) : False := by
   rcases guarded with entry | pin | writing
   · exact hgc.1.no_entry entry
   · exact hgc.1.no_pin pin
-  · exact hgc.1.not_writing writing
+  · exact Nat.ne_of_gt writing hgc.1.not_writing
 
-theorem write_lease_excludes_gc (writing : c.writing) (hgc : GcCommit.rel c c') : False :=
+theorem write_lease_excludes_gc (writing : 0 < c.writing) (hgc : GcCommit.rel c c') : False :=
   gc_respects_protection hgc (Or.inr (Or.inr writing))
+
+/-- Two overlapping writers remain protected after either one releases its
+lease; the remaining count still excludes collection. -/
+theorem overlapping_write_survives_one_release {c₁ c₂ c₃ : Cell H}
+    (first : BeginWrite.rel c c₁) (second : BeginWrite.rel c₁ c₂)
+    (release : WriteAbort.rel c₂ c₃) : 0 < c₃.writing := by
+  simp only [transition] at first second release
+  obtain ⟨_, rfl⟩ := first
+  obtain ⟨_, rfl⟩ := second
+  obtain ⟨_, rfl⟩ := release
+  change 0 < (c.writing + 1 + 1) - 1
+  omega
 
 theorem possession_is_atomic (h : (TakePossession holder).rel c c') :
     holder ∈ c'.pin ∧ holder ∉ c'.want ∧ Durable c' := by
@@ -427,30 +447,37 @@ structure NoLoss (c : Cell H) : Prop where
   durable_backed : c.durable → c.remote ∨ Complete c
   /-- A complete row has its bytes on disk. -/
   complete_backed : Complete c → c.bytes
+  /-- A live source advertises exactly the size its durable CAS row records. -/
+  source_advertised : ∀ holder ∈ c.sourceLive,
+    c.sourceAdvertised holder c.size ∧
+      ∀ advertised, c.sourceAdvertised holder advertised → advertised = c.size
 
 theorem initial_noLoss : NoLoss ({} : Cell H) :=
   ⟨fun _ p => p.elim, fun _ l => l.elim, fun d => d.elim,
-    fun complete => (complete 0 (groupCount_pos 0)).elim⟩
+    fun complete => (complete 0 (groupCount_pos 0)).elim, fun _ l => l.elim⟩
 
 /-! ## Transitions that stand a role behind a leaf -/
 
 variable [Roles H]
 
-/-- `node.rs::Node::publish`: `hold_source_blob` pins a durable row of the
-entry's size, in the transaction that stands the leaf. -/
-@[transition, rust_impl "cas-source-publish"]
-def SourcePublish (holder : H) : Transition (Cell H) where
-  guard c := IsRole holder ∧ ¬c.sweeping ∧ Durable c
+/-- The source-publication micro-step inside `Node::publish`:
+`hold_source_blob` checks that `publishedSize` is the durable row's size, and
+the transaction writes that same value into the complete `BlobAd`. -/
+@[transition]
+def SourcePublish (holder : H) (publishedSize : Nat) : Transition (Cell H) where
+  guard c := IsRole holder ∧ ¬c.sweeping ∧ Durable c ∧ publishedSize = c.size
   post c := { c with
     entry := True
     pin := insert holder c.pin
     want := c.want \ {holder}
-    sourceLive := insert holder c.sourceLive }
+    sourceLive := insert holder c.sourceLive
+    sourceAdvertised := fun h size =>
+      (h = holder ∧ size = publishedSize) ∨ (h ≠ holder ∧ c.sourceAdvertised h size) }
 
 /-- `reconcile.rs::try_promote`, the `content_wants` decision under
 `materialize_diff`: a replica leaf takes a pin over a durable row (`pinned`),
 or records a want when the row is not durable. -/
-@[transition, rust_impl "cas-remote-promotion"]
+@[transition]
 def ReplicaPromote (holder : H) (pinned : Bool) : Transition (Cell H) where
   guard c := IsRole holder ∧ ¬c.sweeping ∧ (pinned ↔ Durable c)
   post c := { c with
@@ -459,11 +486,13 @@ def ReplicaPromote (holder : H) (pinned : Bool) : Transition (Cell H) where
     want := if pinned then c.want \ {holder} else insert holder c.want
     replicaLive := insert holder c.replicaLive }
 
-theorem source_publish_is_closed (h : (SourcePublish holder).rel c c') :
-    c'.entry ∧ holder ∈ c'.pin ∧ Durable c' := by
+theorem source_publish_is_closed {publishedSize : Nat}
+    (h : (SourcePublish holder publishedSize).rel c c') :
+    c'.entry ∧ holder ∈ c'.pin ∧ Durable c' ∧
+      c'.sourceAdvertised holder c'.size := by
   simp only [transition] at h
-  obtain ⟨⟨_, _, durable⟩, rfl⟩ := h
-  exact ⟨trivial, Set.mem_insert _ _, durable⟩
+  obtain ⟨⟨_, _, durable, published⟩, rfl⟩ := h
+  exact ⟨trivial, Set.mem_insert _ _, durable, by simp [published]⟩
 
 theorem replica_promotion_is_total {pinned : Bool} (h : (ReplicaPromote holder pinned).rel c c') :
     c'.entry ∧ ((holder ∈ c'.pin ∧ Durable c') ∨ holder ∈ c'.want) := by
@@ -482,7 +511,8 @@ inductive Kind (H : Type) where
   | commitComplete (durable : Bool) (size : Nat)
   | commitGroups (durable : Bool) (size : Nat) (groups : Set Nat)
   | finalizeRemote | age | adoptRemote (size : Nat) | cacheEvict | dropStaged
-  | sourcePublish (holder : H) | replicaPromote (holder : H) (pinned : Bool)
+  | sourcePublish (holder : H) (publishedSize : Nat)
+  | replicaPromote (holder : H) (pinned : Bool)
   | ordinaryPromote (holder : H)
   | removeSource (holder : H) | removeReplica (holder : H) | removeOrdinary (holder : H)
   | dropEntry
@@ -502,7 +532,7 @@ def Trans : Kind H → Transition (Cell H)
   | .adoptRemote size => AdoptRemote size
   | .cacheEvict => CacheEvict
   | .dropStaged => DropStaged
-  | .sourcePublish holder => SourcePublish holder
+  | .sourcePublish holder publishedSize => SourcePublish holder publishedSize
   | .replicaPromote holder pinned => ReplicaPromote holder pinned
   | .ordinaryPromote holder => OrdinaryPromote holder
   | .removeSource holder => RemoveSource holder
@@ -525,7 +555,7 @@ flip.  `Bridge` pairs these with the `MptGc` transition they commit alongside;
 every other transition interleaves freely
 (`Bridge.live_leaf_flips_head`). -/
 def Kind.flipsHead : Kind H → Bool
-  | .sourcePublish _ | .replicaPromote _ _ | .ordinaryPromote _ => true
+  | .sourcePublish _ _ | .replicaPromote _ _ | .ordinaryPromote _ => true
   | _ => false
 
 /-- Some transition took the cell from `c` to `c'`. -/
@@ -559,7 +589,7 @@ structure Invariant (c : Cell H) : Prop where
   /-- A metadata-only leaf has an entry. -/
   ordinary_live : ∀ holder ∈ c.ordinaryLive, c.entry
   /-- A sweep in flight protects nothing and has no row. -/
-  sweeping : c.sweeping → ¬c.entry ∧ (∀ holder, holder ∉ c.pin) ∧ ¬c.writing ∧ ¬c.row
+  sweeping : c.sweeping → ¬c.entry ∧ (∀ holder, holder ∉ c.pin) ∧ c.writing = 0 ∧ ¬c.row
   /-- Only a row holds groups. -/
   held_has_row : ∀ g ∈ c.held, c.row
   /-- The bitmap is read against the row's own size: every held group lies
@@ -583,7 +613,7 @@ theorem noLoss_step (hinv : Invariant c) (hnl : NoLoss c) (hstep : CellStep c c'
     NoLoss c' := by
   obtain ⟨k, h⟩ := hstep
   obtain ⟨pins, sources, replicas, ordinary, sweepInv, heldRow, heldSize⟩ := hinv
-  obtain ⟨pinsAvailable, sourcePinned, durableBacked, completeBacked⟩ := hnl
+  obtain ⟨pinsAvailable, sourcePinned, durableBacked, completeBacked, sourceAd⟩ := hnl
   cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;>
     grind [LiveClaim, Durable, Available, AnyPin, AnyLive, Settles, Settled, Attested, Complete,
       settleHeld, groupCount_pos]
@@ -623,8 +653,11 @@ theorem dropped_bit_was_a_claim {durable : Bool} {size : Nat} {groups : Set Nat}
 
 /-- A step that stands a new source leaf is a publication. -/
 theorem sourcePublish_of_new_leaf (h : (Trans k).rel c c')
-    (new : holder ∈ c'.sourceLive) (old : holder ∉ c.sourceLive) : k = .sourcePublish holder := by
-  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> grind
+    (new : holder ∈ c'.sourceLive) (old : holder ∉ c.sourceLive) :
+    ∃ publishedSize, k = .sourcePublish holder publishedSize := by
+  cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h
+  case sourcePublish _ publishedSize => exact ⟨publishedSize, by grind⟩
+  all_goals grind
 
 /-- A step that stands a new replica leaf is a promotion. -/
 theorem replicaPromote_of_new_leaf (h : (Trans k).rel c c')
@@ -639,7 +672,7 @@ theorem flipsHead_of_new_leaf (h : (Trans k).rel c c')
     (new : holder ∈ c'.sourceLive ∨ holder ∈ c'.replicaLive)
     (old : holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive) : k.flipsHead = true := by
   rcases new with source | replica
-  · rw [sourcePublish_of_new_leaf h source old.1]; rfl
+  · obtain ⟨_, rfl⟩ := sourcePublish_of_new_leaf h source old.1; rfl
   · obtain ⟨_, rfl⟩ := replicaPromote_of_new_leaf h replica old.2; rfl
 
 /-! ## The store: one cell per content root -/
