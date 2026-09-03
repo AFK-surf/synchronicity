@@ -487,7 +487,10 @@ fn configure_unix_command(command: &mut std::process::Command, controlling_tty: 
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) != 0 {
+            // `ioctl`'s request type varies by platform (`c_int` on musl,
+            // `c_ulong` on glibc and macOS) and so does `TIOCSCTTY`'s own
+            // type: infer the cast rather than naming one of them.
+            if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // The pty descriptors are close-on-exec and std's dup2 clears the

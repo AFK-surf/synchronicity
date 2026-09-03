@@ -98,6 +98,32 @@ jobs:
       - run: cargo test -p synch-engine --doc --no-fail-fast
       - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
+  musl:
+    name: musl (release binaries)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      # musl's libc typedefs are not glibc's — `ioctl`'s request argument is
+      # `c_int` there and `c_ulong` here — so code that compiles on every host
+      # in `test` above can still fail to compile for the static Linux binaries
+      # the release workflow ships, and the first sign of it is a broken tag.
+      # Type-check the released binaries against musl here instead, where the
+      # break costs a red pull request. This checks x86_64 only: the aarch64
+      # musl build differs from it in target-specific constants, not in the
+      # libc typedefs that make glibc-only code fail, and cross-compiling C
+      # dependencies for it would need the release workflow's zig toolchain.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo check --target x86_64-unknown-linux-musl --bin synch --bin synch-s3 --bin synch-monitor
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+
   cloud-providers:
     name: cloud CAS providers
     runs-on: ubuntu-latest
