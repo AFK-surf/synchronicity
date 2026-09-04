@@ -57,7 +57,10 @@ pub use pb::{
 /// path-based activation (`SocketActivate`/`SocketDeactivate`): a removal and
 /// an addition of calls, so a daemon on either side of the change must not be
 /// spoken to by a client on the other.
-pub const CONTROL_VERSION: u32 = 5;
+///
+/// v6 adds source relinking and local detachment, and reports filesystem
+/// source availability through `ListSpaces`.
+pub const CONTROL_VERSION: u32 = 6;
 
 /// How many payload bytes one chunk carries.
 ///

@@ -4,8 +4,8 @@ import Testing
 
 /// The coverage audit.
 ///
-/// The daemon exposes 68 addressable operations: 14 typed rpcs and the 54
-/// subcommands `Run` carries (proto field numbers 1…55 with 9 reserved).
+/// The daemon exposes 69 addressable operations: 15 typed rpcs and the 54
+/// subcommands `Run` carries (non-contiguous proto fields through 71).
 ///
 /// These numbers are the app's side of the count only. Asserting them here is
 /// what failed before: new daemon operations shipped while this test stayed
@@ -18,9 +18,9 @@ import Testing
 struct CoverageTests {
 
   @Test func everyOperationIsAccountedFor() {
-    #expect(Operations.typed.count == 14)
+    #expect(Operations.typed.count == 15)
     #expect(Operations.run.count == 54)
-    #expect(Operations.all.count == 68)
+    #expect(Operations.all.count == 69)
   }
 
   @Test func noOperationIsListedTwice() {
@@ -47,7 +47,7 @@ struct CoverageTests {
     // and everything a superseded version or a `forever` replica holds needs
     // `--root` — which is why they are surfaced now.
     //
-    // The nine `socket` subcommands and `rpc.openSocket` are a second kind of
+    // The seven `socket` subcommands and `rpc.openSocket` are a second kind of
     // omission, and the distinction is the point: `ls` is *replaced*, they are
     // simply *unbuilt*. v3 grew a socket surface — publish, review, arm, run,
     // watch, kill — and this app has none of it. They are registered so the
@@ -56,9 +56,8 @@ struct CoverageTests {
     // was dropped, not replaced.
     let omitted = Operations.all.filter { $0.surface == .notSurfaced }.map(\.id).sorted()
     #expect(omitted == [
-      "ls", "rpc.openSocket", "socket.arm", "socket.declare", "socket.disarm",
-      "socket.kill", "socket.log", "socket.ls", "socket.ps", "socket.undeclare",
-      "socket.sdk",
+      "ls", "rpc.openSocket", "socket.activate", "socket.deactivate", "socket.kill",
+      "socket.log", "socket.ls", "socket.ps", "socket.sdk", "source.ls",
     ])
   }
 
@@ -120,7 +119,7 @@ struct CoverageTests {
     // or a folder, it belongs in the Node window.
     let allowed: Set<String> = [
       "rpc.list", "rpc.resolve", "rpc.read", "rpc.put", "rpc.delete",
-      "rpc.listSpaces", "source.ls", "source.add", "status", "adopt.path", "log", "compare",
+      "rpc.listSpaces", "source.ls", "source.add", "source.relink", "status", "adopt.path", "log", "compare",
       "pin.add", "pin.rm", "source.scan",
       // Tree adoption names a folder and writes into it. `cat` and `get` name one
       // object by its content root, which is a version of a file — the only
@@ -295,7 +294,15 @@ struct OptionalFieldTests {
   }
 
   @Test func repairRebuildsViews() {                // DiagnosticsPane
-    #expect(Cmd.rebuildViews.hasRepairRebuildViews)
+    guard case .repairRebuildViews? = Cmd.rebuildViews.kind else {
+      Issue.record("rebuildViews did not build RepairRebuildViews")
+      return
+    }
+  }
+
+  @Test func sourceRecoveryCommandsCarryTheirFolder() {
+    #expect(Cmd.sourceRelink(id: "notes", path: "/tmp/notes").sourceRelink.path == "/tmp/notes")
+    #expect(Cmd.sourceDetach(id: "notes").sourceDetach.space == "notes")
   }
 
   @Test func referencesFollowTheDaemonsGrammar() {

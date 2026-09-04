@@ -231,6 +231,8 @@ message Command {
     RepairRebuildViews repair_rebuild_views = 65;
     AdoptPath adopt_path = 66;
     AdoptTree adopt_tree = 67;
+    SourceRelink source_relink = 70;
+    SourceDetach source_detach = 71;
   }
 }
 
@@ -349,6 +351,15 @@ message SourceScan {
 }
 
 message SourceRm {
+  string space = 1;
+}
+
+message SourceRelink {
+  string space = 1;
+  string path = 2;
+}
+
+message SourceDetach {
   string space = 1;
 }
 
@@ -645,6 +656,12 @@ message Written {
 
 message ListSpacesRequest {}
 
+enum SourceState {
+  SOURCE_STATE_UNSPECIFIED = 0;
+  SOURCE_STATE_AVAILABLE = 1;
+  SOURCE_STATE_UNAVAILABLE = 2;
+}
+
 // One configured space, as a program reads it.
 message SpaceInfo {
   string id = 1;
@@ -656,6 +673,8 @@ message SpaceInfo {
   optional uint64 wanted = 7;
   optional string source_kind = 8;
   optional string checkout_path = 9;
+  SourceState source_state = 10;
+  optional string source_error = 11;
 }
 
 message GetConfigRequest {

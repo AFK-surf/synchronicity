@@ -785,6 +785,18 @@ pub enum SourceCommand {
         /// One space namespace.
         space: Option<String>,
     },
+    /// Reconnect a missing filesystem source after its folder moved or was renamed.
+    Relink {
+        /// The space namespace.
+        space: String,
+        /// The folder's new location.
+        path: PathBuf,
+    },
+    /// Disconnect the local folder while keeping the source and published view.
+    Detach {
+        /// The space namespace.
+        space: String,
+    },
     /// Stop publishing this node's view of a space.
     Rm {
         /// The space namespace.

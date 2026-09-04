@@ -27,8 +27,13 @@ struct FilesSidebar: View {
         // A checkout is a materialization of the tree, so browsing one *inside*
         // the app would be a second, subtly different view of the same data.
         // It reveals in Finder instead.
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: checkout.localPath)
+        NSWorkspace.shared.activateFileViewerSelecting([
+          URL(fileURLWithPath: checkout.localPath, isDirectory: true)
+        ])
       },
+      onRevealSource: node.revealSource,
+      onRelink: locate,
+      onDetach: requestDetach,
       onStopSharing: requestStopSharing,
       onAdopt: { adopting = $0 })
     .confirmedAction($confirmation)
@@ -74,6 +79,33 @@ struct FilesSidebar: View {
             Operations.require("source.rm"), Cmd.sourceRm(id: space.id),
             commandLine: "synch source rm \(Shell.quote(space.id))")
         }
+      }
+    )
+  }
+
+  private func locate(_ space: Space) {
+    let panel = NSOpenPanel()
+    panel.title = "Locate “\(space.id)”"
+    panel.message = "Choose the renamed or moved folder that belongs to this space."
+    panel.prompt = "Reconnect"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    if panel.runModal() == .OK, let url = panel.url {
+      node.enqueue { await node.relinkSource(id: space.id, path: url.path) }
+    }
+  }
+
+  private func requestDetach(_ space: Space) {
+    confirmation = ConfirmationRequest(
+      title: "Disconnect the local folder from “\(space.id)”?",
+      consequence: "This Mac stops scanning and writing the missing folder. The cloud space and every entry already published in it stay unchanged; this source remains available through APIs.",
+      verb: "Disconnect Folder",
+      gate: Operations.require("source.detach").gate,
+      commandLine: "synch source detach \(Shell.quote(space.id))",
+      isDestructive: false,
+      perform: {
+        node.enqueue { await node.detachSource(id: space.id) }
       }
     )
   }

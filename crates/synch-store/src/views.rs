@@ -666,6 +666,9 @@ impl Store {
                 "DELETE FROM socket_activations WHERE space = ?1",
                 params![space],
             )?;
+            // Scanner state can contain hundreds of thousands of rows.
+            txn.conn()
+                .execute("DELETE FROM local_files WHERE space = ?1", params![space])?;
             txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             let holder = crate::PinHolder::Source(space.to_string()).render();
@@ -695,6 +698,27 @@ impl Store {
                     )",
                 params![holder, space],
             )?;
+            Ok(true)
+        })
+    }
+
+    /// Disconnects the filesystem directory without withdrawing published entries.
+    pub fn detach_source(&self, space: &str) -> Result<bool> {
+        self.transaction(|txn| {
+            let exists: bool = txn.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE space = ?1)",
+                params![space],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            txn.conn().execute(
+                "UPDATE sources SET kind = 'api', local_path = NULL WHERE space = ?1",
+                params![space],
+            )?;
+            txn.conn()
+                .execute("DELETE FROM local_files WHERE space = ?1", params![space])?;
             Ok(true)
         })
     }
@@ -2133,9 +2157,34 @@ mod tests {
                 checkout_path: Some("/mnt/media".into()),
             })
             .unwrap();
+        let indexed = LocalFile {
+            space: "media".into(),
+            relpath: "large/index.txt".into(),
+            size: 5,
+            mtime_ns: 100,
+            file_id: Some(vec![1, 2, 3]),
+            content: Some(Hash::new(b"index")),
+            scanned_at: 1,
+        };
+        store.put_local_file(&indexed).unwrap();
         assert!(store.remove_source("media").unwrap());
         assert!(store.replica("media").unwrap().is_some());
+        assert!(store.local_files("media").unwrap().is_empty());
         assert!(!store.remove_source("media").unwrap());
+
+        store
+            .put_source("attached", SourceKind::Filesystem, Some("/srv/attached"))
+            .unwrap();
+        let attached = LocalFile {
+            space: "attached".into(),
+            ..indexed.clone()
+        };
+        store.put_local_file(&attached).unwrap();
+        assert!(store.detach_source("attached").unwrap());
+        let detached = store.source("attached").unwrap().unwrap();
+        assert_eq!(detached.kind, SourceKind::Api);
+        assert_eq!(detached.local_path, None);
+        assert!(store.local_files("attached").unwrap().is_empty());
 
         // Scanner state round-trips the same way.
         let f = LocalFile {

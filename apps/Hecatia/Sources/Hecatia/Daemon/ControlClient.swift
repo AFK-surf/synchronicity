@@ -46,7 +46,7 @@ actor ControlClient {
   /// (`NodeStore` turns it into `.needsUpdate` and `FirstRunView` takes the
   /// window).
   ///
-  /// Four, because the daemon's interceptor compares this header for
+  /// Six, because the daemon's interceptor compares this header for
   /// *equality* on every call (`control/server.rs:306`) rather than for a
   /// floor. Announcing "2" to a v3 daemon is therefore not a degraded
   /// connection but no connection at all: even the `daemon status` round trip
@@ -57,7 +57,8 @@ actor ControlClient {
   /// token rather than by content root, which was a change to work in flight
   /// on its side: sockets and v3 landed together, so no shipped version of
   /// this protocol ever had the other kind.
-  static let controlVersion = "4"
+  /// v6 adds filesystem-source availability, relinking, and local detachment.
+  static let controlVersion = "6"
   /// Identifies this app's multipart uploads so a listing can show only its
   /// own. An upload id is a bearer token; a listing across principals would
   /// make it a public one.
@@ -280,7 +281,8 @@ actor ControlClient {
     let call = try client(.standard).makeListCall(request)
     var entries: [Synch_Control_V1_Entry] = []
     do {
-      for try await entry in call.responseStream {
+      for try await item in call.responseStream {
+        guard case .entry(let entry)? = item.item else { continue }
         entries.append(entry)
         if entries.count > wanted { break }
       }
@@ -460,8 +462,9 @@ actor ControlClient {
     let call = try client(.long).makeListCall(request)
     var entries: [Synch_Control_V1_Entry] = []
     do {
-      for try await entry in call.responseStream {
+      for try await item in call.responseStream {
         try Task.checkCancellation()
+        guard case .entry(let entry)? = item.item else { continue }
         entries.append(entry)
       }
     } catch {
