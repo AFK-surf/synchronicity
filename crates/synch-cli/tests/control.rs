@@ -1628,6 +1628,200 @@ async fn a_failed_fetch_publishes_nothing() {
     daemon.shutdown().await;
 }
 
+/// `synch put` streams a local file into the tree through the same write the
+/// S3 gateway and `synch fetch` use, completes a directory destination with
+/// the file's own name, and needs no checkout: on an API source the payload
+/// is published from the CAS and nothing is materialized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_streams_a_local_file_into_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    says(
+        data_dir,
+        api_source_add("media"),
+        "publishing media through APIs",
+    )
+    .await;
+
+    let files = tempfile::tempdir().unwrap();
+    // Larger than one control chunk, so the payload crosses the coalescing
+    // path rather than fitting a single message.
+    let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(files.path().join("1.txt"), b"hello from disk\n").unwrap();
+    std::fs::write(files.path().join("system.img"), &payload).unwrap();
+    std::fs::write(files.path().join("empty"), b"").unwrap();
+
+    // A directory destination keeps the file's name.
+    let written = synch_cli::write::put(data_dir, &files.path().join("1.txt"), "media/documents/")
+        .await
+        .unwrap();
+    assert_eq!(written.entry.path, "documents/1.txt");
+    assert_eq!(
+        read(data_dir, cat("media/documents/1.txt", None, None)).await,
+        b"hello from disk\n"
+    );
+
+    let written =
+        synch_cli::write::put(data_dir, &files.path().join("system.img"), "media/images/")
+            .await
+            .unwrap();
+    assert_eq!(written.entry.path, "images/system.img");
+    assert_eq!(written.entry.size, payload.len() as u64);
+    assert_eq!(
+        read(data_dir, cat("media/images/system.img", None, None)).await,
+        payload
+    );
+
+    // An explicit file destination is taken as written, whatever the file
+    // was called; and an empty file is a file.
+    let written = synch_cli::write::put(
+        data_dir,
+        &files.path().join("empty"),
+        "media/copies/renamed.txt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.entry.path, "copies/renamed.txt");
+    assert_eq!(written.entry.size, 0);
+
+    // Nothing was materialized: the API source has no directory and no local
+    // files, and the bytes are in the CAS.
+    let root = written.entry.content.unwrap();
+    let inspecting = daemon.node.clone();
+    let (bytes, local_path, local_files) = synch_core::offload(move || {
+        Ok::<_, synch_engine::EngineError>((
+            inspecting.store().read_all(&root)?,
+            inspecting.store().source("media")?.unwrap().local_path,
+            inspecting.store().local_files("media")?,
+        ))
+    })
+    .await
+    .unwrap();
+    assert!(bytes.is_empty());
+    assert_eq!(local_path, None);
+    assert!(local_files.is_empty());
+
+    daemon.shutdown().await;
+}
+
+/// `synch put` into a filesystem source lands the file in that source's
+/// directory, exactly as a gateway write would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_into_a_filesystem_source_writes_the_file() {
+    let (dir, daemon, space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("notes.txt"), b"kept\n").unwrap();
+
+    let written = synch_cli::write::put(data_dir, &files.path().join("notes.txt"), "media/")
+        .await
+        .unwrap();
+    assert_eq!(written.entry.path, "notes.txt");
+    assert_eq!(
+        std::fs::read(space.path().join("notes.txt")).unwrap(),
+        b"kept\n"
+    );
+    assert_eq!(
+        read(data_dir, cat("media/notes.txt", None, None)).await,
+        b"kept\n"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A put that cannot complete publishes nothing, and one this process can
+/// refuse on its own — a missing file, a directory, stdin without a name, a
+/// malformed destination — is refused before any write opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_put_publishes_nothing() {
+    let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("a.txt"), b"a").unwrap();
+
+    let missing = files.path().join("missing.txt");
+    let a = files.path().join("a.txt");
+    for (file, destination, says) in [
+        (missing.as_path(), "media/", "missing.txt"),
+        (files.path(), "media/", "is a directory"),
+        (
+            std::path::Path::new("-"),
+            "media/",
+            "stdin carries no file name",
+        ),
+        (a.as_path(), "media", "is not a destination"),
+        (a.as_path(), "nas@cluster.example:media/f", "own version"),
+    ] {
+        let error = synch_cli::write::put(data_dir, file, destination)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(says),
+            "{} -> {destination}: {error:#}",
+            file.display()
+        );
+    }
+    assert_eq!(
+        resolve(data_dir, resolve_req("media", "a.txt"))
+            .await
+            .unwrap_err(),
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        resolve(data_dir, resolve_req("media", "missing.txt"))
+            .await
+            .unwrap_err(),
+        ErrorCode::NotFound
+    );
+
+    daemon.shutdown().await;
+}
+
+/// `synch delete` publishes this node's tombstone through the same call the
+/// gateway's `DeleteObject` uses, and says whether another origin still
+/// publishes the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_publishes_a_tombstone() {
+    let (dir, daemon, _space, _scan) = daemon_with_space(&[("gone.txt", b"bytes")]).await;
+    let data_dir = dir.path();
+    assert_eq!(
+        read(data_dir, cat("media/gone.txt", None, None)).await,
+        b"bytes"
+    );
+
+    let (target, deleted) = synch_cli::write::delete(data_dir, "media/gone.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        (target.space.as_str(), target.path.as_str()),
+        ("media", "gone.txt")
+    );
+    assert!(!deleted.still_published);
+    assert_eq!(
+        resolve(data_dir, resolve_req("media", "gone.txt"))
+            .await
+            .unwrap_err(),
+        ErrorCode::NotFound
+    );
+
+    // A delete names one file: a directory, an origin-qualified reference, or
+    // no path at all is refused before the daemon is asked.
+    for (target, says) in [
+        ("media/", "names no file"),
+        ("media/docs/", "names no file"),
+        ("media", "is not a destination"),
+        ("nas@cluster.example:media/f", "own version"),
+    ] {
+        let error = synch_cli::write::delete(data_dir, target)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(says), "{target}: {error:#}");
+    }
+
+    daemon.shutdown().await;
+}
+
 /// Gateway config lives in the daemon: appended a record at a time, fenced
 /// to `s3.*` so one config row cannot reach another (§9.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -181,8 +181,8 @@ for the complete provider options. The storage-policy flags are `--cas-root`,
 used.
 
 Only API sources are valid on a cloud-backed node. They have no scanner,
-watcher, or local directory: gateway writes and `synch adopt path` ingest directly into
-the cloud CAS, while `cat`, `get`, and gateway reads fill the ephemeral range
+watcher, or local directory: gateway writes, `synch put`, `synch fetch`, and
+`synch adopt path` ingest directly into the cloud CAS, while `cat`, `get`, and gateway reads fill the ephemeral range
 cache on demand. A durable-disk node can configure a replica checkout when a
 filesystem projection is wanted elsewhere.
 
@@ -411,6 +411,19 @@ changes, and the other versions stay visible until a `synch adopt path` ends the
 divergence. Deletions are adoptable the same way: taking a tombstone version
 removes the local copy and publishes our own tombstone, and once every
 publisher has done so the path leaves the tree.
+
+Write without a checkout. `put` streams a local file, or stdin, through the same
+typed write the S3 gateway uses and publishes it as this node's own version;
+`delete` publishes this node's tombstone. Both work on an API source, where
+nothing is materialized:
+
+```sh
+synch put notes.txt media/notes.txt                  # this node's version of the path
+synch put report.pdf media/documents/                # a trailing slash keeps the file name
+tar cz src | synch put - media/backups/src.tgz       # stdin, with an explicit name
+synch fetch https://example.com/1.txt media/documents/  # an http(s) URL, the same way
+synch delete media/notes.txt                         # our tombstone; other origins' versions stay
+```
 
 Adopt a tree into a filesystem source — the directory `synch source add` named — with
 the content of the unified tree. One pass, and additive: a path missing here is

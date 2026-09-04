@@ -423,6 +423,32 @@ pub enum Command {
         /// carries.
         destination: String,
     },
+    /// Write a local file, or stdin, into the tree.
+    ///
+    /// The payload streams through this process into the daemon and is
+    /// published as this node's own version of the destination path, exactly
+    /// as a write through the API would be. The space needs no local
+    /// directory: on an API source nothing is materialized. Nothing is
+    /// published unless the whole payload arrives: a read that fails partway
+    /// leaves the tree untouched.
+    ///
+    /// The write replaces whatever the destination path held.
+    Put {
+        /// The file to write, or `-` to read stdin.
+        file: PathBuf,
+        /// Where the file lands: `<space>/<path>`, or a directory as
+        /// `<space>/<dir>/` — the trailing slash keeps the file's own name.
+        destination: String,
+    },
+    /// Remove this node's copy of a path and publish its tombstone.
+    ///
+    /// Other origins may still publish the path, and the answer says whether
+    /// they do: the path stays readable through the unified tree until every
+    /// publisher has removed it.
+    Delete {
+        /// `<space>/<path>`.
+        target: String,
+    },
     /// Adopt content into this node's published source.
     Adopt {
         /// The adoption subcommand.
@@ -1098,6 +1124,8 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::CommandFactory;
 
     use super::*;
@@ -1157,6 +1185,34 @@ mod tests {
         ));
         // Both arguments are required.
         assert!(Cli::try_parse_from(["synch", "fetch", "https://example.com/1.txt"]).is_err());
+    }
+
+    #[test]
+    fn put_takes_a_file_and_a_destination() {
+        let cli = Cli::parse_from(["synch", "put", "notes.txt", "workspace/documents/"]);
+        assert!(matches!(
+            cli.command,
+            Command::Put { file, destination }
+                if file == Path::new("notes.txt") && destination == "workspace/documents/"
+        ));
+        // `-` is an ordinary positional, not a flag: stdin.
+        let cli = Cli::parse_from(["synch", "put", "-", "workspace/notes.txt"]);
+        assert!(matches!(
+            cli.command,
+            Command::Put { file, .. } if file == Path::new("-")
+        ));
+        // Both arguments are required.
+        assert!(Cli::try_parse_from(["synch", "put", "notes.txt"]).is_err());
+    }
+
+    #[test]
+    fn delete_takes_one_target() {
+        let cli = Cli::parse_from(["synch", "delete", "workspace/notes.txt"]);
+        assert!(matches!(
+            cli.command,
+            Command::Delete { target } if target == "workspace/notes.txt"
+        ));
+        assert!(Cli::try_parse_from(["synch", "delete"]).is_err());
     }
 
     #[test]

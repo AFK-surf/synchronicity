@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod fetch;
 pub mod mcp;
 pub mod render;
+pub mod write;
 
 /// The platform data directory both binaries default to (§9.3).
 ///
