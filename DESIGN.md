@@ -1501,6 +1501,14 @@ synch fetch <url> <space>/<path>             stream an http(s) URL into the tree
                                              this node's own version, redirects
                                              followed; a destination ending in `/`
                                              keeps the URL's file name
+synch put <file>|- <space>/<path>            write a local file, or stdin, into the
+                                             tree as this node's own version through
+                                             the same typed write; no checkout needed,
+                                             a destination ending in `/` keeps the
+                                             file's name
+synch delete <space>/<path>                  remove my copy and publish my tombstone;
+                                             says whether another origin still
+                                             publishes the path
 synch adopt path [<origin>:]<space>/<path>   adopt one version as my own
            [--select <policy>]
 synch adopt tree <space>[/<dir>]             additive bulk adoption into a source

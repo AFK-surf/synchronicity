@@ -486,6 +486,8 @@ A source publishes this node's assertions:
 ```sh
 synch source add media /srv/media    # watched filesystem publisher
 synch source add uploads --api       # writes arrive through typed APIs
+synch put report.pdf uploads/docs/   # a local file, or `-` for stdin, through that API
+synch delete uploads/docs/report.pdf # this node's tombstone
 synch source ls [media]
 synch source scan [media]            # filesystem sources only
 synch source rm media                # unpublish this origin's entries

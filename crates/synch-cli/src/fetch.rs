@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::control::{proto::CHUNK_SIZE, Client, Written};
+use crate::write::Destination;
 
 /// How long establishing the HTTP connection may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,7 +69,7 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
     }
     // The file name comes off the URL the response actually came from, so a
     // redirect to the real file names the entry after what was served.
-    let path = destination.entry_path(response.url())?;
+    let path = entry_path(&destination, response.url())?;
 
     // The daemon takes its gates — publishability, a resolvable target —
     // before `put` returns, so a destination it refuses fails here, before
@@ -117,53 +118,16 @@ pub async fn fetch(data_dir: &Path, url: &str, destination: &str) -> Result<Writ
     Ok(put.finish().await?)
 }
 
-/// Where a fetch lands: a space, and the path — or directory — within it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Destination {
-    /// The space to write into.
-    space: String,
-    /// The path within the space. Empty or `/`-terminated means a directory,
-    /// completed with the file name the URL carries.
-    path: String,
-}
-
-impl Destination {
-    /// Parses `<space>/<path>` or `<space>/<dir>/`.
-    fn parse(text: &str) -> Result<Destination> {
-        let Some((space, path)) = text.split_once('/') else {
-            anyhow::bail!(
-                "`{text}` is not a destination; use <space>/<path>, or <space>/<dir>/ to \
-                 keep the URL's file name"
-            );
-        };
-        if space.is_empty() {
-            anyhow::bail!("`{text}` names no space; use <space>/<path>");
-        }
-        // Every reference-taking read accepts `<origin>:`, so say why this
-        // one cannot rather than failing on a space that does not exist.
-        if space.contains(':') {
-            anyhow::bail!(
-                "`{text}` names an origin, and a fetch publishes this node's own version; \
-                 use <space>/<path>"
-            );
-        }
-        Ok(Destination {
-            space: space.to_string(),
-            path: path.to_string(),
-        })
+/// The path a fetch publishes, completing a directory destination with the
+/// file name the URL carries.
+fn entry_path(destination: &Destination, url: &reqwest::Url) -> Result<String> {
+    if let Some(path) = destination.explicit_path() {
+        return Ok(path);
     }
-
-    /// The path this fetch publishes, completing a directory destination with
-    /// the file name the URL carries.
-    fn entry_path(&self, url: &reqwest::Url) -> Result<String> {
-        if !self.path.is_empty() && !self.path.ends_with('/') {
-            return Ok(self.path.clone());
-        }
-        let name = file_name(url).with_context(|| {
-            format!("{url} does not name a file; give the destination an explicit file name")
-        })?;
-        Ok(format!("{}{name}", self.path))
-    }
+    let name = file_name(url).with_context(|| {
+        format!("{url} does not name a file; give the destination an explicit file name")
+    })?;
+    Ok(destination.join(&name))
 }
 
 /// The file name a URL carries: its last path segment, percent-decoded.
@@ -217,7 +181,10 @@ mod tests {
     use super::*;
 
     fn entry_path(destination: &str, url: &str) -> Result<String> {
-        Destination::parse(destination)?.entry_path(&reqwest::Url::parse(url).unwrap())
+        super::entry_path(
+            &Destination::parse(destination)?,
+            &reqwest::Url::parse(url).unwrap(),
+        )
     }
 
     #[test]
@@ -275,15 +242,5 @@ mod tests {
                 "{url}: {e:#}"
             );
         }
-    }
-
-    #[test]
-    fn a_destination_names_a_space() {
-        for bad in ["workspace", "", "/path"] {
-            assert!(Destination::parse(bad).is_err(), "{bad}");
-        }
-        // An origin prefix is refused with its reason, not as a missing space.
-        let e = Destination::parse("nas@cluster.example:media/f").unwrap_err();
-        assert!(e.to_string().contains("own version"), "{e:#}");
     }
 }
